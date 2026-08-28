@@ -1,0 +1,128 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Workspace garbage collection.
+#
+# The reaper has been written, built into the image and self-checked on every
+# image build since it was added, and never once run: nothing in this chart
+# invoked it. Its own source comment describes the manifest that was supposed
+# to call it. Meanwhile every session that ever ran left its workspace on the
+# shared filesystem, and nothing has ever removed one.
+#
+# It is off by default even so, because turning on a collector that has never
+# executed against a filesystem full of real data is not something a chart
+# should decide on an operator's behalf. The intended sequence is: attach the
+# storage, enable with `dryRun: true`, read what it says it would remove, then
+# turn dry-run off.
+{{- if .Values.reaper.enabled }}
+{{- if not .Values.secret.workspacePersistBase }}
+{{- fail "reaper.enabled requires secret.workspacePersistBase: the reaper sweeps that path, and with it empty it would exit having done nothing" }}
+{{- end }}
+{{- if not .Values.reaper.volume }}
+{{- fail "reaper.enabled requires reaper.volume: the pod needs the shared workspace filesystem mounted, and the chart cannot guess how it is attached at your site" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: primus-claw-workspace-reaper
+  labels:
+    app: primus-claw
+    component: primus-claw-workspace-reaper
+spec:
+  schedule: {{ .Values.reaper.schedule | quote }}
+  # Forbid rather than Replace: a run that is still going is walking a
+  # filesystem and moving directories, and killing it midway is a worse
+  # outcome than skipping a cycle. There is nothing urgent about garbage.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.reaper.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.reaper.failedJobsHistoryLimit }}
+  # A missed window is not worth catching up on; the next one collects
+  # whatever the missed one would have.
+  startingDeadlineSeconds: {{ .Values.reaper.startingDeadlineSeconds }}
+  jobTemplate:
+    spec:
+      # No retries. The reaper is idempotent, so a retry is harmless, but a
+      # failing run that retries is a run failing repeatedly against the same
+      # filesystem -- better to leave it for the next schedule and the alert.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.reaper.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app: primus-claw
+            component: primus-claw-workspace-reaper
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          {{- with .Values.reaper.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.reaper.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumes:
+          - name: workspaces
+            {{- toYaml .Values.reaper.volume | nindent 12 }}
+          containers:
+          - name: reaper
+            image: {{ include "primus-claw.image" . | quote }}
+            imagePullPolicy: {{ .Values.image.pullPolicy }}
+            # Bypasses the entrypoint's role dispatch, which knows about api,
+            # brain and hands only.
+            command: ["node", "/app/packages/brain/dist/reaper-entry.js"]
+            # NATS and WORKSPACE_PERSIST_BASE, plus AUTH_INTERNAL_TOKEN when
+            # it asks the API who owns a workspace. It needs no database and
+            # no object storage of its own: eligibility is decided from the KV
+            # buckets, the API's answer, and the directory's own mtime.
+            envFrom:
+            - secretRef:
+                name: primus-claw-secrets
+            env:
+            # How long a workspace must have been untouched. Counted on top of
+            # the checks that it holds no checkpoint and no lock, so this is
+            # the margin beyond "demonstrably not in use", not the whole of the
+            # safety.
+            - name: WORKSPACE_GC_RETENTION_DAYS
+              value: {{ .Values.reaper.retentionDays | quote }}
+            # Covers the gap between a run finishing and its KV entries
+            # settling, so a workspace whose lock has just expired is not
+            # collected out from under a run that is about to resume.
+            - name: REAPER_KV_GRACE_MIN
+              value: {{ .Values.reaper.kvGraceMin | quote }}
+            # Collection is two-phase: eligible directories are renamed into a
+            # trash directory first and only removed after this long. That
+            # window is the one chance to notice a mistake and move something
+            # back.
+            - name: REAPER_TRASH_GRACE_HOURS
+              value: {{ .Values.reaper.trashGraceHours | quote }}
+            # Bounds the blast radius of a first real run against a filesystem
+            # with years of accumulation: a misjudgement costs at most this
+            # many directories before someone sees the logs.
+            - name: REAPER_MAX_DELETE_PER_RUN
+              value: {{ .Values.reaper.maxDeletePerRun | quote }}
+            - name: REAPER_DRY_RUN
+              value: {{ .Values.reaper.dryRun | quote }}
+            {{- if .Values.reaper.askApiWhoOwnsWorkspaces }}
+            # Direct evidence of who still references a workspace, which
+            # outranks the mtime rule in both directions. Left unset, the
+            # reaper decides the way it always has. Pointed at the wrong API
+            # it would be told that nothing owns anything, which is why it is
+            # the cluster service name and not a value someone types.
+            - name: WORKSPACE_OWNER_API_URL
+              value: {{ printf "http://primus-claw-api.%s.svc.cluster.local:80" .Release.Namespace | quote }}
+            {{- end }}
+            {{- if .Values.tls.insecureSkipVerify }}
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+            {{- end }}
+            volumeMounts:
+            - name: workspaces
+              mountPath: {{ .Values.secret.workspacePersistBase | quote }}
+            resources:
+              {{- toYaml .Values.reaper.resources | nindent 14 }}
+{{- end }}

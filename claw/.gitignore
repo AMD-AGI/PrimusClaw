@@ -1,0 +1,33 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+node_modules/
+dist/
+*.js.map
+*.d.ts
+*.tsbuildinfo
+!packages/*/src/**
+.env
+.env.local
+*.log
+
+# Per-env deploy values (contain secrets — keep example template tracked)
+deploy/values.*.env
+!deploy/values.example.env
+
+# Runtime files
+*.pid
+.frontend.pid
+.harness-*.pid
+
+# Test artifacts (allow .test.ts sources; ignore generated snapshots + coverage)
+packages/*/test/__snapshots__/
+packages/*/test/coverage/
+packages/*/test/.tmp/
+
+# Local soak/loop scratch (per-round logs + runner, not for VCS)
+.rich-test-loop*
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+Agent Sandbox
+Copyright 2025 Advanced Micro Devices, Inc.
+
+This product includes software developed by
+The Kubernetes Authors (https://github.com/kubernetes-sigs/agent-sandbox).
+
+Portions of this directory are derived from kubernetes-sigs/agent-sandbox,
+licensed under the Apache License, Version 2.0. See LICENSE in this directory
+for the full license text and UPSTREAM.md for what was inherited from upstream
+and what was added by AMD.
+
+Modifications and additions by Advanced Micro Devices, Inc. are also released
+under the Apache License, Version 2.0, and are marked with an
+`SPDX-FileCopyrightText: Advanced Micro Devices, Inc.` header.
+
+Note that this directory is licensed under Apache-2.0, whereas the rest of the
+PrimusClaw repository is licensed under MIT (see ../LICENSE).

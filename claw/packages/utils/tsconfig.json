@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    // This package has no third-party imports, so nothing pulls in @types/node
+    // transitively the way it happens in api/brain/hands. security/constant-time.ts needs
+    // node:crypto, so request the types explicitly.
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

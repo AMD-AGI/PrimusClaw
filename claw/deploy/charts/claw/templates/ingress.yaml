@@ -1,0 +1,60 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: primus-claw
+  labels:
+    app: primus-claw
+    {{- /*
+      Everything higress.io/* below is emitted only when the ingress class is
+      actually higress. These carry the path rewrite and the 2g body limit the
+      API needs for uploads, so on another controller the Ingress would be
+      created, accepted, and route nothing -- with no error anywhere to say
+      the annotations were addressed to a controller that is not installed.
+      Another controller needs its own equivalents; add them under
+      ingress.extraAnnotations rather than here.
+    */}}
+    {{- if eq .Values.ingress.className "higress" }}
+    {{- if .Values.ingress.host }}
+    higress.io/domain_{{ .Values.ingress.host }}: "true"
+    {{- end }}
+    higress.io/resource-definer: higress
+    {{- end }}
+  {{- $ann := dict }}
+  {{- if eq .Values.ingress.className "higress" }}
+  {{- $ann = merge $ann (dict
+        "higress.io/enable-rewrite" "true"
+        "higress.io/rewrite-target" "$1"
+        "higress.io/proxy-body-size" "2g"
+        "higress.io/client-max-body-size" "2g"
+        "higress.io/allow_chunked_length" "true"
+        "higress.io/proxy-buffering" "off"
+        "higress.io/proxy-read-timeout" "3600"
+        "higress.io/proxy-send-timeout" "3600"
+        "higress.io/proxy-buffer-size" "1k") }}
+  {{- if .Values.ingress.priority }}
+  {{- $ann = merge $ann (dict "higress.io/route-priority" (.Values.ingress.priority | toString)) }}
+  {{- end }}
+  {{- end }}
+  {{- $ann = merge $ann (.Values.ingress.extraAnnotations | default dict) }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+  - host: {{ required "ingress.host is required when ingress.enabled=true" .Values.ingress.host }}
+    http:
+      paths:
+      - path: {{ .Values.ingress.path }}(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: primus-claw-api
+            port:
+              number: 80
+{{- end }}

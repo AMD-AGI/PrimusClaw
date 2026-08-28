@@ -1,0 +1,127 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Agent Sandbox Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths:
+      - 'sandbox/**'
+      - '.github/workflows/agent-sandbox-build.yaml'
+  pull_request:
+    paths:
+      - 'sandbox/**'
+      - '.github/workflows/agent-sandbox-build.yaml'
+  workflow_dispatch:
+
+# Least privilege for the default GITHUB_TOKEN. Registry pushes authenticate
+# with their own credentials, not this token, so read access to the checkout is
+# all any job here needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      image_version: ${{ steps.get-image-version.outputs.image_version }}
+      date_time: ${{ steps.get-current-time.outputs.date_time }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Calculate ImageVersion
+        id: get-image-version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "image_version=$TAG" >> $GITHUB_OUTPUT
+          else
+            echo "image_version=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Current Time
+        id: get-current-time
+        run: |
+          FORMATTED_DATE=$(TZ='Asia/Shanghai' date +'%Y%m%d%H%M')
+          echo "date_time=$FORMATTED_DATE" >> $GITHUB_OUTPUT
+          echo "Formatted date: $FORMATTED_DATE"
+
+      - name: Generate matrix
+        id: generate-matrix
+        run: |
+          echo 'matrix={"include":[{"name":"agent-sandbox-controlplane","context_path":"sandbox","dockerfile_path":"sandbox/docker/Dockerfile.controlplane"},{"name":"agent-sandbox-envd-injector","context_path":"sandbox","dockerfile_path":"sandbox/docker/Dockerfile.envd-injector"}]}' >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Buildah
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      - name: Login Docker Hub
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Logging in to Docker Hub..."
+          buildah login -u "${{ secrets.DOCKER_USERNAME }}" -p "${{ secrets.DOCKER_PASSWORD }}" docker.io
+
+      - name: Build sandbox image
+        env:
+          REPOSITORY: docker.io/primussafe
+          IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+          DATE_TIME: ${{ needs.prepare.outputs.date_time }}
+        run: |
+          set -e
+          echo "Building ${{ matrix.name }}..."
+
+          buildah bud \
+            --layers \
+            -t ${{ matrix.name }}:${IMAGE_VERSION} \
+            -t ${{ matrix.name }}:${DATE_TIME} \
+            -f ${{ matrix.dockerfile_path }} ${{ matrix.context_path }}
+
+      - name: Push sandbox image
+        if: github.event_name != 'pull_request'
+        env:
+          REPOSITORY: docker.io/primussafe
+          IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+          DATE_TIME: ${{ needs.prepare.outputs.date_time }}
+        run: |
+          set -e
+          echo "Pushing ${{ matrix.name }} to ${REPOSITORY}..."
+          buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah tag ${{ matrix.name }}:${DATE_TIME} ${REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push ${REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push ${REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+
+      - name: Record image tags
+        env:
+          IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+          DATE_TIME: ${{ needs.prepare.outputs.date_time }}
+        run: |
+          {
+            echo "## Built image"
+            echo ""
+            echo "- image: \`${{ matrix.name }}\`"
+            echo "- latest tag: \`${IMAGE_VERSION}\`"
+            echo "- timestamp tag: \`${DATE_TIME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

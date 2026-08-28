@@ -1,0 +1,288 @@
+<mxfile host="app.diagrams.net" version="24.0.0">
+  <diagram id="primus-claw-arch" name="PrimusClaw / Claw Architecture">
+    <mxGraphModel dx="1700" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1150" math="0" shadow="0" background="#0F1B2D">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- TITLE -->
+        <mxCell id="title" value="PrimusClaw / Claw  ·  V2 Architecture" style="text;html=1;align=center;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="600" y="10" width="500" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- USER / CLIENT -->
+        <mxCell id="user" value="User / Client&#10;Web UI · CLI · REST API" style="ellipse;whiteSpace=wrap;html=1;fillColor=#1F3B70;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=13;fontStyle=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="740" y="60" width="220" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- DATA INFRASTRUCTURE -->
+        <mxCell id="data-infra" value="Data Infrastructure" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1A2233;strokeColor=#4A5F80;fontColor=#9FB8E8;fontSize=14;fontStyle=1;verticalAlign=top;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="20" y="150" width="220" height="540" as="geometry" />
+        </mxCell>
+        <mxCell id="pg" value="PostgreSQL&#10;&#10;Session State&#10;Conversation&#10;Memory · Plugins" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#22324E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="180" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="nats" value="NATS / JetStream + KV&#10;&#10;Event Bus · Sub Routing&#10;hands.&lt;sid&gt; KV&#10;Brain Registry KV" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#22324E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="180" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="S3 / MinIO&#10;&#10;Workspace Snapshots&#10;Transcripts (.transcripts/)&#10;Marketplace Plugins" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#22324E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="490" width="180" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="memdb" value="Memory Service&#10;(Postgres-backed)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#22324E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="630" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- API LAYER -->
+        <mxCell id="api-box" value="API Layer  (Stateless ×N)&#10;HTTP Gateway · SSE Push · Auth · Context Building · NATS Bridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0F2A4A;strokeColor=#3D7BC9;fontColor=#9FCEFF;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="280" y="150" width="1080" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="api1" value="API 1&#10;REST + SSE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F4F8E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="210" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api2" value="API 2&#10;REST + SSE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F4F8E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="600" y="210" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="apiN" value="API N&#10;REST + SSE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F4F8E;strokeColor=#5B8DD6;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="210" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-dots" value="..." style="text;html=1;align=center;fontSize=18;fontColor=#9FCEFF;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="220" width="200" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- BRAIN LAYER -->
+        <mxCell id="brain-box" value="Security Boundary  ·  Keys INSIDE Brain&#10;Brain Layer  -  LLM Reasoning · Tool Routing · Agent Loop · Event Emit" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A2A0A;strokeColor=#E0A030;fontColor=#FFD27A;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="320" width="1080" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="brain1" value="Brain 1  (Main / Leader)&#10;&#10;LLM API Keys · Agent Loop&#10;Tool Route · Sub-Agent · A2A" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7A5A1F;strokeColor=#E0A030;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="380" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="brain2" value="Brain 2  (Sub / Worker)&#10;&#10;LLM API Keys · Agent Loop&#10;Delegate Worker" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7A5A1F;strokeColor=#E0A030;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="600" y="380" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="brainN" value="Brain N&#10;&#10;Durable Consumer&#10;Session Lock per Brain" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7A5A1F;strokeColor=#E0A030;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="380" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="brain-dots" value="..." style="text;html=1;align=center;fontSize=18;fontColor=#FFD27A;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="410" width="200" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- HANDS LAYER -->
+        <mxCell id="hands-box" value="Sandbox Boundary  ·  NO KEYS&#10;Hands Layer  -  Per-Session K8s Workload  ·  bash · read · write · shell" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0E2A20;strokeColor=#3DB07A;fontColor=#9CE3BD;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="530" width="1080" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="hands1" value="Hands 1&#10;&#10;No Keys&#10;Isolated Workspace&#10;MCP Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C40;strokeColor=#3DB07A;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="585" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="hands2" value="Hands 2&#10;&#10;No Keys&#10;Isolated Workspace&#10;MCP Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C40;strokeColor=#3DB07A;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="600" y="585" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="handsN" value="Hands N&#10;&#10;No Keys&#10;Isolated Workspace&#10;MCP Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C40;strokeColor=#3DB07A;fontColor=#FFFFFF;fontSize=12;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="585" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="hands-dots" value="..." style="text;html=1;align=center;fontSize=18;fontColor=#9CE3BD;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="615" width="200" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- SELF-EVOLUTION LOOP -->
+        <mxCell id="evo-box" value="Self-Evolution Loop&#10;Skill Auto-Optimization" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2C1F4A;strokeColor=#9466D9;fontColor=#D4B7FF;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="150" width="290" height="430" as="geometry" />
+        </mxCell>
+        <mxCell id="evo1" value="① Execute&#10;Run Skill in Session" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5C3CB0;strokeColor=#9466D9;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="210" width="210" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="evo2" value="② Analyze&#10;Scan Logs · Detect Failures" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5C3CB0;strokeColor=#9466D9;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="290" width="210" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="evo3" value="③ Optimize&#10;LLM Generates Improved Skill (Draft)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5C3CB0;strokeColor=#9466D9;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="370" width="210" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="evo4" value="④ Review · Approve&#10;Update Skill Store" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B5572A;strokeColor=#FF9A4A;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="450" width="210" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- HARNESS -->
+        <mxCell id="harness-box" value="Harness  ·  Agent Orchestration Engine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3D2A12;strokeColor=#E0903A;fontColor=#FFC785;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="280" y="730" width="660" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="harness1" value="Phase 1  (V1)&#10;Claude SDK query()&#10;Black-box · deprecated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5C3818;strokeColor=#E0903A;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="780" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="harness2" value="Phase 2  (V2)&#10;Custom Agent Loop&#10;Decoupled · Stateless · Current" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B45F1F;strokeColor=#E0903A;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="510" y="780" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="harness3" value="Phase 3  (Future)&#10;Programmable Engine&#10;Template = Dockerfile&#10;Harness = Engine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5C3818;strokeColor=#E0903A;fontColor=#FFFFFF;fontSize=11;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="720" y="780" width="200" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- A2A -->
+        <mxCell id="a2a-box" value="A2A  ·  Cross-System Collaboration" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3D1A1A;strokeColor=#E04C4C;fontColor=#FF9A9A;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="960" y="730" width="400" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="a2a1" value="CI/CD Agent" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8C2A2A;strokeColor=#E04C4C;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="980" y="780" width="110" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a2a2" value="3rd Party Agent" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8C2A2A;strokeColor=#E04C4C;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="780" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a2a3" value="Monitor Agent" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8C2A2A;strokeColor=#E04C4C;fontColor=#FFFFFF;fontSize=11;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1230" y="780" width="115" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a2a-card" value="agent.json   ·   Agent Card" style="text;html=1;align=center;fontSize=11;fontColor=#FF9A9A;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="980" y="835" width="365" height="25" as="geometry" />
+        </mxCell>
+
+        <!-- PLUGIN SYSTEM -->
+        <mxCell id="plugin-box" value="Plugin System" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0E2738;strokeColor=#3D9DB0;fontColor=#7FD9E8;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="600" width="290" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="plg1" value="plugin.json&#10;Manifest" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1405" y="640" width="80" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="plg2" value="MCP Tools" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1495" y="640" width="80" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="plg3" value="Skills" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1585" y="640" width="80" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="plg4" value="Hooks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1405" y="680" width="80" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="plg5" value="Rules" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1495" y="680" width="80" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="plg6" value="Exec Template" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5260;strokeColor=#3D9DB0;fontColor=#FFFFFF;fontSize=10;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1585" y="680" width="80" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- LAYERED MEMORY -->
+        <mxCell id="mem-box" value="Layered Memory" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0E2A2A;strokeColor=#3DB0A8;fontColor=#7FE3D8;fontSize=13;fontStyle=1;verticalAlign=top;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="20" y="730" width="220" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="mem1" value="Short-term&#10;Sliding Window&#10;Raw Context" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C5C;strokeColor=#3DB0A8;fontColor=#FFFFFF;fontSize=10;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="35" y="770" width="190" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="mem2" value="Mid-term&#10;LLM Summary · Auto-Compaction" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C5C;strokeColor=#3DB0A8;fontColor=#FFFFFF;fontSize=10;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="35" y="815" width="190" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="mem3" value="Long-term&#10;Persistent Knowledge (Memory Service)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1F5C5C;strokeColor=#3DB0A8;fontColor=#FFFFFF;fontSize=10;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="35" y="860" width="190" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- V1 → V2 COMPARISON -->
+        <mxCell id="cmp-box" value="V1  →  V2  Comparison" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1A2233;strokeColor=#4A5F80;fontColor=#9FB8E8;fontSize=12;fontStyle=1;verticalAlign=top;arcSize=6;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="740" width="290" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="cmp-h1" value="Dimension" style="text;html=1;align=center;fontSize=10;fontColor=#9FB8E8;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="1395" y="775" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-h2" value="V1" style="text;html=1;align=center;fontSize=10;fontColor=#9FB8E8;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="1485" y="775" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-h3" value="V2" style="text;html=1;align=center;fontSize=10;fontColor=#9FB8E8;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="1580" y="775" width="100" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r1a" value="Security" style="text;html=1;align=center;fontSize=10;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="1395" y="800" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r1b" value="Keys in Sandbox" style="text;html=1;align=center;fontSize=10;fontColor=#FFB0B0;" vertex="1" parent="1"><mxGeometry x="1485" y="800" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r1c" value="Keys Isolated" style="text;html=1;align=center;fontSize=10;fontColor=#9CE3BD;" vertex="1" parent="1"><mxGeometry x="1580" y="800" width="100" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r2a" value="Scale" style="text;html=1;align=center;fontSize=10;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="1395" y="825" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r2b" value="Single instance" style="text;html=1;align=center;fontSize=10;fontColor=#FFB0B0;" vertex="1" parent="1"><mxGeometry x="1485" y="825" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r2c" value="N×Brain×Hands" style="text;html=1;align=center;fontSize=10;fontColor=#9CE3BD;" vertex="1" parent="1"><mxGeometry x="1580" y="825" width="100" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r3a" value="Concurrency" style="text;html=1;align=center;fontSize=10;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="1395" y="850" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r3b" value="No sub-agent" style="text;html=1;align=center;fontSize=10;fontColor=#FFB0B0;" vertex="1" parent="1"><mxGeometry x="1485" y="850" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r3c" value="Sub-Agent + AgentTeam" style="text;html=1;align=center;fontSize=10;fontColor=#9CE3BD;" vertex="1" parent="1"><mxGeometry x="1580" y="850" width="100" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r4a" value="Engine" style="text;html=1;align=center;fontSize=10;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="1395" y="875" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r4b" value="Claude SDK" style="text;html=1;align=center;fontSize=10;fontColor=#FFB0B0;" vertex="1" parent="1"><mxGeometry x="1485" y="875" width="90" height="20" as="geometry"/></mxCell>
+        <mxCell id="cmp-r4c" value="Custom Loop" style="text;html=1;align=center;fontSize=10;fontColor=#9CE3BD;" vertex="1" parent="1"><mxGeometry x="1580" y="875" width="100" height="20" as="geometry"/></mxCell>
+
+        <!-- LEGEND -->
+        <mxCell id="lg-box" value="Legend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1A2233;strokeColor=#4A5F80;fontColor=#9FB8E8;fontSize=11;fontStyle=1;verticalAlign=top;arcSize=6;" vertex="1" parent="1">
+          <mxGeometry x="20" y="930" width="1340" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lg-1" value="Brain (Keys IN)" style="text;html=1;align=left;fontSize=10;fontColor=#FFD27A;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="40" y="960" width="160" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-2" value="Hands (No Keys)" style="text;html=1;align=left;fontSize=10;fontColor=#9CE3BD;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="220" y="960" width="160" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-3" value="Self-Evolution" style="text;html=1;align=left;fontSize=10;fontColor=#D4B7FF;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="400" y="960" width="160" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-4" value="A2A External" style="text;html=1;align=left;fontSize=10;fontColor=#FF9A9A;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="580" y="960" width="160" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-5" value="MCP Protocol" style="text;html=1;align=left;fontSize=10;fontColor=#9CE3BD;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="760" y="960" width="160" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-6" value="NATS Bus / Sub Routing" style="text;html=1;align=left;fontSize=10;fontColor=#9FCEFF;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="940" y="960" width="200" height="20" as="geometry"/></mxCell>
+        <mxCell id="lg-7" value="HTTP / SSE" style="text;html=1;align=left;fontSize=10;fontColor=#FFFFFF;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="1160" y="960" width="160" height="20" as="geometry"/></mxCell>
+
+        <!-- ============ EDGES (flat, no nested mxCell) ============ -->
+        <mxCell id="e-user-api" value="HTTPS · WebSocket / SSE" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#FFFFFF;strokeWidth=2;fontColor=#FFFFFF;fontSize=10;" edge="1" parent="1" source="user" target="api2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-api-pg" style="endArrow=classic;startArrow=classic;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;strokeColor=#5B8DD6;strokeWidth=1.5;" edge="1" parent="1" source="api1" target="pg">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-api-nats" style="endArrow=classic;startArrow=classic;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;strokeColor=#5B8DD6;strokeWidth=1.5;" edge="1" parent="1" source="api1" target="nats">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-api-brain1" value="NATS sub.&lt;sid&gt;" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9FCEFF;strokeWidth=2;dashed=1;fontColor=#9FCEFF;fontSize=9;" edge="1" parent="1" source="api1" target="brain1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-api-brain2" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9FCEFF;strokeWidth=2;dashed=1;" edge="1" parent="1" source="api2" target="brain2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-api-brainN" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9FCEFF;strokeWidth=2;dashed=1;" edge="1" parent="1" source="apiN" target="brainN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b1-h1" value="MCP" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9CE3BD;strokeWidth=2;fontColor=#9CE3BD;fontSize=10;fontStyle=1;" edge="1" parent="1" source="brain1" target="hands1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-b2-h2" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9CE3BD;strokeWidth=2;" edge="1" parent="1" source="brain2" target="hands2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-bN-hN" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#9CE3BD;strokeWidth=2;" edge="1" parent="1" source="brainN" target="handsN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b-nats" value="Heartbeat · Events" style="endArrow=classic;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.3;strokeColor=#5B8DD6;strokeWidth=1.5;dashed=1;fontColor=#5B8DD6;fontSize=9;" edge="1" parent="1" source="brain1" target="nats">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b-evo" value="Skill ↔ Plugin" style="endArrow=classic;startArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#D4B7FF;strokeWidth=1.5;dashed=1;fontColor=#D4B7FF;fontSize=9;" edge="1" parent="1" source="brainN" target="evo1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-evo-12" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#D4B7FF;strokeWidth=1.5;" edge="1" parent="1" source="evo1" target="evo2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-evo-23" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#D4B7FF;strokeWidth=1.5;" edge="1" parent="1" source="evo2" target="evo3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-evo-34" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#D4B7FF;strokeWidth=1.5;" edge="1" parent="1" source="evo3" target="evo4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-evo-41" style="endArrow=classic;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#FF9A4A;strokeWidth=1.5;dashed=1;curved=1;" edge="1" parent="1" source="evo4" target="evo1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1400" y="480"/>
+              <mxPoint x="1400" y="240"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e-api-a2a" value="A2A In/Out" style="endArrow=classic;startArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#FF9A9A;strokeWidth=1.5;dashed=1;fontColor=#FF9A9A;fontSize=9;" edge="1" parent="1" source="apiN" target="a2a2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b-plg" value="Resolve / Load" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#7FD9E8;strokeWidth=1.5;fontColor=#7FD9E8;fontSize=9;" edge="1" parent="1" source="brainN" target="plg1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b-mem" style="endArrow=classic;startArrow=classic;html=1;exitX=0;exitY=1;entryX=1;entryY=0.5;strokeColor=#7FE3D8;strokeWidth=1.5;" edge="1" parent="1" source="brain1" target="mem2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-b-s3" value="Transcript · Snapshot" style="endArrow=classic;html=1;exitX=0;exitY=0.7;entryX=1;entryY=0.5;strokeColor=#5B8DD6;strokeWidth=1.5;dashed=1;fontColor=#5B8DD6;fontSize=9;" edge="1" parent="1" source="brain1" target="s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-h-s3" style="endArrow=classic;startArrow=classic;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;strokeColor=#3DB07A;strokeWidth=1.5;" edge="1" parent="1" source="hands1" target="s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-h-b" value="Drives" style="endArrow=open;html=1;exitX=0.5;exitY=0;entryX=0.5;entryY=1;strokeColor=#FFC785;strokeWidth=1.5;dashed=1;fontColor=#FFC785;fontSize=9;" edge="1" parent="1" source="harness2" target="brain2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,25 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+  Fail the install when the sandbox namespace is absent, instead of letting the
+  first message come back as a router 500 that names nothing actionable. The
+  chart deliberately owns no cluster-scoped resources, so this uses `lookup`
+  (which runs with the installing user's credentials) rather than a hook Job
+  with a ClusterRole.
+
+  `lookup` returns nothing during `helm template` and `--dry-run`, which is
+  indistinguishable from "the namespace is missing". Probing the release's own
+  namespace first tells the two apart: when even that comes back empty the
+  lookup is not live, and the check skips rather than failing a plain render.
+
+  This template intentionally emits no manifest.
+*/ -}}
+{{- if lookup "v1" "Namespace" "" .Release.Namespace }}
+{{-   $sandboxNamespace := .Values.secret.sandboxNamespace }}
+{{-   if $sandboxNamespace }}
+{{-     if not (lookup "v1" "Namespace" "" $sandboxNamespace) }}
+{{-       fail (printf "sandbox namespace %q does not exist. Sandboxes are created there by the agent-sandbox router, and the chart does not create it: either create the namespace first or point secret.sandboxNamespace at an existing one." $sandboxNamespace) }}
+{{-     end }}
+{{-   end }}
+{{- end }}

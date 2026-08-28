@@ -1,0 +1,6 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+sphinx>=7,<10
+furo>=2024.1.29
+myst-parser>=2

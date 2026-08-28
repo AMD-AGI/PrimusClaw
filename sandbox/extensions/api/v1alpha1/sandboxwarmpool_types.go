@@ -1,0 +1,72 @@
+// SPDX-FileCopyrightText: The Kubernetes Authors / kubernetes-sigs/agent-sandbox
+// SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// NOTE: json tags are required. Any new fields you add must have json tags for the fields to be serialized.
+// Important: Run "make" to regenerate code after modifying this file
+
+// SandboxWarmPoolSpec defines the desired state of SandboxWarmPool
+type SandboxWarmPoolSpec struct {
+	// Replicas is the desired number of sandboxes in the pool.
+	// This field is controlled by an HPA if specified.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas"`
+
+	// sandboxTemplateRef - name of the SandboxTemplate to be used for creating a Sandbox
+	// +kubebuilder:validation:Required
+	TemplateRef SandboxTemplateRef `json:"sandboxTemplateRef,omitempty" protobuf:"bytes,3,name=sandboxTemplateRef"`
+}
+
+// SandboxWarmPoolStatus defines the observed state of SandboxWarmPool
+type SandboxWarmPoolStatus struct {
+	// Replicas is the total number of sandboxes in the pool.
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// ReadyReplicas is the total number of sandboxes in the pool that are in a ready state.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+// +kubebuilder:resource:scope=Namespaced,shortName=swp
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// SandboxWarmPool is the Schema for the sandboxwarmpools API
+type SandboxWarmPool struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// metadata is a standard object metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// spec defines the desired state of SandboxWarmPool
+	// +required
+	Spec SandboxWarmPoolSpec `json:"spec"`
+
+	// status defines the observed state of SandboxWarmPool
+	// +optional
+	Status SandboxWarmPoolStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// SandboxWarmPoolList contains a list of SandboxWarmPool
+type SandboxWarmPoolList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []SandboxWarmPool `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&SandboxWarmPool{}, &SandboxWarmPoolList{})
+}

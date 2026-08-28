@@ -1,0 +1,87 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Tests
+
+# The Python suites run in tests-coverage.yml. This workflow covers the
+# TypeScript and Go trees, which had no CI execution at all: a broken build or a
+# failing unit test in Claw or Sandbox could be merged without anything
+# noticing.
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  claw:
+    name: Claw (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: claw
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: claw/package-lock.json
+
+      - run: npm ci
+
+      # Build first: `npm test` runs the sources through tsx, so a type error
+      # that only tsc catches would otherwise slip through.
+      - run: npm run build
+
+      - run: npm test
+
+      # End-to-end smoke test over the real MCP transport: starts Hands against
+      # a temporary workspace and drives it. Needs no cluster, GPU or LLM key,
+      # and keeps the published example from rotting unnoticed.
+      - name: Minimal demo (Hands over MCP)
+        run: ./examples/hands-mcp/run.sh
+
+  sandbox:
+    name: Sandbox (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: sandbox/go.mod
+          cache-dependency-path: sandbox/go.sum
+
+      - run: go build ./...
+
+      - run: go vet ./...
+
+      # e2e suites are behind the `e2e` build tag and need a cluster, so a plain
+      # `go test ./...` covers exactly the unit tests.
+      - run: go test ./...

@@ -1,0 +1,75 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Public Tree Scan
+
+# Deliberately has no paths filter. Lint runs with paths-ignore for "**/*.md"
+# and "docs/**", which is right for a code linter and wrong for this: internal
+# hostnames reach a repository through prose far more often than through code,
+# and documentation held the large majority of the 1122 endpoint occurrences
+# this guard was written against. Every file has to be in scope, including
+# dotfiles, which is why the scan passes --hidden.
+on:
+  pull_request:
+    branches:
+      - '**'
+  push:
+    branches:
+      - '**'
+
+# Least privilege for the default GITHUB_TOKEN. Registry pushes authenticate
+# with their own credentials, not this token, so read access to the checkout is
+# all any job here needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: public-tree-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-tree-scan:
+    name: no internal literals or key-shaped strings in the tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Not preinstalled on the runner image. The scan needs the PCRE2 build
+      # for its lookahead, which the Ubuntu package provides; the script
+      # verifies that itself and exits 2 rather than reporting a clean tree it
+      # never searched.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Run public-tree-scan
+        run: |
+          bash scripts/release-tests/public-tree-scan.sh
+
+  public-message-scan:
+    name: no internal literals in commit messages or author identities
+    # Pull requests only. This is the last point at which a message or an
+    # author field can still be amended; once the commits are on main, a
+    # follow-up commit cannot unpublish them.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The scan walks from the base commit, which a shallow clone omits.
+          fetch-depth: 0
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Run public-message-scan
+        run: |
+          bash scripts/release-tests/public-message-scan.sh \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"

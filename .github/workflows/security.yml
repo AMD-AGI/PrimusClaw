@@ -1,0 +1,310 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Security
+
+# Runs on a schedule as well as on change. Advisories are published against code
+# that has not moved, so a scan wired only to push/pull_request goes quiet
+# exactly when a dependency turns out to be vulnerable and nobody is editing it.
+# The weekly run catches that; the per-change runs stop a known-vulnerable
+# dependency from being merged in the first place.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/pyproject.toml"
+      - "**/requirements*.txt"
+      - "**/Dockerfile*"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/pyproject.toml"
+      - "**/requirements*.txt"
+      - "**/Dockerfile*"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Mondays 03:17 UTC. Off the hour on purpose: scheduled jobs at :00 queue
+    # behind everyone else's cron and start late or get dropped outright.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    name: npm audit (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [claw]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+
+      # Both projects sit at zero advisories, so the gate is set where it can
+      # actually hold: high and critical fail. Moderate and below print but do
+      # not block, otherwise one unfixable transitive advisory wedges every PR
+      # in the repo and the gate gets switched off wholesale.
+      - name: Audit
+        working-directory: ${{ matrix.project }}
+        run: |
+          npm audit --audit-level=moderate || true
+          npm audit --audit-level=high
+
+  govulncheck:
+    name: govulncheck (Sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: sandbox/go.mod
+
+      # govulncheck only reports advisories the code can actually reach, so
+      # unlike a manifest scanner every finding is actionable and the gate can
+      # be zero rather than a severity threshold. It covers the standard library
+      # too, which is why go.mod carries a `toolchain` line: the `go` directive
+      # alone is a language floor and leaves the build on a stdlib with known
+      # reachable advisories.
+      - name: Run govulncheck
+        working-directory: sandbox
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  pip-audit:
+    name: pip-audit (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Extras follow what each image installs, so the audited set is the
+          # set that ships: memory-service's Dockerfile installs `.[storage]`,
+          # which is where fastapi, uvicorn and asyncpg come from.
+          - package: memory/memory-service
+            extras: "[storage]"
+          - package: memory/knowledge-worker
+            extras: ""
+          - package: sandbox/sdk-python
+            extras: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      # Audits what a fresh install resolves to, not the declared ranges. All
+      # three packages pin lower bounds only, so the resolved set is what a user
+      # actually receives and is therefore the set worth checking.
+      #
+      # The resolution happens in a throwaway virtualenv and the audit runs
+      # against the frozen result, for two reasons. The package under audit is
+      # not on PyPI, so auditing it directly fails as "not found" under
+      # `--strict`; installing it editable keeps it out of `pip freeze
+      # --exclude-editable` while its dependencies stay in. And the runner's own
+      # interpreter carries pip/setuptools that no manifest in this repo pins, so
+      # auditing the ambient environment reports advisories in GitHub's image
+      # rather than in anything we publish.
+      - name: Audit resolved dependencies
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/resolve"
+          "$RUNNER_TEMP/resolve/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/resolve/bin/pip" install --quiet \
+            --editable "./${{ matrix.package }}${{ matrix.extras }}"
+          "$RUNNER_TEMP/resolve/bin/pip" freeze --exclude-editable \
+            > "$RUNNER_TEMP/resolved-requirements.txt"
+          echo "Resolved dependency set:"
+          cat "$RUNNER_TEMP/resolved-requirements.txt"
+
+          pip install pip-audit
+          pip-audit --strict --progress-spinner off \
+            -r "$RUNNER_TEMP/resolved-requirements.txt"
+
+  pip-audit-docs:
+    name: pip-audit (docs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Audit doc dependencies
+        run: |
+          pip install pip-audit
+          pip-audit --strict --progress-spinner off -r docs/requirements.txt
+
+  base-images:
+    name: Base image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Trivy is pinned by release tag rather than digest because the digest
+      # cannot be resolved without registry access at authoring time; upstream
+      # does not move release tags. Every image it scans is digest-pinned.
+      TRIVY: aquasec/trivy:0.72.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Scans the base images the Dockerfiles pin, rather than images built
+      # here: building needs registry credentials, which pull requests from
+      # forks do not get, and the OS-level CVEs that matter live in the base
+      # layer either way. The lists are read out of the Dockerfiles so they
+      # cannot drift from what is actually built.
+      #
+      # rocm/pytorch is excluded: it is tens of gigabytes and would dominate the
+      # run for a base AMD publishes and tracks with the image itself.
+      - name: Collect pinned base images
+        id: collect
+        run: |
+          set -euo pipefail
+
+          # Everything pinned, builder stages included: the report step prints
+          # these so drift is visible even where it is not blocking.
+          grep -rhoP '^FROM\s+\K\S+' --include='Dockerfile*' . \
+            | grep '@sha256:' \
+            | grep -v '^rocm/pytorch' \
+            | sort -u > reported-images.txt
+
+          # The base of each Dockerfile's *final* stage — the layers that end up
+          # in a running container. A builder stage's packages never leave the
+          # build host, and treating them as shippable is what makes this gate
+          # unsatisfiable: `golang:1.26` carries kernel headers whose CVEs are
+          # neither reachable in a container nor fixable from this repository.
+          : > shipped-images.txt
+          while IFS= read -r file; do
+            base=$(grep -oP '^FROM\s+\K\S+' "$file" | tail -1)
+            case "$base" in
+              *@sha256:*)
+                echo "$base" >> shipped-images.txt
+                ;;
+              *)
+                echo "::error::final stage of $file builds on '$base', which is not a digest-pinned image. Teach this step how to resolve it, otherwise the gate below silently stops covering that image."
+                exit 1
+                ;;
+            esac
+          done < <(grep -rlP '^FROM' --include='Dockerfile*' .)
+
+          # ghcr.io/berriai/litellm is a third-party *application* image, not a
+          # base we add our code to. Its OS packages are patched by whoever
+          # builds the next litellm release, so the only move available here is a
+          # pin bump — which Dependabot proposes — and blocking every unrelated
+          # pull request on an upstream release cadence is how a scan ends up
+          # switched off. It stays in the report list.
+          grep -vE '^(rocm/pytorch|ghcr\.io/berriai/litellm)' shipped-images.txt \
+            | sort -u > gated-images.txt
+
+          echo "Reported:"; cat reported-images.txt
+          echo "Gated:"; cat gated-images.txt
+          test -s reported-images.txt
+          test -s gated-images.txt
+
+      # Findings do not fail this step; a scan that could not run does. One
+      # shared cache directory for the job, because otherwise every invocation
+      # re-downloads the vulnerability database.
+      - name: Report every pinned base image
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          rc=0
+          while read -r image; do
+            [ -n "$image" ] || continue
+            echo "::group::$image"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY" image \
+                --scanners vuln \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --exit-code 0 \
+                --no-progress \
+                "$image" || rc=1
+            echo "::endgroup::"
+          done < reported-images.txt
+          exit "$rc"
+
+      # --ignore-unfixed: an advisory the base vendor has not patched cannot be
+      # acted on here beyond changing base image, and blocking every merge on it
+      # trains people to ignore the job.
+      #
+      # --pkg-types os: the language packages inside a base image are the
+      # vendor's own tooling — npm's bundled dependencies, setuptools' vendored
+      # copies — already at the newest version that vendor publishes, so a
+      # finding there has no action behind it either. What this repository
+      # declares is covered by the npm audit and pip-audit jobs above; the
+      # report step prints the rest.
+      - name: Gate on OS packages in the images we ship
+        run: |
+          set -uo pipefail
+          rc=0
+          while read -r image; do
+            [ -n "$image" ] || continue
+            echo "::group::$image"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY" image \
+                --scanners vuln \
+                --pkg-types os \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --exit-code 1 \
+                --no-progress \
+                "$image" || rc=1
+            echo "::endgroup::"
+          done < gated-images.txt
+          exit "$rc"
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Via the pinned action rather than curl-ing a release tarball: the
+      # checksum of that tarball would have to be pinned here too, and a
+      # hand-copied checksum is exactly the kind of thing that gets pasted
+      # wrong and then verifies nothing. The action SHA pins the whole chain.
+      #
+      # SPDX because the repo already carries SPDX licence headers and is
+      # REUSE-linted, so consumers get one vocabulary across both.
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: sbom.spdx.json
+          output-file: sbom.spdx.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 90

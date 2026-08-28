@@ -1,0 +1,84 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: litellm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: litellm
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- if .Values.image.pullSecret }}
+      imagePullSecrets:
+      - name: {{ .Values.image.pullSecret }}
+      {{- end }}
+      containers:
+      - name: litellm
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - "--config"
+        - "/app/config.yaml"
+        - "--port"
+        - "{{ .Values.port }}"
+        ports:
+        - name: http
+          containerPort: {{ .Values.port }}
+        env:
+        - name: SERVER_ROOT_PATH
+          value: {{ .Values.serverRootPath | quote }}
+        - name: STORE_MODEL_IN_DB
+          value: "True"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "litellm.fullname" . }}
+              key: database_url
+        - name: LITELLM_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "litellm.fullname" . }}
+              key: master_key
+        - name: SAFE_API_URL
+          value: {{ .Values.safeApiUrl | quote }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        readinessProbe:
+          httpGet:
+            path: {{ printf "%s/health/readiness" .Values.serverRootPath }}
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: {{ printf "%s/health/liveness" .Values.serverRootPath }}
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "litellm.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,81 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: claw-memory-postgres
+  namespace: primus-claw
+  labels:
+    app: claw-memory-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: claw-memory-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: claw-memory-postgres
+  namespace: primus-claw
+  labels:
+    app: claw-memory-postgres
+spec:
+  serviceName: claw-memory-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claw-memory-postgres
+  template:
+    metadata:
+      labels:
+        app: claw-memory-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: docker.io/postgres:16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: claw-memory-postgres-secret
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

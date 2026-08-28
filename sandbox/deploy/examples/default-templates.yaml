@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: runtime.agent-sandbox.io/v1alpha1
+kind: CodeInterpreter
+metadata:
+  name: python-311-runc
+  namespace: default
+spec:
+  authMode: envd
+  runtimePolicy: agent-default
+  maxSessionDuration: 8h
+  sessionTimeout: 15m
+  warmPoolSize: 1
+  template:
+    fromImage: python:3.11-slim
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    steps:
+      - type: workdir
+        args:
+          - /home/sandbox
+---
+apiVersion: runtime.agent-sandbox.io/v1alpha1
+kind: CodeInterpreter
+metadata:
+  name: python-311-kata
+  namespace: default
+spec:
+  authMode: envd
+  runtimePolicy: agent-default
+  maxSessionDuration: 8h
+  sessionTimeout: 15m
+  warmPoolSize: 1
+  template:
+    fromImage: python:3.11-slim
+    runtimeClassName: kata-qemu
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    steps:
+      - type: workdir
+        args:
+          - /home/sandbox

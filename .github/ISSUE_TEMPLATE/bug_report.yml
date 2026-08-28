@@ -1,0 +1,77 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Bug report
+description: Something behaves differently from what the docs or the code say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Use the process in
+        [SECURITY.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/SECURITY.md)
+        instead — private vulnerability reporting, or the AMD Product Security portal.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - claw / api
+        - claw / brain
+        - claw / hands
+        - claw / protocol or utils
+        - sandbox (Go control plane)
+        - sandbox / sdk-python
+        - memory (memory-service or knowledge-worker)
+        - deployment (Helm, installers, Docker)
+        - docs
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        Commands, config, and the smallest case that still shows it. If it needs
+        a cluster, say which parts are required — some issues reproduce against
+        `make demo` alone, which is much easier for us to act on.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: |
+        Paste the relevant output. **Redact tokens, API keys, internal hostnames,
+        and anything else you would not publish** — this is a public issue tracker.
+      render: text
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Whatever applies: image tag or commit, Node / Go / Python version,
+        Kubernetes version and distribution, deployment method, LLM gateway.
+      placeholder: |
+        Commit/tag:
+        Deployment: helm chart / docker / local dev
+        Node:  go:  python:
+        Kubernetes:
+    validations:
+      required: true

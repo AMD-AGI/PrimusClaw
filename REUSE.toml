@@ -1,0 +1,31 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+version = 1
+SPDX-PackageName = "PrimusClaw"
+SPDX-PackageSupplier = "Advanced Micro Devices, Inc."
+SPDX-PackageDownloadLocation = "https://github.com/AMD-AGI/PrimusClaw"
+
+# The repository is MIT-licensed (see the root LICENSE file). This default
+# annotation makes every file REUSE-compliant without per-file headers.
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
+SPDX-License-Identifier = "MIT"
+
+# The sandbox/ directory is a FORK of the upstream sigs.k8s.io/agent-sandbox
+# project (not an unmodified vendored copy), licensed under Apache-2.0. This more
+# specific annotation comes last so it overrides the repo-wide MIT default and
+# keeps the correct upstream license for these files.
+#
+# Copyright is genuinely shared here: large parts are upstream (api/, controllers/,
+# extensions/, client-go/, test/) while others are AMD-authored and released under
+# the same Apache-2.0 terms (see sandbox/UPSTREAM.md for the split). Both holders
+# are listed rather than attributing the whole tree to one of them; the per-file
+# SPDX headers remain authoritative for any individual file.
+[[annotations]]
+path = "sandbox/**"
+precedence = "override"
+SPDX-FileCopyrightText = ["The Kubernetes Authors", "Advanced Micro Devices, Inc."]
+SPDX-License-Identifier = "Apache-2.0"

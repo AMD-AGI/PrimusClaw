@@ -1,0 +1,81 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Example private Helm values for LiteLLM Auto Routing.
+# Copy into a file that is NOT committed, replace api_base / api_key, and pass
+# it as LITELLM_VALUES_FILE. Public chart defaults stay modelList: [].
+#
+# Requirements:
+#   - LiteLLM image >= v1.96.2 (classifier context window). NOT satisfied by
+#     bumping litellm/Dockerfile alone. Nothing deploys from that Dockerfile:
+#     deploy.sh defaults LITELLM_IMAGE to a prebuilt
+#     docker.io/primussafe/litellm:<timestamp>, and charts/litellm/values.yaml
+#     pins the same tag. Deploying this file against that image gets you a
+#     1.83 proxy, where auto_router/complexity_router does not exist and every
+#     claude-auto call fails. Rebuild first:
+#         docker build -t <registry>/litellm:<new-tag> litellm/
+#         docker push  <registry>/litellm:<new-tag>
+#     then deploy with LITELLM_IMAGE=<registry>/litellm:<new-tag>, and confirm
+#     the running proxy is on it before enabling the router:
+#         kubectl exec -n <ns> deploy/<litellm-deploy> -- \
+#           python3 -c "import importlib.metadata as m; print(m.version('litellm'))"
+#   - The router alias must contain "claude" (claude-auto) so apim_key_hook.py
+#     still injects Anthropic cache_control.
+#   - Backend model_name values must already exist in this same modelList.
+#   - Probe each tier with Anthropic Messages against the same api_base Claw
+#     uses. A Vertex-only or undeployed Sonnet id 400s the whole claude-auto
+#     call; if MEDIUM is not served there, point that tier at a backend that is
+#     (Haiku or the flagship) rather than shipping a name the proxy cannot reach.
+#   - Skip deploy.sh interactive model discovery; it overwrites this list.
+#
+# Enable from Claw with DEFAULT_MODEL=claude-auto (LLM_API_STYLE=anthropic).
+# Pin MEMORY_LLM_MODEL in the same change: it defaults to DEFAULT_MODEL, so
+# leaving it unset routes memory/skill extraction through the router too.
+# A task can still pin a backend with request.model=claude-opus-4-7.
+
+modelList:
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_base: https://example.invalid/v1
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+      api_base: https://example.invalid/v1
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_base: https://example.invalid/v1
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-auto
+    litellm_params:
+      model: auto_router/complexity_router
+      drop_params: true
+      complexity_router_config:
+        tiers:
+          SIMPLE: claude-haiku-4-5
+          MEDIUM: claude-sonnet-4-20250514
+          COMPLEX: claude-opus-4-7
+          REASONING: claude-opus-4-7
+        classifier_type: llm
+        classifier_llm_config:
+          model: claude-haiku-4-5
+          timeout_ms: 2000
+        # No classifier_fallback key here on purpose: it is not a field on
+        # ComplexityRouterConfig at v1.96.2, and the model is extra="allow",
+        # so setting it is accepted and silently ignored. Falling back to the
+        # heuristic scorer on classifier failure is unconditional at this pin.
+        classifier_context_window_size: 3
+        return_raw_model_name: true
+        # Only pins if the caller sends x-litellm-session-id (or
+        # x-litellm-trace-id) -- the router reads metadata.session_id and
+        # nothing else. Brain's providers send it; a different caller that
+        # does not will get this silently ignored, not an error.
+        session_affinity: true
+        session_affinity_ttl_seconds: 3600
+        keyword_tier_rules:
+          - keywords: [architecture, debug, refactor]
+            tier: REASONING
+      complexity_router_default_model: claude-opus-4-7

@@ -1,0 +1,37 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+[build-system]
+requires = ["setuptools>=84.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claw-memory-service"
+version = "0.1.0"
+description = "PrimusClaw owned memory service."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "AMD-AGI Primus"}]
+dependencies = [
+    "pydantic>=2.13.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+storage = [
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.3",
+    "prometheus-client>=0.26.0",
+    "asyncpg>=0.31.0",
+]
+
+[project.scripts]
+claw-memory-service = "claw_memory.storage.main:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

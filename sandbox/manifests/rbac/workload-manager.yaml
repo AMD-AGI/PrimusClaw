@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# RBAC for the Workload Manager.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workload-manager
+  namespace: agent-sandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox-workload-manager
+rules:
+  # Sandbox CRDs
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes/status"]
+    verbs: ["get", "update", "patch"]
+  # Extensions CRDs
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims", "sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims/status", "sandboxwarmpools/status"]
+    verbs: ["get", "update", "patch"]
+  # Runtime CRDs (CodeInterpreter / AgentRuntime)
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["codeinterpreters", "agentruntimes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["codeinterpreters/status", "agentruntimes/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["codeinterpreters/finalizers", "agentruntimes/finalizers"]
+    verbs: ["update"]
+  # Pods (read-only for status polling)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Pod logs (for build diagnostics — fetch container logs when run steps fail)
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Secrets (for Router JWT key)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-workload-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox-workload-manager
+subjects:
+  - kind: ServiceAccount
+    name: workload-manager
+    namespace: agent-sandbox-system

@@ -1,0 +1,89 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Claw Memory Service Helm values
+# Install example:
+#   helm upgrade --install claw-memory-service ./memory/memory-service/deploy/helm \
+#     -n primus-claw --create-namespace \
+#     --set image.tag=<ci-timestamp> \
+#     --set postgres.auth.existingSecret=<postgres-secret>
+
+namespaceOverride: ""
+nameOverride: ""
+fullnameOverride: ""
+
+imagePullSecrets: []
+
+image:
+  repository: docker.io/primussafe/claw-memory-service
+  tag: latest
+  pullPolicy: Always
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8765
+
+config:
+  host: "0.0.0.0"
+  port: "8765"
+  # KB extension routes (/api/kb/*). Set to false for an instant rollback
+  # to pre-extension behaviour without touching the image or schema.
+  kbEndpointsEnabled: true
+
+# Use this to connect to an externally managed database instead of the bundled
+# StatefulSet. Either field takes precedence over postgres.enabled: the bundled
+# Secret, Service, and StatefulSet are not rendered and postgres.auth.password
+# is not required.
+externalDatabase:
+  url: ""
+  existingSecret: ""
+
+postgres:
+  enabled: true
+  image:
+    repository: docker.io/postgres
+    tag: "16"
+    pullPolicy: IfNotPresent
+  auth:
+    database: claw_memory
+    username: claw_memory
+    # postgres.auth.password carries no default, not even an empty one: a
+    # password key that ships blank reads as "no password required". Pass it
+    # with --set when existingSecret is empty, or leave both to the Secret below.
+    #
+    # Secret with POSTGRES_DB, POSTGRES_USER, and POSTGRES_PASSWORD. The same
+    # keys are injected into the memory service to construct its internal DSN.
+    existingSecret: ""
+  service:
+    port: 5432
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8765"
+  prometheus.io/path: "/metrics"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

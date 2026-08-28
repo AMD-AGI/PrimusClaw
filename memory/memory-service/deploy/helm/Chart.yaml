@@ -1,0 +1,15 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v2
+name: claw-memory-service
+description: Claw-owned memory service backed by Postgres
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - claw
+  - memory
+  - postgres
+maintainers:
+  - name: AMD-AGI Primus

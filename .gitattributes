@@ -1,0 +1,10 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Shell scripts and Dockerfiles must use LF line endings so they work
+# inside Linux containers regardless of the committer's OS (Windows Git
+# would otherwise store them with CRLF under core.autocrlf=true, which
+# breaks `#!/bin/bash` and HEREDOCs at runtime).
+*.sh              text eol=lf
+Dockerfile        text eol=lf
+Dockerfile.*      text eol=lf

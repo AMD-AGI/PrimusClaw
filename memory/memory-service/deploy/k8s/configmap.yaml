@@ -1,0 +1,14 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claw-memory-service-config
+  namespace: primus-claw
+data:
+  MEMORY_SERVICE_PORT: "8765"
+  MEMORY_SERVICE_HOST: "0.0.0.0"
+  # KB extension routes (/api/kb/*). Set to "false" for instant rollback
+  # to pre-extension behaviour without touching the image or schema.
+  KB_ENDPOINTS_ENABLED: "true"

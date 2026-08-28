@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Agent-Sandbox external access configuration — EXAMPLE
+#
+# Traffic flow:
+#   User -> SaFE cluster (x-flannel-forward) -> agent-sandbox cluster (Higress) -> Router -> backend
+#
+# User access URL:
+#   https://<your-host>/x-flannel/sandbox/...
+#
+# Replace every `sandbox.example.com` below with your own hostname before
+# applying (install.sh does this for you via INGRESS_HOST).
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-sandbox
+  namespace: agent-sandbox-system
+  annotations:
+    higress.io/rewrite-target: /$1
+    higress.io/route-priority: "10"
+    higress.io/proxy-body-size: "0"
+    higress.io/proxy-read-timeout: "300"
+    higress.io/proxy-send-timeout: "300"
+    higress.io/proxy-buffering: "off"
+spec:
+  ingressClassName: higress
+  rules:
+  - host: sandbox.example.com
+    http:
+      paths:
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/namespaces/.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/code-interpreter.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/sandbox/.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/templates.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(health.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/health)
+        pathType: Prefix

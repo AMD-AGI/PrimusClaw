@@ -1,0 +1,85 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: CodeQL
+
+# PR/push on all branches: skip when all changes match paths-ignore (doc-only).
+# Weekly schedule still runs on the default branch for full analysis.
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  # ``codeql-action/analyze`` reads the current workflow run via
+  # ``GET /repos/.../actions/runs/{id}`` to attach run metadata to the
+  # SARIF upload + send completion telemetry. Without ``actions: read``
+  # both calls fail with ``Resource not accessible by integration``.
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: go
+            build-mode: manual
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Go is a compiled language; CodeQL needs the module toolchain to
+      # trace the build. The only Go module lives under ``sandbox/``.
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: sandbox/go.mod
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+          queries: security-and-quality
+
+      # Manual build for Go: CodeQL wraps this step to extract the database.
+      - name: Build Go module
+        if: matrix.build-mode == 'manual'
+        working-directory: sandbox
+        run: go build ./...
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        with:
+          category: "/language:${{ matrix.language }}"

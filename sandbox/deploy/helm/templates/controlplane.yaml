@@ -1,0 +1,309 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.controlplane.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-sandbox-controlplane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-controlplane
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-controlplane
+  namespace: {{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-controlplane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-sandbox-controlplane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods", "services"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims", "sandboxwarmpools", "sandboxtemplates"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims/status", "sandboxwarmpools/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["codeinterpreters"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["codeinterpreters/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["clustersandboxpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-controlplane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-sandbox-router
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+    app.kubernetes.io/component: router
+spec:
+  type: {{ .Values.controlplane.service.router.type }}
+  ports:
+    - port: {{ .Values.controlplane.service.router.port }}
+      targetPort: router
+      name: http
+  selector:
+    app: agent-sandbox-controlplane
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workloadmanager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+    app.kubernetes.io/component: workload-manager
+spec:
+  type: {{ .Values.controlplane.service.workloadManager.type }}
+  ports:
+    - port: {{ .Values.controlplane.service.workloadManager.port }}
+      targetPort: wm
+      name: http
+  selector:
+    app: agent-sandbox-controlplane
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-sandbox-controlplane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: agent-sandbox
+spec:
+  replicas: {{ .Values.controlplane.replicas }}
+  selector:
+    matchLabels:
+      app: agent-sandbox-controlplane
+  template:
+    metadata:
+      labels:
+        app: agent-sandbox-controlplane
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/part-of: agent-sandbox
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.controlplane.ports.router }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: agent-sandbox-controlplane
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controlplane.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controlplane.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controlplane
+          image: "{{ .Values.controlplane.image.repository }}:{{ .Values.controlplane.image.tag }}"
+          imagePullPolicy: {{ .Values.controlplane.image.pullPolicy }}
+          args:
+            - --router-port={{ .Values.controlplane.ports.router }}
+            - --wm-port={{ .Values.controlplane.ports.workloadManager }}
+            - --metrics-bind-address=:{{ .Values.controlplane.ports.managerMetrics }}
+            - --health-probe-bind-address=:{{ .Values.controlplane.ports.managerHealth }}
+            - --max-concurrent-requests={{ .Values.router.config.maxConcurrentRequests }}
+            - --gc-interval={{ .Values.workloadmanager.config.gcInterval }}
+            - --default-ttl={{ .Values.workloadmanager.config.defaultTTL }}
+            - --session-timeout={{ .Values.controlplane.config.sessionTimeout }}
+            - --leader-elect={{ ternary "true" "false" .Values.controlplane.config.leaderElect }}
+            - --extensions={{ ternary "true" "false" .Values.controlplane.config.extensions }}
+            - --namespace={{ .Release.Namespace }}
+            {{- if .Values.router.config.enableAuth }}
+            - --enable-auth=true
+            - --safe-api-url={{ .Values.router.config.safeApiUrl }}
+            {{- end }}
+          env:
+            - name: AGENT_SANDBOX_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: agent-sandbox-redis
+                  key: addr
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-sandbox-redis
+                  key: password
+            - name: ENABLE_AUTH
+              value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
+            - name: SAFE_API_URL
+              value: {{ .Values.router.config.safeApiUrl | quote }}
+            - name: ALLOW_INSECURE_NO_AUTH
+              value: {{ ternary "true" "false" .Values.security.allowInsecureNoAuth | quote }}
+            - name: EGRESS_ENABLED
+              value: {{ ternary "true" "false" .Values.egress.enabled | quote }}
+            - name: EGRESS_EXTRA_BLOCKED_CIDRS
+              value: {{ .Values.egress.extraBlockedCIDRs | quote }}
+            {{- if .Values.controlplane.config.sandboxNodeSelector }}
+            - name: SANDBOX_NODE_SELECTOR
+              value: {{ .Values.controlplane.config.sandboxNodeSelector | quote }}
+            {{- end }}
+            - name: INFERENCE_ENABLED
+              value: {{ ternary "true" "false" .Values.inference.enabled | quote }}
+            - name: INFERENCE_LITELLM_ENDPOINT
+              value: {{ .Values.inference.litellmEndpoint | quote }}
+            - name: ENVD_INJECTOR_IMAGE
+              value: {{ .Values.controlplane.config.envdInjectorImage | quote }}
+            - name: WORKLOAD_MANAGER_SERVICE_NAME
+              value: "workloadmanager"
+            - name: WORKLOAD_MANAGER_SERVICE_PORT
+              value: {{ .Values.controlplane.service.workloadManager.port | quote }}
+            - name: AUDIT_ENABLED
+              value: {{ ternary "true" "false" .Values.controlplane.config.auditEnabled | quote }}
+            - name: AUDIT_RETENTION_DAYS
+              value: {{ .Values.controlplane.config.auditRetentionDays | quote }}
+            {{- if .Values.controlplane.config.sandboxImageRegistry }}
+            - name: SANDBOX_IMAGE_REGISTRY
+              value: {{ .Values.controlplane.config.sandboxImageRegistry | quote }}
+            {{- end }}
+            {{- if .Values.controlplane.config.registrySecret }}
+            - name: REGISTRY_SECRET
+              value: {{ .Values.controlplane.config.registrySecret | quote }}
+            {{- end }}
+            {{- with .Values.router.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.workloadmanager.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.controlplane.config.watchInterval }}
+            - name: SANDBOX_WATCH_INTERVAL
+              value: {{ .Values.controlplane.config.watchInterval | quote }}
+            {{- end }}
+            {{- with .Values.controlplane.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.controlplane.ports.router }}
+              name: router
+            - containerPort: {{ .Values.controlplane.ports.workloadManager }}
+              name: wm
+            - containerPort: {{ .Values.controlplane.ports.managerMetrics }}
+              name: manager-metrics
+            - containerPort: {{ .Values.controlplane.ports.managerHealth }}
+              name: manager-health
+          # 30 * 2s = 60s. The router port stays closed until the JWT identity
+          # is reconciled against the envd-router-identity Secret, so this has
+          # to cover identityReconcileBudget (pkg/router/jwt.go, 30s) plus the
+          # rest of startup. Shortening it kills the container mid-retry.
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: router
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: router
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: router
+            periodSeconds: 15
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources: {{ toYaml .Values.controlplane.resources | nindent 12 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-sandbox-controlplane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+spec:
+  podSelector:
+    matchLabels:
+      app: agent-sandbox-controlplane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector: {}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controlplane.ports.router }}
+        - protocol: TCP
+          port: {{ .Values.controlplane.ports.managerMetrics }}
+{{- end }}

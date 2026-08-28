@@ -1,0 +1,9 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v2
+name: litellm
+description: LiteLLM gateway for standalone PrimusClaw deployments
+type: application
+version: 0.1.0
+appVersion: "20260331111348"

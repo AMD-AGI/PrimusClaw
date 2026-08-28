@@ -1,0 +1,22 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+{{- if .Values.modelList }}
+{{ toYaml .Values.modelList | indent 6 }}
+{{- else }}
+      []
+{{- end }}
+    general_settings: {}
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+      callbacks: litellm.proxy.hooks.apim_key_hook.proxy_handler_instance

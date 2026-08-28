@@ -1,0 +1,171 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Lint
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  push:
+    branches:
+      - '**'
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+
+# Least privilege for the default GITHUB_TOKEN. Registry pushes authenticate
+# with their own credentials, not this token, so read access to the checkout is
+# all any job here needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace-sync-hands-timeout:
+    name: enforce withHandsTimeout in workspace-sync/reaper
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-no-direct-hands-calltool-in-workspace
+        run: |
+          bash claw/scripts/lint-no-direct-hands-calltool-in-workspace.sh --all
+
+  metrics-must-register:
+    name: enforce registers:[registry] on every prom-client metric
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-metrics-must-register
+        run: |
+          bash claw/scripts/lint-metrics-must-register.sh --all
+
+  session-events-must-redact:
+    name: enforce redaction on routes reading claw_session_events.data
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-session-events-must-redact
+        run: |
+          bash claw/scripts/lint-session-events-must-redact.sh --all
+
+  tenant-routes-must-authorize:
+    name: enforce an ownership check on tenant-scoped routes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-tenant-routes-must-authorize
+        run: |
+          bash claw/scripts/lint-tenant-routes-must-authorize.sh --all
+
+  drain-shutdown-guard:
+    name: enforce the SIGTERM guard uses the shutdown latch, not the drain flag
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-drain-shutdown-guard
+        run: |
+          bash claw/scripts/lint-drain-shutdown-guard.sh --all
+
+  dockerfile-build-order:
+    name: enforce the Dockerfile build order matches package.json "workspaces"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-dockerfile-build-order
+        run: |
+          bash claw/scripts/lint-dockerfile-build-order.sh --all
+
+  no-nullish-env-default:
+    name: forbid ?? defaults on process.env (blank must take the default)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run lint-no-nullish-env-default
+        run: |
+          bash claw/scripts/lint-no-nullish-env-default.sh --all
+
+  gofmt:
+    name: gofmt (Sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: sandbox/go.mod
+
+      - name: Verify gofmt
+        run: make fmt-verify
+        working-directory: sandbox
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Install reuse
+        run: pip install reuse
+
+      # Validates REUSE.toml itself, including the two-copyright-holder array on
+      # the sandbox/** override, and that every file resolves to a license.
+      - name: Run reuse lint
+        run: reuse lint

@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=84.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sandbox"
+version = "0.1.0"
+description = "Python SDK for agent-sandbox — E2B-style sandboxed code execution"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "requests>=2.34.2",
+    "websockets>=16.1.1",
+]
+
+[project.optional-dependencies]
+cli = ["click>=8.4.2"]
+dev = ["pytest>=9.1.1", "pytest-asyncio", "click>=8.4.2"]
+
+[project.scripts]
+sandbox-cli = "sandbox_cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_sandbox*", "sandbox_cli*"]

@@ -1,0 +1,31 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+controlplane:
+  image:
+    repository: example.invalid/agent-sandbox-controlplane
+    tag: release-test@sha256:1111111111111111111111111111111111111111111111111111111111111111
+  config:
+    envdInjectorImage: example.invalid/agent-sandbox-envd-injector:release-test@sha256:2222222222222222222222222222222222222222222222222222222222222222
+router:
+  config:
+    enableAuth: true
+    safeApiUrl: https://safe.example
+workloadmanager:
+  config:
+    enableAuth: true
+    safeApiUrl: https://safe.example
+redis:
+  deploy: true
+  password: release-test-password
+  secret:
+    create: true
+  image:
+    repository: example.invalid/redis
+    tag: release-test@sha256:3333333333333333333333333333333333333333333333333333333333333333
+  storage:
+    storageClassName: release-test-sc
+    size: 1Gi
+egress:
+  enabled: true
+  extraBlockedCIDRs: 10.0.0.0/8,169.254.0.0/16

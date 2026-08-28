@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Dockerfile for EnvD with AMD ROCm GPU support.
+
+FROM rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release_2.3.0@sha256:931d3e3dcebe6c6fab84adf16cfca3e1d1449100df7c881a46fccd06f6c9bc1c
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tmux \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy EnvD binary (built separately)
+COPY envd /usr/local/bin/envd
+
+RUN useradd -m -u 1000 sandbox || true
+RUN mkdir -p /home/sandbox && chown sandbox:sandbox /home/sandbox 2>/dev/null || true
+
+WORKDIR /home/sandbox
+
+EXPOSE 8080
+
+ENTRYPOINT ["envd", "--port=8080", "--workspace=/home/sandbox"]

@@ -1,0 +1,445 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+nameOverride: ""
+fullnameOverride: primus-claw
+
+image:
+  registry: docker.io/primussafe
+  repository: claw
+  tag: latest
+  pullPolicy: IfNotPresent
+
+tls:
+  # Sets NODE_TLS_REJECT_UNAUTHORIZED=0 on api and brain, disabling certificate
+  # verification for *every* outbound connection they make -- LLM gateway, SaFE,
+  # S3. Only for diagnosing a trust-store problem, never for steady state. The
+  # supported way to reach an endpoint behind a private CA is to bake the anchor
+  # into the image trust store, which the runtime stage of the Dockerfile
+  # already does with NODE_EXTRA_CA_CERTS.
+  insecureSkipVerify: false
+api:
+  replicas: 4
+  port: 8200
+  # Browser origins allowed to call the API with credentials, comma-separated
+  # and including the scheme -- "https://claw.example.com,https://admin.example.com".
+  #
+  # Leave empty if the UI is served from the same host as the API through this
+  # chart's ingress -- same-origin requests are not subject to CORS, so there is
+  # nothing to allow.
+  #
+  # Leaving this empty makes the API reflect whatever Origin a request carries
+  # and still send Access-Control-Allow-Credentials, so any website a logged-in
+  # user visits can call the API with their session cookie AND read the replies.
+  # It is a local-development default only.
+  corsOrigins: ""
+  resources:
+    requests:
+      cpu: 200m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  nodeOptions: "--max-old-space-size=3072"
+  brainTaskTimeoutSec: "21600"
+  # Wall clock a single run may occupy the fleet, per scope, in seconds.
+  # Empty means "use the code default" -- the two scopes do not share one, and
+  # the numbers and the reasoning live on RUN_BUDGET_DEFAULT_SEC in
+  # tasks/run-budget.ts. Left empty rather than restating them here, so the
+  # chart cannot silently pin a default the code later moves, and so there is
+  # one place to correct when the measurement is redone.
+  #
+  # "0" turns the ceiling off. That is not a longer budget: it stops a
+  # deadline being stamped at all, and the deadline is what lets Brain end a
+  # runaway turn gracefully -- flushing the transcript and reporting
+  # run_budget_exhausted with the turn count. Without one the row is requeued
+  # from outside and the user is told nothing about why.
+  #
+  # runBudgetDagNodeSec only bites below api.brainTaskTimeoutSec: above it a
+  # graph node is closed as brain_timeout first, because a DAG row carries no
+  # lease for the budget arm to outrun.
+  runBudgetChatSec: ""
+  runBudgetDagNodeSec: ""
+  # How many times a message queued behind a running turn may be refused a
+  # workspace before it is given up on. Each refusal returns through the event
+  # consumer's ten-second nak, so six is about a minute of retrying; giving up
+  # records a failed run row and tells the session's client the turn was
+  # refused. The count is compared against the attempt just made, so 1 would
+  # abandon on the first database hiccup: anything below 2 is refused outright
+  # rather than clamped -- the API falls back to the default here and reports
+  # the setting it ignored in its startup.config_refused line.
+  pendingDispatchBindMaxAttempts: "6"
+  # Cluster-wide admission. Zero means that dimension is not enforced.
+  # Soft: further chat runs sit at queued for an idle worker to claim.
+  # Hard: the create is refused with 429. Counted by run-tree root.
+  admitSoftRuns: "0"
+  admitHardRuns: "0"
+  admitSoftSandboxes: "0"
+  admitHardSandboxes: "0"
+  admitSoftGpuNodes: "0"
+  admitHardGpuNodes: "0"
+  admitTreeMaxNodes: "0"
+  admitTreeMaxDepth: "0"
+
+brain:
+  replicas: 3
+  port: 8100
+  maxConcurrent: "5"
+  # Runs a pod may hold at once, executing or waiting. A run that stops for a
+  # user approval or a background command gives its execution slot back, so
+  # without a second ceiling a pod full of waiting runs would keep admitting
+  # work until the node ran out of memory -- the sandbox is not handed back,
+  # only the slot. Set it equal to maxConcurrent for one run per slot however
+  # long it waits.
+  maxResident: "10"
+  # How often an idle replica asks the API for the next queued doorbell
+  # row. Enabled whenever INTERNAL_BACKEND_URL is set, including after
+  # features.runDoorbellDispatch is turned off, so leftover rows still drain.
+  claimNextIdleMs: "2000"
+  # What decides whether two runs may proceed at once: "workspace" keys the
+  # gate on the files a run writes, "session" on the session or DAG root.
+  # The second is the historical proxy and it lets two runs that share a
+  # directory overlap, which is how they come to overwrite each other's files.
+  # Queueing them is a throughput change as well as a fix, so the old
+  # behaviour is one value away.
+  #
+  # Under "workspace" the runs of one session serialise, including DAG roots that
+  # used to fan out in parallel. The waiting is bounded by taskMaxDeliver below,
+  # so a session whose fan-out is deep enough to outlast that budget should give
+  # each root its own session rather than sharing one directory -- and
+  # "session" is the switch to reach for if a deployment needs the old
+  # concurrency back before it can be restructured.
+  #
+  # Changing this value is not a hot switch. The two settings give the same
+  # directory two different lock names, so for as long as pods disagree -- the
+  # length of one rolling restart -- a run under each name can hold what it
+  # believes is the only lock on that directory, and the second one to sync
+  # deletes the first one's files. The deployment rolls automatically (the pod
+  # template carries a checksum of this Secret), but the window is inherent to
+  # the change rather than to how it is applied: pick a quiet moment for it,
+  # ideally with no runs in flight.
+  runGateKey: "workspace"
+  # Redelivery budget for the shared brain-workers consumer. The poison guard
+  # fires at taskMaxDeliver-1, so the task is reported rather than dropped.
+  #
+  # It is also how long a run may wait for the gate: waiting spends one delivery
+  # per attempt, and the backoff curve turns this number into ~80min nominal,
+  # ~60min at the jitter floor. The task stream's retention is derived from it
+  # and follows on its own. The deletion tombstone's TTL only has it as a floor:
+  # every value permitted here comes to less than the event stream's retention,
+  # so that retention is what decides how long a deleted session stays marked.
+  # taskMaxAckPending follows nothing, and has to be raised with this.
+  taskMaxDeliver: "23"
+  # Unacked ceiling for that same consumer, fleet-wide rather than per pod, and
+  # today the only bound on how many tasks execute at once. Must stay above
+  # replicas * maxConcurrent plus the set of tasks backing off on a lock; raise
+  # it alongside either. Undersized it stalls delivery to every replica at once,
+  # which is what a wide fan-out queued on one workspace would have done at the
+  # previous 64. Spare slots buy prefetch and backoff room, not sandboxes: what
+  # runs is decided per pod by maxConcurrent.
+  taskMaxAckPending: "256"
+  # Defer sandbox creation until a tool asks for one. Most chat turns are
+  # answered from the conversation without touching a file or running a
+  # command, and a pod start is the largest fixed cost in a short session; runs
+  # that are about the sandbox -- script mode, multi-node, anything resuming
+  # from a checkpoint -- still provision up front whatever this says. Set it to
+  # "false" to open one for every run, which is the switch to reach for if a
+  # sandbox-dependent path turns out to have been missed.
+  lazySandbox: "true"
+  # Tag workspace objects with origin=workspace as they are uploaded, which is
+  # what the bucket's lifecycle rules select on. An escape hatch rather than a
+  # rollout gate: the tag rides on the presigned URL and needs nothing from the
+  # sandbox, so the one uncertainty is whether a given object store applies a
+  # hoisted tagging parameter. Ignoring it costs an untagged object; anything
+  # worse is switched off here rather than rolled back.
+  workspaceTagging: "true"
+  # Ceiling on how many objects one workspace sync may delete while pruning
+  # what is no longer in /workspace. A bound on the rate rather than a
+  # second-guess of the decision -- the listing has to prove it is complete
+  # before anything is pruned at all -- so that a mistake costs a bounded
+  # number of objects and leaves s3.prune.capped in the log. Whatever is
+  # deferred is still stale on the next sync, so a genuinely large deletion
+  # converges over a few of them.
+  pruneMaxObjects: "5000"
+  # The bash and wait limits, in seconds. Brain states them in the tool schema
+  # it shows the model and forwards the same numbers into every sandbox, so one
+  # value governs what is promised and what is enforced. Empty means the code's
+  # own default, which for the bash ceiling depends on features.backgroundShell
+  # -- see the note there before pinning it.
+  bashMaxTimeoutSec: ""
+  bashDefaultTimeoutSec: ""
+  waitMaxSec: ""
+  waitDefaultSec: ""
+  # Seconds a source waits for Hands to read and delete the environment file
+  # before treating the binary as too old to know about it. Raise it on a
+  # cluster where sandbox images page in slowly: the wait costs nothing when
+  # Hands is working, since the check exits as soon as the file is gone, and
+  # too low a value fails a healthy sandbox on every source it has. Empty means
+  # the code's own default. Zero is refused (the floor is 1) and the default
+  # is kept; it does not turn the guard off.
+  handsEnvFileWaitSec: ""
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+  terminationGracePeriodSeconds: 300
+
+postgres:
+  enabled: true
+  clusterName: primus-claw
+  appUser: primus-claw
+  appDb: primus-claw
+  userSecretName: "" # defaults to <clusterName>-pguser-<appUser>
+  postgresVersion: 17
+  storageClass: rbd
+  dataSize: 200Gi
+  backupSize: 200Gi
+  # PGO serves TLS with a cert from its own generated CA, which no client trust
+  # store carries. api builds its DSN with sslmode=require, node-postgres aliases
+  # that to verify-full, and the DSN it parses wins over the pool's own ssl
+  # option, so the connection fails with SELF_SIGNED_CERT_IN_CHAIN. Enabling this
+  # sends POSTGRES_SSLMODE=no-verify instead: still encrypted, but the server
+  # certificate is not validated. Scoped to the PG connection, unlike
+  # tls.insecureSkipVerify which drops verification for every outbound TLS.
+  #
+  # Off by default so the chart never silently weakens TLS. Turn it on
+  # (PG_SSL_NO_VERIFY=true for deploy.sh) when pointing at a PGO-managed
+  # database whose CA is absent from the image trust store.
+  sslNoVerify: false
+
+ingress:
+  enabled: true
+  # The higress.io/* annotations the template adds -- path rewrite, 2g body
+  # size, the long proxy timeouts -- are emitted only when this is "higress".
+  # Point it at another controller and you get a plain Ingress; supply that
+  # controller's equivalents through extraAnnotations.
+  className: higress
+  host: ""
+  path: /claw-api
+  priority: ""
+  extraAnnotations: {}
+
+secret:
+  # When false, the Secret template is skipped entirely (its `required`
+  # guards never fire). Deploy renders it (default); upgrade renders only a
+  # Deployment and disables it to avoid needing secret values.
+  create: true
+  authInternalToken: ""
+  userEnvEncryptionKey: ""
+  natsUrl: ""
+  natsUser: prod
+  natsPassword: "__TBD__"
+  # "safe" routes sandboxes through the SaFE workload API; "kubernetes" (BYOK)
+  # drives the agent-sandbox router directly and authenticates callers against
+  # the LLM gateway instead of SaFE. deploy.sh passes "kubernetes"; leaving this
+  # empty selects "safe" in packages/{api,brain}/src/config.ts.
+  clawDeployMode: ""
+  # Router base and workspace for sandboxes. Rendered into both the SANDBOX_*
+  # and AGENT_SANDBOX_* env names because the provider that reads each is
+  # selected by clawDeployMode -- see templates/secret.yaml. The namespace must
+  # already exist; the chart does not create it.
+  #
+  # sandboxNamespace is only the deployment-wide fallback: a request that carries
+  # `workspace_id` lands its sandbox there instead (sandbox/ensure-hands.ts). It defaults
+  # to `default` so a fresh cluster installs without pre-creating a namespace;
+  # point it at a dedicated namespace to keep agent workloads isolated.
+  sandboxRouterUrl: http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080
+  sandboxNamespace: default
+  clawDeployRoot: ""
+  workspacePersistBase: ""
+  litellmApiBase: ""
+  safeDefaultWorkspace: default
+  sandboxWorkloadPriority: "0"
+  sandboxDefaultTimeoutSeconds: "86400"
+  # Max time a sandbox may stay Pending/Creating before the message fails with
+  # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
+  sandboxPendingTimeoutSeconds: "10800"
+  multiNodeDefaultTimeoutSeconds: "86400"
+  llmApiStyle: anthropic
+  anthropicBaseUrl: ""
+  defaultModel: claude-opus-4-7
+  openaiBaseUrl: ""
+  byokVerifyModelsUrl: ""
+  byokVerifyApiStyle: openai
+  cursorApiKey: ""
+  s3Endpoint: ""
+  s3ApiEndpoint: ""
+  s3Bucket: claw
+  s3Region: us
+  s3AccessKey: ""
+  s3SecretKey: ""
+  # Overrides of app code defaults; keys removed here fall back to the code
+  # defaults in packages/{api,brain}/src/config.ts (kept minimal on purpose).
+  fetchHeadersTimeoutMs: "60000"
+  fetchBodyIdleTimeoutMs: "120000"
+  sandboxKeepaliveFailLimit: "5"
+
+sandboxTemplate:
+  enabled: true
+  name: primus-claw-sandbox-template
+  codeInterpreterYaml: ""
+  # Pre-warmed sandbox pods the platform keeps ready, so a new session can adopt
+  # one instead of waiting out a cold start. Applies to every rendered template,
+  # not only the inline fallback where the value used to be hard-coded.
+  #
+  # Safe to raise. It was pinned at 0 because the platform's claim path adopts
+  # an already-running pod and so cannot apply the per-request environment,
+  # which left pooled sandboxes running without user_env, session_env or the
+  # LLM keys -- healthy-looking and quietly wrong. Brain now hands that
+  # environment to Hands during bootstrap instead of relying on the pod spec.
+  #
+  # Still off by default because it is a cost: pooled pods are idle pods, and
+  # there is one pool per rendered template, so a deployment using several
+  # images or resource shapes pays for each. Note also that the pool removes
+  # only the pod-creation wait -- bootstrap, the health poll and the workspace
+  # restore all still happen for every session.
+  warmPoolSize: 0
+
+# Workspace garbage collection.
+#
+# Every session that has ever run left a workspace on the shared filesystem and
+# nothing has ever removed one: the collector was written and built into the
+# image, but no manifest invoked it. This is that manifest.
+#
+# Off by default, and dry-run when first enabled. A collector that has never
+# executed, pointed at a filesystem holding every workspace since the
+# deployment began, is not something to turn loose in one step. Enable it,
+# read what it reports it would remove, then set dryRun to false.
+#
+# Four of the defaults below say the same thing and are worth reading together:
+# enabled false, dryRun true, askApiWhoOwnsWorkspaces false and idleReleaseDays
+# 0 mean a default install writes workspace references and reads none of them.
+# That is the intended first stage, not an oversight. The rows are new, and the
+# point of writing them before anything acts on them is to compare them against
+# the filesystem while being wrong is free -- a reference the bookkeeping missed
+# is a directory deleted under a live session, and there is no undo past the
+# trash grace. Turn them on in that order: reaper, then the API's answer, then
+# dryRun off, and idleReleaseDays only once the first three have been watched.
+reaper:
+  enabled: false
+  # Nightly and off-peak. The work is a filesystem walk plus a few KV lookups
+  # per candidate; it competes with running sessions for the same filesystem.
+  schedule: "17 3 * * *"
+  # Report only. Classification runs in full and is logged, nothing is moved
+  # or removed.
+  dryRun: true
+  # How the shared workspace filesystem is attached. Required when enabled and
+  # deliberately empty: this differs per site, and a chart that guessed would
+  # produce a pod that mounts the wrong thing and collects nothing -- or, far
+  # worse, mounts an empty volume over the path and reports every workspace as
+  # already gone. Mounted at secret.workspacePersistBase.
+  #
+  # Any volume source, e.g.
+  #   volume:
+  #     persistentVolumeClaim:
+  #       claimName: claw-workspaces
+  volume: {}
+  # Untouched for this long, on top of holding no checkpoint and no lock.
+  retentionDays: 7
+  # Days a DELETED session's leaked reference may sit before it is reclaimed.
+  # 0 disables it.
+  #
+  # The teardown releases the reference; one still held means that step did not
+  # land, and nothing else can put it right, because a deleted session is never
+  # dispatched to again. The workspace then keeps a live reference forever,
+  # which outranks every other signal the collector has -- so the files of
+  # deleted sessions become the ones that are never collected.
+  #
+  # On by default and with a short window because nothing here is at risk: the
+  # teardown deleted the objects before it tried the release, so this reclaims
+  # bookkeeping about files that are already gone. The day is margin for a
+  # teardown still running.
+  deletedReleaseDays: 1
+  # Days a session that STILL EXISTS may sit idle before it stops holding its
+  # files. 0 disables it, which is the default.
+  #
+  # Unlike the sweep above, this one ends with a user's files being deleted:
+  # releasing the reference starts the retention lease, and after the lease and
+  # the trash grace the collector really removes them. So it is opt-in, and a
+  # value below twice retentionDays is raised to it -- under that, the lease
+  # rather than this number is what governs, and the sweep logs the window it
+  # actually used.
+  #
+  # The three windows are serial, so the total time before files go is this plus
+  # retentionDays plus trashGraceHours, and this is the term that decides that
+  # total. A user returning within any of the three loses nothing: the session
+  # re-adopts the same workspace and the files are still there. Raising
+  # retentionDays lengthens the total and raises the floor above with it, so a
+  # value set here can stop being the one in effect because a different setting
+  # changed: at retentionDays 30 the floor is 60, and a deliberate 30 here
+  # becomes 60. The startup log names the value it ignored.
+  idleReleaseDays: 0
+  # Margin for KV entries settling after a run ends, so a workspace whose lock
+  # has just expired is not taken from a run about to resume.
+  kvGraceMin: 30
+  # Eligible directories are renamed into a trash directory and only removed
+  # after this long. The one window in which a mistake can be undone.
+  trashGraceHours: 24
+  # Bounds what a single misjudgement can cost, which matters most on the
+  # first real run against years of accumulation.
+  maxDeletePerRun: 500
+  # Ask the API which workspaces are still referenced instead of inferring it
+  # from file timestamps. The answer outranks mtime both ways: referenced
+  # files stay however old they look, and files whose retention lease has run
+  # out go without waiting for a timestamp anything could have reset. An
+  # unreachable API decides nothing and the sweep falls back to mtime.
+  #
+  # Off until the workspace rows have been compared against reality, since
+  # before that the rows describe fewer sessions than the filesystem holds.
+  askApiWhoOwnsWorkspaces: false
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # A missed window is not worth catching up on; the next run collects
+  # whatever this one would have.
+  startingDeadlineSeconds: 300
+  # Two hours is far beyond a normal sweep. Past that something is wrong --
+  # a hung filesystem call, most likely -- and the pod should be stopped
+  # rather than left holding the schedule with Forbid.
+  activeDeadlineSeconds: 7200
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits: { cpu: "500m", memory: "512Mi" }
+
+# Optional agent capabilities, off unless a deployment asks for them.
+features:
+  # Lets the agent start commands that keep running after the tool call returns
+  # (bash run_in_background, then bash_output / kill_shell). Brain passes this
+  # value on to every sandbox, so it gates both the tools the model is offered
+  # and whether Hands will spawn anything -- one switch, not two.
+  #
+  # Off by default: a background shell holds the sandbox's CPU and memory until
+  # something stops it, and the agent has to be disciplined about killing what
+  # it starts. Turn it on where long builds, training runs or dev servers are
+  # part of the work.
+  #
+  # It also decides the foreground bash ceiling, because a short ceiling is only
+  # reasonable where long work has somewhere else to go. On, the ceiling is 120s
+  # and every foreground command has ended well inside the 300s
+  # brain.terminationGracePeriodSeconds, which is what makes a rolling update
+  # safe to hand a run over during. Off, it is ten hours held down to 3540s by
+  # the MCP cap -- an order of magnitude past that grace, so a restart can leave
+  # the outgoing replica still running a command the incoming one has taken
+  # over. Pin brain.bashMaxTimeoutSec if you need the short ceiling without the
+  # background tools.
+  backgroundShell: false
+  # Chat dispatch publishes a doorbell and injects credentials at claim time
+  # instead of putting the full execute request on the shared durable. Off
+  # until every Brain replica understands the doorbell: a mixed fleet must
+  # keep serving fat messages.
+  runDoorbellDispatch: false
+
+# Fallback sandbox for sessions that name neither an image nor a size. The API
+# migration seeds these into the resources table as the type='default' row when
+# it is absent, which is what makes the first message on a fresh deployment
+# work. Leave image empty to opt out, in which case every caller must pass
+# sandbox_image itself. Editing the row directly later takes precedence -- the
+# seed only ever fills an empty table.
+defaultSandbox:
+  image: ""
+  cpu: "2"
+  memory: 4Gi

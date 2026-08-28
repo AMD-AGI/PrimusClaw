@@ -1,0 +1,51 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: docker.io/primussafe/litellm
+  tag: "20260331111348"
+  pullPolicy: Always
+  pullSecret: ""
+
+replicas: 1
+port: 4000
+serverRootPath: /llm-gateway
+
+safeApiUrl: ""
+
+secrets:
+  masterKey: ""
+  databaseUrl: ""
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+
+ingress:
+  enabled: false
+  className: higress
+  host: ""
+  priority: "10"
+
+nodeSelector: {}
+tolerations: []
+
+# Keep model routing out of the public chart defaults. Supply a private values
+# file with modelList entries for your deployment (LITELLM_VALUES_FILE).
+#
+# Auto Routing (LiteLLM v1.96+ complexity_router) is also a modelList entry,
+# not a separate Helm key. ConfigMap templates toYaml the whole list. See
+# litellm/values.autorouting.example.yaml. Alias names must contain "claude"
+# so apim_key_hook.py still injects Anthropic prompt-cache breakpoints.
+# Do not put API keys in this public chart. Opt in at runtime with
+# DEFAULT_MODEL=claude-auto; leave this list empty in public defaults.
+# Skip deploy.sh interactive /models discovery when using a router entry —
+# that prompt overwrites modelList from LITELLM_VALUES_FILE.
+modelList: []

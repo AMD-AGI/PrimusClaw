@@ -1,0 +1,5 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+_build/
+api/_autosummary/

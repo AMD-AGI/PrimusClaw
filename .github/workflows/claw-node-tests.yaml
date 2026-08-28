@@ -1,0 +1,64 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Claw Node Tests
+
+# The node:test suites under claw/packages/*/test were not covered by any
+# workflow, so a Node version below the one claw/package.json declares only
+# showed up as a cryptic undici failure on a developer's machine. The version
+# comes from claw/.nvmrc, which is also what claw/Dockerfile builds and runs on,
+# so this suite cannot pass on a version the image would reject.
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - "claw/**"
+      - ".github/workflows/claw-node-tests.yaml"
+  push:
+    branches:
+      - '**'
+    paths:
+      - "claw/**"
+      - ".github/workflows/claw-node-tests.yaml"
+
+# Least privilege for the default GITHUB_TOKEN. Registry pushes authenticate
+# with their own credentials, not this token, so read access to the checkout is
+# all any job here needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: claw-node-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: npm test --workspaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: claw
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: claw/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build first: workspace packages resolve @claw/* through dist/index.js,
+      # and tsx does not compile dependency sources on the fly.
+      - name: Build workspaces
+        run: npm run build
+
+      - name: Run tests
+        run: npm test

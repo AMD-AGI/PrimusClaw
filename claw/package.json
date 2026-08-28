@@ -1,0 +1,26 @@
+{
+  "name": "claw",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "//workspaces": "Dependency order. `npm run build --workspaces` builds in this order and each package consumes its dependencies' emitted .d.ts, so a package must be listed after everything it imports.",
+  "workspaces": [
+    "packages/utils",
+    "packages/protocol",
+    "packages/hands",
+    "packages/brain",
+    "packages/api"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "clean": "rm -rf packages/*/dist"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0"
+  },
+  "engines": {
+    "node": ">=26"
+  }
+}

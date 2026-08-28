@@ -1,0 +1,56 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# NATS Helm values for Claw (primus-claw namespace).
+# Chart version: nats-2.12.6.
+#
+# This file is a template — do NOT feed it to `helm` directly. Both
+# deploy.sh and deploy/scripts/make-dev-account.sh render it by:
+#   (1) replacing __PROD_NATS_PASSWORD__ / __SYS_NATS_PASSWORD__ with
+#       values from the operator's credentials file (default
+#       $HOME/.nats-claw-creds.env, gitignored).
+#   (2) replacing the {{DEV_ACCOUNTS}} placeholder with one block per
+#       DEV_<NAME> entry found in the same credentials file.
+#
+# Multi-account isolation:
+#   - PROD account hosts the production api/brain deployment.
+#   - DEV_<NAME> accounts host individual developers' local instances.
+#   - Each account has its own JetStream namespace, so prod and devs can
+#     reuse the same subject names (events.>, tasks.>) without collision.
+
+container:
+  image:
+    repository: nats
+    tag: 2.12.6-alpine
+
+reloader:
+  image:
+    repository: natsio/nats-server-config-reloader
+    tag: 0.21.1
+
+# storageClassName is injected at deploy time via:
+#   --set config.jetstream.fileStore.pvc.storageClassName=$STORAGE_CLASS
+config:
+  cluster:
+    enabled: true
+    replicas: 3
+    name: nats
+  jetstream:
+    enabled: true
+    fileStore:
+      pvc:
+        size: 100Gi
+
+  merge:
+    accounts:
+      PROD:
+        jetstream: enabled
+        users:
+          - user: prod
+            password: "__PROD_NATS_PASSWORD__"
+      # {{DEV_ACCOUNTS}}
+      SYS:
+        users:
+          - user: sys
+            password: "__SYS_NATS_PASSWORD__"
+    system_account: SYS

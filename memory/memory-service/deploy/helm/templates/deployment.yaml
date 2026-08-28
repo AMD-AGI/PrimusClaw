@@ -1,0 +1,78 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- $useBundledPostgres := eq (include "claw-memory-service.useBundledPostgres" .) "true" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "claw-memory-service.fullname" . }}
+  namespace: {{ include "claw-memory-service.namespace" . }}
+  labels:
+    {{- include "claw-memory-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: memory-service
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "claw-memory-service.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: memory-service
+  template:
+    metadata:
+      labels:
+        {{- include "claw-memory-service.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: memory-service
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/postgres-secret: {{ include (print $.Template.BasePath "/postgres-secret.yaml") . | sha256sum }}
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: memory-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "claw-memory-service.fullname" . }}-config
+            - secretRef:
+                name: {{ ternary (default (printf "%s-secret" (include "claw-memory-service.postgresName" .)) .Values.postgres.auth.existingSecret) (default (printf "%s-secret" (include "claw-memory-service.fullname" .)) .Values.externalDatabase.existingSecret) $useBundledPostgres }}
+          {{- if $useBundledPostgres }}
+          env:
+            - name: POSTGRES_HOST
+              value: {{ include "claw-memory-service.postgresName" . | quote }}
+            - name: POSTGRES_PORT
+              value: {{ .Values.postgres.service.port | quote }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

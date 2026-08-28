@@ -1,0 +1,72 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- if .Values.postgres.enabled }}
+apiVersion: postgres-operator.crunchydata.com/v1beta1
+kind: PostgresCluster
+metadata:
+  name: {{ .Values.postgres.clusterName }}
+  labels:
+    app: primus-claw
+spec:
+  postgresVersion: {{ .Values.postgres.postgresVersion }}
+  port: 5432
+  instances:
+  - name: db
+    replicas: 2
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                postgres-operator.crunchydata.com/cluster: {{ .Values.postgres.clusterName }}
+                postgres-operator.crunchydata.com/instance-set: db
+    dataVolumeClaimSpec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: {{ .Values.postgres.storageClass }}
+      resources:
+        requests:
+          storage: {{ .Values.postgres.dataSize }}
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+  patroni:
+    leaderLeaseDurationSeconds: 30
+    syncPeriodSeconds: 10
+    port: 8008
+    dynamicConfiguration:
+      postgresql:
+        parameters:
+          max_connections: "200"
+          shared_buffers: 256MB
+          effective_cache_size: 1GB
+  users:
+  - name: postgres
+  - name: {{ .Values.postgres.appUser }}
+    databases:
+    - {{ .Values.postgres.appDb }}
+  backups:
+    pgbackrest:
+      global:
+        repo1-retention-full: "7"
+        repo1-retention-full-type: time
+      repos:
+      - name: repo1
+        schedules:
+          full: "0 3 * * 0"
+          differential: "0 3 * * 1-6"
+        volume:
+          volumeClaimSpec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: {{ .Values.postgres.storageClass }}
+            resources:
+              requests:
+                storage: {{ .Values.postgres.backupSize }}
+{{- end }}

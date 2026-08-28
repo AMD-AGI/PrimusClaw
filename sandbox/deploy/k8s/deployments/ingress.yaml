@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Agent-Sandbox external access configuration (unified gateway) — EXAMPLE
+#
+# Replace every `sandbox.example.com` below with your own hostname before
+# applying (install.sh does this for you via INGRESS_HOST).
+#
+# Traffic flow:
+#   User -> SaFE cluster (x-flannel-forward) -> agent-sandbox cluster (Higress) -> Router -> backend
+#
+# Router as the sole external gateway:
+#   - Data plane routes (invocations) -> Router handles locally (session routing + reverse proxy to Sandbox Pod)
+#   - Control plane routes (code-interpreter, templates) -> Router reverse-proxies to Workload Manager
+#
+# User access URL (via x-flannel-forward):
+#   https://sandbox.example.com/x-flannel/sandbox/...
+#
+# Examples:
+#   # Health check
+#   curl https://sandbox.example.com/x-flannel/sandbox/health
+#   curl https://sandbox.example.com/x-flannel/sandbox/v1/health
+#
+#   # Control plane (Router proxies to Workload Manager)
+#   curl https://sandbox.example.com/x-flannel/sandbox/v1/templates
+#   curl -X POST https://sandbox.example.com/x-flannel/sandbox/v1/code-interpreter \
+#     -H "Content-Type: application/json" -d '{"name":"python-311-runc","namespace":"default"}'
+#
+#   # Data plane (Router handles directly)
+#   curl https://sandbox.example.com/x-flannel/sandbox/v1/namespaces/default/code-interpreters/python-311-runc/invocations/api/health \
+#     -H "x-session-id: sess_xxx"
+#
+# In-cluster debugging (direct Higress ClusterIP access):
+#   curl http://<higress-cluster-ip>/sandbox/health -H "Host: sandbox.example.com"
+#
+# Deploy:
+#   kubectl apply -f deploy/k8s/deployments/ingress.yaml
+
+# ── Unified entry: all requests via Router gateway ────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-sandbox
+  namespace: agent-sandbox-system
+  annotations:
+    higress.io/rewrite-target: /$1
+    higress.io/route-priority: "10"
+    higress.io/proxy-body-size: "0"
+    higress.io/proxy-read-timeout: "300"
+    higress.io/proxy-send-timeout: "300"
+    higress.io/proxy-buffering: "off"
+spec:
+  ingressClassName: higress
+  rules:
+  - host: sandbox.example.com
+    http:
+      paths:
+      # Data plane: invocations (handled locally by Router)
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/namespaces/.*)
+        pathType: Prefix
+      # Control plane: code-interpreter CRUD (Router reverse-proxies to WM)
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/code-interpreter.*)
+        pathType: Prefix
+      # Control plane: sandbox session policy endpoints (Router reverse-proxies to WM)
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/sandbox/.*)
+        pathType: Prefix
+      # Control plane: template CRUD (Router reverse-proxies to WM)
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/templates.*)
+        pathType: Prefix
+      # Health check
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(health.*)
+        pathType: Prefix
+      - backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+        path: /sandbox/(v1/health)
+        pathType: Prefix

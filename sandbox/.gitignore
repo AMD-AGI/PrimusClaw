@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: The Kubernetes Authors / kubernetes-sigs/agent-sandbox
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+bin/
+
+# Ignore python cache files
+**/__pycache__/
+
+# Local Netlify folder
+.netlify
+# Added by goreleaser init:
+dist/
+release_assets/
+
+# Dynamic versioning file (generated during CI/CD)
+clients/python/agentic-sandbox-client/VERSION
+
+# Temporary folders
+tmp/
+temp/
+
+architecture/.dev-notes.md
+
+# Local scratch notes (not tracked; keep file on disk only)
+progress-report.md

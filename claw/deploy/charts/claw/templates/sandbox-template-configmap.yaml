@@ -1,0 +1,15 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.sandboxTemplate.name }}
+  labels:
+    app: primus-claw
+    component: sandbox-template
+data:
+  codeinterpreter-base.yaml: |
+{{ .Values.sandboxTemplate.codeInterpreterYaml | indent 4 }}
+{{- end }}

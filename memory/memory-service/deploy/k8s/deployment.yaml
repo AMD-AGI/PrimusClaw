@@ -1,0 +1,56 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claw-memory-service
+  namespace: primus-claw
+  labels:
+    app: claw-memory-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claw-memory-service
+  template:
+    metadata:
+      labels:
+        app: claw-memory-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8765"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: memory-service
+          image: docker.io/primussafe/claw-memory-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8765
+              name: http
+          envFrom:
+            - configMapRef:
+                name: claw-memory-service-config
+            - secretRef:
+                name: claw-memory-service-secret
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8765
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claw-memory-service
+  namespace: primus-claw
+spec:
+  type: ClusterIP
+  selector:
+    app: claw-memory-service
+  ports:
+    - port: 80
+      targetPort: 8765
+      name: http

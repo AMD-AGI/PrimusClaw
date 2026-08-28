@@ -1,0 +1,66 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+version: 2
+updates:
+  # GitHub Actions workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Node / TypeScript
+  - package-ecosystem: "npm"
+    directory: "/claw"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Python services
+  - package-ecosystem: "pip"
+    directories:
+      - "/memory/memory-service"
+      - "/memory/knowledge-worker"
+      - "/sandbox/sdk-python"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    groups:
+      pip-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+        # One PR per dependency name across memory-service, knowledge-worker, and sdk-python.
+        group-by: dependency-name
+
+  # Go module (Sandbox)
+  - package-ecosystem: "gomod"
+    directory: "/sandbox"
+    schedule:
+      interval: "monthly"
+    groups:
+      gomod:
+        patterns: ["*"]
+
+  # Docker base images. Every directory containing a Dockerfile must be listed;
+  # dependabot does not discover them, so an omission is silent.
+  - package-ecosystem: "docker"
+    directories:
+      - "/claw"
+      - "/deploy/litellm"
+      - "/memory/knowledge-worker"
+      - "/memory/memory-service/deploy"
+      - "/sandbox/docker"
+    schedule:
+      interval: "monthly"
+    groups:
+      docker:
+        patterns: ["*"]
+        # One PR per base image across all listed Dockerfiles.
+        group-by: dependency-name

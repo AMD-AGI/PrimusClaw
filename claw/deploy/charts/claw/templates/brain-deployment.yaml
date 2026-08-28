@@ -1,0 +1,212 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: primus-claw-brain
+  labels:
+    app: primus-claw
+    component: primus-claw-brain
+spec:
+  replicas: {{ .Values.brain.replicas }}
+  selector:
+    matchLabels:
+      app: primus-claw
+      component: primus-claw-brain
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 3
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: primus-claw
+        component: primus-claw-brain
+        brain-version: {{ .Values.image.tag | quote }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.brain.port | quote }}
+        prometheus.io/path: "/metrics"
+        # See the same annotation on the API deployment for why a Secret change
+        # has to become a spec change. It matters more here: RUN_GATE_KEY lives
+        # in that Secret, and it decides which runs are allowed to overlap. Pods
+        # that disagree about it compute different lock names for the same
+        # directory, so both believe they hold it and the second one's
+        # `rsync --delete` removes the first one's files.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: {{ .Values.brain.terminationGracePeriodSeconds }}
+      initContainers:
+      - name: wait-for-migration
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+          for i in $(seq 1 12); do
+            FOUND=$(PGPASSWORD="$POSTGRES_PASSWORD" psql \
+              -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" \
+              -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+              -v ON_ERROR_STOP=1 -tAc \
+              "SELECT 1 FROM information_schema.columns
+                 WHERE table_name='claw_sessions'
+                   AND column_name='status_event_at'
+                 LIMIT 1" 2>&1 || true)
+            if [ "$FOUND" = "1" ]; then
+              echo "OK: migration 0042 status_event_at column present"
+              exit 0
+            fi
+            echo "wait-for-migration attempt $i/12; sleep 5s" >&2
+            sleep 5
+          done
+          echo "FATAL: claw_sessions.status_event_at missing" >&2
+          exit 1
+        env:
+        - name: POSTGRES_HOST
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: host } }
+        - name: POSTGRES_PORT
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: port } }
+        - name: POSTGRES_USER
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: user } }
+        - name: POSTGRES_PASSWORD
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: password } }
+        - name: POSTGRES_DB
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: dbname } }
+        resources:
+          requests: { cpu: "50m", memory: "32Mi" }
+          limits: { cpu: "200m", memory: "128Mi" }
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: primus-claw
+            component: primus-claw-brain
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: primus-claw
+                  component: primus-claw-brain
+      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+      volumes:
+      - name: sandbox-template
+        configMap:
+          name: {{ .Values.sandboxTemplate.name }}
+      {{- end }}
+      containers:
+      - name: brain
+        image: {{ include "primus-claw.image" . | quote }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args: ["brain"]
+        ports:
+        - name: http
+          containerPort: {{ .Values.brain.port }}
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "3"]
+        envFrom:
+        - secretRef:
+            name: primus-claw-secrets
+        env:
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - name: POD_NAMESPACE
+          valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+        - name: BRAIN_ID
+          value: $(POD_NAME)
+        - name: INTERNAL_BACKEND_URL
+          value: {{ printf "http://primus-claw-api.%s.svc.cluster.local:80" .Release.Namespace | quote }}
+        - name: CLAIM_NEXT_IDLE_MS
+          value: {{ .Values.brain.claimNextIdleMs | default "2000" | quote }}
+        - name: BRAIN_VERSION
+          value: {{ .Values.image.tag | quote }}
+        - name: POSTGRES_HOST
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: host } }
+        - name: POSTGRES_PORT
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: port } }
+        - name: POSTGRES_USER
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: user } }
+        - name: POSTGRES_PASSWORD
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: password } }
+        - name: POSTGRES_DB
+          valueFrom: { secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: dbname } }
+        {{- if .Values.tls.insecureSkipVerify }}
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        {{- end }}
+        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+        - name: AGENT_SANDBOX_TEMPLATE_FILE
+          value: /etc/claw/codeinterpreter-base.yaml
+        {{- end }}
+        - name: AGENT_SANDBOX_WARM_POOL_SIZE
+          value: {{ .Values.sandboxTemplate.warmPoolSize | default 0 | quote }}
+        # Brain forwards this into each sandbox's Hands env, so this one value
+        # decides both what the model is offered and what the sandbox will run.
+        - name: BG_SHELL_ENABLED
+          value: {{ .Values.features.backgroundShell | default false | quote }}
+        # Read by brain and, until now, reachable only by editing the Deployment
+        # by hand -- which the next helm upgrade would have undone. Each renders
+        # empty when the value is absent, and each answers an empty value with
+        # its own default: all but one go through the config helpers, which
+        # treat empty as unset, while S3_WORKSPACE_TAGGING tests for the literal
+        # "false" and so reads empty as on -- the same answer by a different
+        # route, and the reason "false" is the only value worth putting here.
+        - name: BRAIN_LAZY_SANDBOX
+          value: {{ .Values.brain.lazySandbox | quote }}
+        - name: S3_WORKSPACE_TAGGING
+          value: {{ .Values.brain.workspaceTagging | quote }}
+        - name: S3_PRUNE_MAX_OBJECTS
+          value: {{ .Values.brain.pruneMaxObjects | quote }}
+        # Forwarded into every sandbox alongside BG_SHELL_ENABLED, for the same
+        # reason: a schema promising one limit while the sandbox enforces
+        # another is worse than either number on its own.
+        - name: BASH_MAX_TIMEOUT_SEC
+          value: {{ .Values.brain.bashMaxTimeoutSec | quote }}
+        - name: BASH_DEFAULT_TIMEOUT_SEC
+          value: {{ .Values.brain.bashDefaultTimeoutSec | quote }}
+        - name: WAIT_MAX_SEC
+          value: {{ .Values.brain.waitMaxSec | quote }}
+        - name: WAIT_DEFAULT_SEC
+          value: {{ .Values.brain.waitDefaultSec | quote }}
+        # How long a source waits for Hands to consume the environment file
+        # before ruling that this binary predates the feature. Reachable from
+        # here because the wait is really a property of the storage the image
+        # comes off: too short on a slow mount kills a Hands that was going to
+        # succeed, and since every source carries the same check, it kills all
+        # of them and the sandbox never starts.
+        - name: HANDS_ENV_FILE_WAIT_SEC
+          value: {{ .Values.brain.handsEnvFileWaitSec | quote }}
+        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+        volumeMounts:
+        - name: sandbox-template
+          mountPath: /etc/claw
+          readOnly: true
+        {{- end }}
+        startupProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 3
+          failureThreshold: 40
+        livenessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 5
+          failureThreshold: 2
+        resources:
+          {{- toYaml .Values.brain.resources | nindent 10 }}

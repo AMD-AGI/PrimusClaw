@@ -1,0 +1,27 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Coverage settings for the Python trees exercised in CI. See
+# .github/workflows/tests-coverage.yml, which runs one `pytest --cov=.` and
+# reads every figure out of the single .coverage file this produces.
+
+[run]
+branch = false
+# Test files are ~100% covered by the act of running them, so counting them as
+# source inflates the total and lets it rise by adding tests that assert
+# nothing. Measuring source only makes the number mean what people read it to
+# mean, and is why the thresholds below look lower than the previous headline
+# figure (68% including tests, 56% without).
+omit =
+    */tests/*
+    */test_*.py
+    */conftest.py
+    */.venv/*
+    */node_modules/*
+
+[report]
+skip_empty = true
+exclude_also =
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    @(abc\.)?abstractmethod

@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# agent-sandbox Helm Chart default values
+# Override with: helm install agent-sandbox ./deploy/helm --set key=value
+
+# ── Global ────────────────────────────────────────────────────────────────────
+namespace: agent-sandbox-system
+imagePullSecrets: []
+
+# ── Unified Controlplane ──────────────────────────────────────────────────────
+controlplane:
+  enabled: true
+  replicas: 1
+  image:
+    repository: primussafe/agent-sandbox-controlplane
+    tag: latest                       # override per-release: --set controlplane.image.tag=<yyyymmddhhmm>
+    pullPolicy: IfNotPresent
+  ports:
+    router: 8080
+    workloadManager: 8081
+    managerMetrics: 8082
+    managerHealth: 8083
+  config:
+    leaderElect: true
+    extensions: true
+    sessionTimeout: 15m
+    envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
+    auditEnabled: true
+    auditRetentionDays: 30
+    sandboxImageRegistry: ""
+    # Optional key=value selector applied to sandbox workload pods.
+    sandboxNodeSelector: ""
+    registrySecret: ""
+    watchInterval: "30s"
+  service:
+    router:
+      type: ClusterIP
+      port: 8080
+    workloadManager:
+      type: ClusterIP
+      port: 8080
+  resources:
+    requests:
+      cpu: 150m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations: []
+  extraEnv: []
+
+# ── Redis ──────────────────────────────────────────────────────────────────────
+# Redis is deployed independently via deploy-redis.sh, not updated with service deploys.
+# When deploy=true, Helm also deploys Redis (for all-in-one installation).
+redis:
+  deploy: false                   # false=Redis already deployed via deploy-redis.sh
+  addr: "redis.agent-sandbox-system:6379"   # In-cluster Redis Service address
+  password: ""                    # Empty = read from Secret/agent-sandbox-redis
+  db: 1                           # DB 1, isolated from legacy sandbox (DB 0)
+  secret:
+    create: true                  # false = skip creating Secret, reuse external Secret named agent-sandbox-redis
+  # Settings below only apply when deploy=true
+  # The probes shell out to redis-cli, which every redis image ships; an image
+  # without it fails both probes and takes Redis out of the Service.
+  image:
+    reference: ""                  # optional full immutable reference; overrides repository/tag
+    repository: redis
+    tag: "7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  storage:
+    size: 100Gi
+    storageClassName: "rbd"              # empty = use cluster default; set to e.g. "local-path" to pin
+
+# ── Security posture ─────────────────────────────────────────────────────────
+# READ THIS BEFORE DEPLOYING. The values shipped below are DEVELOPMENT defaults:
+# authentication off and the egress proxy off. In that configuration a sandbox is
+# an ordinary runc container with unrestricted outbound network access, and any
+# caller that can reach the Router can create sandboxes and run code in them.
+#
+# The control plane refuses to start with `router.config.enableAuth: false`
+# unless you also set `security.allowInsecureNoAuth: true`, so this cannot be
+# reached silently. For anything beyond a throwaway cluster, see the
+# "Production hardening" section of sandbox/README.md.
+security:
+  # Acknowledge running with authentication disabled. Development only.
+  allowInsecureNoAuth: false
+
+# ── Router (merged into controlplane; only config/extraEnv are consumed) ──────
+router:
+  config:
+    maxConcurrentRequests: 1000
+    # false leaves the Router and Workload Manager with NO auth middleware at
+    # all — not a weaker check, none. Set true (plus safeApiUrl) in production.
+    enableAuth: false
+    safeApiUrl: ""                # required when enableAuth=true
+  extraEnv: []
+
+# ── Workload Manager (merged into controlplane; only config/extraEnv are consumed) ──
+workloadmanager:
+  config:
+    # Mirrors router.config.enableAuth (the control plane copies it at startup).
+    enableAuth: false
+    safeApiUrl: ""
+    gcInterval: 15s
+    defaultTTL: 24h
+  extraEnv: []
+
+# ── Egress (egress traffic control) ───────────────────────────────────────────
+# EnvD embedded transparent proxy: iptables REDIRECT intercepts outbound TCP for SSRF protection + DNS rebinding defense.
+# When enabled, Pod gets CAP_NET_ADMIN/CAP_NET_RAW (dropped after init).
+#
+# This proxy is the ONLY network control in the reference deployment: Flannel has
+# no NetworkPolicy support, so with `enabled: false` there is nothing restricting
+# a sandbox's outbound traffic — it can reach the cluster API, link-local
+# metadata endpoints and the public internet. Enable it in production.
+egress:
+  enabled: false                    # true = enable transparent proxy + SSRF protection
+  extraBlockedCIDRs: ""             # Extra blocked CIDRs (comma-separated), e.g. "169.254.0.0/16,100.64.0.0/10"
+
+# ── Inference (unified inference gateway) ─────────────────────────────────────
+# OPENAI_BASE_URL injected via Pod env (global);
+# OPENAI_API_KEY injected by EnvD at process level (per-user, fetched from Redis session).
+# Backend LLM API keys only exist in LiteLLM memory, never enter sandbox Pods.
+inference:
+  enabled: false                    # true = enable unified inference gateway
+  litellmEndpoint: ""               # LiteLLM inference gateway URL, e.g. http://litellm.agent-sandbox-system:4000/v1
+

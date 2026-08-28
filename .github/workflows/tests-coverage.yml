@@ -1,0 +1,162 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Tests with Coverage
+
+# Runs on push and pull_request for all branches. Skips when every changed file
+# matches paths-ignore (documentation-only and repo-metadata edits).
+#
+# Single workflow for test + coverage: one pytest run (--cov=.) produces one
+# .coverage file. The job Summary lists a whole-repo total plus per-tree totals
+# for the three Python trees exercised in CI (see CONTRIBUTING.md).
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-cov pytest-asyncio coverage
+          pip install -e "memory/memory-service/.[dev,storage]"
+          pip install -e "memory/knowledge-worker/.[dev]"
+
+      # continue-on-error so the Summary step always runs; "Enforce test success"
+      # restores a failing job when pytest fails.
+      # Thresholds are ratchets set just under the measured figures, not targets:
+      # a floor above where the code actually sits fails on the day it lands and
+      # gets removed within the week. Raise them as coverage improves; never
+      # lower one to make a red build green.
+      #
+      # Measured with .coveragerc (source only, tests excluded):
+      #   combined 55.8%, memory-service 46%, knowledge-worker 85%.
+      #
+      # The combined floor is the loosest of the three because `--cov=.` measures
+      # whatever the run happens to import, so it drifts for reasons unrelated to
+      # test quality. The per-tree floors below are the precise ones.
+      - name: Run tests with coverage
+        id: pytest
+        continue-on-error: true
+        run: |
+          pytest --cov=. --cov-report=xml --cov-report=term \
+            --cov-fail-under=54 \
+            memory/memory-service/tests \
+            memory/knowledge-worker/tests
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          extract_total() {
+            local file="$1"
+            local line
+            line=$(grep -E '^TOTAL ' "$file" 2>/dev/null | tail -1 || true)
+            if [ -n "$line" ]; then
+              echo "$line" | awk '{print $NF}'
+            else
+              echo "unknown"
+            fi
+          }
+
+          # --include, not --source: `coverage report` has no --source option
+          # (that belongs to `coverage run`). This previously invoked it anyway,
+          # with stderr discarded and `|| true` swallowing the exit code, so
+          # both per-tree rows below silently read "unknown" on every run.
+          narrow_report() {
+            local pattern="$1"
+            local out="$2"
+            if ! coverage report --skip-empty --include="$pattern" >"$out" 2>&1; then
+              echo "::warning::coverage report failed for $pattern"
+              cat "$out"
+            fi
+          }
+
+          if [ -f .coverage ]; then
+            coverage report --skip-empty > /tmp/coverage-full.txt
+            echo "=== Full coverage report (step log) ==="
+            cat /tmp/coverage-full.txt
+            narrow_report "memory/memory-service/*" /tmp/cov-ms.txt
+            narrow_report "memory/knowledge-worker/*" /tmp/cov-kw.txt
+          fi
+
+          {
+            echo "## Coverage";
+            echo "";
+            echo "Single \`pytest --cov=.\` run; all rows use the same \`.coverage\` file.";
+            echo "";
+            if [ -f .coverage ]; then
+              TOTAL=$(extract_total /tmp/coverage-full.txt)
+              echo "### Whole repository (all traced files)";
+              echo "**TOTAL (line): ${TOTAL}**";
+              echo "";
+              echo "### CI Python trees (narrow; same trees as previous \`--cov=\` targets)";
+              echo "| Tree | Line coverage (TOTAL) |";
+              echo "|------|----------------------|";
+              echo "| \`memory/memory-service\` | $(extract_total /tmp/cov-ms.txt) |";
+              echo "| \`memory/knowledge-worker\` | $(extract_total /tmp/cov-kw.txt) |";
+            else
+              echo "No \`.coverage\` file; coverage cannot be summarized.";
+            fi
+            if [ "${{ steps.pytest.outcome }}" != "success" ]; then
+              echo "";
+              echo "> Tests did not all pass; coverage can be **partial or misleading**.";
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Per-tree floors as well as the combined one. A single aggregate lets a
+      # well-covered tree carry a poorly covered one: knowledge-worker at 85%
+      # would keep the total green while memory-service, at 46%, slid further.
+      - name: Enforce per-tree coverage floors
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -f .coverage ] || { echo "::error::no .coverage file to check"; exit 1; }
+          rc=0
+          check() {
+            local name="$1" pattern="$2" floor="$3"
+            if coverage report --skip-empty --include="$pattern" --fail-under="$floor" >/dev/null 2>&1; then
+              echo "ok: $name >= ${floor}%"
+            else
+              local actual
+              actual=$(coverage report --skip-empty --include="$pattern" 2>/dev/null \
+                       | grep -E '^TOTAL ' | awk '{print $NF}')
+              echo "::error::$name coverage ${actual:-unknown} is below the ${floor}% floor"
+              rc=1
+            fi
+          }
+          check "memory/memory-service" "memory/memory-service/*" 45
+          check "memory/knowledge-worker" "memory/knowledge-worker/*" 84
+          exit "$rc"
+
+      - name: Enforce test success
+        if: always() && steps.pytest.outcome == 'failure'
+        run: |
+          echo "::error::Tests failed, or coverage fell below the --cov-fail-under floor"
+          echo "::error::(see the \"Run tests with coverage\" step log)."
+          exit 1

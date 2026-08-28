@@ -1,0 +1,207 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  # Pull requests build the affected images without pushing, so a Dockerfile or
+  # build-context break is caught in review rather than after it lands on main.
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+
+# Least privilege for the default GITHUB_TOKEN. Registry pushes authenticate
+# with their own credentials, not this token, so read access to the checkout is
+# all any job here needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      image_version: ${{ steps.get-image-version.outputs.image_version }}
+      date_time: ${{ steps.get-current-time.outputs.date_time }}
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        fetch-depth: 0
+
+    - name: Calculate ImageVersion
+      id: get-image-version
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "image_version=$TAG" >> $GITHUB_OUTPUT
+        else
+          echo "image_version=latest" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Get Current Time
+      id: get-current-time
+      run: |
+        FORMATTED_DATE=$(TZ='Asia/Shanghai' date +'%Y%m%d%H%M')
+        echo "date_time=$FORMATTED_DATE" >> $GITHUB_OUTPUT
+        echo "Formatted date: $FORMATTED_DATE"
+
+    - name: Detect changed files with git diff
+      id: detect-changes
+      run: |
+        set -e
+
+        if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          echo "Release tag: rebuilding every image in this workflow"
+          echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
+          echo "claw_changed=true" >> "$GITHUB_OUTPUT"
+          echo "memory_service_changed=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
+            BASE_COMMIT="HEAD^"
+          else
+            BASE_COMMIT="${{ github.event.before }}"
+          fi
+          HEAD_COMMIT="${{ github.sha }}"
+        else
+          BASE_COMMIT="HEAD^"
+          HEAD_COMMIT="HEAD"
+        fi
+
+        echo "Comparing $BASE_COMMIT...$HEAD_COMMIT"
+        CHANGED_FILES=$(git diff --name-only $BASE_COMMIT $HEAD_COMMIT || echo "")
+        echo "Changed files:"
+        echo "$CHANGED_FILES"
+
+        # Changes to the workflow itself should rebuild all images described by
+        # this workflow, so a CI-only edit is still validated end-to-end.
+        if echo "$CHANGED_FILES" | grep -qE '^\.github/workflows/build\.yaml$'; then
+          WORKFLOW_CHANGED=true
+          echo "workflow_changed=true" >> $GITHUB_OUTPUT
+        else
+          WORKFLOW_CHANGED=false
+          echo "workflow_changed=false" >> $GITHUB_OUTPUT
+        fi
+
+        # claw (unified image): TS monorepo sources baked into claw/Dockerfile
+        if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(claw/packages/|claw/deploy/|claw/package\.json$|claw/package-lock\.json$|claw/tsconfig.*\.json$|claw/Dockerfile$)'; then
+          echo "claw_changed=true" >> $GITHUB_OUTPUT
+        else
+          echo "claw_changed=false" >> $GITHUB_OUTPUT
+        fi
+
+        # claw-memory-service: owned memory API + Postgres-backed service
+        if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(memory/memory-service/)'; then
+          echo "memory_service_changed=true" >> $GITHUB_OUTPUT
+        else
+          echo "memory_service_changed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate matrix
+      id: generate-matrix
+      run: |
+        MATRIX='{"include":['
+        if [[ "${{ steps.detect-changes.outputs.claw_changed }}" == "true" ]]; then
+          MATRIX+='{"name":"claw","context_path":"claw","dockerfile_path":"claw/Dockerfile"},'
+        fi
+        if [[ "${{ steps.detect-changes.outputs.memory_service_changed }}" == "true" ]]; then
+          MATRIX+='{"name":"claw-memory-service","context_path":"memory/memory-service","dockerfile_path":"memory/memory-service/deploy/Dockerfile"},'
+        fi
+        MATRIX=${MATRIX%,}
+        MATRIX+=']}'
+        echo "Generated matrix: $MATRIX"
+        echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+        # A matrix entry for a component that no longer exists stays invisible
+        # until something else forces a full rebuild, and then fails deep inside
+        # buildah with `no such file or directory`. Check the paths here, where
+        # the message names the entry that went stale.
+        echo "$MATRIX" | python3 -c '
+        import json, os, sys
+        missing = []
+        for entry in json.load(sys.stdin)["include"]:
+            for field in ("context_path", "dockerfile_path"):
+                if not os.path.exists(entry[field]):
+                    missing.append(entry["name"] + ": " + field + "=" + entry[field])
+        if missing:
+            sys.exit("matrix entries point at paths that do not exist: " + "; ".join(missing))
+        '
+
+  build:
+    needs: detect-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    if: ${{ needs.detect-changes.outputs.matrix != '' && needs.detect-changes.outputs.matrix != '{"include":[]}' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Buildah
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      # Pull requests build but never push, so they need no registry credentials
+      # at all. A failed login now fails the job: previously it was swallowed by
+      # `|| echo`, and the run continued to the push, which then failed with an
+      # authentication error far from its actual cause.
+      - name: Login registries
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Logging in to Docker Hub..."
+          buildah login -u "${{ secrets.DOCKER_USERNAME }}" -p "${{ secrets.DOCKER_PASSWORD }}" docker.io
+
+      - name: Build with Buildah
+        env:
+          IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
+          DATE_TIME: ${{ needs.detect-changes.outputs.date_time }}
+        run: |
+          set -e
+          echo "Building ${{ matrix.name }}..."
+
+          buildah bud \
+            --layers \
+            --build-context agent-sandbox=sandbox \
+            -t ${{ matrix.name }}:${IMAGE_VERSION} \
+            -t ${{ matrix.name }}:${DATE_TIME} \
+            -f ${{ matrix.dockerfile_path }} ${{ matrix.context_path }}
+
+      - name: Push with Buildah
+        if: github.event_name != 'pull_request'
+        env:
+          DOCKERIO_REPOSITORY: docker.io/primussafe
+          IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
+          DATE_TIME: ${{ needs.detect-changes.outputs.date_time }}
+        run: |
+          set -e
+          echo "Pushing ${{ matrix.name }} to ${DOCKERIO_REPOSITORY}..."
+          buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah tag ${{ matrix.name }}:${DATE_TIME} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}

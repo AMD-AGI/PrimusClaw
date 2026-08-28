@@ -1,0 +1,24 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- if and .Values.ingress.enabled .Values.ingress.host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  annotations:
+    higress.io/route-priority: {{ .Values.ingress.priority | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+  - host: {{ .Values.ingress.host }}
+    http:
+      paths:
+      - backend:
+          service:
+            name: {{ include "litellm.fullname" . }}
+            port:
+              number: {{ .Values.port }}
+        path: {{ .Values.serverRootPath }}
+        pathType: Prefix
+{{- end }}

@@ -1,0 +1,16 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Override the root .gitignore which ignores test_*.py globally; this
+# service intentionally tracks its pytest suite.
+!test_*.py

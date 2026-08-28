@@ -1,0 +1,33 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+image:
+  registry: example.invalid
+  repository: claw
+  tag: release-test@sha256:4444444444444444444444444444444444444444444444444444444444444444
+postgres:
+  clusterName: release-pg
+  appUser: release-user
+  appDb: release-db
+  userSecretName: release-pguser-release-user
+  storageClass: release-test-sc
+  dataSize: 1Gi
+  backupSize: 1Gi
+ingress:
+  enabled: true
+  className: nginx
+  host: claw.release.example
+secret:
+  create: true
+  authInternalToken: release-test-internal-token
+  userEnvEncryptionKey: 01234567890123456789012345678901
+  natsPassword: release-test-nats-password
+  clawDeployMode: release-test
+  llmApiStyle: anthropic
+  anthropicBaseUrl: https://llm.release.example
+  openaiBaseUrl: https://llm.release.example/v1
+  byokVerifyApiStyle: openai
+  s3Endpoint: https://s3.release.example
+  s3ApiEndpoint: https://s3.release.example
+  s3AccessKey: release-test-access
+  s3SecretKey: release-test-secret

@@ -1,0 +1,37 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: primus-claw-api
+  labels:
+    app: primus-claw
+    component: primus-claw-api
+    a2a.primus.io/enabled: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app: primus-claw
+    component: primus-claw-api
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: primus-claw-brain
+  labels:
+    app: primus-claw
+    component: primus-claw-brain
+spec:
+  type: ClusterIP
+  selector:
+    app: primus-claw
+    component: primus-claw-brain
+  ports:
+  - name: http
+    port: {{ .Values.brain.port }}
+    targetPort: http

@@ -1,0 +1,19 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "claw-memory-service.fullname" . }}
+  namespace: {{ include "claw-memory-service.namespace" . }}
+  labels:
+    {{- include "claw-memory-service.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "claw-memory-service.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: memory-service
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http

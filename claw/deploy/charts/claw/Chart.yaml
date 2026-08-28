@@ -1,0 +1,9 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v2
+name: primus-claw
+description: PrimusClaw API and Brain deployment
+type: application
+version: 0.1.0
+appVersion: "latest"

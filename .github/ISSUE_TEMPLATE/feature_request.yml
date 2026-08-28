@@ -1,0 +1,57 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Feature request
+description: Propose a capability or a change in behaviour.
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - claw / api
+        - claw / brain
+        - claw / hands
+        - claw / protocol or utils
+        - sandbox (Go control plane)
+        - sandbox / sdk-python
+        - memory (memory-service or knowledge-worker)
+        - deployment (Helm, installers, Docker)
+        - docs
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you trying to do, and where does the current design stop you?
+        Describe the situation rather than the solution — it often turns out the
+        capability exists under another name.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: The shape of the change, and what the API or config would look like.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including doing it outside PrimusClaw, and why that does not work.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This would change existing behaviour for current deployments
+        - label: I am willing to open a pull request for this

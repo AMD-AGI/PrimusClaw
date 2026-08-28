@@ -1,0 +1,111 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: primus-claw-api
+  labels:
+    app: primus-claw
+    component: primus-claw-api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: primus-claw
+      component: primus-claw-api
+  template:
+    metadata:
+      labels:
+        app: primus-claw
+        component: primus-claw-api
+        api-version: {{ .Values.image.tag | quote }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.api.port | quote }}
+        prometheus.io/path: "/metrics"
+        # Every setting these pods have arrives through the Secret as an
+        # environment variable, and environment variables are read once at
+        # startup. Without this, `helm upgrade` with a changed value leaves the
+        # Deployment spec identical, no rollout happens, and the pods keep
+        # running the old configuration -- indefinitely, and silently. Naming
+        # the rendered Secret in the pod template makes a value change a spec
+        # change, which is what a rollout is triggered by.
+        #
+        # Only covers a Secret this chart renders. With `secret.create=false`
+        # the Secret is someone else's, and a change to it still needs a
+        # deliberate `kubectl rollout restart`.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: api
+        image: {{ include "primus-claw.image" . | quote }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args: ["api"]
+        ports:
+        - name: http
+          containerPort: {{ .Values.api.port }}
+        envFrom:
+        - secretRef:
+            name: primus-claw-secrets
+        env:
+        - name: NODE_OPTIONS
+          value: {{ .Values.api.nodeOptions | quote }}
+        - name: BRAIN_TASK_TIMEOUT_SEC
+          value: {{ .Values.api.brainTaskTimeoutSec | quote }}
+        - name: INTERNAL_BACKEND_URL
+          value: {{ printf "http://primus-claw-api.%s.svc.cluster.local:80" .Release.Namespace | quote }}
+        - name: POSTGRES_HOST
+          valueFrom:
+            secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: host }
+        - name: POSTGRES_PORT
+          valueFrom:
+            secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: port }
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: user }
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: password }
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: dbname }
+        {{- if .Values.postgres.sslNoVerify }}
+        - name: POSTGRES_SSLMODE
+          value: no-verify
+        {{- end }}
+        {{- if .Values.tls.insecureSkipVerify }}
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        {{- end }}
+        # The startup budget has to cover a schema migration, because initDb runs
+        # before the server listens: nothing answers /health while a migration is
+        # in flight, on the replica doing it and on every replica waiting behind
+        # its advisory lock. At 30 x 3s the budget was 90s while a single
+        # statement was allowed PG_MIGRATION_STATEMENT_TIMEOUT_MS (300s), so the
+        # longest migration the code permits could never finish -- the pod was
+        # killed and the next one started the same statement again. 120 x 3s is
+        # 360s, which leaves the statement its whole budget plus connect time.
+        startupProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 3
+          failureThreshold: 120
+        livenessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 5
+          failureThreshold: 2
+        resources:
+          {{- toYaml .Values.api.resources | nindent 10 }}

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v2
+name: agent-sandbox
+description: AI Agent sandbox platform — secure code execution environment on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/kubernetes-sigs/agent-sandbox
+keywords:
+  - sandbox
+  - agent
+  - ai
+  - code-interpreter
+  - kata-containers
+maintainers:
+  - name: Kubernetes SIG Apps

@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.redis.deploy }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: {{ .Release.Namespace }}
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: {{ default (printf "%s:%s" .Values.redis.image.repository .Values.redis.image.tag) .Values.redis.image.reference | quote }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          # --save narrows how much an ungraceful stop costs. The built-in
+          # defaults are 3600s/1 change, 300s/100 and 60s/10000, so a workload
+          # this write-light snapshots roughly hourly and a node failure or an
+          # OOM kill discards everything written since. Session records are a
+          # few hundred bytes each, so a full snapshot is cheap enough to take
+          # every minute instead. A save directive replaces the defaults rather
+          # than adding to them, and 60s/1 change fires strictly sooner than all
+          # three, so nothing is lost by stating only this one.
+          #
+          # AOF would cut the window further, to a second. It is not enabled
+          # because it does not remove the fork -- rewrites still take one -- and
+          # it adds AOF write failure as another way to reach the refuse-writes
+          # state these probes exist to catch. Recovery must survive losing the
+          # store outright regardless, so the value of shrinking this window past
+          # a minute is small next to the extra failure surface.
+          args: ["--requirepass", "$(REDIS_PASSWORD)", "--save", "60", "1"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-sandbox-redis
+                  key: password
+            # redis-cli reads this on its own, keeping the password off the probe
+            # command line and out of ps.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: agent-sandbox-redis
+                  key: password
+          # PING is not enough to call this instance usable. When the data volume
+          # stops accepting writes, Redis keeps answering PING out of memory while
+          # stop-writes-on-bgsave-error -- the default -- makes it refuse every
+          # write, so a broken volume reads as healthy and the pod stays in the
+          # Service. Readiness writes a throwaway key instead, which is what the
+          # session store actually needs, and lands in DB 0 rather than the DB 1
+          # the application uses. Failing it takes the pod out of the Service so
+          # callers fail fast rather than hanging on a Redis that cannot record
+          # anything.
+          # -e is what makes this assert anything: without it redis-cli exits 0 on a
+          # server error reply, so a bare `redis-cli set` passes while the write it
+          # just made was refused. Measured on this image:
+          #
+          #                    redis-cli ping   redis-cli -e set
+          #   healthy                       0                  0
+          #   MISCONF (bad volume)          0                  1
+          #   NOAUTH                        0                  1
+          #   not answering                 1                  1
+          #
+          # Readiness takes the -e column: the pod leaves the Service exactly when
+          # the store cannot record anything, whether the volume refuses writes or
+          # REDISCLI_AUTH stopped resolving.
+          # timeoutSeconds is explicit because the default is 1s and this forks a
+          # redis-cli process inside a CPU-limited container. Under contention
+          # that margin is thin enough to fail a healthy Redis, and three such
+          # failures take it out of the Service for every caller.
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-e", "set", "health:probe", "1", "EX", "30"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness takes the other column, and the difference is the point. Under
+          # MISCONF even PING answers with the error rather than PONG, so anything
+          # asserting the reply restarts the container on a volume fault -- and a
+          # restart re-enters the same pod and remounts nothing, so it cannot clear
+          # one. It would only trade a visible failure for CrashLoopBackOff. Exit
+          # status without -e is non-zero only when the server does not answer at
+          # all, which is the fault a restart does fix.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources: {{ toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.redis.storage.storageClassName }}
+        storageClassName: {{ .Values.redis.storage.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.storage.size }}
+{{- end }}

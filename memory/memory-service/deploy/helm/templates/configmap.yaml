@@ -1,0 +1,19 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "claw-memory-service.fullname" . }}-config
+  namespace: {{ include "claw-memory-service.namespace" . }}
+  labels:
+    {{- include "claw-memory-service.labels" . | nindent 4 }}
+{{- $cfg := .Values.config | default dict }}
+{{- $kbEnabled := "true" }}
+{{- if hasKey $cfg "kbEndpointsEnabled" }}
+{{-   $kbEnabled = $cfg.kbEndpointsEnabled | toString }}
+{{- end }}
+data:
+  MEMORY_SERVICE_HOST: {{ .Values.config.host | quote }}
+  MEMORY_SERVICE_PORT: {{ .Values.config.port | quote }}
+  KB_ENDPOINTS_ENABLED: {{ $kbEnabled | quote }}

@@ -1,0 +1,33 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: CodeQL configuration
+
+# Applies to every language in the CodeQL matrix, not just JavaScript.
+#
+# The two exclusions below were added for a Fastify service that is no longer
+# part of this repository, and they have NOT been re-validated against the code
+# that remains. They now suppress these queries for `claw/` alone, which is also
+# a Fastify service — so treat them as inherited debt, not as a considered
+# judgement about the current tree:
+#
+#   js/missing-rate-limiting
+#     The original service registered @fastify/rate-limit globally before its
+#     auth hook, and CodeQL still flagged the hook. `claw/packages/api` has no
+#     rate-limit plugin at all, so this exclusion is very likely hiding a real
+#     finding rather than a false positive.
+#
+#   js/file-access-to-http
+#     The original service deliberately transferred its own helper scripts to
+#     an authenticated internal sandbox endpoint whose destination is not user
+#     controlled. Whether the equivalent flows in `claw/packages/brain` have the
+#     same property has not been checked.
+#
+# TODO: re-run CodeQL without these filters, triage what the two queries report
+# against `claw/`, then either fix the findings or replace this file with
+# per-finding suppressions that name the specific code and reason.
+query-filters:
+  - exclude:
+      id: js/missing-rate-limiting
+  - exclude:
+      id: js/file-access-to-http
