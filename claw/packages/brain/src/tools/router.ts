@@ -416,13 +416,13 @@ export class ToolRouter {
       }},
       { name: "bash", description: BG_SHELL_ENABLED
         ? "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back. For anything that may outlast the timeout — servers, training runs, long builds, watchers — pass run_in_background=true instead of raising the timeout, then call wait to block until it finishes."
-        : "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back, so keep each command inside the timeout rather than raising it.",
+        : "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back, so give a long command a timeout to match rather than splitting it up. When you need to wait — for a job to finish, for a file to appear — wait once for the whole interval in a single call and raise `timeout` to cover it. Every call is a separate model request that re-sends the entire conversation, so three chained sleeps cost three times what one longer sleep costs and tell you nothing extra.",
         input_schema: {
         type: "object", properties: {
           command: { type: "string", description: "Shell command to execute" },
           timeout: { type: "number", description: BG_SHELL_ENABLED
             ? `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap, so use run_in_background plus wait for anything longer instead of raising this.`
-            : `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap. There is no background mode in this deployment, so a long command needs a timeout to match.` },
+            : `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap. The default is a default, not a budget — there is no background mode in this deployment, so a command or a wait that needs longer should say so here, up to the cap, in one call.` },
           ...(BG_SHELL_ENABLED ? {
             run_in_background: { type: "boolean", description: "Return a shell_id immediately and keep the command running. Follow with wait to block until it finishes, or bash_output to look at it without waiting." },
             shell_id: { type: "string", description: "Name this shell instead of taking a generated id (advanced). Private to this conversation, so a plain name like 'server' is fine." },
