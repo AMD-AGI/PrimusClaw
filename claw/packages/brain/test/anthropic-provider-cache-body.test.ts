@@ -316,3 +316,16 @@ test("a failed probe keeps the evidence instead of discarding it", async () => {
   assert.equal(markersIn(bodies[4]), 0);
   assert.equal(ok.cacheReport?.enabled, false, "and it latches");
 });
+
+test("the web-tool client carries no auto-caching header either", async () => {
+  // The guard has to sit on both paths. This header was set in two places, and
+  // a fix that removed it from one would have looked complete in the diff and
+  // in the provider test above, while the second client kept asking a gateway
+  // hook to add markers to requests that now carry their own.
+  const { webToolClientHeaders } = await import("../src/agent/engine.js");
+  const headers = webToolClientHeaders();
+  assert.equal(
+    Object.keys(headers).some((k) => k.toLowerCase() === "x-auto-prompt-caching"),
+    false,
+  );
+});

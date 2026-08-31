@@ -40,6 +40,23 @@ const logger = pino({ name: "agent-engine" });
  * LLM_API_STYLE for provider selection). No Claude/Agent SDK dependency.
  * All state is local (multi-user safe).
  */
+/**
+ * Headers for the web-tool Anthropic client.
+ *
+ * A named function so the absence of `x-auto-prompt-caching` is a line a test
+ * can hold down, the same way the agent-loop client's headers are. That header
+ * lived here too, and removing it from only one of the two clients would have
+ * left the guard on one path and not the other -- which is how it survives a
+ * fix and comes back.
+ *
+ * These calls get no cache markers either. web_search and the web_fetch
+ * summariser are single-shot with no reusable prefix, so a breakpoint would
+ * bill the write premium for an entry nothing ever reads back.
+ */
+export function webToolClientHeaders(): Record<string, string> {
+  return {};
+}
+
 export class AgentEngine {
   async execute(
     request: ExecuteRequest,
@@ -167,7 +184,7 @@ export class AgentEngine {
         ? (() => {
             const anthropicClient = new Anthropic({
               apiKey: webApiKey, baseURL: ANTHROPIC_BASE_URL, maxRetries: 2,
-              defaultHeaders: { "x-auto-prompt-caching": "true" },
+              defaultHeaders: webToolClientHeaders(),
             });
             const costTracker = new SimpleSessionCostTracker();
             return {
