@@ -11,9 +11,9 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1116.0",
-    "@aws-sdk/lib-storage": "^3.1116.0",
-    "@aws-sdk/s3-request-presigner": "^3.1116.0",
+    "@aws-sdk/client-s3": "^3.1120.0",
+    "@aws-sdk/lib-storage": "^3.1120.0",
+    "@aws-sdk/s3-request-presigner": "^3.1120.0",
     "@claw/protocol": "*",
     "@claw/utils": "*",
     "@fastify/cookie": "^11.1.2",
@@ -31,10 +31,10 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.5",
+    "@electric-sql/pglite": "^0.5.8",
     "@types/adm-zip": "^0.5.5",
     "@types/archiver": "^8.0.0",
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.4.0",
     "@types/pg": "^8.23.1",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
