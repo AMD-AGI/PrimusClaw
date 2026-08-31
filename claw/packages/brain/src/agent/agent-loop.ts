@@ -385,33 +385,58 @@ Keep it under 4 KB. Do not editorialize. Output the summary text only.`;
  *  Reuses the main loop's model (no extra gateway routing required) — cost
  *  delta vs sonnet is ~$0.4/call which is negligible for a low-frequency op.
  *  Falls back to the original messages on summarization error. */
+/**
+ * What compaction did, said outright rather than inferred.
+ *
+ * The caller used to compare array identity and length, which cannot tell a
+ * summariser failure from "nothing worth compacting" -- both came back as the
+ * same array. That made `result="failed"` a metric value no production line
+ * could ever emit, and a counter that cannot report the bad case is worse than
+ * no counter. Best-effort behaviour is unchanged: a failure still leaves the
+ * loop running on the uncompacted history.
+ */
+type CompactionOutcome = {
+  status: "compacted" | "noop" | "failed";
+  messages: Message[];
+};
+
 async function compactConversation(
   session: LlmSession,
   workingMessages: Message[],
   sessionIdLog: string | undefined,
   compactRound: number,
   atTurn: number,
-): Promise<Message[]> {
-  if (workingMessages.length < COMPACTION_MIN_MESSAGES) return workingMessages;
+): Promise<CompactionOutcome> {
+  const noop = (): CompactionOutcome => ({ status: "noop", messages: workingMessages });
+  if (workingMessages.length < COMPACTION_MIN_MESSAGES) return noop();
 
-  // Always preserve the first user message (original prompt) so the agent
-  // never loses sight of the top-level goal.
-  const head = workingMessages[0];
-  if (head.role !== "user") return workingMessages;
+  // Preserve the head: any leading role:"system" run, plus the first user
+  // message (the original prompt) so the agent never loses sight of the goal.
+  //
+  // The system run is KEPT rather than treated as a reason to bail. Bailing is
+  // what made a system-headed conversation permanently uncompactable -- it
+  // could only ever grow, until it hit the context window and died on a 400
+  // that streamTurnWithRetry does not retry. Keeping the run contiguous at
+  // index 0 also leaves the tools -> system -> messages cache prefix intact.
+  let headEnd = 0;
+  while (headEnd < workingMessages.length && workingMessages[headEnd].role === "system") headEnd++;
+  if (workingMessages[headEnd]?.role === "user") headEnd++;
+  if (headEnd === 0) return noop();
+  const head = workingMessages.slice(0, headEnd);
 
   // Find a safe cut boundary: the kept tail must START with an assistant
   // message so the prepended "user"-role summary connects naturally.
   const desiredKeep = COMPACTION_KEEP_RECENT_TURNS * 2;
   let keepStart = workingMessages.length - desiredKeep;
-  if (keepStart <= 1) return workingMessages; // nothing meaningful to compact yet
+  if (keepStart <= head.length) return noop(); // nothing meaningful to compact yet
   while (keepStart < workingMessages.length && workingMessages[keepStart].role !== "assistant") {
     keepStart++;
   }
-  if (keepStart >= workingMessages.length) return workingMessages;
+  if (keepStart >= workingMessages.length) return noop();
 
-  const middle = workingMessages.slice(1, keepStart);
+  const middle = workingMessages.slice(head.length, keepStart);
   const tail = workingMessages.slice(keepStart);
-  if (middle.length === 0) return workingMessages;
+  if (middle.length === 0) return noop();
 
   // Serialize middle messages into a flat text the summarizer can read.
   const middleText = middle.map((m, i) => {
@@ -438,17 +463,17 @@ async function compactConversation(
     summary = await session.complete(COMPACTION_PROMPT, middleText.slice(0, 600_000), 4096);
   } catch (err: any) {
     logger.warn({ err: err?.message || String(err), sessionId: sessionIdLog }, "compaction.failed");
-    return workingMessages;
+    return { status: "failed", messages: workingMessages };
   }
 
   const summaryMsg: Message = {
     role: "user",
     content: [{
       type: "text",
-      text: `[Compact #${compactRound} at turn ${atTurn} — ${middle.length} messages (msgs 1..${keepStart - 1}) replaced with this summary]\n\n${summary}`,
+      text: `[Compact #${compactRound} at turn ${atTurn} — ${middle.length} messages (msgs ${head.length}..${keepStart - 1}) replaced with this summary]\n\n${summary}`,
     }],
   };
-  const newMessages = [head, summaryMsg, ...tail];
+  const newMessages = [...head, summaryMsg, ...tail];
   logger.info(
     {
       sessionId: sessionIdLog,
@@ -459,7 +484,7 @@ async function compactConversation(
     },
     "compaction.done",
   );
-  return newMessages;
+  return { status: "compacted", messages: newMessages };
 }
 
 /** Detects bash commands that install system-level packages. */
@@ -1135,16 +1160,28 @@ class AgentLoopRunner {
     });
     this.workingMessages.push({ role: "user", content: results as any });
 
-    // Auto-compaction: when this turn's input_tokens crossed the trigger,
-    // compress older messages to a summary so the next turn's input fits in
-    // the model context window. Top-level loop only — sub-agents have their
-    // own short-lived context and rarely need this. Best-effort: failure to
-    // compact falls back to the original messages and the loop continues.
-    if (this.depth === 0 && turnUsage.input_tokens > COMPACTION_TRIGGER_INPUT_TOKENS) {
+    // Auto-compaction: when this turn's prompt crossed the trigger, compress
+    // older messages to a summary so the next turn fits in the model context
+    // window. Top-level loop only — sub-agents have their own short-lived
+    // context and rarely need this. Best-effort: failure to compact falls back
+    // to the original messages and the loop continues.
+    //
+    // Compared against promptTokens, not turnUsage.input_tokens. Anthropic
+    // reports input_tokens as the UNCACHED REMAINDER: measured on the live
+    // gateway, one prompt reads 10,960 without a cache marker and 6 with one.
+    // This is the only context-size guard in Brain, and a context-window
+    // rejection is a 400, which streamTurnWithRetry does not retry — so with
+    // markers on and this reading input_tokens, a twelve-hour run would grow
+    // unchecked to the 1M window and die there. The two must never ship apart.
+    const promptTokens = streamResult.promptTokens ?? turnUsage.input_tokens;
+    if (this.depth === 0 && promptTokens > COMPACTION_TRIGGER_INPUT_TOKENS) {
       const before = this.workingMessages.length;
       this.compactionRound++;
-      const compacted = await compactConversation(this.session, this.workingMessages, this.sessionId, this.compactionRound, turn);
-      if (compacted !== this.workingMessages && compacted.length < before) {
+      const outcome = await compactConversation(this.session, this.workingMessages, this.sessionId, this.compactionRound, turn);
+      const compacted = outcome.messages;
+      // Read the status rather than re-deriving it from array identity: that
+      // inference cannot tell a summariser failure from "nothing to compact".
+      if (outcome.status === "compacted") {
         this.workingMessages.length = 0;
         this.workingMessages.push(...compacted);
         await this.onEvent({
@@ -1155,7 +1192,7 @@ class AgentLoopRunner {
           at_turn: turn,
           messages_before: before,
           messages_after: compacted.length,
-          trigger_input_tokens: turnUsage.input_tokens,
+          trigger_input_tokens: promptTokens,
         });
       } else {
         this.compactionRound--; // rollback if no-op

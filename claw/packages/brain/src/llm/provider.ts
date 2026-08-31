@@ -60,6 +60,21 @@ export interface LlmTurnResult {
    * a real zero.
    */
   cacheReport?: LlmCacheReport;
+  /**
+   * How big this turn's prompt actually was, in the provider's own accounting.
+   *
+   * `usage.input_tokens` cannot be compared against a context budget once
+   * caching works. Anthropic reports it as the UNCACHED REMAINDER -- measured
+   * on the live gateway, the same prompt reads 10,960 without a cache marker
+   * and 6 with one -- so a guard written against it silently stops firing the
+   * moment the fix lands. OpenAI's `prompt_tokens` already includes cached
+   * tokens, so the two need opposite arithmetic and only the provider knows
+   * which it is.
+   *
+   * Absent from a session double, in which case callers fall back to
+   * `usage.input_tokens` and behave as they did before.
+   */
+  promptTokens?: number;
 }
 
 export interface LlmCacheReport {

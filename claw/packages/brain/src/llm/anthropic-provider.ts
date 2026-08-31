@@ -311,6 +311,9 @@ async function streamingTurn(
       bodyModel,
       headerModel: capture.headerModel ?? headerModelFromStream(stream),
     }),
+    // Anthropic's input_tokens is the uncached remainder; the whole prompt is
+    // the three added together.
+    promptTokens: usage.input_tokens + usage.cache_read + usage.cache_create,
     cacheReport: {
       breakpointsSent,
       enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,
