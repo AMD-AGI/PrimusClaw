@@ -878,6 +878,46 @@ export const SANDBOX_HANDS_RESTART_EXEC_DEADLINE_MS = envInt(
 // later switches to a model whose effective context is back at 200K.
 export const COMPACTION_TRIGGER_INPUT_TOKENS = envInt("COMPACTION_TRIGGER_INPUT_TOKENS", 850_000);
 
+// --- Prompt cache ---
+/**
+ * Lifetime of the cache entries Brain writes, "5m" or "1h".
+ *
+ * "1h" by default because of what this deployment's agents actually do between
+ * requests. The babysitter tasks that motivated this run `sleep 300` inside a
+ * single tool call, so the gap between the request that emits the sleep and
+ * the one that reads its result is over five minutes every cycle -- the one
+ * request in three that a 5-minute entry cannot survive, and the most
+ * expensive one, since it is the full conversation that gets re-written rather
+ * than read. Measured against the live gateway: a 1h marker writes a real
+ * `ephemeral_1h` entry, needs no beta header, is not silently downgraded to
+ * 5m, and is still readable seven minutes later. The 2x write premium buys
+ * roughly 9x against today's cost where 5m buys about 2x.
+ *
+ * "5m" is the escape hatch if a gateway ever starts refusing the ttl field.
+ */
+export type PromptCacheTtl = "5m" | "1h";
+function resolvePromptCacheTtl(): PromptCacheTtl {
+  const configured = env("LLM_CACHE_TTL");
+  if (configured === "5m" || configured === "1h") return configured;
+  if (configured) {
+    settingProblems.push(`LLM_CACHE_TTL=${configured} is not "5m" or "1h"; using 1h`);
+  }
+  return "1h";
+}
+export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
+
+/**
+ * Turns off client-side cache breakpoints entirely.
+ *
+ * The provider already disables itself for the rest of a session when the
+ * gateway rejects a marker, so this is not the first line of defence -- it is
+ * the one an operator can reach without a code change when the failure is
+ * something the latch does not recognise. Rolling restart, not a live flip:
+ * every constant in this file is read once at import.
+ */
+export const PROMPT_CACHE_ENABLED = envBool("PROMPT_CACHE_ENABLED", true);
+
+
 // --- LLM streaming timeouts (SSE-style response body) ---
 // Aligned to LiteLLM gateway's read=600s to avoid client-side aborts that
 // the upstream proxy would still consider in-flight. Long prefill on big

@@ -8,8 +8,10 @@ import type {
   MessageParam,
   Tool as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages/messages.js";
-import { STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
-import type { LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
+import { LLM_CACHE_TTL, PROMPT_CACHE_ENABLED, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
+import type { Message } from "@claw/protocol";
+import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
 import {
   headerModelFromStream,
   resolveRoutedModel,
@@ -29,6 +31,43 @@ const logger = pino({ name: "anthropic-provider" });
  * stop_reason, usage) the surrounding loop already consumes — no other code
  * changes needed.
  */
+/**
+ * Per-session state for the cache-marker kill switch.
+ *
+ * Session-scoped rather than global: a rejection is evidence about this
+ * gateway and this model, and one bad session should not silently switch
+ * caching off for every other run in the process.
+ */
+interface SessionCacheState {
+  disabled: boolean;
+  /** Consecutive failures seen while sending markers. Reset by any success. */
+  decoratedFailures: number;
+}
+
+/**
+ * Does this failure look like the gateway objecting to a cache marker?
+ *
+ * Matched against the whole serialized error, and deliberately NOT gated on
+ * HTTP 400. This gateway is documented in agent-loop.ts to re-wrap upstream
+ * failures as 502/503/504 and even as a 401, and every one of those is in the
+ * loop's transient set -- so a status-gated latch would never arm while the
+ * loop cheerfully re-sent the same rejected body up to twelve times a turn.
+ */
+function looksLikeCacheRejection(err: unknown): boolean {
+  let text: string;
+  try {
+    const e = err as Record<string, unknown> | null;
+    text = [
+      (e?.message as string) ?? "",
+      typeof e?.error === "object" ? JSON.stringify(e.error) : String(e?.error ?? ""),
+      String(e === null || e === undefined ? "" : e),
+    ].join(" ");
+  } catch {
+    text = String(err);
+  }
+  return /cache_control|cache_creation|ephemeral|prompt.?cach/i.test(text);
+}
+
 async function streamingTurn(
   client: Anthropic,
   model: string,
@@ -36,37 +75,103 @@ async function streamingTurn(
   tools: AnthropicTool[],
   signal: AbortSignal | undefined,
   capture: RoutedModelSink,
+  cacheState: SessionCacheState,
 ): Promise<LlmTurnResult> {
-  // Outer abort controller so first-byte / idle watchdogs can kill the stream
-  // independently of the caller-supplied signal.
-  const ctrl = new AbortController();
-  const onParentAbort = () => ctrl.abort(signal?.reason);
-  if (signal) {
-    if (signal.aborted) ctrl.abort(signal.reason);
-    else signal.addEventListener("abort", onParentAbort, { once: true });
+  // One abort controller PER ATTEMPT, not per turn.
+  //
+  // The first-byte watchdog aborts the controller it is watching, and an
+  // AbortController is one-shot. Sharing one across attempts means the
+  // undecorated fallback below inherits an already-aborted signal and rejects
+  // before a request leaves the process -- so the probe that decides whether
+  // the markers were at fault never actually runs, and the latch arms or does
+  // not on the strength of a request that was never sent.
+  let activeCtrl: AbortController | undefined;
+  const onParentAbort = () => activeCtrl?.abort(signal?.reason);
+  if (signal && !signal.aborted) {
+    signal.addEventListener("abort", onParentAbort, { once: true });
   }
+
+  // The system hoist is NOT conditional on caching.
+  //
+  // The Messages API has no "system" role; leaving one in `messages` works
+  // only because the gateway rewrites it. That is a correctness fix in its own
+  // right, so it must survive PROMPT_CACHE_ENABLED=false and the session latch
+  // -- otherwise turning caching off silently reverts the request to a shape
+  // the API does not accept. Only the markers are gated.
+  const prepared = prepareAnthropicRequest(messages as unknown as Message[], { ttl: LLM_CACHE_TTL });
+  const useMarkers = PROMPT_CACHE_ENABLED && !cacheState.disabled;
+  const decorated = useMarkers ? prepared : stripCacheControl(prepared);
 
   // First-byte deadline: with stream:true the gateway must flush SSE headers
   // promptly. If it doesn't, we abort and let the caller handle the failure.
+  // Each attempt gets its own budget, not the remainder of the previous one's.
   const t0 = Date.now();
-  const firstByteTimer = setTimeout(() => {
-    ctrl.abort(new Error(`stream first-byte timeout after ${STREAM_FIRST_BYTE_TIMEOUT_MS}ms`));
-  }, STREAM_FIRST_BYTE_TIMEOUT_MS);
+  const openStream = async (body: PreparedAnthropicRequest) => {
+    const ctrl = new AbortController();
+    activeCtrl = ctrl;
+    if (signal?.aborted) ctrl.abort(signal.reason);
+    const timer = setTimeout(() => {
+      ctrl.abort(new Error(`stream first-byte timeout after ${STREAM_FIRST_BYTE_TIMEOUT_MS}ms`));
+    }, STREAM_FIRST_BYTE_TIMEOUT_MS);
+    try {
+      return await client.messages.create(
+        {
+          model,
+          ...(body.system ? { system: body.system as any } : {}),
+          messages: body.messages as unknown as MessageParam[],
+          tools,
+          max_tokens: 16384,
+          stream: true,
+        },
+        { signal: ctrl.signal },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   let stream;
+  let breakpointsSent = decorated.breakpointsApplied;
   try {
-    stream = await client.messages.create(
-      { model, messages, tools, max_tokens: 16384, stream: true },
-      { signal: ctrl.signal },
-    );
+    stream = await openStream(decorated);
+    cacheState.decoratedFailures = 0;
   } catch (err) {
-    clearTimeout(firstByteTimer);
-    if (signal) signal.removeEventListener("abort", onParentAbort);
-    throw err;
+    // Two independent reasons to suspect the markers, because the obvious one
+    // is not reliable here. The first is the error saying so. The second is a
+    // second consecutive failure while decorated -- which we test by actually
+    // dropping the markers and seeing whether the request goes through, rather
+    // than by assuming. If the bare request fails too, the markers were not
+    // the problem and the session keeps them.
+    const suspect = breakpointsSent > 0
+      && (looksLikeCacheRejection(err) || cacheState.decoratedFailures >= 1);
+    if (!suspect) {
+      if (breakpointsSent > 0) cacheState.decoratedFailures++;
+      if (signal) signal.removeEventListener("abort", onParentAbort);
+      throw err;
+    }
+    logger.warn(
+      { err: (err as Error)?.message, breakpoints: breakpointsSent },
+      "llm.cache_control.retry_undecorated",
+    );
+    try {
+      stream = await openStream(stripCacheControl(prepared));
+      cacheState.disabled = true;
+      cacheState.decoratedFailures = 0;
+      breakpointsSent = 0;
+      logger.error({ model }, "llm.cache_control.disabled_for_session");
+    } catch (bareErr) {
+      // Deliberately does NOT reset decoratedFailures. That attempt did fail
+      // while decorated, so it is evidence, and zeroing it discards the very
+      // thing that arms the probe. On a gateway that both rejects markers and
+      // is slow -- and this one re-wraps upstream failures as 502/503/504 and
+      // 401 -- resetting leaves the latch permanently one failure short of
+      // arming, which is the end state the status-gated design was rejected
+      // for.
+      if (signal) signal.removeEventListener("abort", onParentAbort);
+      throw bareErr;
+    }
   }
 
-  // Reset watchdog: from here on it's an idle timer.
-  clearTimeout(firstByteTimer);
   const firstByteMs = Date.now() - t0;
 
   // Idle watchdog: abort if no event arrives within STREAM_IDLE_TIMEOUT_MS.
@@ -75,7 +180,7 @@ async function streamingTurn(
   const armIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      ctrl.abort(new Error(`stream idle timeout after ${STREAM_IDLE_TIMEOUT_MS}ms`));
+      activeCtrl?.abort(new Error(`stream idle timeout after ${STREAM_IDLE_TIMEOUT_MS}ms`));
     }, STREAM_IDLE_TIMEOUT_MS);
   };
   armIdleTimer();
@@ -88,6 +193,8 @@ async function streamingTurn(
   const toolJsonBuf: Map<number, string> = new Map();
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
+  let created5m: number | undefined;
+  let created1h: number | undefined;
   let bodyModel: string | undefined;
 
   try {
@@ -103,6 +210,14 @@ async function streamingTurn(
             usage.input_tokens = u.input_tokens ?? 0;
             usage.cache_create = u.cache_creation_input_tokens ?? 0;
             usage.cache_read = u.cache_read_input_tokens ?? 0;
+            // A 1h marker that comes back as a 5m write is a silent downgrade:
+            // the request succeeds, the cache works, it just expires under the
+            // sleep it was chosen to outlast.
+            const split = (u as Record<string, any>).cache_creation;
+            if (split && typeof split === "object") {
+              created5m = split.ephemeral_5m_input_tokens ?? undefined;
+              created1h = split.ephemeral_1h_input_tokens ?? undefined;
+            }
           }
           break;
         }
@@ -196,6 +311,48 @@ async function streamingTurn(
       bodyModel,
       headerModel: capture.headerModel ?? headerModelFromStream(stream),
     }),
+    cacheReport: {
+      breakpointsSent,
+      enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,
+      // This path reads both numbers straight off message_start.
+      reported: ["cache_read", "cache_create"] as const,
+      createdEphemeral5m: created5m,
+      createdEphemeral1h: created1h,
+    } satisfies LlmCacheReport,
+  };
+}
+
+/**
+ * The headers every request carries.
+ *
+ * A named function so that what is NOT here is a line a test can hold down.
+ * `x-auto-prompt-caching: true` used to be: a header asking the gateway to
+ * pick cache breakpoints on our behalf, whose implementation landed two months
+ * after the header and has never once fired. It read in the diff, and to
+ * everyone who came after, as "caching is on".
+ *
+ * It is removed rather than left as a harmless no-op. Now that Brain places
+ * its own markers, a gateway hook that started working would add its own on
+ * top -- and four is the hard cap, so the two together are a 400.
+ */
+export function anthropicDefaultHeaders(opts: {
+  litellmTags: string;
+  litellmMeta: string;
+  userId?: string;
+  sessionId?: string;
+}): Record<string, string> {
+  return {
+    "anthropic-version": "2023-06-01",
+    "x-litellm-tags": opts.litellmTags,
+    "x-litellm-spend-logs-metadata": opts.litellmMeta,
+    "x-litellm-end-user-id": opts.userId || "",
+    // The Auto Router pins a session to one backend only when it can read a
+    // session id, and it reads exactly one place: metadata.session_id, which
+    // the proxy fills from x-litellm-trace-id / x-litellm-session-id. Without
+    // it session_affinity is configured but inert and the backend can change
+    // mid-conversation -- which breaks thinking replay and splits the prompt
+    // cache, since cache entries are scoped to the model that wrote them.
+    "x-litellm-session-id": opts.sessionId || "",
   };
 }
 
@@ -221,36 +378,40 @@ export class AnthropicProvider implements LlmProvider {
       baseURL: apiUrl,
       maxRetries: 2,
       fetch: wrapFetchCaptureRoutedModel(capture),
-      defaultHeaders: {
-        "anthropic-version": "2023-06-01",
-        "x-litellm-tags": litellmTags,
-        "x-litellm-spend-logs-metadata": litellmMeta,
-        "x-litellm-end-user-id": userId || "",
-        // The Auto Router pins a session to one backend only when it can read
-        // a session id, and it reads exactly one place: metadata.session_id,
-        // which the proxy fills from x-litellm-trace-id / x-litellm-session-id.
-        // The id inside x-litellm-spend-logs-metadata above is a JSON blob the
-        // router never looks at, so without this header session_affinity is
-        // configured but inert and the backend can change mid-conversation --
-        // which is what breaks Anthropic thinking replay and the prompt cache.
-        "x-litellm-session-id": sessionId || "",
-        // Tells LiteLLM gateway to auto-mark longest cacheable prefix with
-        // cache_control. Cuts TTFT for follow-up turns from 90s+ to a few
-        // seconds and avoids tripping the idle-stream watchdog above.
-        "x-auto-prompt-caching": "true",
-      },
+      defaultHeaders: anthropicDefaultHeaders({ litellmTags, litellmMeta, userId, sessionId }),
     });
 
-    return {
-      streamTurn: (messages, tools, signal) =>
-        streamingTurn(
-          client,
-          model,
-          messages as unknown as MessageParam[],
-          tools as unknown as AnthropicTool[],
-          signal,
-          capture,
-        ),
+    return buildAnthropicSession(client, model, capture);
+  }
+}
+
+/**
+ * The session, over a client someone else built.
+ *
+ * Split out so a test can drive a stub client and read the request body that
+ * actually goes on the wire. Nothing in this repo could do that before, which
+ * is how a header everybody believed was enabling prompt caching ran for two
+ * years without one request ever carrying a breakpoint. The seam the loop
+ * tests use (`LoopOptions.llmSession`) sits above the provider and cannot see
+ * a body at all.
+ */
+export function buildAnthropicSession(
+  client: Anthropic,
+  model: string,
+  capture: RoutedModelSink = {},
+): LlmSession {
+  const cacheState: SessionCacheState = { disabled: false, decoratedFailures: 0 };
+  return {
+    streamTurn: (messages, tools, signal) =>
+      streamingTurn(
+        client,
+        model,
+        messages as unknown as MessageParam[],
+        tools as unknown as AnthropicTool[],
+        signal,
+        capture,
+        cacheState,
+      ),
       async complete(systemPrompt, userText, maxTokens) {
         const resp = await client.messages.create({
           model,
@@ -266,6 +427,5 @@ export class AnthropicProvider implements LlmProvider {
         if (!text) throw new Error("completion returned empty text");
         return text;
       },
-    };
-  }
+  };
 }

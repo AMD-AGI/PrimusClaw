@@ -43,6 +43,43 @@ export interface LlmTurnResult {
   /** Backend that served this turn, as the gateway or the upstream reported
    *  it. Absent when neither named a model. */
   routedModel?: string;
+  /**
+   * What this turn did about prompt caching, for metering only.
+   *
+   * Deliberately here and not inside `LlmTurnUsage`. That type is accumulated
+   * into `TokenUsage`, which the loop spreads into the version-3 checkpoint
+   * through an unvalidated `{...state}`, then out through ResultMessage, the
+   * agent_done callback and `claw_tasks.token_usage` to clients. A new key
+   * there arrives `undefined` from any checkpoint written before it existed,
+   * and `+=` turns that into NaN on the far side of a resume. This one dies in
+   * `runTurn`.
+   *
+   * Optional rather than required: `test/` is outside the tsconfig include and
+   * tsx erases types, so a required field would not break the existing session
+   * doubles -- they would silently supply nothing and the metric would read as
+   * a real zero.
+   */
+  cacheReport?: LlmCacheReport;
+}
+
+export interface LlmCacheReport {
+  /** Markers counted off the request body that was actually sent. */
+  breakpointsSent: number;
+  /** False once a session has given up on markers after a gateway rejection. */
+  enabled: boolean;
+  /**
+   * Which usage numbers this provider can actually speak to.
+   *
+   * The Anthropic path reports both. The OpenAI path never assigns
+   * `cache_create` at all, so reporting its structural zero as an observation
+   * is how "we cannot see writes" gets averaged into a dashboard as "there
+   * were no writes" -- the exact shape of the incident this exists to catch.
+   */
+  reported: ReadonlyArray<"cache_read" | "cache_create">;
+  /** Write split by lifetime, when the gateway reports it. A 1h marker that
+   *  comes back as a 5m write is a silent downgrade worth seeing. */
+  createdEphemeral5m?: number;
+  createdEphemeral1h?: number;
 }
 
 /**
