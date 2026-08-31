@@ -25,6 +25,7 @@ import type { Message, ToolSchema } from "@claw/protocol";
 import type { LlmSession, LlmTurnResult } from "../src/llm/provider.js";
 import type { ToolRouter } from "../src/tools/router.js";
 import type { CheckpointState } from "../src/agent/index.js";
+import { registry } from "../src/infra/metrics.js";
 
 process.env.COMPACTION_TRIGGER_INPUT_TOKENS = "1000";
 const { agentLoop } = await import("../src/agent/agent-loop.js");
@@ -91,6 +92,13 @@ function resume(messages: Message[]): CheckpointState {
     text_parts: [], error_count: 0, tool_calls_by_name: {}, total_tool_calls: 0,
     elapsed_ms_before: 0, setup_commands: [],
   };
+}
+
+async function compactionCount(result: string): Promise<number> {
+  const m = registry.getSingleMetric("claw_brain_compaction_total");
+  if (!m) return NaN;                       // unregistered: invisible on /metrics
+  const v = await m.get();
+  return v.values.find((x: any) => x.labels?.result === result)?.value ?? 0;
 }
 
 const compacted = (events: Ev[]) =>
@@ -223,4 +231,44 @@ test("a history led by a system message compacts, keeping the system run at the 
   assert.equal(next[0].role, "system");
   assert.equal(next[1].role, "user", "the original prompt is preserved too");
   assert.ok(JSON.stringify(next).includes("COMPACTED-SUMMARY"));
+});
+
+test("a summariser failure is reported as failed, not as a no-op", async () => {
+  // The caller used to infer the outcome from array identity, which cannot
+  // tell "nothing to compact" from "compaction broke" -- both come back as the
+  // same array. That made result="failed" a metric value no production line
+  // could emit, and a counter that cannot report the bad case is worse than no
+  // counter at all.
+  const before = await compactionCount("failed");
+  const s = session(
+    [
+      { usage: { input_tokens: 6, output_tokens: 10, cache_read: 2_000, cache_create: 0 },
+        promptTokens: 2_006, stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "x", name: "read", input: {} }] },
+      { usage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0 },
+        promptTokens: 1, stopReason: "end_turn" },
+    ],
+    async () => { throw new Error("summariser down"); },
+  );
+  const { o, events } = opts({ llmSession: s, resumeFrom: resume(longHistory({ role: "user", content: "go" })) });
+
+  await agentLoop([], [] as ToolSchema[], o);
+  assert.equal(compacted(events).length, 0, "and it must not claim it happened");
+  assert.equal(await compactionCount("failed"), before + 1);
+});
+
+test("a turn with nothing worth compacting is reported as a no-op, not a failure", async () => {
+  const before = { noop: await compactionCount("noop"), failed: await compactionCount("failed") };
+  const s = session([
+    { usage: { input_tokens: 2_006, output_tokens: 10, cache_read: 0, cache_create: 0 },
+      promptTokens: 2_006, stopReason: "tool_use",
+      content: [{ type: "tool_use", id: "x", name: "read", input: {} }] },
+    { usage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0 },
+      promptTokens: 1, stopReason: "end_turn" },
+  ]);
+  // Too short for COMPACTION_MIN_MESSAGES, so there is nothing to do.
+  const { o } = opts({ llmSession: s, resumeFrom: resume([{ role: "user", content: "go" }]) });
+  await agentLoop([], [] as ToolSchema[], o);
+  assert.equal(await compactionCount("noop"), before.noop + 1);
+  assert.equal(await compactionCount("failed"), before.failed, "a no-op must not read as a failure");
 });

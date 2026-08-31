@@ -1026,6 +1026,22 @@ class AgentLoopRunner {
     this.usage.cache_create += turnUsage.cache_create;
     this.usage.turns++;
 
+    // Cache accounting, per turn. Before this, the only place cache_read and
+    // cache_create reached anybody was the terminal ResultMessage -- and the
+    // long-running monitor sessions that this cost the most never reach one,
+    // so Brain was structurally blind to its own headline number for the exact
+    // workload that broke.
+    const cacheReport = streamResult.cacheReport;
+    metrics.onLlmTurnCache({
+      inputTokens: turnUsage.input_tokens,
+      outputTokens: turnUsage.output_tokens,
+      cacheRead: turnUsage.cache_read,
+      cacheCreate: turnUsage.cache_create,
+      breakpointsSent: cacheReport?.breakpointsSent ?? 0,
+      enabled: cacheReport?.enabled ?? false,
+      reported: cacheReport?.reported ?? [],
+    });
+
     // Per-turn token stats + output throughput
     const turnElapsedMs = Date.now() - turnStart;
     const generationMs = turnElapsedMs - (firstByteMs || 0);
@@ -1041,6 +1057,11 @@ class AgentLoopRunner {
       cumulative_input_tokens: this.usage.input_tokens,
       cumulative_output_tokens: this.usage.output_tokens,
       cumulative_turns: this.usage.turns,
+      turn_cache_read_tokens: turnUsage.cache_read,
+      turn_cache_create_tokens: turnUsage.cache_create,
+      cumulative_cache_read_tokens: this.usage.cache_read,
+      cumulative_cache_create_tokens: this.usage.cache_create,
+      cache_breakpoints_sent: cacheReport?.breakpointsSent ?? 0,
       avg_output_tps: Math.round(avgOutputTps * 10) / 10,
       ...(routedModel ? { routed_model: routedModel } : {}),
     };
@@ -1179,8 +1200,10 @@ class AgentLoopRunner {
       this.compactionRound++;
       const outcome = await compactConversation(this.session, this.workingMessages, this.sessionId, this.compactionRound, turn);
       const compacted = outcome.messages;
-      // Read the status rather than re-deriving it from array identity: that
-      // inference cannot tell a summariser failure from "nothing to compact".
+      // The status is reported, not inferred. Deriving it from array identity
+      // cannot tell a summariser failure from "nothing to compact", which left
+      // result="failed" a value no production line could ever emit.
+      metrics.onCompaction(outcome.status);
       if (outcome.status === "compacted") {
         this.workingMessages.length = 0;
         this.workingMessages.push(...compacted);

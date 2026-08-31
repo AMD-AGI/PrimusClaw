@@ -18,6 +18,7 @@ import {
   wrapFetchCaptureRoutedModel,
   type RoutedModelSink,
 } from "./routed-model.js";
+import { metrics } from "../infra/metrics.js";
 import pino from "pino";
 
 const logger = pino({ name: "anthropic-provider" });
@@ -158,6 +159,7 @@ async function streamingTurn(
       cacheState.disabled = true;
       cacheState.decoratedFailures = 0;
       breakpointsSent = 0;
+      metrics.onLlmCacheDisabled();
       logger.error({ model }, "llm.cache_control.disabled_for_session");
     } catch (bareErr) {
       // Deliberately does NOT reset decoratedFailures. That attempt did fail
