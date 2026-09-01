@@ -7,6 +7,7 @@ import {
   TASK_MAX_DELIVER, TASK_MAX_ACK_PENDING,
   BRAIN_REGISTRY_TTL_MS,
   BRAIN_REGISTRY_REPLICAS, BRAIN_CHECKPOINTS_REPLICAS, SYSTEM_ENV_REPLICAS,
+  TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS,
 } from "../config.js";
 import {
   TASK_CONSUMER_ACK_WAIT_NS, TASK_CONSUMER_NAME, TASK_STREAM_NAME,
@@ -202,7 +203,10 @@ export async function initNats(): Promise<void> {
   js = nc.jetstream();
   jsm = await nc.jetstreamManager();
 
-  await ensureStream(jsm, EVENT_STREAM, ["events.>"], EVENT_STREAM_RETENTION_MS * 1_000_000);
+  await ensureStream(
+    jsm, EVENT_STREAM, ["events.>"], EVENT_STREAM_RETENTION_MS * 1_000_000,
+    0, EVENT_STREAM_REPLICAS,
+  );
   // Read back here, ahead of the bucket that is sized from it, because no later
   // start corrects a bucket sized from the constant instead. What would be wrong
   // is the desired value: every start would compute the same too-short TTL, find
@@ -224,7 +228,9 @@ export async function initNats(): Promise<void> {
   // second time. The default is two minutes, which is shorter than a single
   // redelivery.
   const taskRetentionNs = resolveTaskStreamMaxAgeNs(TASK_MAX_DELIVER);
-  await ensureStream(jsm, TASK_STREAM, ["tasks.>"], taskRetentionNs, taskRetentionNs);
+  await ensureStream(
+    jsm, TASK_STREAM, ["tasks.>"], taskRetentionNs, taskRetentionNs, TASK_STREAM_REPLICAS,
+  );
   await ensureTaskConsumer();
 
   const buckets = await ensureKvBuckets(eventRetention);
@@ -389,7 +395,8 @@ export async function ensureStream(
   name: string,
   subjects: string[],
   maxAgeNs: number,
-  duplicateWindowNs = 0,
+  duplicateWindowNs: number,
+  replicas: number,
 ): Promise<void> {
   let existing: Awaited<ReturnType<JetStreamManager["streams"]["info"]>> | null = null;
   try {
@@ -410,13 +417,29 @@ export async function ensureStream(
     if (duplicateWindowNs && existing.config.duplicate_window < duplicateWindowNs) {
       widened.duplicate_window = duplicateWindowNs;
     }
+    // Replicas are reconciled to the exact figure rather than only widened,
+    // which is the rule the KV buckets have always followed, and safe here for
+    // the reason it is safe there: changing a replica count moves copies of the
+    // log between servers, it never drops a message. The direction that matters
+    // is up. A stream created before this argument existed sits at one replica
+    // and nothing else in the process would ever raise it, so without this the
+    // fix would hold only for clusters provisioned after it, and the streams
+    // that actually broke would stay broken until someone edited them by hand.
+    if (existing.config.num_replicas !== replicas) {
+      widened.num_replicas = replicas;
+    }
     if (Object.keys(widened).length) {
       await mgr.streams.update(name, widened as Parameters<
         JetStreamManager["streams"]["update"]
       >[1]);
       logger.warn(
-        { name, widened, wasMaxAgeNs: existing.config.max_age },
-        "nats.stream_retention_widened",
+        {
+          name,
+          widened,
+          wasMaxAgeNs: existing.config.max_age,
+          wasReplicas: existing.config.num_replicas,
+        },
+        "nats.stream_config_reconciled",
       );
     }
     return;
@@ -428,6 +451,7 @@ export async function ensureStream(
       storage: StorageType.File,
       max_age: maxAgeNs,
       retention: RetentionPolicy.Limits,
+      num_replicas: replicas,
       ...(duplicateWindowNs ? { duplicate_window: duplicateWindowNs } : {}),
     });
   } catch (err: unknown) {

@@ -208,9 +208,24 @@ export const BRAIN_REGISTRY_TTL_MS = envInt(
 // mode with "replicas > 1 not supported in non-clustered mode" (err 10074), so
 // the API died provisioning its first bucket and no README said why. The floor
 // is 1 rather than 0 because a bucket with no replicas is not a bucket.
-export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", 3, { min: 1 });
-export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", 3, { min: 1 });
-export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", 3, { min: 1 });
+//
+// NATS_REPLICAS is the deployment-wide default the rest fall back to, so a
+// single-node dev server needs one variable rather than one per object. Each
+// object keeps its own override: they were the existing names, and a cluster
+// that wants the event stream wider than the registry can still say so.
+export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
+export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS, { min: 1 });
+export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", NATS_REPLICAS, { min: 1 });
+export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", NATS_REPLICAS, { min: 1 });
+// The two streams, which had no replica setting at all and so were created at
+// the JetStream default of 1. A single-replica stream lives on exactly one
+// server: when that server's pod went away on 2026-09-01 nothing was hosting
+// `tasks.>`, every `js.publish` came back NO_RESPONDERS -- which the client
+// reports as the bare code "503" -- and the API turned that into a 503 on
+// POST /sessions for four and a half hours. Quorum was never the problem;
+// a stream with one replica does not have a quorum to lose.
+export const TASK_STREAM_REPLICAS = envInt("TASK_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
+export const EVENT_STREAM_REPLICAS = envInt("EVENT_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
 // Bounded the way brain bounds the same two variables, because unbounded on one
 // side of a shared setting is what lets one variable mean two things:
 // `RUN_LEASE_TTL_MS=0` is refused there and taken literally here, and the zero

@@ -45,7 +45,7 @@ import {
 const HOUR_NS = 3600 * 1_000_000_000;
 const HOUR_MS = 3600 * 1000;
 
-interface StreamConfig { max_age: number; duplicate_window: number }
+interface StreamConfig { max_age: number; duplicate_window: number; num_replicas: number }
 
 /**
  * A manager holding one stream, or none. Recording the calls rather than the
@@ -82,9 +82,9 @@ test("a stream kept for longer than the code requires is left as it is", async (
   // The audit window case. The code knows a lower bound the stream has to
   // satisfy and nothing about why an operator went above it; narrowing it back
   // deletes everything past the new window on the spot.
-  const { mgr, updates } = manager({ max_age: 30 * 24 * HOUR_NS, duplicate_window: 0 });
+  const { mgr, updates } = manager({ max_age: 30 * 24 * HOUR_NS, duplicate_window: 0, num_replicas: 3 });
 
-  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS, 0, 3);
 
   assert.deepEqual(updates, [],
     "a start that shortens a retention is a start that deletes history");
@@ -94,17 +94,17 @@ test("a retention that never expires is not read as the narrowest one", async ()
   // NATS spells "keep forever" as max_age = 0, which is the widest setting
   // there is and the smallest number, so a numeric comparison cuts exactly the
   // stream an operator was most deliberate about back to hours.
-  const { mgr, updates } = manager({ max_age: 0, duplicate_window: 0 });
+  const { mgr, updates } = manager({ max_age: 0, duplicate_window: 0, num_replicas: 3 });
 
-  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS, 0, 3);
 
   assert.deepEqual(updates, []);
 });
 
 test("a stream too narrow for the redelivery budget is widened", async () => {
-  const { mgr, updates } = manager({ max_age: HOUR_NS, duplicate_window: HOUR_NS });
+  const { mgr, updates } = manager({ max_age: HOUR_NS, duplicate_window: HOUR_NS, num_replicas: 3 });
 
-  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
 
   assert.deepEqual(updates, [{ max_age: 2 * HOUR_NS, duplicate_window: 2 * HOUR_NS }],
     "this is the drift the reconciliation exists for: at the old flat hour the "
@@ -115,9 +115,9 @@ test("a duplicate window already longer than required is kept", async () => {
   // A longer window only recognises more replays as replays, which is the safe
   // direction: it is what stops a drain that failed after publishing from
   // running the same turn twice.
-  const { mgr, updates } = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS });
+  const { mgr, updates } = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS, num_replicas: 3 });
 
-  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
 
   assert.deepEqual(updates, []);
 });
@@ -125,14 +125,65 @@ test("a duplicate window already longer than required is kept", async () => {
 test("a stream that does not exist yet is created with what the code asked for", async () => {
   const { mgr, updates, added } = manager(null);
 
-  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
 
   assert.equal(added.length, 1);
   assert.equal(added[0].name, "PRIMUS_CLAW_TASKS");
   assert.deepEqual(added[0].subjects, ["tasks.>"]);
   assert.equal(added[0].max_age, 2 * HOUR_NS);
   assert.equal(added[0].duplicate_window, 2 * HOUR_NS);
+  assert.equal(added[0].num_replicas, 3,
+    "a stream added without this field is added at the JetStream default of 1");
   assert.deepEqual(updates, [], "nothing existed to reconcile");
+});
+
+// ===== replicas =====
+
+test("a stream left at one replica is raised to the configured count", async () => {
+  // The 2026-09-01 outage in one assertion. PRIMUS_CLAW_TASKS was created
+  // before `ensureStream` took a replica count, so it lived on exactly one
+  // server; when that server's pod went away nothing was hosting `tasks.>`,
+  // `js.publish` came back NO_RESPONDERS -- reported as the bare code "503" --
+  // and every POST /sessions failed for four and a half hours. Reconciling on
+  // start is what makes the fix reach clusters that already exist.
+  const { mgr, updates } = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS, num_replicas: 1 });
+
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
+
+  assert.deepEqual(updates, [{ num_replicas: 3 }],
+    "retention was already wide enough, so replicas are the only correction");
+});
+
+test("a replica count already correct is not rewritten", async () => {
+  const { mgr, updates } = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS, num_replicas: 3 });
+
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
+
+  assert.deepEqual(updates, []);
+});
+
+test("a single-node cluster is left at one replica rather than asked for three", async () => {
+  // NATS_REPLICAS=1 is how the local quick start survives: JetStream answers a
+  // replicas>1 request in non-clustered mode with err 10074, so a start-up that
+  // insisted on three here would die exactly where the KV buckets used to.
+  const { mgr, updates, added } = manager(null);
+
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 1);
+
+  assert.equal(added[0].num_replicas, 1);
+  assert.deepEqual(updates, []);
+});
+
+test("a narrow retention and a lone replica are corrected in one update", async () => {
+  // Both drifts travel in the same `streams.update`, so a cluster carrying both
+  // is not left half-reconciled by a start that fails between two calls.
+  const { mgr, updates } = manager({ max_age: HOUR_NS, duplicate_window: HOUR_NS, num_replicas: 1 });
+
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
+
+  assert.deepEqual(updates, [
+    { max_age: 2 * HOUR_NS, duplicate_window: 2 * HOUR_NS, num_replicas: 3 },
+  ]);
 });
 
 test("a stream created without a duplicate window does not get one", async () => {
@@ -140,7 +191,7 @@ test("a stream created without a duplicate window does not get one", async () =>
   // for a publish path that carries no message ids.
   const { mgr, added } = manager(null);
 
-  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS);
+  await ensureStream(mgr, "PRIMUS_CLAW_EVENTS", ["events.>"], 24 * HOUR_NS, 0, 3);
 
   assert.equal("duplicate_window" in added[0], false);
 });
@@ -152,7 +203,7 @@ test("the retention read back is the one the stream has, not the one the code wa
   // alone, so on a cluster kept for a month the constant is a month out of date --
   // and the tombstone TTL derived from it expires while the events it answers for
   // are still being delivered.
-  const { mgr } = manager({ max_age: 30 * 24 * HOUR_NS, duplicate_window: 0 });
+  const { mgr } = manager({ max_age: 30 * 24 * HOUR_NS, duplicate_window: 0, num_replicas: 3 });
 
   assert.deepEqual(
     await readEventStreamRetentionMs(mgr),
@@ -164,7 +215,7 @@ test("a stream that never expires is reported as having no retention at all", as
   // Not as zero milliseconds, which is what a number would have to mean here and
   // is the opposite of what NATS spells with it. A caller sizing a TTL has to be
   // able to tell "no window" from "an empty window".
-  const { mgr } = manager({ max_age: 0, duplicate_window: 0 });
+  const { mgr } = manager({ max_age: 0, duplicate_window: 0, num_replicas: 3 });
 
   assert.deepEqual(await readEventStreamRetentionMs(mgr), { retentionMs: null, measured: true });
 });

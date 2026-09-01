@@ -21,6 +21,7 @@ import type { JetStreamClient, KV } from "nats";
 import { StringCodec } from "nats";
 import { DagHandleMap, type HandleInfo } from "@claw/protocol";
 import { natsKvStore, type NatsLikeKv } from "@claw/utils";
+import { DAG_HANDLES_REPLICAS } from "../config.js";
 import pino from "pino";
 
 const logger = pino({ name: "dag-handles" });
@@ -36,7 +37,15 @@ export async function initDagHandles(js: JetStreamClient): Promise<DagHandleMap>
   if (_map) return _map;
   // No TTL by default: DAG handles live as long as their owning DAG, which
   // can be hours for long-running KA evaluations. Sweeper destroys orphans.
-  _kvBucket = await js.views.kv(BUCKET);
+  //
+  // The replica count has to be passed on this first call, because that is the
+  // only one that creates anything: `views.kv` on a bucket that already exists
+  // attaches to it and ignores the options, so a bucket first opened without
+  // them keeps the JetStream default of one replica for the life of the
+  // cluster. Correcting that drift needs a JetStreamManager, which this
+  // package does not hold; the API side does it for the buckets it owns in
+  // `ensureKvBucket`.
+  _kvBucket = await js.views.kv(BUCKET, { replicas: DAG_HANDLES_REPLICAS });
   const adapter: NatsLikeKv = {
     async get(key) {
       const entry = await _kvBucket!.get(key);
