@@ -2093,6 +2093,16 @@ class TaskRunner {
         { sessionId: this.sessionId, messageId: this.messageId },
         "s3.sync_skipped_no_sandbox",
       );
+    } else if (this.request.workspace_throwaway === true) {
+      // The task declared its workspace throwaway -- it has already delivered
+      // its output somewhere of its own -- so this run publishes nothing. The
+      // prune is skipped with the upload, on purpose: pruning against a tree we
+      // never uploaded would delete the last durable copy of whatever an
+      // earlier, non-throwaway run of this session left in S3.
+      logger.info(
+        { sessionId: this.sessionId, messageId: this.messageId },
+        "s3.sync_skipped_workspace_throwaway",
+      );
     } else {
       logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
       try {
@@ -2376,6 +2386,13 @@ class TaskRunner {
             "task.sigterm.workspace_sync_failed");
         }
       }
+      // Deliberately NOT gated on workspace_throwaway, unlike the terminal sync
+      // above. The two calls share code and share nothing else: the terminal one
+      // publishes a finished run's output, which a throwaway task has already
+      // delivered elsewhere, so it is pure duplication. This one is the only
+      // thing that lets a preempted run pick up where it stopped -- skipping it
+      // would not save a copy of anything, it would discard work in flight.
+      //
       // Fall back to S3 whenever the shared-filesystem sync did not happen.
       // This guard used to be the only one, so with WORKSPACE_PERSIST_BASE
       // unset — the default, in code and in the Helm values alike — a SIGTERM

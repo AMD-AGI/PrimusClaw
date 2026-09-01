@@ -57,6 +57,7 @@ export interface InsertTaskParams {
   origin?: RunOrigin;
   /** Which workspace the run's files live in, so ownership is recorded not guessed. */
   workspace_id?: string | null;
+  workspace_throwaway?: boolean;
 }
 
 /**
@@ -89,14 +90,14 @@ export async function insertTask(
        name, input, prompt, script, depends_on, priority,
        executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
        sandbox_spec, callback_url, backend_mcp_url, internal_token_hash,
-       status, metadata, origin, workspace_id, queued_at, started_at, deadline_at
+       status, metadata, origin, workspace_id, workspace_throwaway, queued_at, started_at, deadline_at
      ) VALUES (
        $1, $2, $3, $4,
        $5, $6, $7, $8,
        $9, $10::jsonb, $11, $12::jsonb, $13, $14,
        $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21::jsonb,
        $22::jsonb, $23, $24, $25,
-       $26, $27::jsonb, $28, $29,
+       $26, $27::jsonb, $28, $29, $32,
        CASE WHEN $26::text IN ('queued','preparing') THEN NOW() END,
        CASE WHEN $26::text = 'preparing' THEN NOW() END,
        CASE WHEN $26::text = 'preparing' THEN ${deadlineAtInsertSql({
@@ -135,6 +136,7 @@ export async function insertTask(
       p.workspace_id ?? null,
       RUN_BUDGET_DEFAULT_SEC.chat,
       RUN_BUDGET_DEFAULT_SEC.dag_node,
+      p.workspace_throwaway ?? false,
     ],
   );
   return r.rows[0] as ClawTaskRow;

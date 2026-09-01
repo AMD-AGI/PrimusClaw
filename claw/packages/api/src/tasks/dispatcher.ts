@@ -374,6 +374,7 @@ function buildExecuteRequest(opts: {
     backend_mcp_url: updated.backend_mcp_url ?? undefined,
     backend_internal_token: internalToken,
     mode: (updated.mode as "llm" | "script") ?? "llm",
+    workspace_throwaway: updated.workspace_throwaway === true ? true : undefined,
     sandbox_spec: sandboxSpecForBrain,
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",

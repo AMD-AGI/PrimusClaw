@@ -262,6 +262,9 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
 
   // 1. Structural.
   const idSet = new Set<string>();
+  if (dag.workspace_throwaway !== undefined && typeof dag.workspace_throwaway !== "boolean") {
+    throw new BadRequestError("workspace_throwaway must be a boolean");
+  }
   for (const n of dag.nodes) {
     if (!n || typeof n !== "object") throw new BadRequestError("each node must be an object");
     if (!n.id || typeof n.id !== "string") throw new BadRequestError("each node must have a string id");
@@ -270,6 +273,9 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
     if (n.executor !== "brain") throw new BadRequestError(`node ${n.id}: executor must be 'brain'`);
     if (n.mode !== "llm" && n.mode !== "script") {
       throw new BadRequestError(`node ${n.id}: mode must be 'llm' or 'script'`);
+    }
+    if (n.workspace_throwaway !== undefined && typeof n.workspace_throwaway !== "boolean") {
+      throw new BadRequestError(`node ${n.id}: workspace_throwaway must be a boolean`);
     }
   }
   for (const n of dag.nodes) {

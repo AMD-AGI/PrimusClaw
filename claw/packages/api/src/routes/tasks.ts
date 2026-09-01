@@ -66,6 +66,12 @@ interface CreateTaskBody {
   plugin_id?: number;
   input?: Record<string, unknown>;
   prompt?: string;
+  /**
+   * Skip the post-run /workspace upload: this task has already delivered its
+   * output somewhere of its own. Only honoured on the single-task path -- a DAG
+   * declares it on the template, per node or for all of them.
+   */
+  workspace_throwaway?: boolean;
 }
 
 async function requireSessionAccess(
@@ -162,6 +168,7 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
           input: body.input ?? {},
           prompt: body.prompt,
           mode: "llm",
+          workspace_throwaway: body.workspace_throwaway === true,
           sandbox_spec: plugin
             ? { handle: "main", image: plugin.image, resources: plugin.resource }
             : "none",

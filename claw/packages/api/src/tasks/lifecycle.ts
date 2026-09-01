@@ -281,7 +281,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
         input, prompt, script, depends_on, priority,
         executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
         sandbox_spec, callback_url, backend_mcp_url,
-        status, metadata)
+        status, metadata, workspace_throwaway)
      SELECT $1, session_id, task_id, batch_id,
             dag_id, dag_node_id, dag_root_task_id, plugin_id, name,
             input, prompt, script, depends_on, priority,
@@ -293,7 +293,10 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             replace(callback_url,    task_id, $1),
             replace(backend_mcp_url, task_id, $1),
             CASE WHEN coalesce(array_length(depends_on,1),0) = 0 THEN 'queued' ELSE 'waiting_deps' END,
-            metadata
+            metadata,
+            -- carried, not defaulted: a retry of a task that declared its
+            -- workspace throwaway must not start uploading it.
+            workspace_throwaway
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );

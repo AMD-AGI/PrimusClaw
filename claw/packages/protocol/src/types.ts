@@ -311,6 +311,27 @@ export interface ExecuteRequest {
     post?: Array<{ type: "tool"; name: string; args: Record<string, unknown> }>;
   };
 
+  /**
+   * This run's workspace is throwaway: do not upload it when the run ends.
+   *
+   * Off by default, and deliberately per-task rather than per-mode. With
+   * `WORKSPACE_PERSIST_BASE` unset -- the default in code and in the shipped Helm
+   * values alike -- S3 is the only durable copy of a workspace, so opting out
+   * means the next sandbox in this session rehydrates without these files and the
+   * file browser shows nothing for the run. That is right for a task that has
+   * already delivered its output somewhere else and wrong for almost everything
+   * else, which is why it is a declaration rather than a default.
+   *
+   * The immediate case: a Kernel Arena run uploads its own report to a presigned
+   * URL of its own, so syncing the whole tree afterwards copies gigabytes a second
+   * time to a prefix nobody reads.
+   *
+   * Note it also skips the prune, so files this run deleted stay in S3 and come
+   * back on the next rehydrate. For a throwaway workspace that is nothing; for
+   * anything else it is the second reason not to set this.
+   */
+  workspace_throwaway?: boolean;
+
   // ── mode=script payload ───────────────────────────────────────────────
   script?: ScriptStep[];
 

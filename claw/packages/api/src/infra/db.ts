@@ -1026,6 +1026,11 @@ export async function initDb(): Promise<void> {
     // and is empty for an OOM -- which is the ending exit code 137 alone cannot
     // tell from an eviction or a deliberate stop.
     await addTaskCol("platform_container_reason", "TEXT");
+    // Declared by a task whose workspace is throwaway -- it has already delivered
+    // its output somewhere else, so uploading the tree afterwards copies it a
+    // second time to a prefix nobody reads. Default false: with the shared-disk
+    // sync off by default, S3 is the only durable copy of a workspace.
+    await addTaskCol("workspace_throwaway", "BOOLEAN NOT NULL DEFAULT FALSE");
     // How many times a doorbell run has been claimed. The poison delivery
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.
