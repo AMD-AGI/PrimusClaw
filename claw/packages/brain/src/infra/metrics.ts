@@ -256,6 +256,18 @@ const llmCacheDisabledTotal = new Counter({
   help: "Sessions that stopped sending cache markers after the gateway rejected them.",
   registers: [registry],
 });
+// Turns whose prompt size nobody could measure.
+//
+// Compaction is the only context-size guard here and it needs a number to
+// compare. A provider that reports no usage leaves the run with that guard
+// silently absent, which is indistinguishable from a healthy run until the
+// context window rejects a request. Rising here means some route is flying
+// blind.
+const promptSizeUnknownTotal = new Counter({
+  name: "claw_brain_prompt_size_unknown_total",
+  help: "Turns where no provider reported a prompt size, leaving compaction with nothing to compare.",
+  registers: [registry],
+});
 const compactionTotal = new Counter({
   name: "claw_brain_compaction_total",
   help: "Auto-compaction attempts by result.",
@@ -494,6 +506,9 @@ export const metrics = {
           ? "write"
           : "miss";
     llmCacheTurnsTotal.inc({ state });
+  },
+  onPromptSizeUnknown(): void {
+    promptSizeUnknownTotal.inc();
   },
   onLlmCacheDisabled(): void {
     llmCacheDisabledTotal.inc();

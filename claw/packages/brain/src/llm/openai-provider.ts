@@ -156,6 +156,7 @@ async function streamingTurn(
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
   let bodyModel: string | undefined;
+  let sawUsage = false;
 
   try {
     for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
@@ -167,6 +168,7 @@ async function streamingTurn(
       // Only present (non-null) on the final chunk when stream_options.
       // include_usage=true — see openai SDK ChatCompletionChunk docs.
       if (chunk.usage) {
+        sawUsage = true;
         usage.input_tokens = chunk.usage.prompt_tokens ?? 0;
         usage.output_tokens = chunk.usage.completion_tokens ?? 0;
         usage.cache_read = (chunk.usage as any).prompt_tokens_details?.cached_tokens ?? 0;
@@ -259,7 +261,13 @@ async function streamingTurn(
     // input_tokens, which reports only the uncached remainder. Adding the
     // cache fields on top here would double-count and halve the effective
     // compaction threshold on this path.
-    promptTokens: usage.input_tokens,
+    //
+    // `undefined` rather than 0 when no usage arrived at all, for the reason
+    // spelled out in the Anthropic provider: a gateway that omits usage would
+    // otherwise pin the compaction trigger at zero for the whole run.
+    // stream_options.include_usage is requested, but not every
+    // OpenAI-compatible gateway honours it.
+    promptTokens: sawUsage ? usage.input_tokens : undefined,
     cacheReport: {
       // No markers are rendered on this path: toOpenAiMessages is not a 1:1
       // mapping (a tool_result message fans out into N role:"tool" messages)

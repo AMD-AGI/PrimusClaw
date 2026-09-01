@@ -195,6 +195,7 @@ async function streamingTurn(
   const toolJsonBuf: Map<number, string> = new Map();
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
+  let sawUsage = false;
   let created5m: number | undefined;
   let created1h: number | undefined;
   let bodyModel: string | undefined;
@@ -209,6 +210,7 @@ async function streamingTurn(
           bodyModel = evt.message.model || bodyModel;
           const u = evt.message.usage;
           if (u) {
+            sawUsage = true;
             usage.input_tokens = u.input_tokens ?? 0;
             usage.cache_create = u.cache_creation_input_tokens ?? 0;
             usage.cache_read = u.cache_read_input_tokens ?? 0;
@@ -315,7 +317,18 @@ async function streamingTurn(
     }),
     // Anthropic's input_tokens is the uncached remainder; the whole prompt is
     // the three added together.
-    promptTokens: usage.input_tokens + usage.cache_read + usage.cache_create,
+    // `undefined`, not 0, when the response carried no usage at all.
+    //
+    // A missing number and a real zero are different facts, and the caller's
+    // `?? input_tokens` fallback cannot separate them: 0 is not nullish, so a
+    // usage-less turn would pin the compaction trigger at zero and leave that
+    // entire run with no context guard -- growing until the model rejects the
+    // request with a 400 that streamTurnWithRetry does not retry. Compaction
+    // is the only such guard in Brain, so "we do not know how big this prompt
+    // was" must not read as "it was empty".
+    promptTokens: sawUsage
+      ? usage.input_tokens + usage.cache_read + usage.cache_create
+      : undefined,
     cacheReport: {
       breakpointsSent,
       enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,

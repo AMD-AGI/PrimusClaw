@@ -592,6 +592,8 @@ class AgentLoopRunner {
    */
   private recoveryRefusal: { kind: string; used: number; max: number } | null = null;
   private compactionRound = 0;
+  /** Set once per turn, before any early return, so compaction reads one number. */
+  private promptTokensThisTurn = 0;
 
   // Throttle for sandboxStatus event emission. Key = `${status}:${tool||""}`,
   // value = last emit timestamp (ms). Only high-frequency statuses pass a
@@ -1031,6 +1033,20 @@ class AgentLoopRunner {
     // long-running monitor sessions that this cost the most never reach one,
     // so Brain was structurally blind to its own headline number for the exact
     // workload that broke.
+    // How big was this prompt? A provider that reports nothing is a different
+    // fact from one reporting zero, and `??` cannot separate them because 0 is
+    // not nullish. It matters because compaction is the only context-size
+    // guard here: with no number to compare, the guard cannot fire and the run
+    // continues with nothing watching it -- indistinguishable from a healthy
+    // run until the context window rejects a request. Recorded before the
+    // end_turn return below, because the measurement is true of every turn,
+    // not only the ones that continue.
+    this.promptTokensThisTurn = streamResult.promptTokens ?? turnUsage.input_tokens;
+    if (streamResult.promptTokens === undefined && turnUsage.input_tokens === 0) {
+      metrics.onPromptSizeUnknown();
+      logger.warn({ turn, sessionId: this.sessionId, routedModel }, "agent-loop.prompt_size_unknown");
+    }
+
     const cacheReport = streamResult.cacheReport;
     metrics.onLlmTurnCache({
       inputTokens: turnUsage.input_tokens,
@@ -1200,7 +1216,7 @@ class AgentLoopRunner {
     // rejection is a 400, which streamTurnWithRetry does not retry — so with
     // markers on and this reading input_tokens, a twelve-hour run would grow
     // unchecked to the 1M window and die there. The two must never ship apart.
-    const promptTokens = streamResult.promptTokens ?? turnUsage.input_tokens;
+    const promptTokens = this.promptTokensThisTurn;
     if (this.depth === 0 && promptTokens > COMPACTION_TRIGGER_INPUT_TOKENS) {
       const before = this.workingMessages.length;
       this.compactionRound++;
