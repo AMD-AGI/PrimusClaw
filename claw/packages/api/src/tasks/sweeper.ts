@@ -19,6 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { db } from "../infra/db.js";
+import { backfillPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import { interruptSubject } from "@claw/protocol";
@@ -161,7 +162,7 @@ export async function reapStaleTasks(): Promise<number> {
             AND started_at IS NOT NULL
             AND started_at < NOW() - ($1::int * INTERVAL '1 second'))
        )
-     RETURNING task_id, session_id, dag_root_task_id, deadline_at`,
+     RETURNING task_id, session_id, dag_root_task_id, deadline_at, sandbox_workload_id`,
     [
       BRAIN_TASK_TIMEOUT_SEC,
       `no agent_done after ${BRAIN_TASK_TIMEOUT_SEC}s`,
@@ -176,6 +177,7 @@ export async function reapStaleTasks(): Promise<number> {
     session_id: string;
     dag_root_task_id: string | null;
     deadline_at: string | null;
+    sandbox_workload_id: string | null;
   }>;
   logger.warn(
     {
@@ -187,6 +189,14 @@ export async function reapStaleTasks(): Promise<number> {
     "sweeper.reaped_stale_tasks",
   );
   await interruptReapedRuns(rows);
+  // These are the runs that stopped reporting. Some of them stopped because the
+  // node under them was reclaimed, and this is the last moment their pods can
+  // still say so. Best-effort and after the interrupt: the close has already
+  // happened and must stand regardless.
+  await backfillPlatformFacts(rows).catch((err) => {
+    logger.warn({ err }, "sweeper.platform_backfill_failed");
+    return 0;
+  });
   return r.rowCount;
 }
 

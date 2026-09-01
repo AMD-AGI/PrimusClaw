@@ -34,6 +34,16 @@ interface AgentDoneBody {
   abort_reason?: string;
   failure_reason?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * What the platform did, when it was the platform that ended the run. Only
+   * sent when a read produced something: `applyAgentDone` writes each field it
+   * receives, so sending empties would stamp over a reason a previous attempt
+   * managed to read.
+   */
+  platform_message?: string;
+  platform_node?: string;
+  platform_exit_code?: number;
+  platform_container_reason?: string;
 }
 
 /**
@@ -220,6 +230,18 @@ export async function postRunLease(
  * failures are thrown and the JetStream execution message remains unacked.
  * Backend transitions are CAS/idempotent, making callback retries safe.
  */
+/** The platform half of the body, present only when there is something to say. */
+function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
+  const f = result.platformFacts;
+  if (!f) return {};
+  return {
+    ...(f.message ? { platform_message: f.message } : {}),
+    ...(f.node ? { platform_node: f.node } : {}),
+    ...(f.containerReason ? { platform_container_reason: f.containerReason } : {}),
+    ...(typeof f.exitCode === "number" ? { platform_exit_code: f.exitCode } : {}),
+  };
+}
+
 export async function postAgentDone(
   request: ExecuteRequest,
   result: ExecuteResult,
@@ -238,6 +260,7 @@ export async function postAgentDone(
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
+    ...platformFields(result),
   };
   const headers: Record<string, string> = {
     "Content-Type": "application/json",

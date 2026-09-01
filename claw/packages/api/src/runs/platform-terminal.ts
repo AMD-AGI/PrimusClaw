@@ -138,6 +138,22 @@ const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["run_budget_exhausted", "deadline"],
   ["queue_timeout", "deadline"],
   ["external_timeout", "deadline"],
+]);
+
+/**
+ * Reasons that only say nobody reported back.
+ *
+ * `brain_timeout` is written by the sweeper when a run stops reporting, and that
+ * is precisely what a node reclaim looks like from here -- the sandbox and the
+ * worker watching it go together, so no callback is ever sent. Ranking it with
+ * the real deadlines labelled every preemption `killed/deadline`: a confident
+ * wrong answer, and worse than the empty one, because a dispatcher reading
+ * "deadline" holds the model responsible for the cluster's decision.
+ *
+ * So it yields to anything the platform said, and stands only when the platform
+ * said nothing.
+ */
+const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["brain_timeout", "deadline"],
 ]);
 
@@ -152,7 +168,9 @@ const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
  * 2. Claw's own deadline next, for the same reason: we enforced it, so the pod's
  *    account of being terminated is a description of us doing it.
  * 3. Then the platform's own reason, which is the only source for a preemption.
- * 4. A failure nobody explained stays `failed`, not a kill with a guessed cause.
+ * 4. Then `brain_timeout`, which outranks nothing: it says a run stopped
+ *    reporting, and being reclaimed is one of the reasons a run does that.
+ * 5. A failure nobody explained stays `failed`, not a kill with a guessed cause.
  */
 export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
   const status = (input.status || "").toLowerCase();
@@ -184,6 +202,11 @@ export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
   if (fromContainer) {
     return { class: "killed", kill_reason: fromContainer, exit_code: exitCode, signal };
   }
+
+  // Only now: a timeout that means "nobody reported back" is the best answer
+  // left once the platform has been asked and had nothing to say.
+  const weak = WEAK_REASONS.get(input.failure_reason ?? "");
+  if (weak) return { class: "killed", kill_reason: weak, exit_code: exitCode, signal };
 
   // Ended badly, and nothing said the platform did it. `failed` rather than a kill
   // with an empty reason: the two are different answers to "was it us", and a

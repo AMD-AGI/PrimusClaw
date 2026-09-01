@@ -440,6 +440,23 @@ export type AbortReason =
   | "script_pre_hook_blocked"
   | "script_step_failed";
 
+/**
+ * What the platform said about a run's sandbox ending, read from SaFE at the
+ * moment the sandbox was found dead.
+ *
+ * Carried on the result rather than resolved later because it is perishable:
+ * SaFE serves a pod's account of its own ending from the pod, and a reclaimed
+ * node's pods are collected within minutes.
+ */
+export interface ExecutePlatformFacts {
+  /** Verbatim `pods[].failedMessage` -- `pod.status.reason + ", " + message`. */
+  message: string;
+  node: string;
+  exitCode: number | null;
+  /** `state.terminated.reason`; the only place an OOM is stated. */
+  containerReason: string;
+}
+
 export interface ExecuteResult {
   finalText: string;
   /** Absent when nothing counted it: a run stopped before any turn anywhere
@@ -449,6 +466,13 @@ export interface ExecuteResult {
    *  that claims the run used no tokens. */
   tokenUsage?: TokenUsage;
   turns: number;
+  /**
+   * Absent unless the platform ended this run's sandbox and said why. An absence
+   * means nothing was read, never "the platform had no reason" -- the callback
+   * only writes these fields when they are present, so an absence leaves a row
+   * that an earlier attempt filled alone.
+   */
+  platformFacts?: ExecutePlatformFacts;
   pendingMemories: PendingMemory[];
   pendingSkills: PendingSkill[];
   /** Sub-file mutations queued by add/update/remove_skill_file tool calls. */

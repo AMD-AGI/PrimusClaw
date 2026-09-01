@@ -16,7 +16,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { platformFactsFromWorkloadDetail } from "../src/sandbox/platform-facts.js";
+import { platformFactsFromWorkloadDetail } from "@claw/protocol";
 
 test("E1 the pod's reason, node and exit code are carried", () => {
   const facts = platformFactsFromWorkloadDetail({

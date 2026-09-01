@@ -48,6 +48,8 @@ import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
 import { probeSandboxContainer } from "../sandbox/container-probe.js";
+import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
+import type { PlatformFacts } from "@claw/protocol";
 import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/container-probe.js";
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
@@ -312,6 +314,7 @@ export interface TaskRunnerSideEffects {
   destroyHands: typeof destroyHands;
   reapPendingHands: typeof reapPendingHands;
   probeSandboxContainer: typeof probeSandboxContainer;
+  fetchPlatformFacts: typeof fetchPlatformFacts;
   restartHandsInSandbox: typeof restartHandsInSandbox;
   unregisterSandbox: typeof unregisterSandbox;
   markHandsIdle: typeof markHandsIdle;
@@ -338,6 +341,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   destroyHands,
   reapPendingHands,
   probeSandboxContainer,
+  fetchPlatformFacts,
   restartHandsInSandbox,
   unregisterSandbox,
   markHandsIdle,
@@ -933,6 +937,15 @@ class TaskRunner {
    * workload to name.
    */
   private handsIdentity: HandsProbeEntry | null = null;
+  /**
+   * What the platform said about this run's sandbox dying, read at the moment we
+   * found out and kept until the callback carries it.
+   *
+   * Read once and never overwritten with nothing: a later read of a workload
+   * whose pods have been collected returns null, and letting that replace a real
+   * reason would lose the one fact nothing else can supply.
+   */
+  private platformFacts: PlatformFacts | null = null;
   // Workload id from this run's identity, never the DAG-shared session key.
   private handsWorkloadId = "";
   private multiNodeContext: MultiNodeContext | null = null;
@@ -1163,6 +1176,39 @@ class TaskRunner {
    * behaviour and it had no repair in it at all, so a container that stayed up
    * with a dead Hands produced an unbounded run of identical failures.
    */
+  /**
+   * Ask the platform why this run's sandbox is gone, and keep the answer.
+   *
+   * Called wherever we first establish that it IS gone, which is the only window
+   * in which the answer exists: SaFE serves a pod's account of its own ending
+   * from the pod, and a reclaimed node's pods are collected within minutes. By
+   * the time a dispatcher above Claw asks, there is nothing left to read -- which
+   * is why the fact is stored on the row rather than resolved on request.
+   *
+   * Never overwrites a fact already held, and never records an absence.
+   */
+  private async capturePlatformFacts(): Promise<void> {
+    if (this.platformFacts) return;
+    const facts = await fx().fetchPlatformFacts(
+      this.handsIdentity?.workloadId,
+      this.handsIdentity?.platformKey ?? this.platformKey,
+    ).catch(() => null);
+    if (facts) this.platformFacts = facts;
+  }
+
+  /**
+   * The result as delivered, carrying whatever the platform said.
+   *
+   * Attached here rather than at each construction site so a new terminal path
+   * cannot forget it, and attached to the result rather than to the POST because
+   * `deliverAgentDone` checkpoints the result before sending: a Brain that dies
+   * between the two replays the facts instead of losing them.
+   */
+  private withPlatformFacts(result: ExecuteResult): ExecuteResult {
+    if (!this.platformFacts) return result;
+    return { ...result, platformFacts: this.platformFacts };
+  }
+
   private readonly recreateHands = async (
     allowance: HandsRecoveryAllowance = { rebuild: true, nondestructive: true },
   ): Promise<RecreateHandsResult> => {
@@ -1176,6 +1222,10 @@ class TaskRunner {
       if (!allowance.nondestructive) throw new HandsRecoveryBudgetExhausted("recovery");
       return this.recoverWithoutDestroy(probe.verdict, probe.reason);
     }
+    // The container is gone and we are about to destroy what is left of the
+    // workload. Ask the platform why first: after the destroy there is nothing
+    // to ask, and a preemption is only ever visible here.
+    await this.capturePlatformFacts();
     // A node running on a sandbox it inherited must not destroy it, whatever
     // the probe says: `use` names one sandbox and the destroy path addresses
     // the session, which every node of the DAG shares. See
@@ -2190,7 +2240,7 @@ class TaskRunner {
       this.kvCkpt,
       this.request,
       redactCheckpointState<ExecuteResult>(
-        result,
+        this.withPlatformFacts(result),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
@@ -2583,7 +2633,7 @@ class TaskRunner {
       this.kvCkpt,
       this.request,
       redactCheckpointState<ExecuteResult>(
-        {
+        this.withPlatformFacts({
           finalText,
           // Absent rather than zeroed when nothing recorded them, which is the
           // same statement the event above makes and for a sharper reason:
@@ -2603,7 +2653,7 @@ class TaskRunner {
           elapsedMs,
           abortReason: "cancelled",
           failureReason: "cancelled by user",
-        },
+        }),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
@@ -2803,13 +2853,18 @@ class TaskRunner {
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
     });
+    // Every failed run asks the platform, not only one that reached the rebuild
+    // path: a sandbox can vanish in ways that surface as an ordinary tool error,
+    // and a run that fails for its own reasons simply gets nothing back. No-op
+    // when the facts were already read at the probe.
+    await this.capturePlatformFacts();
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
       redactCheckpointState<ExecuteResult>(
-        {
+        this.withPlatformFacts({
           finalText: finalText,
           // The same partial progress the `exec_complete` above reports. These
           // were hard-coded to zero, and `applyAgentDone` writes them straight
@@ -2827,7 +2882,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
-        },
+        }),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
