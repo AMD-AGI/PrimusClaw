@@ -230,6 +230,44 @@ export async function postRunLease(
  * failures are thrown and the JetStream execution message remains unacked.
  * Backend transitions are CAS/idempotent, making callback retries safe.
  */
+/**
+ * Ceiling on the run's own text in the callback body.
+ *
+ * Captures are bounded where they are produced, because that is where the step
+ * that produced one can be named. `final_text` is not: on the script path it is
+ * the last step's whole stdout, which Hands will hand over up to 10 MiB of --
+ * comfortably past the 4 MiB the API accepts. An oversized body fails the
+ * callback, and a failed callback records a run that finished its work as never
+ * having reported at all, losing everything else in the body with it.
+ */
+const MAX_FINAL_TEXT_BYTES = 256 * 1024;
+
+function truncateFinalText(text: string): string {
+  if (Buffer.byteLength(text, "utf8") <= MAX_FINAL_TEXT_BYTES) return text;
+  const head = Buffer.from(text, "utf8").subarray(0, MAX_FINAL_TEXT_BYTES).toString("utf8");
+  return `${head}\n[final text truncated at ${MAX_FINAL_TEXT_BYTES} bytes]`;
+}
+
+/**
+ * The body with everything optional taken out of it.
+ *
+ * Used once, after a 413, and only because the alternative is worse: the
+ * previous behaviour retried the identical body three times, threw, left the
+ * JetStream message unacked, and failed the same way on every redelivery --
+ * forever, for a run that had done its work. A row that lands carrying the
+ * outcome and none of the output is a far smaller loss than a row that never
+ * lands.
+ */
+function withoutPayload(body: AgentDoneBody): AgentDoneBody {
+  return {
+    ...body,
+    final_text: "[dropped: the callback body exceeded the size the API accepts]",
+    captures: {},
+    artifacts: [],
+    tool_stats: undefined,
+  };
+}
+
 /** The platform half of the body, present only when there is something to say. */
 function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
   const f = result.platformFacts;
@@ -250,7 +288,7 @@ export async function postAgentDone(
   const url = `${request.callback_url}/agent_done`;
   const body: AgentDoneBody = {
     task_id: request.task_id,
-    final_text: result.finalText,
+    final_text: truncateFinalText(result.finalText ?? ""),
     captures: result.captures,
     artifacts: (result.artifacts ?? []) as unknown as Array<Record<string, unknown>>,
     token_usage: result.tokenUsage as unknown as Record<string, unknown>,
@@ -269,6 +307,8 @@ export async function postAgentDone(
     headers["Authorization"] = `Bearer ${request.backend_internal_token}`;
   }
   let lastError: Error | undefined;
+  let payload = body;
+  let shed = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
@@ -276,10 +316,18 @@ export async function postAgentDone(
       const resp = await fetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
       if (resp.ok) return;
+      // 413 is the one status a retry cannot help with: the body is too large
+      // and will be exactly as large next time. Shed it once and retry that,
+      // rather than spending the remaining attempts proving the point.
+      if (resp.status === 413 && !shed) {
+        shed = true;
+        payload = withoutPayload(body);
+        logger.warn({ taskId: request.task_id }, "agent_done.body_shed_after_413");
+      }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));

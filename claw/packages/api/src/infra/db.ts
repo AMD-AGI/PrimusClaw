@@ -1081,6 +1081,16 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON claw_tasks(batch_id) WHERE batch_id IS NOT NULL",
     ).catch(() => {});
+    // GET /v1/runs?state=terminal&since= -- the dispatcher's reconcile, every 30
+    // seconds. Partial on the three terminal statuses because that is the whole
+    // of what the query matches, and ordered the way it reads so the LIMIT stops
+    // early instead of sorting the table. claw_tasks is never pruned, so without
+    // this the cost of that sweep grows with the fleet's whole history.
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed
+         ON claw_tasks(completed_at DESC)
+       WHERE status IN ('completed','failed','cancelled')`,
+    ).catch(() => {});
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});

@@ -37,12 +37,23 @@ const logger = pino({ name: "runs-routes" });
  * Rows one batch call may return.
  *
  * The requirement is 200 in a single call -- the width of one sweep of the model
- * sweep at full concurrency. The ceiling is well above it so a caller that
- * batches two sweeps together is not silently truncated, and low enough that the
- * response stays a page rather than a dump.
+ * sweep at full concurrency. This clears it with room for a caller that batches
+ * two sweeps together, and stays a page rather than a dump.
  */
 const MAX_BATCH = 1000;
 const DEFAULT_LIMIT = 200;
+
+/**
+ * Ids one `?ids=` call may name, which is a smaller number than MAX_BATCH.
+ *
+ * A ULID and its comma are 27 bytes, so 1000 of them is a ~27 KB query string
+ * against Node's 16 KB limit on the request line and headers together. A caller
+ * working up to a ceiling it was told about would get a transport error with no
+ * mention of a size, on some requests and not others, depending on how many ids
+ * that sweep happened to have. 500 is ~13.5 KB, inside the limit with the rest
+ * of the headers, and still more than twice the required width.
+ */
+const MAX_IDS_PER_CALL = 500;
 
 interface RunRow {
   task_id: string;
@@ -105,13 +116,12 @@ export function toRunView(row: RunRow): RunView {
   };
 }
 
-/** Ids from `?ids=a,b,c`, de-duplicated and bounded. */
+/** Ids from `?ids=a,b,c`, de-duplicated. Not bounded here -- see the caller. */
 function parseIds(raw: string): string[] {
   const seen = new Set<string>();
   for (const part of raw.split(",")) {
     const id = part.trim();
     if (id) seen.add(id);
-    if (seen.size >= MAX_BATCH) break;
   }
   return [...seen];
 }
@@ -165,6 +175,19 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
       const ids = parseIds(q.ids);
       if (ids.length === 0) {
         return reply.status(400).send({ ok: false, error: "ids must not be empty" });
+      }
+      // Refused rather than trimmed. This used to stop reading at the cap and
+      // answer for the ids it had, and the response said `requested` = the
+      // trimmed count -- so a caller over the limit was told about exactly the
+      // runs it asked about, and never learnt that the rest of its dispatches
+      // were not in the answer. A caller that has to chunk should be told to.
+      if (ids.length > MAX_IDS_PER_CALL) {
+        return reply.status(400).send({
+          ok: false,
+          error: "too_many_ids",
+          detail: `${ids.length} ids; at most ${MAX_IDS_PER_CALL} per call`,
+          max_ids: MAX_IDS_PER_CALL,
+        });
       }
       const r = await db.query(
         `SELECT ${SELECT_COLUMNS} FROM claw_tasks

@@ -253,6 +253,19 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK").catch(() => {});
+        // The same refusal its sibling endpoint gives, in the same words. It
+        // cannot go through stampCredentialsOr403 because the stamp belongs
+        // inside this transaction, and without the branch a submission with no
+        // platform key came back as an unhandled 500 -- indistinguishable from
+        // Claw being broken, when it is the caller's request that cannot be
+        // honoured.
+        if (error instanceof MissingPlatformKeyError) {
+          logger.warn(
+            { sessionId: body.session_id, userId: user.userId },
+            "batch.submit_without_platform_key",
+          );
+          return reply.status(403).send({ ok: false, error: "missing_platform_key" });
+        }
         throw error;
       } finally {
         client.release();
