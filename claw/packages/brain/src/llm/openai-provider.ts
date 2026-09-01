@@ -9,6 +9,7 @@ import type {
 } from "openai/resources/chat/completions";
 import type { Message, ToolSchema } from "@claw/protocol";
 import { LLM_CACHE_STYLE, LLM_CACHE_TTL, OPENAI_ANTHROPIC_MARKERS, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { requiredArgToolNames } from "./tool-schema.js";
 import { renderOpenAiCacheMarkers } from "./openai-cache.js";
 import type {
   LlmContentBlock,
@@ -283,9 +284,14 @@ async function streamingTurn(
     err.code = "STREAM_TRUNCATED";
     throw err;
   }
+  // Schema-gated for the same reason as the Anthropic path -- see the comment
+  // there. The guard belongs on tools that cannot work without arguments, not
+  // on every empty input.
+  const requiresArgs = requiredArgToolNames(tools);
   for (const b of toolUseBlocks) {
-    if (!b.input || (typeof b.input === "object" && Object.keys(b.input).length === 0)) {
-      const err: any = new Error(`tool_use[${b.name}] has empty input — likely truncated`);
+    const empty = !b.input || (typeof b.input === "object" && Object.keys(b.input).length === 0);
+    if (empty && requiresArgs.has(String(b.name))) {
+      const err: any = new Error(`tool_use[${b.name}] has empty input but its schema requires arguments`);
       err.code = "TOOL_INPUT_EMPTY";
       throw err;
     }
