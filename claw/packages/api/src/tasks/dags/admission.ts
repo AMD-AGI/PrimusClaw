@@ -322,6 +322,7 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
             `node ${n.id}: tool '${step.name}' has scope='${meta.scope}' but sandbox='none'`,
           );
         }
+        assertRepeatIsBounded(n.id, step);
       }
     }
   }
@@ -392,4 +393,60 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
       schema_digest: schemaDigest,
     },
   };
+}
+
+
+/**
+ * Largest repetition a step may declare.
+ *
+ * Not a policy about how long work may take -- the run's own budget decides that,
+ * and a graph node can be given days. These bound the shape of the loop, so a
+ * typo cannot ask for a million attempts, and they are refused at upload rather
+ * than clamped at runtime: a script that quietly ran a tenth of what it asked for
+ * is worse than one that would not save.
+ */
+const REPEAT_MAX_ATTEMPTS = 10_000;
+const REPEAT_MAX_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Refuse a repetition that is not bounded in both dimensions.
+ *
+ * Both, because they bound different failures: a step that returns instantly
+ * burns its attempts in seconds, and one that blocks for its full timeout every
+ * time needs a wall-clock ceiling rather than an attempt count nobody can convert
+ * into one. An unbounded loop inside a script is the hang the per-call ceiling
+ * exists to prevent, and a script has no judgement to fall back on.
+ */
+function assertRepeatIsBounded(nodeId: string, step: ScriptStepDef): void {
+  const repeat = step.repeat;
+  if (!repeat) return;
+  const where = `node ${nodeId}: step '${step.name}' repeat`;
+
+  const attempts = repeat.max_attempts;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > REPEAT_MAX_ATTEMPTS) {
+    throw new BadRequestError(
+      `${where}.max_attempts must be a whole number between 1 and ${REPEAT_MAX_ATTEMPTS}`,
+    );
+  }
+  const seconds = repeat.max_seconds;
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > REPEAT_MAX_SECONDS) {
+    throw new BadRequestError(
+      `${where}.max_seconds must be between 1 and ${REPEAT_MAX_SECONDS}`,
+    );
+  }
+  if (repeat.interval_sec !== undefined) {
+    const interval = repeat.interval_sec;
+    if (!Number.isFinite(interval) || interval < 0 || interval > seconds) {
+      throw new BadRequestError(`${where}.interval_sec must be between 0 and max_seconds`);
+    }
+  }
+  const path = repeat.until?.path;
+  if (typeof path !== "string" || path.trim() === "") {
+    throw new BadRequestError(
+      `${where}.until.path must name the structured field that says the work is done`,
+    );
+  }
+  if (repeat.until.equals === undefined || repeat.until.equals === null) {
+    throw new BadRequestError(`${where}.until.equals must be the value that means done`);
+  }
 }

@@ -139,6 +139,28 @@ export function capCapturesTotal(captures: Record<string, string>): Record<strin
   return out;
 }
 
+/** Pause, unless the caller asked for none. */
+function sleep(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
+}
+
+/**
+ * Whether a repetition's condition holds over the step's structured result.
+ *
+ * A miss is not satisfaction: a tool that returned no structured result, or one
+ * without the named field, keeps the loop going until a bound stops it. The other
+ * reading -- absent means done -- turns a tool that stopped answering into a job
+ * the graph believes finished.
+ */
+export function repeatSatisfied(
+  repeat: { until: { path: string; equals: string | number | boolean } },
+  structured: unknown,
+): boolean {
+  if (structured === undefined || structured === null) return false;
+  const value = getDeep(structured, repeat.until.path.split("."));
+  return value === repeat.until.equals;
+}
+
 function resolvePath(
   path: string,
   state: { captures: Record<string, string>; prev?: { captures: Record<string, string>; structured?: unknown } },
@@ -260,6 +282,20 @@ export async function runScript(
 
     await onEvent({ type: "scriptStep", name: step.name, step: i, status: "started", scope });
 
+    // One attempt of this step, or several when it declares a repetition. The
+    // loop wraps exactly one step's call: nothing nests, so the executor stays
+    // the flat pass over one array that every other stage assumes it is.
+    const repeat = step.repeat;
+    const repeatDeadline = repeat ? nowMs() + repeat.max_seconds * 1000 : 0;
+    let attempt = 0;
+    let repeatStopped = "";
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+    attempt++;
+    resultText = "";
+    structured = undefined;
+    stepError = undefined;
     try {
       if (scope === "backend") {
         if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
@@ -307,6 +343,34 @@ export async function runScript(
     toolStats.total_calls++;
     toolStats.by_tool[step.name] = (toolStats.by_tool[step.name] ?? 0) + 1;
     if (stepError && !waitExternal) toolStats.error_calls++;
+
+    if (!repeat) break;
+    // An error ends the repetition and is handled by on_fail below, exactly as it
+    // would be for a single attempt. Retrying through a failure is a different
+    // feature and a much easier one to get wrong: a step that fails identically
+    // every time would otherwise spend its whole bound discovering that.
+    if (stepError || waitExternal) { repeatStopped = "error"; break; }
+    if (repeatSatisfied(repeat, structured)) { repeatStopped = "done"; break; }
+    if (attempt >= repeat.max_attempts) { repeatStopped = "max_attempts"; break; }
+    if (nowMs() >= repeatDeadline) { repeatStopped = "max_seconds"; break; }
+    if (ctx.signal?.aborted) { repeatStopped = "aborted"; break; }
+    await onEvent({
+      type: "scriptStep", name: step.name, step: i, status: "repeating", attempt, scope,
+    });
+    if (repeat.interval_sec) {
+      await sleep(Math.min(repeat.interval_sec * 1000, Math.max(0, repeatDeadline - nowMs())));
+    }
+    }
+
+    // A repetition that ran out of bound without its condition holding is a
+    // failure of the step, not a quiet success: the work it was waiting for is
+    // still going, and reporting completion would have the graph move on from a
+    // job that is still running.
+    if (repeat && (repeatStopped === "max_attempts" || repeatStopped === "max_seconds")) {
+      stepError = stepError
+        ?? `repeat gave up after ${attempt} attempt(s) without ${repeat.until.path} = ${String(repeat.until.equals)} (${repeatStopped})`;
+      toolStats.error_calls++;
+    }
 
     await ctx.fireHook?.("PostToolUse", { tool_name: step.name, tool_response: stepError ? { error: stepError } : { text: resultText, structured } });
 

@@ -76,6 +76,21 @@ export const wait = {
       ? `Shell ${args.shell_id} finished after ~${waitedSec}s (status=${shell.status}, exit_code=${shell.exitCode ?? "?"})`
       : `Shell ${args.shell_id} is still running after ${waitedSec}s. Call wait again to keep waiting, or kill_shell to stop it.`;
 
-    return { content: [{ type: "text" as const, text: `${header}\n\n${output}` }] };
+    return {
+      content: [{ type: "text" as const, text: `${header}\n\n${output}` }],
+      // The same answer as a field rather than a sentence.
+      //
+      // The text above has always said whether the shell finished, and a caller
+      // that is a person or a model reads it. A script cannot: matching prose is
+      // how a loop comes to run forever because somebody reworded a header. This
+      // is what a repeat step's `until` reads.
+      structuredContent: {
+        shell_id: args.shell_id,
+        finished: !!shell,
+        status: shell?.status ?? "running",
+        exit_code: shell?.exitCode ?? null,
+        waited_sec: waitedSec,
+      },
+    };
   },
 };

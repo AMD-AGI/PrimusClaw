@@ -105,6 +105,61 @@ export interface ScriptStep {
    * (task-design.md §8.2).
    */
   scope?: "hands" | "backend";
+  /**
+   * Run this step repeatedly until it reports done, or the bound runs out.
+   *
+   * A modifier on an ordinary step, deliberately, rather than a step kind of its
+   * own that wraps a body. `name` stays a registered tool, so every check that
+   * already reads it keeps working: DAG admission resolves the tool's scope
+   * against `sandbox='none'` and refuses a backend-scope tool without
+   * `trust_level='platform'`, and both of those walk the top-level array only. A
+   * nested body would have slipped past both, which is a hole rather than a
+   * feature to add carefully later.
+   *
+   * It also means the executor stays a flat loop over one array, and the runtime
+   * template pass keeps rendering exactly `arguments` -- a nested body's
+   * `${captures.x}` would never have been expanded, since nothing renders below
+   * the top level.
+   *
+   * What it exists for: a run whose work outlives any single call. `wait` blocks
+   * on a background shell for up to WAIT_MAX_SEC and then says the shell is still
+   * running, expecting to be called again -- an agent loops, a script could not.
+   * Hands work is measured in hours to days, and the per-call ceiling is there to
+   * stop a half-dead sandbox holding a run open, not to bound the work.
+   */
+  repeat?: ScriptRepeat;
+}
+
+/**
+ * When to stop repeating a step.
+ *
+ * Both bounds are required and neither may be unbounded. An unbounded loop in a
+ * script is precisely the hang the per-call ceiling exists to prevent, and a
+ * script -- unlike an agent -- has no judgement to fall back on.
+ */
+export interface ScriptRepeat {
+  /**
+   * The structured field that says the work is finished, and the value that says
+   * so. `wait` reports `{ finished: true }` when its shell has exited.
+   *
+   * One path and one equality, not an expression language: a condition a reader
+   * has to evaluate in their head is one that fails in a way nobody predicted, at
+   * hour nine of a run.
+   */
+  until: { path: string; equals: string | number | boolean };
+  /** Hard stop on attempts. The step is executed at most this many times. */
+  max_attempts: number;
+  /**
+   * Hard stop on elapsed wall time across all attempts, in seconds.
+   *
+   * Separate from `max_attempts` because they bound different failures: a step
+   * that returns instantly burns the attempts and stops in seconds, and one that
+   * blocks for its full timeout every time needs an hour ceiling rather than an
+   * attempt count nobody can convert into one.
+   */
+  max_seconds: number;
+  /** Pause between attempts, in seconds. Defaults to none: `wait` blocks already. */
+  interval_sec?: number;
 }
 
 /** Lease renewal endpoint for a run that has a row of its own. */

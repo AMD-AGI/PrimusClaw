@@ -42,6 +42,18 @@ export interface ScriptStepDef {
   timeout_sec?: number;
   on_fail?: ScriptOnFail;
   captures?: string;
+  /**
+   * Bounded repetition of this step. Mirrors `ScriptRepeat` in the protocol
+   * package -- the two types describe the same JSON and are checked against each
+   * other by admission, so a field added to one and not the other is a step that
+   * validates here and means something else at dispatch.
+   */
+  repeat?: {
+    until: { path: string; equals: string | number | boolean };
+    max_attempts: number;
+    max_seconds: number;
+    interval_sec?: number;
+  };
 }
 
 export interface DagNode {
