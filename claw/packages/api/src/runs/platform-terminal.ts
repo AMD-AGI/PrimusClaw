@@ -114,6 +114,16 @@ export interface TaskTerminalInput {
   deadline_exceeded?: boolean;
   /** From the platform read, when there was one. */
   pod_failed_message?: string;
+  /**
+   * The container's own termination reason, when the platform reports one.
+   *
+   * The only source for an OOM: the pod-level reason describes the kills decided
+   * above the container and is empty when the kernel killed one for memory. Empty
+   * against a platform that does not report it, and then an OOM simply stays
+   * unnamed -- exit code 137 is any SIGKILL, so reading it as memory pressure
+   * would relabel every eviction and every deliberate stop.
+   */
+  container_reason?: string;
   exit_code?: number | null;
   node?: string;
 }
@@ -164,9 +174,15 @@ export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
     return { class: "killed", kill_reason: own ?? "deadline", exit_code: exitCode, signal };
   }
 
-  const fromPlatform = killReasonFromPodMessage(input.pod_failed_message ?? "");
-  if (fromPlatform) {
-    return { class: "killed", kill_reason: fromPlatform, exit_code: exitCode, signal };
+  // The pod's reason first: a container killed as part of an eviction reports
+  // "Error" of its own, and the eviction is the more useful account of it.
+  const fromPod = killReasonFromPodMessage(input.pod_failed_message ?? "");
+  if (fromPod) {
+    return { class: "killed", kill_reason: fromPod, exit_code: exitCode, signal };
+  }
+  const fromContainer = killReasonFromPodMessage(input.container_reason ?? "");
+  if (fromContainer) {
+    return { class: "killed", kill_reason: fromContainer, exit_code: exitCode, signal };
   }
 
   // Ended badly, and nothing said the platform did it. `failed` rather than a kill

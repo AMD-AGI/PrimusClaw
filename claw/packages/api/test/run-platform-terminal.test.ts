@@ -114,6 +114,52 @@ test("D4b every reason in the map is matched case-insensitively", () => {
   assert.equal(killReasonFromPodMessage("DeadlineExceeded"), "deadline");
 });
 
+test("D7 an OOM is named from the container's reason, not guessed from 137", () => {
+  // The pod-level reason describes the kills decided above the container and is
+  // empty here. Exit code 137 is any SIGKILL, so reading memory pressure off it
+  // would relabel every eviction and every deliberate stop.
+  const t = terminalFacts({
+    status: "failed",
+    failure_reason: "sandbox_died",
+    pod_failed_message: "",
+    container_reason: "OOMKilled",
+    exit_code: 137,
+  });
+  assert.equal(t?.class, "killed");
+  assert.equal(t?.kill_reason, "oom");
+  assert.equal(t?.signal, "SIGKILL");
+});
+
+test("D7b exit code 137 on its own names nothing", () => {
+  const t = terminalFacts({ status: "failed", failure_reason: "sandbox_died", exit_code: 137 });
+  assert.equal(t?.class, "failed");
+  assert.equal(t?.kill_reason, "");
+});
+
+test("D7c the pod's reason outranks the container's", () => {
+  // A container killed as part of an eviction reports an "Error" of its own, and
+  // the eviction is the more useful account of what happened.
+  const t = terminalFacts({
+    status: "failed",
+    failure_reason: "sandbox_died",
+    pod_failed_message: "Evicted, the node was low on resource: memory",
+    container_reason: "Error",
+    exit_code: 137,
+  });
+  assert.equal(t?.kill_reason, "preempted");
+});
+
+test("D7d a container reason the platform does not report leaves the ending unnamed", () => {
+  // Against a SaFE that predates the field. An unexplained kill is a real state.
+  const t = terminalFacts({
+    status: "failed",
+    failure_reason: "sandbox_died",
+    container_reason: "",
+    exit_code: 137,
+  });
+  assert.equal(t?.kill_reason, "");
+});
+
 test("D5 a signal is read off the exit code", () => {
   assert.equal(signalOf(137), "SIGKILL");
   assert.equal(signalOf(143), "SIGTERM");

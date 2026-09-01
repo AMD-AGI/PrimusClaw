@@ -45,6 +45,8 @@ export interface AgentDonePayload {
    * reclaimed node and a crashed agent are the same row.
    */
   platform_kill_reason?: string;
+  /** The container's own termination reason, the only source for an OOM. */
+  platform_container_reason?: string;
   platform_exit_code?: number;
   platform_node?: string;
   /** The pod's own account, kept verbatim so a wrong reading can be re-derived. */
@@ -88,6 +90,9 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
   // previous callback did fill would erase the one field nothing else can supply.
   if (payload.platform_kill_reason) patch.platform_kill_reason = payload.platform_kill_reason;
   if (payload.platform_message) patch.platform_message = payload.platform_message;
+  if (payload.platform_container_reason) {
+    patch.platform_container_reason = payload.platform_container_reason;
+  }
   if (payload.platform_node) patch.platform_node = payload.platform_node;
   if (typeof payload.platform_exit_code === "number") {
     patch.platform_exit_code = payload.platform_exit_code;

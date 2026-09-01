@@ -24,11 +24,25 @@ export interface PlatformFacts {
   node: string;
   /** Exit code of the pod's last terminated container, or null when none. */
   exitCode: number | null;
+  /**
+   * The container's own termination reason, when the platform reports one.
+   *
+   * The only place an OOM is stated. The pod-level reason in `message` covers the
+   * kills decided above the container -- Evicted, Preempted, NodeLost -- and is
+   * empty when the kernel killed one for memory, which left exit code 137 as the
+   * only hint: any SIGKILL, and therefore also every eviction and every stop.
+   *
+   * Empty against a platform that does not report it yet, and an empty reason
+   * simply means the reading falls back to what the pod said.
+   */
+  containerReason: string;
 }
 
 interface RawContainer {
   exitCode?: unknown;
   message?: unknown;
+  /** `state.terminated.reason`: OOMKilled, Error, ContainerCannotRun, … */
+  reason?: unknown;
 }
 
 interface RawPod {
@@ -60,13 +74,13 @@ function decisivePod(all: RawPod[]): RawPod | null {
   );
 }
 
-/** The exit code of the pod's last terminated container, or null. */
-function exitCodeOf(pod: RawPod): number | null {
+/** The pod's last terminated container, or null. */
+function terminatedContainer(pod: RawPod): RawContainer | null {
   const containers = Array.isArray(pod.containers) ? (pod.containers as RawContainer[]) : [];
-  for (const c of containers) {
-    if (typeof c.exitCode === "number") return c.exitCode;
-  }
-  return null;
+  // The first one carrying an exit code. A sandbox pod runs one workload
+  // container; a sidecar that exits cleanly alongside it would report zero, and
+  // preferring a non-zero one would read a sidecar's failure as the run's.
+  return containers.find((c) => typeof c.exitCode === "number") ?? null;
 }
 
 /**
@@ -84,7 +98,9 @@ export function platformFactsFromWorkloadDetail(
   if (!pod) return null;
   const message = String(pod.failedMessage ?? "").trim();
   const node = String(pod.adminNodeName ?? "").trim();
-  const exitCode = exitCodeOf(pod);
-  if (!message && !node && exitCode === null) return null;
-  return { message, node, exitCode };
+  const container = terminatedContainer(pod);
+  const exitCode = typeof container?.exitCode === "number" ? container.exitCode : null;
+  const containerReason = String(container?.reason ?? "").trim();
+  if (!message && !node && !containerReason && exitCode === null) return null;
+  return { message, node, exitCode, containerReason };
 }

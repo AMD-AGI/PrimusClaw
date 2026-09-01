@@ -54,6 +54,7 @@ interface RunRow {
   platform_exit_code: number | null;
   platform_node: string | null;
   platform_message: string | null;
+  platform_container_reason: string | null;
   created_at: string | Date | null;
   started_at: string | Date | null;
   completed_at: string | Date | null;
@@ -63,6 +64,7 @@ interface RunRow {
 const SELECT_COLUMNS = `
   task_id, session_id, status, failure_reason, sandbox_workload_id,
   platform_kill_reason, platform_exit_code, platform_node, platform_message,
+  platform_container_reason,
   created_at, started_at, completed_at, deadline_at
 `;
 
@@ -77,6 +79,7 @@ export function toRunView(row: RunRow): RunView {
     status: row.status,
     failure_reason: row.failure_reason,
     pod_failed_message: row.platform_message ?? "",
+    container_reason: row.platform_container_reason ?? "",
     exit_code: row.platform_exit_code,
   });
   // A reason recorded at the terminal wins over one re-derived here: it was read

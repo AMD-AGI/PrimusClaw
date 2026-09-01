@@ -1021,6 +1021,11 @@ export async function initDb(): Promise<void> {
     // The pod's own account, kept verbatim. The reason above is a reading of it,
     // and a reading that turns out to be wrong is worth being able to re-derive.
     await addTaskCol("platform_message", "TEXT");
+    // The container's own termination reason. Separate from the message above
+    // because the pod-level one describes the kills decided above the container
+    // and is empty for an OOM -- which is the ending exit code 137 alone cannot
+    // tell from an eviction or a deliberate stop.
+    await addTaskCol("platform_container_reason", "TEXT");
     // How many times a doorbell run has been claimed. The poison delivery
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.
