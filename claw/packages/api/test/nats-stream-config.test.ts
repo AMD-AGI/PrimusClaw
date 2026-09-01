@@ -19,6 +19,11 @@
  *      this exists for.
  *   3. A stream that does not exist is still created.
  *
+ * A stream's replica count goes the other way, and the tests below say why the
+ * two rules differ: moving copies of a log between servers never drops a
+ * message, so the count is reconciled to the exact figure in both directions,
+ * while shortening a retention deletes history and is therefore refused.
+ *
  * One KV bucket is reconciled the same way, and for a reason of its own: the
  * tombstone bucket's TTL has to cover whatever the event stream actually keeps,
  * so an operator who lengthened it by hand was correcting the code rather than
@@ -174,6 +179,36 @@ test("a single-node cluster is left at one replica rather than asked for three",
   assert.deepEqual(updates, []);
 });
 
+test("a stream on three replicas is brought back down for a single-node cluster", async () => {
+  // The mirror image of the retention rule at the top of this file, and the
+  // reason the two are allowed to differ: changing a replica count moves copies
+  // of a log between servers and never drops a message, while shortening a
+  // retention deletes history on the spot with nothing to restore it from. So
+  // replicas narrow and retention does not. Reconciling only upward here would
+  // be invisible in every other test in this file, because every one of them
+  // asks for more replicas than the stream has or for the same number -- and it
+  // would strand exactly the operator the config tests exist for: someone
+  // taking a cluster to NATS_REPLICAS=1 keeps streams at three that JetStream
+  // outside clustered mode answers with err 10074, and no restart corrects it.
+  const { mgr, updates } = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS, num_replicas: 3 });
+
+  await ensureStream(mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 1);
+
+  assert.deepEqual(updates, [{ num_replicas: 1 }],
+    "a stream left at three on a single-node cluster is a stream JetStream "
+    + "refuses to serve, and this start-up is the only thing that would lower it");
+
+  // Still clustered, just narrower -- a five-server cluster taken to three.
+  // Nothing in the process rewrites a stream's replica count except this line,
+  // so a count only ever widened drifts one way for the life of the cluster.
+  const shrunk = manager({ max_age: 4 * HOUR_NS, duplicate_window: 4 * HOUR_NS, num_replicas: 5 });
+
+  await ensureStream(shrunk.mgr, "PRIMUS_CLAW_TASKS", ["tasks.>"], 2 * HOUR_NS, 2 * HOUR_NS, 3);
+
+  assert.deepEqual(shrunk.updates, [{ num_replicas: 3 }],
+    "the figure is reconciled exactly, not treated as a floor");
+});
+
 test("a narrow retention and a lone replica are corrected in one update", async () => {
   // Both drifts travel in the same `streams.update`, so a cluster carrying both
   // is not left half-reconciled by a start that fails between two calls.
@@ -184,6 +219,178 @@ test("a narrow retention and a lone replica are corrected in one update", async 
   assert.deepEqual(updates, [
     { max_age: 2 * HOUR_NS, duplicate_window: 2 * HOUR_NS, num_replicas: 3 },
   ]);
+});
+
+test("the reconciliation names the event operators watch and what the stream was", () => {
+  // The two producers a live cluster's move from one replica to three is
+  // visible through, and the only ones: `ensureStream` reaches its logger
+  // through the module, not through an argument, so the manager double above
+  // sees the `streams.update` call and nothing of the line that reports it.
+  // Reading the source is what is left, as with the tombstone bucket's
+  // `retentionMeasured` below -- it holds that the payload and the event name
+  // are wired together, not that the line runs.
+  //
+  // Both halves are new and both are load-bearing. The event was renamed from
+  // `nats.stream_retention_widened`, which is no longer a true description
+  // once replicas travel in the same update -- and a rename is a break for
+  // whoever hung an alert or a log query on the old string, so it needs to be
+  // deliberate rather than a thing that drifts back. `wasReplicas` is the
+  // before-figure: `widened` says the stream is now on three, and only this
+  // field says it was on one, which is the difference between a start-up that
+  // corrected the outage and a start-up that had nothing to correct.
+  const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
+
+  assert.match(src, /wasReplicas: existing\.config\.num_replicas,[\s\S]*?"nats\.stream_config_reconciled"/,
+    "without the before-figure on this line there is no record that a cluster's "
+    + "streams ever moved off one replica");
+  assert.doesNotMatch(src, /nats\.stream_retention_widened/,
+    "the old event name is gone from the file, so the rename is one decision "
+    + "and not two lines emitting under different names");
+});
+
+// ===== the counts above are the ones initNats actually passes =====
+
+/**
+ * Every `ensureStream(...)` in the source -- the call sites and the declaration
+ * -- each as its argument or parameter list split at the top-level commas, with
+ * line and block comments stripped off first.
+ *
+ * A depth-counting scan rather than a regular expression, because a regular
+ * expression cannot match a balanced parenthesis: `[^)]*` stops at the first
+ * `)`, which in an argument list is the one closing a nested call, so wrapping
+ * any argument in a helper -- `resolveTaskStreamMaxAgeNs(...)` sits one line
+ * away from the task call already -- would fail a call site that is entirely
+ * correct. Walking from the opening paren to its match takes the arguments
+ * whole however they nest. Stripping comments is the other half: an identifier
+ * written in prose, in a line comment or in the JSDoc on `ensureStream`, is
+ * not code that runs, and a text search cannot tell the difference.
+ *
+ * The declaration is kept rather than filtered out, and flagged, because the
+ * question below is asked of both: what the parameter list requires is half of
+ * whether a call site can omit it.
+ */
+interface EnsureStreamSite { args: string[]; isDeclaration: boolean }
+
+function ensureStreamSites(source: string): EnsureStreamSite[] {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+  const sites: EnsureStreamSite[] = [];
+  for (const at of code.matchAll(/(?<![\w$.])(function\s+)?ensureStream\s*\(/g)) {
+    const args: string[] = [];
+    let start = at.index + at[0].length;
+    let depth = 1;
+    let i = start;
+    for (; i < code.length && depth > 0; i += 1) {
+      const ch = code[i];
+      if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+      else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+      else if (ch === "," && depth === 1) { args.push(code.slice(start, i)); start = i + 1; }
+    }
+    args.push(code.slice(start, i - 1));
+    sites.push({
+      args: args.map((a) => a.trim()).filter((a) => a !== ""),
+      isDeclaration: at[1] !== undefined,
+    });
+  }
+  return sites;
+}
+
+test("the two ensureStream call sites in the source each name their own replica variable", () => {
+  // Everything above calls `ensureStream` directly with a number, which holds
+  // that the reconciliation is correct and nothing at all about the number it
+  // is given. `initNats` is where that number is chosen, and it needs a live
+  // NATS connection -- it connects, opens a JetStream manager and provisions
+  // the consumer and four buckets before it returns -- so there is no seam to
+  // assert the two calls through. That leaves the source, as with the
+  // tombstone bucket's `retentionMeasured` below.
+  //
+  // What this holds: in the code of that file, comments removed, there is one
+  // `ensureStream` call per stream and each ends in the replica variable
+  // belonging to its own stream -- so the count is neither a hardcoded 1 (the
+  // JetStream default that put PRIMUS_CLAW_TASKS on a single server and turned
+  // one lost pod into four and a half hours of 503 on POST /sessions) nor the
+  // other stream's setting. What it does not hold -- and the name says the same
+  // thing -- is that `initNats` runs at all, that these are the calls it
+  // reaches, or that the number the variable carries arrives at the server
+  // intact: both calls inside `if (false)` would satisfy it. It is a reading of
+  // the wiring, better than the text search it replaces only in that prose can
+  // no longer satisfy it and a wrapped argument can no longer break it. The
+  // fallback chain behind each variable is pinned behaviourally in
+  // config-nats-replicas.test.ts.
+  const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
+  const calls = ensureStreamSites(src).filter((s) => !s.isDeclaration).map((s) => s.args);
+
+  const taskCalls = calls.filter((args) => args[1] === "TASK_STREAM");
+  const eventCalls = calls.filter((args) => args[1] === "EVENT_STREAM");
+
+  assert.equal(taskCalls.length, 1,
+    "exactly one call site creates the task stream, or the one being read here "
+    + "is not the one start-up runs");
+  assert.equal(taskCalls[0].at(-1), "TASK_STREAM_REPLICAS",
+    "this is the stream the outage was on, so a literal in the last argument is "
+    + "the defect reappearing exactly as it was; EVENT_STREAM_REPLICAS here is "
+    + "the quieter version -- both settings fall back to NATS_REPLICAS, so in a "
+    + "default deployment the swap changes nothing and only the operator who "
+    + "raised TASK_STREAM_REPLICAS after the outage finds out, when the stream "
+    + "they were told to fix does not move");
+
+  assert.equal(eventCalls.length, 1,
+    "and exactly one creates the event stream");
+  assert.equal(eventCalls[0].at(-1), "EVENT_STREAM_REPLICAS",
+    "an event stream on one server loses session history to the same lost pod, "
+    + "and there is nothing to rebuild it from");
+});
+
+test("no ensureStream call site can leave the replica count to a default", () => {
+  // The test above knows the two streams that exist today by name, which is the
+  // whole of its reach: a third stream added tomorrow the way the first two were
+  // originally written --
+  //
+  //   await ensureStream(jsm, "PRIMUS_CLAW_AUDIT", ["audit.>"], retentionNs);
+  //
+  // -- is the 2026-09-01 outage verbatim in a new stream, and it neither is nor
+  // filters as TASK_STREAM or EVENT_STREAM. What makes that line compile at all
+  // is a default on the parameter, which is exactly how the field went missing
+  // the first time; requiring the argument is what forces a new call site to say
+  // what it wants, and requiredness is a property of the declaration, so both
+  // halves are read here. This is quantified over whatever the file contains
+  // rather than over the two names, so it closes over streams that do not exist
+  // yet.
+  const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
+  const sites = ensureStreamSites(src);
+  const declarations = sites.filter((s) => s.isDeclaration);
+  const calls = sites.filter((s) => !s.isDeclaration);
+
+  assert.equal(declarations.length, 1,
+    "one declaration, or the parameter list being read is not the one the calls "
+    + "below are checked against");
+  const params = declarations[0].args;
+
+  // `=(?!>)` rather than a bare `=`: an arrow type in a parameter -- none today --
+  // is not a default value, and reading one as such would fail a correct list.
+  assert.deepEqual(params.filter((p) => /=(?!>)/.test(p)), [],
+    "a defaulted parameter is a call site that never has to mention it, which is "
+    + "how PRIMUS_CLAW_TASKS came to be created at the JetStream default of one "
+    + "replica and stayed there until a pod went away");
+
+  const replicaIndex = params.findIndex((p) => /^replicas\b/.test(p));
+  assert.notEqual(replicaIndex, -1,
+    "the replica count is still a parameter of its own and not folded into an "
+    + "options object this scan would read as one argument");
+
+  assert.ok(calls.length >= 2,
+    `the scan found ${calls.length} call sites, so the loop below would pass on `
+    + "an empty list -- both streams are provisioned in initNats");
+  for (const { args } of calls) {
+    const named = args[1] ?? "(unnamed)";
+    const arg = args[replicaIndex];
+    assert.ok(arg !== undefined,
+      `${named} is created by a call that stops short of the replica count, so `
+      + "the stream lands on one server and one lost pod takes its subject down");
+    assert.match(arg, /_REPLICAS$/,
+      `${named} passes ${arg} where the replica count goes: a literal is a count `
+      + "no operator can change, and NATS_REPLICAS itself skips the per-stream "
+      + "override the deployment documents");
+  }
 });
 
 test("a stream created without a duplicate window does not get one", async () => {

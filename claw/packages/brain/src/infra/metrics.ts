@@ -209,6 +209,60 @@ const resumeNoticeFilteredTotal = new Counter({
   registers: [registry],
 });
 
+// ─── Prompt cache ─────────────────────────────────────────────────────
+// Brain had no token or cache metric at all, which is why a 0% cache hit
+// rate ran for two years and was found by reading a bill. The only place
+// these numbers landed was the terminal ResultMessage, and a babysitter
+// session that runs for twelve hours never reaches one.
+//
+// The counter that matters is the pair: markers going out and reads coming
+// back. `breakpoints_sent > 0 && rate(cache_read) == 0` is the fingerprint
+// of this incident and of any future prefix invalidation, and neither half
+// says it alone.
+const llmTokensTotal = new Counter({
+  name: "claw_brain_llm_tokens_total",
+  help: "Prompt tokens by how they were billed. Absent kinds mean the provider cannot report them, not zero.",
+  labelNames: ["kind"],
+  registers: [registry],
+});
+const llmCacheTurnsTotal = new Counter({
+  name: "claw_brain_llm_cache_turns_total",
+  help: "LLM turns by prompt-cache outcome.",
+  labelNames: ["state"],
+  registers: [registry],
+});
+const llmCacheBreakpointsSent = new Histogram({
+  name: "claw_brain_llm_cache_breakpoints_sent",
+  help: "cache_control markers counted off the request body actually sent.",
+  buckets: [0, 1, 2, 3, 4],
+  registers: [registry],
+});
+// Which lifetime the write actually got.
+//
+// A gateway that quietly answers a 1h marker with a 5m entry is a 200 OK
+// failure: the request succeeds, the cache works, and the entry expires under
+// the sleep it was chosen to outlast -- the same shape as the incident this
+// whole change exists to prevent, and invisible in every other number here.
+// `ttl="unreported"` means the gateway sent no breakdown, which is not the
+// same as a zero and must not be read as one.
+const llmCacheWriteTokensTotal = new Counter({
+  name: "claw_brain_llm_cache_write_tokens_total",
+  help: "Cache-write tokens by the lifetime the gateway actually granted.",
+  labelNames: ["ttl"],
+  registers: [registry],
+});
+const llmCacheDisabledTotal = new Counter({
+  name: "claw_brain_llm_cache_disabled_total",
+  help: "Sessions that stopped sending cache markers after the gateway rejected them.",
+  registers: [registry],
+});
+const compactionTotal = new Counter({
+  name: "claw_brain_compaction_total",
+  help: "Auto-compaction attempts by result.",
+  labelNames: ["result"],
+  registers: [registry],
+});
+
 // ─── Resume path classification ───────────────────────────────────────
 const sandboxProbeTotal = new Counter({
   name: "claw_brain_sandbox_probe_total",
@@ -394,6 +448,61 @@ const sessionCleanupIncompleteTotal = new Counter({
 });
 
 export const metrics = {
+  /**
+   * One LLM turn's cache accounting.
+   *
+   * `reported` says which numbers this provider can actually speak to. A kind
+   * it cannot report emits NO series rather than a zero one: an absent series
+   * reads as "we cannot see this", while a series pinned at 0 is a lie a
+   * dashboard averages. The OpenAI path never assigns cache_create, and that
+   * structural zero presented as an observation is precisely the shape of the
+   * failure this whole metric exists to catch.
+   */
+  onLlmTurnCache(input: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheRead: number;
+    cacheCreate: number;
+    breakpointsSent: number;
+    enabled: boolean;
+    reported: ReadonlyArray<"cache_read" | "cache_create">;
+    createdEphemeral5m?: number;
+    createdEphemeral1h?: number;
+  }): void {
+    llmTokensTotal.inc({ kind: "input" }, input.inputTokens);
+    llmTokensTotal.inc({ kind: "output" }, input.outputTokens);
+    if (input.reported.includes("cache_read")) {
+      llmTokensTotal.inc({ kind: "cache_read" }, input.cacheRead);
+    }
+    if (input.reported.includes("cache_create")) {
+      llmTokensTotal.inc({ kind: "cache_create" }, input.cacheCreate);
+    }
+    // Split the write by lifetime when the gateway said; otherwise record it
+    // as unreported rather than inventing a bucket for it.
+    if (input.createdEphemeral5m !== undefined || input.createdEphemeral1h !== undefined) {
+      if (input.createdEphemeral5m) llmCacheWriteTokensTotal.inc({ ttl: "5m" }, input.createdEphemeral5m);
+      if (input.createdEphemeral1h) llmCacheWriteTokensTotal.inc({ ttl: "1h" }, input.createdEphemeral1h);
+    } else if (input.cacheCreate > 0 && input.reported.includes("cache_create")) {
+      llmCacheWriteTokensTotal.inc({ ttl: "unreported" }, input.cacheCreate);
+    }
+    llmCacheBreakpointsSent.observe(input.breakpointsSent);
+    const state = !input.enabled
+      ? "off"
+      : input.cacheRead > 0
+        ? "hit"
+        : input.cacheCreate > 0
+          ? "write"
+          : "miss";
+    llmCacheTurnsTotal.inc({ state });
+  },
+  onLlmCacheDisabled(): void {
+    llmCacheDisabledTotal.inc();
+  },
+  /** Whether compaction still fires. Moving its trigger without this is a
+   *  behaviour change nobody can see. */
+  onCompaction(result: "compacted" | "noop" | "failed"): void {
+    compactionTotal.inc({ result });
+  },
   onSandboxStart(outcome: "ok" | "error", elapsedSec: number): void {
     sandboxStartTotal.inc({ outcome });
     sandboxStartDuration.observe({ outcome }, elapsedSec);

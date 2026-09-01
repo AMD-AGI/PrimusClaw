@@ -255,6 +255,24 @@ async function streamingTurn(
       bodyModel,
       headerModel: capture.headerModel ?? headerModelFromStream(stream),
     }),
+    // OpenAI's prompt_tokens already counts cached tokens, unlike Anthropic's
+    // input_tokens, which reports only the uncached remainder. Adding the
+    // cache fields on top here would double-count and halve the effective
+    // compaction threshold on this path.
+    promptTokens: usage.input_tokens,
+    cacheReport: {
+      // No markers are rendered on this path: toOpenAiMessages is not a 1:1
+      // mapping (a tool_result message fans out into N role:"tool" messages)
+      // and it collapses content to strings, which cannot carry a marker.
+      breakpointsSent: 0,
+      enabled: false,
+      // `cache_create` is initialised above and never assigned -- this
+      // transport has no way to report a cache write. Declaring that is the
+      // difference between "we cannot see writes" and "there were no writes";
+      // a dashboard averaging the second is the exact shape of the incident
+      // this whole change exists to prevent.
+      reported: ["cache_read"] as const,
+    },
   };
 }
 
@@ -287,9 +305,26 @@ export class OpenAiProvider implements LlmProvider {
       },
     });
 
-    return {
-      streamTurn: (messages, tools, signal) =>
-        streamingTurn(client, model, messages, tools, signal, capture),
+    return buildOpenAiSession(client, model, capture);
+  }
+}
+
+/**
+ * The session, over a client someone else built.
+ *
+ * Same seam as the Anthropic provider's, and for the same reason: without it
+ * nothing can assert what this path puts on the wire or what it claims about
+ * its own usage numbers. The loop's `LoopOptions.llmSession` seam sits above
+ * the provider and never sees either.
+ */
+export function buildOpenAiSession(
+  client: OpenAI,
+  model: string,
+  capture: RoutedModelSink = {},
+): LlmSession {
+  return {
+    streamTurn: (messages, tools, signal) =>
+      streamingTurn(client, model, messages, tools, signal, capture),
       async complete(systemPrompt, userText, maxTokens) {
         const resp = await client.chat.completions.create({
           model,
@@ -303,6 +338,5 @@ export class OpenAiProvider implements LlmProvider {
         if (!text) throw new Error("completion returned empty text");
         return text;
       },
-    };
-  }
+  };
 }
