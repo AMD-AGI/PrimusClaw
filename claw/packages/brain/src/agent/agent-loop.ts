@@ -1040,6 +1040,8 @@ class AgentLoopRunner {
       breakpointsSent: cacheReport?.breakpointsSent ?? 0,
       enabled: cacheReport?.enabled ?? false,
       reported: cacheReport?.reported ?? [],
+      createdEphemeral5m: cacheReport?.createdEphemeral5m,
+      createdEphemeral1h: cacheReport?.createdEphemeral1h,
     });
 
     // Per-turn token stats + output throughput
@@ -1062,6 +1064,10 @@ class AgentLoopRunner {
       cumulative_cache_read_tokens: this.usage.cache_read,
       cumulative_cache_create_tokens: this.usage.cache_create,
       cache_breakpoints_sent: cacheReport?.breakpointsSent ?? 0,
+      ...(cacheReport?.createdEphemeral5m !== undefined
+        ? { turn_cache_create_5m: cacheReport.createdEphemeral5m } : {}),
+      ...(cacheReport?.createdEphemeral1h !== undefined
+        ? { turn_cache_create_1h: cacheReport.createdEphemeral1h } : {}),
       avg_output_tps: Math.round(avgOutputTps * 10) / 10,
       ...(routedModel ? { routed_model: routedModel } : {}),
     };

@@ -237,6 +237,20 @@ const llmCacheBreakpointsSent = new Histogram({
   buckets: [0, 1, 2, 3, 4],
   registers: [registry],
 });
+// Which lifetime the write actually got.
+//
+// A gateway that quietly answers a 1h marker with a 5m entry is a 200 OK
+// failure: the request succeeds, the cache works, and the entry expires under
+// the sleep it was chosen to outlast -- the same shape as the incident this
+// whole change exists to prevent, and invisible in every other number here.
+// `ttl="unreported"` means the gateway sent no breakdown, which is not the
+// same as a zero and must not be read as one.
+const llmCacheWriteTokensTotal = new Counter({
+  name: "claw_brain_llm_cache_write_tokens_total",
+  help: "Cache-write tokens by the lifetime the gateway actually granted.",
+  labelNames: ["ttl"],
+  registers: [registry],
+});
 const llmCacheDisabledTotal = new Counter({
   name: "claw_brain_llm_cache_disabled_total",
   help: "Sessions that stopped sending cache markers after the gateway rejected them.",
@@ -452,6 +466,8 @@ export const metrics = {
     breakpointsSent: number;
     enabled: boolean;
     reported: ReadonlyArray<"cache_read" | "cache_create">;
+    createdEphemeral5m?: number;
+    createdEphemeral1h?: number;
   }): void {
     llmTokensTotal.inc({ kind: "input" }, input.inputTokens);
     llmTokensTotal.inc({ kind: "output" }, input.outputTokens);
@@ -460,6 +476,14 @@ export const metrics = {
     }
     if (input.reported.includes("cache_create")) {
       llmTokensTotal.inc({ kind: "cache_create" }, input.cacheCreate);
+    }
+    // Split the write by lifetime when the gateway said; otherwise record it
+    // as unreported rather than inventing a bucket for it.
+    if (input.createdEphemeral5m !== undefined || input.createdEphemeral1h !== undefined) {
+      if (input.createdEphemeral5m) llmCacheWriteTokensTotal.inc({ ttl: "5m" }, input.createdEphemeral5m);
+      if (input.createdEphemeral1h) llmCacheWriteTokensTotal.inc({ ttl: "1h" }, input.createdEphemeral1h);
+    } else if (input.cacheCreate > 0 && input.reported.includes("cache_create")) {
+      llmCacheWriteTokensTotal.inc({ ttl: "unreported" }, input.cacheCreate);
     }
     llmCacheBreakpointsSent.observe(input.breakpointsSent);
     const state = !input.enabled

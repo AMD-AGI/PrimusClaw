@@ -137,3 +137,60 @@ test("per-turn events carry the cache numbers", async () => {
   assert.equal(msg.turn_cache_create_tokens, 88);
   assert.equal(msg.cache_breakpoints_sent, 2);
 });
+
+async function ttlWrite(ttl: string): Promise<number> {
+  return counter("claw_brain_llm_cache_write_tokens_total", { ttl });
+}
+
+test("a write is counted under the lifetime the gateway actually granted", async () => {
+  const before = await ttlWrite("1h");
+  await run({
+    usage: { input_tokens: 2, output_tokens: 1, cache_read: 0, cache_create: 900 },
+    cacheReport: {
+      breakpointsSent: 2, enabled: true, reported: ["cache_read", "cache_create"],
+      createdEphemeral5m: 0, createdEphemeral1h: 900,
+    },
+  });
+  assert.equal(await ttlWrite("1h"), before + 900);
+});
+
+test("a 1h request answered with a 5m write is visible as such", async () => {
+  // The failure this exists for is a 200 OK: the request succeeds, the cache
+  // works, and the entry expires under the sleep it was chosen to outlast.
+  // Nothing else in the usage numbers distinguishes it.
+  const before = await ttlWrite("5m");
+  await run({
+    usage: { input_tokens: 2, output_tokens: 1, cache_read: 0, cache_create: 900 },
+    cacheReport: {
+      breakpointsSent: 2, enabled: true, reported: ["cache_read", "cache_create"],
+      createdEphemeral5m: 900, createdEphemeral1h: 0,
+    },
+  });
+  assert.equal(await ttlWrite("5m"), before + 900, "a silent downgrade must show up under ttl=5m");
+});
+
+test("a gateway that sends no breakdown is recorded as unreported, not as a lifetime", async () => {
+  const before = { m5: await ttlWrite("5m"), h1: await ttlWrite("1h"), un: await ttlWrite("unreported") };
+  await run({
+    usage: { input_tokens: 2, output_tokens: 1, cache_read: 0, cache_create: 700 },
+    cacheReport: { breakpointsSent: 2, enabled: true, reported: ["cache_read", "cache_create"] },
+  });
+  assert.equal(await ttlWrite("unreported"), before.un + 700);
+  assert.equal(await ttlWrite("5m"), before.m5, "must not be attributed to a lifetime nobody stated");
+  assert.equal(await ttlWrite("1h"), before.h1);
+});
+
+test("the per-turn event carries the split when the gateway sent one", async () => {
+  const events: Record<string, unknown>[] = [];
+  await run({
+    content: [{ type: "text", text: "hi" }],
+    usage: { input_tokens: 2, output_tokens: 1, cache_read: 10, cache_create: 500 },
+    cacheReport: {
+      breakpointsSent: 3, enabled: true, reported: ["cache_read", "cache_create"],
+      createdEphemeral5m: 0, createdEphemeral1h: 500,
+    },
+  }, events);
+  const msg = events.find((e) => e.type === "AssistantMessage");
+  assert.equal(msg?.turn_cache_create_1h, 500);
+  assert.equal(msg?.turn_cache_create_5m, 0);
+});
