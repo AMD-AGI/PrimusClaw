@@ -367,6 +367,9 @@ const CANCELLED_TOOL_RESULT =
 // call context to avoid replaying decisions it just made. (Original value of
 // 4 was too aggressive and occasionally caused the agent to re-run commands
 // that were already completed.)
+/** Anthropic's default ephemeral lifetime, the line the survival check splits on. */
+const CACHE_TTL_5M_MS = 5 * 60 * 1000;
+
 const COMPACTION_KEEP_RECENT_TURNS = 8;
 // Don't bother compacting tiny conversations.
 const COMPACTION_MIN_MESSAGES = 8;
@@ -594,6 +597,12 @@ class AgentLoopRunner {
   private compactionRound = 0;
   /** Set once per turn, before any early return, so compaction reads one number. */
   private promptTokensThisTurn = 0;
+  /**
+   * When this run last USED a cache entry -- read or write -- anchored at that
+   * turn's request. Undefined means there is no entry whose loss this run
+   * could observe, which is also what compaction leaves behind.
+   */
+  private lastCacheUseAt: number | undefined;
 
   // Throttle for sandboxStatus event emission. Key = `${status}:${tool||""}`,
   // value = last emit timestamp (ms). Only high-frequency statuses pass a
@@ -1048,6 +1057,55 @@ class AgentLoopRunner {
     }
 
     const cacheReport = streamResult.cacheReport;
+
+    // Did the entry we wrote survive the gap?
+    //
+    // The provider-reported TTL says what the gateway CLAIMS it wrote, and on
+    // some transports it does not say even that -- the OpenAI-shaped streaming
+    // response carries no ephemeral breakdown at all, so a 1h request answered
+    // with a 5m entry is invisible there. This asks the question the TTL label
+    // is a proxy for, and asks it of behaviour instead of of a claim: we wrote
+    // an entry, we came back with the same prefix, and nothing was read.
+    //
+    // Split by how long the gap was, because the two causes are different
+    // problems. Past five minutes it is consistent with an entry shorter-lived
+    // than the one we asked for. Inside five minutes the TTL is not the
+    // suspect and the prefix is -- a tool list that changed, a backend switch,
+    // an eviction.
+    //
+    // Guarded on three things that make a miss legitimate rather than a
+    // symptom: markers actually went out this turn, we have written something
+    // to miss, and compaction did not just rewrite the prefix out from under
+    // us.
+    if (
+      cacheReport?.enabled
+      && (cacheReport.breakpointsSent ?? 0) > 0
+      // The response has to have SAID zero. `cache_read` defaults to zero, so
+      // a gateway that drops its final usage chunk produces the same number as
+      // a genuine miss -- and blaming the cache for a turn we could not
+      // measure is the shape of the incident this whole change exists to fix.
+      // `reported` was built to tell those apart; it has to be consumed.
+      && (cacheReport.reported ?? []).includes("cache_read")
+      && turnUsage.cache_read === 0
+      && this.lastCacheUseAt !== undefined
+    ) {
+      const gapMs = turnStart - this.lastCacheUseAt;
+      const gap = gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
+      metrics.onCacheEntryLost(gap);
+      logger.warn(
+        { turn, sessionId: this.sessionId, gapMs, gap, routedModel },
+        "agent-loop.cache_entry_lost",
+      );
+    }
+    // Last USE, not last write, and anchored at the request rather than the
+    // response. A read refreshes the entry's lifetime, so a session that keeps
+    // hitting keeps its entry alive however long it runs -- timing from the
+    // original write would call that session's first real miss "over_5m"
+    // because the write happened hours ago. And the gateway's clock starts
+    // when it receives the prompt, so timing from the response charges this
+    // turn's own generation time to the gap.
+    if (turnUsage.cache_create > 0 || turnUsage.cache_read > 0) this.lastCacheUseAt = turnStart;
+
     metrics.onLlmTurnCache({
       inputTokens: turnUsage.input_tokens,
       outputTokens: turnUsage.output_tokens,
@@ -1227,6 +1285,14 @@ class AgentLoopRunner {
       // result="failed" a value no production line could ever emit.
       metrics.onCompaction(outcome.status);
       if (outcome.status === "compacted") {
+        // The next turn legitimately cannot read: everything between the head
+        // and the summary is gone, so the prefix it would have matched no
+        // longer exists.
+        // Not a one-turn flag: the entry is gone, so there is nothing to lose
+        // until a new one is written. A boolean cleared after one turn left
+        // the pre-compaction timestamp standing, and the SECOND miss after a
+        // compaction was reported as an expired entry.
+        this.lastCacheUseAt = undefined;
         this.workingMessages.length = 0;
         this.workingMessages.push(...compacted);
         await this.onEvent({

@@ -268,6 +268,22 @@ const promptSizeUnknownTotal = new Counter({
   help: "Turns where no provider reported a prompt size, leaving compaction with nothing to compare.",
   registers: [registry],
 });
+// Cache entries that did not survive the gap between two turns.
+//
+// The complement to the TTL label, and the more trustworthy half: that label
+// reports what the gateway says it wrote, and on the OpenAI-shaped streaming
+// response it says nothing at all. This counts the behaviour instead -- we
+// wrote, we came back with the same prefix, nothing was read -- so it works on
+// any transport regardless of what the usage object chooses to report.
+//
+// gap="over_5m" is consistent with an entry shorter-lived than requested;
+// "under_5m" points at the prefix rather than the lifetime.
+const cacheEntryLostTotal = new Counter({
+  name: "claw_brain_llm_cache_entry_lost_total",
+  help: "Turns that sent markers and read nothing back despite an earlier write in the same run.",
+  labelNames: ["gap"],
+  registers: [registry],
+});
 const compactionTotal = new Counter({
   name: "claw_brain_compaction_total",
   help: "Auto-compaction attempts by result.",
@@ -503,14 +519,29 @@ export const metrics = {
     // we sent no markers, and calling that "off" while the same turn
     // increments cache_read said two contradictory things about one request.
     // "off" now means only "we sent nothing and nothing came back".
+    // A miss has to be something the response SAID. Both cache numbers default
+    // to zero, so a turn whose usage never arrived produced exactly the digits
+    // of a genuine miss -- counted as one, it moves a hit-rate denominator on
+    // the strength of a measurement that was never taken.
+    //
+    // And a backend that caches on its own reports a zero read on the turns it
+    // does not hit. Calling those "off" while its hits count as "hit" leaves a
+    // ratio whose denominator excludes every miss, i.e. a hit rate that can
+    // only ever read 100%.
+    const spoke = input.reported.includes("cache_read") || input.reported.includes("cache_create");
     const state = input.cacheRead > 0
       ? "hit"
       : input.cacheCreate > 0
         ? "write"
-        : input.enabled
+        : spoke
           ? "miss"
-          : "off";
+          : input.enabled
+            ? "unreported"
+            : "off";
     llmCacheTurnsTotal.inc({ state });
+  },
+  onCacheEntryLost(gap: "over_5m" | "under_5m"): void {
+    cacheEntryLostTotal.inc({ gap });
   },
   onPromptSizeUnknown(): void {
     promptSizeUnknownTotal.inc();
