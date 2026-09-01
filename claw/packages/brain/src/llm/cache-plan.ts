@@ -179,13 +179,6 @@ function lastMarkableAtOrBefore(flat: readonly FlatPosition[], from: number): nu
 }
 
 /** Index in `flat` of the first block belonging to `messageIndex`, or -1. */
-function firstBlockOfMessage(flat: readonly FlatPosition[], messageIndex: number): number {
-  for (let i = 0; i < flat.length; i++) {
-    if (flat[i].messageIndex === messageIndex) return i;
-  }
-  return -1;
-}
-
 function toBreakpoint(p: FlatPosition, systemRunLength: number): CacheBreakpoint {
   return {
     kind: p.messageIndex < systemRunLength ? "system" : "message",
@@ -228,9 +221,18 @@ export function planCacheBreakpoints(
   // --- anchor -------------------------------------------------------------
   // The stable prefix ends with the system run when there is one, and with
   // messages[0] otherwise. Both are assembled once per run and never rewritten.
-  const anchorScopeEnd = systemRunLength > 0
-    ? firstBlockOfMessage(flat, systemRunLength) - 1  // last block before the first non-system message
-    : firstBlockOfMessage(flat, 1) - 1;               // last block of messages[0]
+  // Last flat position belonging to a message before the boundary, found by
+  // scanning rather than by asking where the boundary message starts. The
+  // boundary message may contribute NO blocks -- an assistant turn that only
+  // called tools, an empty content array -- and "first block of message N"
+  // then finds nothing, collapsing the anchor scope to the whole array and
+  // putting the anchor at the tail instead of at the head of the prefix.
+  const boundary = systemRunLength > 0 ? systemRunLength : 1;
+  let anchorScopeEnd = -1;
+  for (let i = 0; i < flat.length; i++) {
+    if (flat[i].messageIndex < boundary) anchorScopeEnd = i;
+    else break;
+  }
   const anchorLimit = anchorScopeEnd >= 0 ? anchorScopeEnd : flat.length - 1;
   const anchor = lastMarkableAtOrBefore(flat, anchorLimit);
 

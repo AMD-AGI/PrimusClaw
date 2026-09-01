@@ -311,3 +311,31 @@ test("all four breakpoint slots are used once the conversation is long enough", 
   }
   assert.equal(planCacheBreakpoints(msgs, TTL).breakpoints.length, MAX_BREAKPOINTS);
 });
+
+test("the anchor stays at the head when messages[1] contributes no blocks", () => {
+  // The anchor scope used to be "first block of message 1, minus one", which
+  // finds nothing when message 1 has no blocks -- an assistant turn that only
+  // called tools, or an empty content array. The scope then collapsed to the
+  // whole array and the anchor landed at the TAIL, losing the one marker that
+  // is supposed to never move.
+  const msgs: Message[] = [
+    { role: "user", content: "the stable prompt ".repeat(20) },
+    { role: "assistant", content: [] },
+    { role: "user", content: [toolResult("c0")] },
+    { role: "assistant", content: [textBlock("done")] },
+  ];
+  const plan = planCacheBreakpoints(msgs, TTL);
+  assert.equal(plan.breakpoints[0].messageIndex, 0, "the anchor must stay on messages[0]");
+});
+
+test("the anchor stays at the end of the system run when it contributes blocks unevenly", () => {
+  const msgs: Message[] = [
+    { role: "system", content: [textBlock("rules a")] },
+    { role: "system", content: [] },
+    { role: "user", content: "go ".repeat(20) },
+    { role: "assistant", content: [textBlock("ok")] },
+  ];
+  const plan = planCacheBreakpoints(msgs, TTL);
+  assert.equal(plan.systemRunLength, 2);
+  assert.equal(plan.breakpoints[0].messageIndex, 0, "last markable block inside the system run");
+});

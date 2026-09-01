@@ -40,6 +40,8 @@ import {
   DELIVERY_HEARTBEAT_MS, DELIVERY_HEARTBEATS_PER_ACK_WAIT,
   RUN_GATE_KEY, RUN_GATE_KEY_CONFIGURED,
   envSettingProblems,
+  LLM_CACHE_STYLE,
+  openAiBaseUrlFellBack,
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
 } from "./config.js";
 import { existsSync, createReadStream } from "fs";
@@ -340,6 +342,22 @@ function validateStartupConfig(): void {
   if (missing.length) {
     logger.warn({ missing }, "startup.config_missing");
   }
+  // The OpenAI wire protocol was selected with no URL of its own, so
+  // chat/completions is pointed at whatever ANTHROPIC_BASE_URL names. In this
+  // fleet that is a gateway serving Anthropic models, which honours cache
+  // markers -- and leaving LLM_CACHE_STYLE at its "native" default there means
+  // paying full price on every request. Said at boot because the alternative
+  // is finding out on a bill: that is exactly how the incident this caching
+  // work came from went unnoticed for two years.
+  if (openAiBaseUrlFellBack()) {
+    logger.warn(
+      { llmCacheStyle: LLM_CACHE_STYLE },
+      LLM_CACHE_STYLE === "anthropic"
+        ? "startup.openai_base_url_fell_back: OPENAI_BASE_URL is unset, so chat/completions targets ANTHROPIC_BASE_URL; LLM_CACHE_STYLE=anthropic, so cache markers will be sent"
+        : "startup.openai_base_url_fell_back: OPENAI_BASE_URL is unset, so chat/completions targets ANTHROPIC_BASE_URL -- a gateway that likely honours prompt caching, but LLM_CACHE_STYLE is \"native\" so no markers are sent and every request pays full price. Set LLM_CACHE_STYLE=anthropic if that endpoint fronts Anthropic models.",
+    );
+  }
+
   if (!WORKSPACE_PERSIST_BASE) {
     logger.warn(
       "startup.workspace_persistence_disabled: WORKSPACE_PERSIST_BASE is empty; using S3-only durability",

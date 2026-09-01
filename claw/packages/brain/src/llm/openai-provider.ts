@@ -8,7 +8,8 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import type { Message, ToolSchema } from "@claw/protocol";
-import { STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { LLM_CACHE_STYLE, LLM_CACHE_TTL, OPENAI_ANTHROPIC_MARKERS, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { renderOpenAiCacheMarkers } from "./openai-cache.js";
 import type {
   LlmContentBlock,
   LlmProvider,
@@ -45,7 +46,7 @@ function normalizeStopReason(finishReason: string | null): string | null {
  * while OpenAI expects tool calls on `assistant.tool_calls` and tool results
  * as standalone `role: "tool"` messages.
  */
-function toOpenAiMessages(messages: Message[]): ChatCompletionMessageParam[] {
+export function toOpenAiMessages(messages: Message[]): ChatCompletionMessageParam[] {
   const out: ChatCompletionMessageParam[] = [];
   for (const m of messages) {
     if (typeof m.content === "string") {
@@ -111,6 +112,20 @@ async function streamingTurn(
     else signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
+  // Markers are placed on the WIRE messages, after the transform. See
+  // llm/openai-cache.ts for why planning cannot happen before it.
+  //
+  // Only when the deployment has said what this endpoint is. Left at its
+  // "native" default nothing is sent, because guessing wrong toward markers
+  // puts an unrecognised key in every request to a real OpenAI endpoint.
+  const wire = toOpenAiMessages(messages);
+  const rendered = OPENAI_ANTHROPIC_MARKERS
+    ? renderOpenAiCacheMarkers(wire as unknown as Array<Record<string, unknown>>,
+        { style: LLM_CACHE_STYLE, ttl: LLM_CACHE_TTL })
+    : { messages: wire as unknown as Array<Record<string, unknown>>, breakpointsApplied: 0 };
+  const wireMessages = rendered.messages;
+  const breakpointsSent = rendered.breakpointsApplied;
+
   const t0 = Date.now();
   const firstByteTimer = setTimeout(() => {
     ctrl.abort(new Error(`stream first-byte timeout after ${STREAM_FIRST_BYTE_TIMEOUT_MS}ms`));
@@ -121,7 +136,7 @@ async function streamingTurn(
     stream = await client.chat.completions.create(
       {
         model,
-        messages: toOpenAiMessages(messages),
+        messages: wireMessages as unknown as ChatCompletionMessageParam[],
         tools: tools.length ? toOpenAiTools(tools) : undefined,
         stream: true,
         stream_options: { include_usage: true },
@@ -302,9 +317,8 @@ async function streamingTurn(
     // OpenAI-compatible gateway honours it.
     promptTokens: sawUsage ? usage.input_tokens : undefined,
     cacheReport: {
-      // No markers are rendered on this path yet.
-      breakpointsSent: 0,
-      enabled: false,
+      breakpointsSent,
+      enabled: OPENAI_ANTHROPIC_MARKERS,
       // Derived from the response, not declared here. See the read site above.
       reported: [...reported],
       createdEphemeral5m: created5m,
