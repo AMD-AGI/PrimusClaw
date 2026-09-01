@@ -77,3 +77,44 @@ test("this path claims no breakpoints, because it renders none", async () => {
     "a marker here would be silently destroyed by the string collapse anyway",
   );
 });
+
+test("what the response reports is what gets claimed, not what the provider assumed", async () => {
+  // Measured against the LiteLLM gateway this fleet talks to: an OpenAI-shaped
+  // response carries the cache write in three places at once. Hardcoding
+  // "this transport cannot report writes" was true of genuine OpenAI and false
+  // of the deployment that matters, and a claim about the transport cannot be
+  // right for both.
+  const { client } = stubClient({
+    prompt_tokens: 30037, completion_tokens: 4,
+    cache_creation_input_tokens: 30028,
+    cache_read_input_tokens: 0,
+    prompt_tokens_details: {
+      cached_tokens: 0,
+      cache_creation_tokens: 30028,
+      cache_creation_token_details: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 30028 },
+    },
+  });
+  const res = await buildOpenAiSession(client, "claude-opus-4.5").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  assert.deepEqual([...(res.cacheReport?.reported ?? [])].sort(), ["cache_create", "cache_read"]);
+  assert.equal(res.usage.cache_create, 30028);
+  assert.equal(res.cacheReport?.createdEphemeral1h, 30028);
+  assert.equal(res.cacheReport?.createdEphemeral5m, 0);
+});
+
+test("a backend that reports only reads claims only reads", async () => {
+  // Genuine OpenAI: cached_tokens and nothing else. cache_create must stay
+  // unclaimed rather than be reported as an observed zero.
+  const { client } = stubClient({
+    prompt_tokens: 100, completion_tokens: 1,
+    prompt_tokens_details: { cached_tokens: 40 },
+  });
+  const res = await buildOpenAiSession(client, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  assert.deepEqual([...(res.cacheReport?.reported ?? [])], ["cache_read"]);
+  assert.equal(res.usage.cache_read, 40);
+});
+
+test("a response with no cache fields at all claims nothing", async () => {
+  const { client } = stubClient({ prompt_tokens: 50, completion_tokens: 1 });
+  const res = await buildOpenAiSession(client, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  assert.deepEqual([...(res.cacheReport?.reported ?? [])], []);
+});

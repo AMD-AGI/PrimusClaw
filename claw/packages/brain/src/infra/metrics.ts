@@ -498,13 +498,18 @@ export const metrics = {
       llmCacheWriteTokensTotal.inc({ ttl: "unreported" }, input.cacheCreate);
     }
     llmCacheBreakpointsSent.observe(input.breakpointsSent);
-    const state = !input.enabled
-      ? "off"
-      : input.cacheRead > 0
-        ? "hit"
-        : input.cacheCreate > 0
-          ? "write"
-          : "miss";
+    // Observed behaviour first, our configuration second. A backend that
+    // caches on its own -- genuine OpenAI does -- serves a hit on a turn where
+    // we sent no markers, and calling that "off" while the same turn
+    // increments cache_read said two contradictory things about one request.
+    // "off" now means only "we sent nothing and nothing came back".
+    const state = input.cacheRead > 0
+      ? "hit"
+      : input.cacheCreate > 0
+        ? "write"
+        : input.enabled
+          ? "miss"
+          : "off";
     llmCacheTurnsTotal.inc({ state });
   },
   onPromptSizeUnknown(): void {

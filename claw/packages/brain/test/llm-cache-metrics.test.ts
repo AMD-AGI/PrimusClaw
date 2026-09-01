@@ -194,3 +194,28 @@ test("the per-turn event carries the split when the gateway sent one", async () 
   assert.equal(msg?.turn_cache_create_1h, 500);
   assert.equal(msg?.turn_cache_create_5m, 0);
 });
+
+test("a backend that caches on its own is a hit, not 'off'", async () => {
+  // Genuine OpenAI caches automatically: a turn can come back with a read on a
+  // request where we sent no markers. Labelling that "off" while the same turn
+  // increments cache_read said two contradictory things about one request.
+  const before = {
+    hit: await counter("claw_brain_llm_cache_turns_total", { state: "hit" }),
+    off: await counter("claw_brain_llm_cache_turns_total", { state: "off" }),
+  };
+  await run({
+    usage: { input_tokens: 100, output_tokens: 3, cache_read: 4_000, cache_create: 0 },
+    cacheReport: { breakpointsSent: 0, enabled: false, reported: ["cache_read"] },
+  });
+  assert.equal(await counter("claw_brain_llm_cache_turns_total", { state: "hit" }), before.hit + 1);
+  assert.equal(await counter("claw_brain_llm_cache_turns_total", { state: "off" }), before.off);
+});
+
+test("off still means we sent nothing and nothing came back", async () => {
+  const before = await counter("claw_brain_llm_cache_turns_total", { state: "off" });
+  await run({
+    usage: { input_tokens: 100, output_tokens: 3, cache_read: 0, cache_create: 0 },
+    cacheReport: { breakpointsSent: 0, enabled: false, reported: ["cache_read"] },
+  });
+  assert.equal(await counter("claw_brain_llm_cache_turns_total", { state: "off" }), before + 1);
+});

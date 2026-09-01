@@ -157,6 +157,9 @@ async function streamingTurn(
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
   let bodyModel: string | undefined;
   let sawUsage = false;
+  const reported = new Set<"cache_read" | "cache_create">();
+  let created5m: number | undefined;
+  let created1h: number | undefined;
 
   try {
     for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
@@ -169,9 +172,39 @@ async function streamingTurn(
       // include_usage=true — see openai SDK ChatCompletionChunk docs.
       if (chunk.usage) {
         sawUsage = true;
+        const u = chunk.usage as Record<string, any>;
         usage.input_tokens = chunk.usage.prompt_tokens ?? 0;
         usage.output_tokens = chunk.usage.completion_tokens ?? 0;
-        usage.cache_read = (chunk.usage as any).prompt_tokens_details?.cached_tokens ?? 0;
+        const details = u.prompt_tokens_details ?? {};
+
+        // Read every spelling, and record which ones were actually present.
+        //
+        // Declaring up front that this transport cannot report writes was
+        // wrong for the deployment that matters. Measured against the LiteLLM
+        // gateway this fleet talks to, an OpenAI-shaped response carries the
+        // write in three places at once -- top-level
+        // cache_creation_input_tokens, nested
+        // prompt_tokens_details.cache_creation_tokens, and a per-TTL
+        // breakdown -- while genuine OpenAI carries none of them and reports
+        // only cached_tokens. Which is true is a property of the response, not
+        // of the provider, so it is read rather than asserted. Absent stays
+        // absent: an unreported field emits no metric series, and a zero we
+        // invented would be averaged as an observation.
+        const readRaw = u.cache_read_input_tokens ?? details.cached_tokens;
+        const createRaw = u.cache_creation_input_tokens ?? details.cache_creation_tokens;
+        if (readRaw !== undefined && readRaw !== null) {
+          usage.cache_read = Number(readRaw) || 0;
+          reported.add("cache_read");
+        }
+        if (createRaw !== undefined && createRaw !== null) {
+          usage.cache_create = Number(createRaw) || 0;
+          reported.add("cache_create");
+        }
+        const split = details.cache_creation_token_details;
+        if (split && typeof split === "object") {
+          created5m = split.ephemeral_5m_input_tokens ?? undefined;
+          created1h = split.ephemeral_1h_input_tokens ?? undefined;
+        }
       }
 
       const choice = chunk.choices?.[0];
@@ -269,17 +302,13 @@ async function streamingTurn(
     // OpenAI-compatible gateway honours it.
     promptTokens: sawUsage ? usage.input_tokens : undefined,
     cacheReport: {
-      // No markers are rendered on this path: toOpenAiMessages is not a 1:1
-      // mapping (a tool_result message fans out into N role:"tool" messages)
-      // and it collapses content to strings, which cannot carry a marker.
+      // No markers are rendered on this path yet.
       breakpointsSent: 0,
       enabled: false,
-      // `cache_create` is initialised above and never assigned -- this
-      // transport has no way to report a cache write. Declaring that is the
-      // difference between "we cannot see writes" and "there were no writes";
-      // a dashboard averaging the second is the exact shape of the incident
-      // this whole change exists to prevent.
-      reported: ["cache_read"] as const,
+      // Derived from the response, not declared here. See the read site above.
+      reported: [...reported],
+      createdEphemeral5m: created5m,
+      createdEphemeral1h: created1h,
     },
   };
 }
