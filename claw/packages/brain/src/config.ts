@@ -383,7 +383,13 @@ export const SYSTEM_ENV_BUCKET = env("SYSTEM_ENV_BUCKET", "SYSTEM_ENV");
 // it, and the lease reaper on the API side derives its own grace from that. The
 // two packages read the same default and the same env var, which is what stops
 // one of them being tuned into disagreeing with the other.
-export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", 3);
+//
+// The replica counts fall back to NATS_REPLICAS, the API package's variable of
+// the same name, so one setting covers both processes: a single-node dev server
+// otherwise needs one variable per bucket, and JetStream refuses replicas>1 in
+// non-clustered mode (err 10074) for every one that gets missed.
+export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
+export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS);
 export const BRAIN_REGISTRY_TTL_MS = envInt(
   "BRAIN_REGISTRY_TTL_MS",
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
@@ -513,7 +519,13 @@ export const BRAIN_CHECKPOINTS_TTL_MS = envInt(
   "BRAIN_CHECKPOINTS_TTL_MS",
   24 * 60 * 60 * 1000,
 );
-export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", 3);
+export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", NATS_REPLICAS);
+// DAG_HANDLES is the one bucket brain creates itself, and it was opened with
+// `js.views.kv(BUCKET)` and no options, so it took the JetStream default of a
+// single replica and kept it: one server owning the handles that every
+// `sandbox.use` resolves through. The same single point of failure that took
+// task dispatch down on 2026-09-01, one bucket over.
+export const DAG_HANDLES_REPLICAS = envInt("DAG_HANDLES_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const BRAIN_CHECKPOINTS_MAX_VALUE_BYTES = envInt(
   "BRAIN_CHECKPOINTS_MAX_VALUE_BYTES",
   16 * 1024 * 1024,

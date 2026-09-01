@@ -232,6 +232,14 @@ secret:
   natsUrl: ""
   natsUser: prod
   natsPassword: "__TBD__"
+  # Replicas for every JetStream stream and KV bucket the API and Brain create.
+  # Blank takes the code default of 3, which is what the bundled clustered NATS
+  # serves; set it to 1 only when pointing at a single-node `nats-server -js`,
+  # which refuses replicas>1 and would fail the deployment at provisioning.
+  # Leaving this at 1 against a cluster is what produced the 2026-09-01 outage:
+  # a one-replica `PRIMUS_CLAW_TASKS` lives on a single server, so losing that
+  # pod leaves nothing hosting `tasks.>` and every dispatch returns 503.
+  natsReplicas: ""
   # "safe" routes sandboxes through the SaFE workload API; "kubernetes" (BYOK)
   # drives the agent-sandbox router directly and authenticates callers against
   # the LLM gateway instead of SaFE. deploy.sh passes "kubernetes"; leaving this
