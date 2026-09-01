@@ -11,10 +11,9 @@
  * silently, so every workload created through the DAG path ran as a shared
  * identity.
  *
- * That is not only an attribution problem. SaFE takes
- * `primus-safe.amd.com/user.id` from the bearer's subject and grants
- * update/delete/resume to the workload's owner, so the caller could not stop or
- * delete their own run.
+ * That is not only an attribution problem. SaFE takes the workload's
+ * `user.id` label from the bearer's subject and grants update/delete/resume to
+ * the owner, so the caller could not stop or delete their own run.
  *
  * One helper, used by every entry point that starts server-side work, because
  * the bug was precisely that one path stamped the key and another did not.

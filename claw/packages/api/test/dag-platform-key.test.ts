@@ -11,10 +11,9 @@
  * shared identity, silently, with a `hasPlatformKey` in a log line as the only
  * trace.
  *
- * The consequence is not only attribution. SaFE reads
- * `primus-safe.amd.com/user.id` from the bearer's subject and grants
- * update/delete/resume to the workload's owner, so the person who submitted a run
- * could not stop, delete or resume it.
+ * The consequence is not only attribution. SaFE reads the workload's `user.id`
+ * label from the bearer's subject and grants update/delete/resume to the owner,
+ * so the person who submitted a run could not stop, delete or resume it.
  *
  * Coverage:
  *   C1 a session with the submitter's key dispatches as the submitter

@@ -148,10 +148,10 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   // There is deliberately no fallback to the cluster-wide `SAFE_PLATFORM_KEY`.
   // There used to be, and it applied silently: every DAG-driven workload ran
   // under a shared identity, because the only entry point that recorded the
-  // caller's key was the workbench one. SaFE takes
-  // `primus-safe.amd.com/user.id` from the bearer's subject and grants
-  // update/delete/resume to the owner, so the submitter of a run could not stop
-  // or delete it — and nothing anywhere said why.
+  // caller's key was the workbench one. SaFE takes the workload's `user.id`
+  // label from the bearer's subject and grants update/delete/resume to the
+  // owner, so the submitter of a run could not stop or delete it -- and nothing
+  // anywhere said why.
   //
   // Failing here instead is the point. Every entry point now stamps the key
   // before the task is queued (see auth/session-credentials.ts), so a session
