@@ -26,7 +26,7 @@
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import pino from "pino";
-import { authMiddleware, getUser } from "../auth/middleware.js";
+import { getUser } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
 import { db } from "../infra/db.js";
 import { phaseOf, terminalFacts, type RunView } from "./platform-terminal.js";
@@ -117,7 +117,9 @@ function parseIds(raw: string): string[] {
 }
 
 export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
-  app.addHook("preHandler", authMiddleware);
+  // No auth hook here on purpose: index.ts registers authMiddleware once for the
+  // whole app, and this instance is not encapsulated, so adding one here runs
+  // auth twice on every request to every route -- not just these.
 
   /**
    * Rows this caller may see.
