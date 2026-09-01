@@ -31,22 +31,33 @@ WORKDIR /app
 # Prefer a content-addressed URL (a commit SHA, a digest) over a branch or a
 # mutable path: whoever controls the ref controls what TLS this image trusts.
 #
-# Certificates must be PEM. Fetch failures are fatal rather than silent -- a
-# build that asked for an anchor and did not get it should not be mistaken for
-# a working one.
+# PEM or DER; DER is converted on the way in. A Windows AD CS PKI publishes
+# DER at the CertEnroll URL its own certificates name in their Authority
+# Information Access extension, so a PEM-only rule made the documented
+# mechanism unusable against the most common enterprise CA there is -- and the
+# remaining route is tls.insecureSkipVerify, which is what this block exists to
+# avoid. Fetch failures and unparseable files stay fatal rather than silent: a
+# build that asked for an anchor and did not get one should not be mistaken for
+# a working image.
 ARG EXTRA_CA_CERT_URLS=""
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates git \
+ && apt-get install -y --no-install-recommends curl ca-certificates git openssl \
  && rm -rf /var/lib/apt/lists/* \
  && if [ -n "$EXTRA_CA_CERT_URLS" ]; then \
       i=0; \
       for url in $EXTRA_CA_CERT_URLS; do \
         i=$((i+1)); \
-        curl -fsSL --retry 2 --max-time 30 \
-          -o "/usr/local/share/ca-certificates/extra-ca-${i}.crt" "$url" \
+        dst="/usr/local/share/ca-certificates/extra-ca-${i}.crt"; \
+        curl -fsSL --retry 2 --max-time 30 -o "$dst.in" "$url" \
           || { echo "error: could not fetch CA certificate: $url" >&2; exit 1; }; \
-        grep -q 'BEGIN CERTIFICATE' "/usr/local/share/ca-certificates/extra-ca-${i}.crt" \
-          || { echo "error: not a PEM certificate: $url" >&2; exit 1; }; \
+        if grep -q 'BEGIN CERTIFICATE' "$dst.in"; then \
+          openssl x509 -in "$dst.in" -out "$dst" \
+            || { echo "error: unparseable PEM certificate: $url" >&2; exit 1; }; \
+        else \
+          openssl x509 -inform DER -in "$dst.in" -out "$dst" \
+            || { echo "error: neither PEM nor DER certificate: $url" >&2; exit 1; }; \
+        fi; \
+        rm -f "$dst.in"; \
       done; \
       update-ca-certificates; \
       echo "installed $i extra CA anchor(s)."; \

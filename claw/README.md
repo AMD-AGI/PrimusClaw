@@ -112,8 +112,10 @@ which `NODE_EXTRA_CA_CERTS` then points at. Empty by default: an anchor baked
 into a published image widens what that image accepts for everyone who runs it,
 so it has to be an explicit choice by whoever builds it. Use content-addressed
 URLs — a commit SHA or a digest — since whoever controls the ref controls what
-TLS the image will trust. A URL that cannot be fetched, or that does not return
-PEM, fails the build rather than being skipped.
+TLS the image will trust. PEM or DER is accepted, because a Windows AD CS PKI
+publishes DER at the CertEnroll URL its own certificates advertise. A URL that
+cannot be fetched, or that returns something that is not a certificate in
+either encoding, fails the build rather than being skipped.
 
 This is the supported alternative to `tls.insecureSkipVerify` in the Helm
 chart, which turns off certificate verification for *every* outbound connection
