@@ -8,6 +8,7 @@ import {
   BRAIN_REGISTRY_TTL_MS,
   BRAIN_REGISTRY_REPLICAS, BRAIN_CHECKPOINTS_REPLICAS, SYSTEM_ENV_REPLICAS,
   TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS, DISPATCH_STREAM_REPLICAS,
+  DISPATCH_SUBJECT_PREFIX,
 } from "../config.js";
 import {
   TASK_CONSUMER_ACK_WAIT_NS, TASK_CONSUMER_NAME, TASK_STREAM_NAME,
@@ -34,19 +35,19 @@ export const EVENT_STREAM = "PRIMUS_CLAW_EVENTS";
 // the durable living on it, and a second literal is a second thing to edit.
 export const TASK_STREAM = TASK_STREAM_NAME;
 /**
- * The dispatch control plane's terminal events.
+ * A dispatch control plane's terminal events.
  *
- * Claw hosts the bus and owns the stream; the dispatcher publishes to it and
- * nothing here reads it. It exists so a consumer can be added later without a
+ * Claw hosts the bus and owns the stream; a dispatcher above it publishes, and
+ * nothing here reads. It exists so a consumer can be added later without a
  * migration -- and so the retention is a decision somebody made rather than
  * whatever a first publish happens to create.
  *
- * The subject prefix is `hld`, the dispatcher's name today. It is being renamed
- * to `dispatch`, and this string is versioned (`hld.v1.*`) precisely so the
- * rename is a new subject rather than a reinterpretation of this one.
+ * The prefix is versioned, and configurable because the publisher names it: a
+ * deployment whose dispatcher publishes under some other prefix sets
+ * DISPATCH_SUBJECT_PREFIX rather than running a stream that matches nothing it
+ * sends. Both halves have to agree, and only one of them is this repo.
  */
 export const DISPATCH_STREAM = "PRIMUS_DISPATCH_EVENTS";
-export const DISPATCH_SUBJECT_PREFIX = "hld.v1";
 
 // KV bucket names (Plan Y v2). Must match brain/src/config.ts mirror values.
 // Authority for bucket lifecycle is initNats() below; brain pods attach the

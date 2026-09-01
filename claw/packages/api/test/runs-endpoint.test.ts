@@ -55,9 +55,9 @@ function serve(rows: unknown[]): void {
 }
 
 test("R1 one sweep's worth of runs comes back in a single call", async () => {
-  // 200 concurrent runs is the stated width of a 65K sweep's reconcile, and the
-  // reason the batch form exists at all: point queries would be 200 calls per
-  // 30-second tick.
+  // 200 concurrent runs is the stated width of one reconcile pass at full
+  // concurrency, and the reason the batch form exists at all: point queries
+  // would be 200 calls per 30-second tick.
   const ids = Array.from({ length: 200 }, (_, i) => `ktsk_${String(i).padStart(4, "0")}`);
   serve(ids.map((id) => row(id)));
   const resp = await app.inject({ method: "GET", url: `/v1/runs?ids=${ids.join(",")}` });

@@ -230,6 +230,12 @@ export const EVENT_STREAM_REPLICAS = envInt("EVENT_STREAM_REPLICAS", NATS_REPLIC
 // lands on the JetStream default of 1, and a single-replica stream is hosted by
 // exactly one server.
 export const DISPATCH_STREAM_REPLICAS = envInt("DISPATCH_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
+// Subject prefix for the dispatch event stream. The publisher chooses it and
+// lives outside this repo, so it is configuration rather than a constant; the
+// default is the generic name and a deployment whose dispatcher uses another
+// sets this. Versioned, so a later rename is a new subject rather than a
+// reinterpretation of this one.
+export const DISPATCH_SUBJECT_PREFIX = env("DISPATCH_SUBJECT_PREFIX", "dispatch.v1");
 // Bounded the way brain bounds the same two variables, because unbounded on one
 // side of a shared setting is what lets one variable mean two things:
 // `RUN_LEASE_TTL_MS=0` is refused there and taken literally here, and the zero

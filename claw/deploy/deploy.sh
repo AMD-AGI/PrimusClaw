@@ -231,6 +231,7 @@ if ! $SKIP_NATS; then
     | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
           -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
           -e "s|__DISPATCH_NATS_PASSWORD__|${NATS_PASSWORD_DISPATCH}|g" \
+        -e "s|__DISPATCH_SUBJECT_PREFIX__|${DISPATCH_SUBJECT_PREFIX:-dispatch.v1}|g" \
     > "$RENDERED_NATS_VALUES"
 
   if $DRY_RUN; then

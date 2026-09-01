@@ -13,9 +13,9 @@
 #       DEV_<NAME> entry found in the same credentials file.
 #
 # Multi-account isolation:
-#   - PROD account hosts the production api/brain deployment. The dispatch
-#     control plane publishes into it as a second, publish-only user; it is not
-#     an account of its own because its stream lives in PROD's JetStream
+#   - PROD account hosts the production api/brain deployment. A dispatch control
+#     plane above Claw publishes into it as a second, publish-only user; it is
+#     not an account of its own because its stream lives in PROD's JetStream
 #     namespace and an account boundary is exactly what a separate account
 #     would put between them.
 #   - DEV_<NAME> accounts host individual developers' local instances.
@@ -52,10 +52,15 @@ config:
         users:
           - user: prod
             password: "__PROD_NATS_PASSWORD__"
-          # The dispatch control plane (Dispatron, `hld` today). Publishes its
-          # terminal events and nothing else: it does not read Claw's streams,
-          # and a credential that could would make every future Claw subject
-          # readable by another service by default.
+          # The dispatch control plane above Claw. Publishes its terminal
+          # events and nothing else: it does not read Claw's streams, and a
+          # credential that could would make every future Claw subject readable
+          # by another service by default.
+          #
+          # The subject is rendered from DISPATCH_SUBJECT_PREFIX so it cannot
+          # drift from the stream the API provisions under the same setting --
+          # a permission for one prefix and a stream for another is a publisher
+          # that authenticates and then has nowhere to publish.
           #
           # `_INBOX.>` is not an exception to publish-only -- a JetStream
           # publish waits for its ack on an inbox, so without it every publish
@@ -66,7 +71,7 @@ config:
             permissions:
               publish:
                 allow:
-                  - "hld.v1.>"
+                  - "__DISPATCH_SUBJECT_PREFIX__.>"
               subscribe:
                 allow:
                   - "_INBOX.>"
