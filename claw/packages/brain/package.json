@@ -13,8 +13,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
-    "@aws-sdk/client-s3": "^3.1120.0",
-    "@aws-sdk/s3-request-presigner": "^3.1120.0",
+    "@aws-sdk/client-s3": "^3.1121.0",
+    "@aws-sdk/s3-request-presigner": "^3.1121.0",
     "@claw/protocol": "*",
     "@claw/utils": "*",
     "@modelcontextprotocol/sdk": "^1.12.0",
