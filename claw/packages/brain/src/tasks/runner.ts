@@ -1945,6 +1945,13 @@ class TaskRunner {
     const CHECKPOINT_INTERVAL_MS = 30 * 60 * 1000;
     return setInterval(() => {
       if (this.inflightCkptInProgress || this.abortCtrl.signal.aborted) return;
+      // A throwaway workspace has nothing for this to protect. The checkpoint
+      // exists so a failed terminal sync does not lose the run's artifacts, and
+      // this run publishes none -- so the only thing it would do is repeat the
+      // upload the flag was set to avoid, every half hour, for runs measured in
+      // days. Skipped rather than gated at the terminal, so nothing is written
+      // and there is correspondingly nothing for the recovery copy to find.
+      if (this.request.workspace_throwaway === true) return;
       // Capture the current hands client; recreateHands may swap `hands`
       // mid-run after a sandbox rebuild, but for this checkpoint we want
       // the live reference that exists at fire time.

@@ -86,15 +86,24 @@ export const RUN_BUDGET_OFF = 0;
  * then watches it for hours -- arrive as chat turns too, and they are the runs
  * a budget actually decides the fate of.
  *
- * The chat scope defaults to 48 hours; `dag_node` keeps the day it already
- * had, because the measurement below is about chat turns and nothing here
- * learned anything new about graph nodes -- and raising `dag_node` buys
- * nothing anyway, since the 24h it already has sits above
- * `BRAIN_TASK_TIMEOUT_SEC`, which closes a graph node first (see below), so
- * moving it would have been noise dressed as symmetry. The chat number is not
- * in that position and the whole change depends on its not being: a chat row
- * carries a lease and `reapStaleTasks` skips it by default, so nothing caps a
- * live chat turn at the global timeout and all 48 hours are reachable.
+ * The chat scope defaults to 48 hours. A chat row carries a lease and
+ * `reapStaleTasks` skips it by default, so nothing caps a live chat turn at the
+ * global timeout and all 48 hours are reachable.
+ *
+ * `dag_node` defaults to 72 hours. It sat at 24 for as long as the number was
+ * unreachable: a DAG row is dispatched by a path that issues no run_lease, so
+ * `lease_expires_at` stays NULL for its whole life, and the sweeper's
+ * never-claimed arm closed every graph node at `BRAIN_TASK_TIMEOUT_SEC` -- six
+ * hours in the shipped chart -- with the budget above it dead letter. Raising it
+ * then would have been noise dressed as symmetry, and the comment here said so.
+ *
+ * That arm now excludes rows carrying a deadline of their own, so the budget is
+ * what decides a graph node's fate and the number has to mean something. 72h is
+ * set by the longest workload this fleet is being built to carry rather than by
+ * measurement: a Kernel Arena run is an hour to three days, and a ceiling
+ * *inside* the intended range kills the expensive tail after days of GPU time
+ * already spent. Chat's 48h comes from a measured distribution; this one comes
+ * from a stated requirement, and the two numbers are unrelated on purpose.
  *
  * What was wrong was two hours, not the existence of a ceiling: once liveness moved onto the lease, what a
  * budget still decides is policy rather than safety, and a two-hour policy
@@ -168,7 +177,7 @@ export const RUN_BUDGET_OFF = 0;
  */
 export const RUN_BUDGET_DEFAULT_SEC: Record<RunScope, number> = {
   chat: envBudgetSec("RUN_BUDGET_CHAT_SEC", 48 * 60 * 60),
-  dag_node: envBudgetSec("RUN_BUDGET_DAG_NODE_SEC", 24 * 60 * 60),
+  dag_node: envBudgetSec("RUN_BUDGET_DAG_NODE_SEC", 72 * 60 * 60),
 };
 
 /**

@@ -51,7 +51,7 @@ test("each scope reads its own env key, so lowering one does not move the other"
     const fresh = await import(spec);
     assert.equal(fresh.RUN_BUDGET_DEFAULT_SEC.chat, 600,
       "RUN_BUDGET_CHAT_SEC must be what sets the chat budget");
-    assert.equal(fresh.RUN_BUDGET_DEFAULT_SEC.dag_node, 24 * 60 * 60,
+    assert.equal(fresh.RUN_BUDGET_DEFAULT_SEC.dag_node, 72 * 60 * 60,
       "a chat override must not drag the DAG-node default with it");
   } finally {
     if (before.chat === undefined) delete process.env.RUN_BUDGET_CHAT_SEC;

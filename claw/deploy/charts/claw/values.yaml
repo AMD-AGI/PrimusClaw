@@ -55,9 +55,15 @@ api:
   # run_budget_exhausted with the turn count. Without one the row is requeued
   # from outside and the user is told nothing about why.
   #
-  # runBudgetDagNodeSec only bites below api.brainTaskTimeoutSec: above it a
-  # graph node is closed as brain_timeout first, because a DAG row carries no
-  # lease for the budget arm to outrun.
+  # runBudgetDagNodeSec is now the ceiling a graph node actually runs into, at
+  # any value: the sweeper's never-claimed arm skips a row that carries a
+  # deadline of its own, so it no longer closes budgeted nodes at
+  # api.brainTaskTimeoutSec. It used to, which is why this said the opposite --
+  # a node given three days died in six hours and the budget was dead letter.
+  #
+  # brainTaskTimeoutSec still backstops a row with NO budget, and still bounds a
+  # DAG root once one of its children has failed (sweeper.reapStuckDagRoots), so
+  # a multi-day graph that loses a node does not survive on this setting alone.
   runBudgetChatSec: ""
   runBudgetDagNodeSec: ""
   # How many times a message queued behind a running turn may be refused a

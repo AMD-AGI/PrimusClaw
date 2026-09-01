@@ -21,7 +21,7 @@
  *   R2 a run that did not declare it still syncs -- the guard is inert by default
  *   R3 the flag does not disable the sandbox teardown that follows the sync
  */
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import type { JsMsg, KV } from "nats";
 import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
@@ -68,9 +68,16 @@ function stubSideEffects(): Partial<TaskRunnerSideEffects> {
     reapPendingHands: record("reapPendingHands", undefined),
     unregisterSandbox: ((..._a: unknown[]) => { calls.push("unregisterSandbox"); }) as never,
     markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); }) as never,
-    syncWorkspaceToS3: record("syncWorkspaceToS3", {
-      uploaded: 1, totalFiles: 1, failedCount: 0, exhausted: false, empty: false,
-    }),
+    // The checkpoint and the terminal sync are the same function; only the
+    // destination tells them apart, so the call is logged with it.
+    syncWorkspaceToS3: ((
+      _h: unknown, _s: unknown, _u: unknown, opts?: { s3PrefixOverride?: string },
+    ) => {
+      calls.push(opts?.s3PrefixOverride ? "checkpointSync" : "syncWorkspaceToS3");
+      return Promise.resolve({
+        uploaded: 1, totalFiles: 1, failedCount: 0, exhausted: false, empty: false,
+      });
+    }) as never,
     syncWorkspaceFromS3: record("syncWorkspaceFromS3", undefined),
     archiveRunToS3: record("archiveRunToS3", undefined),
     copyS3Prefix: record("copyS3Prefix", { copied: 0 }),
@@ -85,6 +92,9 @@ function stubSideEffects(): Partial<TaskRunnerSideEffects> {
     })) as never,
   };
 }
+
+/** Set by the test that drives the checkpoint interval. */
+let tickCheckpoint = false;
 
 const RESULT: ExecuteResult = {
   finalText: "done",
@@ -108,6 +118,9 @@ async function run(over: Partial<ExecuteRequest>): Promise<string[]> {
     ) {
       calls.push("engine.execute");
       await extras?.attachHands?.();
+      // The checkpoint timer first fires 30 minutes in. Mock timers are enabled
+      // by the test that cares; elsewhere this is a no-op.
+      if (tickCheckpoint) mock.timers.tick(30 * 60 * 1000);
       return RESULT;
     },
   } as unknown as Engine;
@@ -159,4 +172,33 @@ test("R3 opting out of the sync does not opt out of the teardown", async () => {
     seen.some((c) => c === "destroyHands" || c === "markHandsIdle"), true,
     "the sandbox is still handed back",
   );
+});
+
+/** One run with the checkpoint interval driven forward 30 minutes. */
+async function runWithCheckpointTick(over: Partial<ExecuteRequest>): Promise<string[]> {
+  mock.timers.enable({ apis: ["setInterval"] });
+  tickCheckpoint = true;
+  try {
+    return await run(over);
+  } finally {
+    tickCheckpoint = false;
+    mock.timers.reset();
+  }
+}
+
+test("R4 the in-flight checkpoint is skipped for a throwaway workspace", async () => {
+  // The terminal sync was only half of it. The checkpoint uploads the whole tree
+  // every 30 minutes so a failed terminal sync does not lose the run's
+  // artifacts; across the 1-hour-to-3-day runs this flag exists for, that is up
+  // to ~144 full uploads of a workspace nobody wants -- far more duplication
+  // than the single terminal copy the flag was written to remove.
+  const seen = await runWithCheckpointTick({ workspace_throwaway: true });
+  assert.equal(seen.includes("checkpointSync"), false, seen.join(","));
+});
+
+test("R5 an ordinary run still gets its checkpoint", async () => {
+  // The checkpoint is what saves a long run whose terminal sync fails. Skipping
+  // it by default would trade a duplicate copy for a lost one.
+  const seen = await runWithCheckpointTick({});
+  assert.equal(seen.includes("checkpointSync"), true, seen.join(","));
 });
