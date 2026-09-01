@@ -1005,6 +1005,22 @@ export async function initDb(): Promise<void> {
     // Monotonic per-run event counter, so a reconnecting reader can say what
     // it has already seen instead of receiving the stream from the top.
     await addTaskCol("event_seq", "BIGINT NOT NULL DEFAULT 0");
+    // What the platform did to this run, captured when it ended.
+    //
+    // Recorded rather than fetched on read. A dispatcher above Claw polls a couple
+    // of hundred live runs every thirty seconds; resolving each one against SaFE at
+    // that point would be two hundred calls per sweep, and it would be asking for
+    // facts that stopped changing when the run did. Written once at the terminal,
+    // the batch read is one query.
+    //
+    // `platform_kill_reason` is the field the whole thing is for: only the platform
+    // knows it, and without it a reclaimed node is indistinguishable from a crash.
+    await addTaskCol("platform_kill_reason", "TEXT");
+    await addTaskCol("platform_exit_code", "INT");
+    await addTaskCol("platform_node", "TEXT");
+    // The pod's own account, kept verbatim. The reason above is a reading of it,
+    // and a reading that turns out to be wrong is worth being able to re-derive.
+    await addTaskCol("platform_message", "TEXT");
     // How many times a doorbell run has been claimed. The poison delivery
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.

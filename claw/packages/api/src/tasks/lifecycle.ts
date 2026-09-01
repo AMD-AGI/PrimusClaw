@@ -32,6 +32,23 @@ export interface AgentDonePayload {
   failure_reason?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
+  /**
+   * What the platform did, when the run ended because the platform ended it.
+   *
+   * Recorded here rather than resolved when somebody asks. A dispatcher above
+   * Claw sweeps a couple of hundred live runs every thirty seconds; resolving
+   * each against SaFE at read time would be two hundred calls per sweep, for
+   * facts that stopped changing when the run did.
+   *
+   * `platform_kill_reason` is the one that cannot be obtained anywhere else: no
+   * layer above the platform can observe a preemption, and without it a
+   * reclaimed node and a crashed agent are the same row.
+   */
+  platform_kill_reason?: string;
+  platform_exit_code?: number;
+  platform_node?: string;
+  /** The pod's own account, kept verbatim so a wrong reading can be re-derived. */
+  platform_message?: string;
 }
 
 function resolveTerminalStatus(p: AgentDonePayload): TaskStatus {
@@ -65,6 +82,16 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     failure_reason: payload.failure_reason ?? null,
     error_message: payload.failure_reason ?? null,
   };
+
+  // Only written when the callback carried them. A run that ended for its own
+  // reasons has no platform facts, and stamping empty strings over a row that a
+  // previous callback did fill would erase the one field nothing else can supply.
+  if (payload.platform_kill_reason) patch.platform_kill_reason = payload.platform_kill_reason;
+  if (payload.platform_message) patch.platform_message = payload.platform_message;
+  if (payload.platform_node) patch.platform_node = payload.platform_node;
+  if (typeof payload.platform_exit_code === "number") {
+    patch.platform_exit_code = payload.platform_exit_code;
+  }
 
   if (next === "waiting_external") {
     // Stash external_id under metadata.derived so the ExternalResolver

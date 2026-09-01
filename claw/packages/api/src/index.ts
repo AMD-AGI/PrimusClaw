@@ -32,6 +32,7 @@ import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
+import { registerRunRoutes } from "./runs/routes.js";
 import { registerWorkbenchRoutes } from "./workbenches/routes.js";
 import { startScheduler } from "./tasks/scheduler.js";
 import { startSweeper } from "./tasks/sweeper.js";
@@ -239,6 +240,7 @@ async function main() {
   await registerInternalWorkspaceRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
+  await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
 
   // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
