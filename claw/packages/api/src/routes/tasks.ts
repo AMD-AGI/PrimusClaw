@@ -24,6 +24,8 @@ import { db } from "../infra/db.js";
 import { nc, sc } from "../infra/nats.js";
 import { canExecuteTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
+import type { UserInfo } from "../auth/models.js";
+import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { createSingleTask, expandDag } from "../tasks/dag-expander.js";
 import { getTask, listTasksByDag } from "../tasks/db.js";
 import { cancelTask, retryTask } from "../tasks/lifecycle.js";
@@ -34,6 +36,30 @@ import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
 
 const logger = pino({ name: "tasks-routes" });
+
+/**
+ * Record the caller's credentials on the session, or refuse the submission.
+ *
+ * 403 rather than 500: a caller with no platform key is a request this service
+ * cannot honour, not a fault in it. And rather than the shared identity the
+ * dispatcher used to fall back to -- a submission that runs as somebody else is
+ * worse than one that does not run, because the submitter cannot stop it.
+ */
+async function stampCredentialsOr403(
+  reply: FastifyReply,
+  sessionId: string,
+  user: UserInfo,
+): Promise<boolean> {
+  try {
+    await stampSessionCredentials(sessionId, user);
+    return true;
+  } catch (error) {
+    if (!(error instanceof MissingPlatformKeyError)) throw error;
+    logger.warn({ sessionId, userId: user.userId }, "task.submit_without_platform_key");
+    await reply.status(403).send({ ok: false, error: "missing_platform_key" });
+    return false;
+  }
+}
 
 interface CreateTaskBody {
   dag_id?: string;
@@ -129,6 +155,7 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (!dag) {
+        if (!(await stampCredentialsOr403(reply, sessionId, user))) return reply;
         const single = await createSingleTask({
           session_id: sessionId,
           plugin_id: body.plugin_id ?? null,
@@ -141,6 +168,13 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
         });
         return { ok: true, task_id: single.task_id };
       }
+
+      // Record the caller's own credentials on the session before anything is
+      // queued. A task is dispatched long after this request has gone, and the
+      // session row is the only thing that carries the submitter that far --
+      // which is why the path that skipped this ran every workload under the
+      // cluster's shared identity.
+      if (!(await stampCredentialsOr403(reply, sessionId, user))) return reply;
 
       const result = await expandDag({
         session_id: sessionId,
@@ -187,6 +221,10 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       const roots: string[] = [];
       try {
         await client.query("BEGIN");
+        // Inside the transaction that creates the batch: a batch whose rows exist
+        // without the credential stamped would dispatch under the wrong identity,
+        // and the two facts belong to the same decision.
+        await stampSessionCredentials(body.session_id, user, client);
         await client.query(
           `INSERT INTO claw_batches (batch_id, session_id, user_id, dag_id, size, status)
            VALUES ($1,$2,$3,$4,$5,'running')`,

@@ -74,6 +74,35 @@ function validateStartupConfig(): void {
 }
 
 /**
+ * Refuse to serve when the dev auth bypass is combined with a real cluster key.
+ *
+ * Either alone is a deliberate configuration. Together they are not: the bypass
+ * treats every anonymous caller as a system-admin, and `SAFE_PLATFORM_KEY` is a
+ * credential that acts on the cluster as a shared identity. A deployment with
+ * both hands anyone who can reach the port the ability to create workloads under
+ * an identity nobody owns.
+ *
+ * Fatal rather than warned about, because the combination produces no error at
+ * runtime -- it produces work that runs, attributed to nobody, which is exactly
+ * the failure that went unnoticed on the DAG path for as long as it did.
+ */
+function assertNoSharedIdentityBypass(): void {
+  const bypass = (process.env.CLAW_INSECURE_DEV_AUTH ?? "").trim() === "1";
+  const sharedKey = (process.env.SAFE_PLATFORM_KEY ?? "").trim() !== "";
+  if (!bypass || !sharedKey) return;
+  logger.error(
+    {},
+    "startup.insecure_dev_auth_with_shared_platform_key",
+  );
+  throw new Error(
+    "CLAW_INSECURE_DEV_AUTH=1 and SAFE_PLATFORM_KEY are both set. The bypass makes " +
+      "every caller a system-admin and the key lets them act as the cluster's shared " +
+      "identity; together they let anyone who can reach this port create workloads " +
+      "owned by nobody. Unset one.",
+  );
+}
+
+/**
  * Refuse to serve when the timings that decide a run is dead disagree.
  *
  * Fatal rather than a warning, for the same reason an incomplete schema is: the
@@ -96,6 +125,7 @@ function assertRunLeaseTiming(): void {
 
 async function main() {
   validateStartupConfig();
+  assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),

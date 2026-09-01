@@ -18,6 +18,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
 import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
+import { MissingPlatformKeyError } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
@@ -144,11 +145,18 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   // deployments. We SELECT user_id + config and read platform_key /
   // workspace_id from the config JSONB.
   //
-  // Dev harness fallback: when the session row has no platform_key, fall
-  // back to the cluster-wide `SAFE_PLATFORM_KEY` env so DAG-driven
-  // sandbox.create can talk to SaFE without a real SaFE-issued user
-  // session. Same fallback applies to workspace_id via
-  // `SANDBOX_NAMESPACE`.
+  // There is deliberately no fallback to the cluster-wide `SAFE_PLATFORM_KEY`.
+  // There used to be, and it applied silently: every DAG-driven workload ran
+  // under a shared identity, because the only entry point that recorded the
+  // caller's key was the workbench one. SaFE takes
+  // `primus-safe.amd.com/user.id` from the bearer's subject and grants
+  // update/delete/resume to the owner, so the submitter of a run could not stop
+  // or delete it — and nothing anywhere said why.
+  //
+  // Failing here instead is the point. Every entry point now stamps the key
+  // before the task is queued (see auth/session-credentials.ts), so a session
+  // that reaches this line without one is a path that forgot to, and running it
+  // as somebody else is the wrong way to find that out.
   const r = await db.query(
     `SELECT user_id, config FROM claw_sessions WHERE session_id = $1`,
     [sessionId],
@@ -162,9 +170,12 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   const sessionLlmApiKey = trustedCredentials && typeof cfg.llm_api_key === "string"
     ? cfg.llm_api_key
     : (trustedCredentials && typeof cfg.virtual_key === "string" ? cfg.virtual_key : "");
+  if (!sessionPlatformKey) throw new MissingPlatformKeyError(`session ${sessionId}`);
   return {
     user_id: row.user_id ?? "",
-    platform_key: sessionPlatformKey || process.env.SAFE_PLATFORM_KEY || "",
+    platform_key: sessionPlatformKey,
+    // The namespace is not a credential: it names where the work runs, not who
+    // it runs as, and a deployment-wide default for it grants nothing.
     workspace_id: sessionWorkspaceId || process.env.SANDBOX_NAMESPACE || "",
     llm_api_key: sessionLlmApiKey,
   };
@@ -401,6 +412,7 @@ async function resolveDispatchFailure(
   const msg = e instanceof Error ? e.message : String(e);
   logger.error({ taskId, err: msg }, "task.dispatch_failed");
   const bindFailure = isWorkspaceBindingError(e);
+  const credentialFailure = e instanceof MissingPlatformKeyError;
   // The one failure here that is worth another attempt on its own. Everything
   // else is either the task's own fault (an unrenderable template, a session
   // that does not exist) or already covered: a NATS publish that failed leaves
@@ -429,8 +441,16 @@ async function resolveDispatchFailure(
   // NATS / DB errors will be picked up by sweeper). The binding gets its own
   // reason rather than sharing `agent_error`: no agent ran, nothing was
   // dispatched, and the two need different alerts.
+  // A missing credential gets its own reason for the same reason the binding
+  // failure does: no agent ran, nothing was dispatched, and the fix is a
+  // configuration one. Filed under `agent_error` it would be counted among the
+  // failures that are the workload's own.
   await transitionStatus(taskId, ["preparing"], "failed", {
-    failure_reason: bindFailure ? "workspace_bind_failed" : "agent_error",
+    failure_reason: credentialFailure
+      ? "missing_platform_key"
+      : bindFailure
+        ? "workspace_bind_failed"
+        : "agent_error",
     error_message: msg,
   });
   return { ok: false, reason: msg };

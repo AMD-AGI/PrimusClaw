@@ -99,12 +99,24 @@ function stubDb(
     if (/^UPDATE claw_tasks SET/.test(sql)) return { rows: [row()], rowCount: 1 };
     if (/FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [row()], rowCount: 1 };
     if (/SELECT user_id, config FROM claw_sessions/.test(sql)) {
-      return { rows: [{ user_id: "u-1", config: {} }], rowCount: 1 };
+      // A session carrying its submitter's key, which is what every entry point
+      // now stamps before queueing a task. An empty config here used to dispatch
+      // anyway, under the cluster's shared identity.
+      return { rows: [{ user_id: "u-1", config: SERVER_MANAGED_CONFIG }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   return seen;
 }
+
+/**
+ * A session config as the entry points write it: the submitter's platform key,
+ * marked server-managed so the dispatcher will trust it.
+ */
+const SERVER_MANAGED_CONFIG = {
+  platform_key: "pk-user-1",
+  _server_managed_credentials: true,
+};
 
 /** The status transitions attempted, in order, read as `from -> to`. */
 function transitions(seen: SeenQuery[]): string[] {

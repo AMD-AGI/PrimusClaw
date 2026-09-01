@@ -25,7 +25,7 @@ import {
   isAdmin,
   type UserInfo,
 } from "../auth/models.js";
-import { resolveUserLlmKey } from "../llm/key-source.js";
+import { sessionCredentialPatch } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -48,11 +48,10 @@ async function ensureSession(
   user: UserInfo,
   body: Record<string, unknown>,
 ): Promise<string> {
-  const runConfigPatch = {
-    ...(user.platformKey ? { platform_key: user.platformKey } : {}),
-    ...(resolveUserLlmKey(user) ? { llm_api_key: resolveUserLlmKey(user) } : {}),
-    _server_managed_credentials: true,
-  };
+  // The shared patch, not a second copy of it. This route was the only one that
+  // recorded the caller's key, and the bug was the other paths not doing what it
+  // did -- keeping two spellings of it is how they drift apart again.
+  const runConfigPatch = sessionCredentialPatch(user);
   const provided = (body.session_id as string | undefined) ?? undefined;
   if (provided) {
     const r = await db.query(
