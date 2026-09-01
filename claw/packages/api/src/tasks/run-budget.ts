@@ -121,14 +121,20 @@ export const RUN_BUDGET_OFF = 0;
  * things, and each is asymmetric in its own way. Both are worth knowing before
  * configuring either.
  *
- * `RUN_BUDGET_DAG_NODE_SEC` only works downwards. A graph node is dispatched by
- * a path that issues no `run_lease`, so `startLeaseHeartbeat` returns without
- * arming and `lease_expires_at` stays NULL for the row's whole life. That makes
- * `reapStaleTasks`' never-claimed arm -- `lease_expires_at IS NULL AND
- * started_at < NOW() - BRAIN_TASK_TIMEOUT_SEC` -- reachable and, above that
- * timeout, decisive: raising this setting for a ten-hour training node buys
- * nothing, because the node is closed as `brain_timeout` at six hours first.
- * The setting to raise is `BRAIN_TASK_TIMEOUT_SEC`.
+ `RUN_BUDGET_DAG_NODE_SEC` used to work downwards only, and now works both ways.
+ *
+ * A graph node is dispatched by a path that issues no `run_lease`, so
+ * `startLeaseHeartbeat` returns without arming and `lease_expires_at` stays NULL
+ * for the row's whole life. That made `reapStaleTasks`' never-claimed arm --
+ * `lease_expires_at IS NULL AND started_at < NOW() - BRAIN_TASK_TIMEOUT_SEC` --
+ * reachable and, above that timeout, decisive: a node given three days was closed
+ * as `brain_timeout` after an hour, with the budget above it dead letter.
+ *
+ * That arm now excludes rows carrying a `deadline_at`. A row with an explicit
+ * budget is covered by the arm above it, grace included; a row without one still
+ * gets the backstop, which is the case it was written for. The setting is the
+ * ceiling for a graph node again, which is what a workload measured in days
+ * needs.
  *
  * Lowering it does work, and the reason is worth stating because it is the
  * opposite of the chat case: a DAG row's `origin` is not `chat`, so it clears

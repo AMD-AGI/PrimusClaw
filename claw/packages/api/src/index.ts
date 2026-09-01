@@ -48,6 +48,15 @@ import pino from "pino";
 const logger = pino({ name: "api" });
 
 /**
+ * Largest request body the API accepts.
+ *
+ * Four megabytes: comfortably above the one-megabyte total Brain caps a run's
+ * captures at, so the truncation there is what a caller sees rather than a
+ * refused callback, and low enough that it is still a limit.
+ */
+const BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+
+/**
  * Warn at startup when credentials needed later are missing.
  * In dev mode the auth bypass makes SAFE/internal tokens optional; in prod
  * they are required for the first incoming request to succeed.
@@ -136,6 +145,17 @@ async function main() {
   await initNats();
 
   const app = Fastify({
+    // Stated rather than left to Fastify's 1 MiB default.
+    //
+    // The body that decides this is `agent_done`: it carries a run's captures, and
+    // a run that captured a large result did not lose the capture -- it lost the
+    // callback. A 413 there records a run that finished its work as never having
+    // reported, and takes everything else it captured with it.
+    //
+    // Brain now truncates each capture and caps their total, so this is the
+    // backstop rather than the limit that bites: a body over it means something
+    // other than captures grew, and 413 is then the right answer.
+    bodyLimit: BODY_LIMIT_BYTES,
     logger: {
       redact: {
         paths: [

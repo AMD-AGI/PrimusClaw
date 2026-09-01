@@ -260,3 +260,36 @@ test("a run reaped for never being claimed is not called a budget failure", asyn
     "a row nobody ever picked up would be reported as having burned a budget it never started",
   );
 });
+
+test("a run with a budget of its own is not closed by the legacy timeout", () => {
+  // REGRESSION GUARD.
+  //
+  // A DAG node is dispatched by a path that issues no run_lease, so
+  // `lease_expires_at` stays NULL for its whole life. That made the never-claimed
+  // arm decisive for every graph node, and RUN_BUDGET_DAG_NODE_SEC therefore only
+  // worked downwards: a node given three days was closed as `brain_timeout` after
+  // BRAIN_TASK_TIMEOUT_SEC -- an hour by default -- with the budget above it dead
+  // letter. A Kernel Arena run is an hour to three days, so every one of them
+  // would have died in the first hour.
+  const seen = stubDb([]);
+  stubBus();
+  return reapStaleTasks().then(() => {
+    const sql = seen[0]?.sql ?? "";
+    assert.match(
+      sql,
+      /deadline_at IS NULL AND lease_expires_at IS NULL/,
+      "the never-claimed arm still fires on rows that carry an explicit budget",
+    );
+    // The budget arm is untouched: a row past its own deadline is still reaped.
+    assert.match(sql, /deadline_at IS NOT NULL AND deadline_at < NOW\(\)/);
+  });
+});
+
+test("a run with no budget still gets the legacy backstop", async () => {
+  // The case the never-claimed arm was written for: nothing holds a lease, nothing
+  // stamped a deadline, and without it the row would sit at `running` forever.
+  const seen = stubDb([{ task_id: "t-old", session_id: "s-3", dag_root_task_id: null, deadline_at: null }]);
+  stubBus();
+  assert.equal(await reapStaleTasks(), 1);
+  assert.match(seen[0].sql, /started_at < NOW\(\) - \(\$1::int/);
+});

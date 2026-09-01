@@ -68,14 +68,75 @@ function renderString(
   s: string,
   state: { captures: Record<string, string>; prev?: { captures: Record<string, string>; structured?: unknown } },
 ): string {
-  return s.replace(/\$\{([^}]+)\}/g, (_, raw: string) => {
+  return s.replace(/\$\{([^}]+)\}/g, (whole, raw: string) => {
     const path = raw.trim();
+    // A name with no dot is a shell variable, not a template path -- and it never
+    // could have been one: resolvePath returns undefined for anything shorter than
+    // `root.rest`. Throwing on it took the whole task down for writing `${HOME}`
+    // or `${PATH}` in an inline command, which is the ordinary way to write shell.
+    //
+    // Left literal, which is what the backend renderer already does with the same
+    // input (template-renderer.ts). The two run over the same strings in sequence,
+    // so disagreeing about what counts as a template meant a step could survive one
+    // stage and be destroyed by the next.
+    if (!path.includes(".")) return whole;
     const val = resolvePath(path, state);
     if (val === undefined) {
       throw new Error(`script runtime template '${path}' did not resolve; Backend dispatcher should have rendered it`);
     }
     return typeof val === "string" ? val : JSON.stringify(val);
   });
+}
+
+/**
+ * Largest a single capture may be.
+ *
+ * Captures travel to Backend inside the `agent_done` body, and that body has a
+ * size limit. Unbounded, one step that captured a large `result.json` did not
+ * lose the capture -- it failed the entire completion callback, so a run that had
+ * finished its work was recorded as never having reported at all, and everything
+ * else it captured went with it.
+ *
+ * Truncated here rather than at the boundary because this is where the step that
+ * produced it can be named.
+ */
+const MAX_CAPTURE_BYTES = 256 * 1024;
+
+/** Total across all captures, so many medium ones cannot do what one large one cannot. */
+const MAX_CAPTURES_TOTAL_BYTES = 1024 * 1024;
+
+/**
+ * A capture cut to size, with the cut stated in the value.
+ *
+ * The marker matters: a consumer parsing a capture as JSON has to be able to tell
+ * a truncated document from a malformed one, and silently handing over the first
+ * 256 KiB of a JSON file is how a caller concludes the producer is broken.
+ */
+export function truncateCapture(name: string, value: string): string {
+  if (Buffer.byteLength(value, "utf8") <= MAX_CAPTURE_BYTES) return value;
+  const head = Buffer.from(value, "utf8").subarray(0, MAX_CAPTURE_BYTES).toString("utf8");
+  return `${head}\n[capture '${name}' truncated at ${MAX_CAPTURE_BYTES} bytes]`;
+}
+
+/**
+ * Captures cut to a total, dropping whole entries from the largest down.
+ *
+ * Whole entries rather than a second per-entry trim: a caller reading
+ * `captures.result` wants a document or an absence, and half of one is the answer
+ * that looks valid and is not.
+ */
+export function capCapturesTotal(captures: Record<string, string>): Record<string, string> {
+  const sizes = Object.entries(captures)
+    .map(([k, v]) => [k, Buffer.byteLength(v, "utf8")] as const)
+    .sort((a, b) => b[1] - a[1]);
+  let total = sizes.reduce((n, [, size]) => n + size, 0);
+  const out = { ...captures };
+  for (const [name, size] of sizes) {
+    if (total <= MAX_CAPTURES_TOTAL_BYTES) break;
+    out[name] = `[capture '${name}' dropped: ${size} bytes, over the ${MAX_CAPTURES_TOTAL_BYTES}-byte total]`;
+    total -= size - Buffer.byteLength(out[name], "utf8");
+  }
+  return out;
 }
 
 function resolvePath(
@@ -292,7 +353,7 @@ export async function runScript(
       const value = structured !== undefined && structured !== null
         ? JSON.stringify(structured)
         : resultText;
-      captures[step.captures] = value ?? "";
+      captures[step.captures] = truncateCapture(step.captures, value ?? "");
     }
     lastResultText = resultText ?? lastResultText;
     lastStructured = structured;
@@ -311,7 +372,7 @@ export async function runScript(
     errorCount: toolStats.error_calls,
     toolStats,
     elapsedMs: nowMs() - startedAt,
-    captures,
+    captures: capCapturesTotal(captures),
     artifacts,
     abortReason: "completed",
   };
@@ -335,7 +396,7 @@ function failResult(
     errorCount: toolStats.error_calls,
     toolStats,
     elapsedMs: nowMs() - startedAt,
-    captures,
+    captures: capCapturesTotal(captures),
     artifacts,
     abortReason,
     failureReason: reason,

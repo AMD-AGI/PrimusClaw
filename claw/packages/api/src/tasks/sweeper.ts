@@ -144,7 +144,20 @@ export async function reapStaleTasks(): Promise<number> {
          (deadline_at IS NOT NULL
             AND deadline_at < NOW() - ($3::int * INTERVAL '1 second'))
          OR
-         (lease_expires_at IS NULL
+         -- The never-claimed arm, and it applies only to a row with no budget of
+         -- its own. A DAG node is dispatched by a path that issues no run_lease,
+         -- so lease_expires_at stays NULL for its whole life and this arm was
+         -- decisive for every graph node -- which made RUN_BUDGET_DAG_NODE_SEC
+         -- work downwards only: a node given three days was closed as
+         -- brain_timeout after BRAIN_TASK_TIMEOUT_SEC, an hour by default, with
+         -- the budget above it dead letter.
+         --
+         -- A row carrying deadline_at has an explicit budget and the arm above
+         -- already enforces it, grace included. Excluding those here is what lets
+         -- the budget be raised at all; a row with no deadline still gets this
+         -- backstop, which is the case it was written for.
+         (deadline_at IS NULL
+            AND lease_expires_at IS NULL
             AND started_at IS NOT NULL
             AND started_at < NOW() - ($1::int * INTERVAL '1 second'))
        )
