@@ -226,6 +226,10 @@ export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", NATS_REPLICAS, 
 // a stream with one replica does not have a quorum to lose.
 export const TASK_STREAM_REPLICAS = envInt("TASK_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const EVENT_STREAM_REPLICAS = envInt("EVENT_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
+// Explicit for the same reason the two above are: a stream created without one
+// lands on the JetStream default of 1, and a single-replica stream is hosted by
+// exactly one server.
+export const DISPATCH_STREAM_REPLICAS = envInt("DISPATCH_STREAM_REPLICAS", NATS_REPLICAS, { min: 1 });
 // Bounded the way brain bounds the same two variables, because unbounded on one
 // side of a shared setting is what lets one variable mean two things:
 // `RUN_LEASE_TTL_MS=0` is refused there and taken literally here, and the zero

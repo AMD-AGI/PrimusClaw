@@ -13,7 +13,11 @@
 #       DEV_<NAME> entry found in the same credentials file.
 #
 # Multi-account isolation:
-#   - PROD account hosts the production api/brain deployment.
+#   - PROD account hosts the production api/brain deployment. The dispatch
+#     control plane publishes into it as a second, publish-only user; it is not
+#     an account of its own because its stream lives in PROD's JetStream
+#     namespace and an account boundary is exactly what a separate account
+#     would put between them.
 #   - DEV_<NAME> accounts host individual developers' local instances.
 #   - Each account has its own JetStream namespace, so prod and devs can
 #     reuse the same subject names (events.>, tasks.>) without collision.
@@ -48,6 +52,24 @@ config:
         users:
           - user: prod
             password: "__PROD_NATS_PASSWORD__"
+          # The dispatch control plane (Dispatron, `hld` today). Publishes its
+          # terminal events and nothing else: it does not read Claw's streams,
+          # and a credential that could would make every future Claw subject
+          # readable by another service by default.
+          #
+          # `_INBOX.>` is not an exception to publish-only -- a JetStream
+          # publish waits for its ack on an inbox, so without it every publish
+          # times out while still succeeding server-side, which is the worst of
+          # both.
+          - user: dispatch
+            password: "__DISPATCH_NATS_PASSWORD__"
+            permissions:
+              publish:
+                allow:
+                  - "hld.v1.>"
+              subscribe:
+                allow:
+                  - "_INBOX.>"
       # {{DEV_ACCOUNTS}}
       SYS:
         users:

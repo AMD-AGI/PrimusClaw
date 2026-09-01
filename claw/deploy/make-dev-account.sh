@@ -68,7 +68,16 @@ echo "${PASS_VAR}=${NEW_PASS}" >> "$CREDS_FILE"
 # shellcheck disable=SC1090
 source "$CREDS_FILE"
 
-# Render values file: PROD + SYS passwords + ALL dev account blocks.
+# A credentials file written before the dispatch user existed has no entry for
+# it, and an empty substitution renders `password: ""` on an account with
+# publish rights. deploy.sh does the same; either script may run first.
+if [ -z "${NATS_PASSWORD_DISPATCH:-}" ]; then
+  echo "NATS_PASSWORD_DISPATCH=$(openssl rand -hex 16)" >> "$CREDS_FILE"
+  # shellcheck disable=SC1090
+  source "$CREDS_FILE"
+fi
+
+# Render values file: PROD + SYS + dispatch passwords + ALL dev account blocks.
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 RENDERED="$WORK_DIR/nats-values.rendered.yaml"
@@ -90,6 +99,7 @@ awk -v block="$DEV_BLOCKS" '
 ' "$VALUES_TEMPLATE" \
   | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
         -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
+        -e "s|__DISPATCH_NATS_PASSWORD__|${NATS_PASSWORD_DISPATCH}|g" \
   > "$RENDERED"
 
 echo "Running helm upgrade ..."
