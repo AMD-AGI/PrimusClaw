@@ -961,6 +961,20 @@ export const OPENAI_ANTHROPIC_MARKERS =
   LLM_API_STYLE === "openai" && LLM_CACHE_STYLE === "anthropic" && PROMPT_CACHE_ENABLED;
 
 /**
+ * True when Brain should place markers on the OpenAI-shaped wire at all, in
+ * whichever dialect LLM_CACHE_STYLE names.
+ *
+ * `native` used to mean "send nothing", which left the native dialect
+ * selected by a value its own caller excluded -- present, and unreachable. It
+ * now means what it says: use the endpoint's own dialect,
+ * `prompt_cache_breakpoint` plus the request-level opt-in that makes the
+ * breakpoints count. Genuine OpenAI caches automatically without any of this;
+ * explicit breakpoints buy control over WHERE the cacheable prefix ends, which
+ * automatic prefix detection gives up on in a long tool loop.
+ */
+export const OPENAI_CACHE_MARKERS = LLM_API_STYLE === "openai" && PROMPT_CACHE_ENABLED;
+
+/**
  * The OPENAI_BASE_URL fallback fired: the deployment selected the OpenAI wire
  * protocol and never set a URL for it, so chat/completions is pointed at
  * whatever ANTHROPIC_BASE_URL names -- in this fleet, a gateway serving

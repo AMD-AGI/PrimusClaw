@@ -9,6 +9,7 @@ import type {
   Tool as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages/messages.js";
 import { LLM_CACHE_TTL, PROMPT_CACHE_ENABLED, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
 import type { Message } from "@claw/protocol";
@@ -55,20 +56,6 @@ interface SessionCacheState {
  * loop's transient set -- so a status-gated latch would never arm while the
  * loop cheerfully re-sent the same rejected body up to twelve times a turn.
  */
-function looksLikeCacheRejection(err: unknown): boolean {
-  let text: string;
-  try {
-    const e = err as Record<string, unknown> | null;
-    text = [
-      (e?.message as string) ?? "",
-      typeof e?.error === "object" ? JSON.stringify(e.error) : String(e?.error ?? ""),
-      String(e === null || e === undefined ? "" : e),
-    ].join(" ");
-  } catch {
-    text = String(err);
-  }
-  return /cache_control|cache_creation|ephemeral|prompt.?cach/i.test(text);
-}
 
 async function streamingTurn(
   client: Anthropic,
