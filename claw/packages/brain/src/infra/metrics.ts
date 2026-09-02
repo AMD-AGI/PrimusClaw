@@ -54,6 +54,9 @@ const sandboxSweeperEvicted = new Counter({
   help: "Stale Hands KV entries evicted by the background sweeper.",
   registers: [registry],
 });
+/** Terminal states of a Brain task run; see `metrics.onTask`. */
+export type TaskOutcome = "ok" | "retryable" | "failed" | "interrupted";
+
 const taskTotal = new Counter({
   name: "claw_brain_task_total",
   help: "Brain task consumption by outcome.",
@@ -564,7 +567,19 @@ export const metrics = {
   onSandboxSweeperEvict(n: number): void {
     if (n > 0) sandboxSweeperEvicted.inc(n);
   },
-  onTask(outcome: "ok" | "retryable" | "failed", elapsedSec: number): void {
+  /**
+   * A task reached a terminal state in `run()`.
+   *
+   * `interrupted` is separate from `failed` because run() has a branch for it
+   * that means neither: the user stopped a run that was working. Folding it
+   * into `failed` would make every cancellation look like a defect, and the
+   * failure rate this counter exists to report would track how often people
+   * change their mind. `retryable` covers everything that will be redelivered
+   * -- a retryable error, a SIGTERM checkpoint, a lost lease -- because from
+   * this counter's point of view they are the same event: the task did not
+   * finish here and will be picked up again.
+   */
+  onTask(outcome: TaskOutcome, elapsedSec: number): void {
     taskTotal.inc({ outcome });
     taskDuration.observe({ outcome }, elapsedSec);
   },

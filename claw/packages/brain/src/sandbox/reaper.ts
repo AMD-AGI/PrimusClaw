@@ -253,7 +253,12 @@ export async function destroyHands(
 
   try {
     await stopNamedSandbox(sessionId, target);
+    metrics.onSandboxStop("ok");
   } catch (cause) {
+    // Counted before the rethrow: the caller turns this into a replacement
+    // decision and never reports the teardown itself, so this is the only
+    // place a failed stop is visible.
+    metrics.onSandboxStop("error");
     // Every caller of this is about to build a replacement, and the raw
     // provider message ("HTTP 500") does not say why that is now refused.
     // Naming the consequence is what makes the failure actionable, and what

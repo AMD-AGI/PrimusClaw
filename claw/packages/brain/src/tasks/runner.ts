@@ -63,7 +63,7 @@ import {
 import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import { redactCheckpointState, redactPersistedEvent } from "../events/redaction.js";
 import pino from "pino";
-import { metrics, type TerminalRefusalReason } from "../infra/metrics.js";
+import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
@@ -2729,6 +2729,12 @@ class TaskRunner {
   }
 
   async run(): Promise<void> {
+    // Every terminal branch below sets this; the `finally` reports it once.
+    // Recording at each branch instead would mean nine call sites and a silent
+    // gap the first time a tenth is added -- and the gap would read as "no
+    // tasks ran", which is the same shape as an outage.
+    const runStartedAt = Date.now();
+    let outcome: TaskOutcome | null = null;
     // Armed below, once the resume checkpoint has been read. A deadline that is
     // already past on arrival -- a redelivery of a run whose budget expired
     // while it was queued, which is the resumed case this reports on -- fires
@@ -2846,19 +2852,25 @@ class TaskRunner {
         throw this.abortCtrl.signal.reason ?? new Error("cancelled by user");
       }
 
+      outcome = "ok";
       await this.finalizeSuccess(result);
     } catch (err: any) {
       if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
+        // Checkpointed and re-queued: this pod did not finish it, another will.
+        outcome = "retryable";
         await this.handleSigtermAbort();
         return;
       }
 
       if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+        // A second replica already holds the lock and is running this task.
+        outcome = "retryable";
         this.handleLeaseLost();
         return;
       }
 
       if (this.abortCtrl.signal.reason === RUN_ROW_TERMINAL_ABORT_REASON) {
+        outcome = "failed";
         await this.handleRunRowTerminal();
         return;
       }
@@ -2867,6 +2879,7 @@ class TaskRunner {
       // a user interrupt -- the transcript would read "Interrupted by user" for
       // a run nobody touched.
       if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
+        outcome = "failed";
         await this.settleTerminal(
           () => this.handleFatalError(
             new Error(
@@ -2884,6 +2897,7 @@ class TaskRunner {
       }
 
       if (this.abortCtrl.signal.aborted) {
+        outcome = "interrupted";
         await this.settleTerminal(
           () => this.handleUserInterrupt(),
           "task.cancelled_agent_done_delivery_exhausted",
@@ -2897,6 +2911,8 @@ class TaskRunner {
           { err, sessionId: this.sessionId, taskId: this.request.task_id },
           "task.agent_done_delivery_exhausted",
         );
+        // The run finished; only the handoff failed, and the nak redelivers it.
+        outcome = "retryable";
         await this.releaseAfterTerminal();
         this.msg.nak(5_000);
       } else if (err instanceof SandboxProvisionTerminalError) {
@@ -2911,19 +2927,25 @@ class TaskRunner {
         // the same handler: an AgentDoneDeliveryError raised in the middle of
         // handleFatalError has to be turned into a nak and a release here, or it
         // leaves the catch chain with the message neither acked nor nak'd.
+        outcome = "failed";
         await this.settleTerminal(
           () => this.handleFatalError(err),
           "task.provision_terminal_agent_done_delivery_exhausted",
         );
       } else if (isRetryable(err)) {
+        outcome = "retryable";
         await this.handleRetryableError(err);
       } else {
+        outcome = "failed";
         await this.settleTerminal(
           () => this.handleFatalError(err),
           "task.failed_agent_done_delivery_exhausted",
         );
       }
     } finally {
+      // `outcome` is null only if a branch was added above without setting it;
+      // reporting a made-up value there would be worse than the missing sample.
+      if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
       cancelDeadline();
       clearInterval(this.keepAlive);
       if (leaseTimer) clearInterval(leaseTimer);
