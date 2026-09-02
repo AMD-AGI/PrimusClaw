@@ -49,6 +49,7 @@ function session(turns: Array<Partial<LlmTurnResult>>, completeImpl?: () => Prom
         stopReason: t.stopReason ?? "end_turn",
         usage: t.usage ?? { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 },
         firstByteMs: 1,
+        ...(t.cacheReport ? { cacheReport: t.cacheReport } : {}),
         ...(t.promptTokens !== undefined ? { promptTokens: t.promptTokens } : {}),
       };
     },
@@ -271,4 +272,68 @@ test("a turn with nothing worth compacting is reported as a no-op, not a failure
   await agentLoop([], [] as ToolSchema[], o);
   assert.equal(await compactionCount("noop"), before.noop + 1);
   assert.equal(await compactionCount("failed"), before.failed, "a no-op must not read as a failure");
+});
+
+test("the miss right after a compaction is not counted as a lost cache entry", async () => {
+  // Compaction replaces everything between the head and the summary, so the
+  // prefix the next turn would have matched no longer exists. It cannot read,
+  // and blaming the cache for that would make every compaction look like a
+  // TTL problem.
+  const lost = async () => {
+    const m = registry.getSingleMetric("claw_brain_llm_cache_entry_lost_total");
+    if (!m) return NaN;
+    const v = await m.get();
+    return v.values.reduce((n: number, x: any) => n + (x.value ?? 0), 0);
+  };
+  const before = await lost();
+  const marked = { breakpointsSent: 3, enabled: true, reported: ["cache_read", "cache_create"] as const };
+  const s = session([
+    // Writes, and crosses the trigger so compaction fires at the end of the turn.
+    { usage: { input_tokens: 6, output_tokens: 10, cache_read: 2_000, cache_create: 500 },
+      promptTokens: 2_506, stopReason: "tool_use",
+      content: [{ type: "tool_use", id: "x", name: "read", input: {} }],
+      cacheReport: marked },
+    // The turn after: markers sent, nothing read -- because the prefix is gone.
+    { usage: { input_tokens: 900, output_tokens: 1, cache_read: 0, cache_create: 0 },
+      promptTokens: 900, stopReason: "end_turn", cacheReport: marked },
+  ]);
+  const { o, events } = opts({ llmSession: s, resumeFrom: resume(longHistory({ role: "user", content: "go" })) });
+
+  await agentLoop([], [] as ToolSchema[], o);
+  assert.equal(compacted(events).length, 1, "precondition: compaction actually fired");
+  assert.equal(await lost(), before, "the post-compaction miss must not be blamed on the cache");
+});
+
+test("compaction exempts every turn until a new entry exists, not just one", async () => {
+  // A one-turn boolean left the pre-compaction timestamp standing, so the
+  // SECOND miss after a compaction was reported as an expired entry -- naming
+  // an entry the compaction had itself thrown away. Clearing the timestamp
+  // makes the exemption structural: nothing to lose until something is written.
+  const lost = async () => {
+    const m = registry.getSingleMetric("claw_brain_llm_cache_entry_lost_total");
+    if (!m) return NaN;
+    const v = await m.get();
+    return v.values.reduce((n: number, x: any) => n + (x.value ?? 0), 0);
+  };
+  const before = await lost();
+  const marked = { breakpointsSent: 3, enabled: true, reported: ["cache_read", "cache_create"] as const };
+  const s = session([
+    { usage: { input_tokens: 6, output_tokens: 10, cache_read: 2_000, cache_create: 500 },
+      promptTokens: 2_506, stopReason: "tool_use",
+      content: [{ type: "tool_use", id: "x", name: "read", input: {} }],
+      cacheReport: marked },
+    // First miss after the compaction -- and it keeps the loop running.
+    { usage: { input_tokens: 900, output_tokens: 1, cache_read: 0, cache_create: 0 },
+      promptTokens: 900, stopReason: "tool_use",
+      content: [{ type: "tool_use", id: "y", name: "read", input: {} }],
+      cacheReport: marked },
+    // Second miss after the compaction: the one the boolean stopped covering.
+    { usage: { input_tokens: 900, output_tokens: 1, cache_read: 0, cache_create: 0 },
+      promptTokens: 900, stopReason: "end_turn", cacheReport: marked },
+  ]);
+  const { o, events } = opts({ llmSession: s, resumeFrom: resume(longHistory({ role: "user", content: "go" })) });
+
+  await agentLoop([], [] as ToolSchema[], o);
+  assert.equal(compacted(events).length, 1, "precondition: compaction actually fired");
+  assert.equal(await lost(), before, "neither post-compaction miss is blamed on the cache");
 });

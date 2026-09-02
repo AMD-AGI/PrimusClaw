@@ -917,6 +917,61 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  */
 export const PROMPT_CACHE_ENABLED = envBool("PROMPT_CACHE_ENABLED", true);
 
+/**
+ * What is behind an OpenAI-shaped endpoint, stated by the operator.
+ *
+ * Two dialects share one slot on that wire. A gateway forwarding to Anthropic
+ * models reads `cache_control` inside a content part; genuine OpenAI reads
+ * `prompt_cache_breakpoint` and caches automatically besides. Sending the
+ * wrong one is not symmetric with sending none, so this is not guessed.
+ *
+ * And it cannot be guessed from the URL, which is the whole reason it is a
+ * setting: OPENAI_BASE_URL falls back to ANTHROPIC_BASE_URL above, so on this
+ * very deployment both backends can present the same string.
+ *
+ * Default "native" because that is the safe half of a wrong guess. Wrong
+ * toward native costs money on a gateway that would have honoured markers --
+ * visible immediately in claw_brain_llm_cache_turns_total{state="miss"}.
+ * Wrong toward anthropic puts an unrecognised key in the body of every request
+ * to a real OpenAI endpoint, and an endpoint that rejects it fails the run.
+ * Losing money loudly beats failing quietly.
+ *
+ * Read only when LLM_API_STYLE is "openai"; the Anthropic path declares its
+ * backend by being that path. Refused values land in settingProblems rather
+ * than throwing, unlike LLM_API_STYLE: a wrong wire protocol fails every
+ * request, so dying is honest there, but a mistyped cost knob must not be able
+ * to stop a pod from booting.
+ */
+export type LlmCacheStyle = "anthropic" | "native";
+function resolveLlmCacheStyle(): LlmCacheStyle {
+  const configured = env("LLM_CACHE_STYLE");
+  if (configured === "anthropic" || configured === "native") return configured;
+  if (configured) {
+    settingProblems.push(`LLM_CACHE_STYLE=${configured} is not "anthropic" or "native"; using native`);
+  }
+  return "native";
+}
+export const LLM_CACHE_STYLE: LlmCacheStyle = resolveLlmCacheStyle();
+
+/**
+ * True when the deployment has said the OpenAI-shaped endpoint reads Anthropic
+ * cache markers, i.e. when Brain should place `cache_control` on that wire.
+ */
+export const OPENAI_ANTHROPIC_MARKERS =
+  LLM_API_STYLE === "openai" && LLM_CACHE_STYLE === "anthropic" && PROMPT_CACHE_ENABLED;
+
+/**
+ * The OPENAI_BASE_URL fallback fired: the deployment selected the OpenAI wire
+ * protocol and never set a URL for it, so chat/completions is pointed at
+ * whatever ANTHROPIC_BASE_URL names -- in this fleet, a gateway serving
+ * Anthropic models. That is the configuration in which leaving
+ * LLM_CACHE_STYLE at "native" silently pays full price on every request, so it
+ * is worth saying out loud at boot rather than discovering on a bill.
+ */
+export function openAiBaseUrlFellBack(): boolean {
+  return LLM_API_STYLE === "openai" && !env("OPENAI_BASE_URL") && Boolean(ANTHROPIC_BASE_URL);
+}
+
 
 // --- LLM streaming timeouts (SSE-style response body) ---
 // Aligned to LiteLLM gateway's read=600s to avoid client-side aborts that

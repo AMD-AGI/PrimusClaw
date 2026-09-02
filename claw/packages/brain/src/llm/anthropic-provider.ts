@@ -9,6 +9,7 @@ import type {
   Tool as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages/messages.js";
 import { LLM_CACHE_TTL, PROMPT_CACHE_ENABLED, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { requiredArgToolNames } from "./tool-schema.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
 import type { Message } from "@claw/protocol";
 import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
@@ -195,6 +196,7 @@ async function streamingTurn(
   const toolJsonBuf: Map<number, string> = new Map();
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
+  let sawUsage = false;
   let created5m: number | undefined;
   let created1h: number | undefined;
   let bodyModel: string | undefined;
@@ -209,6 +211,7 @@ async function streamingTurn(
           bodyModel = evt.message.model || bodyModel;
           const u = evt.message.usage;
           if (u) {
+            sawUsage = true;
             usage.input_tokens = u.input_tokens ?? 0;
             usage.cache_create = u.cache_creation_input_tokens ?? 0;
             usage.cache_read = u.cache_read_input_tokens ?? 0;
@@ -286,11 +289,23 @@ async function streamingTurn(
     err.code = "STREAM_TRUNCATED";
     throw err;
   }
+  // A tool_use that arrived with zero JSON fragments is not evidence of a
+  // truncated stream. Truncation leaves stop_reason null and is rejected
+  // above; a fragment that arrived and did not parse becomes `_raw` and is
+  // rejected as TOOL_INPUT_PARSE_FAILED below. What is left is a model calling
+  // a tool with no arguments -- correct for every tool whose schema marks none
+  // required. `ls` is one: its single property is optional and its description
+  // names a default. Blaming truncation there spent four retries on a call
+  // that was right the first time, then failed the session, because every
+  // retry did the same legitimate thing. So the question is asked of the
+  // schema we published, not of the emptiness.
+  const requiresArgs = requiredArgToolNames(tools);
   for (const b of finalBlocks) {
     if ((b as any).type === "tool_use") {
       const input = (b as any).input;
-      if (!input || (typeof input === "object" && Object.keys(input).length === 0)) {
-        const err: any = new Error(`tool_use[${(b as any).name}] has empty input — likely truncated`);
+      const empty = !input || (typeof input === "object" && Object.keys(input).length === 0);
+      if (empty && requiresArgs.has(String((b as any).name))) {
+        const err: any = new Error(`tool_use[${(b as any).name}] has empty input but its schema requires arguments`);
         err.code = "TOOL_INPUT_EMPTY";
         throw err;
       }
@@ -315,7 +330,18 @@ async function streamingTurn(
     }),
     // Anthropic's input_tokens is the uncached remainder; the whole prompt is
     // the three added together.
-    promptTokens: usage.input_tokens + usage.cache_read + usage.cache_create,
+    // `undefined`, not 0, when the response carried no usage at all.
+    //
+    // A missing number and a real zero are different facts, and the caller's
+    // `?? input_tokens` fallback cannot separate them: 0 is not nullish, so a
+    // usage-less turn would pin the compaction trigger at zero and leave that
+    // entire run with no context guard -- growing until the model rejects the
+    // request with a 400 that streamTurnWithRetry does not retry. Compaction
+    // is the only such guard in Brain, so "we do not know how big this prompt
+    // was" must not read as "it was empty".
+    promptTokens: sawUsage
+      ? usage.input_tokens + usage.cache_read + usage.cache_create
+      : undefined,
     cacheReport: {
       breakpointsSent,
       enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,

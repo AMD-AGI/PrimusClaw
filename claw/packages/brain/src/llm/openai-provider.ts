@@ -8,7 +8,9 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import type { Message, ToolSchema } from "@claw/protocol";
-import { STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { LLM_CACHE_STYLE, LLM_CACHE_TTL, OPENAI_ANTHROPIC_MARKERS, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
+import { requiredArgToolNames } from "./tool-schema.js";
+import { renderOpenAiCacheMarkers } from "./openai-cache.js";
 import type {
   LlmContentBlock,
   LlmProvider,
@@ -45,7 +47,7 @@ function normalizeStopReason(finishReason: string | null): string | null {
  * while OpenAI expects tool calls on `assistant.tool_calls` and tool results
  * as standalone `role: "tool"` messages.
  */
-function toOpenAiMessages(messages: Message[]): ChatCompletionMessageParam[] {
+export function toOpenAiMessages(messages: Message[]): ChatCompletionMessageParam[] {
   const out: ChatCompletionMessageParam[] = [];
   for (const m of messages) {
     if (typeof m.content === "string") {
@@ -111,6 +113,20 @@ async function streamingTurn(
     else signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
+  // Markers are placed on the WIRE messages, after the transform. See
+  // llm/openai-cache.ts for why planning cannot happen before it.
+  //
+  // Only when the deployment has said what this endpoint is. Left at its
+  // "native" default nothing is sent, because guessing wrong toward markers
+  // puts an unrecognised key in every request to a real OpenAI endpoint.
+  const wire = toOpenAiMessages(messages);
+  const rendered = OPENAI_ANTHROPIC_MARKERS
+    ? renderOpenAiCacheMarkers(wire as unknown as Array<Record<string, unknown>>,
+        { style: LLM_CACHE_STYLE, ttl: LLM_CACHE_TTL })
+    : { messages: wire as unknown as Array<Record<string, unknown>>, breakpointsApplied: 0 };
+  const wireMessages = rendered.messages;
+  const breakpointsSent = rendered.breakpointsApplied;
+
   const t0 = Date.now();
   const firstByteTimer = setTimeout(() => {
     ctrl.abort(new Error(`stream first-byte timeout after ${STREAM_FIRST_BYTE_TIMEOUT_MS}ms`));
@@ -121,7 +137,7 @@ async function streamingTurn(
     stream = await client.chat.completions.create(
       {
         model,
-        messages: toOpenAiMessages(messages),
+        messages: wireMessages as unknown as ChatCompletionMessageParam[],
         tools: tools.length ? toOpenAiTools(tools) : undefined,
         stream: true,
         stream_options: { include_usage: true },
@@ -156,6 +172,10 @@ async function streamingTurn(
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
   let bodyModel: string | undefined;
+  let sawUsage = false;
+  const reported = new Set<"cache_read" | "cache_create">();
+  let created5m: number | undefined;
+  let created1h: number | undefined;
 
   try {
     for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
@@ -167,9 +187,40 @@ async function streamingTurn(
       // Only present (non-null) on the final chunk when stream_options.
       // include_usage=true — see openai SDK ChatCompletionChunk docs.
       if (chunk.usage) {
+        sawUsage = true;
+        const u = chunk.usage as Record<string, any>;
         usage.input_tokens = chunk.usage.prompt_tokens ?? 0;
         usage.output_tokens = chunk.usage.completion_tokens ?? 0;
-        usage.cache_read = (chunk.usage as any).prompt_tokens_details?.cached_tokens ?? 0;
+        const details = u.prompt_tokens_details ?? {};
+
+        // Read every spelling, and record which ones were actually present.
+        //
+        // Declaring up front that this transport cannot report writes was
+        // wrong for the deployment that matters. Measured against the LiteLLM
+        // gateway this fleet talks to, an OpenAI-shaped response carries the
+        // write in three places at once -- top-level
+        // cache_creation_input_tokens, nested
+        // prompt_tokens_details.cache_creation_tokens, and a per-TTL
+        // breakdown -- while genuine OpenAI carries none of them and reports
+        // only cached_tokens. Which is true is a property of the response, not
+        // of the provider, so it is read rather than asserted. Absent stays
+        // absent: an unreported field emits no metric series, and a zero we
+        // invented would be averaged as an observation.
+        const readRaw = u.cache_read_input_tokens ?? details.cached_tokens;
+        const createRaw = u.cache_creation_input_tokens ?? details.cache_creation_tokens;
+        if (readRaw !== undefined && readRaw !== null) {
+          usage.cache_read = Number(readRaw) || 0;
+          reported.add("cache_read");
+        }
+        if (createRaw !== undefined && createRaw !== null) {
+          usage.cache_create = Number(createRaw) || 0;
+          reported.add("cache_create");
+        }
+        const split = details.cache_creation_token_details;
+        if (split && typeof split === "object") {
+          created5m = split.ephemeral_5m_input_tokens ?? undefined;
+          created1h = split.ephemeral_1h_input_tokens ?? undefined;
+        }
       }
 
       const choice = chunk.choices?.[0];
@@ -233,9 +284,14 @@ async function streamingTurn(
     err.code = "STREAM_TRUNCATED";
     throw err;
   }
+  // Schema-gated for the same reason as the Anthropic path -- see the comment
+  // there. The guard belongs on tools that cannot work without arguments, not
+  // on every empty input.
+  const requiresArgs = requiredArgToolNames(tools);
   for (const b of toolUseBlocks) {
-    if (!b.input || (typeof b.input === "object" && Object.keys(b.input).length === 0)) {
-      const err: any = new Error(`tool_use[${b.name}] has empty input — likely truncated`);
+    const empty = !b.input || (typeof b.input === "object" && Object.keys(b.input).length === 0);
+    if (empty && requiresArgs.has(String(b.name))) {
+      const err: any = new Error(`tool_use[${b.name}] has empty input but its schema requires arguments`);
       err.code = "TOOL_INPUT_EMPTY";
       throw err;
     }
@@ -259,19 +315,20 @@ async function streamingTurn(
     // input_tokens, which reports only the uncached remainder. Adding the
     // cache fields on top here would double-count and halve the effective
     // compaction threshold on this path.
-    promptTokens: usage.input_tokens,
+    //
+    // `undefined` rather than 0 when no usage arrived at all, for the reason
+    // spelled out in the Anthropic provider: a gateway that omits usage would
+    // otherwise pin the compaction trigger at zero for the whole run.
+    // stream_options.include_usage is requested, but not every
+    // OpenAI-compatible gateway honours it.
+    promptTokens: sawUsage ? usage.input_tokens : undefined,
     cacheReport: {
-      // No markers are rendered on this path: toOpenAiMessages is not a 1:1
-      // mapping (a tool_result message fans out into N role:"tool" messages)
-      // and it collapses content to strings, which cannot carry a marker.
-      breakpointsSent: 0,
-      enabled: false,
-      // `cache_create` is initialised above and never assigned -- this
-      // transport has no way to report a cache write. Declaring that is the
-      // difference between "we cannot see writes" and "there were no writes";
-      // a dashboard averaging the second is the exact shape of the incident
-      // this whole change exists to prevent.
-      reported: ["cache_read"] as const,
+      breakpointsSent,
+      enabled: OPENAI_ANTHROPIC_MARKERS,
+      // Derived from the response, not declared here. See the read site above.
+      reported: [...reported],
+      createdEphemeral5m: created5m,
+      createdEphemeral1h: created1h,
     },
   };
 }
