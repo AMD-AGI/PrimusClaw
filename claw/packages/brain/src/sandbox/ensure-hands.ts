@@ -1100,6 +1100,14 @@ async function provisionHands(
  * that runs first, because by then the caller has no sandbox either way, and
  * the alternative -- reporting only the failures that happen after the decision
  * to create -- hides exactly the provisioning outages this is meant to show.
+ *
+ * An aborted call is the exception. A run cancelled out from under this one --
+ * a lease lost to another replica, a user interrupt, SIGTERM -- cancels the
+ * probe and surfaces as a throw, and nothing refused to build anything: the
+ * caller stopped wanting a sandbox. Counting it would put a spike on this
+ * counter during every rolling update, which is exactly when lease handovers
+ * and redeliveries are densest, and the panel would report a provisioning
+ * outage caused by the deploy that was in fact the deploy working.
  */
 export async function ensureHands(
   sessionId: string,
@@ -1119,7 +1127,9 @@ export async function ensureHands(
     }
     return result;
   } catch (err) {
-    metrics.onSandboxStart("error", (Date.now() - startedAt) / 1000);
+    if (!options.signal?.aborted) {
+      metrics.onSandboxStart("error", (Date.now() - startedAt) / 1000);
+    }
     throw err;
   }
 }
