@@ -44,6 +44,19 @@ ingress:
 nodeSelector: {}
 tolerations: []
 
+# Extra environment for the proxy container, appended verbatim -- raw env
+# entries, so `valueFrom` works. The APIM hook this chart bakes into the image
+# reads its credentials from the environment (AMD_HYPERLOOM_APIM_KEY and
+# AMD_HYPERLOOM_APIM_USER), and without a way to pass them the chart ships a
+# hook it cannot feed: every upstream call goes out with an empty subscription
+# header and is refused.
+#
+#   extraEnv:
+#     - name: AMD_HYPERLOOM_APIM_KEY
+#       valueFrom:
+#         secretKeyRef: {name: my-litellm-secret, key: hyperloom_apim_key}
+extraEnv: []
+
 # Keep model routing out of the public chart defaults. Supply a private values
 # file with modelList entries for your deployment (LITELLM_VALUES_FILE).
 #
