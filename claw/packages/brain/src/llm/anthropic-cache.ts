@@ -50,6 +50,22 @@ export interface PreparedAnthropicRequest {
    * sending nothing, and counting the plan would report success either way.
    */
   breakpointsApplied: number;
+  /**
+   * Where those markers landed, as ordinals in a flat walk over every block
+   * the request actually carries (hoisted system run first, then messages).
+   *
+   * A count answers "did we send markers"; only the positions answer "could
+   * they have worked". The chain breaks when the distance between two
+   * consecutive markers exceeds the provider's lookback -- one turn that
+   * appends many blocks at once is enough -- and that failure is invisible in
+   * the count, which stays at its healthy maximum throughout.
+   *
+   * Same rule as the count: read off the rendered structure, never off the
+   * plan, so a marker the renderer refused is absent here too.
+   */
+  markerBlockOffsets: number[];
+  /** Total blocks in that same flat walk, so the tail gap is computable. */
+  totalBlocks: number;
 }
 
 /** Widen a message's content to a block array without touching the original. */
@@ -58,10 +74,19 @@ function contentBlocks(content: Message["content"]): Array<Record<string, unknow
   return [{ type: "text", text: content }];
 }
 
-function countMarkers(blocks: ReadonlyArray<Record<string, unknown>>): number {
-  let n = 0;
-  for (const b of blocks) if (b && typeof b === "object" && "cache_control" in b) n++;
-  return n;
+function isMarked(b: unknown): boolean {
+  return !!b && typeof b === "object" && "cache_control" in (b as Record<string, unknown>);
+}
+
+/** Append `blocks` to the flat walk, recording the ordinal of each marked one. */
+function tallyMarkers(
+  blocks: ReadonlyArray<Record<string, unknown>>,
+  out: { markerBlockOffsets: number[]; totalBlocks: number },
+): void {
+  for (const b of blocks) {
+    if (isMarked(b)) out.markerBlockOffsets.push(out.totalBlocks);
+    out.totalBlocks++;
+  }
 }
 
 /**
@@ -104,7 +129,9 @@ export function renderCacheMarkers(
 
   // Counted off the rendered structure, never off the plan: a marker the
   // planner asked for and the renderer refused must show up as a shortfall.
-  const out: PreparedAnthropicRequest = { messages: rendered, breakpointsApplied: 0 };
+  const out: PreparedAnthropicRequest = {
+    messages: rendered, breakpointsApplied: 0, markerBlockOffsets: [], totalBlocks: 0,
+  };
 
   if (plan.systemRunLength > 0) {
     const systemBlocks: Array<Record<string, unknown>> = [];
@@ -113,12 +140,15 @@ export function renderCacheMarkers(
     }
     out.system = systemBlocks;
     out.messages = rendered.slice(plan.systemRunLength);
-    out.breakpointsApplied += countMarkers(systemBlocks);
+    tallyMarkers(systemBlocks, out);
   }
 
-  for (const m of out.messages) {
-    if (Array.isArray(m.content)) out.breakpointsApplied += countMarkers(m.content);
-  }
+  // A string-content message is one block and cannot carry a marker, but it
+  // still occupies a slot in the walk -- skipping it would shorten every gap
+  // measured past it.
+  for (const m of out.messages) tallyMarkers(contentBlocks(m.content), out);
+
+  out.breakpointsApplied = out.markerBlockOffsets.length;
   return out;
 }
 
@@ -143,6 +173,8 @@ export function stripCacheControl(prepared: PreparedAnthropicRequest): PreparedA
       Array.isArray(m.content) ? { ...m, content: clean(m.content) } : m,
     ),
     breakpointsApplied: 0,
+    markerBlockOffsets: [],
+    totalBlocks: prepared.totalBlocks,
   };
 }
 
