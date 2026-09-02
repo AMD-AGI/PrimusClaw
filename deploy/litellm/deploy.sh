@@ -21,6 +21,25 @@ LITELLM_NAMESPACE="${LITELLM_NAMESPACE:-${NAMESPACE:-primus-claw}}"
 LITELLM_NAME="${LITELLM_NAME:-litellm}"
 LITELLM_RELEASE="${LITELLM_RELEASE:-$LITELLM_NAME}"
 LITELLM_IMAGE="${LITELLM_IMAGE:-docker.io/primussafe/litellm:20260331111348}"
+# The default image and the Dockerfile beside it are two independent claims
+# about which LiteLLM this repo runs, and they were four minor versions apart
+# with nothing in either name to say so -- an entire upgrade was scoped against
+# the wrong one. A tag that names its base (build.sh writes those) is checked;
+# a date-stamped legacy tag can only be warned about.
+_dockerfile_base="$(grep -oE '^FROM .*litellm:v[0-9.]+' "$SCRIPT_DIR/Dockerfile" | grep -oE 'v[0-9.]+' | head -1 || true)"
+case "${LITELLM_IMAGE##*:}" in
+  v[0-9]*)
+    _image_base="$(echo "${LITELLM_IMAGE##*:}" | grep -oE '^v[0-9.]+')"
+    if [ -n "$_dockerfile_base" ] && [ "$_image_base" != "$_dockerfile_base" ]; then
+      echo "ERROR: LITELLM_IMAGE is $_image_base but Dockerfile pins $_dockerfile_base." >&2
+      echo "Rebuild with deploy/litellm/build.sh, or set LITELLM_IMAGE deliberately." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    [ -n "$_dockerfile_base" ] && log "note: $LITELLM_IMAGE does not name a version; Dockerfile pins $_dockerfile_base (build.sh tags by version)"
+    ;;
+esac
 LITELLM_IMAGE_PULL_POLICY="${LITELLM_IMAGE_PULL_POLICY:-Always}"
 LITELLM_SERVER_ROOT_PATH="${LITELLM_SERVER_ROOT_PATH:-/llm-gateway}"
 LITELLM_SAFE_API_URL="${LITELLM_SAFE_API_URL:-${SAFE_API_URL:-}}"
@@ -289,6 +308,21 @@ if [ -n "$GENERATED_MODELS_FILE" ]; then
   helm_args+=(-f "$GENERATED_MODELS_FILE")
 fi
 if [ "$LITELLM_INSTALL_INGRESS" = "true" ] && [ -n "$LITELLM_INGRESS_HOST" ]; then
+  # A second gateway on the same path is not a second gateway, it is a coin
+  # flip: whichever ingress the controller resolves first gets the traffic, and
+  # the other one sits there answering health probes and nothing else. That is
+  # exactly what this cluster grew -- an unused LiteLLM taking 0 real requests
+  # in six hours beside the one taking 3563, each looking healthy.
+  existing="$(kubectl get ingress -A \
+    -o jsonpath="{range .items[*]}{.metadata.namespace}/{.metadata.name}:{range .spec.rules[*].http.paths[*]}{.path},{end}{'\n'}{end}" 2>/dev/null \
+    | grep "$LITELLM_SERVER_ROOT_PATH" | grep -v "^$LITELLM_NAMESPACE/$LITELLM_NAME:" || true)"
+  if [ -n "$existing" ]; then
+    echo "ERROR: $LITELLM_SERVER_ROOT_PATH is already served by:" >&2
+    echo "$existing" | sed 's/^/  /' >&2
+    echo "Point this release elsewhere (LITELLM_SERVER_ROOT_PATH), take over that" >&2
+    echo "release, or pass --skip-ingress if you meant to add a second backend." >&2
+    exit 1
+  fi
   helm_args+=(
     --set "ingress.enabled=true"
     --set "ingress.host=$LITELLM_INGRESS_HOST"
@@ -315,5 +349,30 @@ if [ "$SKIP_HEALTH" != "true" ]; then
     --image="$LITELLM_HEALTH_IMAGE" -- \
     curl -sf -m 10 "http://$LITELLM_NAME:$LITELLM_PORT$LITELLM_SERVER_ROOT_PATH/health/readiness"
 fi
+
+# The hook has to be REACHABLE, not merely present. Its import path moves with
+# the base image: older builds resolve litellm to /app/litellm, current ones to
+# a venv site-packages tree. A deployment that mounts the hook at the old path
+# onto a new image starts cleanly, answers readiness, and never calls the hook
+# -- upgrading this cluster produced exactly that, and nothing in the rollout
+# said so. Asking the running pod is the only answer that survives the move.
+callback="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+  python3 -c 'import yaml;print(yaml.safe_load(open("/app/config.yaml")).get("litellm_settings",{}).get("callbacks",""))' 2>/dev/null || true)"
+case "$callback" in
+  *.*)
+    mod="${callback%.*}"
+    if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+         python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
+      echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
+      echo "The proxy will serve traffic with the hook silently inactive." >&2
+      echo "Usually a hook mounted at a path this base image does not import from;" >&2
+      echo "the image bakes it in at the right place, so drop the mount." >&2
+      exit 1
+    fi
+    log "callback $callback resolves in the running image"
+    ;;
+  "") : ;;
+  *) log "note: callback '$callback' is not a dotted path; not checked" ;;
+esac
 
 log "LiteLLM deploy complete"
