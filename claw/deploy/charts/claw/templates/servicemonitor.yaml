@@ -1,0 +1,72 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+Prometheus Operator ServiceMonitors for the API and Brain /metrics endpoints.
+
+Why this exists at all: the Deployments carry prometheus.io/scrape annotations,
+and neither the Prometheus Operator nor the VictoriaMetrics Operator reads them.
+Those annotations are a convention from the pre-operator era that a plain
+Prometheus honours only if its scrape config was written to relabel on them. On
+an operator-managed cluster the annotations are inert, which is a bad failure to
+own: the pods look instrumented, /metrics answers, the dashboard imports
+cleanly, and every panel is empty.
+
+A ServiceMonitor rather than a VMServiceScrape as well: the VictoriaMetrics
+Operator ships a Prometheus converter that is on by default and turns
+ServiceMonitors into VMServiceScrapes, so one object covers both ecosystems.
+Add a VMServiceScrape by hand only if you have disabled that converter or your
+operator is scoped to a namespace this release does not deploy into -- a
+namespace-scoped operator never sees a CR outside its own namespace, and the
+symptom is silence, not an error.
+
+Gated on the value alone, with no .Capabilities.APIVersions guard: an operator
+who sets serviceMonitor.enabled=true on a cluster with no monitoring.coreos.com
+CRD should get a loud failure from the apply, not a release that silently
+contains nothing. Rendering nothing when someone explicitly asked for scraping
+is the same class of bug this file exists to fix.
+*/ -}}
+{{- if .Values.serviceMonitor.enabled }}
+{{- $root := . }}
+{{- range $component := list "api" "brain" }}
+{{- $svc := printf "primus-claw-%s" $component }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $svc }}
+  {{- with $root.Values.serviceMonitor.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "primus-claw.labels" $root | nindent 4 }}
+    component: {{ $svc }}
+    {{- with $root.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: primus-claw
+      component: {{ $svc }}
+  namespaceSelector:
+    matchNames:
+      - {{ $root.Release.Namespace }}
+  endpoints:
+    # Both Services expose their metrics port under the name "http"; the Brain
+    # serves /metrics on brain.port and the API on api.port behind Service port
+    # 80, and selecting by port NAME keeps this correct if either number moves.
+    - port: http
+      path: /metrics
+      interval: {{ $root.Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ $root.Values.serviceMonitor.scrapeTimeout }}
+      {{- with $root.Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}
