@@ -121,6 +121,10 @@ async function streamingTurn(
 
   let stream;
   let breakpointsSent = decorated.breakpointsApplied;
+  // Moves with the count, never independently: the undecorated retry below
+  // zeroes one, and positions left over from the decorated attempt would say
+  // markers were sent on a request that carried none.
+  let markerBlockOffsets: ReadonlyArray<number> = decorated.markerBlockOffsets;
   try {
     stream = await openStream(decorated);
     cacheState.decoratedFailures = 0;
@@ -147,6 +151,7 @@ async function streamingTurn(
       cacheState.disabled = true;
       cacheState.decoratedFailures = 0;
       breakpointsSent = 0;
+      markerBlockOffsets = [];
       metrics.onLlmCacheDisabled();
       logger.error({ model }, "llm.cache_control.disabled_for_session");
     } catch (bareErr) {
@@ -334,6 +339,8 @@ async function streamingTurn(
       enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,
       // This path reads both numbers straight off message_start.
       reported: ["cache_read", "cache_create"] as const,
+      markerBlockOffsets,
+      promptBlocks: decorated.totalBlocks,
       createdEphemeral5m: created5m,
       createdEphemeral1h: created1h,
     } satisfies LlmCacheReport,

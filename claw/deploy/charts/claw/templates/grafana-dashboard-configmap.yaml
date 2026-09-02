@@ -1,0 +1,52 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+Grafana dashboards for the Brain metrics, as sidecar-discoverable ConfigMaps.
+
+Off by default. It is opt-in rather than opt-out because the chart cannot tell
+whether the cluster runs a Grafana whose sidecar watches for these, and a
+ConfigMap nobody reads is 250KB of confusing dead weight in every namespace.
+
+Sidecar discovery rather than a Grafana provider entry: it decouples this chart
+from how Grafana was installed. The sidecar scans for ConfigMaps carrying the
+label below and imports whatever JSON it finds, so nothing here has to agree
+with a dashboardProviders block in some other release.
+
+One ConfigMap per file via .Files.Glob, keyed by basename. The JSON has to live
+inside the chart directory -- .Files.Get and .Files.Glob cannot read a path that
+escapes it, and the failure is silent: the ConfigMap renders with an empty
+string and Grafana reports a dashboard it cannot load.
+
+The dashboard declares an __inputs datasource, which is the import-time prompt
+in the Grafana UI. A sidecar import has no prompt, so set
+grafanaDashboard.datasourceUid to the uid of the Prometheus-compatible source
+that scrapes Brain /metrics and it is substituted in on render.
+
+NOTE: this chart ships no ServiceMonitor, PodMonitor or VMServiceScrape -- only
+the prometheus.io/* annotations on the Deployments. Neither the Prometheus
+Operator nor the VictoriaMetrics Operator reads those annotations, so on either
+of them these panels stay empty until you add a scrape object of your own.
+*/ -}}
+{{- if .Values.grafanaDashboard.enabled }}
+{{- $root := . }}
+{{- $uid := .Values.grafanaDashboard.datasourceUid | default "PROMETHEUS" }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := base $path | trimSuffix ".json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-dashboard-%s" (include "primus-claw.fullname" $root) $name | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "primus-claw.labels" $root | nindent 4 }}
+    {{ $root.Values.grafanaDashboard.label }}: {{ $root.Values.grafanaDashboard.labelValue | quote }}
+  {{- with $root.Values.grafanaDashboard.folder }}
+  annotations:
+    {{ $root.Values.grafanaDashboard.folderAnnotation }}: {{ . | quote }}
+  {{- end }}
+data:
+  {{ base $path }}: |
+    {{- $root.Files.Get $path | replace "${DS_PROMETHEUS}" $uid | nindent 4 }}
+{{- end }}
+{{- end }}

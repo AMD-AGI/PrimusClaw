@@ -51,6 +51,7 @@ import {
   type HandsProbeEntry,
 } from "./container-probe.js";
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -637,7 +638,7 @@ async function acceptExistingSandbox(
   return { handsUrl: info.handsUrl, created: false, token: info.token, identity };
 }
 
-export async function ensureHands(
+async function provisionHands(
   sessionId: string,
   request: ExecuteRequest,
   platformKey: string,
@@ -1079,6 +1080,58 @@ export async function ensureHands(
   }
 
   return { handsUrl, created: true, token: handsToken, identity };
+}
+
+
+/**
+ * `provisionHands` plus the sandbox-creation counters.
+ *
+ * The measurement sits here rather than around the two `created: true` returns
+ * inside because those are in different functions on different providers, and a
+ * counter that only one of them reaches is worse than none: the gap looks like
+ * "no sandboxes were created", not "this path is not instrumented".
+ *
+ * Only a call that actually built a sandbox is counted. Reuse and the local-dev
+ * short-circuit both return `created: false` and are not creation attempts, so
+ * counting them would put the reuse rate into a latency histogram whose help
+ * text promises creation time.
+ *
+ * A throw is counted as a failed attempt even when it came from the reuse probe
+ * that runs first, because by then the caller has no sandbox either way, and
+ * the alternative -- reporting only the failures that happen after the decision
+ * to create -- hides exactly the provisioning outages this is meant to show.
+ *
+ * An aborted call is the exception. A run cancelled out from under this one --
+ * a lease lost to another replica, a user interrupt, SIGTERM -- cancels the
+ * probe and surfaces as a throw, and nothing refused to build anything: the
+ * caller stopped wanting a sandbox. Counting it would put a spike on this
+ * counter during every rolling update, which is exactly when lease handovers
+ * and redeliveries are densest, and the panel would report a provisioning
+ * outage caused by the deploy that was in fact the deploy working.
+ */
+export async function ensureHands(
+  sessionId: string,
+  request: ExecuteRequest,
+  platformKey: string,
+  onEvent: (evt: Record<string, unknown>) => Promise<void>,
+  multiNodeContext?: MultiNodeContext,
+  options: EnsureHandsOptions = {},
+): Promise<EnsureHandsResult> {
+  const startedAt = Date.now();
+  try {
+    const result = await provisionHands(
+      sessionId, request, platformKey, onEvent, multiNodeContext, options,
+    );
+    if (result.created) {
+      metrics.onSandboxStart("ok", (Date.now() - startedAt) / 1000);
+    }
+    return result;
+  } catch (err) {
+    if (!options.signal?.aborted) {
+      metrics.onSandboxStart("error", (Date.now() - startedAt) / 1000);
+    }
+    throw err;
+  }
 }
 
 function toHex(buf: ArrayBuffer): string {

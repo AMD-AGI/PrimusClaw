@@ -91,6 +91,22 @@ export interface LlmCacheReport {
    * were no writes" -- the exact shape of the incident this exists to catch.
    */
   reported: ReadonlyArray<"cache_read" | "cache_create">;
+  /**
+   * Where this turn's markers sat, as ordinals in a flat walk over the blocks
+   * actually sent, and how many blocks that walk had.
+   *
+   * `breakpointsSent` says markers went out; it stays at its healthy maximum
+   * while the chain they form is broken. The break is a distance: two
+   * consecutive markers further apart than the provider's lookback, which one
+   * turn appending many blocks at once can open in a single step. Only the
+   * positions show it, and only on the turn that failed -- by the next turn
+   * the plan has rolled and the evidence is gone.
+   *
+   * Optional because the OpenAI path builds its markers elsewhere and session
+   * doubles supply neither.
+   */
+  markerBlockOffsets?: ReadonlyArray<number>;
+  promptBlocks?: number;
   /** Write split by lifetime, when the gateway reports it. A 1h marker that
    *  comes back as a 5m write is a silent downgrade worth seeing. */
   createdEphemeral5m?: number;

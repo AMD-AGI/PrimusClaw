@@ -425,6 +425,55 @@ reaper:
     requests: { cpu: "100m", memory: "128Mi" }
     limits: { cpu: "500m", memory: "512Mi" }
 
+# Prometheus Operator ServiceMonitors for the API and Brain /metrics endpoints.
+# Off by default because the monitoring.coreos.com CRDs may not be installed.
+#
+# The Deployments' prometheus.io/* annotations do NOT substitute for this: no
+# operator reads them, so without a scrape object the pods look instrumented and
+# every dashboard panel stays empty. The VictoriaMetrics Operator's Prometheus
+# converter (on by default) turns these into VMServiceScrapes, so one object
+# covers both ecosystems -- unless that operator is scoped to a namespace this
+# release does not deploy into, in which case it never sees them.
+serviceMonitor:
+  enabled: false
+  # Leave empty to create them in the release namespace. Set only if your
+  # Prometheus is configured to look for ServiceMonitors somewhere specific.
+  namespace: ""
+  # Extra labels, e.g. the release label a kube-prometheus-stack install uses
+  # to decide which ServiceMonitors it owns.
+  labels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+  relabelings: []
+  metricRelabelings: []
+
+# Grafana dashboards for the Brain metrics, shipped as ConfigMaps the Grafana
+# sidecar can discover. Off by default: the chart cannot tell whether a sidecar
+# is watching, and an unread 250KB ConfigMap in every namespace is worse than
+# an extra install step.
+#
+# Note this chart ships no ServiceMonitor/PodMonitor/VMServiceScrape, only the
+# prometheus.io/* annotations on the Deployments. The Prometheus Operator and
+# the VictoriaMetrics Operator both ignore those annotations, so on either of
+# them the panels stay empty until you add a scrape object of your own.
+grafanaDashboard:
+  enabled: false
+  # Label the Grafana sidecar matches on. The defaults are what the upstream
+  # Grafana chart's sidecar looks for.
+  label: grafana_dashboard
+  labelValue: "1"
+  # Folder to file the dashboards under, via the sidecar's folder annotation.
+  # Empty leaves them in Grafana's General folder.
+  folder: ""
+  folderAnnotation: grafana_folder
+  # uid of the Prometheus-compatible datasource that scrapes Brain /metrics.
+  # The dashboard JSON carries a ${DS_PROMETHEUS} placeholder, which is the
+  # import-time prompt in the Grafana UI; a sidecar import never prompts, so
+  # the value here is substituted in at render time. Leave it unset only if
+  # your Grafana resolves a datasource named PROMETHEUS.
+  datasourceUid: ""
+
+
 # Optional agent capabilities, off unless a deployment asks for them.
 features:
   # Lets the agent start commands that keep running after the tool call returns

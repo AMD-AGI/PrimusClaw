@@ -176,6 +176,89 @@ kubectl rollout restart deployment/primus-claw-api -n primus-claw
 kubectl rollout restart deployment/primus-claw-brain -n primus-claw
 ```
 
+### Grafana Dashboard
+
+`charts/claw/dashboards/claw-brain.json` is a Grafana dashboard for the Brain's
+Prometheus metrics — 87 panels across 10 rows, each carrying a description saying what
+it measures, how to read it, and what is normal versus what should worry you.
+
+Install it with the chart, as ConfigMaps a Grafana sidecar discovers:
+
+```yaml
+grafanaDashboard:
+  enabled: true
+  folder: Claw                 # omit to leave them in Grafana's General folder
+  datasourceUid: <prom-uid>    # the datasource that scrapes Brain /metrics
+```
+
+Or import the JSON by hand — Grafana UI, Dashboards -> New -> Import -> Upload JSON —
+in which case the `${DS_PROMETHEUS}` input prompts for the datasource instead.
+
+The chart route needs `datasourceUid` because a sidecar import never prompts; the
+placeholder is substituted at render time. The dashboard JSON must stay inside
+`charts/claw/`, since `.Files.Glob` cannot read a path that escapes the chart and fails
+by rendering an empty ConfigMap rather than by erroring.
+
+**A label collision worth knowing about.** The Brain and API label their own
+metrics `service="claw-brain"` / `service="claw-api"` (prom-client
+`setDefaultLabels`), and a ServiceMonitor overwrites `service` with the
+Kubernetes Service name — `primus-claw-brain` / `primus-claw-api` — because
+scrape-time labels win. Enabling `serviceMonitor` therefore changes the value of
+that label. The shipped dashboard does not depend on it: `claw_*` metric names
+are unique, so its queries carry no `service` selector, and the generic
+`process_*` / `nodejs_*` series match both spellings. Queries you write yourself
+should do the same rather than pin one value.
+
+**Scraping.** The Deployments carry `prometheus.io/scrape` annotations, and no operator
+reads them — that convention only works with a plain Prometheus whose scrape config was
+written to relabel on it. On an operator-managed cluster the annotations are inert, so
+the pods look instrumented, `/metrics` answers, and every panel is empty. Turn on the
+ServiceMonitors instead:
+
+```yaml
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack   # whatever label your Prometheus selects on
+```
+
+That creates one ServiceMonitor per component against the `http` port of the
+`primus-claw-api` and `primus-claw-brain` Services. The VictoriaMetrics Operator's
+Prometheus converter is on by default and turns them into VMServiceScrapes, so the same
+object covers both ecosystems — except where that operator runs namespace-scoped
+(`WATCH_NAMESPACE` set) and this release deploys outside its namespace, in which case it
+never sees them and you need a scrape object it does see. It is off by default because
+the `monitoring.coreos.com` CRDs may not be installed; enabling it without them makes the
+apply fail, which is deliberate — rendering nothing when scraping was explicitly asked
+for is the failure this setting exists to prevent.
+
+Two things bite when installing the dashboard outside `helm install`:
+
+- **`kubectl apply` cannot take it.** The JSON is ~250KB, and `kubectl apply` stores the
+  whole object in the `kubectl.kubernetes.io/last-applied-configuration` annotation,
+  which is capped at 256KB. Piping `helm template` into `kubectl apply` therefore fails
+  with `metadata.annotations: Too long`. Use `kubectl apply --server-side`, which does not
+  write that annotation. `helm install` and `helm upgrade` are unaffected — they track
+  state in the release secret, not in an annotation.
+- **No sidecar, no import.** The ConfigMap is only picked up by a Grafana whose deployment
+  runs a dashboard sidecar. On a Grafana managed by grafana-operator there is usually no
+  sidecar, and the equivalent is a `GrafanaDashboard` CR carrying the same JSON, with the
+  `__inputs` entry resolved by `spec.datasources` instead of by
+  `grafanaDashboard.datasourceUid`:
+
+  ```yaml
+  spec:
+    datasources:
+      - inputName: DS_PROMETHEUS
+        datasourceName: <your Prometheus datasource NAME, not its uid>
+  ```
+
+Thresholds and panel maxima assume the upstream defaults — `MAX_CONCURRENT=3`,
+`MAX_RESIDENT=6` (a delivery residency ceiling of 9), `brain.replicas=3`,
+`WORKSPACE_SYNC_NORMAL_SLOTS=4`, `terminationGracePeriodSeconds=300`. Panels whose scale
+depends on one of these say so in their description; adjust the maxima if your
+deployment overrides them.
+
 ### Rollback
 
 ```bash
@@ -230,3 +313,5 @@ Requires `boto3` (`pip install boto3`). See `deploy/minio-lifecycle.py` for user
 | `charts/claw/` | Helm chart — single source of truth for every manifest (API, Brain, Secret, Services, Ingress, PostgresCluster) |
 | `nats-values.yaml` | NATS Helm values |
 | `minio-lifecycle.py` | S3 bucket lifecycle rules script (boto3) |
+| `charts/claw/dashboards/claw-brain.json` | Grafana dashboard for the Brain metrics (installed by the chart when `grafanaDashboard.enabled`, or imported by hand) |
+| `charts/claw/templates/servicemonitor.yaml` | Prometheus Operator ServiceMonitors for API and Brain (`serviceMonitor.enabled`) |

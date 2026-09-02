@@ -1092,8 +1092,51 @@ class AgentLoopRunner {
       const gapMs = turnStart - this.lastCacheUseAt;
       const gap = gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
       metrics.onCacheEntryLost(gap);
+      // Everything needed to tell the three causes apart, on the one turn that
+      // can still tell them apart -- the next turn re-plans and the evidence is
+      // gone. The counter says a read was lost; it cannot say why, and the
+      // three answers want different fixes:
+      //
+      //   cacheCreate > 0        the prefix was rewritten, not dropped. Cost is
+      //                          a write instead of a read, not a full-price
+      //                          prompt, which is why the bill does not show it.
+      //   maxMarkerGap large     the chain broke: two markers further apart
+      //                          than the lookback, which one turn appending
+      //                          many blocks opens in a single step. Ours.
+      //   neither                the entry was not where we left it -- eviction,
+      //                          or a gateway that routed to a backend without
+      //                          it. Not ours, and the gateway has to answer.
+      //
+      // `markerBlockOffsets` is absent on providers that cannot report it, and
+      // an absent measurement must not read as a zero-width gap.
+      const offsets = cacheReport.markerBlockOffsets;
+      const blocks = cacheReport.promptBlocks;
+      let maxMarkerGap: number | undefined;
+      if (offsets && offsets.length > 0 && blocks !== undefined) {
+        maxMarkerGap = offsets[0];
+        for (let i = 1; i < offsets.length; i++) {
+          maxMarkerGap = Math.max(maxMarkerGap, offsets[i] - offsets[i - 1]);
+        }
+        maxMarkerGap = Math.max(maxMarkerGap, blocks - offsets[offsets.length - 1]);
+      }
       logger.warn(
-        { turn, sessionId: this.sessionId, gapMs, gap, routedModel },
+        {
+          turn,
+          sessionId: this.sessionId,
+          gapMs,
+          gap,
+          routedModel,
+          breakpointsSent: cacheReport.breakpointsSent,
+          markerBlockOffsets: offsets,
+          promptBlocks: blocks,
+          maxMarkerGap,
+          cacheCreate: turnUsage.cache_create,
+          inputTokens: turnUsage.input_tokens,
+          promptTokens: streamResult.promptTokens,
+          reported: cacheReport.reported,
+          ttl5m: cacheReport.createdEphemeral5m,
+          ttl1h: cacheReport.createdEphemeral1h,
+        },
         "agent-loop.cache_entry_lost",
       );
     }
