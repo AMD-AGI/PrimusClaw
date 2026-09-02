@@ -64,6 +64,18 @@ jobs:
         run: |
           bash claw/scripts/lint-metrics-must-register.sh --all
 
+  llm-settings-must-be-deployable:
+    name: enforce that every LLM_*/PROMPT_CACHE_* setting reaches a cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run lint-llm-settings-deployable
+        run: |
+          bash claw/scripts/lint-llm-settings-deployable.sh
+
   session-events-must-redact:
     name: enforce redaction on routes reading claw_session_events.data
     runs-on: ubuntu-latest

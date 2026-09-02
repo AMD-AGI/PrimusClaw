@@ -267,6 +267,13 @@ secret:
   sandboxPendingTimeoutSeconds: "10800"
   multiNodeDefaultTimeoutSeconds: "86400"
   llmApiStyle: anthropic
+  # Prompt caching. `llmCacheStyle` only means anything when llmApiStyle is
+  # openai: it says whether that endpoint reads Anthropic `cache_control`
+  # markers, which is a fact about the gateway and not something the URL can be
+  # asked. Left at native, Brain sends no markers on that wire.
+  promptCacheEnabled: "true"
+  llmCacheTtl: "1h"
+  llmCacheStyle: native
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
