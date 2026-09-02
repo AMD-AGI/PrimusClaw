@@ -942,14 +942,20 @@ export const PROMPT_CACHE_ENABLED = envBool("PROMPT_CACHE_ENABLED", true);
  * request, so dying is honest there, but a mistyped cost knob must not be able
  * to stop a pod from booting.
  */
-export type LlmCacheStyle = "anthropic" | "native";
+export type LlmCacheStyle = "off" | "anthropic" | "native";
 function resolveLlmCacheStyle(): LlmCacheStyle {
   const configured = env("LLM_CACHE_STYLE");
-  if (configured === "anthropic" || configured === "native") return configured;
+  if (configured === "off" || configured === "anthropic" || configured === "native") return configured;
   if (configured) {
-    settingProblems.push(`LLM_CACHE_STYLE=${configured} is not "anthropic" or "native"; using native`);
+    settingProblems.push(`LLM_CACHE_STYLE=${configured} is not "off", "anthropic" or "native"; using off`);
   }
-  return "native";
+  // Off by default. Markers on this wire are a claim about an endpoint that
+  // cannot be interrogated, and a wrong claim is REFUSED rather than merely
+  // uncached -- so a default that sends something spends a failed request and
+  // a probe on the first markable turn of every session, on every deployment
+  // that never chose a dialect. A log line that fires once per session cannot
+  // report a regression.
+  return "off";
 }
 export const LLM_CACHE_STYLE: LlmCacheStyle = resolveLlmCacheStyle();
 
@@ -957,8 +963,8 @@ export const LLM_CACHE_STYLE: LlmCacheStyle = resolveLlmCacheStyle();
  * True when the deployment has said the OpenAI-shaped endpoint reads Anthropic
  * cache markers, i.e. when Brain should place `cache_control` on that wire.
  */
-export const OPENAI_ANTHROPIC_MARKERS =
-  LLM_API_STYLE === "openai" && LLM_CACHE_STYLE === "anthropic" && PROMPT_CACHE_ENABLED;
+export const OPENAI_CACHE_MARKERS =
+  LLM_API_STYLE === "openai" && PROMPT_CACHE_ENABLED && LLM_CACHE_STYLE !== "off";
 
 /**
  * The OPENAI_BASE_URL fallback fired: the deployment selected the OpenAI wire

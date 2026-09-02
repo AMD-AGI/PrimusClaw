@@ -267,6 +267,18 @@ secret:
   sandboxPendingTimeoutSeconds: "10800"
   multiNodeDefaultTimeoutSeconds: "86400"
   llmApiStyle: anthropic
+  # Prompt caching. `llmCacheStyle` only means anything when llmApiStyle is
+  # openai: it names which cache dialect that endpoint speaks, which is a fact
+  # about the gateway and not something the URL can be asked.
+  #   off        send no markers (default)
+  #   anthropic  `cache_control` -- for a gateway fronting Anthropic models
+  #   native     `prompt_cache_breakpoint` -- for a genuine OpenAI endpoint
+  # Off by default because a wrong dialect is REFUSED rather than merely
+  # uncached: guessing costs a failed request on the first markable turn of
+  # every session. Genuine OpenAI caches automatically and needs no marker.
+  promptCacheEnabled: "true"
+  llmCacheTtl: "1h"
+  llmCacheStyle: "off"
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""

@@ -83,15 +83,29 @@ function project(wire: readonly WireMessage[]): Message[] {
   }));
 }
 
-/** The marker itself, in whichever dialect the endpoint speaks. */
+/**
+ * The marker, in whichever dialect the endpoint speaks.
+ *
+ * A gateway forwarding to Anthropic reads `cache_control`; genuine OpenAI
+ * reads `prompt_cache_breakpoint`, and only when the request also carries
+ * `prompt_cache_options.mode = "explicit"` -- see `PROMPT_CACHE_OPTIONS`.
+ * Which dialect an endpoint speaks is a deployment fact; the URL cannot be
+ * asked.
+ */
 function markerFor(style: "anthropic" | "native", ttl: CacheTtl): Record<string, unknown> {
-  // Two dialects share this slot. A gateway forwarding to Anthropic reads
-  // `cache_control`; genuine OpenAI reads `prompt_cache_breakpoint`. Which one
-  // is a deployment fact, not something the URL can be asked.
   return style === "anthropic"
     ? { cache_control: ttl === "1h" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" } }
     : { prompt_cache_breakpoint: { mode: "explicit" } };
 }
+
+/**
+ * Request-level opt-in that the native dialect requires.
+ *
+ * Breakpoints without it are accepted and ignored, which is the worst of the
+ * three outcomes: it looks like caching is configured and bills like it is
+ * not. It travels with the messages so the two can never be sent apart.
+ */
+export const PROMPT_CACHE_OPTIONS = { mode: "explicit" } as const;
 
 export interface PreparedOpenAiMessages {
   messages: WireMessage[];
@@ -133,10 +147,28 @@ export function renderPlannedOpenAiMarkers(
 
   const marker = markerFor(opts.style, opts.ttl);
   let applied = 0;
+  // Widen EVERY markable message, mark only the planned ones.
+  //
+  // Widening is what carries a marker: string content becomes a one-element
+  // parts array. Doing it only where a marker lands makes a message's shape a
+  // function of where the breakpoints are -- and the rolling ones move every
+  // turn, so a message widened in turn N goes back to a bare string in turn
+  // N+1. Measured on this wire: request 1 sent `user:arr | user:arr`, request
+  // 2 sent `user:arr | user:str | ...`. Every cached prefix containing that
+  // second message is invalidated by its own re-serialisation, which is a
+  // cache that pays to write and can never read.
+  //
+  // Widening unconditionally costs nothing -- token counts and output are
+  // identical either way, measured when this path was first added -- and makes
+  // the serialisation depend only on the conversation.
   const messages = wire.map((m, i) => {
-    if (!wanted.has(i) || !markableWire(m)) return m;
-    applied++;
-    return { ...m, content: [{ type: "text", text: m.content as string, ...marker }] };
+    if (!markableWire(m)) return m;
+    const part: Record<string, unknown> = { type: "text", text: m.content as string };
+    if (wanted.has(i)) {
+      applied++;
+      Object.assign(part, marker);
+    }
+    return { ...m, content: [part] };
   });
   // Counted off the rendered messages, never off the plan: a plan/render
   // divergence is the likeliest way this quietly stops sending anything, and

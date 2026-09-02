@@ -345,7 +345,7 @@ function validateStartupConfig(): void {
   // The OpenAI wire protocol was selected with no URL of its own, so
   // chat/completions is pointed at whatever ANTHROPIC_BASE_URL names. In this
   // fleet that is a gateway serving Anthropic models, which honours cache
-  // markers -- and leaving LLM_CACHE_STYLE at its "native" default there means
+  // markers -- and leaving LLM_CACHE_STYLE at its "off" default there means
   // paying full price on every request. Said at boot because the alternative
   // is finding out on a bill: that is exactly how the incident this caching
   // work came from went unnoticed for two years.
@@ -354,7 +354,7 @@ function validateStartupConfig(): void {
       { llmCacheStyle: LLM_CACHE_STYLE },
       LLM_CACHE_STYLE === "anthropic"
         ? "startup.openai_base_url_fell_back: OPENAI_BASE_URL is unset, so chat/completions targets ANTHROPIC_BASE_URL; LLM_CACHE_STYLE=anthropic, so cache markers will be sent"
-        : "startup.openai_base_url_fell_back: OPENAI_BASE_URL is unset, so chat/completions targets ANTHROPIC_BASE_URL -- a gateway that likely honours prompt caching, but LLM_CACHE_STYLE is \"native\" so no markers are sent and every request pays full price. Set LLM_CACHE_STYLE=anthropic if that endpoint fronts Anthropic models.",
+        : `startup.openai_base_url_fell_back: OPENAI_BASE_URL is unset, so chat/completions targets ANTHROPIC_BASE_URL -- a gateway that likely honours prompt caching, but LLM_CACHE_STYLE is "${LLM_CACHE_STYLE}", which sends no cache_control, so every request pays full price. Set LLM_CACHE_STYLE=anthropic if that endpoint fronts Anthropic models.`,
     );
   }
 

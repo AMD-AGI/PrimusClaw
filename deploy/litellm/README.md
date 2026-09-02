@@ -73,3 +73,36 @@ will not load; the API is unaffected.
 
 The base image is pinned by digest and floors at `v1.96.2`, which is the first
 release carrying Auto Router v2 and classifier context windows.
+
+## Building the image
+
+`./build.sh` (needs `REGISTRY`; set `HARBOR_PASSWORD` to build in-cluster with
+kaniko when there is no docker daemon). The tag it writes names the LiteLLM
+version taken from the Dockerfile, and `deploy.sh` refuses an image whose
+version-named tag disagrees with that pin.
+
+## Upgrading LiteLLM
+
+**The database migration is one-way.** LiteLLM runs `prisma migrate deploy` on
+startup whenever a database is configured. Going from 1.82.1 to 1.98.0 applied
+46 migrations; nothing tries the reverse, and the older image against the newer
+schema is untested. Rolling the image back is therefore not a rollback.
+
+Before upgrading:
+
+1. Snapshot the schema and the applied-migration list -- the data is usually
+   covered by the cluster's own backups, but the schema is what the upgrade
+   changes and what a rollback would have to answer for:
+   `pg_dump -d <db> --schema-only` and `select migration_name from _prisma_migrations`.
+2. Save the current Deployment and ConfigMaps.
+3. Start the new image against the REAL config in a throwaway pod with the
+   database detached, and confirm `/health/readiness` returns 200. A config key
+   the new version dropped shows up here rather than under traffic.
+
+**Do not mount the hook from a ConfigMap.** The image bakes `apim_key_hook.py`
+into whatever path the installed LiteLLM actually imports from, which moves
+between base images -- older ones resolve to `/app/litellm`, current ones to a
+venv `site-packages` tree. A mount pinned to the old path onto a new image
+starts cleanly, passes readiness, and leaves the hook inert. `deploy.sh` now
+fails the deploy when the configured callback cannot be resolved inside the
+running pod, but a hand-applied Deployment bypasses that check entirely.

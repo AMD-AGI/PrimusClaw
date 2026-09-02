@@ -383,6 +383,20 @@ llm_api_style = env("LLM_API_STYLE", "anthropic")
 if llm_api_style not in {"anthropic", "openai"}:
     raise SystemExit("LLM_API_STYLE must be either 'anthropic' or 'openai'")
 provider_base = openai_base if llm_api_style == "openai" else anthropic_base
+# Prompt caching. These have to travel the same path as LLM_API_STYLE: a
+# setting the image reads but the chart never writes is a setting that is
+# always at its default, and the one that matters here defaults to sending no
+# markers at all. An OpenAI-shaped endpoint that fronts Anthropic caches
+# nothing until a deployment says so, and there is no way to ask the URL.
+prompt_cache_enabled = env("PROMPT_CACHE_ENABLED", "true")
+if prompt_cache_enabled not in {"true", "false"}:
+    raise SystemExit("PROMPT_CACHE_ENABLED must be either 'true' or 'false'")
+llm_cache_ttl = env("LLM_CACHE_TTL", "1h")
+if llm_cache_ttl not in {"5m", "1h"}:
+    raise SystemExit("LLM_CACHE_TTL must be either '5m' or '1h'")
+llm_cache_style = env("LLM_CACHE_STYLE", "off")
+if llm_cache_style not in {"off", "anthropic", "native"}:
+    raise SystemExit("LLM_CACHE_STYLE must be one of 'off', 'anthropic', 'native'")
 # Where the agent-sandbox control plane runs, which is what the router URL is
 # derived from. Where sandbox workloads land is a separate decision the chart
 # already defaults for a fresh cluster, so it is only overridden below when the
@@ -450,6 +464,9 @@ values = {
             "86400",
         ),
         "llmApiStyle": llm_api_style,
+        "promptCacheEnabled": prompt_cache_enabled,
+        "llmCacheTtl": llm_cache_ttl,
+        "llmCacheStyle": llm_cache_style,
         "anthropicBaseUrl": anthropic_base,
         "openaiBaseUrl": openai_base,
         "byokVerifyModelsUrl": env("BYOK_VERIFY_MODELS_URL", models_url(provider_base)),
