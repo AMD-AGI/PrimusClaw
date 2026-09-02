@@ -43,12 +43,12 @@ spec:
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
-              name: {{ include "litellm.fullname" . }}
+              name: {{ include "litellm.secretName" . }}
               key: database_url
         - name: LITELLM_MASTER_KEY
           valueFrom:
             secretKeyRef:
-              name: {{ include "litellm.fullname" . }}
+              name: {{ include "litellm.secretName" . }}
               key: master_key
         - name: SAFE_API_URL
           value: {{ .Values.safeApiUrl | quote }}

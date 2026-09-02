@@ -17,6 +17,13 @@ serverRootPath: /llm-gateway
 safeApiUrl: ""
 
 secrets:
+  # Name a Secret you already manage and the chart will not render its own.
+  # It must carry the keys `master_key` and `database_url`. Use this rather
+  # than the two below for anything real: values passed to Helm end up in the
+  # release history in plain text, and master_key is not only the admin
+  # credential -- it is also the encryption key for every model credential
+  # stored in the database.
+  existingSecret: ""
   masterKey: ""
   databaseUrl: ""
 
