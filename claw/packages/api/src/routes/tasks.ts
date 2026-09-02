@@ -20,7 +20,7 @@ import {
   canAccessSessionAsOperator,
   canWriteSessionAsOperator,
 } from "../auth/models.js";
-import { db } from "../infra/db.js";
+import { db, MarketplaceDb } from "../infra/db.js";
 import { nc, sc } from "../infra/nats.js";
 import { canExecuteTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
@@ -34,6 +34,36 @@ import { enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plug
 import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
+
+/**
+ * The sandbox a plugin-less single task should get.
+ *
+ * This used to be the literal `"none"`, which `resolveSandboxAction` maps to
+ * `{kind:"none"}` and `ensureHands` then throws on -- while the agent is still
+ * handed the full tool schema. So a prompt-only task advertised every sandbox
+ * tool and died on the first one that was called, and the sandboxless fast
+ * path that would have excused it is gated on `mode === "script"`. The visible
+ * symptom was a run ending in two turns having called nothing, and a
+ * `sandbox_workload_id` that was NULL for every row ever written -- which in
+ * turn left the platform-facts backfill filtering out every row it was given.
+ *
+ * The chat path never had this: it resolves an image through
+ * request -> plugin -> marketplace default and ships it as the legacy
+ * top-level field. Same precedence here, minus the per-request override a task
+ * body has no field for. `"none"` survives only for the case it describes --
+ * no plugin and no default image, where a sandbox genuinely cannot be built.
+ */
+export async function singleTaskSandboxSpec(
+  plugin: { image?: string; resource?: unknown } | null | undefined,
+): Promise<{ handle: string; image: string; resources?: unknown } | "none"> {
+  if (plugin?.image) {
+    return { handle: "main", image: plugin.image, resources: plugin.resource };
+  }
+  const row = await MarketplaceDb.resourceFirstByType("default").catch(() => null);
+  const image = String((row as Record<string, unknown> | null)?.image ?? "").trim();
+  if (!image) return "none";
+  return { handle: "main", image, resources: (row as Record<string, unknown>).resource };
+}
 
 const logger = pino({ name: "tasks-routes" });
 
@@ -169,9 +199,7 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
           prompt: body.prompt,
           mode: "llm",
           workspace_throwaway: body.workspace_throwaway === true,
-          sandbox_spec: plugin
-            ? { handle: "main", image: plugin.image, resources: plugin.resource }
-            : "none",
+          sandbox_spec: await singleTaskSandboxSpec(plugin),
         });
         return { ok: true, task_id: single.task_id };
       }
