@@ -14,6 +14,14 @@
 
 set -euo pipefail
 
+# Defined here rather than further down because the image-tag check below
+# calls log(). It used to sit at line 90, so any LITELLM_IMAGE whose tag did
+# not start with v[0-9] -- including this script's own default, and every
+# timestamp tag build.sh produces -- hit `log: command not found` and, under
+# `set -e`, exited 127 before doing anything.
+log() { echo "[litellm] $(date +%H:%M:%S) $*"; }
+fail() { echo "[litellm] ERROR: $*" >&2; exit 1; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "$SCRIPT_DIR/charts/litellm" && pwd)"
 
@@ -86,9 +94,6 @@ HELP
     *) echo "Unknown flag: $1" >&2; exit 2 ;;
   esac
 done
-
-log() { echo "[litellm] $(date +%H:%M:%S) $*"; }
-fail() { echo "[litellm] ERROR: $*" >&2; exit 1; }
 
 # Temp files may hold a provider API key; remove them on any exit.
 MODELS_TMP_FILES=()
@@ -356,23 +361,40 @@ fi
 # onto a new image starts cleanly, answers readiness, and never calls the hook
 # -- upgrading this cluster produced exactly that, and nothing in the rollout
 # said so. Asking the running pod is the only answer that survives the move.
-callback="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-  python3 -c 'import yaml;print(yaml.safe_load(open("/app/config.yaml")).get("litellm_settings",{}).get("callbacks",""))' 2>/dev/null || true)"
-case "$callback" in
-  *.*)
-    mod="${callback%.*}"
-    if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-         python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
-      echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
-      echo "The proxy will serve traffic with the hook silently inactive." >&2
-      echo "Usually a hook mounted at a path this base image does not import from;" >&2
-      echo "the image bakes it in at the right place, so drop the mount." >&2
-      exit 1
-    fi
-    log "callback $callback resolves in the running image"
-    ;;
-  "") : ;;
-  *) log "note: callback '$callback' is not a dotted path; not checked" ;;
-esac
+# `callbacks` is a list as often as it is a string -- anything that adds
+# `prometheus` alongside the hook makes it one. Reading it as a scalar printed
+# the repr of the list, which still matched `*.*`, so the module name became
+# "['prometheus', 'litellm.proxy.hooks.apim_key_hook" and the import failed:
+# a hard error on a perfectly healthy deployment. Normalise to one entry per
+# line and check each dotted one on its own; bare names like `prometheus` are
+# built in and have nothing to import.
+callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+  python3 -c 'import yaml
+cb = yaml.safe_load(open("/app/config.yaml")).get("litellm_settings", {}).get("callbacks", [])
+if isinstance(cb, str):
+    cb = [cb]
+for c in cb or []:
+    if c:
+        print(c)' 2>/dev/null || true)"
+while IFS= read -r callback; do
+  [ -n "$callback" ] || continue
+  case "$callback" in
+    *.*)
+      mod="${callback%.*}"
+      if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+           python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
+        echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
+        echo "The proxy will serve traffic with the hook silently inactive." >&2
+        echo "Usually a hook mounted at a path this base image does not import from;" >&2
+        echo "the image bakes it in at the right place, so drop the mount." >&2
+        exit 1
+      fi
+      log "callback $callback resolves in the running image"
+      ;;
+    *) log "note: callback '$callback' is built in; nothing to import" ;;
+  esac
+done <<EOF
+$callbacks
+EOF
 
 log "LiteLLM deploy complete"
