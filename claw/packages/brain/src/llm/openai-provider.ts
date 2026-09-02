@@ -114,7 +114,23 @@ export interface OpenAiCacheState {
   markersDisabled: boolean;
   /** Consecutive failures while decorated; arms the probe on the second. */
   decoratedFailures: number;
+  /** A bare probe has already run and did not help; do not pay for another. */
+  probedWithoutRelief: boolean;
 }
+
+/**
+ * Which models this process has already watched refuse markers.
+ *
+ * The latch itself is per-session, but what it learns is per-deployment: an
+ * endpoint that does not implement a dialect will not start. Left session-
+ * scoped, every new session repeats the same refused request and the same
+ * warning, so a line that should report a regression fires once per session
+ * instead. Remembered here, N sessions cost one failed request.
+ *
+ * Deliberately not persisted: a process restart is the cheapest way to re-ask
+ * after the endpoint changes.
+ */
+const markersRefusedByModel = new Set<string>();
 
 const logger = pino({ name: "openai-provider" });
 
@@ -141,10 +157,10 @@ async function streamingTurn(
   // "native" default nothing is sent, because guessing wrong toward markers
   // puts an unrecognised key in every request to a real OpenAI endpoint.
   const wire = toOpenAiMessages(messages);
-  const useMarkers = OPENAI_CACHE_MARKERS && !cacheState.markersDisabled;
+  const useMarkers = OPENAI_CACHE_MARKERS && !cacheState.markersDisabled && !markersRefusedByModel.has(model);
   const rendered = useMarkers
     ? renderOpenAiCacheMarkers(wire as unknown as Array<Record<string, unknown>>,
-        { style: LLM_CACHE_STYLE, ttl: LLM_CACHE_TTL })
+        { style: LLM_CACHE_STYLE === "anthropic" ? "anthropic" : "native", ttl: LLM_CACHE_TTL })
     : { messages: wire as unknown as Array<Record<string, unknown>>, breakpointsApplied: 0 };
   const wireMessages = rendered.messages;
   let breakpointsSent = rendered.breakpointsApplied;
@@ -189,6 +205,7 @@ async function streamingTurn(
     // with caching, into a session that never caches again. On a wire whose
     // markers front Anthropic that is the original incident, per session.
     const suspect = useMarkers && breakpointsSent > 0
+      && !cacheState.probedWithoutRelief
       && (looksLikeCacheRejection(err) || cacheState.decoratedFailures >= 1);
     if (!suspect) {
       if (useMarkers && breakpointsSent > 0) cacheState.decoratedFailures++;
@@ -210,9 +227,15 @@ async function streamingTurn(
       );
       cacheState.markersDisabled = true;
       cacheState.decoratedFailures = 0;
+      if (looksLikeCacheRejection(err)) markersRefusedByModel.add(model);
       breakpointsSent = 0;
       logger.warn({ model, err: String(err) }, "openai.cache_markers_rejected");
     } catch {
+      // The bare request failed too, so the markers were not the problem --
+      // and asking again every turn would double the request rate against an
+      // endpoint that is already failing, for as long as the outage lasts.
+      // One probe per session is enough to answer the question it asks.
+      cacheState.probedWithoutRelief = true;
       clearTimeout(firstByteTimer);
       if (signal) signal.removeEventListener("abort", onParentAbort);
       throw err;
@@ -392,7 +415,14 @@ async function streamingTurn(
     promptTokens: sawUsage ? usage.input_tokens : undefined,
     cacheReport: {
       breakpointsSent,
-      enabled: OPENAI_CACHE_MARKERS && !cacheState.markersDisabled,
+      // Recomputed here, not the pre-request `useMarkers`: the latch is thrown
+      // during this turn's catch, so the value the request was built from
+      // describes the attempt rather than the wire. Memo included -- reading
+      // only the session latch made a fresh session against a model already
+      // known to refuse report "markers enabled" on a turn that sent none.
+      enabled: OPENAI_CACHE_MARKERS
+        && !cacheState.markersDisabled
+        && !markersRefusedByModel.has(model),
       // Derived from the response, not declared here. See the read site above.
       reported: [...reported],
       createdEphemeral5m: created5m,
@@ -447,7 +477,7 @@ export function buildOpenAiSession(
   model: string,
   capture: RoutedModelSink = {},
 ): LlmSession {
-  const cacheState: OpenAiCacheState = { markersDisabled: false, decoratedFailures: 0 };
+  const cacheState: OpenAiCacheState = { markersDisabled: false, decoratedFailures: 0, probedWithoutRelief: false };
   return {
     streamTurn: (messages, tools, signal) =>
       streamingTurn(client, model, messages, tools, signal, capture, cacheState),

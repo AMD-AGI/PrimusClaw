@@ -62,7 +62,7 @@ function markers(body: Record<string, any>): Array<Record<string, any>> {
 
 test("markers reach the wire when the deployment declares an Anthropic backend", async () => {
   const { client, bodies } = stub();
-  await buildOpenAiSession(client, "claude-opus-4.5").streamTurn(convo(), [] as ToolSchema[], undefined);
+  await buildOpenAiSession(client, "m-tool-loop").streamTurn(convo(), [] as ToolSchema[], undefined);
   const found = markers(bodies[0]);
   assert.ok(found.length > 0, "no cache_control reached the wire");
   assert.ok(found.length <= MAX_BREAKPOINTS, `${found.length} markers, over the cap`);
@@ -74,7 +74,7 @@ test("a marked string content is widened into a text part, not left a string", a
   // parts form is accepted transparently: identical token counts and output,
   // the only difference being the cache accounting.
   const { client, bodies } = stub();
-  await buildOpenAiSession(client, "claude-opus-4.5").streamTurn(convo(), [] as ToolSchema[], undefined);
+  await buildOpenAiSession(client, "m-tool-loop").streamTurn(convo(), [] as ToolSchema[], undefined);
   const first = bodies[0].messages[0];
   assert.ok(Array.isArray(first.content));
   assert.equal(first.content[0].type, "text");
@@ -85,7 +85,7 @@ test("no marker lands on a role:'tool' message", async () => {
   // Excluded until a gateway is confirmed to honour one there. An unverified
   // marker is worse than a missing one: counted as sent, buying nothing.
   const { client, bodies } = stub();
-  await buildOpenAiSession(client, "claude-opus-4.5").streamTurn(convo(), [] as ToolSchema[], undefined);
+  await buildOpenAiSession(client, "m-tool-loop").streamTurn(convo(), [] as ToolSchema[], undefined);
   for (const m of bodies[0].messages) {
     if (m.role !== "tool") continue;
     assert.equal(JSON.stringify(m).includes("cache_control"), false);
@@ -107,7 +107,7 @@ test("an assistant turn that only called tools carries no marker", async () => {
 
 test("the count comes off the rendered messages, not the plan", async () => {
   const { client, bodies } = stub();
-  const res = await buildOpenAiSession(client, "claude-opus-4.5")
+  const res = await buildOpenAiSession(client, "m-tool-loop")
     .streamTurn(convo(), [] as ToolSchema[], undefined);
   assert.equal(res.cacheReport?.breakpointsSent, markers(bodies[0]).length);
   assert.equal(res.cacheReport?.enabled, true);
@@ -251,7 +251,7 @@ test("one transient failure does not disable markers for the session", async () 
       yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } };
     } };
   } } } } as any;
-  const s = buildOpenAiSession(client, "gpt-4o");
+  const s = buildOpenAiSession(client, "m13");
   const msgs = [{ role: "user" as const, content: "prompt ".repeat(40) }];
 
   await assert.rejects(s.streamTurn(msgs, [] as any, undefined), /426/,
@@ -273,7 +273,7 @@ test("an error that names the cache disables markers at once", async () => {
       yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } };
     } };
   } } } } as any;
-  const res = await buildOpenAiSession(client, "gpt-4o")
+  const res = await buildOpenAiSession(client, "m14")
     .streamTurn([{ role: "user", content: "prompt ".repeat(40) }] as any, [] as any, undefined);
   assert.equal(calls, 2, "decorated, then bare");
   assert.equal(res.cacheReport?.enabled, false, "latched off");
@@ -301,7 +301,7 @@ test("a SECOND consecutive decorated failure arms the probe", async () => {
   // The other arm: an endpoint that rejects markers without saying so. One
   // failure is a blip; two in a row is worth the cost of asking.
   const { client, calls } = scripted(["fail", "fail", "ok"]);
-  const s = buildOpenAiSession(client, "gpt-4o");
+  const s = buildOpenAiSession(client, "m15");
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined));
   const res = await s.streamTurn(LONG as any, [] as any, undefined);
   assert.deepEqual(calls, ["decorated", "decorated", "bare"], "the second failure probes bare");
@@ -312,7 +312,7 @@ test("a success between two failures resets the count", async () => {
   // Consecutive, not cumulative: two blips an hour apart are two blips, and
   // must not add up to a session that stops caching.
   const { client, calls } = scripted(["fail", "ok", "fail", "ok"]);
-  const s = buildOpenAiSession(client, "gpt-4o");
+  const s = buildOpenAiSession(client, "m16");
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined));
   await s.streamTurn(LONG as any, [] as any, undefined);
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined),
@@ -346,4 +346,47 @@ test("a message's shape does not depend on where the breakpoints landed", () => 
   // Every message the shorter turn sent must keep its shape in the longer one.
   assert.deepEqual(shape(long).slice(0, short.length), shape(short),
     "the shared prefix must serialise identically across turns");
+});
+
+test("a sustained outage does not double the upstream request rate", async () => {
+  // Once a bare probe has run and the request failed anyway, the markers are
+  // not the problem and asking again buys nothing. Without a latch the count
+  // stays armed, so from the second failure onward every turn issues two
+  // upstream requests instead of one -- against an endpoint already failing,
+  // for as long as the outage lasts.
+  const { client, calls } = scripted(["fail", "fail", "fail", "fail", "fail"]);
+  const s = buildOpenAiSession(client, "m18");
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined), /503/);
+  }
+  const bare = calls.filter((c) => c === "bare").length;
+  assert.equal(bare, 1, `exactly one probe for the whole outage, got ${bare} (${calls.join(",")})`);
+  assert.equal(calls.length, 5, "four turns plus the single probe");
+});
+
+test("one session's refusal spares every later session the same request", async () => {
+  // The latch is per-session but what it learns is per-deployment: an endpoint
+  // that does not implement a dialect will not start mid-run. Left session-
+  // scoped, every new session repeats the same refused request and the same
+  // warning, and a line that should report a regression fires once per session
+  // instead.
+  let calls = 0;
+  const client = { chat: { completions: { create: async () => {
+    calls++;
+    if (calls === 1) throw new Error("400 BadRequest: prompt_cache_breakpoint is not supported on this model");
+    return { async *[Symbol.asyncIterator]() {
+      yield { choices: [{ delta: { content: "ok" }, finish_reason: null }] };
+      yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } };
+    } };
+  } } } } as any;
+  const MODEL = "m-refuses-markers";
+  const first = await buildOpenAiSession(client, MODEL).streamTurn(LONG as any, [] as any, undefined);
+  assert.equal(first.cacheReport?.enabled, false, "precondition: the first session latched");
+  assert.equal(calls, 2, "decorated, then bare");
+
+  // A brand new session, same model: it must not pay for the answer again.
+  const second = await buildOpenAiSession(client, MODEL).streamTurn(LONG as any, [] as any, undefined);
+  assert.equal(calls, 3, "one request, not a decorated attempt plus a probe");
+  assert.equal(second.cacheReport?.breakpointsSent, 0);
+  assert.equal(second.cacheReport?.enabled, false);
 });

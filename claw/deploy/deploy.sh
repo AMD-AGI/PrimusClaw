@@ -394,9 +394,9 @@ if prompt_cache_enabled not in {"true", "false"}:
 llm_cache_ttl = env("LLM_CACHE_TTL", "1h")
 if llm_cache_ttl not in {"5m", "1h"}:
     raise SystemExit("LLM_CACHE_TTL must be either '5m' or '1h'")
-llm_cache_style = env("LLM_CACHE_STYLE", "native")
-if llm_cache_style not in {"anthropic", "native"}:
-    raise SystemExit("LLM_CACHE_STYLE must be either 'anthropic' or 'native'")
+llm_cache_style = env("LLM_CACHE_STYLE", "off")
+if llm_cache_style not in {"off", "anthropic", "native"}:
+    raise SystemExit("LLM_CACHE_STYLE must be one of 'off', 'anthropic', 'native'")
 # Where the agent-sandbox control plane runs, which is what the router URL is
 # derived from. Where sandbox workloads land is a separate decision the chart
 # already defaults for a fresh cluster, so it is only overridden below when the

@@ -12,12 +12,15 @@ delete process.env.OPENAI_BASE_URL;
 delete process.env.LLM_CACHE_STYLE;
 const cfg = await import("../src/config.js");
 
-test("the default is native: no markers unless the operator says otherwise", () => {
-  // Wrong toward native costs money, loudly, on a miss counter. Wrong toward
-  // anthropic puts an unrecognised key in every request to a real OpenAI
-  // endpoint. Losing money loudly beats failing quietly.
-  assert.equal(cfg.LLM_CACHE_STYLE, "native");
-  assert.equal(cfg.OPENAI_ANTHROPIC_MARKERS, false);
+test("the default is off: no markers on this wire unless a dialect is named", () => {
+  // Both dialects send something, and a wrong dialect is REFUSED rather than
+  // merely uncached -- so a default that guesses spends a failed request and a
+  // probe on the first markable turn of every session. Off costs money loudly,
+  // on a miss counter. Asserted on OPENAI_CACHE_MARKERS because that is the
+  // constant the provider actually consults; a test on any other expression
+  // can stay green while the wire does the opposite.
+  assert.equal(cfg.LLM_CACHE_STYLE, "off");
+  assert.equal(cfg.OPENAI_CACHE_MARKERS, false);
 });
 
 test("the OPENAI_BASE_URL fallback is detected, because the URL carries no signal", () => {
@@ -29,5 +32,5 @@ test("the OPENAI_BASE_URL fallback is detected, because the URL carries no signa
 
 test("an unrecognised value is refused into settingProblems, not thrown", () => {
   // A wrong wire protocol should kill the pod; a mistyped cost knob should not.
-  assert.equal(cfg.LLM_CACHE_STYLE, "native");
+  assert.equal(cfg.LLM_CACHE_STYLE, "off");
 });

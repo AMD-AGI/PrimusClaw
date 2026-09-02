@@ -12,7 +12,7 @@ const cfg = await import("../src/config.js");
 
 test("declaring the backend anthropic turns markers on for the openai wire", () => {
   assert.equal(cfg.LLM_CACHE_STYLE, "anthropic");
-  assert.equal(cfg.OPENAI_ANTHROPIC_MARKERS, true);
+  assert.equal(cfg.OPENAI_CACHE_MARKERS, true);
 });
 
 test("an explicit OPENAI_BASE_URL is not the fallback", () => {
