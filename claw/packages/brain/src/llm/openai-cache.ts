@@ -95,7 +95,7 @@ function project(wire: readonly WireMessage[]): Message[] {
 function markerFor(style: "anthropic" | "native", ttl: CacheTtl): Record<string, unknown> {
   return style === "anthropic"
     ? { cache_control: ttl === "1h" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" } }
-    : { prompt_cache_breakpoint: { type: "explicit" } };
+    : { prompt_cache_breakpoint: { mode: "explicit" } };
 }
 
 /**

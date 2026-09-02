@@ -221,6 +221,12 @@ test("the native dialect sends prompt_cache_breakpoint", () => {
   assert.ok(out.breakpointsApplied > 0);
   const json = JSON.stringify(out.messages);
   assert.ok(json.includes("prompt_cache_breakpoint"), "the native marker");
+  // The field is `mode`, not `type`. Azure/OpenAI validates the shape and
+  // rejects the whole request with
+  //   Missing required parameter: messages[0].content[0].prompt_cache_breakpoint.mode
+  // -- caught only by putting it on a live endpoint, which is also how we
+  // learned the gateway does NOT quietly drop these params.
+  assert.deepEqual(JSON.parse(json).at(-1).content[0].prompt_cache_breakpoint, { mode: "explicit" });
   assert.equal(json.includes("cache_control"), false, "not the Anthropic one");
 });
 
@@ -245,7 +251,7 @@ test("one transient failure does not disable markers for the session", async () 
       yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } };
     } };
   } } } } as any;
-  const s = buildOpenAiSession(client, "gpt-5.2");
+  const s = buildOpenAiSession(client, "gpt-4o");
   const msgs = [{ role: "user" as const, content: "prompt ".repeat(40) }];
 
   await assert.rejects(s.streamTurn(msgs, [] as any, undefined), /426/,
@@ -267,7 +273,7 @@ test("an error that names the cache disables markers at once", async () => {
       yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } };
     } };
   } } } } as any;
-  const res = await buildOpenAiSession(client, "gpt-5.2")
+  const res = await buildOpenAiSession(client, "gpt-4o")
     .streamTurn([{ role: "user", content: "prompt ".repeat(40) }] as any, [] as any, undefined);
   assert.equal(calls, 2, "decorated, then bare");
   assert.equal(res.cacheReport?.enabled, false, "latched off");
@@ -295,7 +301,7 @@ test("a SECOND consecutive decorated failure arms the probe", async () => {
   // The other arm: an endpoint that rejects markers without saying so. One
   // failure is a blip; two in a row is worth the cost of asking.
   const { client, calls } = scripted(["fail", "fail", "ok"]);
-  const s = buildOpenAiSession(client, "gpt-5.2");
+  const s = buildOpenAiSession(client, "gpt-4o");
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined));
   const res = await s.streamTurn(LONG as any, [] as any, undefined);
   assert.deepEqual(calls, ["decorated", "decorated", "bare"], "the second failure probes bare");
@@ -306,7 +312,7 @@ test("a success between two failures resets the count", async () => {
   // Consecutive, not cumulative: two blips an hour apart are two blips, and
   // must not add up to a session that stops caching.
   const { client, calls } = scripted(["fail", "ok", "fail", "ok"]);
-  const s = buildOpenAiSession(client, "gpt-5.2");
+  const s = buildOpenAiSession(client, "gpt-4o");
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined));
   await s.streamTurn(LONG as any, [] as any, undefined);
   await assert.rejects(s.streamTurn(LONG as any, [] as any, undefined),
