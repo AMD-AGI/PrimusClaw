@@ -112,11 +112,18 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
  * does.
  */
 export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
-  const targets = rows.filter((r) => r.sandbox_workload_id).slice(0, MAX_PER_SWEEP);
+  const withWorkload = rows.filter((r) => r.sandbox_workload_id);
+  const targets = withWorkload.slice(0, MAX_PER_SWEEP);
   if (targets.length === 0) return 0;
-  if (rows.filter((r) => r.sandbox_workload_id).length > MAX_PER_SWEEP) {
+  if (withWorkload.length > MAX_PER_SWEEP) {
+    // The overflow is not lost, only deferred: the rows are already terminal
+    // and the sweeper's UPDATE cannot select them again, so before this they
+    // were dropped in memory and no path ever revisited them -- a reap of 200
+    // left 150 runs permanently without a platform account. drainPending picks
+    // them up on later ticks by looking for exactly the state they are left
+    // in: a workload id recorded and no facts against it.
     logger.warn(
-      { swept: rows.length, asked: MAX_PER_SWEEP },
+      { swept: rows.length, asked: MAX_PER_SWEEP, deferred: withWorkload.length - MAX_PER_SWEEP },
       "platform_backfill.capped",
     );
   }
@@ -136,4 +143,34 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
   });
   await Promise.all(workers);
   return recorded;
+}
+
+/**
+ * Work down the backlog the per-sweep cap leaves behind.
+ *
+ * Selected by outcome rather than by remembering a list: a row that has a
+ * workload id and no facts is one nobody has answered for yet, whether it was
+ * capped, raced, or failed its first read. Terminal rows only, so this cannot
+ * touch a run still in flight, and the same NULL guards on the write mean a
+ * late Brain callback still wins.
+ *
+ * Bounded per tick for the same reason the sweep is: this runs inside the
+ * sweeper's tick and talks to SaFE one workload at a time.
+ */
+export async function drainPendingPlatformFacts(): Promise<number> {
+  const r = await db.query(
+    `SELECT task_id, session_id, sandbox_workload_id
+       FROM claw_tasks
+      WHERE status NOT IN ('preparing', 'running', 'cancelling')
+        AND sandbox_workload_id IS NOT NULL
+        AND sandbox_workload_id <> ''
+        AND platform_message IS NULL
+        AND platform_kill_reason IS NULL
+        AND completed_at > NOW() - INTERVAL '1 hour'
+      ORDER BY completed_at DESC
+      LIMIT $1`,
+    [MAX_PER_SWEEP],
+  );
+  if (!r.rowCount) return 0;
+  return await backfillPlatformFacts(r.rows as SweptRow[]);
 }

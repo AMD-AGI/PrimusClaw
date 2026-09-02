@@ -100,7 +100,7 @@ export const RUN_BUDGET_OFF = 0;
  * That arm now excludes rows carrying a deadline of their own, so the budget is
  * what decides a graph node's fate and the number has to mean something. 72h is
  * set by the longest workload this fleet is being built to carry rather than by
- * measurement: a Kernel Arena run is an hour to three days, and a ceiling
+ * measurement: a long training run is hours to days, and a ceiling
  * *inside* the intended range kills the expensive tail after days of GPU time
  * already spent. Chat's 48h comes from a measured distribution; this one comes
  * from a stated requirement, and the two numbers are unrelated on purpose.

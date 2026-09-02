@@ -38,10 +38,20 @@ import type {
   TaskDagDef,
 } from "./types.js";
 
-/** Hands-side builtin tools always available; not in the `tools` table. */
+/**
+ * Hands-side builtin tools always available; not in the `tools` table.
+ *
+ * `wait` and `log_s3_upload_manifest` were missing, and `wait` is the tool the
+ * repeat/until step exists to drive -- so the very pattern this admission code
+ * validates the bounds of was rejected one check earlier as an unknown tool.
+ * The list is duplicated from brain's HANDS_TOOLS by necessity (the API cannot
+ * import from brain), which is exactly how it fell behind; anything added
+ * there has to be added here.
+ */
 const HANDS_BUILTIN_TOOLS = new Set([
   "read", "write", "edit", "multi_edit", "bash", "glob", "grep", "ls",
   "notebook_edit", "upload_to_s3", "download_from_s3", "bash_output", "kill_shell",
+  "wait", "log_s3_upload_manifest",
 ]);
 
 export interface ToolMeta {

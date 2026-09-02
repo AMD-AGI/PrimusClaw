@@ -269,7 +269,7 @@ test("a run with a budget of its own is not closed by the legacy timeout", () =>
   // arm decisive for every graph node, and RUN_BUDGET_DAG_NODE_SEC therefore only
   // worked downwards: a node given three days was closed as `brain_timeout` after
   // BRAIN_TASK_TIMEOUT_SEC -- an hour by default -- with the budget above it dead
-  // letter. A Kernel Arena run is an hour to three days, so every one of them
+  // letter. A long training run is hours to days, so every one of them
   // would have died in the first hour.
   const seen = stubDb([]);
   stubBus();

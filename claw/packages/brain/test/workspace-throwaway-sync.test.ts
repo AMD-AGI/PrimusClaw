@@ -5,7 +5,7 @@
  * A task that declared its workspace throwaway does not publish it.
  *
  * The default is to upload all of /workspace to S3 when a run ends. For a task
- * that has already delivered its own output -- a Kernel Arena run posts its
+ * that has already delivered its own output -- a long-running job posts its
  * report to a presigned URL of its own -- that copies gigabytes a second time to
  * a prefix nobody reads, and it is what `workspace_throwaway` turns off.
  *

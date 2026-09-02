@@ -322,7 +322,7 @@ export interface ExecuteRequest {
    * already delivered its output somewhere else and wrong for almost everything
    * else, which is why it is a declaration rather than a default.
    *
-   * The immediate case: a Kernel Arena run uploads its own report to a presigned
+   * The immediate case: a long-running job uploads its own report to a presigned
    * URL of its own, so syncing the whole tree afterwards copies gigabytes a second
    * time to a prefix nobody reads.
    *
@@ -349,7 +349,7 @@ export interface ExecuteRequest {
   /**
    * What this run needs beyond a sandbox: node count, per-node shape, backend.
    *
-   * The declaration Brain prefers over the Hyperloom flags in the prompt (see
+   * The declaration Brain prefers over the the dispatcher flags in the prompt (see
    * protocol/topology.ts). Absent means "read the prompt", which is what every
    * caller did before this field existed.
    */

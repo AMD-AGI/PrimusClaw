@@ -961,10 +961,19 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       }
       logger.info({ sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId }, "keepalive.ping");
     } catch (err: any) {
-      const fails = (failCounts.get(targetKey) || 0) + 1;
+      // A definite absence is not a missed ping. The control plane answering
+      // 404/410 has settled the question the retries exist to ask, so it goes
+      // straight to the limit instead of spending four more ticks -- about
+      // five minutes during which the run still reads healthy. Every other
+      // error keeps the full tolerance, so a transient control-plane outage
+      // still cannot tear down a healthy long-running sandbox.
+      const gone = err?.sandboxGone === true;
+      const fails = gone
+        ? Math.max(SANDBOX_KEEPALIVE_FAIL_LIMIT, (failCounts.get(targetKey) || 0) + 1)
+        : (failCounts.get(targetKey) || 0) + 1;
       failCounts.set(targetKey, fails);
       logger.warn(
-        { err: err?.message || String(err), sessionId, workloadId: entry.workloadId, fails },
+        { err: err?.message || String(err), sessionId, workloadId: entry.workloadId, fails, gone },
         "keepalive.ping_failed",
       );
       // Auto-eviction is opt-in: only when FAIL_LIMIT > 0. When disabled (<=0)

@@ -19,6 +19,7 @@
  * the bug was precisely that one path stamped the key and another did not.
  */
 import type { PoolClient } from "pg";
+import { CLAW_DEPLOY_MODE } from "../config.js";
 import { db } from "../infra/db.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import type { UserInfo } from "./models.js";
@@ -68,7 +69,15 @@ export async function stampSessionCredentials(
   user: UserInfo,
   client?: PoolClient,
 ): Promise<void> {
-  if (!user.platformKey) throw new MissingPlatformKeyError(`session ${sessionId}`);
+  // Only the SaFE path needs a platform key: it is what creates the workload
+  // and what the platform-facts read authenticates with. In kubernetes/BYOK
+  // mode there is no SaFE workload and the caller's key is a virtual key, so
+  // demanding a platform key rejected every task and batch on a deployment
+  // whose own deploy.sh defaults CLAW_DEPLOY_MODE to "kubernetes" -- a 403 on
+  // the default configuration, from a check written for the other one.
+  if (CLAW_DEPLOY_MODE !== "kubernetes" && !user.platformKey) {
+    throw new MissingPlatformKeyError(`session ${sessionId}`);
+  }
   const runner = client ?? db;
   await runner.query(
     `UPDATE claw_sessions

@@ -242,10 +242,23 @@ export async function postRunLease(
  */
 const MAX_FINAL_TEXT_BYTES = 256 * 1024;
 
+/**
+ * Cap for a downgraded body's failure_reason.
+ *
+ * Far smaller than the final-text cap on purpose: the downgrade exists because
+ * the full body was already refused, so what survives it has to be small
+ * enough that the second attempt cannot fail the same way.
+ */
+const MAX_DOWNGRADED_REASON_BYTES = 8 * 1024;
+
+function truncate(text: string, maxBytes: number, label: string): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const head = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+  return `${head}\n[${label} truncated at ${maxBytes} bytes]`;
+}
+
 function truncateFinalText(text: string): string {
-  if (Buffer.byteLength(text, "utf8") <= MAX_FINAL_TEXT_BYTES) return text;
-  const head = Buffer.from(text, "utf8").subarray(0, MAX_FINAL_TEXT_BYTES).toString("utf8");
-  return `${head}\n[final text truncated at ${MAX_FINAL_TEXT_BYTES} bytes]`;
+  return truncate(text, MAX_FINAL_TEXT_BYTES, "final text");
 }
 
 /**
@@ -262,6 +275,15 @@ function withoutPayload(body: AgentDoneBody): AgentDoneBody {
   return {
     ...body,
     final_text: "[dropped: the callback body exceeded the size the API accepts]",
+    // failure_reason survived the downgrade, and on the script path it carries
+    // a failing step's entire tool output -- uncapped. A multi-MiB stderr made
+    // it the dominant field, so the shed body was still over the limit, all
+    // three attempts 413'd, the JetStream message never acked, and every
+    // redelivery failed identically. A downgrade that can still be too large
+    // is not a downgrade.
+    failure_reason: body.failure_reason
+      ? truncate(body.failure_reason, MAX_DOWNGRADED_REASON_BYTES, "failure reason")
+      : body.failure_reason,
     captures: {},
     artifacts: [],
     tool_stats: undefined,

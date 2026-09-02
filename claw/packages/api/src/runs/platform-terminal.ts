@@ -15,7 +15,7 @@
  * preemption, and nothing below it knows the run existed.
  *
  * Deliberately absent from everything here: the optimizer's stop reasons
- * (`conc_sweep_done`, `plateau_explore`, …). That is Hyperloom's private
+ * (`conc_sweep_done`, `plateau_explore`, …). That is the dispatcher's private
  * vocabulary, it is still growing, and a platform API that knew those words would
  * have to change when they do — and would be useless to every other workload.
  * Claw answers "did the process end, was it us, and why". What the run concluded

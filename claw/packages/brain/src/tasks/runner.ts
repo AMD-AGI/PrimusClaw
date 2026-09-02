@@ -1276,7 +1276,7 @@ class TaskRunner {
     // wedged; ignore failures).
     const oldHands = this.hands;
     oldHands?.close().catch(() => {});
-    // Pass multiNodeContext so the rebuilt sandbox keeps Hyperloom external-mode
+    // Pass multiNodeContext so the rebuilt sandbox keeps the dispatcher external-mode
     // env and the Infera SSH key for the cluster already provisioned above.
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,

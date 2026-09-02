@@ -50,7 +50,7 @@ test("D1c a run cut off by its deadline is `killed` / `deadline`", () => {
   assert.equal(t?.kill_reason, "deadline");
 });
 
-test("D1d the three are distinguishable without reading any Hyperloom output", () => {
+test("D1d the three are distinguishable without reading any dispatcher output", () => {
   const kinds = [
     terminalFacts({ status: "completed", failure_reason: null }),
     terminalFacts({ status: "failed", failure_reason: "sandbox_died", pod_failed_message: "Preempted" }),

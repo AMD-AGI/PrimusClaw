@@ -1219,7 +1219,7 @@ export async function initDb(): Promise<void> {
          ON claw_workspace_refs(ref_kind, ref_id)`,
     ).catch(() => {});
 
-    // Legacy Kernel Arena tables (`claw_kernel_*`) are no longer created or
+    // Legacy a long-running job tables (`claw_kernel_*`) are no longer created or
     // referenced by the Claw API. Existing deployments keep those historical
     // rows untouched; a destructive DROP belongs in a separate data-migration PR.
 

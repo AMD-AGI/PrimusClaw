@@ -21,7 +21,7 @@ import {
   SANDBOX_ROUTER_URL,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
-import { SandboxStopUnavailable } from "./errors.js";
+import { SandboxGoneError, SandboxStopUnavailable } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
@@ -150,7 +150,18 @@ export class SafeWorkloadProvider implements SandboxProvider {
     });
     if (!resp.ok) {
       const errBody = await resp.text();
-      throw new Error(`sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`);
+      // A 404/410 is not a failed ping, it is an answer: the workload is gone.
+      // Collapsing it into the same untyped Error as a timeout made a definite
+      // absence spend the same five keepalive strikes as one dropped packet --
+      // five minutes to notice something the first reply already settled.
+      const msg = `sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`;
+      // The message is deliberately identical for both branches: the container
+      // classifier reads this string to decide a gone container licenses a
+      // rebuild, so rewording it here silently downgraded a definite 404 to
+      // "unreachable". The type is added alongside the message, not instead of
+      // it -- one reader parses the text, the other tests the flag.
+      if (resp.status === 404 || resp.status === 410) throw new SandboxGoneError(msg);
+      throw new Error(msg);
     }
     const result = (await resp.json()) as Record<string, unknown>;
     return {

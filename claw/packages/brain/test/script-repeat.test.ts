@@ -6,7 +6,7 @@
  *
  * `wait` blocks on a background shell for up to WAIT_MAX_SEC and then reports the
  * shell is still running, expecting to be called again -- an agent loops, a script
- * could not. Kernel Arena runs for an hour to three days, and the per-call ceiling
+ * could not. A long training run lasts hours to days, and the per-call ceiling
  * is there to stop a half-dead sandbox holding a run open, not to bound the work.
  *
  * `repeat` is a modifier on an ordinary step rather than a step kind wrapping a

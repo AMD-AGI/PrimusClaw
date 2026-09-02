@@ -19,7 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { db } from "../infra/db.js";
-import { backfillPlatformFacts } from "./platform-backfill.js";
+import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import { interruptSubject } from "@claw/protocol";
@@ -195,6 +195,12 @@ export async function reapStaleTasks(): Promise<number> {
   // happened and must stand regardless.
   await backfillPlatformFacts(rows).catch((err) => {
     logger.warn({ err }, "sweeper.platform_backfill_failed");
+    return 0;
+  });
+  // And whatever the per-sweep cap deferred on an earlier tick, including this
+  // one's own overflow. Best-effort like the call above: the closes stand.
+  await drainPendingPlatformFacts().catch((err) => {
+    logger.warn({ err }, "sweeper.platform_backfill_drain_failed");
     return 0;
   });
   return r.rowCount;
