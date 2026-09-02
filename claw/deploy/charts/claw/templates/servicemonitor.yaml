@@ -20,6 +20,16 @@ operator is scoped to a namespace this release does not deploy into -- a
 namespace-scoped operator never sees a CR outside its own namespace, and the
 symptom is silence, not an error.
 
+A label collision to know about: the Brain and API set service="claw-brain" /
+service="claw-api" on their own metrics via prom-client setDefaultLabels, and a
+ServiceMonitor overwrites `service` with the Kubernetes Service name
+(primus-claw-brain / primus-claw-api). Scrape-time labels win, so the app's
+value disappears the moment you enable this. The shipped dashboard therefore
+does not filter on service for claw_* metrics -- their names are already unique
+-- and matches both spellings for the generic process_/nodejs_ series that
+genuinely need to tell the two components apart. Anything else you build on
+these metrics should do the same rather than assume either value.
+
 Gated on the value alone, with no .Capabilities.APIVersions guard: an operator
 who sets serviceMonitor.enabled=true on a cluster with no monitoring.coreos.com
 CRD should get a loud failure from the apply, not a release that silently

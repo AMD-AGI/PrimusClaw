@@ -199,6 +199,16 @@ placeholder is substituted at render time. The dashboard JSON must stay inside
 `charts/claw/`, since `.Files.Glob` cannot read a path that escapes the chart and fails
 by rendering an empty ConfigMap rather than by erroring.
 
+**A label collision worth knowing about.** The Brain and API label their own
+metrics `service="claw-brain"` / `service="claw-api"` (prom-client
+`setDefaultLabels`), and a ServiceMonitor overwrites `service` with the
+Kubernetes Service name — `primus-claw-brain` / `primus-claw-api` — because
+scrape-time labels win. Enabling `serviceMonitor` therefore changes the value of
+that label. The shipped dashboard does not depend on it: `claw_*` metric names
+are unique, so its queries carry no `service` selector, and the generic
+`process_*` / `nodejs_*` series match both spellings. Queries you write yourself
+should do the same rather than pin one value.
+
 **Scraping.** The Deployments carry `prometheus.io/scrape` annotations, and no operator
 reads them — that convention only works with a plain Prometheus whose scrape config was
 written to relabel on it. On an operator-managed cluster the annotations are inert, so

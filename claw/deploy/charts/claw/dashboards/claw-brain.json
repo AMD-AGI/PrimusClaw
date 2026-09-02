@@ -123,7 +123,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(rate(claw_brain_llm_tokens_total{service=\"claw-brain\",kind=\"cache_read\"}[$__rate_interval])) / (sum(rate(claw_brain_llm_tokens_total{service=\"claw-brain\",kind=~\"input|cache_read|cache_create\"}[$__rate_interval])))",
+          "expr": "sum(rate(claw_brain_llm_tokens_total{kind=\"cache_read\"}[$__rate_interval])) / (sum(rate(claw_brain_llm_tokens_total{kind=~\"input|cache_read|cache_create\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -131,7 +131,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(rate(claw_brain_llm_cache_turns_total{service=\"claw-brain\",state=\"hit\"}[$__rate_interval])) / (sum(rate(claw_brain_llm_cache_turns_total{service=\"claw-brain\"}[$__rate_interval])))",
+          "expr": "sum(rate(claw_brain_llm_cache_turns_total{state=\"hit\"}[$__rate_interval])) / (sum(rate(claw_brain_llm_cache_turns_total[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -184,7 +184,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(claw_brain_gate_inflight{service=\"claw-brain\"})",
+          "expr": "sum(claw_brain_gate_inflight)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -237,7 +237,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(claw_brain_gate_queued{service=\"claw-brain\"})",
+          "expr": "sum(claw_brain_gate_queued)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -290,7 +290,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(claw_brain_gate_parked{service=\"claw-brain\"})",
+          "expr": "sum(claw_brain_gate_parked)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -342,7 +342,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(claw_brain_deliveries_held{service=\"claw-brain\"})",
+          "expr": "sum(claw_brain_deliveries_held)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -394,7 +394,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "max(claw_brain_watchdog_last_tick_age_seconds{service=\"claw-brain\"})",
+          "expr": "max(claw_brain_watchdog_last_tick_age_seconds)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -447,7 +447,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_brain_task_poison_unresolved_total{service=\"claw-brain\"}[24h]))",
+          "expr": "sum(increase(claw_brain_task_poison_unresolved_total[24h]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -551,7 +551,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "(sum(rate(claw_brain_workspace_sync_failures_total{service=\"claw-brain\"}[30m])) or vector(0)) / clamp_min((sum(rate(claw_brain_workspace_sync_failures_total{service=\"claw-brain\"}[30m])) + sum(rate(claw_brain_workspace_sync_duration_seconds_count{service=\"claw-brain\"}[30m]))), 1)",
+          "expr": "(sum(rate(claw_brain_workspace_sync_failures_total[30m])) or vector(0)) / clamp_min((sum(rate(claw_brain_workspace_sync_failures_total[30m])) + sum(rate(claw_brain_workspace_sync_duration_seconds_count[30m]))), 1)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -608,7 +608,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(rate(claw_brain_prompt_size_unknown_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum(rate(claw_brain_prompt_size_unknown_total[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -616,7 +616,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(rate(claw_brain_llm_cache_entry_lost_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum(rate(claw_brain_llm_cache_entry_lost_total[$__rate_interval]))",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -624,7 +624,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(rate(claw_brain_llm_cache_disabled_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum(rate(claw_brain_llm_cache_disabled_total[$__rate_interval]))",
           "refId": "C",
           "range": true,
           "editorMode": "code",
@@ -701,7 +701,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum by (le) (rate(claw_brain_task_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum by (le) (rate(claw_brain_task_duration_seconds_bucket[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -762,7 +762,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_brain_task_total{service=\"claw-brain\",outcome=\"ok\"}[$__range])) / sum(increase(claw_brain_task_total{service=\"claw-brain\",outcome=~\"ok|failed\"}[$__range]))",
+          "expr": "sum(increase(claw_brain_task_total{outcome=\"ok\"}[$__range])) / sum(increase(claw_brain_task_total{outcome=~\"ok|failed\"}[$__range]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -823,7 +823,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_sandbox_start_total{service=\"claw-brain\",outcome=\"ok\"}[$__range])) / sum(increase(claw_sandbox_start_total{service=\"claw-brain\"}[$__range]))",
+          "expr": "sum(increase(claw_sandbox_start_total{outcome=\"ok\"}[$__range])) / sum(increase(claw_sandbox_start_total[$__range]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -879,7 +879,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum by (outcome) (rate(claw_brain_task_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(claw_brain_task_total[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -944,7 +944,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_brain_task_total{service=\"claw-brain\",outcome=\"retryable\"}[$__rate_interval])) / clamp_min(sum(increase(claw_brain_task_total{service=\"claw-brain\"}[$__rate_interval])), 1)",
+          "expr": "sum(increase(claw_brain_task_total{outcome=\"retryable\"}[$__rate_interval])) / clamp_min(sum(increase(claw_brain_task_total[$__rate_interval])), 1)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -952,7 +952,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_brain_task_total{service=\"claw-brain\",outcome=\"interrupted\"}[$__rate_interval])) / clamp_min(sum(increase(claw_brain_task_total{service=\"claw-brain\"}[$__rate_interval])), 1)",
+          "expr": "sum(increase(claw_brain_task_total{outcome=\"interrupted\"}[$__rate_interval])) / clamp_min(sum(increase(claw_brain_task_total[$__rate_interval])), 1)",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -1016,7 +1016,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_brain_task_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_brain_task_duration_seconds_bucket[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1024,7 +1024,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.90, sum by (le) (rate(claw_brain_task_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.90, sum by (le) (rate(claw_brain_task_duration_seconds_bucket[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -1032,7 +1032,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(claw_brain_task_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(claw_brain_task_duration_seconds_bucket[$__rate_interval])))",
           "refId": "C",
           "range": true,
           "editorMode": "code",
@@ -1096,7 +1096,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(claw_brain_task_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(claw_brain_task_duration_seconds_bucket[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1160,7 +1160,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{service=\"claw-brain\",outcome=\"ok\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1168,7 +1168,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{service=\"claw-brain\",outcome=\"ok\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -1176,7 +1176,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{service=\"claw-brain\",outcome=\"error\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{outcome=\"error\"}[$__rate_interval])))",
           "refId": "C",
           "range": true,
           "editorMode": "code",
@@ -1240,7 +1240,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{service=\"claw-brain\",outcome=\"ok\"}[$__rate_interval]))",
+          "expr": "sum by (le) (rate(claw_sandbox_start_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1296,7 +1296,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum by (outcome) (rate(claw_sandbox_start_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(claw_sandbox_start_total[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1304,7 +1304,7 @@
         },
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum by (outcome) (rate(claw_sandbox_stop_total{service=\"claw-brain\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(claw_sandbox_stop_total[$__rate_interval]))",
           "refId": "B",
           "range": true,
           "editorMode": "code",
@@ -1370,7 +1370,7 @@
       "targets": [
         {
           "datasource": "${DS_PROMETHEUS}",
-          "expr": "sum(increase(claw_sandbox_stop_total{service=\"claw-brain\",outcome=\"error\"}[$__rate_interval])) / clamp_min(sum(increase(claw_sandbox_stop_total{service=\"claw-brain\"}[$__rate_interval])), 1)",
+          "expr": "sum(increase(claw_sandbox_stop_total{outcome=\"error\"}[$__rate_interval])) / clamp_min(sum(increase(claw_sandbox_stop_total[$__rate_interval])), 1)",
           "refId": "A",
           "range": true,
           "editorMode": "code",
@@ -1438,7 +1438,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(claw_brain_gate_inflight{service=\"claw-brain\"})",
+              "expr": "sum(claw_brain_gate_inflight)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1446,7 +1446,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(claw_brain_gate_queued{service=\"claw-brain\"})",
+              "expr": "sum(claw_brain_gate_queued)",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -1454,7 +1454,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(claw_brain_gate_parked{service=\"claw-brain\"})",
+              "expr": "sum(claw_brain_gate_parked)",
               "refId": "C",
               "range": true,
               "editorMode": "code",
@@ -1462,7 +1462,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(claw_brain_deliveries_held{service=\"claw-brain\"})",
+              "expr": "sum(claw_brain_deliveries_held)",
               "refId": "D",
               "range": true,
               "editorMode": "code",
@@ -1518,7 +1518,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (claw_brain_gate_inflight{service=\"claw-brain\"})",
+              "expr": "sum by (pod) (claw_brain_gate_inflight)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1570,7 +1570,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (claw_brain_deliveries_held{service=\"claw-brain\"}) / 9",
+              "expr": "sum by (pod) (claw_brain_deliveries_held) / 9",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1626,7 +1626,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (has_checkpoint) (increase(claw_brain_task_redelivery_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (has_checkpoint) (increase(claw_brain_task_redelivery_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1677,7 +1677,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (has_checkpoint) (increase(claw_brain_task_redelivery_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (has_checkpoint) (increase(claw_brain_task_redelivery_total[24h]))",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -1736,7 +1736,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (rate(claw_brain_delivery_refused_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (reason) (rate(claw_brain_delivery_refused_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1788,7 +1788,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (increase(claw_brain_delivery_refused_total{service=\"claw-brain\",reason=\"surplus\"}[1h]))",
+              "expr": "sum by (pod) (increase(claw_brain_delivery_refused_total{reason=\"surplus\"}[1h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1854,7 +1854,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "(sum(increase(claw_brain_checkpoint_writes_total{service=\"claw-brain\",result=\"failure\"}[1h])) or vector(0)) / clamp_min(sum(increase(claw_brain_checkpoint_writes_total{service=\"claw-brain\"}[1h])), 1)",
+              "expr": "(sum(increase(claw_brain_checkpoint_writes_total{result=\"failure\"}[1h])) or vector(0)) / clamp_min(sum(increase(claw_brain_checkpoint_writes_total[1h])), 1)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1905,7 +1905,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_brain_checkpoint_payload_bytes_bucket{service=\"claw-brain\"}[30m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_brain_checkpoint_payload_bytes_bucket[30m])))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -1957,7 +1957,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "(sum(increase(claw_brain_checkpoint_resume_total{service=\"claw-brain\",result=\"hit\"}[6h])) or vector(0)) / clamp_min(sum(increase(claw_brain_checkpoint_resume_total{service=\"claw-brain\",result=~\"hit|miss_redelivery\"}[6h])), 1)",
+              "expr": "(sum(increase(claw_brain_checkpoint_resume_total{result=\"hit\"}[6h])) or vector(0)) / clamp_min(sum(increase(claw_brain_checkpoint_resume_total{result=~\"hit|miss_redelivery\"}[6h])), 1)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2009,7 +2009,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_brain_resume_workspace_mode_total{service=\"claw-brain\",mode=~\"sandbox_reuse|workspace_restore\"}[6h])) / sum(increase(claw_brain_resume_workspace_mode_total{service=\"claw-brain\",mode=~\"sandbox_reuse|workspace_restore|no_data_turn0\"}[6h]))",
+              "expr": "sum(increase(claw_brain_resume_workspace_mode_total{mode=~\"sandbox_reuse|workspace_restore\"}[6h])) / sum(increase(claw_brain_resume_workspace_mode_total{mode=~\"sandbox_reuse|workspace_restore|no_data_turn0\"}[6h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2017,7 +2017,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_brain_resume_workspace_mode_total{service=\"claw-brain\",mode=\"sandbox_reuse\"}[6h])) / sum(increase(claw_brain_resume_workspace_mode_total{service=\"claw-brain\",mode=~\"sandbox_reuse|workspace_restore|no_data_turn0\"}[6h]))",
+              "expr": "sum(increase(claw_brain_resume_workspace_mode_total{mode=\"sandbox_reuse\"}[6h])) / sum(increase(claw_brain_resume_workspace_mode_total{mode=~\"sandbox_reuse|workspace_restore|no_data_turn0\"}[6h]))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -2073,7 +2073,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind, result) (rate(claw_brain_checkpoint_writes_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (kind, result) (rate(claw_brain_checkpoint_writes_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2137,7 +2137,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (le) (rate(claw_brain_checkpoint_payload_bytes_bucket{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (le) (rate(claw_brain_checkpoint_payload_bytes_bucket[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2193,7 +2193,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(claw_brain_checkpoint_write_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(claw_brain_checkpoint_write_duration_seconds_bucket[5m])))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2201,7 +2201,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.50, sum by (le, kind) (rate(claw_brain_checkpoint_write_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.50, sum by (le, kind) (rate(claw_brain_checkpoint_write_duration_seconds_bucket[5m])))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -2258,7 +2258,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.95, sum by (le, sync_result) (rate(claw_brain_sigterm_checkpoint_duration_seconds_bucket{service=\"claw-brain\"}[30m])))",
+              "expr": "histogram_quantile(0.95, sum by (le, sync_result) (rate(claw_brain_sigterm_checkpoint_duration_seconds_bucket[30m])))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2310,7 +2310,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (sync_result) (increase(claw_brain_sigterm_checkpoint_duration_seconds_count{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (sync_result) (increase(claw_brain_sigterm_checkpoint_duration_seconds_count[24h]))",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -2363,7 +2363,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (result) (increase(claw_brain_checkpoint_resume_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (result) (increase(claw_brain_checkpoint_resume_total[24h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2419,7 +2419,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (mode) (rate(claw_brain_resume_workspace_mode_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (mode) (rate(claw_brain_resume_workspace_mode_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2475,7 +2475,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_brain_resume_notice_filtered_total{service=\"claw-brain\"}[1h]))",
+              "expr": "sum(increase(claw_brain_resume_notice_filtered_total[1h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2542,7 +2542,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_brain_lock_release_skipped_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum(increase(claw_brain_lock_release_skipped_total[24h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2595,7 +2595,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_brain_task_poison_deferred_total{service=\"claw-brain\",cause=\"already_running_final\"}[24h]))",
+              "expr": "sum(increase(claw_brain_task_poison_deferred_total{cause=\"already_running_final\"}[24h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2652,7 +2652,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (rate(claw_brain_task_poison_discarded_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (reason) (rate(claw_brain_task_poison_discarded_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2709,7 +2709,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (cause) (rate(claw_brain_task_poison_deferred_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (cause) (rate(claw_brain_task_poison_deferred_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2766,7 +2766,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (rate(claw_brain_lock_release_skipped_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (reason) (rate(claw_brain_lock_release_skipped_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2818,7 +2818,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (increase(claw_brain_task_poison_discarded_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (reason) (increase(claw_brain_task_poison_discarded_total[24h]))",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -2828,7 +2828,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (increase(claw_brain_task_poison_unresolved_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (reason) (increase(claw_brain_task_poison_unresolved_total[24h]))",
               "refId": "B",
               "range": false,
               "editorMode": "code",
@@ -2896,7 +2896,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "(sum(rate(claw_brain_workspace_sync_bytes_sum{service=\"claw-brain\"}[30m])) or vector(0)) / clamp_min(sum(rate(claw_brain_workspace_sync_bytes_count{service=\"claw-brain\"}[30m])), 1)",
+              "expr": "(sum(rate(claw_brain_workspace_sync_bytes_sum[30m])) or vector(0)) / clamp_min(sum(rate(claw_brain_workspace_sync_bytes_count[30m])), 1)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2947,7 +2947,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max by (kind) (claw_brain_pending_sync_inflight{service=\"claw-brain\"})",
+              "expr": "max by (kind) (claw_brain_pending_sync_inflight)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -2955,7 +2955,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max by (kind) (claw_brain_pending_sync_queued{service=\"claw-brain\"})",
+              "expr": "max by (kind) (claw_brain_pending_sync_queued)",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -3011,7 +3011,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (rate(claw_brain_workspace_sync_duration_seconds_count{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (kind) (rate(claw_brain_workspace_sync_duration_seconds_count[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3019,7 +3019,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (rate(claw_brain_workspace_sync_failures_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (kind) (rate(claw_brain_workspace_sync_failures_total[5m]))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -3075,7 +3075,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.5, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.5, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket[5m])))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3083,7 +3083,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket[5m])))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -3091,7 +3091,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.99, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, kind) (rate(claw_brain_workspace_sync_duration_seconds_bucket[5m])))",
               "refId": "C",
               "range": true,
               "editorMode": "code",
@@ -3155,7 +3155,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (le) (rate(claw_brain_workspace_sync_duration_seconds_bucket{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (le) (rate(claw_brain_workspace_sync_duration_seconds_bucket[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3206,7 +3206,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind, reason) (increase(claw_brain_workspace_sync_failures_total{service=\"claw-brain\"}[1h]))",
+              "expr": "sum by (kind, reason) (increase(claw_brain_workspace_sync_failures_total[1h]))",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -3265,7 +3265,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (claw_brain_pending_sync_inflight{service=\"claw-brain\"})",
+              "expr": "sum by (kind) (claw_brain_pending_sync_inflight)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3273,7 +3273,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (claw_brain_pending_sync_queued{service=\"claw-brain\"})",
+              "expr": "sum by (kind) (claw_brain_pending_sync_queued)",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -3339,7 +3339,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_llm_cache_breakpoints_sent_bucket{service=\"claw-brain\",le=\"0\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_llm_cache_breakpoints_sent_count{service=\"claw-brain\"}[$__rate_interval])), 1)",
+              "expr": "sum(rate(claw_brain_llm_cache_breakpoints_sent_bucket{le=\"0\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_llm_cache_breakpoints_sent_count[$__rate_interval])), 1)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3395,7 +3395,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (rate(claw_brain_llm_tokens_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (kind) (rate(claw_brain_llm_tokens_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3451,7 +3451,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (state) (rate(claw_brain_llm_cache_turns_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (state) (rate(claw_brain_llm_cache_turns_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3515,7 +3515,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (le) (rate(claw_brain_llm_cache_breakpoints_sent_bucket{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(claw_brain_llm_cache_breakpoints_sent_bucket[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3572,7 +3572,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (gap) (increase(claw_brain_llm_cache_entry_lost_total{service=\"claw-brain\"}[1h]))",
+              "expr": "sum by (gap) (increase(claw_brain_llm_cache_entry_lost_total[1h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3628,7 +3628,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (ttl) (rate(claw_brain_llm_cache_write_tokens_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (ttl) (rate(claw_brain_llm_cache_write_tokens_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3679,7 +3679,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (ttl) (increase(claw_brain_llm_cache_write_tokens_total{service=\"claw-brain\"}[24h]))",
+              "expr": "sum by (ttl) (increase(claw_brain_llm_cache_write_tokens_total[24h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3736,7 +3736,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (result) (increase(claw_brain_compaction_total{service=\"claw-brain\"}[1h]))",
+              "expr": "sum by (result) (increase(claw_brain_compaction_total[1h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3787,7 +3787,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (kind) (claw_brain_llm_tokens_total{service=\"claw-brain\"})",
+              "expr": "sum by (kind) (claw_brain_llm_tokens_total)",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -3853,7 +3853,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_hands_binary_download_total{service=\"claw-brain\", outcome!=\"ok\"}[15m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_total{service=\"claw-brain\"}[15m])), 0.0000001)",
+              "expr": "sum(rate(claw_brain_hands_binary_download_total{outcome!=\"ok\"}[15m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_total[15m])), 0.0000001)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3905,7 +3905,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(claw_brain_hands_binary_download_total{service=\"claw-brain\", outcome=\"ok\"})",
+              "expr": "sum(claw_brain_hands_binary_download_total{outcome=\"ok\"})",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -3957,7 +3957,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_hands_binary_download_bytes_total{service=\"claw-brain\"}[30m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_total{service=\"claw-brain\", outcome=\"ok\"}[30m])), 0.0000001)",
+              "expr": "sum(rate(claw_brain_hands_binary_download_bytes_total[30m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_total{outcome=\"ok\"}[30m])), 0.0000001)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4013,7 +4013,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (outcome) (rate(claw_brain_hands_binary_download_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (outcome) (rate(claw_brain_hands_binary_download_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4069,7 +4069,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_hands_binary_download_bytes_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum(rate(claw_brain_hands_binary_download_bytes_total[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4125,7 +4125,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket[5m])))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4133,7 +4133,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket[5m])))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -4141,7 +4141,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket{service=\"claw-brain\"}[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(claw_brain_hands_binary_download_duration_seconds_bucket[5m])))",
               "refId": "C",
               "range": true,
               "editorMode": "code",
@@ -4149,7 +4149,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_hands_binary_download_duration_seconds_sum{service=\"claw-brain\"}[5m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_duration_seconds_count{service=\"claw-brain\"}[5m])), 0.0000001)",
+              "expr": "sum(rate(claw_brain_hands_binary_download_duration_seconds_sum[5m])) / clamp_min(sum(rate(claw_brain_hands_binary_download_duration_seconds_count[5m])), 0.0000001)",
               "refId": "D",
               "range": true,
               "editorMode": "code",
@@ -4200,7 +4200,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (increase(claw_brain_hands_binary_download_total{service=\"claw-brain\", outcome=\"ok\"}[1h]))",
+              "expr": "sum by (pod) (increase(claw_brain_hands_binary_download_total{outcome=\"ok\"}[1h]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4266,7 +4266,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_sandbox_recovery_decision_total{service=\"claw-brain\",decision=\"rebuilt\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_sandbox_recovery_decision_total{service=\"claw-brain\"}[$__rate_interval])), 0.0000001)",
+              "expr": "sum(rate(claw_brain_sandbox_recovery_decision_total{decision=\"rebuilt\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_sandbox_recovery_decision_total[$__rate_interval])), 0.0000001)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4318,7 +4318,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_brain_sandbox_recovery_decision_total{service=\"claw-brain\",decision=~\"left_alone|failed|exhausted\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_sandbox_recovery_decision_total{service=\"claw-brain\"}[$__rate_interval])), 0.0000001)",
+              "expr": "sum(rate(claw_brain_sandbox_recovery_decision_total{decision=~\"left_alone|failed|exhausted\"}[$__rate_interval])) / clamp_min(sum(rate(claw_brain_sandbox_recovery_decision_total[$__rate_interval])), 0.0000001)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4374,7 +4374,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(rate(claw_sandbox_sweeper_evicted_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum(rate(claw_sandbox_sweeper_evicted_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4382,7 +4382,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum(increase(claw_sandbox_sweeper_evicted_total{service=\"claw-brain\"}[1h]))",
+              "expr": "sum(increase(claw_sandbox_sweeper_evicted_total[1h]))",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -4438,7 +4438,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (reason) (rate(claw_brain_session_cleanup_incomplete_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (reason) (rate(claw_brain_session_cleanup_incomplete_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4489,7 +4489,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (result) (increase(claw_brain_sandbox_probe_total{service=\"claw-brain\"}[$__range]))",
+              "expr": "sum by (result) (increase(claw_brain_sandbox_probe_total[$__range]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4545,7 +4545,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (verdict) (rate(claw_brain_sandbox_container_probe_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (verdict) (rate(claw_brain_sandbox_container_probe_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4596,7 +4596,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (verdict, reason) (increase(claw_brain_sandbox_container_probe_total{service=\"claw-brain\"}[$__range]))",
+              "expr": "sum by (verdict, reason) (increase(claw_brain_sandbox_container_probe_total[$__range]))",
               "refId": "A",
               "range": false,
               "editorMode": "code",
@@ -4662,7 +4662,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (le) (rate(claw_brain_sandbox_container_probe_duration_seconds_bucket{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(claw_brain_sandbox_container_probe_duration_seconds_bucket[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4718,7 +4718,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (decision) (rate(claw_brain_sandbox_recovery_decision_total{service=\"claw-brain\"}[$__rate_interval]))",
+              "expr": "sum by (decision) (rate(claw_brain_sandbox_recovery_decision_total[$__rate_interval]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4819,7 +4819,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max by (pod) (claw_brain_watchdog_last_tick_age_seconds{service=\"claw-brain\"})",
+              "expr": "max by (pod) (claw_brain_watchdog_last_tick_age_seconds)",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4870,7 +4870,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max(process_open_fds{service=\"claw-brain\"} / process_max_fds{service=\"claw-brain\"})",
+              "expr": "max(process_open_fds{service=~\"claw-brain|primus-claw-brain\"} / process_max_fds{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4926,7 +4926,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max(nodejs_eventloop_lag_p50_seconds{service=\"claw-brain\"})",
+              "expr": "max(nodejs_eventloop_lag_p50_seconds{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -4934,7 +4934,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max(nodejs_eventloop_lag_p90_seconds{service=\"claw-brain\"})",
+              "expr": "max(nodejs_eventloop_lag_p90_seconds{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -4942,7 +4942,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max(nodejs_eventloop_lag_p99_seconds{service=\"claw-brain\"})",
+              "expr": "max(nodejs_eventloop_lag_p99_seconds{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "C",
               "range": true,
               "editorMode": "code",
@@ -4998,7 +4998,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (nodejs_heap_size_used_bytes{service=\"claw-brain\"})",
+              "expr": "sum by (pod) (nodejs_heap_size_used_bytes{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -5006,7 +5006,7 @@
             },
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "max by (pod) (nodejs_heap_size_total_bytes{service=\"claw-brain\"})",
+              "expr": "max by (pod) (nodejs_heap_size_total_bytes{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "B",
               "range": true,
               "editorMode": "code",
@@ -5062,7 +5062,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (process_resident_memory_bytes{service=\"claw-brain\"})",
+              "expr": "sum by (pod) (process_resident_memory_bytes{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -5118,7 +5118,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (pod) (rate(process_cpu_seconds_total{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (pod) (rate(process_cpu_seconds_total{service=~\"claw-brain|primus-claw-brain\"}[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -5182,7 +5182,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "sum by (le) (rate(nodejs_gc_duration_seconds_bucket{service=\"claw-brain\"}[5m]))",
+              "expr": "sum by (le) (rate(nodejs_gc_duration_seconds_bucket{service=~\"claw-brain|primus-claw-brain\"}[5m]))",
               "refId": "A",
               "range": true,
               "editorMode": "code",
@@ -5233,7 +5233,7 @@
           "targets": [
             {
               "datasource": "${DS_PROMETHEUS}",
-              "expr": "time() - max by (pod) (process_start_time_seconds{service=\"claw-brain\"})",
+              "expr": "time() - max by (pod) (process_start_time_seconds{service=~\"claw-brain|primus-claw-brain\"})",
               "refId": "A",
               "range": false,
               "editorMode": "code",
