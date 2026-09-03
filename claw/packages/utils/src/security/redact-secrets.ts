@@ -185,8 +185,13 @@ const ACRONYM_SEGMENT_RE = /^[A-Z]{2,}[0-9]{0,3}$/;
  * `gcc11`), carry nothing on their own, so they are allowed to sit between
  * the words without deciding anything -- the decision is left to the rule
  * that at least one segment must be a real word or acronym.
+ *
+ * A number may carry a release tag: `12rc1`, `13t`, `0b1`, `2post1`. This is
+ * PEP 440 read loosely rather than parsed, which is all that is wanted here
+ * -- the tag says "still a version", and getting the grammar exactly right
+ * would buy nothing that the word-or-acronym rule is not already deciding.
  */
-const VERSION_SEGMENT_RE = /^(?:[0-9]{1,4}|[A-Za-z]{1,4}[0-9]{1,3})$/;
+const VERSION_SEGMENT_RE = /^(?:[0-9]{1,4}(?:[a-z]{1,4}[0-9]{0,3})?|[A-Za-z]{1,4}[0-9]{1,3})$/;
 
 /**
  * Whether every symbol-delimited piece reads as prose or as a version.

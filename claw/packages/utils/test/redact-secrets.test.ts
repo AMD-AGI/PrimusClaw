@@ -322,6 +322,11 @@ test("a toolchain or version string is not a credential", () => {
   for (const build of [
     "x86_64+AVX2", "Python3.12+NumPy2", "Node18.20+OpenSSL3",
     "gcc11+CUDA12", "llvm15+MLIR2", "rocm6.2+HIP6",
+    // A version may carry a release tag, and these are real build strings:
+    // rc1 is a release candidate, and the bare t is the free-threaded 3.13
+    // build. Read loosely as PEP 440 rather than parsed.
+    "Python3.12rc1+NumPy2", "Python3.13t+NumPy2",
+    "Django4.2post1+Celery5", "Ruby3.4dev0+Rails8",
   ]) {
     assert.equal(
       looksLikeCredentialValue(build), false,
@@ -332,5 +337,18 @@ test("a toolchain or version string is not a credential", () => {
   // a version string however much punctuation it borrows from one.
   for (const secret of ["aB12+cD34+eF56", "Xk9$mzPl2"]) {
     assert.ok(looksLikeCredentialValue(secret), `${JSON.stringify(secret)} is a credential`);
+  }
+});
+
+test("a bare version number is left alone at every spelling of it", () => {
+  // These carry no symbol from the credential set, so they never reach the
+  // segment rules at all -- which is worth pinning, because it means a change
+  // to those rules cannot start redacting a version out of a build log.
+  for (const version of [
+    "1.0.0rc2", "2.1.0b1", "3.9.0a1", "1.21.0", "4.2.0post1", "0.1.0dev0",
+  ]) {
+    const r = redactSecrets(version);
+    assert.equal(r.text, version, `${JSON.stringify(version)} is a version`);
+    assert.equal(r.hits, 0);
   }
 });
