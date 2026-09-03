@@ -1331,10 +1331,20 @@ class TaskRunner {
         // writer landing in between could start the cycle again -- and an
         // unbounded repair loop on the awaited turn path is a worse failure
         // than a checkpoint that is one turn stale until the next one lands.
+        // The repair's result is the caller's result. Returning true
+        // regardless would tell the loop a durable checkpoint exists when the
+        // key still holds the older state -- and the loop uses that to decide
+        // whether to keep retrying, so a swallowed failure stops the retries
+        // as well as losing the write.
         if (!isRepair && this.latestCheckpointState) {
-          await this.writeKvCheckpoint(this.latestCheckpointState, workspaceInfo, kind, true);
+          return await this.writeKvCheckpoint(
+            this.latestCheckpointState, workspaceInfo, kind, true,
+          );
         }
-        return true;
+        // No newer state to restore, or this IS the repair: the key holds
+        // something older than what was just serialized and nothing here can
+        // fix that, so do not claim otherwise.
+        return isRepair;
       }
       this.lastWrittenSeq = seq;
       metrics.onCheckpointWrite(

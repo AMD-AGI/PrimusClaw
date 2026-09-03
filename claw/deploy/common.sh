@@ -256,8 +256,48 @@ trap cleanup_deploy_temp_files EXIT
 #
 # helm template does NOT stamp metadata.namespace onto rendered objects, so the
 # imperative kubectl_apply below always passes -n "$NAMESPACE".
+# ── Security values that must survive a re-render ────────────────────────
+#
+# render_chart renders one template with chart DEFAULTS for everything it is
+# not told about. That is fine for a knob whose default is the desired value
+# and catastrophic for one an operator turned on: a routine `upgrade.sh` would
+# otherwise strip BRAIN_CHECKPOINT_KEY out of the Deployment, reset
+# CHECKPOINT_WRITE_VERSION to 3, and drop the per-workload NATS credentials so
+# every component silently reverted to the shared all-access user. On a fleet
+# already writing v4 that is not a rollback, it is data loss: the sealed
+# checkpoints stay in the bucket and nothing can open them.
+#
+# Read from the cluster rather than from a values file. The file that has these
+# is not the one every entrypoint sources -- deploy.sh knows the NATS creds
+# file, upgrade.sh does not -- and "the operator must remember to pass them" is
+# precisely the failure being fixed. What is deployed is the authority on what
+# should stay deployed.
+_preserve_security_values() {
+  local out=() v
+  v=$(kubectl get secret primus-claw-brain-checkpoint -n "$NAMESPACE" \
+      -o jsonpath='{.data.BRAIN_CHECKPOINT_KEY}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [ -n "$v" ] && out+=(--set-string "secret.brainCheckpointKey=$v")
+
+  v=$(kubectl get deployment primus-claw-brain -n "$NAMESPACE" -o \
+      jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CHECKPOINT_WRITE_VERSION")]}{.value}{end}' \
+      2>/dev/null || true)
+  [ -n "$v" ] && out+=(--set-string "brain.checkpointWriteVersion=$v")
+
+  local c
+  for c in api brain reaper ops; do
+    v=$(kubectl get secret "primus-claw-nats-$c" -n "$NAMESPACE" \
+        -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    [ -n "$v" ] && out+=(--set-string "secret.natsUsers.$c.password=$v")
+  done
+  printf '%s\n' "${out[@]+"${out[@]}"}"
+}
+
 render_chart() {
   local template="$1" dst="$2"; shift 2
+  local preserved=()
+  # Explicit values from the caller come after these, so a deliberate --set
+  # still wins over what happens to be deployed.
+  mapfile -t preserved < <(_preserve_security_values)
   helm template primus-claw "$CLAW_CHART_DIR" \
     -n "$NAMESPACE" \
     --set secret.create=false \
@@ -266,6 +306,7 @@ render_chart() {
     --set-string image.registry="$REGISTRY" \
     --set-string image.repository=claw \
     --set-string image.tag="$TAG" \
+    ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst"
 }
