@@ -73,8 +73,26 @@ const ORDINARY_NUMBER_RE = /^[0-9]+([.,][0-9]+)?$/;
  *
  * See the limitations note at the top of redactPersistedEvent -- this is one
  * of the two shapes recorded there as knowingly not covered.
+ *
+ * The digit run is unbounded. It was capped at three for no reason anyone
+ * wrote down, and the cap did the opposite of protecting anything: the longer
+ * the run, the more the value reads as a year, a date or a counter rather than
+ * a credential. `report2024`, `snapshot20240115` and `getUserById2024` are the
+ * shapes a transcript is actually full of, and at `{1,3}` every one of them
+ * was hunted while `hunter2` -- an actual password, and the reason this rule
+ * exists -- was spared. A boundary that spares the password and cuts the
+ * timestamp is exactly backwards.
+ *
+ * Four digits do not raise the collision risk above the three already
+ * accepted, because the shape this matches is a word and then nothing but
+ * digits, and generated credentials do not have that shape: they interleave.
+ * `x9k2m4p7`, `a1b2c3d4e5f6a7b8` and every vendor format keep their digits
+ * mixed in with the letters and are still hunted. What is given up is the
+ * free-text echo of a password that happens to end in a digit run, which is
+ * the same thing already given up for `hunter2`, bounded the same way, and
+ * still masked wherever the value sits in a field.
  */
-const WORD_WITH_TRAILING_DIGITS_RE = /^[\p{L}\p{M}]+[0-9]{1,3}$/u;
+const WORD_WITH_TRAILING_DIGITS_RE = /^[\p{L}\p{M}]+[0-9]+$/u;
 /**
  * A path or timezone spelled out of words: `America/New_York`, `src/main`.
  *

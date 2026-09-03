@@ -272,3 +272,32 @@ test("widening the letter class did not exempt anything that is not a letter", (
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
   }
 });
+
+test("the trailing-digit exemption does not stop at three digits", () => {
+  // Round 12. The run used to be capped at `{1,3}` for no recorded reason,
+  // and the cap ran backwards: `hunter2`, a real password, was spared, while
+  // a year-stamped identifier -- the single most ordinary thing in a
+  // transcript -- was cut out of every line that mentioned it.
+  //
+  // The shape being matched is a word and then nothing but digits. Generated
+  // credentials do not have that shape; they interleave, and the test below
+  // pins that they are still hunted.
+  for (const identifier of [
+    "getUserById2024", "report2024", "snapshot20240115", "migration20231115",
+    "batch1000", "run123456789", "année2024",
+  ]) {
+    assert.ok(
+      !isDistinctiveSecret(identifier),
+      `${JSON.stringify(identifier)} is an identifier, not a credential`,
+    );
+  }
+  // The other direction, and the reason widening the digit run is safe: the
+  // moment digits sit among the letters rather than after them, the value is
+  // hunted again, at any length.
+  for (const secret of [
+    "x9k2m4p7", "a1b2c3d4e5f6a7b8", "s3cr3t", "abc-123", "getUser2024ById",
+    "hunter2024x", "P@ssw0rd2024",
+  ]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
+  }
+});

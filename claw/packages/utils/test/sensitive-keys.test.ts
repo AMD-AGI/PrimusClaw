@@ -107,3 +107,26 @@ test("ordinary field names are untouched", () => {
 test("an empty or punctuation-only key is not sensitive", () => {
   assertSensitive(["", "_", "-", "..."], false);
 });
+
+test("vendor spellings of 'password' are sensitive", () => {
+  // The word list only works if it holds the words config files actually use.
+  // Each of these is a password whose name does not contain "password":
+  // Postgres writes it as one unsplittable run, MySQL abbreviates, OpenSSH
+  // calls it a passphrase, and the Unix spelling drops the vowel.
+  assertSensitive([
+    "PGPASSWORD", "pgpassword", "pgPassword", "PGPASS",
+    "MYSQL_PWD", "mysql_pwd", "mysqlPwd", "pwd", "db_pwd", "pwd_hash",
+    "SSH_PASSPHRASE", "ssh_passphrase", "sshPassphrase", "key_passphrase",
+    "passphrases", "PASSWD", "passwd", "user_passwd",
+  ], true);
+});
+
+test("adding the vendor spellings did not widen anything else", () => {
+  // `pwd` is a word, not a substring, so a name that merely contains those
+  // three letters is untouched -- which is the whole reason this file matches
+  // by word. `password` remains the only thing being spelled differently.
+  assertSensitive([
+    "cwd", "upwd", "pwdless", "passphraseless", "passwdless",
+    "pg_host", "pg_database", "mysql_host", "ssh_host", "ssh_port",
+  ], false);
+});

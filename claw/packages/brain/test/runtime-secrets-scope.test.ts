@@ -410,3 +410,37 @@ test("the field itself is still masked whatever the value looks like", () => {
     PLATFORM_KEY: "<redacted>", OTHER_SECRET: "<redacted>", PROJECT_TOKEN: "<redacted>",
   });
 });
+
+test("a year-stamped identifier under a credential name survives free text", () => {
+  // Round 12 end to end. Collected by name, so the value gate is all that
+  // stands between an ordinary identifier and a hole in every line that
+  // mentions it.
+  const text = "call getUserById2024 then load snapshot20240115 and report2024";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        PROJECT_TOKEN: "getUserById2024",
+        OTHER_SECRET: "snapshot20240115",
+        THIRD_TOKEN: "report2024",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("vendor spellings of a password name are masked at their field", () => {
+  // The counterpart to widening the value gate: what is not hunted in free
+  // text must still be masked where it sits, and these are the names that
+  // reach a real config file.
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { values: {
+      PGPASSWORD: "hunter2", MYSQL_PWD: "getUserById2024", SSH_PASSPHRASE: "correct horse",
+      PG_HOST: "db.internal",
+    } } },
+  ) as { argumentsDetail: { values: Record<string, string> } };
+  assert.deepEqual(evt.argumentsDetail.values, {
+    PGPASSWORD: "<redacted>", MYSQL_PWD: "<redacted>", SSH_PASSPHRASE: "<redacted>",
+    PG_HOST: "db.internal",
+  });
+});

@@ -24,6 +24,22 @@ const SENSITIVE_WORDS = new Set([
   "secrets",
   "password",
   "passwords",
+  // The spellings a real config file uses. `password` written out in full is
+  // the exception rather than the rule once a vendor is involved: MySQL reads
+  // MYSQL_PWD, OpenSSH prompts for a passphrase, and /etc/shadow's ancestor
+  // named the field `passwd`. Each is a password under another name and none
+  // of them contains the word.
+  //
+  // `pwd` is also the shell builtin that prints a directory, so it is worth
+  // saying why that is not a collision worth worrying about: this list matches
+  // the name of a field holding a value, and a field named `pwd` holds a
+  // password. A working directory travels under `cwd`, `dir` or `path`. The
+  // predicate errs towards masking in any case, and a wrongly masked directory
+  // is cosmetic where a leaked password is not.
+  "pwd",
+  "passwd",
+  "passphrase",
+  "passphrases",
   "authorization",
   // The whole auth family, as words rather than as a list of header names.
   // `x-auth`, `x-auth-key`, `authentication-info` and
@@ -52,6 +68,14 @@ const SENSITIVE_WORDS = new Set([
   "privatekey",
   "platformkey",
   "virtualkey",
+  // Postgres spells its password variable as one run of letters, so there is
+  // no boundary for splitWords to break on and no pair rule that can see it:
+  // `PGPASSWORD` arrives as the single word `pgpassword`. `PGPASS` is the same
+  // variable's shorter spelling. Only names that are genuinely written this
+  // way belong here -- MySQL's `MYSQL_PWD` has an underscore and is caught as
+  // `pwd` above, which is the general rule doing the work rather than a list.
+  "pgpassword",
+  "pgpass",
   // A personal access token is a credential whose name says "token" only in
   // expanded form; the spelling that reaches a config file is GITHUB_PAT.
   "pat",

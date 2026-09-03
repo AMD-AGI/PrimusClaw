@@ -34,7 +34,10 @@ record it.
   as a credential, hunted only when the value is distinctive enough that
   replacing it will not also delete ordinary words, and matched by **shape**
   (GitHub/GitLab/Slack/OpenAI/Hugging Face/AWS tokens, JWTs, URLs with inline
-  credentials) regardless of the field they sit in.
+  credentials) regardless of the field they sit in. The name rule knows the
+  spellings a real config file uses, not just the word `password`:
+  `PGPASSWORD`, `MYSQL_PWD` and `SSH_PASSPHRASE` are each masked at their
+  field.
 
   **Still open — among other shapes, two are knowingly not caught in free
   text.** A purely alphabetic secret at any length and in any script
