@@ -406,6 +406,46 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 //  2. SandboxClaim controller creates a Sandbox with Name = SandboxClaim.Name (= sandboxName).
 //  3. The SandboxClaim controller adopts a warm Pod (sets the agents.x-k8s.io/pod-name annotation).
 //  4. SandboxReconciler fires when the Sandbox reaches Ready state → we get ServiceFQDN.
+//
+// applyClaimMetadata writes the labels and annotations a warm-pool claim needs
+// onto the Sandbox the pool handed over.
+//
+// The error is returned, not discarded. Everything in this patch is load-bearing
+// on a pod that already exists: the session-id annotation is how a session is
+// recovered when the store is lost, the idle-timeout annotation is the only
+// place a configured lifetime lands on a claim, and the user label is how the
+// sandbox is attributed. Swallowing a failure returned a sandbox that looks
+// created and quietly has none of them -- the caller's lifetime silently
+// replaced by the controller default, with nothing outside to tell from.
+// Failing the claim is recoverable; a claim that half-succeeded is not.
+func applyClaimMetadata(
+	ctx context.Context,
+	c ctrlclient.Client,
+	sandbox *sandboxv1alpha1.Sandbox,
+	labels map[string]string,
+	annotations map[string]string,
+) error {
+	if len(labels) == 0 && len(annotations) == 0 {
+		return nil
+	}
+	patchMeta := map[string]interface{}{}
+	if len(labels) > 0 {
+		patchMeta["labels"] = labels
+	}
+	if len(annotations) > 0 {
+		patchMeta["annotations"] = annotations
+	}
+	metaJSON, err := json.Marshal(map[string]interface{}{"metadata": patchMeta})
+	if err != nil {
+		return fmt.Errorf("marshal metadata patch: %w", err)
+	}
+	if err := c.Patch(ctx, sandbox,
+		ctrlclient.RawPatch(types.MergePatchType, metaJSON)); err != nil {
+		return fmt.Errorf("patch metadata: %w", err)
+	}
+	return nil
+}
+
 func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alpha1.CodeInterpreter, sandboxName string, sessionID string, user *UserIdentity, overrides *SandboxOverrides) (*SandboxResult, error) {
 	namespace := ci.Namespace
 
@@ -510,17 +550,9 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 						patchAnnotations[userNameAnnotationKey] = user.UserName
 					}
 				}
-				if len(patchLabels) > 0 || len(patchAnnotations) > 0 {
-					patchMeta := map[string]interface{}{}
-					if len(patchLabels) > 0 {
-						patchMeta["labels"] = patchLabels
-					}
-					if len(patchAnnotations) > 0 {
-						patchMeta["annotations"] = patchAnnotations
-					}
-					metaJSON, _ := json.Marshal(map[string]interface{}{"metadata": patchMeta})
-					_ = c.client.Patch(waitCtx, createdSandbox,
-						ctrlclient.RawPatch(types.MergePatchType, metaJSON))
+				if err := applyClaimMetadata(waitCtx, c.client, createdSandbox,
+					patchLabels, patchAnnotations); err != nil {
+					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {
 					podName := createdSandbox.Annotations["agents.x-k8s.io/pod-name"]

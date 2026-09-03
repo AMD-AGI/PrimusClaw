@@ -208,7 +208,21 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Emit audit event BEFORE deletion so callers can observe the cause.
 		// Fire-and-forget: never block the GC on audit failures.
 		r.emitIdleDeletedEvent(ctx, sandbox, lastActivity, timeout)
-		deleteErr := r.Delete(ctx, sandbox)
+		// Bound to the object this reconcile decided about. Without it, a sandbox
+		// deleted and recreated under the same name between the read and here --
+		// the same session coming straight back -- would have its replacement
+		// deleted instead, and the replacement is by definition not idle.
+		//
+		// UID and not ResourceVersion, deliberately. A ResourceVersion
+		// precondition would also close the narrower race where another actor
+		// marks the object for deletion after the read, but it makes the reclaim
+		// fail whenever anything at all writes the object first -- a status
+		// update is enough -- and trading a working collector for exact
+		// attribution on a rare race is the wrong way round. What that leaves is
+		// documented on the Event: a delete this call did not cause can still be
+		// reported as one, if it lands inside that window.
+		deleteErr := r.Delete(ctx, sandbox,
+			client.Preconditions{UID: &sandbox.UID})
 		if deleteErr != nil && client.IgnoreNotFound(deleteErr) != nil {
 			return ctrl.Result{}, deleteErr
 		}

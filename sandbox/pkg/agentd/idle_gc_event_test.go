@@ -224,3 +224,54 @@ func TestATerminatingSandboxIsLeftAlone(t *testing.T) {
 		t.Errorf("it was already going; got %v", events)
 	}
 }
+
+func TestTheDeleteIsBoundToTheObjectItDecidedAbout(t *testing.T) {
+	// The same session coming straight back gets a new sandbox under the same
+	// name. Between this reconcile's read and its delete, that replacement is
+	// what the name now points at -- and it is by definition not idle. Without a
+	// precondition the delete lands on it anyway, and the Event says it was
+	// reclaimed for being idle.
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	var gotPreconditionUID bool
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sandboxCR(testSession)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ ctrlclient.WithWatch, _ ctrlclient.Object,
+				opts ...ctrlclient.DeleteOption) error {
+				for _, o := range opts {
+					if p, ok := o.(ctrlclient.Preconditions); ok && p.UID != nil {
+						gotPreconditionUID = true
+					}
+				}
+				// What the API server does when the UID no longer matches.
+				return apierrors.NewConflict(
+					schema.GroupResource{
+						Group:    sandboxv1alpha1.GroupVersion.Group,
+						Resource: "sandboxes",
+					}, testSandbox, errors.New("UID precondition failed"))
+			},
+		}).Build()
+	st := store.NewMemoryStore()
+	rec := record.NewFakeRecorder(8)
+	r := &SandboxReconciler{
+		Client: c, Scheme: scheme, SessionTimeout: 15 * time.Minute,
+		Store: st, Recorder: rec, startedAt: time.Now().Add(-72 * time.Hour),
+	}
+	seedSession(t, st, testSession, 30*time.Minute)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testSandbox, Namespace: testNamespace},
+	})
+
+	if !gotPreconditionUID {
+		t.Error("the delete named no UID, so it would land on whatever holds the name now")
+	}
+	if err == nil {
+		t.Error("a refused delete should surface, not be read as a reclaim")
+	}
+	if events := drain(rec); len(events) != 0 {
+		t.Errorf("nothing was reclaimed here; got %v", events)
+	}
+}
