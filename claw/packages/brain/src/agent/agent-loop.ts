@@ -252,6 +252,24 @@ export interface LoopOptions {
   /** Called after each complete turn (tool results appended to messages).
    *  Caller persists state to NATS KV for cross-Brain resume. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
+  /**
+   * Called the moment a turn's response shows the prefix cache was used, with
+   * the timestamp that goes into `last_cache_use_at`.
+   *
+   * A checkpoint is written at a turn BOUNDARY, so between the response that
+   * updates this timestamp and the checkpoint that persists it lies the whole
+   * of that turn's tool batch -- which can be half an hour of one bash call.
+   * A SIGTERM in that window persists the PREVIOUS turn's timestamp, and the
+   * gap the detector computes on resume is overstated by the length of the
+   * batch, which biases the diagnosis towards "over_ttl" on exactly the runs
+   * where a tool call ran long.
+   *
+   * Synchronous, in-memory, no I/O: this is a notification, not a write, and
+   * deliberately does not touch the checkpoint cadence. It exists so the
+   * SIGTERM path can overlay a fresher timestamp on the state it is already
+   * about to persist. See the note on `latestCacheUseAt` in the runner.
+   */
+  onCacheUse?: (at: number | undefined) => void;
   /** Resume from a prior checkpoint. Skips turns 0..resumeFrom.turns_completed-1.
    *  Messages, usage, stats are pre-populated from checkpoint values. */
   resumeFrom?: CheckpointState;
@@ -379,6 +397,41 @@ const CANCELLED_TOOL_RESULT =
  * a different claim depending on what was paid for.
  */
 const CONFIGURED_CACHE_TTL_MS = LLM_CACHE_TTL === "5m" ? 5 * 60 * 1000 : 60 * 60 * 1000;
+
+/**
+ * The two block-distances worth logging when a cache read is lost, kept apart.
+ *
+ * Only the ROLLING markers form a chain that can break, so only distances
+ * between them -- and from the last one to the end of the prompt -- are
+ * evidence. The anchor is pinned to the end of the system run and never moves,
+ * so its distance to anything is planCacheBreakpoints' own geometry: it grows
+ * with the conversation and is identical on the healthy turns. Folding it into
+ * one maximum made every conversation past ~57 blocks report a broken chain.
+ * It is returned separately, under its own name, so a reader can see it
+ * without it being mistaken for the thing that went wrong.
+ *
+ * Nothing is reported when the anchor is all there is. `blocks - anchor` was
+ * being filled in as `rollingMaxGap` in that case, which is the same
+ * conflation one subtraction further along: a number that grows with the
+ * conversation, published under a name that means "the chain broke". An absent
+ * field says there was no chain to measure, and it is honest -- offsets and
+ * promptBlocks are logged beside it, so a reader who wants the geometry has
+ * it. Both are also absent when the provider cannot report offsets at all: an
+ * absent measurement must not read as a zero-width gap.
+ */
+export function cacheChainGaps(
+  offsets: readonly number[] | undefined,
+  blocks: number | undefined,
+): { anchorGap: number | undefined; rollingMaxGap: number | undefined } {
+  if (!offsets || offsets.length < 2 || blocks === undefined) {
+    return { anchorGap: undefined, rollingMaxGap: undefined };
+  }
+  let rollingMaxGap = blocks - offsets[offsets.length - 1]!;
+  for (let i = 2; i < offsets.length; i++) {
+    rollingMaxGap = Math.max(rollingMaxGap, offsets[i]! - offsets[i - 1]!);
+  }
+  return { anchorGap: offsets[1]! - offsets[0]!, rollingMaxGap };
+}
 
 const COMPACTION_KEEP_RECENT_TURNS = 8;
 // Don't bother compacting tiny conversations.
@@ -1118,7 +1171,13 @@ class AgentLoopRunner {
       && this.lastCacheUseAt !== undefined
     ) {
       const gapMs = turnStart - this.lastCacheUseAt;
-      const gap = gapMs > CONFIGURED_CACHE_TTL_MS ? "over_ttl" : "under_ttl";
+      // `>=`, so a gap of exactly the TTL reads as expiry. At that point the
+      // lifetime the deployment paid for has fully elapsed and expiry is a
+      // complete explanation for the miss; "under_ttl" is the label that says
+      // the lifetime is NOT the suspect, and pointing an investigation at the
+      // prefix on the one gap expiry accounts for exactly is the kind of
+      // wrong-first-guess this whole branch is about.
+      const gap = gapMs >= CONFIGURED_CACHE_TTL_MS ? "over_ttl" : "under_ttl";
       metrics.onCacheEntryLost(gap);
       // Everything needed to tell the three causes apart, on the one turn that
       // can still tell them apart -- the next turn re-plans and the evidence is
@@ -1138,11 +1197,12 @@ class AgentLoopRunner {
       //                          MAX_STRIDE_BLOCKS), so it grows with the
       //                          conversation and is identical on the healthy
       //                          turns. Folding it into one maximum, as this
-      //                          did, made every conversation past ~57 blocks
-      //                          report a broken chain -- the field was
-      //                          constant across 310 hits and 5 losses of one
-      //                          session alike, and it sent the first
-      //                          investigation after the wrong cause.
+      //                          did, made every long conversation report a
+      //                          broken chain: the field read the same on the
+      //                          hits as on the losses, because it was
+      //                          measuring the conversation's length, and it
+      //                          sent the first investigation after the wrong
+      //                          cause.
       //   neither                the entry was not where we left it -- eviction,
       //                          or a gateway that routed to a backend without
       //                          it. Not ours, and the gateway has to answer.
@@ -1151,18 +1211,7 @@ class AgentLoopRunner {
       // an absent measurement must not read as a zero-width gap.
       const offsets = cacheReport.markerBlockOffsets;
       const blocks = cacheReport.promptBlocks;
-      let rollingMaxGap: number | undefined;
-      let anchorGap: number | undefined;
-      if (offsets && offsets.length > 0 && blocks !== undefined) {
-        // Only the rolling markers form a chain that can break. The anchor is
-        // pinned to the end of the system run and never moves, so its distance
-        // to the first rolling marker is structural, not evidence.
-        if (offsets.length > 1) anchorGap = offsets[1] - offsets[0];
-        rollingMaxGap = blocks - offsets[offsets.length - 1];
-        for (let i = 2; i < offsets.length; i++) {
-          rollingMaxGap = Math.max(rollingMaxGap, offsets[i] - offsets[i - 1]);
-        }
-      }
+      const { anchorGap, rollingMaxGap } = cacheChainGaps(offsets, blocks);
       logger.warn(
         {
           turn,
@@ -1189,11 +1238,16 @@ class AgentLoopRunner {
     // Last USE, not last write, and anchored at the request rather than the
     // response. A read refreshes the entry's lifetime, so a session that keeps
     // hitting keeps its entry alive however long it runs -- timing from the
-    // original write would call that session's first real miss "over_5m"
+    // original write would call that session's first real miss "over_ttl"
     // because the write happened hours ago. And the gateway's clock starts
     // when it receives the prompt, so timing from the response charges this
     // turn's own generation time to the gap.
-    if (turnUsage.cache_create > 0 || turnUsage.cache_read > 0) this.lastCacheUseAt = turnStart;
+    if (turnUsage.cache_create > 0 || turnUsage.cache_read > 0) {
+      this.lastCacheUseAt = turnStart;
+      // Tell the caller now rather than at the next checkpoint: the tool batch
+      // that follows this line is exactly the window a SIGTERM would land in.
+      this.opts.onCacheUse?.(turnStart);
+    }
 
     metrics.onLlmTurnCache({
       inputTokens: turnUsage.input_tokens,
@@ -1382,6 +1436,17 @@ class AgentLoopRunner {
         // the pre-compaction timestamp standing, and the SECOND miss after a
         // compaction was reported as an expired entry.
         this.lastCacheUseAt = undefined;
+        // Say the clear out loud, here, before the await below. The caller is
+        // told about cache USE on the same line it happens for the same
+        // reason, and a clear is the half that matters more: the checkpoint
+        // that would otherwise carry the pre-compaction timestamp already
+        // exists, so a SIGTERM landing between this line and the checkpoint
+        // call at the bottom of the turn would persist a timestamp for an
+        // entry this compaction just destroyed -- and the resumed run would
+        // measure a gap against it and report a loss that never happened.
+        // Waiting for `onCheckpoint` to carry the news is a window, and it is
+        // an `await onEvent` wide.
+        this.opts.onCacheUse?.(undefined);
         this.workingMessages.length = 0;
         this.workingMessages.push(...compacted);
         await this.onEvent({

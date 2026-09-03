@@ -998,7 +998,14 @@ export function assertDiagnosableHeaderName(name: string): void {
       + `HTTP header name. Reading it would throw on every response.`,
     );
   }
-  if (CREDENTIAL_HEADERS.has(name) || isSensitiveKey(name)) {
+  // Header names are case-insensitive on the wire, so the list has to be
+  // compared case-insensitively too. The env parse lowercases before calling
+  // here, which hid it: this predicate is exported and is the thing a caller
+  // reaches for, and `WWW-Authenticate` walked straight past a set that only
+  // holds `www-authenticate`. isSensitiveKey lowercases on its own, which is
+  // why the names it covers were never exposed to this.
+  const lowered = name.toLowerCase();
+  if (CREDENTIAL_HEADERS.has(lowered) || isSensitiveKey(name)) {
     throw new Error(
       `LLM_DEBUG_RESPONSE_HEADERS names ${JSON.stringify(name)}, which carries a credential. `
       + `Captured headers are logged; pick a header that identifies the upstream instead.`,

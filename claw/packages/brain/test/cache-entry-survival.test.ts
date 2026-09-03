@@ -272,3 +272,67 @@ test("a resumed run records its own cache use for the next redelivery", async ()
     "a checkpoint written after a cache write must carry the timestamp",
   );
 });
+
+test("a resumed run with evidence is still subject to the other two guards", async () => {
+  // Restoring the timestamp answers "did an entry exist". It does not answer
+  // "were markers sent" or "did the provider say zero", and it must not be
+  // read as answering them: the disjunct this replaced routed around both,
+  // which is how a resumed run whose markers had been refused was counted.
+  const before = { over: await lost("over_ttl"), under: await lost("under_ttl") };
+
+  // Markers off on the resumed turn: a miss is the expected outcome.
+  await withClock({ now: 8_500_000 }, () => run(
+    session([{ ...missed, cacheReport: { breakpointsSent: 0, enabled: false, reported: REPORTED } }],
+      { now: 8_500_000 }),
+    { resumeFrom: checkpoint({ last_cache_use_at: 8_500_000 - 30 * 1000 }) },
+  ));
+  assert.equal(await lost("under_ttl"), before.under, "markers were never sent");
+
+  // Usage that never mentioned the cache: unmeasurable, not a miss.
+  await withClock({ now: 8_600_000 }, () => run(
+    session([{ ...missed, cacheReport: { breakpointsSent: 3, enabled: true, reported: [] } }],
+      { now: 8_600_000 }),
+    { resumeFrom: checkpoint({ last_cache_use_at: 8_600_000 - 30 * 1000 }) },
+  ));
+  assert.equal(await lost("under_ttl"), before.under, "the turn could not be measured");
+  assert.equal(await lost("over_ttl"), before.over);
+});
+
+test("a restored timestamp older than the TTL lands in the long-gap bucket", async () => {
+  // The redelivery this was extended for: a pod died, the replacement picked
+  // the task up an hour later, and the entry is gone because it expired. The
+  // label has to say that rather than point at the prefix.
+  const before = { over: await lost("over_ttl"), under: await lost("under_ttl") };
+  const clock = { now: 9_500_000 };
+  await withClock(clock, () => run(
+    session([missed], clock),
+    { resumeFrom: checkpoint({ last_cache_use_at: clock.now - 70 * 60 * 1000 }) },
+  ));
+  assert.equal(await lost("over_ttl"), before.over + 1);
+  assert.equal(await lost("under_ttl"), before.under);
+});
+
+// ── The TTL boundary ────────────────────────────────────────────────────────
+
+test("a gap of exactly the configured TTL reads as expiry", async () => {
+  // The boundary is `>=`, and which way it falls is a decision rather than an
+  // accident: at exactly the TTL the entry's lifetime is fully spent, so
+  // expiry explains the miss completely and there is nothing left for a prefix
+  // change to explain. Calling it under_ttl would send the reader hunting a
+  // second cause for a turn that already has one. Default LLM_CACHE_TTL is 1h.
+  const before = { over: await lost("over_ttl"), under: await lost("under_ttl") };
+  const clock = { now: 5_500_000 };
+  await withClock(clock, () => run(session([{ ...wrote, advanceMsAfter: 60 * 60 * 1000 }, missed], clock)));
+  assert.equal(await lost("over_ttl"), before.over + 1, "exactly the TTL is over_ttl");
+  assert.equal(await lost("under_ttl"), before.under);
+});
+
+test("one millisecond inside the TTL still points at the prefix", async () => {
+  // The other side of the same step, so the boundary cannot drift unnoticed in
+  // either direction.
+  const before = { over: await lost("over_ttl"), under: await lost("under_ttl") };
+  const clock = { now: 6_500_000 };
+  await withClock(clock, () => run(session([{ ...wrote, advanceMsAfter: 60 * 60 * 1000 - 1 }, missed], clock)));
+  assert.equal(await lost("under_ttl"), before.under + 1, "one ms short of the TTL is under_ttl");
+  assert.equal(await lost("over_ttl"), before.over);
+});

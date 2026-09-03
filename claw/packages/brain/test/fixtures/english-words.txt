@@ -1,0 +1,39 @@
+# Ordinary English words that a credential-named env var can plausibly hold,
+# collected from the counterexamples that broke three successive attempts to
+# tell a word from a token by its shape. None of these may ever be hunted by
+# the blind substring pass. See isDistinctiveSecret in src/events/redaction.ts.
+#
+# Round 3 -- mixed case was read as "generated".
+GitHub
+macOS
+iPhone
+OpenAI
+getUserById2
+# Round 7 -- sixteen letters was read as "past what vocabulary reaches".
+internationalization
+characterization
+responsibilities
+institutionalization
+telecommunications
+indistinguishable
+juxtapositioning
+representative
+implementation
+configuration
+# Round 8 -- consonant runs and vowel ratio were read as "not a word".
+straightforwardly
+straightforwardness
+misunderstandings
+strengthlessness
+twelfthstreets
+chrysanthemums
+rhythmically
+strengthened
+lengthscales
+watchstraps
+# Ordinary vocabulary that has always been safe and must stay so.
+main
+staging
+production
+remote
+default
