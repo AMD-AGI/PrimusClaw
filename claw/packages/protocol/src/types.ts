@@ -349,7 +349,7 @@ export interface ExecuteRequest {
   /**
    * What this run needs beyond a sandbox: node count, per-node shape, backend.
    *
-   * The declaration Brain prefers over the the dispatcher flags in the prompt (see
+   * The declaration Brain prefers over the dispatcher flags in the prompt (see
    * protocol/topology.ts). Absent means "read the prompt", which is what every
    * caller did before this field existed.
    */
