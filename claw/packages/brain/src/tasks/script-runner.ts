@@ -139,9 +139,22 @@ export function capCapturesTotal(captures: Record<string, string>): Record<strin
   return out;
 }
 
-/** Pause, unless the caller asked for none. */
-function sleep(ms: number): Promise<void> {
-  return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
+/** Pause until the interval elapses or the run is cancelled. */
+function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -234,21 +247,10 @@ export async function runScript(
 
   for (let i = 0; i < script.length; i++) {
     if (ctx.signal?.aborted) {
-      return {
-        finalText: "",
-        tokenUsage: zeroTokens(),
-        turns: 0,
-        pendingMemories: [],
-        pendingSkills: [],
-        skillsUsed: {},
-        errorCount: toolStats.error_calls,
-        toolStats,
-        elapsedMs: nowMs() - startedAt,
-        captures,
-        artifacts,
-        abortReason: "cancelled",
-        failureReason: "script aborted by signal",
-      };
+      return failResult(
+        "script aborted by signal", "cancelled",
+        captures, artifacts, toolStats, startedAt,
+      );
     }
     const step = script[i];
     let args: Record<string, unknown>;
@@ -292,74 +294,124 @@ export async function runScript(
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
-    attempt++;
-    resultText = "";
-    structured = undefined;
-    stepError = undefined;
-    try {
-      if (scope === "backend") {
-        if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
-        if (!request.backend_internal_token) throw new Error("backend_internal_token not provided for scope=backend tool");
-        const out = await callBackendMcpTool(
-          request.backend_mcp_url,
-          request.backend_internal_token,
-          step.name,
-          args,
-          { timeoutMs: stepDeadlineSec * 1000, signal: ctx.signal },
+      if (ctx.signal?.aborted) {
+        return failResult(
+          "script aborted by signal", "cancelled",
+          captures, artifacts, toolStats, startedAt,
         );
-        if (out.wait_external) {
-          waitExternal = true;
-          stepError = out.error;
-          const md = out.metadata as Record<string, unknown> | undefined;
-          if (md && typeof md.external_id === "string") waitExternalId = md.external_id;
-        } else if (out.isError) {
-          stepError = out.error || out.text || "backend tool returned isError";
+      }
+      const remainingMs = repeat ? repeatDeadline - nowMs() : stepDeadlineSec * 1000;
+      if (repeat && remainingMs <= 0) {
+        repeatStopped = "max_seconds";
+        break;
+      }
+
+      attempt++;
+      resultText = "";
+      structured = undefined;
+      stepError = undefined;
+      const attemptTimeoutMs = Math.max(
+        1,
+        Math.floor(repeat ? Math.min(stepDeadlineSec * 1000, remainingMs) : stepDeadlineSec * 1000),
+      );
+      const budgetSignal = repeat ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
+      const attemptSignal = budgetSignal && ctx.signal
+        ? AbortSignal.any([ctx.signal, budgetSignal])
+        : (budgetSignal ?? ctx.signal);
+      try {
+        if (scope === "backend") {
+          if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
+          if (!request.backend_internal_token) throw new Error("backend_internal_token not provided for scope=backend tool");
+          const out = await callBackendMcpTool(
+            request.backend_mcp_url,
+            request.backend_internal_token,
+            step.name,
+            args,
+            { timeoutMs: attemptTimeoutMs, signal: attemptSignal },
+          );
+          if (out.wait_external) {
+            waitExternal = true;
+            stepError = out.error;
+            const md = out.metadata as Record<string, unknown> | undefined;
+            if (md && typeof md.external_id === "string") waitExternalId = md.external_id;
+          } else if (out.isError) {
+            stepError = out.error || out.text || "backend tool returned isError";
+          }
+          resultText = out.text;
+          structured = out.structured;
+        } else {
+          if (!ctx.hands) throw new Error("Hands client not provided for scope=hands tool");
+          let handsArgs = args;
+          const timeoutField = step.name === "wait"
+            ? "timeout_sec"
+            : (step.name === "bash" ? "timeout" : null);
+          if (timeoutField && (repeat || step.timeout_sec !== undefined)) {
+            const requested = Number(args[timeoutField]);
+            const timeoutSec = Math.min(
+              Number.isFinite(requested) && requested > 0 ? requested : stepDeadlineSec,
+              Math.max(1, Math.ceil(attemptTimeoutMs / 1000)),
+            );
+            handsArgs = { ...args, [timeoutField]: timeoutSec };
+          }
+          const out = await ctx.hands.callToolFull(step.name, handsArgs, attemptSignal);
+          resultText = out.text;
+          structured = out.structured;
+          if (out.isError) stepError = out.text || "hands tool returned isError";
+          if (
+            stepError &&
+            step.on_fail === "wait_external" &&
+            resultText.includes(WAIT_EXTERNAL_SENTINEL)
+          ) {
+            waitExternal = true;
+            stepError = undefined;
+            waitExternalId = `timer:${request.task_id}:${i}`;
+          }
         }
-        resultText = out.text;
-        structured = out.structured;
-      } else {
-        if (!ctx.hands) throw new Error("Hands client not provided for scope=hands tool");
-        const handsArgs = step.timeout_sec === undefined || Object.prototype.hasOwnProperty.call(args, "timeout")
-          ? args
-          : { ...args, timeout: stepDeadlineSec };
-        const out = await ctx.hands.callToolFull(step.name, handsArgs, ctx.signal);
-        resultText = out.text;
-        structured = out.structured;
-        if (out.isError) stepError = out.text || "hands tool returned isError";
-        if (
-          stepError &&
-          step.on_fail === "wait_external" &&
-          resultText.includes(WAIT_EXTERNAL_SENTINEL)
-        ) {
-          waitExternal = true;
-          stepError = undefined;
-          waitExternalId = `timer:${request.task_id}:${i}`;
+      } catch (callErr) {
+        stepError = callErr instanceof Error ? callErr.message : String(callErr);
+      }
+
+      toolStats.total_calls++;
+      toolStats.by_tool[step.name] = (toolStats.by_tool[step.name] ?? 0) + 1;
+
+      // Cancellation and the wall-clock bound outrank a late tool answer. A
+      // completed-looking result after either event must not advance the DAG.
+      if (ctx.signal?.aborted) {
+        return failResult(
+          "script aborted by signal", "cancelled",
+          captures, artifacts, toolStats, startedAt,
+        );
+      }
+      if (repeat && nowMs() >= repeatDeadline) {
+        waitExternal = false;
+        waitExternalId = undefined;
+        stepError = undefined;
+        repeatStopped = "max_seconds";
+        break;
+      }
+      if (stepError && !waitExternal) toolStats.error_calls++;
+
+      if (!repeat) break;
+      // An error ends the repetition and is handled by on_fail below, exactly as it
+      // would be for a single attempt.
+      if (stepError || waitExternal) { repeatStopped = "error"; break; }
+      if (repeatSatisfied(repeat, structured)) { repeatStopped = "done"; break; }
+      if (attempt >= repeat.max_attempts) { repeatStopped = "max_attempts"; break; }
+      await onEvent({
+        type: "scriptStep", name: step.name, step: i, status: "repeating", attempt, scope,
+      });
+      if (repeat.interval_sec) {
+        const completedSleep = await sleep(
+          Math.min(repeat.interval_sec * 1000, Math.max(0, repeatDeadline - nowMs())),
+          ctx.signal,
+        );
+        if (!completedSleep) {
+          return failResult(
+            "script aborted by signal", "cancelled",
+            captures, artifacts, toolStats, startedAt,
+          );
         }
       }
-    } catch (callErr) {
-      stepError = callErr instanceof Error ? callErr.message : String(callErr);
-    }
-
-    toolStats.total_calls++;
-    toolStats.by_tool[step.name] = (toolStats.by_tool[step.name] ?? 0) + 1;
-    if (stepError && !waitExternal) toolStats.error_calls++;
-
-    if (!repeat) break;
-    // An error ends the repetition and is handled by on_fail below, exactly as it
-    // would be for a single attempt. Retrying through a failure is a different
-    // feature and a much easier one to get wrong: a step that fails identically
-    // every time would otherwise spend its whole bound discovering that.
-    if (stepError || waitExternal) { repeatStopped = "error"; break; }
-    if (repeatSatisfied(repeat, structured)) { repeatStopped = "done"; break; }
-    if (attempt >= repeat.max_attempts) { repeatStopped = "max_attempts"; break; }
-    if (nowMs() >= repeatDeadline) { repeatStopped = "max_seconds"; break; }
-    if (ctx.signal?.aborted) { repeatStopped = "aborted"; break; }
-    await onEvent({
-      type: "scriptStep", name: step.name, step: i, status: "repeating", attempt, scope,
-    });
-    if (repeat.interval_sec) {
-      await sleep(Math.min(repeat.interval_sec * 1000, Math.max(0, repeatDeadline - nowMs())));
-    }
     }
 
     // A repetition that ran out of bound without its condition holding is a

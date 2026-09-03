@@ -14,6 +14,7 @@
  *   R1 an oversized final_text is truncated, and says so
  *   R2 a 413 sheds the body once instead of retrying it identically
  *   R3 the shed retry still carries the outcome
+ *   R4 a first 413 on attempt three still sends the lean body exactly once
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -97,4 +98,31 @@ test("R3 the shed retry still carries the outcome", async () => {
   assert.equal(cap.bodies[1].abort_reason, "error");
   assert.equal(cap.bodies[1].failure_reason, "sandbox_lost");
   assert.equal(cap.bodies[1].turns, 7);
+});
+
+test("R4 a first 413 on attempt three gets one lean-body attempt", async () => {
+  const original = globalThis.fetch;
+  const cap = capture([500, 503, 413, 200]);
+  try {
+    await postAgentDone(REQUEST, result({ captures: { report: "payload" } }));
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(cap.bodies.length, 4);
+  assert.deepEqual(cap.bodies[2].captures, { report: "payload" });
+  assert.deepEqual(cap.bodies[3].captures, {});
+});
+
+test("R4b the dedicated lean-body attempt is still bounded", async () => {
+  const original = globalThis.fetch;
+  const cap = capture([500, 503, 413, 413]);
+  try {
+    await assert.rejects(
+      () => postAgentDone(REQUEST, result({ captures: { report: "payload" } })),
+      /HTTP 413/,
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(cap.bodies.length, 4, "the lean body was retried more than once");
 });

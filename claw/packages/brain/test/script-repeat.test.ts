@@ -20,6 +20,7 @@
  *   G2 an absent or unstructured result is not satisfaction
  *   G3 both bounds stop the loop, and giving up is a failure
  *   G4 an error ends the repetition rather than being retried through
+ *   G6-G9 cancellation, interval waits, late success, and wait timeout wiring
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -156,6 +157,7 @@ test("G5 a step with no repeat still runs exactly once", async () => {
 test("G6 an aborted run stops repeating", async () => {
   const controller = new AbortController();
   let seen = 0;
+  const events: Array<Record<string, unknown>> = [];
   const client = {
     callToolFull: async () => {
       if (++seen === 2) controller.abort();
@@ -165,8 +167,83 @@ test("G6 an aborted run stops repeating", async () => {
   const result = await runScript(
     request(WAIT_STEP),
     { hands: client, signal: controller.signal },
+    async (event) => { events.push(event); },
+  );
+  assert.equal(seen, 2, `kept calling after abort: ${seen}`);
+  assert.equal(result.abortReason, "cancelled");
+  assert.match(result.failureReason ?? "", /aborted by signal/);
+  assert.equal(
+    events.some((event) => event.type === "scriptStep" && event.status === "completed"),
+    false,
+    "a cancelled final step was announced as completed",
+  );
+});
+
+test("G7 cancelling an interval sleep returns without another attempt", async () => {
+  const controller = new AbortController();
+  const step: ScriptStep = {
+    ...WAIT_STEP,
+    repeat: {
+      until: { path: "finished", equals: true },
+      max_attempts: 5,
+      max_seconds: 60,
+      interval_sec: 30,
+    },
+  };
+  let calls = 0;
+  const client = {
+    callToolFull: async () => {
+      calls++;
+      setTimeout(() => controller.abort(), 10);
+      return { text: "", structured: { finished: false }, isError: false };
+    },
+  } as never;
+  const started = Date.now();
+
+  const result = await runScript(
+    request(step),
+    { hands: client, signal: controller.signal },
     async () => {},
   );
-  assert.ok(seen <= 3, `kept calling after abort: ${seen}`);
-  assert.ok(result.failureReason || result.abortReason, "an aborted run reported nothing");
+
+  assert.equal(result.abortReason, "cancelled");
+  assert.equal(calls, 1);
+  assert.ok(Date.now() - started < 1_000, "cancellation waited out the 30-second interval");
+});
+
+test("G8 a success returned after max_seconds does not advance the graph", async () => {
+  const step: ScriptStep = {
+    ...WAIT_STEP,
+    repeat: { until: { path: "finished", equals: true }, max_attempts: 2, max_seconds: 1 },
+  };
+  const client = {
+    callToolFull: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      return { text: "", structured: { finished: true }, isError: false };
+    },
+  } as never;
+
+  const result = await runScript(request(step), { hands: client }, async () => {});
+
+  assert.equal(result.abortReason, "script_step_failed");
+  assert.match(result.failureReason ?? "", /max_seconds/);
+});
+
+test("G9 wait receives timeout_sec rather than bash's timeout field", async () => {
+  const hands = scriptedHands([{ structured: { finished: true } }]);
+  const step: ScriptStep = { ...WAIT_STEP, timeout_sec: 10 };
+
+  await runScript(request(step), { hands: hands.client }, async () => {});
+
+  assert.equal(hands.calls[0].timeout_sec, 10);
+  assert.equal(Object.prototype.hasOwnProperty.call(hands.calls[0], "timeout"), false);
+});
+
+test("G9b repeat budget bounds wait even without an explicit step timeout", async () => {
+  const hands = scriptedHands([{ structured: { finished: true } }]);
+
+  await runScript(request(WAIT_STEP), { hands: hands.client }, async () => {});
+
+  assert.ok(Number(hands.calls[0].timeout_sec) <= 60);
+  assert.equal(Object.prototype.hasOwnProperty.call(hands.calls[0], "timeout"), false);
 });

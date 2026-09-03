@@ -331,7 +331,8 @@ export async function postAgentDone(
   let lastError: Error | undefined;
   let payload = body;
   let shed = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  let maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
     try {
@@ -348,6 +349,10 @@ export async function postAgentDone(
       if (resp.status === 413 && !shed) {
         shed = true;
         payload = withoutPayload(body);
+        // Ordinary failures get three attempts. If the first size answer only
+        // arrives on the third, grant the newly-built lean payload one distinct
+        // send rather than constructing it and immediately leaving the loop.
+        if (attempt === maxAttempts) maxAttempts++;
         logger.warn({ taskId: request.task_id }, "agent_done.body_shed_after_413");
       }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
@@ -360,7 +365,7 @@ export async function postAgentDone(
       { taskId: request.task_id, attempt, err: lastError.message },
       "agent_done.retry",
     );
-    if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
   }
   throw new AgentDoneDeliveryError(lastError?.message ?? "agent_done callback failed");
 }
