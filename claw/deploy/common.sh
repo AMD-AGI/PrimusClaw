@@ -452,13 +452,40 @@ _nats_workload_adoption() {
         *) echo "the $name Deployment does not read primus-claw-nats-$c, so it is still on the shared credential"
            return 1 ;;
       esac
-      local want have ready
-      want=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
-      have=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || true)
-      ready=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
-      want="${want:-0}"; have="${have:-0}"; ready="${ready:-0}"
-      if [ "$have" != "$want" ] || [ "$ready" = "0" ]; then
-        echo "the $name rollout has not finished ($have/$want updated, $ready ready), so pods on the old credential are still serving"
+      # Rollout completeness, by the same four conditions `kubectl rollout
+      # status` waits on. The obvious pair -- every replica updated, at least
+      # one ready -- is satisfied in the middle of a rolling update: with
+      # maxUnavailable 0 the new ReplicaSet can hold both replicas with one
+      # Ready while the old ReplicaSet still has a Ready pod serving on the old
+      # credential. `status.replicas` counts pods across every ReplicaSet the
+      # Deployment owns, so it is the field that says whether any old pod is
+      # left; `updatedReplicas` alone cannot, because it only ever describes
+      # the new one.
+      local want have ready total gen seen
+      _dep() {
+        kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath="{$1}" 2>/dev/null || true
+      }
+      want=$(_dep .spec.replicas);            want="${want:-0}"
+      have=$(_dep .status.updatedReplicas);   have="${have:-0}"
+      ready=$(_dep .status.readyReplicas);    ready="${ready:-0}"
+      total=$(_dep .status.replicas);         total="${total:-0}"
+      gen=$(_dep .metadata.generation);       gen="${gen:-0}"
+      seen=$(_dep .status.observedGeneration); seen="${seen:-0}"
+      local state="$have/$want updated, $ready ready, $total pods, generation $seen/$gen observed"
+      if [ "$seen" -lt "$gen" ] 2>/dev/null; then
+        echo "the $name Deployment has been changed since the controller last acted on it ($state), so what is running is not what the spec asks for"
+        return 1
+      fi
+      if [ "$want" = "0" ] || [ "$have" != "$want" ]; then
+        echo "the $name rollout has not finished ($state), so pods on the old credential are still serving"
+        return 1
+      fi
+      if [ "$total" != "$have" ]; then
+        echo "the $name Deployment still owns pods from an older ReplicaSet ($state): they hold the shared credential and are still taking traffic"
+        return 1
+      fi
+      if [ "$ready" != "$have" ]; then
+        echo "the $name rollout is not complete ($state): a replacement pod is not Ready yet, so the update can still roll back onto the old credential"
         return 1
       fi
       ;;

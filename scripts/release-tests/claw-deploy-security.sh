@@ -199,9 +199,13 @@ case "$args" in
     name="${args#*get deployment }"; name="${name%% *}"; comp="${name#primus-claw-}"
     case "$args" in
       *secretKeyRef.name*) val "refs-$comp" || exit 0 ;;
-      *".spec.replicas}"*) val "replicas-$comp" | awk '{print $1}' ;;
-      *updatedReplicas*)   val "replicas-$comp" | awk '{print $2}' ;;
-      *readyReplicas*)     val "replicas-$comp" | awk '{print $3}' ;;
+      # replicas-<comp> is: desired updated ready total generation observed
+      *".spec.replicas}"*)       val "replicas-$comp" | awk '{print $1}' ;;
+      *updatedReplicas*)         val "replicas-$comp" | awk '{print $2}' ;;
+      *readyReplicas*)           val "replicas-$comp" | awk '{print $3}' ;;
+      *".status.replicas}"*)     val "replicas-$comp" | awk '{print $4}' ;;
+      *".metadata.generation}"*) val "replicas-$comp" | awk '{print $5}' ;;
+      *observedGeneration*)      val "replicas-$comp" | awk '{print $6}' ;;
       *) exit 1 ;;
     esac
     exit 0 ;;
@@ -222,7 +226,9 @@ adopted() {
   for c in api brain reaper ops; do echo "claw-$c pw-$c" >"$cluster/secret-$c"; done
   for c in api brain; do
     echo "primus-claw-secrets primus-claw-nats-$c" >"$cluster/refs-$c"
-    echo "2 2 2" >"$cluster/replicas-$c"
+    # desired 2, both updated, both Ready, two pods in total (no old
+    # ReplicaSet left) and the controller has acted on the current spec.
+    echo "2 2 2 2 7 7" >"$cluster/replicas-$c"
   done
   echo "primus-claw-secrets primus-claw-nats-reaper" >"$cluster/refs-reaper-cronjob"
   printf 'claw-api\nclaw-brain\nclaw-reaper\nclaw-ops\n' >"$cluster/auth-ok"
@@ -290,11 +296,43 @@ ok "a Deployment that does not read its own credential blocks retirement"
 # 5. The spec is right and the rollout is not finished. Half the pods are still
 #    the old ReplicaSet, authenticating as prod.
 adopted
-echo "2 1 1" >"$cluster/replicas-brain"
+echo "2 1 1 2 8 8" >"$cluster/replicas-brain"
 out="$(blockers)"
 grep -q "^brain (the primus-claw-brain rollout has not finished" <<<"$out" \
   || bad "an unfinished rollout must block retirement, got: $out"
 ok "a rollout still in progress blocks retirement"
+
+# 5b. The rolling update that satisfies the obvious check. With
+#     maxUnavailable 0 the new ReplicaSet takes both replicas before the old
+#     one gives any up: desired 2, updated 2, and one new pod Ready -- which
+#     reads as finished if you only ever look at the new ReplicaSet. The
+#     Deployment owns three pods, and the third is an old-ReplicaSet pod that
+#     is Ready and taking traffic on the shared credential. Retire prod here
+#     and that pod is cut off mid-request.
+adopted
+echo "2 2 2 3 8 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment still owns pods from an older ReplicaSet" <<<"$out" \
+  || bad "an old ReplicaSet pod still serving must block retirement, got: $out"
+ok "a mid-rollout Deployment whose old ReplicaSet still has a pod blocks retirement"
+
+# 5c. No old pods left and a replacement that is not Ready yet. The update can
+#     still fail and roll back onto the old credential, so it is not finished.
+adopted
+echo "2 2 1 2 8 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api rollout is not complete" <<<"$out" \
+  || bad "a replacement pod that is not Ready must block retirement, got: $out"
+ok "a replacement pod that is not Ready blocks retirement"
+
+# 5d. The spec has moved and the controller has not acted on it. Every count
+#     describes the previous generation, so agreeing with it proves nothing.
+adopted
+echo "2 2 2 2 9 8" >"$cluster/replicas-brain"
+out="$(blockers)"
+grep -q "^brain (the primus-claw-brain Deployment has been changed since" <<<"$out" \
+  || bad "an unobserved spec change must block retirement, got: $out"
+ok "status from a generation older than the spec blocks retirement"
 
 # 6. The reaper's CronJob is the case a connection census cannot see at all:
 #    between sweeps there is nothing connected to count, so the spec is the
