@@ -38,7 +38,7 @@ Environment surface:
 | `LITELLM_VALUES_FILE` | Private Helm values carrying `modelList` and provider credentials |
 | `LITELLM_EXISTING_SECRET` | Existing Secret containing `master_key` and `database_url`; prevents either value from entering Helm release values |
 | `LITELLM_PROVIDER_TYPE` / `_URL` / `_API_KEY` | Supply the provider instead of answering the prompt; all three together. The key is stored in a Secret and referenced as `os.environ/`, never written into values |
-| `LITELLM_PROVIDER_VALUES_FILE` | Where to keep the discovered `modelList`; without it the discovery lives only for that run |
+| `LITELLM_PROVIDER_VALUES_FILE` | Writes the discovered `modelList` to a file you keep. Without it there is no copy on disk — the wrapper still carries the deployed one forward on later upgrades, but nothing outside the release holds it |
 | `LITELLM_INGRESS_HOST` | Enables ingress for `/llm-gateway` when set |
 | `LITELLM_IMAGE` | Defaults to a pinned `docker.io/primussafe/litellm` timestamp tag |
 
@@ -60,6 +60,17 @@ mounted with `subPath`, and a `subPath` mount is a copy made at start — kubele
 never refreshes it — so the chart hashes the rendered ConfigMap into the pod
 template as well. Without that, a changed model list or `api_base` would reach
 the ConfigMap and stop there.
+
+The key Secret is named after a hash of the key, so each rotation adds one and
+Helm owns none of them: `helm uninstall` leaves every one behind. A successful
+deploy prunes the ones this release has superseded, keeping the current one and
+one older so a single `helm rollback` still finds its key. After uninstalling,
+remove the rest by label:
+
+```sh
+kubectl -n "$NS" delete secret \
+  -l app.kubernetes.io/managed-by=litellm-deploy.sh,app.kubernetes.io/instance="$RELEASE"
+```
 
 Helm keeps nothing from the previous run, so an upgrade that does not repeat the
 provider config would hand it an empty `modelList`. The wrapper reads what the
