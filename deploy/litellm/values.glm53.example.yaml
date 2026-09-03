@@ -10,12 +10,23 @@
 # or add streaming patches. Point Brain at glm-5.3 separately (LLM_API_STYLE=openai,
 # DEFAULT_MODEL=glm-5.3 matching model_name below).
 #
+# glm-5-3 is the same backend under the dash-form id that Claude Code / some
+# LiteLLM Anthropic routes emit (glm-5.3 -> glm-5-3). Upstream still serves
+# openai/glm-5.3.
+#
 # glm-5.3 has no dedicated upstream key. api_key: dummy is only for an
 # unauthenticated local backend. LiteLLM still requires a non-empty api_key
 # on openai/* routes; the placeholder is not read by the backend.
 
 modelList:
   - model_name: glm-5.3
+    litellm_params:
+      model: openai/glm-5.3
+      api_base: https://example.invalid/v1
+      api_key: dummy
+    model_info:
+      supports_native_streaming: true
+  - model_name: glm-5-3
     litellm_params:
       model: openai/glm-5.3
       api_base: https://example.invalid/v1
