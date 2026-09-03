@@ -19,3 +19,11 @@ app.kubernetes.io/name: {{ include "litellm.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
+
+{{/*
+The Secret holding master_key and database_url: one you already manage when
+secrets.existingSecret is set, otherwise the one this chart renders.
+*/}}
+{{- define "litellm.secretName" -}}
+{{- .Values.secrets.existingSecret | default (include "litellm.fullname" .) -}}
+{{- end -}}
