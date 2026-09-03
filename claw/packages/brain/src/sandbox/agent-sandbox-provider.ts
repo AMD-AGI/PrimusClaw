@@ -154,24 +154,27 @@ function extractHost(entryPoint?: string): string {
  * must never collide with another's.
  */
 /**
- * The lifetime overrides this sandbox should be created with: the caller's
- * value, else the deployment default, else nothing.
+ * The lifetime overrides every sandbox this deployment creates is built with.
  *
  * Sent as Workload Manager create overrides rather than written into the
  * rendered template, which is the difference between a knob and a template
- * explosion. The template name is a content hash, so a value baked into the
- * spec makes every distinct timeout its own CodeInterpreter -- and a knob whose
- * whole point is to differ per workload would then leave one template, and one
- * warm pool, per value. Overrides are the path the Workload Manager documents
- * for exactly this, they cost no template, and an empty one is simply not sent,
- * so a base template that set its own value keeps it.
+ * explosion: the template name is a content hash, so a value baked into the
+ * spec would make every distinct timeout its own CodeInterpreter, and its own
+ * warm pool. An empty one is simply not sent, so a base template that set its
+ * own value keeps it.
+ *
+ * Deployment-wide on purpose, for now. A per-request version needs more than a
+ * field on this type: the value has to reach here through the protocol and the
+ * request normalisation, and it has to join the sandbox reuse fingerprint --
+ * without that last part a session would happily reuse a pod built with a
+ * different lifetime and the caller's value would silently not apply. That is
+ * its own change, and it wants the caller that needs it in the same one.
  */
-export function lifetimeOverrides(params: SandboxCreateParams): Record<string, string> {
-  const idle = params.sessionTimeout?.trim() || AGENT_SANDBOX_SESSION_TIMEOUT;
-  const life = params.maxSessionDuration?.trim() || AGENT_SANDBOX_MAX_SESSION_DURATION;
+export function lifetimeOverrides(): Record<string, string> {
   return {
-    ...(idle ? { sessionTimeout: idle } : {}),
-    ...(life ? { maxSessionDuration: life } : {}),
+    ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
+    ...(AGENT_SANDBOX_MAX_SESSION_DURATION
+      ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
   };
 }
 
@@ -265,7 +268,7 @@ export class AgentSandboxProvider implements SandboxProvider {
         overrides: {
           environment: params.env,
           ...(params.labels ? { labels: params.labels } : {}),
-          ...lifetimeOverrides(params),
+          ...lifetimeOverrides(),
         },
       }),
       timeoutMs: CREATE_TIMEOUT_MS,

@@ -97,65 +97,47 @@ test("a differing pool size would select a differing template", () => {
 // Until these existed every sandbox took 15m and 24h no matter what it was for.
 //
 // They travel as Workload Manager create overrides, not in the rendered
-// template, and the second half of that is what these pin: the template name is
-// a content hash, so baking a per-workload value into the spec would give every
-// distinct timeout its own CodeInterpreter -- and its own warm pool.
+// template, and that is what these pin: the template name is a content hash, so
+// baking a value into the spec would give every distinct timeout its own
+// CodeInterpreter -- and its own warm pool.
 
-test("nothing is sent when neither the caller nor the deployment asked", () => {
-  assert.deepEqual(
-    lifetimeOverrides(params),
-    {
-      ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
-      ...(AGENT_SANDBOX_MAX_SESSION_DURATION ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
-    },
-    "an override that is sent empty is still an override: it would replace a "
-      + "base template's own value with nothing",
-  );
+test("what is sent is what the deployment configured", () => {
+  assert.deepEqual(lifetimeOverrides(), {
+    ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
+    ...(AGENT_SANDBOX_MAX_SESSION_DURATION
+      ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
+  });
 });
 
-test("a caller's values are sent as overrides", () => {
-  assert.deepEqual(
-    lifetimeOverrides({ ...params, sessionTimeout: "6h", maxSessionDuration: "72h" }),
-    { sessionTimeout: "6h", maxSessionDuration: "72h" },
-  );
-});
-
-test("a caller beats the deployment default", () => {
-  const got = lifetimeOverrides({ ...params, sessionTimeout: "6h" });
-
-  assert.equal(got.sessionTimeout, "6h",
-    "the per-request knob is the one a long-running workload can reach without "
-      + "moving the floor for every other sandbox");
-});
-
-test("whitespace is not a request for a zero-length window", () => {
-  const got = lifetimeOverrides({ ...params, sessionTimeout: "   " });
-
-  assert.equal(got.sessionTimeout, AGENT_SANDBOX_SESSION_TIMEOUT || undefined);
-});
-
-test("the two are independent", () => {
-  assert.deepEqual(
-    lifetimeOverrides({ ...params, maxSessionDuration: "72h" }),
-    {
-      ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
-      maxSessionDuration: "72h",
-    },
-    "asking to live longer is not asking for a longer idle window, and a "
-      + "sandbox given the second without the first is still reclaimed early",
-  );
+test("an unset knob is absent, not empty", () => {
+  // An override sent empty is still an override: it would replace a base
+  // template's own value with nothing.
+  const got = lifetimeOverrides();
+  for (const [k, v] of Object.entries(got)) {
+    assert.notEqual(v, "", `${k} was sent as an empty string`);
+  }
+  if (!AGENT_SANDBOX_SESSION_TIMEOUT) {
+    assert.ok(!("sessionTimeout" in got), "nothing was configured, so nothing goes");
+  }
 });
 
 test("neither value reaches the template name", () => {
-  // The regression this exists for: adding them to the hash renamed every
-  // template on upgrade even for deployments that set nothing, orphaning the
-  // old CodeInterpreters and -- with a warm pool -- leaving a pool behind each.
-  const plain = templateHashKey(foreignBase, params);
+  // The regression this exists for: putting them in the hash renamed every
+  // template on upgrade even for deployments that set nothing, orphaning the old
+  // CodeInterpreters and -- with a warm pool -- leaving a pool behind each.
+  const a = templateHashKey(foreignBase, params);
+  const b = templateHashKey(foreignBase, { ...params, image: params.image });
 
-  assert.equal(
-    templateHashKey(foreignBase, { ...params, sessionTimeout: "6h", maxSessionDuration: "72h" }),
-    plain,
-    "these are per-request overrides; a template that varies with them is a "
-      + "template per workload",
-  );
+  assert.equal(a, b);
+  assert.ok(!a.includes("idle="), "the key must not carry a lifetime at all");
+  assert.ok(!a.includes("life="));
+});
+
+test("the base template's own lifetime survives rendering", () => {
+  const { spec } = renderTemplate(foreignBase, params);
+
+  assert.equal(spec.sessionTimeout, "30m",
+    "a ConfigMap that set its own value meant it; the override path is how a "
+      + "deployment changes its mind, not the renderer");
+  assert.equal(spec.maxSessionDuration, "48h");
 });

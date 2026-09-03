@@ -212,33 +212,54 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * moving the floor for all of them.
  */
 /**
- * A Go duration in whole nanoseconds, or null if it is not one worth sending.
+ * A Go duration in whole nanoseconds, or null if `time.ParseDuration` would not
+ * give a positive one.
  *
- * Three ways a well-formed string is still not a value the Workload Manager will
- * use, and it refuses all three the same way -- silently, leaving the default in
- * place while the operator believes they configured something:
+ * Mirrors Go's arithmetic rather than approximating it, because "close enough"
+ * here means a value this accepts and the Workload Manager then drops without a
+ * word -- the operator reads their setting back from the Deployment and believes
+ * it took. Three ways that happened with float maths and a range check:
  *
- *   `0s`       parses, but the override is only applied when positive
- *   `0.1ns`    parses to zero, because a Go duration is whole nanoseconds
- *   `1e6h`     overflows int64 and does not parse at all
+ *   `0s`             parses; the override is applied only when positive
+ *   `0.1ns`          Go truncates each segment to whole nanoseconds, so this is
+ *                    zero -- and `0.6ns0.6ns` is zero twice, not one
+ *   `9223372036854775808ns`
+ *                    one past int64; a double rounds it to exactly int64 max and
+ *                    the range check passed it, while Go refuses to parse it
  *
- * Nanoseconds rather than milliseconds so the truncation happens here, in the
- * same units and the same direction Go does it.
+ * So: BigInt for the accumulation, per-segment truncation in the same place Go
+ * does it, and the overflow check Go makes before each multiply.
  */
-const GO_DURATION_NS: Record<string, number> = {
-  ns: 1, us: 1e3, "\u00b5s": 1e3, ms: 1e6, s: 1e9, m: 6e10, h: 3.6e12,
+const GO_DURATION_UNIT_NS: Record<string, bigint> = {
+  ns: 1n, us: 1_000n, "\u00b5s": 1_000n, ms: 1_000_000n,
+  s: 1_000_000_000n, m: 60_000_000_000n, h: 3_600_000_000_000n,
 };
-const GO_DURATION_MAX_NS = 2 ** 63 - 1;
+const GO_DURATION_MAX_NS = (1n << 63n) - 1n;
 
-export function goDurationNs(value: string): number | null {
+export function goDurationNs(value: string): bigint | null {
   if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(value)) return null;
-  let total = 0;
-  for (const [, n, unit] of value.matchAll(/(\d+(?:\.\d+)?)(ns|us|\u00b5s|ms|s|m|h)/g)) {
-    total += Number(n) * GO_DURATION_NS[unit];
+
+  let total = 0n;
+  for (const m of value.matchAll(/(\d+)(?:\.(\d+))?(ns|us|\u00b5s|ms|s|m|h)/g)) {
+    const [, whole, frac, unit] = m;
+    const unitNs = GO_DURATION_UNIT_NS[unit];
+
+    let v = BigInt(whole);
+    if (v > GO_DURATION_MAX_NS / unitNs) return null;
+    v *= unitNs;
+
+    if (frac) {
+      // Go computes this term in float64 and truncates it, per segment. Doing
+      // the same -- rather than carrying the fraction exactly -- is what makes
+      // `0.1ns` a zero here as well.
+      const scale = 10 ** frac.length;
+      v += BigInt(Math.trunc(Number(frac) * (Number(unitNs) / scale)));
+    }
+
+    total += v;
+    if (total > GO_DURATION_MAX_NS) return null;
   }
-  const whole = Math.trunc(total);
-  if (!Number.isFinite(whole) || whole <= 0 || whole > GO_DURATION_MAX_NS) return null;
-  return whole;
+  return total > 0n ? total : null;
 }
 
 function resolveAgentSandboxSessionTimeout(): string {
