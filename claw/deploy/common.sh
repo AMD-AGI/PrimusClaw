@@ -348,6 +348,180 @@ _missing_nats_identities() {
   return 1
 }
 
+# ── Is an identity ADOPTED, or merely configured? ────────────────────────
+#
+# The check above reads the operator's own inputs, which is the weaker half of
+# the question: the environment says what the next render will contain, not
+# what the cluster is running. Export the four passwords and set
+# NATS_RETIRE_PROD in one invocation and every input is present while nothing
+# has been deployed -- the workloads are still authenticating as prod, and
+# retiring it is one-way. So the evidence has to come from the cluster and
+# from the NATS server, not from this shell.
+#
+# Three independent things must hold for each identity:
+#
+#   provisioned  the Secret primus-claw-nats-<c> exists and holds the same
+#                password that is configured here. A mismatch means the
+#                cluster is a render behind, and the credential the workload
+#                actually has is not the one about to become the only way in.
+#   adopted      the live workload spec reads that Secret and its rollout is
+#                complete, so the running pods hold it. api and brain are
+#                Deployments; reaper is a CronJob whose spec is the evidence
+#                (it need not have run); ops has no workload at all -- it is
+#                the credential upgrade.sh borrows, so the Secret and the
+#                probe are everything there is to check.
+#   functional   NATS accepts that user and password. This is the half no
+#                amount of Kubernetes inspection can answer: nats-values.yaml
+#                may not have been applied, or the user may exist with a
+#                different password, and in both cases the workload is still
+#                running on prod without knowing it.
+#
+# Fails closed. A probe that cannot reach the cluster is not evidence that
+# retirement is safe, and this is the one decision where "unknown" and "no"
+# have to mean the same thing.
+#
+# Prints one line per identity that is not adopted, and returns non-zero.
+
+# Quote a value for the `sh -c` that runs inside the nats-box pod. Passwords
+# are operator-supplied and go into a command line; without this a quote in
+# one silently changes what runs there.
+_shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+_nats_secret_value() {
+  kubectl get secret "$1" -n "$NAMESPACE" \
+    -o jsonpath="{.data.$2}" 2>/dev/null | base64 -d 2>/dev/null || true
+}
+
+# The two strategies upgrade.sh's nats_kv_put uses, in the same order: the
+# long-running nats-box when the chart deployed one, a throwaway pod when it
+# did not.
+_nats_box_exec() {
+  local cmd="$1" pod
+  pod=$(kubectl get pods -n "$NAMESPACE" \
+    -l "app.kubernetes.io/name=nats-box,app.kubernetes.io/instance=primus-claw-nats" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [ -z "$pod" ]; then
+    pod=$(kubectl get pods -n "$NAMESPACE" 2>/dev/null \
+      | awk '$1 ~ /^primus-claw-nats-box/ && $3 == "Running" {print $1; exit}' || true)
+  fi
+  if [ -n "$pod" ]; then
+    kubectl exec -n "$NAMESPACE" "$pod" -- sh -c "$cmd"
+    return $?
+  fi
+  kubectl run "nats-adoption-probe-$$" --rm -i --restart=Never \
+    -n "$NAMESPACE" --image="${NATS_BOX_IMAGE:-docker.io/natsio/nats-box:0.14.5}" \
+    --command -- sh -c "$cmd"
+}
+
+# host:port with any credentials stripped. The stored URL may already carry
+# user:pass, and nats://user:pass@user:pass@host is the shape the CLI rejects
+# without saying why -- the bug nats_kv_put documents.
+_nats_server_hostport() {
+  local url rest
+  url="$(_nats_secret_value primus-claw-secrets NATS_URL)"
+  [ -n "$url" ] || url="nats://primus-claw-nats.${NAMESPACE}.svc.cluster.local:4222"
+  rest="${url#nats://}"
+  printf '%s\n' "${rest##*@}"
+}
+
+# Does NATS accept this user and password?
+#
+# `nats rtt` is a protocol-level round trip: it proves the server authenticated
+# the connection without requiring a single subject permission. Anything that
+# publishes or subscribes would confuse "these credentials are refused" with
+# "this user is not allowed on that subject" -- opposite answers, and the
+# second one is what a correctly least-privileged user is supposed to give.
+_nats_auth_probe() {
+  local user="$1" pass="$2" url
+  url="nats://${user}:${pass}@$(_nats_server_hostport)"
+  _nats_box_exec "nats rtt --server=$(_shq "$url")" >/dev/null 2>&1
+}
+
+# Prints why this component's workload has not adopted its identity, and
+# returns non-zero. Silent and 0 when it has.
+_nats_workload_adoption() {
+  local c="$1" refs name
+  case "$c" in
+    api|brain)
+      name="primus-claw-$c"
+      refs=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[*].env[*].valueFrom.secretKeyRef.name}' \
+        2>/dev/null || true)
+      case " $refs " in
+        *" primus-claw-nats-$c "*) ;;
+        *) echo "the $name Deployment does not read primus-claw-nats-$c, so it is still on the shared credential"
+           return 1 ;;
+      esac
+      local want have ready
+      want=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+      have=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || true)
+      ready=$(kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+      want="${want:-0}"; have="${have:-0}"; ready="${ready:-0}"
+      if [ "$have" != "$want" ] || [ "$ready" = "0" ]; then
+        echo "the $name rollout has not finished ($have/$want updated, $ready ready), so pods on the old credential are still serving"
+        return 1
+      fi
+      ;;
+    reaper)
+      refs=$(kubectl get cronjob primus-claw-workspace-reaper -n "$NAMESPACE" \
+        -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[*].env[*].valueFrom.secretKeyRef.name}' \
+        2>/dev/null || true)
+      case " $refs " in
+        *" primus-claw-nats-reaper "*) ;;
+        *) echo "the primus-claw-workspace-reaper CronJob does not read primus-claw-nats-reaper, so the next sweep would authenticate as prod"
+           return 1 ;;
+      esac
+      ;;
+    ops) : ;;
+  esac
+  return 0
+}
+
+_unadopted_nats_identities() {
+  local unadopted=() c var configured user pass why
+  for c in api brain reaper ops; do
+    var="NATS_PASSWORD_$(echo "$c" | tr '[:lower:]' '[:upper:]')"
+    configured="${!var:-}"
+    user="$(_nats_secret_value "primus-claw-nats-$c" NATS_USER)"
+    pass="$(_nats_secret_value "primus-claw-nats-$c" NATS_PASSWORD)"
+    if [ -z "$user" ] || [ -z "$pass" ]; then
+      unadopted+=("$c (no primus-claw-nats-$c Secret in $NAMESPACE: this identity has never been deployed)")
+      continue
+    fi
+    if [ -n "$configured" ] && [ "$configured" != "$pass" ]; then
+      unadopted+=("$c (the deployed Secret holds a different password than $var: the cluster is a render behind)")
+      continue
+    fi
+    if ! why="$(_nats_workload_adoption "$c")"; then
+      unadopted+=("$c ($why)")
+      continue
+    fi
+    if ! _nats_auth_probe "$user" "$pass"; then
+      unadopted+=("$c (NATS refused '$user': the user is not in the applied nats-values.yaml, its password differs, or the server could not be reached)")
+      continue
+    fi
+  done
+  [ ${#unadopted[@]} -eq 0 ] && return 0
+  printf '%s\n' "${unadopted[@]}"
+  return 1
+}
+
+# The whole gate, in the order that costs least: what is configured here,
+# then what the cluster and the server say. Prints every blocker it found and
+# returns non-zero; prints nothing and returns 0 when prod may be retired.
+nats_retirement_blockers() {
+  local out
+  if ! out="$(_missing_nats_identities)"; then
+    printf '%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(_unadopted_nats_identities)"; then
+    printf '%s\n' "$out"
+    return 1
+  fi
+  return 0
+}
+
 render_chart() {
   local template="$1" dst="$2"; shift 2
   local preserved=()

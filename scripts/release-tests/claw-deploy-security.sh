@@ -152,8 +152,189 @@ ok "a named workload with no password blocks retirement"
 out="$(NATS_PER_USER_WORKLOADS="api,brain,reaper,ops" \
       NATS_PASSWORD_API=a NATS_PASSWORD_BRAIN=b \
       NATS_PASSWORD_REAPER=r NATS_PASSWORD_OPS=o missing)"
-[ -z "$out" ] || bad "all four identities are provisioned, so retirement must be allowed: $out"
-ok "all four provisioned identities allow retirement"
+[ -z "$out" ] || bad "all four identities are configured, so this check must pass them: $out"
+ok "all four configured identities clear the input-side check"
+
+# ── The decision path itself, against a declared cluster ─────────────────
+#
+# Everything above is the operator's own input. It is the weaker half: the
+# environment describes the render that is ABOUT to happen, so a run that
+# exports the four passwords and retires prod in the same breath satisfies it
+# with nothing deployed -- workloads still on the shared credential, and the
+# credential about to be deleted. These cases drive the real gate, with a
+# cluster and a NATS server whose answers each case declares.
+
+cluster="$tmp/cluster"
+cat >"$tmp/bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+# A cluster made of files. Absent file, absent object.
+args="$*"
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+val() { [ -f "$CLUSTER_DIR/$1" ] && cat "$CLUSTER_DIR/$1" || return 1; }
+
+case "$args" in
+  *"exec"*"nats rtt"*)
+    # The probe. Record the credential it was given -- an adoption check that
+    # authenticates as something other than the identity under test proves
+    # nothing -- then answer as this case declared.
+    creds="${args#*nats://}"; creds="${creds%%@*}"
+    printf '%s\n' "$creds" >>"$CLUSTER_DIR/probes"
+    user="${creds%%:*}"
+    grep -qxF "$user" "$CLUSTER_DIR/auth-ok" 2>/dev/null || exit 1
+    echo "round trip time: 1ms"; exit 0 ;;
+  *"get pods"*nats-box*)
+    echo -n "primus-claw-nats-box-0"; exit 0 ;;
+  *"get secret primus-claw-secrets"*NATS_URL*)
+    b64 "nats://primus-claw-nats.primus-claw.svc.cluster.local:4222"; exit 0 ;;
+  *"get secret primus-claw-nats-"*)
+    name="${args#*get secret }"; name="${name%% *}"; comp="${name#primus-claw-nats-}"
+    line="$(val "secret-$comp")" || exit 1
+    case "$args" in
+      *NATS_USER*) b64 "${line%% *}" ;;
+      *NATS_PASSWORD*) b64 "${line##* }" ;;
+      *) exit 1 ;;
+    esac
+    exit 0 ;;
+  *"get deployment primus-claw-"*)
+    name="${args#*get deployment }"; name="${name%% *}"; comp="${name#primus-claw-}"
+    case "$args" in
+      *secretKeyRef.name*) val "refs-$comp" || exit 0 ;;
+      *".spec.replicas}"*) val "replicas-$comp" | awk '{print $1}' ;;
+      *updatedReplicas*)   val "replicas-$comp" | awk '{print $2}' ;;
+      *readyReplicas*)     val "replicas-$comp" | awk '{print $3}' ;;
+      *) exit 1 ;;
+    esac
+    exit 0 ;;
+  *"get cronjob primus-claw-workspace-reaper"*)
+    val "refs-reaper-cronjob" || exit 0
+    exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$tmp/bin/kubectl"
+
+# A cluster that has adopted all four identities completely. Each case below
+# starts from this and breaks exactly one thing, so what it proves is the
+# thing it broke.
+adopted() {
+  rm -rf "$cluster"; mkdir -p "$cluster"
+  local c
+  for c in api brain reaper ops; do echo "claw-$c pw-$c" >"$cluster/secret-$c"; done
+  for c in api brain; do
+    echo "primus-claw-secrets primus-claw-nats-$c" >"$cluster/refs-$c"
+    echo "2 2 2" >"$cluster/replicas-$c"
+  done
+  echo "primus-claw-secrets primus-claw-nats-reaper" >"$cluster/refs-reaper-cronjob"
+  printf 'claw-api\nclaw-brain\nclaw-reaper\nclaw-ops\n' >"$cluster/auth-ok"
+}
+
+# Runs the gate deploy.sh actually calls, against $cluster.
+blockers() {
+  (
+    export PATH="$tmp/bin:$PATH" CLUSTER_DIR="$cluster" NAMESPACE=primus-claw
+    export NATS_PER_USER_WORKLOADS="api,brain,reaper,ops"
+    export NATS_PASSWORD_API=pw-api NATS_PASSWORD_BRAIN=pw-brain
+    export NATS_PASSWORD_REAPER=pw-reaper NATS_PASSWORD_OPS=pw-ops
+    SCRIPT_DIR="$deploy_dir"
+    # shellcheck disable=SC1091
+    source "$deploy_dir/common.sh"
+    nats_retirement_blockers || true
+  )
+}
+
+# 1. Configured everywhere, deployed nowhere. This is the run the old check
+#    waved through: four exported passwords and an empty cluster.
+rm -rf "$cluster"; mkdir -p "$cluster"
+out="$(blockers)"
+for c in api brain reaper ops; do
+  grep -q "^$c (no primus-claw-nats-$c Secret" <<<"$out" \
+    || bad "an identity with nothing deployed must block retirement, got: $out"
+done
+ok "four configured passwords and an empty cluster block retirement"
+
+# 2. Everything adopted: the gate has to get out of the way, or it has simply
+#    banned retirement.
+adopted
+out="$(blockers)"
+[ -z "$out" ] || bad "a fully adopted cluster must allow retirement, got: $out"
+ok "a cluster that has adopted all four identities allows retirement"
+
+# The probe must have authenticated as each identity in turn, with that
+# identity's own deployed password. Probing as one credential four times would
+# pass every case here and prove nothing about the other three.
+for c in api brain reaper ops; do
+  grep -qxF "claw-$c:pw-$c" "$cluster/probes" \
+    || bad "the probe never authenticated as claw-$c: $(cat "$cluster/probes" 2>/dev/null)"
+done
+ok "the probe authenticates as each identity with its own deployed credential"
+
+# 3. The Secret is deployed but holds a different password than the one
+#    configured here -- the cluster is a render behind, and the credential the
+#    workload holds is not the one that is about to become the only way in.
+adopted
+echo "claw-brain pw-brain-old" >"$cluster/secret-brain"
+out="$(blockers)"
+grep -q "^brain (the deployed Secret holds a different password" <<<"$out" \
+  || bad "a stale deployed password must block retirement, got: $out"
+ok "a deployed password that differs from the configured one blocks retirement"
+
+# 4. The Secret exists and the workload does not read it. A Secret can be
+#    applied a full deploy before the Deployment that consumes it.
+adopted
+echo "primus-claw-secrets" >"$cluster/refs-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment does not read primus-claw-nats-api" <<<"$out" \
+  || bad "a workload that does not read its Secret must block retirement, got: $out"
+ok "a Deployment that does not read its own credential blocks retirement"
+
+# 5. The spec is right and the rollout is not finished. Half the pods are still
+#    the old ReplicaSet, authenticating as prod.
+adopted
+echo "2 1 1" >"$cluster/replicas-brain"
+out="$(blockers)"
+grep -q "^brain (the primus-claw-brain rollout has not finished" <<<"$out" \
+  || bad "an unfinished rollout must block retirement, got: $out"
+ok "a rollout still in progress blocks retirement"
+
+# 6. The reaper's CronJob is the case a connection census cannot see at all:
+#    between sweeps there is nothing connected to count, so the spec is the
+#    only evidence there is.
+adopted
+echo "primus-claw-secrets" >"$cluster/refs-reaper-cronjob"
+out="$(blockers)"
+grep -q "^reaper (the primus-claw-workspace-reaper CronJob does not read" <<<"$out" \
+  || bad "a CronJob still on the shared credential must block retirement, got: $out"
+ok "a reaper CronJob still on the shared credential blocks retirement"
+
+# 7. Kubernetes says adopted and NATS refuses the credential -- nats-values.yaml
+#    was never applied, or the user exists with a different password. The
+#    workload is running on prod and nothing in the cluster says so.
+adopted
+printf 'claw-brain\nclaw-reaper\nclaw-ops\n' >"$cluster/auth-ok"
+out="$(blockers)"
+grep -q "^api (NATS refused 'claw-api'" <<<"$out" \
+  || bad "a credential NATS does not accept must block retirement, got: $out"
+ok "an identity NATS refuses blocks retirement even when the cluster looks right"
+
+# 8. The server cannot be reached. Unknown and no have to mean the same thing
+#    for a decision that cannot be undone.
+adopted
+rm -f "$cluster/auth-ok"
+out="$(blockers)"
+grep -q "^api (NATS refused" <<<"$out" || bad "an unreachable server must block retirement, got: $out"
+ok "a probe that cannot get an answer blocks retirement"
+
+# 9. deploy.sh has to run this gate before it strips the user, not after. The
+#    check is on the call, because the retirement branch is inline in a script
+#    that runs top to bottom and cannot be sourced.
+retire_block="$(sed -n '/NATS_RETIRE_PROD:-false/,/_strip_prod=./p' "$deploy_dir/deploy.sh")"
+grep -q 'nats_retirement_blockers' <<<"$retire_block" \
+  || bad "deploy.sh retires prod without running the adoption gate"
+grep -q 'exit 1' <<<"$retire_block" \
+  || bad "deploy.sh must abort, not warn, when the gate reports blockers"
+[ "$(grep -c '__PROD_USER_BEGIN__' <<<"$retire_block")" -ge 1 ] \
+  || bad "the retirement branch no longer strips the prod user block"
+ok "deploy.sh runs the gate before stripping the prod user, and aborts on blockers"
 
 echo "==> chart render guards"
 

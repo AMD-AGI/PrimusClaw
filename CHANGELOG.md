@@ -110,8 +110,11 @@ record it.
   instead of the single all-access `prod` account. Off until
   `NATS_PER_USER_WORKLOADS` names a component, so the fleet moves one at a
   time; `NATS_RETIRE_PROD=true` removes the all-access user once nothing is
-  left on it. See `deploy/nats-values.yaml` for the allow-lists and for the
-  connection census that decides when retiring it is safe.
+  left on it, and refuses unless every built-in identity is deployed, adopted
+  by its workload and accepted by the NATS server -- retirement is one-way, and
+  a connection census cannot see a CronJob between sweeps. See
+  `deploy/nats-values.yaml` for the allow-lists and for the census that decides
+  about clients this repo does not deploy.
 - Brain checkpoints can be sealed with AES-256-GCM
   (`brain.checkpointWriteVersion: 4` plus `secret.brainCheckpointKey`) instead
   of being rewritten by the observability redactor. Off by default, and readers

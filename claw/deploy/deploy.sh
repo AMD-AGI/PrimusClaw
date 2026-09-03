@@ -244,28 +244,35 @@ if ! $SKIP_NATS; then
   # nats-values.yaml.
   _strip_prod=""
   if [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
-    # Retirement is gated on all four built-in identities actually being
-    # provisioned, not on the operator having looked at a connection census.
-    # reaper is a CronJob and ops runs only during an upgrade, so a census
-    # taken at any given moment can easily show neither -- and reading that as
-    # "nothing else uses prod" retires it out from under the workloads that
-    # were merely idle. See _missing_nats_identities in common.sh.
+    # Retirement is gated on all four built-in identities having actually been
+    # adopted, not on the operator having looked at a connection census and
+    # not on this shell's own inputs. reaper is a CronJob and ops runs only
+    # during an upgrade, so a census taken at any given moment can easily show
+    # neither -- and reading that as "nothing else uses prod" retires it out
+    # from under the workloads that were merely idle. Environment variables are
+    # no better on their own: they say what the next render will contain, so
+    # exporting the four passwords and retiring in one invocation would pass a
+    # check that reads only them while nothing is deployed. The gate asks the
+    # cluster and the NATS server instead. See nats_retirement_blockers in
+    # common.sh.
     #
     # Loud rather than skipped: an operator who asked for retirement and got a
     # silently unretired cluster would believe the all-access user was gone.
-    if ! _missing="$(_missing_nats_identities)"; then
-      echo "ERROR: NATS_RETIRE_PROD=true, but these identities are not provisioned:" >&2
-      printf '%s\n' "$_missing" | sed 's/^/  - /' >&2
+    log "  NATS: verifying every built-in identity is deployed and accepted before retiring prod"
+    if ! _blockers="$(nats_retirement_blockers)"; then
+      echo "ERROR: NATS_RETIRE_PROD=true, but these identities are not in use yet:" >&2
+      printf '%s\n' "$_blockers" | sed 's/^/  - /' >&2
       echo "" >&2
       echo "  Removing the all-access 'prod' user would cut off every workload still" >&2
       echo "  using the shared credential. Add each component to" >&2
-      echo "  NATS_PER_USER_WORKLOADS, deploy so it adopts its own identity, and" >&2
-      echo "  retire prod after that -- having also run the connection census in" >&2
-      echo "  deploy/nats-values.yaml for clients that are not in this repo." >&2
+      echo "  NATS_PER_USER_WORKLOADS, deploy so it adopts its own identity, confirm" >&2
+      echo "  the rollout finished, and retire prod after that -- having also run the" >&2
+      echo "  connection census in deploy/nats-values.yaml for clients that are not in" >&2
+      echo "  this repo." >&2
       exit 1
     fi
     log "  NATS: retiring the all-access prod user (NATS_RETIRE_PROD=true)"
-    log "  NATS: all four built-in identities are provisioned"
+    log "  NATS: all four built-in identities are deployed and authenticate"
     _strip_prod='/__PROD_USER_BEGIN__/,/__PROD_USER_END__/d'
   fi
   awk -v block="$DEV_BLOCKS" '
