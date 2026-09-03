@@ -251,6 +251,21 @@ const MAX_FINAL_TEXT_BYTES = 256 * 1024;
  */
 const MAX_DOWNGRADED_REASON_BYTES = 8 * 1024;
 
+/**
+ * Cap for every other string a downgraded body keeps.
+ *
+ * The fields below are a node name, a termination reason, an abort reason, a
+ * task id and an external id -- all of which are tens of bytes when the system
+ * producing them is behaving. The cap is not sized for those; it is sized so
+ * that one that is *not* behaving, such as a SaFE payload carrying a megabyte
+ * in `message`, cannot be the reason the shed body is refused as well.
+ */
+const MAX_DOWNGRADED_FIELD_BYTES = 1024;
+
+function truncateField(text: string, label: string): string {
+  return truncate(text, MAX_DOWNGRADED_FIELD_BYTES, label);
+}
+
 function truncate(text: string, maxBytes: number, label: string): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const head = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
@@ -272,9 +287,30 @@ function truncateFinalText(text: string): string {
  * lands.
  */
 function withoutPayload(body: AgentDoneBody): AgentDoneBody {
-  return {
-    ...body,
+  // Built field by field rather than by spreading `body` and overwriting the
+  // large ones. A spread keeps whatever it was not told about, so the size of
+  // the result depended on fields nobody had thought of: `token_usage`,
+  // `metadata`, and the `platform_*` strings all passed through at their
+  // original size. Any one of them being the reason for the 413 meant the shed
+  // body was refused too, all attempts failed, the JetStream message never
+  // acked, and every redelivery repeated it -- the exact loop this function
+  // exists to break. Listing what survives makes the bound a property of the
+  // function instead of a property of the input.
+  const downgraded: AgentDoneBody = {
+    task_id: body.task_id ? truncateField(body.task_id, "task id") : body.task_id,
     final_text: "[dropped: the callback body exceeded the size the API accepts]",
+    captures: {},
+    artifacts: [],
+    // Dropped, not truncated: it is accounting rather than outcome, it has no
+    // declared shape here to trim to, and a row that lands without its usage
+    // numbers is a far smaller loss than one that never lands.
+    token_usage: undefined,
+    turns: body.turns,
+    tool_stats: undefined,
+    error_count: body.error_count,
+    abort_reason: body.abort_reason
+      ? truncateField(body.abort_reason, "abort reason")
+      : body.abort_reason,
     // failure_reason survived the downgrade, and on the script path it carries
     // a failing step's entire tool output -- uncapped. A multi-MiB stderr made
     // it the dominant field, so the shed body was still over the limit, all
@@ -284,10 +320,37 @@ function withoutPayload(body: AgentDoneBody): AgentDoneBody {
     failure_reason: body.failure_reason
       ? truncate(body.failure_reason, MAX_DOWNGRADED_REASON_BYTES, "failure reason")
       : body.failure_reason,
-    captures: {},
-    artifacts: [],
-    tool_stats: undefined,
   };
+
+  // The one part of `metadata` that is load-bearing rather than informational:
+  // a run ending in `waiting_external` is found again by this id alone, so
+  // shedding it would strand the row where no resolver tick can reach it.
+  // Carried as its own object so nothing else under `metadata` rides along.
+  const externalId = body.metadata?.external_id;
+  if (typeof externalId === "string" && externalId) {
+    downgraded.metadata = { external_id: truncateField(externalId, "external id") };
+  }
+
+  // Kept because they are the platform's account of how the run ended, which is
+  // what a shed body is for -- and bounded because they are the half of the
+  // body this process did not author.
+  if (body.platform_message) {
+    downgraded.platform_message = truncateField(body.platform_message, "platform message");
+  }
+  if (body.platform_node) {
+    downgraded.platform_node = truncateField(body.platform_node, "platform node");
+  }
+  if (body.platform_container_reason) {
+    downgraded.platform_container_reason = truncateField(
+      body.platform_container_reason,
+      "platform container reason",
+    );
+  }
+  if (typeof body.platform_exit_code === "number") {
+    downgraded.platform_exit_code = body.platform_exit_code;
+  }
+
+  return downgraded;
 }
 
 /** The platform half of the body, present only when there is something to say. */

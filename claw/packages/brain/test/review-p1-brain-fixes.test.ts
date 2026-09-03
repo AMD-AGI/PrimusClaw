@@ -83,7 +83,11 @@ test("a downgraded callback body caps failure_reason too", async () => {
   // three attempts 413'd and every JetStream redelivery failed identically.
   const src = await import("node:fs/promises")
     .then((fs) => fs.readFile(new URL("../src/tasks/callback.ts", import.meta.url), "utf8"));
-  const fn = src.slice(src.indexOf("function withoutPayload"), src.indexOf("function withoutPayload") + 900);
+  // To the end of the function, not a fixed number of characters from its
+  // start: the cap is a property of the whole downgrade, and a window measured
+  // in bytes silently stops covering it the moment the function grows.
+  const from = src.indexOf("function withoutPayload");
+  const fn = src.slice(from, src.indexOf("\n}", from));
   assert.ok(fn.includes("failure_reason"), "the downgrade must touch failure_reason");
   assert.match(fn, /truncate\(body\.failure_reason, MAX_DOWNGRADED_REASON_BYTES/,
     "with a cap smaller than the one the full body already exceeded");
