@@ -140,8 +140,14 @@ import json, sys
 prefix, api_base, env_name, secret, secret_key, out = sys.argv[1:7]
 data = json.load(sys.stdin)
 items = data.get("data") if isinstance(data, dict) else data
-ids = [it.get("id") if isinstance(it, dict) else it for it in (items or [])]
-ids = [i for i in ids if i]
+if items is None:
+    items = []
+if not isinstance(items, list):
+    # A dict iterates as its keys, which would become model names: a
+    # plausible-looking modelList built out of nothing.
+    sys.exit("unexpected /models response: 'data' is %s, not a list" % type(items).__name__)
+ids = [it.get("id") if isinstance(it, dict) else it for it in items]
+ids = [i for i in ids if isinstance(i, str) and i]
 if not ids:
     sys.exit("no models found in /models response")
 json.dump({
@@ -163,9 +169,21 @@ store_provider_key() {
   local key; key="$(cat)"
   kubectl create namespace "$LITELLM_NAMESPACE" --dry-run=client -o yaml \
     | kubectl apply -f - >/dev/null 2>&1 || true
+  # Labelled so the ones this script leaves behind can be found again: they are
+  # named after the key's hash, so each rotation adds one, and Helm does not own
+  # them -- `helm uninstall` leaves every one of them in the namespace.
   printf '%s' "$key" \
     | kubectl -n "$LITELLM_NAMESPACE" create secret generic "$PROVIDER_KEY_SECRET" \
-        --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o yaml \
+        --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o json \
+    | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+doc.setdefault("metadata", {}).setdefault("labels", {}).update({
+    "app.kubernetes.io/managed-by": "litellm-deploy.sh",
+    "app.kubernetes.io/instance": sys.argv[1],
+})
+json.dump(doc, sys.stdout)
+' "$LITELLM_RELEASE" \
     | kubectl -n "$LITELLM_NAMESPACE" apply -f - >/dev/null \
     || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
 }
@@ -240,12 +258,15 @@ configure_models_interactive() {
   key_hash="$(printf '%s' "$pkey" | sha256sum | cut -c1-10)"
   PROVIDER_KEY_SECRET="$LITELLM_NAME-provider-$key_hash"
 
-  GENERATED_MODELS_FILE="${LITELLM_PROVIDER_VALUES_FILE:-}"
-  if [ -z "$GENERATED_MODELS_FILE" ]; then
-    GENERATED_MODELS_FILE="$(mktemp)"
-    MODELS_TMP_FILES+=("$GENERATED_MODELS_FILE")
+  # Always written to a temp file first. Truncating the destination before the
+  # response has parsed means a provider that answers with an error page
+  # destroys the modelList the operator was keeping there.
+  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ] \
+     && [ "${LITELLM_PROVIDER_VALUES_FILE:-}" = "${LITELLM_VALUES_FILE:-}" ]; then
+    fail "LITELLM_PROVIDER_VALUES_FILE and LITELLM_VALUES_FILE point at the same file"
   fi
-  : >"$GENERATED_MODELS_FILE"
+  GENERATED_MODELS_FILE="$(mktemp)"
+  MODELS_TMP_FILES+=("$GENERATED_MODELS_FILE")
   chmod 600 "$GENERATED_MODELS_FILE"
 
   local count
@@ -253,6 +274,13 @@ configure_models_interactive() {
     || fail "could not parse models response from $models_url"
 
   printf '%s' "$pkey" | store_provider_key
+
+  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ]; then
+    # Only now that the response parsed and the file holds a complete modelList.
+    install -m 600 "$GENERATED_MODELS_FILE" "$LITELLM_PROVIDER_VALUES_FILE" \
+      || fail "could not write $LITELLM_PROVIDER_VALUES_FILE"
+    GENERATED_MODELS_FILE="$LITELLM_PROVIDER_VALUES_FILE"
+  fi
 
   log "discovered $count model(s) from $ptype provider"
   log "provider API key in Secret/$PROVIDER_KEY_SECRET, referenced as os.environ/$PROVIDER_KEY_ENV"
@@ -367,9 +395,25 @@ else
   fi
 
   if [ -z "$LITELLM_MASTER_KEY" ]; then
+    # Only a Secret that is genuinely absent may produce a new key. Treating any
+    # read failure as "first install" -- a transient API error, an RBAC change,
+    # a truncated response -- rotates the master key by accident, and with
+    # LITELLM_SALT_KEY unset that is also the key every model credential in the
+    # database was encrypted with.
     if [ "$DRY_RUN" != "true" ]; then
-      LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
-        -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+      master_err="$(mktemp)"; MODELS_TMP_FILES+=("$master_err")
+      if encoded="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
+           -o jsonpath='{.data.master_key}' 2>"$master_err")"; then
+        if [ -n "$encoded" ]; then
+          LITELLM_MASTER_KEY="$(printf '%s' "$encoded" | base64 -d)" \
+            || fail "Secret/$LITELLM_NAME holds a master_key that is not valid base64"
+        fi
+      elif grep -qi 'NotFound\|secrets .* not found' "$master_err"; then
+        : # no Secret yet, so generating one below is correct
+      else
+        sed 's/^/  /' "$master_err" >&2
+        fail "could not read Secret/$LITELLM_NAME; refusing to generate a new master key over it"
+      fi
     fi
     if [ -z "$LITELLM_MASTER_KEY" ]; then
       LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
@@ -416,7 +460,7 @@ if [ -z "$GENERATED_MODELS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
   carried_err="$(mktemp)"; MODELS_TMP_FILES+=("$carried_err")
   if carried="$(helm -n "$LITELLM_NAMESPACE" get values "$LITELLM_RELEASE" -o json 2>"$carried_err")"; then
     :
-  elif grep -qi "not found" "$carried_err"; then
+  elif grep -qi "release: not found" "$carried_err"; then
     # No release yet: this is a first install, and there is nothing to carry.
     carried=""
   else
@@ -431,29 +475,13 @@ if [ -z "$GENERATED_MODELS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
     CARRIED_VALUES_FILE="$(mktemp)"
     chmod 600 "$CARRIED_VALUES_FILE"
     MODELS_TMP_FILES+=("$CARRIED_VALUES_FILE")
-    # The parser refuses a literal api_key. A release installed before the key
-    # moved into a Secret has one sitting in its values, and copying it forward
-    # would write the plaintext into the new revision too -- quietly undoing the
-    # thing this is all for.
+    # No validation here on purpose: what matters is the modelList that ends
+    # up deployed, and an operator supplying a corrected LITELLM_VALUES_FILE
+    # overrides this one. The check runs on the merged result, below.
     carried_keys="$(printf '%s' "$carried" | python3 -c '
 import json, sys
 out = sys.argv[1]
 cur = json.load(sys.stdin)
-models = cur.get("modelList") or []
-literal = sorted({
-    m.get("model_name", "?") for m in models
-    if isinstance(m, dict)
-    and isinstance(m.get("litellm_params"), dict)
-    and isinstance(m["litellm_params"].get("api_key"), str)
-    and not m["litellm_params"]["api_key"].startswith("os.environ/")
-})
-if literal:
-    sys.exit(
-        "the deployed release stores a literal api_key for: " + ", ".join(literal)
-        + "\nCarrying that forward would copy the plaintext into the new revision."
-        + "\nRe-run with LITELLM_PROVIDER_TYPE/_URL/_API_KEY to rewrite modelList"
-        + "\nagainst a Secret, or supply a corrected LITELLM_VALUES_FILE."
-    )
 keep = {k: cur[k] for k in ("modelList", "providerApiKey") if cur.get(k)}
 if not keep:
     sys.exit(0)
@@ -533,7 +561,89 @@ if [ "$DRY_RUN" = "true" ]; then
   exit 0
 fi
 
+# A rotated database password or master key has to reach the running Pods. Both
+# arrive by secretKeyRef, so rewriting the Secret leaves the Deployment
+# unchanged: helm reports success, rollout status waits on nothing, and the old
+# credentials keep being used until something else happens to restart them.
+# Hashing them into a pod annotation makes the rotation a template change.
+creds_fingerprint=""
+if [ "$USE_EXISTING_SECRET" = "true" ]; then
+  if creds_raw="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_EXISTING_SECRET" \
+       -o jsonpath='{.data.master_key}{.data.database_url}' 2>/dev/null)"; then
+    creds_fingerprint="$(printf '%s' "$creds_raw" | sha256sum | cut -c1-32)"
+  else
+    log "note: could not read Secret/$LITELLM_EXISTING_SECRET; a credential change"
+    log "      in it will not roll the Pods on this run"
+  fi
+else
+  creds_fingerprint="$(printf '%s%s' "$LITELLM_MASTER_KEY" "$LITELLM_DATABASE_URL" \
+    | sha256sum | cut -c1-32)"
+fi
+[ -n "$creds_fingerprint" ] && helm_args+=(--set-string "podAnnotations.checksum/credentials=$creds_fingerprint")
+
+# Validate the modelList that will actually be deployed, not any one source of
+# it. Helm does the merging, so ask Helm: the carried values, the operator's
+# values file and anything discovered this run are all already in helm_args.
+# Checking the carried copy earlier meant an operator handed a corrected values
+# file still hit the refusal -- the documented way out of the problem could not
+# be taken, because their file had not been read yet.
+tmpl_args=()
+for a in "${helm_args[@]}"; do
+  case "$a" in
+    upgrade) tmpl_args+=(template) ;;
+    --install|--create-namespace) ;;
+    *) tmpl_args+=("$a") ;;
+  esac
+done
+if ! rendered="$(helm "${tmpl_args[@]}" 2>&1)"; then
+  printf '%s\n' "$rendered" | sed 's/^/  /' >&2
+  fail "could not render the chart with the values for this deploy"
+fi
+printf '%s' "$rendered" | python3 -c '
+import re, sys
+def val(m):
+    return m.group(1).strip().strip(chr(34)).strip(chr(39))
+bad = sorted({
+    val(m) for m in re.finditer(r"^\s*api_key:\s*(.+)$", sys.stdin.read(), re.M)
+    if not val(m).startswith("os.environ/")
+})
+if bad:
+    sys.exit(
+        "the modelList for this deploy carries a literal api_key: " + ", ".join(bad)
+        + "\nIt would be written into the release values and every revision after"
+        + "\nit. Re-run with LITELLM_PROVIDER_TYPE/_URL/_API_KEY to rewrite modelList"
+        + "\nagainst a Secret, or pass a LITELLM_VALUES_FILE whose modelList uses an"
+        + "\nos.environ/ reference."
+    )
+' || fail "refusing to deploy a modelList that holds a provider key in plain text"
+
 helm "${helm_args[@]}" --wait --timeout 300s
+
+# Each rotation leaves another key Secret behind, and Helm does not own them, so
+# nothing would ever remove them. Prune once the upgrade has succeeded -- not
+# before, because until then the previous release is still the live one and still
+# points at its own. One older Secret is kept so a single `helm rollback` finds
+# the key it was deployed with; anything further back needs the key supplied
+# again.
+#
+# Collected into an array rather than piped: `set -o pipefail` is on, and a grep
+# that selects nothing returns 1, which would end the script here on the very
+# first deploy -- when there is nothing to prune and everything went right.
+if [ -n "$PROVIDER_KEY_SECRET" ]; then
+  provider_secrets=()
+  while IFS= read -r name; do
+    [ -n "$name" ] && [ "$name" != "$PROVIDER_KEY_SECRET" ] && provider_secrets+=("$name")
+  done < <(kubectl -n "$LITELLM_NAMESPACE" get secret \
+    -l "app.kubernetes.io/managed-by=litellm-deploy.sh,app.kubernetes.io/instance=$LITELLM_RELEASE" \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  # Oldest first, so everything but the last entry is older than the one kept.
+  for ((n = 0; n < ${#provider_secrets[@]} - 1; n++)); do
+    if kubectl -n "$LITELLM_NAMESPACE" delete secret "${provider_secrets[$n]}" >/dev/null 2>&1; then
+      log "removed superseded provider key Secret/${provider_secrets[$n]}"
+    fi
+  done
+fi
 
 kubectl -n "$LITELLM_NAMESPACE" rollout status "deployment/$LITELLM_NAME" --timeout=300s
 
