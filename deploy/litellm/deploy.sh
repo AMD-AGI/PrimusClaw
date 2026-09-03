@@ -56,6 +56,15 @@ LITELLM_DATABASE_URL="${LITELLM_DATABASE_URL:-}"
 LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
 LITELLM_VALUES_FILE="${LITELLM_VALUES_FILE:-}"
 LITELLM_EXISTING_SECRET="${LITELLM_EXISTING_SECRET:-}"
+# Captured and removed from the environment here, before anything else runs.
+# helm, kubectl and python are all started further down -- the cluster-info
+# check and the chart probe among them -- and each would inherit the key,
+# readable in /proc/<pid>/environ for as long as it runs.
+PROVIDER_TYPE_IN="${LITELLM_PROVIDER_TYPE:-}"
+PROVIDER_URL_IN="${LITELLM_PROVIDER_URL:-}"
+PROVIDER_KEY_IN="${LITELLM_PROVIDER_API_KEY:-}"
+PROVIDER_VALUES_FILE_IN="${LITELLM_PROVIDER_VALUES_FILE:-}"
+unset LITELLM_PROVIDER_TYPE LITELLM_PROVIDER_URL LITELLM_PROVIDER_API_KEY
 LITELLM_INSTALL_INGRESS="${LITELLM_INSTALL_INGRESS:-true}"
 LITELLM_INGRESS_HOST="${LITELLM_INGRESS_HOST:-}"
 LITELLM_INGRESS_CLASS="${LITELLM_INGRESS_CLASS:-higress}"
@@ -188,41 +197,38 @@ json.dump(doc, sys.stdout)
     || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
 }
 
-configure_models_interactive() {
-  [ "$DRY_RUN" = "true" ] && return 0
+# Resolves the provider from the environment or, failing that, from the
+# operator. Sets PTYPE / PURL / PKEY; kept apart from the discovery itself so
+# that neither half has to be read while thinking about the other.
+collect_provider_input() {
+  PTYPE="$PROVIDER_TYPE_IN"; PURL="$PROVIDER_URL_IN"; PKEY="$PROVIDER_KEY_IN"
 
-  # The provider can also be supplied non-interactively. That is what makes this
-  # path testable at all -- everything below (the key never reaching argv, the
-  # Secret being namespaced and content-addressed, the values file that survives
-  # the next upgrade) used to be reachable only by a human at a terminal, and so
-  # was covered by nothing.
-  local ptype="${LITELLM_PROVIDER_TYPE:-}" purl="${LITELLM_PROVIDER_URL:-}"
-  local pkey="${LITELLM_PROVIDER_API_KEY:-}"
-
-  if [ -n "$ptype$purl$pkey" ]; then
-    [ -n "$ptype" ] && [ -n "$purl" ] && [ -n "$pkey" ] \
+  if [ -n "$PTYPE$PURL$PKEY" ]; then
+    [ -n "$PTYPE" ] && [ -n "$PURL" ] && [ -n "$PKEY" ] \
       || fail "LITELLM_PROVIDER_TYPE, _URL and _API_KEY must be set together"
-    case "$ptype" in anthropic|openai) ;; *) fail "LITELLM_PROVIDER_TYPE must be anthropic or openai" ;; esac
-  else
-    [ -t 0 ] || { log "non-interactive shell; skipping model provider prompt"; return 0; }
-    local ans
-    read -r -p "[litellm] Configure an LLM provider and auto-discover models now? [y/N] " ans
-    case "${ans:-}" in
-      y|Y|yes|YES) ;;
-      *) log "skipping model provider configuration"; return 0 ;;
-    esac
-    while :; do
-      read -r -p "[litellm] Provider type (anthropic/openai): " ptype
-      case "${ptype:-}" in anthropic|openai) break ;; *) echo "  enter 'anthropic' or 'openai'" ;; esac
-    done
-    read -r -p "[litellm] Provider base URL (e.g. https://api.anthropic.com or https://host/v1): " purl
-    read -r -s -p "[litellm] Provider API key: " pkey; echo
+    case "$PTYPE" in anthropic|openai) ;; *) fail "LITELLM_PROVIDER_TYPE must be anthropic or openai" ;; esac
+    return 0
   fi
 
-  # Out of the environment now that they are in locals: everything below runs
-  # helm, kubectl and python as children, and each would otherwise inherit the
-  # key -- visible in /proc/<child>/environ for the life of those processes.
-  unset LITELLM_PROVIDER_TYPE LITELLM_PROVIDER_URL LITELLM_PROVIDER_API_KEY
+  [ -t 0 ] || { log "non-interactive shell; skipping model provider prompt"; return 1; }
+  local ans
+  read -r -p "[litellm] Configure an LLM provider and auto-discover models now? [y/N] " ans
+  case "${ans:-}" in
+    y|Y|yes|YES) ;;
+    *) log "skipping model provider configuration"; return 1 ;;
+  esac
+  while :; do
+    read -r -p "[litellm] Provider type (anthropic/openai): " PTYPE
+    case "${PTYPE:-}" in anthropic|openai) break ;; *) echo "  enter 'anthropic' or 'openai'" ;; esac
+  done
+  read -r -p "[litellm] Provider base URL (e.g. https://api.anthropic.com or https://host/v1): " PURL
+  read -r -s -p "[litellm] Provider API key: " PKEY; echo
+}
+
+configure_models_interactive() {
+  [ "$DRY_RUN" = "true" ] && return 0
+  collect_provider_input || return 0
+  local ptype="$PTYPE" purl="$PURL" pkey="$PKEY"
 
   purl="${purl%/}"
   [ -n "$purl" ] || fail "provider base URL is required"
@@ -261,9 +267,14 @@ configure_models_interactive() {
   # Always written to a temp file first. Truncating the destination before the
   # response has parsed means a provider that answers with an error page
   # destroys the modelList the operator was keeping there.
-  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ] \
-     && [ "${LITELLM_PROVIDER_VALUES_FILE:-}" = "${LITELLM_VALUES_FILE:-}" ]; then
-    fail "LITELLM_PROVIDER_VALUES_FILE and LITELLM_VALUES_FILE point at the same file"
+  # Compared after resolving: `f` and `./f`, or a symlink to the other, are the
+  # same file, and writing the discovery over the operator's own values would
+  # take their configuration with it.
+  if [ -n "$PROVIDER_VALUES_FILE_IN" ] && [ -n "${LITELLM_VALUES_FILE:-}" ]; then
+    a="$(readlink -f -- "$PROVIDER_VALUES_FILE_IN" 2>/dev/null || printf '%s' "$PROVIDER_VALUES_FILE_IN")"
+    b="$(readlink -f -- "$LITELLM_VALUES_FILE" 2>/dev/null || printf '%s' "$LITELLM_VALUES_FILE")"
+    [ "$a" != "$b" ] \
+      || fail "LITELLM_PROVIDER_VALUES_FILE and LITELLM_VALUES_FILE resolve to the same file"
   fi
   GENERATED_MODELS_FILE="$(mktemp)"
   MODELS_TMP_FILES+=("$GENERATED_MODELS_FILE")
@@ -275,16 +286,16 @@ configure_models_interactive() {
 
   printf '%s' "$pkey" | store_provider_key
 
-  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ]; then
+  if [ -n "$PROVIDER_VALUES_FILE_IN" ]; then
     # Only now that the response parsed and the file holds a complete modelList.
-    install -m 600 "$GENERATED_MODELS_FILE" "$LITELLM_PROVIDER_VALUES_FILE" \
+    install -m 600 "$GENERATED_MODELS_FILE" "$PROVIDER_VALUES_FILE_IN" \
       || fail "could not write $LITELLM_PROVIDER_VALUES_FILE"
-    GENERATED_MODELS_FILE="$LITELLM_PROVIDER_VALUES_FILE"
+    GENERATED_MODELS_FILE="$PROVIDER_VALUES_FILE_IN"
   fi
 
   log "discovered $count model(s) from $ptype provider"
   log "provider API key in Secret/$PROVIDER_KEY_SECRET, referenced as os.environ/$PROVIDER_KEY_ENV"
-  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ]; then
+  if [ -n "$PROVIDER_VALUES_FILE_IN" ]; then
     log "wrote modelList and providerApiKey to $GENERATED_MODELS_FILE"
   else
     log "note: this modelList lives only in this run. Set LITELLM_PROVIDER_VALUES_FILE"
@@ -404,10 +415,15 @@ else
       master_err="$(mktemp)"; MODELS_TMP_FILES+=("$master_err")
       if encoded="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
            -o jsonpath='{.data.master_key}' 2>"$master_err")"; then
-        if [ -n "$encoded" ]; then
-          LITELLM_MASTER_KEY="$(printf '%s' "$encoded" | base64 -d)" \
-            || fail "Secret/$LITELLM_NAME holds a master_key that is not valid base64"
+        if [ -z "$encoded" ]; then
+          # The Secret is there but has no master_key. Generating one would
+          # re-key a deployment whose stored model credentials were encrypted
+          # with whatever used to be in this field, so stop and let a human
+          # decide whether it was lost or never set.
+          fail "Secret/$LITELLM_NAME exists but has no master_key; refusing to generate one over it"
         fi
+        LITELLM_MASTER_KEY="$(printf '%s' "$encoded" | base64 -d)" \
+          || fail "Secret/$LITELLM_NAME holds a master_key that is not valid base64"
       elif grep -qi 'NotFound\|secrets .* not found' "$master_err"; then
         : # no Secret yet, so generating one below is correct
       else
@@ -561,32 +577,9 @@ if [ "$DRY_RUN" = "true" ]; then
   exit 0
 fi
 
-# A rotated database password or master key has to reach the running Pods. Both
-# arrive by secretKeyRef, so rewriting the Secret leaves the Deployment
-# unchanged: helm reports success, rollout status waits on nothing, and the old
-# credentials keep being used until something else happens to restart them.
-# Hashing them into a pod annotation makes the rotation a template change.
-creds_fingerprint=""
-if [ "$USE_EXISTING_SECRET" = "true" ]; then
-  if creds_raw="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_EXISTING_SECRET" \
-       -o jsonpath='{.data.master_key}{.data.database_url}' 2>/dev/null)"; then
-    creds_fingerprint="$(printf '%s' "$creds_raw" | sha256sum | cut -c1-32)"
-  else
-    log "note: could not read Secret/$LITELLM_EXISTING_SECRET; a credential change"
-    log "      in it will not roll the Pods on this run"
-  fi
-else
-  creds_fingerprint="$(printf '%s%s' "$LITELLM_MASTER_KEY" "$LITELLM_DATABASE_URL" \
-    | sha256sum | cut -c1-32)"
-fi
-[ -n "$creds_fingerprint" ] && helm_args+=(--set-string "podAnnotations.checksum/credentials=$creds_fingerprint")
-
-# Validate the modelList that will actually be deployed, not any one source of
-# it. Helm does the merging, so ask Helm: the carried values, the operator's
-# values file and anything discovered this run are all already in helm_args.
-# Checking the carried copy earlier meant an operator handed a corrected values
-# file still hit the refusal -- the documented way out of the problem could not
-# be taken, because their file had not been read yet.
+# Render once with everything Helm will merge, and use it for two things: the
+# modelList that will actually be deployed, and the name of the Secret the Pods
+# will read their credentials from.
 tmpl_args=()
 for a in "${helm_args[@]}"; do
   case "$a" in
@@ -599,23 +592,78 @@ if ! rendered="$(helm "${tmpl_args[@]}" 2>&1)"; then
   printf '%s\n' "$rendered" | sed 's/^/  /' >&2
   fail "could not render the chart with the values for this deploy"
 fi
+
+# Checking the carried copy earlier meant an operator handed a corrected values
+# file still hit the refusal -- the documented way out of the problem could not
+# be taken, because their file had not been read yet.
+#
+# The message names models, never values: the offending value is the credential,
+# and printing it to a terminal and a CI log is the leak all over again.
 printf '%s' "$rendered" | python3 -c '
 import re, sys
-def val(m):
-    return m.group(1).strip().strip(chr(34)).strip(chr(39))
-bad = sorted({
-    val(m) for m in re.finditer(r"^\s*api_key:\s*(.+)$", sys.stdin.read(), re.M)
-    if not val(m).startswith("os.environ/")
-})
+
+# Chunked per entry rather than tracking the last model_name seen: the chart
+# renders litellm_params before model_name, so an api_key is read before the
+# name it belongs to and every finding came out as "<unnamed entry>".
+text = sys.stdin.read()
+entries = re.split(r"\n(?=\s*-\s)", text)
+bad = []
+for e in entries:
+    k = re.search(r"^\s*api_key:\s*(.+?)\s*$", e, re.M)
+    if not k or k.group(1).strip("\"" + chr(39)).startswith("os.environ/"):
+        continue
+    nm = re.search(r"^\s*model_name:\s*(.+?)\s*$", e, re.M)
+    bad.append(nm.group(1).strip("\"" + chr(39)) if nm else "<unnamed entry>")
 if bad:
     sys.exit(
-        "the modelList for this deploy carries a literal api_key: " + ", ".join(bad)
-        + "\nIt would be written into the release values and every revision after"
-        + "\nit. Re-run with LITELLM_PROVIDER_TYPE/_URL/_API_KEY to rewrite modelList"
-        + "\nagainst a Secret, or pass a LITELLM_VALUES_FILE whose modelList uses an"
-        + "\nos.environ/ reference."
+        "the modelList for this deploy stores a literal api_key for: "
+        + ", ".join(sorted(set(bad)))
+        + "\n(the values are not printed here; they are the credentials)"
+        + "\nThey would be written into the release values and every revision"
+        + "\nafter it. Re-run with LITELLM_PROVIDER_TYPE/_URL/_API_KEY to rewrite"
+        + "\nmodelList against a Secret, or pass a LITELLM_VALUES_FILE whose"
+        + "\nmodelList uses an os.environ/ reference."
     )
 ' || fail "refusing to deploy a modelList that holds a provider key in plain text"
+
+# A rotated database password or master key has to reach the running Pods. Both
+# arrive by secretKeyRef, so rewriting the Secret leaves the Deployment
+# unchanged: helm reports success, rollout status waits on nothing, and the old
+# credentials keep being used. Hashing them into a pod annotation makes the
+# rotation a template change.
+#
+# The name comes out of the rendered Deployment rather than LITELLM_EXISTING_SECRET:
+# secrets.existingSecret can just as well be set in a values file, and then that
+# variable is empty while the chart is still pointing the Pods somewhere else.
+creds_secret="$(printf '%s' "$rendered" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+m = re.search(
+    r"name:\s*DATABASE_URL\s*\n\s*valueFrom:\s*\n\s*secretKeyRef:\s*\n\s*name:\s*(\S+)",
+    text,
+)
+print(m.group(1).strip("\"" + chr(39)) if m else "")
+')"
+[ -n "$creds_secret" ] \
+  || fail "could not tell which Secret the Pods read their credentials from"
+
+if creds_raw="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$creds_secret" \
+     -o jsonpath='{.data.master_key}{.data.database_url}' 2>/dev/null)"; then
+  [ -n "$creds_raw" ] \
+    || fail "Secret/$creds_secret has neither master_key nor database_url"
+  helm_args+=(--set-string \
+    "podAnnotations.checksum/credentials=$(printf '%s' "$creds_raw" | sha256sum | cut -c1-32)")
+elif [ "$USE_EXISTING_SECRET" = "true" ]; then
+  # The chart renders no Secret in this mode, so an unreadable one is not "not
+  # created yet" -- the Pods would come up unable to read their credentials, and
+  # a rotation would never reach them. Not something to note and continue past.
+  fail "could not read Secret/$creds_secret, which the Pods take their credentials from"
+else
+  # First install: the chart is about to create it, so hash what it will hold.
+  helm_args+=(--set-string \
+    "podAnnotations.checksum/credentials=$(printf '%s%s' "$LITELLM_MASTER_KEY" \
+      "$LITELLM_DATABASE_URL" | sha256sum | cut -c1-32)")
+fi
 
 helm "${helm_args[@]}" --wait --timeout 300s
 
