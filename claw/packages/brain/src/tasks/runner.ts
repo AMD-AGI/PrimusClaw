@@ -73,8 +73,10 @@ const sc = StringCodec();
  * redaction.ts. A value listed here is replaced wherever it appears in any
  * string that leaves the process.
  *
- * Only env vars whose NAME reads as a credential are included, because that
- * pass is an exact-substring replace with no notion of what it is cutting.
+ * An env var is included on one of two grounds -- its NAME reads as a
+ * credential, or its VALUE is shaped like one -- and never merely for being
+ * present, because that pass is an exact-substring replace with no notion of
+ * what it is cutting.
  * Feeding it every user_env / session_env value made it delete ordinary
  * content. Any session whose environment named a path put that path's text
  * into the hunt, so `sed -n '140,340p' <redacted>` came back for a command

@@ -29,38 +29,49 @@ const HEX_TOKEN_32B_RE = /\b[A-Fa-f0-9]{64}\b/g;
 // it silently rewrites the conversation -- the exact failure mode the
 // name-based pass was narrowed to stop.
 //
-// `sk-` additionally needs more than a boundary, because its charset includes
-// the hyphen and so a boundary alone still swallows any hyphenated phrase
-// beginning with those two letters -- `sk-learn-is-a-typo`.
+// `sk-` is the hard one, and two rounds of generic heuristics failed on it.
+// The prefix is two letters, so it occurs inside ordinary hyphenated
+// identifiers, and every property tried as a stand-in for "this is a key" has
+// an ordinary identifier that satisfies it:
 //
-// Two rules matter here and they are easy to conflate. What the pattern
-// CONSUMES has to be the whole token, separators and all. What it REQUIRES in
-// order to fire has to be something a phrase does not have. Writing the
-// requirement as the final consumed segment -- `sk-(?:seg-)*<long run>` --
-// broke the first rule: the match stopped at the last long run, so
-// `sk-ant-api03-<93 chars>-<6 chars>AA` redacted to `<redacted>-BBBBBBAA` and
-// published the key's last eight characters. A partial redaction is the worst
-// of both outcomes: it mangles the text AND it leaks. So the requirements are
-// lookaheads, and the consuming half takes everything.
+//   requirement                          ordinary string that satisfies it
+//   a 16+ unbroken run                   sk-internationalization-settings
+//   32+ chars with a digit and a capital sk-HTTP2-client-configuration-for-Production
 //
-// There are two requirements because keys come in two spellings. Either the
-// token contains one unbroken key-length run (`sk-proj-<48 chars>`), or it is
-// long and carries both a digit and a capital -- which is what a base64url
-// body looks like when its separators fall every few characters, and which no
-// hyphenated English phrase does. `sk-learn-is-a-typo-but-a-common-one` is 35
-// characters and satisfies neither: no long run, no digit, no capital.
+// That is not a coincidence to be patched around. Entropy tests on a mixed
+// alphabet all have a boundary, and hyphenated English is on the wrong side of
+// every boundary low enough to catch a real key.
+//
+// So `sk-` is matched by its DOCUMENTED prefixes and their documented minimum
+// lengths instead of by one generic rule. `sk-ant-api03-` is Anthropic's,
+// `sk-proj-` and `sk-svcacct-` are OpenAI's project and service-account forms,
+// `sk-live-`/`sk-test-` are the hyphenated Stripe-style spellings. The bare
+// legacy form (`sk-` + 48 base64url, no internal separators) is admitted only
+// as one unbroken 32+ alphanumeric run containing a digit, which no English
+// word reaches -- the longest are around 30 letters and have no digits.
+//
+// The cost, stated plainly: an undocumented or future `sk-` format whose body
+// is separator-dense and under 32 characters is not caught by shape. It is
+// still caught by name -- these arrive in `llm_api_key` and in `*_API_KEY`
+// vars, which both passes already cover -- and this is the direction to err
+// in, because a false positive here is not a masked secret but a hole cut in
+// a transcript that gets replayed to the model.
+//
+// The other rule, and the one that had nothing to do with `sk-`: what the
+// pattern CONSUMES must be the whole token, separators included. Writing a
+// requirement as the final consumed segment made the match stop at the last
+// long run, so `sk-ant-api03-<93>-<6>AA` redacted to `<redacted>-BBBBBBAA` and
+// published the key's last eight characters. Partial redaction is the worst
+// outcome available: it mangles the text AND it leaks.
 const VENDOR_TOKEN_RE = new RegExp([
   "\\bgh[pousr]_[A-Za-z0-9]{16,}",                      // GitHub classic
   "\\bgithub_pat_[A-Za-z0-9_]{20,}",                    // GitHub fine-grained
   "\\bxox[baprs]-[A-Za-z0-9-]{10,}",                    // Slack
-  // sk-: OpenAI / Anthropic. See the note above -- requirements are
-  // lookaheads so that the consuming half can take the whole token.
-  "\\bsk-"
-    + "(?:"
-    +   "(?=[A-Za-z0-9_-]*[A-Za-z0-9_]{16,})"                 // one long run, or
-    +   "|(?=[A-Za-z0-9_-]{32,})(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])"
-    + ")"
-    + "[A-Za-z0-9_-]{16,}",
+  // sk-: documented vendor prefixes with their documented minimum bodies.
+  "\\bsk-ant-api03-[A-Za-z0-9_-]{80,}",                 // Anthropic
+  "\\bsk-ant-[A-Za-z0-9_-]{40,}",                       // Anthropic, older
+  "\\bsk-(?:proj|svcacct|admin|live|test)-[A-Za-z0-9_-]{32,}",
+  "\\bsk-(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}",        // legacy bare form
   "\\bhf_[A-Za-z0-9]{20,}",                             // Hugging Face
   "\\bAKIA[0-9A-Z]{16}",                                // AWS access key id
   "\\bglpat-[A-Za-z0-9_-]{16,}",                        // GitLab
@@ -111,6 +122,17 @@ const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
  *
  * A leading `-` or `+` is flag syntax, never a credential.
  *
+ * It must not parse as a familiar structured format. Two get through every
+ * character-class rule, because they are built from exactly the characters a
+ * password is built from: an email address (`User1@example.com`) and a
+ * word-symbol-word pattern (`Foo1.*Bar2`, `Abc1+Def2`, the contents of a
+ * REGEX or GLOB variable). Both are recognised by structure rather than by
+ * charset -- a domain-shaped tail after an `@`, or symbol-delimited segments
+ * that are every one of them a plain word with at most a trailing digit. A
+ * real credential fails the second test almost by definition, because its
+ * digits fall inside the segments rather than after them: `P@ssw0rd` splits
+ * into `P` and `ssw0rd`, and neither is a word with a digit stuck on the end.
+ *
  * All three of lower, upper and digit must be present, and at least six
  * DISTINCT characters. The distinct-character floor is the entropy half, and
  * it is what stops a short repeating pattern from qualifying on the strength
@@ -130,11 +152,35 @@ const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
  */
 const CREDENTIAL_CHARSET_RE = /^[A-Za-z0-9._~+@!$%^&*-]+$/;
 const CREDENTIAL_SYMBOL_RE = /[@!$%^&*+~]/;
+/** `name@host.tld` -- an address, whatever variable it was found in. */
+const EMAIL_SHAPED_RE = /@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/;
+/**
+ * A plain word, optionally with digits stuck on the end: `Foo`, `Bar2`.
+ *
+ * The vowel is what carries the weight. Without it this also swallows
+ * `Xk9$mzPl2` -- a password with the same skeleton as `Abc1+Def2` -- and the
+ * two are separable only by whether the letter runs read as words at all.
+ */
+const WORD_SEGMENT_RE = /^(?=[A-Za-z]*[AEIOUYaeiouy])[A-Za-z]{2,}[0-9]{0,3}$/;
+
+/**
+ * Whether every symbol-delimited piece is an ordinary word.
+ *
+ * `Foo1.*Bar2` and `Abc1+Def2` are patterns, not passwords, and what says so
+ * is that taking the symbols out leaves nothing but words. A credential's
+ * segments are not words -- its digits and case changes fall inside them.
+ */
+function isWordSymbolWord(value: string): boolean {
+  const segments = value.split(/[^A-Za-z0-9]+/).filter((seg) => seg.length > 0);
+  return segments.length >= 2 && segments.every((seg) => WORD_SEGMENT_RE.test(seg));
+}
 export function looksLikeCredentialValue(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
   if (!CREDENTIAL_CHARSET_RE.test(value)) return false;
   if (!CREDENTIAL_SYMBOL_RE.test(value)) return false;
   if (value.startsWith("-") || value.startsWith("+")) return false;
+  if (EMAIL_SHAPED_RE.test(value)) return false;
+  if (isWordSymbolWord(value)) return false;
   if (!/[a-z]/.test(value) || !/[A-Z]/.test(value) || !/[0-9]/.test(value)) return false;
   return new Set(value).size >= 6;
 }

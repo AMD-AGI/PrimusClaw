@@ -119,7 +119,7 @@ test("a vendor prefix inside a larger word is not a token", () => {
 
 test("a real token at a boundary is still redacted", () => {
   for (const secret of [
-    "sk-ant-api03-abcdefghijklmnopqrstuvwxyz", `ghp_${"a".repeat(36)}`,
+    `sk-ant-api03-${"abcdefghijklmnopqrstuvwxyz".repeat(4)}`, `ghp_${"a".repeat(36)}`,
     `hf_${"b".repeat(24)}`, "AKIAIOSFODNN7EXAMPLE", `glpat-${"c".repeat(20)}`,
   ]) {
     for (const text of [secret, `key=${secret}`, `(${secret})`, `run ${secret} now`]) {
@@ -219,7 +219,9 @@ test("a redacted vendor token leaves not one character of itself behind", () => 
     `sk-ant-api03-${"A".repeat(93)}-${"B".repeat(6)}AA`,
     `sk-ant-api03-${"Ab9_-".repeat(20)}xY7`,
     `sk-proj-${"a".repeat(48)}`,
-    `sk-${"Q".repeat(20)}_${"z".repeat(20)}-${"7".repeat(8)}`,
+    `sk-svcacct-${"Bq7_-".repeat(8)}Zt4`,
+    `sk-live-${"c".repeat(24)}-${"D9".repeat(6)}`,
+    `sk-${"a1B2".repeat(12)}`,
     `github_pat_11ABCDEFG0${"x".repeat(30)}_${"y".repeat(20)}`,
     `glpat-${"a".repeat(10)}-${"B9_".repeat(6)}`,
     `xoxb-1234567890-0987654321-${"AbCdEf".repeat(4)}`,
@@ -245,10 +247,61 @@ test("a redacted vendor token leaves not one character of itself behind", () => 
   }
 });
 
-test("a hyphenated phrase beginning sk- is still not a token", () => {
-  // The lookahead has to keep this side working too: widening what the pattern
-  // consumes must not widen what it matches.
-  for (const prose of ["sk-learn-is-a-typo", "sk-load-the-data", "ask-me-anything-now"]) {
-    assert.equal(redactSecrets(prose).text, prose);
+test("an ordinary identifier beginning sk- is not a token", () => {
+  // Two generic rules failed here before the pattern was pinned to documented
+  // vendor prefixes, and each was defeated by a plausible identifier rather
+  // than by a contrived one:
+  //
+  //   "a 16+ unbroken run"                  sk-internationalization-settings
+  //   "32+ chars with a digit and a capital" sk-HTTP2-client-configuration-...
+  //
+  // Both are here permanently. A rule that redacts either of them is wrong
+  // however well it scores on real keys, because what it does to these is not
+  // masking -- it deletes them from a transcript that gets replayed.
+  for (const prose of [
+    "sk-internationalization-settings",
+    "sk-HTTP2-client-configuration-for-Production",
+    "sk-learn-is-a-typo", "sk-load-the-data", "ask-me-anything-now",
+    "sk-electroencephalography-pipeline", "sk-Batch2-Retry-Handler-Configuration",
+  ]) {
+    const r = redactSecrets(prose);
+    assert.equal(r.text, prose, `${JSON.stringify(prose)} is an identifier, not a key`);
+    assert.equal(r.hits, 0);
+  }
+});
+
+test("the documented sk- prefixes are matched at their documented lengths", () => {
+  // The other side of the same trade: pinning to prefixes must not lose the
+  // real formats. One case per vendor spelling the pattern claims to know.
+  for (const key of [
+    `sk-ant-api03-${"Xy9_-".repeat(20)}Qq2`,
+    `sk-ant-${"z".repeat(48)}`,
+    `sk-proj-${"Ab3_".repeat(14)}`,
+    `sk-svcacct-${"Cd4-".repeat(10)}`,
+    `sk-live-${"e".repeat(40)}`,
+    `sk-test-${"f".repeat(40)}`,
+    `sk-${"g7H8".repeat(10)}`,
+  ]) {
+    assert.equal(redactSecrets(key).text, "<redacted>", `${key.slice(0, 24)}... must be redacted`);
+  }
+});
+
+test("an email or a glob is not a credential whatever variable holds it", () => {
+  // These are built from exactly the characters a password is built from, so
+  // no charset or character-class rule separates them. Structure does: a
+  // domain-shaped tail, or symbol-delimited pieces that are all plain words.
+  for (const ordinary of [
+    "User1@example.com", "First.Last2@sub.example.co.uk", "Ops1@corp-mail.io",
+    "Foo1.*Bar2", "Abc1+Def2", "Alpha1~Beta2", "Report2.Summary3",
+  ]) {
+    assert.equal(
+      looksLikeCredentialValue(ordinary), false,
+      `${JSON.stringify(ordinary)} is an address or a pattern`,
+    );
+  }
+  // And the credentials that share their surface shape are still caught: the
+  // digits fall inside the segments rather than after them.
+  for (const secret of ["P@ssw0rd", "Xk9$mzPl2vQ", "Tr0ub4dor&3x", "n7%Qw2Lz!pE"]) {
+    assert.ok(looksLikeCredentialValue(secret), `${JSON.stringify(secret)} is a credential`);
   }
 });

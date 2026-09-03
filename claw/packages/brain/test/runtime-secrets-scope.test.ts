@@ -261,8 +261,8 @@ test("build flags and product names under the same names are left alone", () => 
 test("the shape ground stays narrow enough not to re-open the incident", () => {
   // Every value below is distinctive by the length-and-entropy test, so a
   // shape rule written as "anything distinctive" would collect all of them --
-  // and collecting them is precisely what deleted content out of a thousand
-  // transcripts. Paths, versions, URLs and prose are excluded by shape before
+  // and collecting them is precisely what cut holes in the transcripts they
+  // appeared in. Paths, versions, URLs and prose are excluded by shape before
   // distinctiveness is ever consulted.
   const secrets = runtimeSecrets(request({
     user_env: {
@@ -294,4 +294,32 @@ test("an ordinary word is never hunted whatever case it is written in", () => {
     })),
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("an identifier or a timezone under a credential name survives free text", () => {
+  // The name pass collects these -- PROJECT_TOKEN and TZ_SETTING both read as
+  // credentials -- so the second gate is the only thing between them and the
+  // transcript. A run that reads its own timezone and calls its own helper
+  // gets both words back intact.
+  const text = "call getUserById2 with TZ America/New_York then retry3";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        PROJECT_TOKEN: "getUserById2",
+        TZ_SECRET: "America/New_York",
+        RETRY_TOKEN: "retry3",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("a real credential under the same names is still hunted", () => {
+  // The other half: the gate above rejects shapes, not the name path itself.
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: "auth Tr0ub4dor&3x now" } } },
+    runtimeSecrets(request({ user_env: { PROJECT_TOKEN: "Tr0ub4dor&3x" } })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command.includes("Tr0ub4dor"), false);
 });

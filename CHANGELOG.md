@@ -34,9 +34,19 @@ record it.
   as a credential, hunted only when the value is distinctive enough that
   replacing it will not also delete ordinary words, and matched by **shape**
   (GitHub/GitLab/Slack/OpenAI/Hugging Face/AWS tokens, JWTs, URLs with inline
-  credentials) regardless of the field they sit in. A short, ordinary-looking
-  secret echoed into free text still cannot be removed safely after the fact —
-  do not put one in an env var the agent can print.
+  credentials) regardless of the field they sit in.
+
+  **Still open — two shapes are knowingly not caught in free text.** A short,
+  purely alphabetic secret (`XkjQmzPl`) and a word with digits on the end
+  (`hunter2`) are both masked wherever they sit in a field, but an echo of
+  either in free text — a log line, tool output — is left alone. The only
+  rules that would catch them also catch ordinary prose (`GitHub`, `macOS`,
+  `getUserById2`), and this pass is a blind substring replace over payloads
+  that are replayed to the model: a false positive does not mask a secret, it
+  deletes text from a conversation and the agent resumes without it. A missed
+  secret is bounded and fixed by rotating the credential; a corrupted
+  transcript is neither. Do not put a secret in an env var the agent can
+  print.
 - `LLM_DEBUG_RESPONSE_HEADERS` rejects credential-bearing header names and
   names that are not valid HTTP tokens, at boot rather than per request.
 

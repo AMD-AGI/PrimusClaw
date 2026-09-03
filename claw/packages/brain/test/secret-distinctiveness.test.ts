@@ -9,19 +9,25 @@
  * it appears will also destroy ordinary text -- in payloads that are logged,
  * streamed to users, and replayed to the model, where what is cut is gone.
  *
- * A flat length floor failed in both directions, and the two halves below pin
- * both failures at once. Raise the bar and `hunter2` leaks; lower it and
+ * A flat length floor failed in both directions, and the halves below pin the
+ * failures at once. Raise the bar and short real secrets leak; lower it and
  * `true` is excised from every command in the transcript.
+ *
+ * Two shapes have no separating predicate at all -- `hunter2` and
+ * `getUserById2` are one shape -- and those are settled in favour of leaving
+ * prose intact, for the reasons written down at `isDistinctiveSecret`.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isDistinctiveSecret } from "../src/events/redaction.js";
 
 test("a short but distinctive credential is still hunted", () => {
-  // The regression that motivated this: DB_PASSWORD=hunter2 is named
+  // The regression that motivated this: a short password is named
   // unambiguously and is seven characters, and a 16-character floor sent it
-  // to NATS, the event DB, SSE and the checkpoint verbatim.
-  for (const secret of ["hunter2", "P@ssw0rd", "abc-123", "s3cr3t"]) {
+  // to NATS, the event DB, SSE and the checkpoint verbatim. Each of these
+  // carries something no word does -- a symbol, a separator, digits inside
+  // the letters -- which is exactly what `hunter2` lacks.
+  for (const secret of ["P@ssw0rd", "abc-123", "s3cr3t", "x9k2m4p7"]) {
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
   }
 });
@@ -118,5 +124,31 @@ test("case alone does not make a boolean spelling distinctive", () => {
   // same collision hazard as one holding "true".
   for (const ordinary of ["TRUE", "False", "YES", "Off", "None", "NULL", "Default", "Debug"]) {
     assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is a boolean spelling`);
+  }
+});
+
+test("an identifier with a digit on the end is not distinctive enough to hunt", () => {
+  // A var named PROJECT_TOKEN can hold `getUserById2`, and hunting it turns
+  // "call getUserById2" in the transcript into "call <redacted>". There is no
+  // predicate separating this from `hunter2`; see isDistinctiveSecret for why
+  // the tie is broken towards leaving the transcript alone.
+  for (const ordinary of [
+    "getUserById2", "word2", "word123", "retry3", "Batch7", "step10", "hunter2",
+  ]) {
+    assert.ok(
+      !isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} reads as an identifier`,
+    );
+  }
+});
+
+test("a slash-joined pair of words is a path or a zone, not a token", () => {
+  for (const ordinary of [
+    "America/New_York", "Europe/London", "Asia/Tokyo", "feature/Login", "src/Main_Handler",
+  ]) {
+    assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is path-shaped`);
+  }
+  // A path carrying anything a path does not carry stays huntable.
+  for (const secret of ["prod/a9f3c2b1d4e5", "vault/kv2/db-password"]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is not just words`);
   }
 });
