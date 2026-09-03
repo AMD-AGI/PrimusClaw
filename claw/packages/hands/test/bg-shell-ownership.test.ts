@@ -28,6 +28,7 @@ process.env.BG_SHELL_REAP_DELAY_MS = "10";
 // the feature flag are read at module load, so the module has to come in after.
 const {
   spawnBackground, pollOutput, killShell, listRunningShells, shutdownAllShells, shutdownRunShells,
+  runningShellCount,
 } = await import("../src/tools/shell/bg-manager.js");
 
 const ALICE = "run-alice";
@@ -162,6 +163,79 @@ test("an unclaimed shell is not reaped by every run that ends", async () => {
   assert.equal(orphan.status, "running", "only shutdown may take an unclaimed shell");
 
   killShell(ALICE, "orphan");
+});
+
+/**
+ * The predicate the keepalive sweep asks, which is the same one the reap walks.
+ *
+ * Brain marks a sandbox idle on every terminal task and never pings an idle one,
+ * so the control plane reclaims it about fifteen minutes later -- taking a
+ * background shell the conversation was promised would still be there. The sweep
+ * asks this before treating a handle as free, so what it counts, and under which
+ * key, is what decides whether the pod survives.
+ */
+test("a still-running shell is what keeps its owner's sandbox from being reclaimed", async () => {
+  assert.equal(runningShellCount(ALICE), 0, "nothing started yet");
+
+  const shell = spawnBackground(ALICE, RUN_1, "sleep 60", "server");
+  assert.equal(runningShellCount(ALICE), 1,
+    "the sweep reads this to decide the sandbox is still working; zero here is "
+      + "the pod being reclaimed out from under the shell");
+
+  killShell(ALICE, "server");
+  assert.ok(await until(() => shell.status !== "running"));
+  assert.ok(await until(() => runningShellCount(ALICE) === 0),
+    "once the work is done the handle is free again and the existing expiry applies");
+});
+
+test("the count is scoped to the owner asked for, so a DAG node's work does not hold a conversation's pod", async () => {
+  // The owner is the DAG root for a DAG node and the session otherwise, and the
+  // sweep asks under the session because that is the key it walks
+  // (`hands.<session>`). A sibling DAG node's shells are filed under the root,
+  // are reaped when that node reports, and must not read as the session still
+  // being busy -- ALICE and BOB stand in for the two scopes.
+  const theirs = spawnBackground(BOB, RUN_1, "sleep 60", "dag-server");
+
+  assert.equal(runningShellCount(ALICE), 0,
+    "another scope's shell must not keep this session's sandbox alive");
+  assert.equal(runningShellCount(BOB), 1, "it is running -- just not under ALICE");
+
+  killShell(BOB, "dag-server");
+  assert.ok(await until(() => theirs.status !== "running"));
+});
+
+test("an owner nothing was started under, or none at all, answers zero rather than everything", async () => {
+  // The mirror of the unclaimed-shell case above: an older Brain sends no owner
+  // header, so its shells are filed under the empty string. Matching "" against
+  // those would report a busy sandbox to every session that asked without one,
+  // and no idle pod in the fleet would ever be reclaimed.
+  const unclaimed = spawnBackground("", RUN_1, "sleep 60", "unclaimed");
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine");
+
+  assert.equal(runningShellCount(""), 0,
+    "the empty owner must answer zero, not sweep up every shell filed without one");
+  assert.equal(runningShellCount("session-never-seen"), 0);
+  assert.equal(runningShellCount(ALICE), 1, "sanity: a real owner still counts its own");
+
+  killShell("", "unclaimed");
+  killShell(ALICE, "mine");
+  assert.ok(await until(() => unclaimed.status !== "running" && mine.status !== "running"));
+});
+
+test("a reaped run stops counting, which is how a finished DAG node releases the pod", async () => {
+  // The two halves together: the reap ends a finished run's shells, and the
+  // count is what the sweep then reads. A sibling run under the same owner has
+  // not ended, so the pod is still working and must still be pinged.
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "reaped");
+  spawnBackground(ALICE, RUN_2, "sleep 60", "survivor");
+  assert.equal(runningShellCount(ALICE), 2);
+
+  assert.equal(await shutdownRunShells(RUN_1, 200), 1);
+  assert.ok(await until(() => mine.status !== "running"));
+  assert.ok(await until(() => runningShellCount(ALICE) === 1),
+    "the reaped run leaves the count, the sibling keeps the sandbox alive");
+
+  killShell(ALICE, "survivor");
 });
 
 test("with background shells on, the foreground ceiling is the tight one and points at them", async () => {

@@ -92,6 +92,14 @@ app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, 
   return { running: runningShellCount(owner) };
 });
 
+/**
+ * End the background shells a finished run started.
+ *
+ * Brain calls this instead of doing it through a tool because by the time it
+ * knows a run is over the model is no longer being asked anything, and because
+ * the decision is Brain's: a batch node's shells go, a conversation's stay. Not
+ * an MCP tool, so the model cannot invoke it on itself or on another run.
+ */
 app.post<{ Body?: { run?: unknown } }>("/internal/shells/reap", async (req, reply) => {
   const denied = authFailure(req);
   if (denied) return reply.status(denied.status).send({ error: denied.error });
