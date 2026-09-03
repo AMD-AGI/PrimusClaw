@@ -39,8 +39,10 @@ record it.
   copying database or master credentials into Helm release values. This applies
   from the next revision onward; revisions written earlier still hold both in
   plain text. See "Credentials already in the release history" in
-  `deploy/litellm/README.md` for removing them and for the rotation order that
-  does not strand model credentials encrypted with the old master key.
+  `deploy/litellm/README.md` — for removing them, for the rotation order that
+  does not strand model credentials encrypted with the old master key, and for
+  why the upstream provider credentials have to be rotated as well: a reader of
+  those revisions held both the encryption key and the database URL.
 
 <!--
 Template for the next release. Drop the sections that do not apply.

@@ -65,27 +65,63 @@ Deleting those Secrets removes the values, and with them the ability to roll
 back to those points. It does not undo the exposure: anyone who could read them
 already could. Treat both values as compromised and rotate.
 
-**Rotating the database URL.** Change the password on the database, update the
-Secret named by `secrets.existingSecret`, and redeploy. Nothing else derives
-from it.
+Rotate in this order. The steps are ordered because the master key is not just
+the admin credential: when `LITELLM_SALT_KEY` is unset, LiteLLM falls back to it
+for encrypting model credentials stored under `STORE_MODEL_IN_DB`
+(`_get_salt_key()` in `litellm/proxy/common_utils/encrypt_decrypt_utils.py`), so
+changing it first leaves every stored credential undecryptable.
 
-**Rotating the master key.** Do this in two steps, not one. The master key is
-the proxy's admin credential, and when `LITELLM_SALT_KEY` is unset it is *also*
-the key that encrypts model credentials stored in the database under
-`STORE_MODEL_IN_DB` — LiteLLM falls back to the master key when no salt key is
-configured. Changing it on such a deployment leaves every stored model
-credential undecryptable. So:
+**1. Pin the salt key — without writing it into values.** Add a second key to the
+Secret named by `secrets.existingSecret`, holding the master key's *current*
+value:
 
-1. Set `LITELLM_SALT_KEY` to the master key's **current** value (via `extraEnv`)
-   and redeploy. Nothing is re-encrypted and nothing changes behaviourally —
-   the value the code was already using is now pinned explicitly — but the
-   encryption key is no longer tied to the admin credential.
-2. Verify the proxy still answers and still resolves models from the database,
-   then rotate the master key on its own.
+```sh
+kubectl -n "$NS" patch secret "$SECRET" --type merge -p "{\"data\":{\"salt_key\":\"$(
+  kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.master_key}')\"}}"
+```
 
-Virtual keys already issued keep working across a master-key rotation: they are
-stored as a plain SHA-256 hash of the key itself, with the master key playing no
-part.
+Then point `LITELLM_SALT_KEY` at that key:
+
+```yaml
+extraEnv:
+  - name: LITELLM_SALT_KEY
+    valueFrom:
+      secretKeyRef:
+        name: <the existingSecret>
+        key: salt_key
+```
+
+Two ways to get this wrong, both of which defeat the exercise:
+
+- `value: <the old master key>` inline puts the key straight back into the
+  release values you are cleaning up — the same leak, by another route.
+- `key: master_key` ties the salt key to the credential you are about to
+  rotate, so step 3 changes both at once and strands the data.
+
+Redeploy and confirm the proxy still resolves models from the database. Nothing
+is re-encrypted: the value the code was already using is now named explicitly.
+
+**2. Rotate the database password.** Change it on the database, update
+`database_url` in the Secret, redeploy. Nothing else derives from it.
+
+**3. Rotate the master key.** Write a new value into `master_key` and redeploy.
+Virtual keys already issued keep working — they are stored as a plain SHA-256
+hash of the key, with the master key playing no part. Callers using the master
+key directly need the new value.
+
+**4. Rotate the upstream provider credentials.** Not optional, and not covered by
+the three steps above. Anyone who read the leaked revisions held both the salt
+key and the database URL, and together those decrypt every provider credential
+in `LiteLLM_ProxyModelTable` — the `api_key` and `extra_headers` fields inside
+`litellm_params`. Rotating this gateway's own credentials does not un-disclose
+them. Issue new credentials at each provider, enter them through the proxy, and
+retire the old ones there.
+
+Re-encrypting instead is not offered here because LiteLLM has no supported path
+for it — `encrypt_value_helper()` takes a `new_encryption_key` argument, but
+nothing in the proxy passes one — and it would not be the remedy in any case:
+re-encryption changes the ciphertext, not the fact that the plaintext was
+readable.
 
 ## Model routing is deployment-specific
 
