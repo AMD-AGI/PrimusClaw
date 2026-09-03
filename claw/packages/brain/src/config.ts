@@ -376,13 +376,44 @@ export function goDurationSeconds(ns: bigint): number {
  * join the sandbox reuse fingerprint, or a session would reuse a pod built with
  * a different lifetime and the caller's value would silently not apply.
  */
+/**
+ * Floor for AGENT_SANDBOX_SESSION_TIMEOUT, in nanoseconds.
+ *
+ * The idle timeout is a deadline something else has to keep pushing back, and
+ * what pushes it back arrives on a fixed cadence -- the Router refreshes
+ * LastActivity every 5 minutes for as long as a proxy connection is open, and
+ * that constant carries the invariant in its own comment: it has to sit "well
+ * below the default idle timeout (15min) to guarantee the sandbox is never
+ * mistakenly considered idle". This setting is the first thing that can move
+ * the other side of that comparison, and so the first thing that can invert it.
+ * Set below the cadence, the sandbox is reclaimed while it is being used,
+ * because the signal saying so was not due yet -- and nothing reports that as a
+ * misconfiguration, it looks like a sandbox that died.
+ *
+ * Ten minutes is two refresh intervals: one missed tick must not be fatal. It
+ * is deliberately looser than the 3x implied by the shipped 15m default,
+ * because this rejects a setting outright rather than quietly clamping it, and
+ * what it has to establish is only the floor of what can work at all.
+ */
+const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 600_000_000_000n; // 10m
+
 function resolveAgentSandboxSessionTimeout(): string {
   const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
   if (!configured) return "";
-  if (goDurationNs(configured) === null) {
+  const ns = goDurationNs(configured);
+  if (ns === null) {
     settingProblems.push(
       `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a positive Go duration `
         + `(e.g. "90m", "2h30m"); leaving the template's own value`,
+    );
+    return "";
+  }
+  if (ns < AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS) {
+    settingProblems.push(
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is below the 10m floor: the `
+        + `liveness signal that holds a sandbox open only arrives every 5m, so a `
+        + `sandbox still in use would be reclaimed before the signal saying so is `
+        + `due; leaving the template's own value`,
     );
     return "";
   }

@@ -20,7 +20,6 @@ import {
 import type { SandboxCreateParams } from "../src/sandbox/provider.js";
 import {
   AGENT_SANDBOX_WARM_POOL_SIZE, AGENT_SANDBOX_SESSION_TIMEOUT,
-  AGENT_SANDBOX_MAX_SESSION_DURATION,
 } from "../src/config.js";
 
 const params: SandboxCreateParams = {
@@ -101,12 +100,15 @@ test("a differing pool size would select a differing template", () => {
 // baking a value into the spec would give every distinct timeout its own
 // CodeInterpreter -- and its own warm pool.
 
-test("what is sent is what the deployment configured", () => {
-  assert.deepEqual(lifetimeOverrides(), {
-    ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
-    ...(AGENT_SANDBOX_MAX_SESSION_DURATION
-      ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
-  });
+// This process has an empty environment, which is the only case it can pin
+// with a literal: config reads these once at module scope, so a *configured*
+// value needs a process that owns its environment, and that is
+// agent-sandbox-lifetime-overrides.test.ts next door. Written out as `{}`
+// rather than rebuilt from the same constants the implementation is built from
+// -- an expectation assembled that way agrees with the implementation by
+// construction, and would go on agreeing with a broken one.
+test("nothing configured sends nothing at all", () => {
+  assert.deepEqual(lifetimeOverrides(), {});
 });
 
 test("an unset knob is absent, not empty", () => {
