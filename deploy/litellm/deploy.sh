@@ -418,21 +418,30 @@ fi
 # a hard error on a perfectly healthy deployment. Normalise to one entry per
 # line and check each dotted one on its own; bare names like `prometheus` are
 # built in and have nothing to import.
-callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+# Not `|| true`: an exec that cannot run at all was indistinguishable from a
+# config with no callbacks, so the check passed and the deploy continued with
+# the hook silently inactive -- the exact outcome this check exists to catch.
+if ! callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
   python3 -c 'import yaml
 cb = yaml.safe_load(open("/app/config.yaml")).get("litellm_settings", {}).get("callbacks", [])
 if isinstance(cb, str):
     cb = [cb]
 for c in cb or []:
     if c:
-        print(c)' 2>/dev/null || true)"
+        print(c)' 2>/dev/null)"; then
+  fail "could not read the configured callbacks from deployment/$LITELLM_NAME"
+fi
 while IFS= read -r callback; do
   [ -n "$callback" ] || continue
   case "$callback" in
     *.*)
-      mod="${callback%.*}"
+      # Passed as argv rather than interpolated into the source: the value
+      # comes out of the cluster, and a quote in it would end the string.
       if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-           python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
+           python3 -c 'import importlib, sys
+mod, attr = sys.argv[1].rsplit(".", 1)
+module = importlib.import_module(mod)
+sys.exit(0 if hasattr(module, attr) else 1)' "$callback" 2>/dev/null; then
         echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
         echo "The proxy will serve traffic with the hook silently inactive." >&2
         echo "Usually a hook mounted at a path this base image does not import from;" >&2
