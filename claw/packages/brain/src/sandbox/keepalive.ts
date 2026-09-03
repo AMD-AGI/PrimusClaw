@@ -152,7 +152,15 @@ async function shouldSkipExpiredRetry(
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
 export function registerSandbox(sessionId: string, entry: SandboxEntry): void {
-  localRegistry.set(sandboxRegistryKey(sessionId, entry), { sessionId, entry });
+  const key = sandboxRegistryKey(sessionId, entry);
+  // A task has taken this sandbox, so whatever the last sweep concluded about
+  // it is about the turn before. Reuse hands the same pod to the next task, so
+  // identity alone would carry an `idle` verdict across that boundary -- and a
+  // turn that leaves a background shell behind would be read as one that left
+  // nothing, up to the length of the cache TTL. The next idle decision is made
+  // from a fresh answer.
+  forgetBackgroundWork(key);
+  localRegistry.set(key, { sessionId, entry });
   logger.info({ sessionId, workloadId: entry.workloadId }, "keepalive.registered");
 }
 
@@ -304,14 +312,40 @@ const BG_PROBE_TTL_MS = 5 * 60_000;
  */
 const BG_UNKNOWN_TOLERANCE = 5;
 
+/**
+ * How many probes may be in flight across the whole sweep.
+ *
+ * Per-session de-duplication is not a bound: on a cold start every idle handle
+ * is uncached at once, so a replica with a few hundred of them opened a few
+ * hundred sockets in the same tick -- times the number of replicas, against one
+ * control plane. Reaching the limit skips the rest of the probes rather than
+ * queueing them, because a skipped probe is not a lost one: the handle stays
+ * `unknown`, which keeps it, and the next tick picks up where this one stopped.
+ * A cold start spreads over a few ticks instead of arriving as a burst.
+ */
+const BG_PROBE_MAX_IN_FLIGHT = 8;
+
+/**
+ * How many sandboxes are pinged at once.
+ *
+ * The ping fan-out was `Promise.all` over every target, which was survivable
+ * while an idle handle was never a target. It is not any more: an uncached
+ * handle answers `unknown`, and `unknown` is pinged -- so the same cold start
+ * that floods the probes floods this too, and the two are the same connection
+ * pool. Bounded rather than skipped, because unlike a probe a missed ping is
+ * how a sandbox dies.
+ */
+const PING_MAX_IN_FLIGHT = 16;
+
+/** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
 const bgUnknownStreak = new Map<string, number>();
 const bgProbeInFlight = new Set<string>();
 
 /** Drop bookkeeping for sessions this sweep no longer sees. */
-function forgetBackgroundWork(sessionId: string): void {
-  bgProbeCache.delete(sessionId);
-  bgUnknownStreak.delete(sessionId);
+function forgetBackgroundWork(identity: string): void {
+  bgProbeCache.delete(identity);
+  bgUnknownStreak.delete(identity);
 }
 
 /**
@@ -347,9 +381,9 @@ export function resetBackgroundWorkStateForTest(): void {
  * A handle with no URL or token predates this and cannot be asked; it answers
  * idle, which is what the sweep did before the question existed.
  */
-function peekBackgroundWork(sessionId: string, info: HandsKvEntry): BackgroundWork {
+function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWork {
   if (!info.handsUrl || !info.token) return "idle";
-  const cached = bgProbeCache.get(sessionId);
+  const cached = bgProbeCache.get(identity);
   if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
   return "unknown";
 }
@@ -365,26 +399,37 @@ function peekBackgroundWork(sessionId: string, info: HandsKvEntry): BackgroundWo
  * the last answer costs nothing and is never more than one tick stale; the
  * refresh catches up behind it.
  *
- * `unknown` until the first answer arrives, which keeps the handle and pings it
- * -- the safe direction for a sweep whose job is to keep things alive.
+ * Keyed by sandbox identity rather than by session, and that is not a detail.
+ * A session outlives its sandbox: reuse hands the next task the same pod, a
+ * failed reuse builds a new one, and a session-keyed answer would carry the old
+ * pod's verdict onto the new one. It also settles the late-probe problem for
+ * free -- a probe that started against the sandbox that has since been replaced
+ * writes under the key it started with, which nothing reads any more, instead of
+ * overwriting the new pod's state with an answer about a pod that is gone.
+ *
+ * Bounded across the whole sweep, not just per session. Skipping rather than
+ * queueing when the limit is reached: the handle stays `unknown`, which keeps
+ * and pings it, and the next tick continues down the list.
  */
 function refreshBackgroundWork(
   deps: KeepaliveDeps,
+  identity: string,
   sessionId: string,
   info: HandsKvEntry,
 ): void {
   if (!info.handsUrl || !info.token) return;
-  const cached = bgProbeCache.get(sessionId);
+  const cached = bgProbeCache.get(identity);
   if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return;
-  if (bgProbeInFlight.has(sessionId)) return;
+  if (bgProbeInFlight.has(identity)) return;
+  if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) return;
 
-  bgProbeInFlight.add(sessionId);
+  bgProbeInFlight.add(identity);
   const probe = deps.countActiveShells ?? countActiveShells;
   void probe(info.handsUrl, info.token, sessionId)
     .then((running) => {
       const state: BackgroundWork = running > 0 ? "running" : "idle";
-      bgProbeCache.set(sessionId, { at: Date.now(), state });
-      bgUnknownStreak.delete(sessionId);
+      bgProbeCache.set(identity, { at: Date.now(), state });
+      bgUnknownStreak.delete(identity);
       if (state === "running") {
         logger.info(
           { sessionId, workloadId: info.workloadId, running },
@@ -393,23 +438,21 @@ function refreshBackgroundWork(
       }
     })
     .catch((err) => {
-      const streak = (bgUnknownStreak.get(sessionId) ?? 0) + 1;
-      bgUnknownStreak.set(sessionId, streak);
+      const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
+      bgUnknownStreak.set(identity, streak);
       logger.warn(
         { err: (err as Error)?.message ?? err, sessionId, streak },
         "keepalive.background_work_check_failed",
       );
-      // Give up only after the streak, and say so: from here the handle is on
-      // the ordinary expiry path and whatever was running goes with the sandbox.
       if (streak > BG_UNKNOWN_TOLERANCE) {
-        bgProbeCache.set(sessionId, { at: Date.now(), state: "idle" });
+        bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
         logger.warn(
           { sessionId, workloadId: info.workloadId, streak },
           "keepalive.background_work_unknown_giving_up",
         );
       }
     })
-    .finally(() => { bgProbeInFlight.delete(sessionId); });
+    .finally(() => { bgProbeInFlight.delete(identity); });
 }
 
 /**
@@ -439,9 +482,35 @@ async function refreshIdleSince(
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
+/**
+ * Run `fn` over every item, at most `limit` at a time.
+ *
+ * `Promise.all` over the whole list was fine while an idle handle was never a
+ * ping target. It is not any more: an uncached handle answers `unknown`, and
+ * `unknown` is pinged, so a cold start turns every handle in the bucket into a
+ * simultaneous request -- from each replica, into one connection pool and one
+ * control plane. Bounded rather than skipped, because unlike a probe a missed
+ * ping is how a sandbox dies.
+ */
+async function forEachWithLimit<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function collectTargets(
   deps: KeepaliveDeps,
-  seenSessions: Set<string>,
+  seenIdentities: Set<string>,
 ): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
 
@@ -464,10 +533,6 @@ async function collectTargets(
     const keys = await deps.kv.keys("hands.*");
     for await (const key of keys) {
       const sessionId = key.slice("hands.".length);
-      // Seen, whatever the sweep then decides to do with it: the cache reaper
-      // below keys on this rather than on the ping list, because an `idle` answer
-      // is exactly the case that never becomes a ping target.
-      seenSessions.add(sessionId);
       const e = await deps.kv.get(key).catch(() => null);
       if (!e) continue;
       try {
@@ -486,17 +551,26 @@ async function collectTargets(
         //   unknown  ping it and refresh the record's TTL, but leave the clock
         //            alone -- a blip must not decide this, and without the TTL
         //            write the bucket drops the entry on its own inside the
-        //            tolerance window (both are five minutes), so holding the
-        //            handle here would mean nothing
+        //            tolerance window (both are five minutes)
         //   idle     the handle really is spare; the expiry below is unchanged
         //
         // Read, not asked: the probe runs behind the sweep and leaves its answer
-        // for the next one, because an awaited probe sits in front of every ping
-        // in the fleet.
+        // for the next one. Under the identity of the sandbox this entry names,
+        // so the answer cannot outlive the pod it was about.
+        const identity = sandboxRegistryKey(sessionId, {
+          provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+          workloadId: info.workloadId,
+          sessionId: info.sessionId,
+          sandboxName: info.sandboxName,
+          namespace: info.namespace,
+        });
+        seenIdentities.add(identity);
         const bgWork = info.keepalive === false
-          ? peekBackgroundWork(sessionId, info)
+          ? peekBackgroundWork(identity, info)
           : "idle";
-        if (info.keepalive === false) refreshBackgroundWork(deps, sessionId, info);
+        if (info.keepalive === false) {
+          refreshBackgroundWork(deps, identity, sessionId, info);
+        }
         if (info.keepalive === false && bgWork === "running") {
           await refreshIdleSince(deps, key, e.revision, info);
         } else if (info.keepalive === false && bgWork === "unknown") {
@@ -591,8 +665,8 @@ export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void
 }
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
-  const seenSessions = new Set<string>();
-  const targets = await collectTargets(deps, seenSessions);
+  const seenIdentities = new Set<string>();
+  const targets = await collectTargets(deps, seenIdentities);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
@@ -605,8 +679,8 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // answer is exactly the case where the handle does not become a target, so
   // reaping on targets threw away the answer at the end of every tick and asked
   // again on the next one -- which is the load the cache exists to remove.
-  for (const sessionId of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
-    if (!seenSessions.has(sessionId)) forgetBackgroundWork(sessionId);
+  for (const identity of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
+    if (!seenIdentities.has(identity)) forgetBackgroundWork(identity);
   }
 
   if (!targets.size) return;
@@ -619,7 +693,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     "keepalive.tick_scan",
   );
 
-  await Promise.all([...targets.entries()].map(async ([targetKey, target]) => {
+  await forEachWithLimit([...targets.entries()], PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
     const { sessionId, entry } = target;
     const isAgent = entry.provider === "agent-sandbox";
     if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return;
@@ -697,7 +771,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
         );
       }
     }
-  }));
+  });
 }
 
 /** Start the periodic keepalive. Idempotent. */

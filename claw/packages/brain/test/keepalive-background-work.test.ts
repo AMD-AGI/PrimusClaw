@@ -21,6 +21,7 @@ import { StringCodec } from "nats";
 import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
+  registerSandbox,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -70,12 +71,12 @@ function stubPingableProvider(): void {
  * seed value hides whichever write came first -- including the one these tests
  * are about.
  */
-function fakeKv(): {
+function fakeKv(overrides: Record<string, unknown> = {}): {
   kv: KV; deleted: string[];
   current: () => Record<string, unknown>; revision: () => number;
 } {
   const deleted: string[] = [];
-  let value = sc.encode(JSON.stringify(ENTRY));
+  let value = sc.encode(JSON.stringify({ ...ENTRY, ...overrides }));
   let revision = 5;
   const kv = {
     async keys(filter = ">") {
@@ -114,6 +115,26 @@ async function sweepUntilProbed(deps: Parameters<typeof runKeepaliveTickForTest>
   await runKeepaliveTickForTest(deps);
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest(deps);
+}
+
+/** A KV holding `n` distinct idle handles, all uncached. */
+function manyIdleHandles(n: number): KV {
+  const entries = new Map<string, Record<string, unknown>>();
+  for (let i = 0; i < n; i++) {
+    entries.set(`hands.sess-${i}`, { ...ENTRY, workloadId: `wl-${i}` });
+  }
+  return {
+    async keys(filter = ">") {
+      const keys = [...entries.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* keys; })();
+    },
+    async get(key: string) {
+      const v = entries.get(key);
+      return v ? { key, value: sc.encode(JSON.stringify(v)), revision: 1 } : null;
+    },
+    async delete() {}, async put() { return 1; },
+    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
+  } as unknown as KV;
 }
 
 test("an idle handle is kept while the session still has a background shell running", async () => {
@@ -250,4 +271,126 @@ test("an unanswered probe also keeps the record from expiring underneath it", as
     "the entry was never re-put, so its TTL is still counting down from the "
       + "moment the task ended",
   );
+});
+
+// --- cold start, and answers that outlive what they were about ---
+
+test("a cold start does not open one socket per handle at once", async () => {
+  // Per-session de-duplication is not a bound. On a restart every idle handle
+  // is uncached in the same tick, and a replica with a few hundred of them --
+  // times the replica count, into one control plane -- is the burst this cap
+  // exists for. Skipped, not queued: the handle stays `unknown`, which keeps
+  // it, and the next tick continues down the list.
+  const kv = manyIdleHandles(50);
+  stubPingableProvider();
+  let peak = 0;
+  let live = 0;
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise((r) => setImmediate(r));
+      live -= 1;
+      return 0;
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(peak > 0, "nothing was probed at all");
+  assert.ok(peak <= 8, `${peak} probes were in flight at once`);
+});
+
+test("a task taking the sandbox back throws away the last verdict", async () => {
+  // Reuse hands the next task the same pod, so identity alone would carry an
+  // `idle` answer across the boundary -- and a turn that leaves a background
+  // shell behind would be read as one that left nothing, for as long as the
+  // cache holds.
+  // Inside the reuse window, so the sweep keeps the handle instead of expiring
+  // it -- this is about the answer, not about the expiry.
+  const { kv } = fakeKv({ idleSince: Date.now() });
+  stubPingableProvider();
+  let probes = 0;
+  const deps = { kv, countActiveShells: async () => { probes += 1; return 0; } };
+
+  await sweepUntilProbed(deps);
+  const afterFirst = probes;
+
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(
+    probes > afterFirst,
+    "the sweep answered from a verdict formed before the task ran",
+  );
+});
+
+test("an answer about a replaced sandbox does not land on its successor", async () => {
+  // The cache is keyed by sandbox identity, so an answer formed about one pod
+  // cannot be read as an answer about the pod that replaced it -- and a probe
+  // still in flight when the swap happens writes under the key it started with,
+  // which nothing reads any more, instead of overwriting the new pod's state.
+  let workloadId = "wl-1";
+  const kv = {
+    async keys(filter = ">") {
+      const key = `hands.${SESSION}`;
+      const matched = filterToRegExp(filter).test(key) ? [key] : [];
+      return (async function* () { yield* matched; })();
+    },
+    async get(key: string) {
+      if (key !== `hands.${SESSION}`) return null;
+      const v = { ...ENTRY, workloadId, idleSince: Date.now() };
+      return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
+    },
+    async delete() {}, async put() { return 1; },
+    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
+  } as unknown as KV;
+  stubPingableProvider();
+  const asked: string[] = [];
+  const deps = {
+    kv,
+    countActiveShells: async () => { asked.push(workloadId); return 0; },
+  };
+
+  await sweepUntilProbed(deps);
+  workloadId = "wl-2";                       // reuse failed; a new pod took over
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(
+    asked,
+    ["wl-1", "wl-2"],
+    "the replacement was answered from the pod it replaced",
+  );
+});
+
+test("the ping fan-out is bounded too, not just the probes", async () => {
+  // The two share a connection pool, so bounding one and not the other moves
+  // the burst rather than removing it: an uncached handle answers `unknown`,
+  // and `unknown` is pinged, so the same cold start that would flood the probes
+  // floods the pings behind them.
+  const kv = manyIdleHandles(50);
+  let peak = 0;
+  let live = 0;
+  const provider = {
+    kind: "safe-workload",
+    async exec() {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise((r) => setImmediate(r));
+      live -= 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    async get() { return { running: true, healthy: true }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+
+  // Every handle is uncached, so every one answers `unknown` and is pinged.
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.ok(peak > 0, "nothing was pinged at all");
+  assert.ok(peak <= 16, `${peak} pings were in flight at once`);
 });
