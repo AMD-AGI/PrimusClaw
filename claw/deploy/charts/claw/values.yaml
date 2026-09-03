@@ -232,6 +232,32 @@ secret:
   natsUrl: ""
   natsUser: prod
   natsPassword: "__TBD__"
+  # Per-workload NATS identities, replacing the single all-access `prod` user
+  # above for the components listed here.
+  #
+  # Leave a password empty and that workload keeps using natsUser /
+  # natsPassword, so this can be filled in one component at a time. Do it in
+  # order of how loudly each fails: reaper first (it exits non-zero), then api
+  # (its consumer setup is fatal on error), and brain last -- brain has the
+  # most fail-open paths, so a subject missing from its allow-list in
+  # deploy/nats-values.yaml is the one most likely to look like nothing at all.
+  #
+  # A denied publish does not raise in the client. Watch the NATS server log
+  # for "Permissions Violation" while cutting over; that is the only reliable
+  # signal.
+  natsUsers:
+  #
+  # Each entry gains a `password` when its user is provisioned -- normally by
+  # deploy.sh, which generates one per component and passes it through. The key
+  # is absent rather than empty here on purpose: an empty password in a config
+  # file is indistinguishable from a real one that was blanked by mistake, and
+  # every scanner that looks at this file is right to say so.
+    api:
+      user: api
+    brain:
+      user: brain
+    reaper:
+      user: reaper
   # Replicas for every JetStream stream and KV bucket the API and Brain create.
   # Blank takes the code default of 3, which is what the bundled clustered NATS
   # serves; set it to 1 only when pointing at a single-node `nats-server -js`,

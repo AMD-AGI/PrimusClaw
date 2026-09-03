@@ -90,7 +90,25 @@ awk -v block="$DEV_BLOCKS" '
 ' "$VALUES_TEMPLATE" \
   | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
         -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
+        -e "s|__API_NATS_PASSWORD__|${NATS_PASSWORD_API}|g" \
+        -e "s|__BRAIN_NATS_PASSWORD__|${NATS_PASSWORD_BRAIN}|g" \
+        -e "s|__REAPER_NATS_PASSWORD__|${NATS_PASSWORD_REAPER}|g" \
+        -e "s|__OPS_NATS_PASSWORD__|${NATS_PASSWORD_OPS}|g" \
   > "$RENDERED"
+
+# This script helm-upgrades the whole NATS release, so it re-renders the PROD
+# account too -- adding a dev account rewrites every production user. If a
+# password variable is missing from the creds file, the corresponding user
+# would be rendered with the literal placeholder as its password and every
+# component authenticating as that user would start failing. deploy.sh is what
+# creates and backfills those variables, so point the operator there rather
+# than generating one here and diverging from what the cluster expects.
+if grep -q '__[A-Z]*_NATS_PASSWORD__' "$RENDERED"; then
+  echo "ERROR: unsubstituted NATS password placeholder in $RENDERED:" >&2
+  grep -n '__[A-Z]*_NATS_PASSWORD__' "$RENDERED" >&2
+  echo "Run deploy.sh once to backfill $CREDS_FILE, then retry." >&2
+  exit 1
+fi
 
 echo "Running helm upgrade ..."
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/ 2>/dev/null || true

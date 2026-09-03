@@ -58,6 +58,24 @@ spec:
         - secretRef:
             name: primus-claw-secrets
         env:
+        {{- with (get .Values.secret.natsUsers "api") }}
+        {{- if .password }}
+        # A container-level env entry overrides the same name coming from envFrom,
+        # so these replace the shared prod credential in primus-claw-secrets
+        # without that Secret having to change. Absent a password, nothing renders
+        # here and the shared credential is used exactly as before.
+        - name: NATS_USER
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-api
+              key: NATS_USER
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-api
+              key: NATS_PASSWORD
+        {{- end }}
+        {{- end }}
         - name: NODE_OPTIONS
           value: {{ .Values.api.nodeOptions | quote }}
         - name: BRAIN_TASK_TIMEOUT_SEC

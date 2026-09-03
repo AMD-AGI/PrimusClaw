@@ -196,6 +196,29 @@ if ! $SKIP_NATS; then
     source "$NATS_CREDS_FILE"
   fi
 
+  # Backfill the per-component passwords.
+  #
+  # These arrived after the creds file did, and the branch above only writes a
+  # fresh file -- an existing namespace sources one that predates them and
+  # leaves the new variables unset. The sed below substitutes an unset variable
+  # with the empty string, which renders four users whose password is "" and
+  # authenticates nobody. So append what is missing rather than assuming the
+  # file is current, and do it one variable at a time so a file written by a
+  # future version with more users still works.
+  for _nats_user in API BRAIN REAPER OPS; do
+    _nats_var="NATS_PASSWORD_${_nats_user}"
+    if [ -z "${!_nats_var:-}" ]; then
+      if $DRY_RUN; then
+        printf -v "$_nats_var" 'dry-run-%s-password' "$(echo "$_nats_user" | tr '[:upper:]' '[:lower:]')"
+      else
+        log "  Adding $_nats_var -> $NATS_CREDS_FILE"
+        printf -v "$_nats_var" '%s' "$(openssl rand -hex 16)"
+        echo "${_nats_var}=${!_nats_var}" >> "$NATS_CREDS_FILE"
+      fi
+    fi
+  done
+  unset _nats_user _nats_var
+
   # Render values file: substitute PROD/SYS passwords and inject one
   # account block per NATS_PASSWORD_DEV_<NAME> entry in the creds file.
   RENDERED_NATS_VALUES="$WORK_DIR/nats-values.rendered.yaml"
@@ -218,7 +241,20 @@ if ! $SKIP_NATS; then
   ' "$SCRIPT_DIR/nats-values.yaml" \
     | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
           -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
+          -e "s|__API_NATS_PASSWORD__|${NATS_PASSWORD_API}|g" \
+          -e "s|__BRAIN_NATS_PASSWORD__|${NATS_PASSWORD_BRAIN}|g" \
+          -e "s|__REAPER_NATS_PASSWORD__|${NATS_PASSWORD_REAPER}|g" \
+          -e "s|__OPS_NATS_PASSWORD__|${NATS_PASSWORD_OPS}|g" \
     > "$RENDERED_NATS_VALUES"
+
+  # A placeholder that survived rendering means a password variable was unset,
+  # and the resulting user would silently accept the literal string as its
+  # password. Fail here rather than shipping that to the cluster.
+  if grep -q '__[A-Z]*_NATS_PASSWORD__' "$RENDERED_NATS_VALUES"; then
+    echo "ERROR: unsubstituted NATS password placeholder in $RENDERED_NATS_VALUES:" >&2
+    grep -n '__[A-Z]*_NATS_PASSWORD__' "$RENDERED_NATS_VALUES" >&2
+    exit 1
+  fi
 
   if $DRY_RUN; then
     log "[dry-run] helm upgrade --install $NATS_RELEASE nats/nats -n $NAMESPACE -f $RENDERED_NATS_VALUES"
