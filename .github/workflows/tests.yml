@@ -85,3 +85,12 @@ jobs:
       # e2e suites are behind the `e2e` build tag and need a cluster, so a plain
       # `go test ./...` covers exactly the unit tests.
       - run: go test ./...
+
+  litellm-existing-secret:
+    name: LiteLLM existingSecret handling
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - run: bash scripts/release-tests/litellm-existing-secret.sh

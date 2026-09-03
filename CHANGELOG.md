@@ -27,6 +27,12 @@ record it.
 
 ## [Unreleased]
 
+### Fixed
+- The LiteLLM deploy wrapper no longer passes the master key and database URL to
+  Helm when `secrets.existingSecret` is set, so they stay out of the release
+  values. Revisions written before this change still hold them; see
+  "Credentials already in the release history" in `deploy/litellm/README.md`.
+
 ### Added
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
   Agent Sandbox control-plane fork (`sandbox/`), the long-term memory plane

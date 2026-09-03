@@ -39,6 +39,19 @@ Environment surface:
 | `LITELLM_INGRESS_HOST` | Enables ingress for `/llm-gateway` when set |
 | `LITELLM_IMAGE` | Defaults to a pinned `docker.io/primussafe/litellm` timestamp tag |
 
+## Credentials already in the release history
+
+`secrets.existingSecret` keeps the master key and the database URL out of the
+values Helm stores **from the next revision onward**. It does not reach back:
+revisions written before it was set still carry both in plain text, and an
+upgrade does not rewrite them.
+
+Each revision is a Secret named `sh.helm.release.v1.<release>.v<N>` in the
+release namespace, so `helm get values <release> --revision N` returns what that
+revision held. Deleting those Secrets removes the values and the ability to roll
+back to those points; it does not undo the exposure, so treat anything that was
+in them as compromised and rotate it.
+
 ## Model routing is deployment-specific
 
 The chart ships **no model list**. Which providers and models a deployment
