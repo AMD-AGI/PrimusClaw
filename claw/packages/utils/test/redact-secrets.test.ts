@@ -220,7 +220,7 @@ test("a redacted vendor token leaves not one character of itself behind", () => 
     `sk-ant-api03-${"Ab9_-".repeat(20)}xY7`,
     `sk-proj-${"a".repeat(48)}`,
     `sk-svcacct-${"Bq7_-".repeat(8)}Zt4`,
-    `sk-live-${"c".repeat(24)}-${"D9".repeat(6)}`,
+    `sk_live_${"c7D9".repeat(8)}`,
     `sk-${"a1B2".repeat(12)}`,
     `github_pat_11ABCDEFG0${"x".repeat(30)}_${"y".repeat(20)}`,
     `glpat-${"a".repeat(10)}-${"B9_".repeat(6)}`,
@@ -263,6 +263,13 @@ test("an ordinary identifier beginning sk- is not a token", () => {
     "sk-HTTP2-client-configuration-for-Production",
     "sk-learn-is-a-typo", "sk-load-the-data", "ask-me-anything-now",
     "sk-electroencephalography-pipeline", "sk-Batch2-Retry-Handler-Configuration",
+    // A dash-delimited sk-live-/sk-test- was a guess at a format no vendor
+    // publishes. Stripe's real keys are sk_live_/sk_test_ with an unbroken
+    // base62 body, so the dash forms match nothing and these read as what
+    // they are.
+    "sk-test-user-authentication-configuration",
+    "sk-live-payment-processing-configuration",
+    "sk-live-deployment-orchestration-service",
   ]) {
     const r = redactSecrets(prose);
     assert.equal(r.text, prose, `${JSON.stringify(prose)} is an identifier, not a key`);
@@ -278,8 +285,9 @@ test("the documented sk- prefixes are matched at their documented lengths", () =
     `sk-ant-${"z".repeat(48)}`,
     `sk-proj-${"Ab3_".repeat(14)}`,
     `sk-svcacct-${"Cd4-".repeat(10)}`,
-    `sk-live-${"e".repeat(40)}`,
-    `sk-test-${"f".repeat(40)}`,
+    `sk_live_${"A1b2C3d4".repeat(4)}`,
+    `sk_test_${"z9Y8".repeat(8)}`,
+    `rk_live_${"Q7w8E9r0".repeat(3)}`,
     `sk-${"g7H8".repeat(10)}`,
   ]) {
     assert.equal(redactSecrets(key).text, "<redacted>", `${key.slice(0, 24)}... must be redacted`);
@@ -302,6 +310,27 @@ test("an email or a glob is not a credential whatever variable holds it", () => 
   // And the credentials that share their surface shape are still caught: the
   // digits fall inside the segments rather than after them.
   for (const secret of ["P@ssw0rd", "Xk9$mzPl2vQ", "Tr0ub4dor&3x", "n7%Qw2Lz!pE"]) {
+    assert.ok(looksLikeCredentialValue(secret), `${JSON.stringify(secret)} is a credential`);
+  }
+});
+
+test("a toolchain or version string is not a credential", () => {
+  // TOOLCHAIN=x86_64+AVX2 is ordinary config, and redacting it takes the
+  // architecture out of every command in the transcript that mentions it.
+  // What these have that a password does not is a real word or acronym in
+  // among the version numbers.
+  for (const build of [
+    "x86_64+AVX2", "Python3.12+NumPy2", "Node18.20+OpenSSL3",
+    "gcc11+CUDA12", "llvm15+MLIR2", "rocm6.2+HIP6",
+  ]) {
+    assert.equal(
+      looksLikeCredentialValue(build), false,
+      `${JSON.stringify(build)} is a toolchain, not a key`,
+    );
+  }
+  // And a value made only of the filler, with no word anywhere in it, is not
+  // a version string however much punctuation it borrows from one.
+  for (const secret of ["aB12+cD34+eF56", "Xk9$mzPl2"]) {
     assert.ok(looksLikeCredentialValue(secret), `${JSON.stringify(secret)} is a credential`);
   }
 });

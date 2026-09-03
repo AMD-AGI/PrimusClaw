@@ -153,11 +153,17 @@ function redactValue(
  * rendering, while sensitive-key fields, known secret formats, and exact
  * runtime credentials are replaced.
  *
- * ── Known limitations ───────────────────────────────────────────────────────
+ * ── Known limitations, which are not the whole list ─────────────────────────
  *
  * Two shapes are knowingly NOT caught in free text, and calling them out here
  * is the point: they are deliberate choices, not oversights, and a reader who
  * assumes otherwise will build on a guarantee that was never made.
+ *
+ * They are examples, not an inventory. Every round of review on this code has
+ * turned up another ordinary string that a heuristic mistook for a key, and
+ * the honest reading is that the list below is where the search had got to,
+ * not where it ends. Treat free text as unredacted and do not echo
+ * credentials into it; that is the only guarantee available here.
  *
  *  1. A short, purely alphabetic secret (`DB_PASSWORD=XkjQmzPl`). The field is
  *     masked by the key-name pass, but `auth failed XkjQmzPl` written loose in

@@ -70,7 +70,14 @@ const VENDOR_TOKEN_RE = new RegExp([
   // sk-: documented vendor prefixes with their documented minimum bodies.
   "\\bsk-ant-api03-[A-Za-z0-9_-]{80,}",                 // Anthropic
   "\\bsk-ant-[A-Za-z0-9_-]{40,}",                       // Anthropic, older
-  "\\bsk-(?:proj|svcacct|admin|live|test)-[A-Za-z0-9_-]{32,}",
+  "\\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{32,}",   // OpenAI, base64url
+  // Stripe and its siblings are underscore-delimited and their bodies are
+  // one unbroken base62 run. Nothing in this class carries word separators,
+  // so the body may not either. A dash-delimited `sk-live-...` was a guess at
+  // a format no vendor publishes, and it read `sk-live-payment-processing-
+  // configuration` as a key; it is gone, left to the legacy rule and the name
+  // pass rather than approximated.
+  "\\b[rs]k_(?:live|test)_[A-Za-z0-9]{24,}",           // Stripe
   "\\bsk-(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}",        // legacy bare form
   "\\bhf_[A-Za-z0-9]{20,}",                             // Hugging Face
   "\\bAKIA[0-9A-Z]{16}",                                // AWS access key id
@@ -160,19 +167,46 @@ const EMAIL_SHAPED_RE = /@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/;
  * The vowel is what carries the weight. Without it this also swallows
  * `Xk9$mzPl2` -- a password with the same skeleton as `Abc1+Def2` -- and the
  * two are separable only by whether the letter runs read as words at all.
+ * Three letters is the floor for the same reason: at two, `aB12+cD34+eF56`
+ * reads as a word between versions instead of as the password it is.
  */
-const WORD_SEGMENT_RE = /^(?=[A-Za-z]*[AEIOUYaeiouy])[A-Za-z]{2,}[0-9]{0,3}$/;
+const WORD_SEGMENT_RE = /^(?=[A-Za-z]*[AEIOUYaeiouy])[A-Za-z]{3,}[0-9]{0,3}$/;
+
+/** An acronym, with or without a version on it: `SSL`, `AVX2`, `SHA256`. */
+const ACRONYM_SEGMENT_RE = /^[A-Z]{2,}[0-9]{0,3}$/;
 
 /**
- * Whether every symbol-delimited piece is an ordinary word.
+ * The filler a version or architecture string puts between its words.
  *
- * `Foo1.*Bar2` and `Abc1+Def2` are patterns, not passwords, and what says so
- * is that taking the symbols out leaves nothing but words. A credential's
- * segments are not words -- its digits and case changes fall inside them.
+ * `x86_64+AVX2` breaks into `x86`, `64`, `AVX2`, and only the last of those
+ * is a word by any reading -- which is why a rule asking every segment to be
+ * a word rejected the whole string and called an arch triple a password.
+ * A bare number, and a short letter run with a version stuck on it (`x86`,
+ * `gcc11`), carry nothing on their own, so they are allowed to sit between
+ * the words without deciding anything -- the decision is left to the rule
+ * that at least one segment must be a real word or acronym.
  */
-function isWordSymbolWord(value: string): boolean {
+const VERSION_SEGMENT_RE = /^(?:[0-9]{1,4}|[A-Za-z]{1,4}[0-9]{1,3})$/;
+
+/**
+ * Whether every symbol-delimited piece reads as prose or as a version.
+ *
+ * `Foo1.*Bar2` and `Abc1+Def2` are patterns, `x86_64+AVX2` and
+ * `Node18.20+OpenSSL3` are toolchain strings, and what says so in every case
+ * is that taking the symbols out leaves nothing but words, acronyms and
+ * numbers. A credential's segments are none of those -- its digits and case
+ * changes fall inside them, as in `Xk9$mzPl2` or `Tr0ub4dor&3x`.
+ *
+ * At least one segment has to be a real word or acronym. Numbers and
+ * letter-number pairs are filler, and a value made only of filler --
+ * `aB12+cD34+eF56` -- is not a version string, it is a password.
+ */
+function isProseOrVersion(value: string): boolean {
   const segments = value.split(/[^A-Za-z0-9]+/).filter((seg) => seg.length > 0);
-  return segments.length >= 2 && segments.every((seg) => WORD_SEGMENT_RE.test(seg));
+  if (segments.length < 2) return false;
+  const isWord = (seg: string) => WORD_SEGMENT_RE.test(seg) || ACRONYM_SEGMENT_RE.test(seg);
+  if (!segments.some(isWord)) return false;
+  return segments.every((seg) => isWord(seg) || VERSION_SEGMENT_RE.test(seg));
 }
 export function looksLikeCredentialValue(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
@@ -180,7 +214,7 @@ export function looksLikeCredentialValue(value: string): boolean {
   if (!CREDENTIAL_SYMBOL_RE.test(value)) return false;
   if (value.startsWith("-") || value.startsWith("+")) return false;
   if (EMAIL_SHAPED_RE.test(value)) return false;
-  if (isWordSymbolWord(value)) return false;
+  if (isProseOrVersion(value)) return false;
   if (!/[a-z]/.test(value) || !/[A-Z]/.test(value) || !/[0-9]/.test(value)) return false;
   return new Set(value).size >= 6;
 }

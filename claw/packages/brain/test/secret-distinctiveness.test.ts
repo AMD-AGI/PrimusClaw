@@ -89,11 +89,12 @@ test("the lowercase-word exemption ends exactly where the docstring says", () =>
   assert.equal(isDistinctiveSecret("a".repeat(16)), true, "16 is past what vocabulary reaches");
   assert.equal(isDistinctiveSecret("A".repeat(15)), false, "shouting does not add entropy");
   assert.equal(isDistinctiveSecret("A".repeat(16)), true, "the step is the same on both cases");
-  // Only a run of letters in a casing a human types gets the exemption:
-  // all-lower, all-upper, or Capitalized. Anything the number row or the
-  // punctuation keys touched is distinctive at any length above the floor, and
-  // so is a run that changes case mid-word -- no vocabulary does that, but a
-  // generated token does it constantly.
+  // Casing is not consulted at all. It was, once, on the premise that a
+  // mid-word capital meant a generated token -- but `GitHub`, `macOS` and
+  // `iPhone` all change case mid-word, and the premise cost more than it
+  // bought. What earns the exemption now is being letters and nothing else;
+  // anything the number row or the punctuation keys touched is distinctive
+  // above the floor, whatever case it is written in.
   for (const short of ["ma1n", "ma-n", "m.in", "s3cr3t", "P@ssw0rd", "abc-123"]) {
     assert.ok(isDistinctiveSecret(short), `${JSON.stringify(short)} does not occur in prose`);
   }
