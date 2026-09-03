@@ -79,6 +79,9 @@ LiteLLM env (deployed AFTER Claw so it can reuse Claw's PGO database):
   LITELLM_VALUES_FILE=/path/private-values.yaml
   LITELLM_INGRESS_HOST=<host>          # optional; enables ingress when set
   # Interactive (TTY only): prompts to add an anthropic/openai provider and auto-discovers its models
+  # glm-5.3: copy deploy/litellm/values.glm53.example.yaml, set api_base to the
+  # cluster OpenAI-compatible /v1 URL, then pass that copy as LITELLM_VALUES_FILE.
+  # Skip the interactive /models prompt so it does not overwrite that modelList.
 
 Claw env:
   CLAW_NAMESPACE=<NAMESPACE>          # defaults to $NAMESPACE

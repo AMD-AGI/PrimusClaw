@@ -11,6 +11,10 @@
 #   LITELLM_MASTER_KEY        Generated if unset (or reused from the existing Secret)
 #   LITELLM_INGRESS_HOST      If set, apply ingress for /llm-gateway
 #   LITELLM_VALUES_FILE       Private Helm values file with modelList/secrets
+#
+# glm-5.3: copy values.glm53.example.yaml, set litellm_params.api_base to the
+# cluster OpenAI-compatible /v1 URL, then pass that file as LITELLM_VALUES_FILE.
+# Skip interactive /models discovery; it overwrites modelList from the file.
 
 set -euo pipefail
 
@@ -89,6 +93,10 @@ Key env:
   LITELLM_INGRESS_HOST=<host>       # optional; enables ingress when set
   LITELLM_SERVER_ROOT_PATH=/llm-gateway
   LITELLM_SAFE_API_URL=https://safe.example.com
+
+  glm-5.3: copy values.glm53.example.yaml, replace api_base with the cluster
+  OpenAI-compatible /v1 URL, then set LITELLM_VALUES_FILE to that copy. Skip
+  the interactive /models prompt so it does not overwrite the glm-5.3 modelList.
 HELP
       exit 0 ;;
     *) echo "Unknown flag: $1" >&2; exit 2 ;;
