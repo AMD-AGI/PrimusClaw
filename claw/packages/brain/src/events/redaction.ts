@@ -19,7 +19,15 @@ function redactValue(
   if (typeof value === "string") {
     let text = redactSecrets(value).text;
     for (const secret of runtimeSecrets) {
-      if (secret.length >= 4) text = text.split(secret).join("<redacted>");
+      // The floor matches redactSecrets()'s own guard on extraSecrets, and for
+      // the same reason: this is a blind substring replace, so a short value
+      // does not identify a credential, it just matches prose. A config var
+      // holding "true", "main" or "8080" would otherwise excise that word from
+      // every command, path and log line in the payload -- and these payloads
+      // are replayed to the model, so what is cut is gone for good. Sixteen
+      // characters is short enough to still catch a real token and long enough
+      // that a collision with ordinary text is a deliberate act.
+      if (secret.length >= 16) text = text.split(secret).join("<redacted>");
     }
     return text;
   }

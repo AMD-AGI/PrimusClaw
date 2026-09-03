@@ -27,7 +27,7 @@ import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { classifyResumeOutcome } from "./resume-outcome.js";
-import { sleep, redactSecrets } from "@claw/utils";
+import { sleep, redactSecrets, isSensitiveKey } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
   WORKSPACE_SYNC_INTERVAL_MS, WORKSPACE_SYNC_GRACE_MS,
@@ -68,15 +68,44 @@ import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
 
+/**
+ * The exact credential strings this run knows about, for the substring pass in
+ * redaction.ts. A value listed here is replaced wherever it appears in any
+ * string that leaves the process.
+ *
+ * Only env vars whose NAME reads as a credential are included, because that
+ * pass is an exact-substring replace with no notion of what it is cutting.
+ * Feeding it every user_env / session_env value made it delete ordinary
+ * content: on one live deployment 342 of 344 sessions in a week carried a
+ * `<redacted>` in their persisted history, and what had been destroyed was
+ * things like `sed -n '140,340p' <redacted>` (a FORGE_PATH), `MODEL_PATH=<redacted>/Qwen3-8B`,
+ * and `backends/<redacted>_runner.py` -- a word excised from the middle of an
+ * identifier. Those strings are also replayed to the model, so the agent came
+ * back from a resume having lost the paths it was itself working with.
+ *
+ * isSensitiveKey is the same predicate the key-name pass uses, so a name that
+ * gets a field masked also gets its value hunted; the two halves cannot drift
+ * apart. It errs towards redacting, which is the right direction here: a
+ * config value wrongly treated as a secret costs one mangled log line, and the
+ * length floor in redactValue keeps a short one from mangling anything at all.
+ */
 function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): string[] {
   return [
     request.platform_key,
     resolvedPlatformKey,
     request.llm_api_key,
     request.backend_internal_token,
-    ...Object.values(request.user_env ?? {}),
-    ...Object.values(request.session_env ?? {}),
+    ...sensitiveEnvValues(request.user_env),
+    ...sensitiveEnvValues(request.session_env),
   ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/** Values of the env vars whose name reads as a credential. */
+function sensitiveEnvValues(env: Record<string, string> | undefined): string[] {
+  if (!env) return [];
+  return Object.entries(env)
+    .filter(([name]) => isSensitiveKey(name))
+    .map(([, value]) => value);
 }
 
 function pendingCallbackKey(taskId: string): string {
@@ -439,6 +468,7 @@ export const __test__ = {
   classifyRetryableReason,
   checkpointKey,
   checkpointS3Prefix,
+  runtimeSecrets,
 };
 
 // ===== Post-task keepalive teardown =====
