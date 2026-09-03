@@ -1071,6 +1071,24 @@ class TaskRunner {
     }
   };
 
+  /**
+   * The workspace-sync metadata that belongs with the state this runner holds
+   * right now.
+   *
+   * One expression, called from both the turn write and the repair below,
+   * because the two have to agree. `lastSyncedTurn` only ever advances, so a
+   * value derived from it here is never older than the one a caller captured
+   * earlier -- which is the whole point: a repair re-writes
+   * `latestCheckpointState`, and pairing that with a caller's captured
+   * `workspaceInfo` would put `has_workspace_sync: false` back on a run whose
+   * sync has since completed.
+   */
+  private currentWorkspaceInfo(): { has_workspace_sync: boolean; last_sync_turn: number } | undefined {
+    return this.lastSyncedTurn > 0
+      ? { has_workspace_sync: true, last_sync_turn: this.lastSyncedTurn }
+      : undefined;
+  }
+
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
     if (this.abortCtrl.signal.aborted || this.taskFinished) {
       logger.debug(
@@ -1081,12 +1099,13 @@ class TaskRunner {
     }
     // Held verbatim. This is the conversation a resumed run replays to the
     // model, and mutating it here is what deleted file paths and identifiers
-    // out of live sessions. The v3 write path still redacts on its way to the
-    // bucket (see encodeCheckpointV3); v4 seals instead. Anything that takes a
-    // string out of this object and sends it somewhere -- the partial summary
-    // below is the one that does -- has to redact for itself now.
-    const safeState = state;
-    this.latestCheckpointState = safeState;
+    // out of live sessions. There is deliberately no copy taken: the agent
+    // loop already hands this in as `workingMessages.slice()`, and the v3
+    // write path redacts on its way to the bucket (see encodeCheckpointV3)
+    // while v4 seals instead. Anything that takes a string out of this object
+    // and sends it somewhere -- the partial summary below is the one that does
+    // -- has to redact for itself now.
+    this.latestCheckpointState = state;
     // The checkpoint is authoritative about cache use, so this assignment can
     // move the timestamp BACKWARDS -- or clear it -- where `onCacheUse` only
     // ever moves it forward. That asymmetry is the fix: compaction discards
@@ -1098,14 +1117,9 @@ class TaskRunner {
     // false positive the clear exists to prevent, reintroduced downstream of
     // it. Within a turn `onCacheUse` is still the fresher of the two; at a
     // turn boundary the loop's state is the one that knows.
-    this.latestCacheUseAt = safeState.last_cache_use_at;
-    this.cacheUseCleared = safeState.last_cache_use_at === undefined;
-    const written = await this.writeKvCheckpoint(
-      safeState,
-      this.lastSyncedTurn > 0
-        ? { has_workspace_sync: true, last_sync_turn: this.lastSyncedTurn }
-        : undefined,
-    );
+    this.latestCacheUseAt = state.last_cache_use_at;
+    this.cacheUseCleared = state.last_cache_use_at === undefined;
+    const written = await this.writeKvCheckpoint(state, this.currentWorkspaceInfo());
 
     // Trigger an async workspace sync if it's been long enough since the
     // last one AND we are not already syncing AND we have a hex user id
@@ -1123,7 +1137,7 @@ class TaskRunner {
       this.lastSyncAt = now;
       const frozenHands = this.hands;
       const frozenUidHex = this.userIdHex;
-      const turnSnapshot = safeState.turns_completed;
+      const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
         .run(() => fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot))
         .then(async (info) => {
@@ -1133,7 +1147,7 @@ class TaskRunner {
           // Use the cached latestCheckpointState if the agent loop has
           // since advanced; otherwise fall back to the state captured at
           // sync issue time so the flip is never lost.
-          const stateToCommit = this.latestCheckpointState ?? safeState;
+          const stateToCommit = this.latestCheckpointState ?? state;
           await this.writeKvCheckpoint(
             stateToCommit,
             { has_workspace_sync: true, last_sync_turn: turnSnapshot },
@@ -1159,7 +1173,7 @@ class TaskRunner {
     // treating the failed write as a fresh checkpoint.
     if (!written) {
       throw new Error(
-        `checkpoint KV write failed at turn ${safeState.turns_completed}`,
+        `checkpoint KV write failed at turn ${state.turns_completed}`,
       );
     }
   };
@@ -1520,15 +1534,25 @@ class TaskRunner {
         // key still holds the older state -- and the loop uses that to decide
         // whether to keep retrying, so a swallowed failure stops the retries
         // as well as losing the write.
+        //
+        // The repair carries `currentWorkspaceInfo()` rather than this call's
+        // `workspaceInfo`, because the state it re-writes is not this call's
+        // state. Handing the newest conversation the captured flag of a turn
+        // write issued before a sync completed is how a repair used to clear
+        // `has_workspace_sync` on a run that had in fact synced, which sends
+        // the next attempt to restore from S3 instead of the shared disk.
         if (!isRepair && this.latestCheckpointState) {
           return await this.writeKvCheckpoint(
-            this.latestCheckpointState, workspaceInfo, kind, true,
+            this.latestCheckpointState, this.currentWorkspaceInfo(), kind, true,
           );
         }
-        // No newer state to restore, or this IS the repair: the key holds
-        // something older than what was just serialized and nothing here can
-        // fix that, so do not claim otherwise.
-        return isRepair;
+        // Either there was no newer state to restore, or this IS the repair
+        // and it was itself overtaken before its put landed. Both leave the
+        // key holding something other than what this call was asked to
+        // persist, so neither may be reported as a write that landed -- the
+        // loop uses this to decide whether to keep retrying, and a false
+        // success stops the retries as well as losing the write.
+        return false;
       }
       this.lastWrittenSeq = seq;
       metrics.onCheckpointWrite(

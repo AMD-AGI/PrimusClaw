@@ -39,18 +39,47 @@ export class AeadOpenError extends Error {
 }
 
 /**
- * Decode a base64 key and check its length.
+ * Decode a base64 key, checking that the input is canonical base64 and that it
+ * decodes to exactly one key.
  *
  * Separate from seal/open so a process can fail at boot rather than at the
  * first write. A key that is the wrong length is a deployment mistake, and the
  * useful moment to say so is before anything depends on it.
+ *
+ * The syntax check is not pedantry. `Buffer.from(s, "base64")` skips whatever
+ * it cannot interpret, so a key with a character lost in a copy-paste, a
+ * trailing newline swallowed from a file, or an inner space decodes to
+ * *something* rather than failing -- and only the length check stands between
+ * that and a fleet sealing checkpoints under a key nobody can reproduce. Two
+ * pods given two different manglings of the same key would silently be unable
+ * to read each other's checkpoints. So require the exact canonical encoding of
+ * AEAD_KEY_LEN bytes, and say which of the two problems it is.
  */
+const CANONICAL_B64 = /^[A-Za-z0-9+/]+={0,2}$/;
+
 export function decodeAeadKey(b64: string, envVarName: string): Buffer {
+  const generate = `Generate with 'openssl rand -base64 32'.`;
+  if (!CANONICAL_B64.test(b64)) {
+    throw new Error(
+      `${envVarName} is not canonical base64: it must contain only A-Z a-z 0-9 + / `
+      + `with at most two trailing '=' and no whitespace. ${generate}`,
+    );
+  }
   const decoded = Buffer.from(b64, "base64");
+  // Re-encoding catches what the character class cannot: padding in the wrong
+  // place, a length that is not a whole number of base64 quanta, and non-zero
+  // bits in the final partial character -- each of which decodes to a Buffer
+  // that no longer round-trips to the string it came from.
+  if (decoded.toString("base64") !== b64) {
+    throw new Error(
+      `${envVarName} is not a canonical base64 encoding of its own bytes `
+      + `(check padding and length). ${generate}`,
+    );
+  }
   if (decoded.length !== AEAD_KEY_LEN) {
     throw new Error(
       `${envVarName} decoded to ${decoded.length} bytes, expected ${AEAD_KEY_LEN}. `
-      + `Generate with 'openssl rand -base64 32'.`,
+      + generate,
     );
   }
   return decoded;

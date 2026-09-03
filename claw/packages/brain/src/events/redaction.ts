@@ -381,9 +381,11 @@ export const redactToolEvent = redactPersistedEvent;
  * to the checkpoint: a name that says "checkpoint" makes redacting one look
  * like the intended use. It never was. A checkpoint is the conversation a
  * resumed run replays to the model, and mutating it deletes content the agent
- * then no longer has. The six callers that use this are all genuine egress;
- * the checkpoint writer takes it as an explicit parameter for the v3 format
- * only, and cannot import it at all (see checkpoint-codec.ts).
+ * then no longer has. Seven call sites reference it. Six are genuine egress;
+ * the seventh hands it to the checkpoint writer as an explicit parameter, used
+ * on the v3 format only -- the codec cannot import it at all, which is what
+ * keeps that the deliberate exception rather than a habit (see
+ * checkpoint-codec.ts).
  *
  * `runtimeSecrets` is required rather than defaulted. An optional parameter is
  * one a caller can omit and still typecheck, and `redactEgressPayload(x)` with

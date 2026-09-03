@@ -14,12 +14,12 @@
  * through the same redactor that masks events on their way to NATS and the
  * event database, and that redactor mutates -- by design, because a log line
  * with a credential in it should not be stored verbatim. Applied to replayable
- * state the same behaviour deletes content: on one live deployment nearly every
- * session in a week resumed with `<redacted>` standing where a file path, a
- * model directory or a word from the middle of an identifier used to be. The
- * agent came back having lost what it was working on, and the turn was a
- * guaranteed total prompt-cache miss because the bytes no longer matched what
- * had been sent.
+ * state the same behaviour deletes content: any resumed session can come back
+ * with `<redacted>` standing where a file path, a directory name or a word from
+ * the middle of an identifier used to be, because the substring pass matches on
+ * shape rather than on provenance. The agent returns having lost what it was
+ * working on, and the turn is a guaranteed total prompt-cache miss because the
+ * bytes no longer match what had been sent.
  *
  * Confidentiality is then a separate problem with a separate answer. The bucket
  * holds every user's prompts, file contents and tool output; NATS here runs
@@ -47,10 +47,11 @@
  * `compression=s2`, and ciphertext does not compress, so without it the stream
  * loses a compression ratio it currently gets for free.
  *
- * AAD binds each blob to `<session_id>|<message_id>|<version>`. Without it,
- * anyone able to write the bucket could move run A's sealed conversation onto
- * run B's key and have B replay it -- the reader authenticates a checkpoint by
- * a `message_id` field that lives inside the same writable value, so it would
+ * AAD binds each blob to the session id, message id, user id and format
+ * version of the run the reader believes it is loading. Without it, anyone able
+ * to write the bucket could move run A's sealed conversation onto run B's key
+ * and have B replay it -- the reader authenticates a checkpoint by a
+ * `message_id` field that lives inside the same writable value, so it would
  * accept the move. With it, the open fails. The envelope counters are checked
  * against their sealed copies for the same reason: everything outside the seal
  * is attacker-writable, so nothing outside it may be trusted on its own.
@@ -116,8 +117,34 @@ export interface CheckpointIdentity {
   userId: string;
 }
 
+/**
+ * The AAD bytes for one identity, encoded so that no two distinct identities
+ * can produce the same bytes.
+ *
+ * A delimiter join cannot promise that. `"a|b"` joined to `"c"` and `"a"`
+ * joined to `"b|c"` are the same string, so two runs whose ids differ only in
+ * where the boundary falls would share an AAD -- and a sealed conversation
+ * could then be moved between them and still open. Nothing validates that a
+ * session or message id contains no `|`; they arrive from the request.
+ *
+ * Each field is therefore length-prefixed with its byte length, which makes the
+ * encoding injective: the decoder of these bytes (which nobody needs to write)
+ * would recover exactly one field split, so exactly one identity maps to any
+ * given AAD. The version is appended as a fixed-width field for the same
+ * reason.
+ */
 function aadFor(id: CheckpointIdentity, version: number): Buffer {
-  return Buffer.from(`${id.sessionId}|${id.messageId}|${id.userId}|${version}`, "utf8");
+  const parts: Buffer[] = [];
+  for (const field of [id.sessionId, id.messageId, id.userId]) {
+    const bytes = Buffer.from(field, "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(bytes.length);
+    parts.push(len, bytes);
+  }
+  const ver = Buffer.alloc(4);
+  ver.writeUInt32BE(version);
+  parts.push(ver);
+  return Buffer.concat(parts);
 }
 
 /**
