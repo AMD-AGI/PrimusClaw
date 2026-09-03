@@ -174,6 +174,7 @@ val() { [ -f "$CLUSTER_DIR/$1" ] && cat "$CLUSTER_DIR/$1" || return 1; }
 fld() {
   local v
   v="$(val "replicas-$1" | awk -v n="$2" '{print $n}')" || exit 1
+  [ "$v" = "!" ] && exit 7          # the query itself fails, as kubectl does
   [ "$v" = "-" ] && exit 0          # the field is simply not there
   printf '%s' "$v"
 }
@@ -388,6 +389,20 @@ echo "0 - - - 8 8" >"$cluster/replicas-api"
 out="$(blockers)"
 [ -z "$out" ] || bad "a Deployment intentionally scaled to zero must not block retirement, got: $out"
 ok "a Deployment scaled to zero with no pods left allows retirement"
+
+# That legitimate zero and a kubectl that never answered look identical on
+# stdout: both are empty. Fail the one query for status.replicas and leave
+# every other field reading like the finished scale-down above -- if the exit
+# status is thrown away, the gate reports "zero pods owned, safe to retire"
+# about a cluster it never managed to ask.
+adopted
+echo "0 - - ! 8 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment's rollout cannot be verified" <<<"$out" \
+  || bad "a failed status.replicas query must block retirement, got: $out"
+grep -q "the query for .status.replicas failed" <<<"$out" \
+  || bad "the blocker must say the query failed, got: $out"
+ok "a status query that fails blocks retirement instead of reading as zero"
 
 # The same zero with a pod still owned is a scale-down in flight, and that pod
 # is serving.

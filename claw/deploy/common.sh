@@ -463,21 +463,30 @@ _nats_workload_adoption() {
       # the new one.
       local want have ready total gen seen unverifiable=()
       _dep() {
-        kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath="{$1}" 2>/dev/null || true
+        kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath="{$1}" 2>/dev/null
       }
       # Read one field into _DEP_VALUE, recording anything that is not a count.
       #
-      # Empty means two different things depending on the field, and reading
-      # both as 0 is how a gate ends up passing on no evidence at all.
-      # Kubernetes omits a zero-valued status counter, so an absent
-      # updatedReplicas/readyReplicas/replicas genuinely is zero. An absent
-      # generation, observedGeneration or spec.replicas is not a zero: it means
-      # the Deployment could not be read, or the controller has never written a
-      # status. Non-numeric is never a count, whichever field it came from --
+      # Empty means three different things, and reading all of them as 0 is how
+      # a gate ends up passing on no evidence at all. Kubernetes omits a
+      # zero-valued status counter, so an absent updatedReplicas/readyReplicas/
+      # replicas genuinely is zero. An absent generation, observedGeneration or
+      # spec.replicas is not a zero: it means the Deployment could not be read,
+      # or the controller has never written a status. And a kubectl that failed
+      # -- unreachable API server, expired credential, a timeout -- prints
+      # nothing either, which is the emptiest evidence of all: the cluster was
+      # never successfully asked, so nothing it "returned" is a count. That case
+      # shows up only in the exit status, so the exit status is what is checked
+      # first. Non-numeric is never a count, whichever field it came from --
       # `[ "$seen" -lt "$gen" ]` on a word is an error, and an error swallowed
       # here reads as "no blocker".
       _dep_field() {
-        local v; v="$(_dep "$1")"
+        local v
+        if ! v="$(_dep "$1")"; then
+          unverifiable+=("the query for $1 failed")
+          _DEP_VALUE=0
+          return 0
+        fi
         case "$v" in
           "")       if [ "$2" = required ]; then
                       unverifiable+=("$1 was not reported")
