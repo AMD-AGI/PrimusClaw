@@ -20,6 +20,7 @@ import {
   sameHandsSandbox,
   HANDS_ENTRY_CORRUPT,
 } from "../src/sandbox/container-probe.js";
+import { SandboxGoneError } from "../src/sandbox/errors.js";
 import type { SandboxInstance } from "../src/sandbox/provider.js";
 
 let restore: (() => void) | null = null;
@@ -37,6 +38,13 @@ const SAFE_ENTRY = {
   workloadId: "claw-sandbox-1",
   platformKey: "pk",
   namespace: "ns",
+};
+const AGENT_ENTRY = {
+  provider: "agent-sandbox",
+  sessionId: "sess-1",
+  sandboxName: "box",
+  namespace: "ns",
+  userId: "u-1",
 };
 
 const neverExec = async (): Promise<never> => {
@@ -124,11 +132,10 @@ test("a control plane that says the sandbox is not there is dead", async () => {
   for (const message of [
     "sandboxExec failed: HTTP 404 workload not found",
     "sandboxExec failed: HTTP 410 gone",
-    'agent-sandbox exec failed: 404 {"error":"no such session"}',
   ]) {
     bind({
       readHandsEntry: async () => SAFE_ENTRY,
-      exec: async () => { throw new Error(message); },
+      exec: async () => { throw new SandboxGoneError(message); },
     });
     assert.deepEqual(
       await probeSandboxContainer("sess-1"),
@@ -170,9 +177,8 @@ test("the incident's own failure shape does not license a destroy", async () => 
     exec: async () => {
       throw new Error(
         'sandboxExec failed: HTTP 502 {"error":"upstream error: Post '
-        + '\\"http://primus-claw-86c427cd7e8d-ct49ab8m.project1-dev.svc.cluster.local:8080'
-        + '/api/execute\\": dial tcp: lookup primus-claw-86c427cd7e8d-ct49ab8m'
-        + '.project1-dev.svc.cluster.local: no such host"}',
+        + '\\"http://sandbox.example.svc.cluster.local:8080/api/execute\\": '
+        + 'dial tcp: lookup sandbox.example.svc.cluster.local: no such host"}',
       );
     },
   });
@@ -184,7 +190,7 @@ test("the incident's own failure shape does not license a destroy", async () => 
 
 test("a session the Router has no record of is dead, in its real wording", async () => {
   bind({
-    readHandsEntry: async () => SAFE_ENTRY,
+    readHandsEntry: async () => AGENT_ENTRY,
     exec: async () => {
       throw new Error(
         'agent-sandbox exec failed: 404 {"error":"session \\"sess_c54e877\\" not found '

@@ -6,9 +6,25 @@
 // Two review findings on the brain side. Both are cases where a distinction
 // that existed in the data was thrown away before anyone could act on it.
 
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { SandboxGoneError } from "../src/sandbox/errors.js";
+import {
+  SandboxExecRouteUnavailableError,
+  SandboxGoneError,
+} from "../src/sandbox/errors.js";
+import { SafeWorkloadProvider } from "../src/sandbox/safe-workload-provider.js";
+
+const originalFetch = globalThis.fetch;
+afterEach(() => { globalThis.fetch = originalFetch; });
+
+const INSTANCE = {
+  provider: "safe-workload" as const,
+  id: "wl-1",
+  sandboxName: "wl-1",
+  namespace: "ns",
+  handsBaseUrl: "",
+  platformKey: "pk-1",
+};
 
 test("a 404 from the control plane is a distinguishable answer, not a failed ping", () => {
   const e = new SandboxGoneError("workload absent (HTTP 404)");
@@ -16,25 +32,48 @@ test("a 404 from the control plane is a distinguishable answer, not a failed pin
   assert.ok(e instanceof Error, "and it still behaves as an error everywhere else");
 });
 
-test("keepalive spends no further ticks once absence is established", async () => {
-  // Before: a definite 404 spent the same five strikes as one dropped packet,
-  // about five minutes during which the run still reads healthy. After: it
-  // reaches the limit at once, while every other error keeps full tolerance.
-  const src = await import("node:fs/promises")
-    .then((fs) => fs.readFile(new URL("../src/sandbox/keepalive.ts", import.meta.url), "utf8"));
-  assert.match(src, /sandboxGone === true/, "the flag must be consulted");
-  assert.match(src, /Math\.max\(SANDBOX_KEEPALIVE_FAIL_LIMIT/,
-    "and it must jump the counter to the limit rather than merely incrementing");
+test("a Router 404 cannot call a running workload gone", async () => {
+  let call = 0;
+  globalThis.fetch = (async () => {
+    call++;
+    if (call === 1) {
+      return { ok: false, status: 404, text: async () => "route not found" } as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({ phase: "Running" }) } as Response;
+  }) as typeof globalThis.fetch;
+
+  await assert.rejects(
+    () => new SafeWorkloadProvider().exec(INSTANCE, "true", "1s"),
+    SandboxExecRouteUnavailableError,
+  );
 });
 
-test("the exec path raises the typed error only for absence", async () => {
-  const src = await import("node:fs/promises")
-    .then((fs) => fs.readFile(new URL("../src/sandbox/safe-workload-provider.ts", import.meta.url), "utf8"));
-  assert.match(src, /status === 404 \|\| resp\.status === 410\) throw new SandboxGoneError/,
-    "404/410 only");
-  assert.ok(src.includes("const msg = `sandboxExec failed: HTTP"),
-    "and the message must stay identical: the container classifier parses this exact string, "
-    + "so rewording it downgrades a definite 404 to merely unreachable");
+test("the exec path raises the typed gone error only after independent confirmation", async () => {
+  globalThis.fetch = (async () =>
+    ({ ok: false, status: 404, text: async () => "not found" }) as Response
+  ) as typeof globalThis.fetch;
+
+  await assert.rejects(
+    () => new SafeWorkloadProvider().exec(INSTANCE, "true", "1s"),
+    SandboxGoneError,
+  );
+});
+
+test("terminated is a conclusive workload phase", async () => {
+  globalThis.fetch = (async () =>
+    ({ ok: true, status: 200, json: async () => ({ phase: "Terminated" }) }) as Response
+  ) as typeof globalThis.fetch;
+
+  assert.deepEqual(
+    await new SafeWorkloadProvider().get(INSTANCE),
+    { running: false, healthy: false, state: "terminal" },
+  );
+});
+
+test("the shipped chart does not opt every sandbox into automatic eviction", async () => {
+  const values = await import("node:fs/promises")
+    .then((fs) => fs.readFile(new URL("../../../deploy/charts/claw/values.yaml", import.meta.url), "utf8"));
+  assert.match(values, /sandboxKeepaliveFailLimit:\s*"0"/);
 });
 
 test("a downgraded callback body caps failure_reason too", async () => {

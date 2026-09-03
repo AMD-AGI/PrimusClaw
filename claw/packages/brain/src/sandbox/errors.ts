@@ -100,3 +100,18 @@ export class SandboxGoneError extends Error {
     this.name = "SandboxGoneError";
   }
 }
+
+/**
+ * The workload still exists, but the Router could not execute inside it.
+ *
+ * Keepalive must not turn this data-plane failure into evidence that the
+ * workload itself is dead. In particular, a wrong Router path can return 404
+ * for every healthy sandbox at once.
+ */
+export class SandboxExecRouteUnavailableError extends Error {
+  readonly sandboxConfirmedRunning = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxExecRouteUnavailableError";
+  }
+}

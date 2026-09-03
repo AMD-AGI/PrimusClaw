@@ -21,7 +21,11 @@ import {
   SANDBOX_ROUTER_URL,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
-import { SandboxGoneError, SandboxStopUnavailable } from "./errors.js";
+import {
+  SandboxExecRouteUnavailableError,
+  SandboxGoneError,
+  SandboxStopUnavailable,
+} from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
@@ -98,18 +102,27 @@ export class SafeWorkloadProvider implements SandboxProvider {
     };
   }
 
-  async get(inst: SandboxInstance): Promise<SandboxStatus> {
+  async get(inst: SandboxInstance, signal?: AbortSignal): Promise<SandboxStatus> {
     try {
       const r = await fetch(`${SAFE_API_URL}/api/v1/workloads/${inst.id}`, {
         headers: { Authorization: `Bearer ${inst.platformKey ?? ""}` },
-        signal: AbortSignal.timeout(15000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+          : AbortSignal.timeout(15_000),
       });
-      if (!r.ok) return { running: false, healthy: false };
+      if (r.status === 404 || r.status === 410) {
+        return { running: false, healthy: false, state: "absent" };
+      }
+      if (!r.ok) return { running: false, healthy: false, state: "unknown" };
       const info = (await r.json()) as Record<string, unknown>;
       const phase = String(info.phase ?? "").toLowerCase();
-      return { running: phase === "running", healthy: phase === "running" };
+      if (phase === "running") return { running: true, healthy: true, state: "running" };
+      if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(phase)) {
+        return { running: false, healthy: false, state: "terminal" };
+      }
+      return { running: false, healthy: false, state: "unknown" };
     } catch {
-      return { running: false, healthy: false };
+      return { running: false, healthy: false, state: "unknown" };
     }
   }
 
@@ -150,17 +163,20 @@ export class SafeWorkloadProvider implements SandboxProvider {
     });
     if (!resp.ok) {
       const errBody = await resp.text();
-      // A 404/410 is not a failed ping, it is an answer: the workload is gone.
-      // Collapsing it into the same untyped Error as a timeout made a definite
-      // absence spend the same five keepalive strikes as one dropped packet --
-      // five minutes to notice something the first reply already settled.
       const msg = `sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`;
-      // The message is deliberately identical for both branches: the container
-      // classifier reads this string to decide a gone container licenses a
-      // rebuild, so rewording it here silently downgraded a definite 404 to
-      // "unreachable". The type is added alongside the message, not instead of
-      // it -- one reader parses the text, the other tests the flag.
-      if (resp.status === 404 || resp.status === 410) throw new SandboxGoneError(msg);
+      if (resp.status === 404 || resp.status === 410) {
+        // A Router 404 can mean a missing workload, but it can also mean a
+        // wrong namespace, an old Router without this route, or a bad ingress
+        // path. Confirm through the independent workload API before licensing
+        // any caller to destroy the sandbox.
+        const status = await this.get(inst, signal);
+        if (status.state === "absent" || status.state === "terminal") {
+          throw new SandboxGoneError(msg);
+        }
+        if (status.state === "running") {
+          throw new SandboxExecRouteUnavailableError(msg);
+        }
+      }
       throw new Error(msg);
     }
     const result = (await resp.json()) as Record<string, unknown>;

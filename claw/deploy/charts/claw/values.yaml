@@ -315,7 +315,10 @@ secret:
   # defaults in packages/{api,brain}/src/config.ts (kept minimal on purpose).
   fetchHeadersTimeoutMs: "60000"
   fetchBodyIdleTimeoutMs: "120000"
-  sandboxKeepaliveFailLimit: "5"
+  # Automatic stop on failed keepalive probes is opt-in. A shared Router or
+  # control-plane fault can affect every sandbox at once, so the safe default is
+  # to log and let the platform's own idle/TTL GC reclaim confirmed orphans.
+  sandboxKeepaliveFailLimit: "0"
 
 sandboxTemplate:
   enabled: true
