@@ -77,6 +77,7 @@ LiteLLM env (deployed AFTER Claw so it can reuse Claw's PGO database):
   LITELLM_NAMESPACE=<NAMESPACE>        # defaults to $NAMESPACE (shares Claw's namespace)
   LITELLM_DATABASE_URL=...             # optional; if unset, auto-discovers the PGO PostgresCluster in LITELLM_NAMESPACE, else prompts (TTY)
   LITELLM_VALUES_FILE=/path/private-values.yaml
+  LITELLM_EXISTING_SECRET=litellm-credentials
   LITELLM_INGRESS_HOST=<host>          # optional; enables ingress when set
   # Interactive (TTY only): prompts to add an anthropic/openai provider and auto-discovers its models
 
@@ -292,6 +293,15 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl cluster-info >/dev/null 2>&1 || fail "kubectl cannot reach cluster"
 fi
 
+litellm_database_source="auto-discover PGO"
+if [ -n "${LITELLM_EXISTING_SECRET:-}" ]; then
+  litellm_database_source="existing Secret"
+elif [ -n "${LITELLM_DATABASE_URL:-}" ]; then
+  litellm_database_source="provided"
+elif [ -n "${LITELLM_VALUES_FILE:-}" ]; then
+  litellm_database_source="values file / auto-detect"
+fi
+
 if [ "$YES" != "true" ] && [ "$DRY_RUN" != "true" ]; then
   cat >&2 <<EOF
 This command will mutate the current Kubernetes cluster.
@@ -299,7 +309,7 @@ This command will mutate the current Kubernetes cluster.
 Context:          $(kubectl config current-context 2>/dev/null || echo '<unknown>')
 Sandbox:          $DEPLOY_SANDBOX (namespace=$SANDBOX_NAMESPACE image=${SANDBOX_IMAGE_REGISTRY}agent-sandbox-controlplane:$SANDBOX_IMAGE_TAG)
 Claw:             $DEPLOY_CLAW (namespace=$CLAW_NAMESPACE registry=$CLAW_REGISTRY tag=$CLAW_TAG)
-LiteLLM:          $DEPLOY_LITELLM (namespace=$LITELLM_NAMESPACE name=${LITELLM_NAME:-litellm}, db=$([ -n "${LITELLM_DATABASE_URL:-}" ] && echo provided || echo 'auto-discover PGO'))
+LiteLLM:          $DEPLOY_LITELLM (namespace=$LITELLM_NAMESPACE name=${LITELLM_NAME:-litellm}, db=$litellm_database_source)
 
 Re-run with --yes to execute, or --dry-run to preview.
 EOF
@@ -374,8 +384,9 @@ if [ "$DEPLOY_LITELLM" = "true" ]; then
   [ "$SKIP_LITELLM_HEALTH" = "true" ] && litellm_args+=(--skip-health)
 
   litellm_env=("LITELLM_NAMESPACE=$LITELLM_NAMESPACE")
-  [ -n "${LITELLM_VALUES_FILE:-}" ]  && litellm_env+=("LITELLM_VALUES_FILE=$LITELLM_VALUES_FILE")
-  [ -n "${LITELLM_INGRESS_HOST:-}" ] && litellm_env+=("LITELLM_INGRESS_HOST=$LITELLM_INGRESS_HOST")
+  [ -n "${LITELLM_VALUES_FILE:-}" ]      && litellm_env+=("LITELLM_VALUES_FILE=$LITELLM_VALUES_FILE")
+  [ -n "${LITELLM_EXISTING_SECRET:-}" ]  && litellm_env+=("LITELLM_EXISTING_SECRET=$LITELLM_EXISTING_SECRET")
+  [ -n "${LITELLM_INGRESS_HOST:-}" ]     && litellm_env+=("LITELLM_INGRESS_HOST=$LITELLM_INGRESS_HOST")
 
   log "+ env ${litellm_env[*]} bash $REPO_ROOT/deploy/litellm/deploy.sh ${litellm_args[*]}"
   env "${litellm_env[@]}" bash "$REPO_ROOT/deploy/litellm/deploy.sh" "${litellm_args[@]}"

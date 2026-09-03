@@ -8,7 +8,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-mkdir -p "$tmp/repo/sandbox/deploy/scripts" "$tmp/repo/claw/deploy" "$tmp/repo/deploy" "$tmp/bin"
+mkdir -p \
+  "$tmp/repo/sandbox/deploy/scripts" \
+  "$tmp/repo/claw/deploy" \
+  "$tmp/repo/deploy/litellm" \
+  "$tmp/bin"
 cp "$repo_root/deploy/deploy.sh" "$tmp/repo/deploy/deploy.sh"
 cp "$repo_root/deploy/profile-loader.sh" "$tmp/repo/deploy/profile-loader.sh"
 
@@ -35,6 +39,12 @@ cat >"$tmp/repo/claw/deploy/deploy.sh" <<'EOF'
 exit 0
 EOF
 chmod +x "$tmp/repo/claw/deploy/deploy.sh"
+
+cat >"$tmp/repo/deploy/litellm/deploy.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'LITELLM_EXISTING_SECRET=%s\n' "${LITELLM_EXISTING_SECRET:-}" >"$LITELLM_CAPTURE"
+EOF
+chmod +x "$tmp/repo/deploy/litellm/deploy.sh"
 
 common_env=(
   "PATH=$tmp/bin:$PATH"
@@ -100,6 +110,15 @@ env "${common_env[@]}" CAPTURE="$capture" \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check --insecure-sandbox >/dev/null
 grep -qx 'SAFE_API_URL=' "$capture"
 grep -qx 'ALLOW_INSECURE_NO_AUTH=true' "$capture"
+
+litellm_capture="$tmp/litellm.env"
+env "${common_env[@]}" \
+  CAPTURE="$tmp/litellm-sandbox.env" \
+  LITELLM_CAPTURE="$litellm_capture" \
+  LITELLM_EXISTING_SECRET=release-litellm-credentials \
+  SAFE_API_URL="https://safe.example" \
+  bash "$tmp/repo/deploy/deploy.sh" --yes --skip-sandbox-check >/dev/null
+grep -qx 'LITELLM_EXISTING_SECRET=release-litellm-credentials' "$litellm_capture"
 
 if env "${common_env[@]}" CAPTURE="$tmp/missing.env" \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null 2>&1; then

@@ -84,7 +84,9 @@ shows the shape, including complexity-based auto-routing.
 Two conveniences worth knowing: `LITELLM_DATABASE_URL` is optional when the
 wrapper can discover Claw's PGO database in the same namespace, and
 `LITELLM_MASTER_KEY` is generated on first install and reused from the existing
-Secret afterwards.
+Secret afterwards. For externally managed credentials, set
+`LITELLM_EXISTING_SECRET` or `secrets.existingSecret` in the private values
+file; the Secret must contain `master_key` and `database_url`.
 
 ## Verifying a release
 

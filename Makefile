@@ -6,6 +6,7 @@
 #
 #   verify-claw       -> .github/workflows/tests.yml, job "claw"
 #   verify-sandbox    -> .github/workflows/tests.yml, job "sandbox"
+#   verify-deployment -> .github/workflows/tests.yml, job "litellm-deployment"
 #   verify-python     -> .github/workflows/tests-coverage.yml
 #   verify-docs       -> .github/workflows/docs.yml
 #   verify-lint       -> .github/workflows/lint.yaml + public-tree-scan.yaml
@@ -28,6 +29,7 @@ SHELL := /bin/bash
 NPM  := $(shell command -v npm 2>/dev/null)
 GO   := $(shell command -v go 2>/dev/null)
 PY   := $(shell command -v python3 2>/dev/null)
+HELM := $(shell command -v helm 2>/dev/null)
 
 define require
 	@if [ -z "$($(1))" ]; then \
@@ -46,6 +48,7 @@ help:
 	@echo
 	@echo "  make verify-claw        Claw workspaces: build + test + hands-mcp example"
 	@echo "  make verify-sandbox     Sandbox: go build + vet + test"
+	@echo "  make verify-deployment  LiteLLM chart and deploy script"
 	@echo "  make verify-python      memory/ pytest suites"
 	@echo "  make verify-docs        Sphinx build with warnings as errors"
 	@echo "  make verify-lint        repo lint scripts, gofmt, public tree scan, REUSE"
@@ -56,7 +59,7 @@ help:
 	@echo "The Node version is pinned in claw/.nvmrc; Go reads sandbox/go.mod."
 
 .PHONY: verify
-verify: verify-lint verify-claw verify-sandbox verify-python verify-docs
+verify: verify-lint verify-claw verify-sandbox verify-deployment verify-python verify-docs
 	@echo
 	@echo "verify: all targets passed"
 
@@ -72,6 +75,11 @@ release-verify-k8s:
 	fi
 	@command -v kubectl >/dev/null 2>&1 || { echo "error: kubectl is required" >&2; exit 1; }
 	@bash scripts/release-tests/k8s-postgres-smoke.sh "$$RELEASE_IMAGE"
+
+.PHONY: verify-deployment
+verify-deployment:
+	$(call require,HELM,helm)
+	@bash scripts/release-tests/litellm-deployment.sh
 
 # --- TypeScript --------------------------------------------------------------
 

@@ -36,8 +36,18 @@ Environment surface:
 | `LITELLM_DATABASE_URL` | PostgreSQL URL. Optional when the wrapper can discover Claw's PGO cluster in the namespace |
 | `LITELLM_MASTER_KEY` | Generated on first install, then reused from the existing Secret |
 | `LITELLM_VALUES_FILE` | Private Helm values carrying `modelList` and provider credentials |
+| `LITELLM_EXISTING_SECRET` | Existing Secret containing `master_key` and `database_url`; prevents either value from entering Helm release values |
 | `LITELLM_INGRESS_HOST` | Enables ingress for `/llm-gateway` when set |
 | `LITELLM_IMAGE` | Defaults to a pinned `docker.io/primussafe/litellm` timestamp tag |
+
+The chart also accepts `secrets.existingSecret` in
+`LITELLM_VALUES_FILE`; the wrapper detects it and skips credential discovery.
+`extraEnv` appends raw container environment entries, including `valueFrom`,
+while `litellmSettings` and `generalSettings` configure the corresponding
+LiteLLM sections. The `AMD_HYPERLOOM_APIM_KEY` and
+`AMD_HYPERLOOM_APIM_USER` environment variables only support shared-key user
+attribution; APIM authentication still comes from Virtual Key
+`metadata.apim_key` or model configuration.
 
 ## Model routing is deployment-specific
 

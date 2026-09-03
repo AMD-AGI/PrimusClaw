@@ -43,6 +43,7 @@ require_tool() {
 echo "==> deployment script behavior"
 bash -n \
   "$repo_root/deploy/deploy.sh" \
+  "$repo_root/deploy/litellm/deploy.sh" \
   "$repo_root/deploy/profile-loader.sh" \
   "$repo_root/sandbox/deploy/scripts/install.sh"
 bash "$repo_root/scripts/release-tests/deploy-auth-forwarding.sh"
@@ -51,6 +52,7 @@ bash "$repo_root/scripts/release-tests/dry-run-no-side-effects.sh"
 
 require_tool helm
 echo "==> Helm lint and render"
+bash "$repo_root/scripts/release-tests/litellm-deployment.sh"
 helm lint "$repo_root/sandbox/deploy/helm" \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml"
 sandbox_render="$(mktemp)"

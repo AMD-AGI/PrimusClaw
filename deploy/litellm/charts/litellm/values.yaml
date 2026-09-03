@@ -44,12 +44,11 @@ ingress:
 nodeSelector: {}
 tolerations: []
 
-# Extra environment for the proxy container, appended verbatim -- raw env
-# entries, so `valueFrom` works. The APIM hook this chart bakes into the image
-# reads its credentials from the environment (AMD_HYPERLOOM_APIM_KEY and
-# AMD_HYPERLOOM_APIM_USER), and without a way to pass them the chart ships a
-# hook it cannot feed: every upstream call goes out with an empty subscription
-# header and is refused.
+# Extra environment for the proxy container, appended verbatim so `valueFrom`
+# works. The APIM hook uses AMD_HYPERLOOM_APIM_KEY and
+# AMD_HYPERLOOM_APIM_USER only for optional shared-key user attribution; the
+# upstream subscription key still comes from Virtual Key `metadata.apim_key`
+# or a model's configured extra headers.
 #
 #   extraEnv:
 #     - name: AMD_HYPERLOOM_APIM_KEY

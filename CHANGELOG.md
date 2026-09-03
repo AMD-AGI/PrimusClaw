@@ -31,6 +31,12 @@ record it.
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
   Agent Sandbox control-plane fork (`sandbox/`), the long-term memory plane
   (`memory/`), and the whole-stack installer.
+- LiteLLM chart support for existing credential Secrets, additional container
+  environment entries, and configurable LiteLLM settings.
+
+### Fixed
+- LiteLLM deployment now handles callback lists and existing Secrets without
+  copying database or master credentials into Helm release values.
 
 <!--
 Template for the next release. Drop the sections that do not apply.

@@ -4,8 +4,9 @@
 
 # Deploy the LiteLLM gateway used by PrimusClaw standalone deployments.
 #
-# Required for a real deploy:
-#   LITELLM_DATABASE_URL      Postgres URL used by LiteLLM
+# Credentials:
+#   LITELLM_EXISTING_SECRET   Preferred Secret with master_key and database_url
+#   LITELLM_DATABASE_URL      Required when no existing Secret or PGO database is available
 #
 # Optional:
 #   LITELLM_MASTER_KEY        Generated if unset (or reused from the existing Secret)
@@ -54,6 +55,7 @@ LITELLM_SAFE_API_URL="${LITELLM_SAFE_API_URL:-${SAFE_API_URL:-}}"
 LITELLM_DATABASE_URL="${LITELLM_DATABASE_URL:-}"
 LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
 LITELLM_VALUES_FILE="${LITELLM_VALUES_FILE:-}"
+LITELLM_EXISTING_SECRET="${LITELLM_EXISTING_SECRET:-}"
 LITELLM_INSTALL_INGRESS="${LITELLM_INSTALL_INGRESS:-true}"
 LITELLM_INGRESS_HOST="${LITELLM_INGRESS_HOST:-}"
 LITELLM_INGRESS_CLASS="${LITELLM_INGRESS_CLASS:-higress}"
@@ -70,6 +72,7 @@ while [ $# -gt 0 ]; do
       cat <<'HELP'
 Usage:
   LITELLM_DATABASE_URL=... LITELLM_VALUES_FILE=/path/private-values.yaml bash litellm/deploy.sh
+  LITELLM_EXISTING_SECRET=litellm-credentials bash litellm/deploy.sh
 
 Flags:
   --dry-run       Render/apply with kubectl --dry-run=client where possible
@@ -86,6 +89,7 @@ Key env:
   LITELLM_NAME=litellm
   LITELLM_IMAGE=docker.io/primussafe/litellm:20260331111348
   LITELLM_VALUES_FILE=/path/private-values.yaml # optional modelList overrides
+  LITELLM_EXISTING_SECRET=litellm-credentials   # skips inline database/master credentials
   LITELLM_INGRESS_HOST=<host>       # optional; enables ingress when set
   LITELLM_SERVER_ROOT_PATH=/llm-gateway
   LITELLM_SAFE_API_URL=https://safe.example.com
@@ -97,7 +101,14 @@ done
 
 # Temp files may hold a provider API key; remove them on any exit.
 MODELS_TMP_FILES=()
-cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; }
+cleanup_tmp() {
+  local f
+  for f in "${MODELS_TMP_FILES[@]:-}"; do
+    if [ -n "${f:-}" ]; then
+      rm -f "$f"
+    fi
+  done
+}
 trap cleanup_tmp EXIT
 GENERATED_MODELS_FILE=""
 
@@ -229,9 +240,27 @@ discover_pgo_database_url() {
   printf 'postgresql://%s:%s@%s:%s/%s' "$user" "$pass" "$host" "${port:-5432}" "${db:-$user}"
 }
 
+chart_uses_existing_secret() {
+  local rendered
+  local -a args=(
+    template "$LITELLM_RELEASE" "$CHART_DIR"
+    --namespace "$LITELLM_NAMESPACE"
+    --show-only templates/secret.yaml
+    --set-string "fullnameOverride=$LITELLM_NAME"
+    --set-string "secrets.masterKey=probe"
+    --set-string "secrets.databaseUrl=postgresql://probe.invalid/litellm"
+  )
+  [ -n "$LITELLM_VALUES_FILE" ] && args+=(-f "$LITELLM_VALUES_FILE")
+  [ -n "$LITELLM_EXISTING_SECRET" ] && args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+
+  if ! rendered="$(helm "${args[@]}")"; then
+    fail "could not resolve the chart's Secret configuration"
+  fi
+  ! grep -q '^kind: Secret$' <<<"$rendered"
+}
+
 command -v kubectl >/dev/null || fail "kubectl not found"
 command -v helm >/dev/null || fail "helm not found"
-command -v openssl >/dev/null || fail "openssl not found"
 command -v python3 >/dev/null || fail "python3 not found"
 [[ -f "$CHART_DIR/Chart.yaml" ]] || fail "missing Helm chart: $CHART_DIR"
 
@@ -239,33 +268,41 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl cluster-info >/dev/null 2>&1 || fail "kubectl cannot reach cluster"
 fi
 
-if [ -z "$LITELLM_DATABASE_URL" ]; then
-  if [ "$DRY_RUN" = "true" ]; then
-    LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
-  else
-    # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
-    LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
-    if [ -n "$LITELLM_DATABASE_URL" ]; then
-      log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
-    elif [ -t 0 ]; then
-      read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
-      [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+USE_EXISTING_SECRET=false
+if chart_uses_existing_secret; then
+  USE_EXISTING_SECRET=true
+  log "using an existing Secret for database and master credentials"
+else
+  command -v openssl >/dev/null || fail "openssl not found"
+
+  if [ -z "$LITELLM_DATABASE_URL" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+      LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
     else
-      fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
+      LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
+      if [ -n "$LITELLM_DATABASE_URL" ]; then
+        log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
+      elif [ -t 0 ]; then
+        read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
+        [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+      else
+        fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      fi
     fi
   fi
-fi
 
-if [ -z "$LITELLM_MASTER_KEY" ]; then
-  if [ "$DRY_RUN" != "true" ]; then
-    LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
-      -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-  fi
   if [ -z "$LITELLM_MASTER_KEY" ]; then
-    LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
-    log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
-  else
-    log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    if [ "$DRY_RUN" != "true" ]; then
+      LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
+        -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
+    if [ -z "$LITELLM_MASTER_KEY" ]; then
+      LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
+      log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
+    else
+      log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    fi
   fi
 fi
 
@@ -303,11 +340,19 @@ helm_args=(
   --set "image.tag=$image_tag"
   --set "image.pullPolicy=$LITELLM_IMAGE_PULL_POLICY"
   --set "serverRootPath=$LITELLM_SERVER_ROOT_PATH"
-  --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
-  --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
 )
 [ -n "$LITELLM_SAFE_API_URL" ] && helm_args+=(--set "safeApiUrl=$LITELLM_SAFE_API_URL")
 [ -n "$LITELLM_VALUES_FILE" ] && helm_args+=(-f "$LITELLM_VALUES_FILE")
+[ -n "$LITELLM_EXISTING_SECRET" ] && helm_args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+if [ "$USE_EXISTING_SECRET" = "true" ]; then
+  # Override stale inline values from a values file so Helm stores no copy.
+  helm_args+=(--set-string "secrets.masterKey=" --set-string "secrets.databaseUrl=")
+else
+  helm_args+=(
+    --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
+    --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
+  )
+fi
 if [ -n "$GENERATED_MODELS_FILE" ]; then
   [ -n "$LITELLM_VALUES_FILE" ] && log "note: discovered modelList overrides any modelList in LITELLM_VALUES_FILE"
   helm_args+=(-f "$GENERATED_MODELS_FILE")
@@ -368,21 +413,27 @@ fi
 # a hard error on a perfectly healthy deployment. Normalise to one entry per
 # line and check each dotted one on its own; bare names like `prometheus` are
 # built in and have nothing to import.
-callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+if ! callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
   python3 -c 'import yaml
 cb = yaml.safe_load(open("/app/config.yaml")).get("litellm_settings", {}).get("callbacks", [])
 if isinstance(cb, str):
     cb = [cb]
 for c in cb or []:
+    if not isinstance(c, str):
+        raise TypeError("callback entries must be strings")
     if c:
-        print(c)' 2>/dev/null || true)"
+        print(c)' 2>/dev/null)"; then
+  fail "could not read callbacks from deployment/$LITELLM_NAME"
+fi
 while IFS= read -r callback; do
   [ -n "$callback" ] || continue
   case "$callback" in
     *.*)
-      mod="${callback%.*}"
       if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-           python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
+           python3 -c 'import importlib, sys
+mod, attr = sys.argv[1].rsplit(".", 1)
+module = importlib.import_module(mod)
+sys.exit(0 if hasattr(module, attr) else 1)' "$callback" 2>/dev/null; then
         echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
         echo "The proxy will serve traffic with the hook silently inactive." >&2
         echo "Usually a hook mounted at a path this base image does not import from;" >&2
