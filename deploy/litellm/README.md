@@ -76,9 +76,14 @@ Secret named by `secrets.existingSecret`, holding the master key's *current*
 value:
 
 ```sh
-kubectl -n "$NS" patch secret "$SECRET" --type merge -p "{\"data\":{\"salt_key\":\"$(
-  kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.master_key}')\"}}"
+kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.master_key}' \
+  | python3 -c 'import json,sys; print(json.dumps({"data":{"salt_key":sys.stdin.read().strip()}}))' \
+  | kubectl -n "$NS" patch secret "$SECRET" --type merge --patch-file /dev/stdin
 ```
+
+The value goes through a pipe, not `-p`. An argument is visible in `/proc` and
+to anything auditing process starts, so `-p "{...$(kubectl get ...)...}"` would
+publish the key it is trying to protect for as long as the command runs.
 
 Then point `LITELLM_SALT_KEY` at that key:
 
