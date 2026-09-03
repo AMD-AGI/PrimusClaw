@@ -77,13 +77,24 @@ value:
 
 ```sh
 kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.master_key}' \
-  | python3 -c 'import json,sys; print(json.dumps({"data":{"salt_key":sys.stdin.read().strip()}}))' \
+  | python3 -c 'import json,sys
+v = sys.stdin.read().strip()
+if not v:
+    sys.exit("refusing to write an empty salt_key: master_key is missing or empty")
+print(json.dumps({"data": {"salt_key": v}}))' \
   | kubectl -n "$NS" patch secret "$SECRET" --type merge --patch-file /dev/stdin
 ```
 
-The value goes through a pipe, not `-p`. An argument is visible in `/proc` and
-to anything auditing process starts, so `-p "{...$(kubectl get ...)...}"` would
-publish the key it is trying to protect for as long as the command runs.
+Two things that command is doing deliberately:
+
+- The value goes through a pipe, not `-p`. An argument is visible in `/proc` and
+  to anything auditing process starts, so `-p "{...$(kubectl get ...)...}"`
+  would publish the key it exists to protect for as long as it runs.
+- It refuses an empty value. `jsonpath` prints nothing for a key that is not
+  there, and an empty `LITELLM_SALT_KEY` does *not* fall back to the master key
+  — `os.getenv` returns `""`, which is not `None` — so the proxy would encrypt
+  and decrypt with an empty string and nothing written under the old key would
+  open again.
 
 Then point `LITELLM_SALT_KEY` at that key:
 
