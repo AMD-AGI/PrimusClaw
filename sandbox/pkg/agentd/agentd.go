@@ -204,6 +204,12 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Delete(ctx, sandbox); err != nil && client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
 		}
+		// After the delete, not before it: an Event saying a sandbox was reclaimed
+		// while it is still there because RBAC, a webhook or a flaky API call
+		// refused the delete is worse than no Event -- it is the one an operator
+		// would trust. A NotFound is a success here; something else got there
+		// first and the sandbox is gone either way.
+		r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
 		// Reached whether this call removed the Sandbox or found it already gone --
 		// something else deleting it first still leaves the mapping stale, and the
 		// session id is in hand either way. Safe to run on that path because
@@ -337,8 +343,6 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 	lastActivity time.Time,
 	timeout time.Duration,
 ) {
-	r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
-
 	if r.Audit == nil {
 		return
 	}
@@ -403,12 +407,12 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 // nothing outside it could see -- is an argument for saying so, not for
 // alarming on every one.
 //
-// Emitted before the delete for the same reason the audit event is: an Event
-// referencing an object that is already gone is still recorded, but it races
-// with anything reading the object to enrich it, and there is no reason to run
-// that race. Events also expire on their own (an hour, in a default cluster),
-// so this is a debugging aid on top of the audit trail, not a replacement for
-// it.
+// Emitted after the delete, unlike the audit event: this one is what an
+// operator reads, and one saying a sandbox was reclaimed while it is still
+// there -- RBAC, a webhook, a flaky API call -- is worse than none at all. The
+// object being gone is not a problem; an Event holds its own reference. Events
+// also expire on their own (an hour, in a default cluster), so this is a
+// debugging aid on top of the audit trail, not a replacement for it.
 func (r *SandboxReconciler) recordIdleDeletedEvent(
 	sandbox *sandboxv1alpha1.Sandbox,
 	lastActivity time.Time,

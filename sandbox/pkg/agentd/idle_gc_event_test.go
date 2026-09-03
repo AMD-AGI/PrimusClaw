@@ -14,12 +14,22 @@
 package agentd
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -109,5 +119,38 @@ func TestAReclaimStillHappensWithoutARecorder(t *testing.T) {
 
 	if sandboxExists(t, r) {
 		t.Error("a missing Recorder must not stop the reclaim")
+	}
+}
+
+func TestNoEventWhenTheDeleteIsRefused(t *testing.T) {
+	// An Event is what an operator trusts. One saying a sandbox was reclaimed
+	// while it is still there -- RBAC, an admission webhook, a flaky API call --
+	// sends them looking for a pod that never went anywhere.
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sandboxCR(testSession)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object, ...ctrlclient.DeleteOption) error {
+				return errors.New("forbidden")
+			},
+		}).Build()
+	st := store.NewMemoryStore()
+	rec := record.NewFakeRecorder(8)
+	r := &SandboxReconciler{
+		Client: c, Scheme: scheme, SessionTimeout: 15 * time.Minute,
+		Store: st, Recorder: rec, startedAt: time.Now().Add(-72 * time.Hour),
+	}
+	seedSession(t, st, testSession, 30*time.Minute)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testSandbox, Namespace: testNamespace},
+	})
+	if err == nil {
+		t.Fatal("a refused delete should surface as an error, not be swallowed")
+	}
+	if events := drain(rec); len(events) != 0 {
+		t.Errorf("the sandbox is still there; got %v", events)
 	}
 }
