@@ -233,3 +233,42 @@ test("no word in the checked-in corpus is ever hunted", () => {
     assert.ok(!isDistinctiveSecret(word), `${JSON.stringify(word)} is an ordinary word`);
   }
 });
+
+test("a word is a word in any script, not only in ASCII", () => {
+  // Round 9. The rule said "purely alphabetic" and the implementation said
+  // `A-Za-z`, so it hunted every word that is not spelled in English letters:
+  // a French transcript lost `naïveté` and `façade`, a Russian one lost
+  // `конфигурация`. The asymmetry that governs every call in this file does
+  // not change with the writing system -- a deleted word is still fixed by
+  // nothing -- so the letters are Unicode letters.
+  for (const word of [
+    "naïveté", "façade", "développement", "résumé", "Ærøskøbing", "Straße",
+    "конфигурация", "παραμετροποίηση", "設定ファイル", "구성파일",
+  ]) {
+    assert.ok(!isDistinctiveSecret(word), `${JSON.stringify(word)} is letters only`);
+  }
+  // A diacritic written as a combining mark is part of its letter, so the
+  // decomposed spelling of a word is exempt exactly as the precomposed one
+  // is. Otherwise the same word would survive or be deleted depending on
+  // which normal form the producer happened to emit.
+  for (const word of ["naïveté", "façade", "résumé"]) {
+    const decomposed = word.normalize("NFD");
+    assert.notEqual(decomposed, word, "expected this word to decompose");
+    assert.ok(!isDistinctiveSecret(decomposed), `${JSON.stringify(word)} decomposed`);
+  }
+});
+
+test("widening the letter class did not exempt anything that is not a letter", () => {
+  // The other direction of round 9's fix, and the one that would be quiet if
+  // it broke. `\p{L}`/`\p{M}` admit letters and combining marks and nothing
+  // else, so a digit, a separator or a symbol anywhere in the value still
+  // sends it to the substring pass -- including the non-ASCII spellings, once
+  // they carry one.
+  for (const secret of [
+    "abc-123", "P@ssw0rd", "naïveté-2024", "façade_x9k2", "конфигурация-42",
+    `ghp_${"a".repeat(36)}`, "sk_live_" + "a".repeat(24), "AKIAIOSFODNN7EXAMPLE",
+    "設定ファイル/9", "aB3-dE6-fG9-hJ2",
+  ]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
+  }
+});

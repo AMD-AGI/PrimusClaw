@@ -38,7 +38,21 @@ import { isSensitiveKey, looksLikeVersionString, redactSecrets } from "@claw/uti
  * there is one place it can be applied and no way for a new collection rule to
  * arrive without it.
  */
-const ORDINARY_WORD_RE = /^[A-Za-z]+$/;
+/**
+ * A run of nothing but letters -- in any script, not just the Latin ASCII one.
+ *
+ * `\p{L}` rather than `A-Za-z`, with `\p{M}` alongside it so that a diacritic
+ * written as a combining mark counts as part of its letter and a decomposed
+ * `naïveté` reads the same as a precomposed one. Without that, this rule said
+ * "purely alphabetic" and meant "purely English": `naïveté`, `façade`,
+ * `développement` and `конфигурация` were all hunted, and a transcript in any
+ * language but one lost words the ASCII spelling kept.
+ *
+ * Digits, separators and punctuation stay outside the class, so nothing that
+ * was hunted before is exempted now beyond the letters themselves -- `abc-123`
+ * and every vendor key format still fall through to the return below.
+ */
+const ORDINARY_WORD_RE = /^[\p{L}\p{M}]+$/u;
 const ORDINARY_NUMBER_RE = /^[0-9]+([.,][0-9]+)?$/;
 /**
  * A word with digits stuck on the end: `word2`, `getUserById2`, `v2`.
@@ -60,7 +74,7 @@ const ORDINARY_NUMBER_RE = /^[0-9]+([.,][0-9]+)?$/;
  * See the limitations note at the top of redactPersistedEvent -- this is one
  * of the two shapes recorded there as knowingly not covered.
  */
-const WORD_WITH_TRAILING_DIGITS_RE = /^[A-Za-z]+[0-9]{1,3}$/;
+const WORD_WITH_TRAILING_DIGITS_RE = /^[\p{L}\p{M}]+[0-9]{1,3}$/u;
 /**
  * A path or timezone spelled out of words: `America/New_York`, `src/main`.
  *
@@ -68,7 +82,7 @@ const WORD_WITH_TRAILING_DIGITS_RE = /^[A-Za-z]+[0-9]{1,3}$/;
  * credential does not look like this. Base64 is not caught by it: its segments
  * are not words.
  */
-const WORD_PATH_RE = /^[A-Za-z][A-Za-z_]*(\/[A-Za-z][A-Za-z_]*)+$/;
+const WORD_PATH_RE = /^[\p{L}][\p{L}\p{M}_]*(\/[\p{L}][\p{L}\p{M}_]*)+$/u;
 const BOOLEANISH = new Set([
   "true", "false", "yes", "no", "on", "off", "none", "null", "nil",
   "enabled", "disabled", "auto", "default", "debug", "info", "warn", "error",
@@ -92,6 +106,9 @@ const BOOLEANISH = new Set([
  *   - a word is a third vowels and never stacks five consonants.
  *     `straightforwardly`, `straightforwardness`, `misunderstandings` and
  *     `strengthlessness` are none of those things and are all words.
+ *   - letters are `A-Za-z`. Only in one language. `naïveté`, `façade`,
+ *     `développement` and `конфигурация` are words too, and were hunted for
+ *     the sole reason that they are not spelled in ASCII.
  *
  * The fourth attempt is to stop. A run of nothing but letters is never hunted,
  * at any length and in any casing, because every rule that separates the two
@@ -119,9 +136,10 @@ export function isDistinctiveSecret(secret: string): boolean {
   const lower = secret.toLowerCase();
   if (BOOLEANISH.has(lower)) return false;
   if (ORDINARY_NUMBER_RE.test(secret)) return false;
-  // Nothing but letters is never hunted, at any length. See the note above
-  // this function for why the shape of a letter run is not a question worth
-  // asking.
+  // Nothing but letters is never hunted, at any length, in any script. See
+  // the note above this function for why the shape of a letter run is not a
+  // question worth asking, and the note on the constant for why the letters
+  // are Unicode ones.
   if (ORDINARY_WORD_RE.test(secret)) return false;
   // A word with digits on the end is an identifier far more often than it is a
   // credential, and the two are indistinguishable. See the note on the
@@ -185,8 +203,8 @@ function redactValue(
  * not where it ends. Treat free text as unredacted and do not echo
  * credentials into it; that is the only guarantee available here.
  *
- *  1. A purely alphabetic secret, at ANY length (`DB_PASSWORD=XkjQmzPl`, or a
- *     32-character generated one). The field is masked by the key-name pass,
+ *  1. A purely alphabetic secret, at ANY length and in ANY script
+ *     (`DB_PASSWORD=XkjQmzPl`, or a 32-character generated one). The field is masked by the key-name pass,
  *     but `auth failed XkjQmzPl` written loose in a log line or tool output is
  *     not.
  *  2. A secret that is a word with digits on the end (`hunter2`). Same: the

@@ -37,13 +37,15 @@ record it.
   credentials) regardless of the field they sit in.
 
   **Still open — among other shapes, two are knowingly not caught in free
-  text.** A purely alphabetic secret at any length (`XkjQmzPl`) and a word
-  with digits on the end (`hunter2`) are both masked wherever they sit in a
-  field, but an echo of either in free text — a log line, tool output — is
-  left alone. The only rules that would catch them also catch ordinary prose:
-  three attempts to tell a long word from a long token by its shape were each
-  broken by ordinary English (`GitHub`, `internationalization`,
-  `straightforwardly`), so letters are no longer judged at all. This pass is a
+  text.** A purely alphabetic secret at any length and in any script
+  (`XkjQmzPl`) and a word with digits on the end (`hunter2`) are both masked
+  wherever they sit in a field, but an echo of either in free text — a log
+  line, tool output — is left alone. The only rules that would catch them also
+  catch ordinary prose: three attempts to tell a long word from a long token
+  by its shape were each broken by ordinary English (`GitHub`,
+  `internationalization`, `straightforwardly`), and a fourth read `A-Za-z` as
+  the definition of a letter and so deleted `naïveté` and `конфигурация`.
+  Letters — Unicode ones — are no longer judged at all. This pass is a
   blind substring replace over payloads that are replayed to the model: a
   false positive does not mask a secret, it deletes text from a conversation
   and the agent resumes without it. A missed secret is bounded and fixed by

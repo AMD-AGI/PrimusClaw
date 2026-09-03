@@ -373,3 +373,36 @@ test("a long compound word under a credential name survives free text", () => {
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command, text);
 });
+
+test("a non-ASCII word under a credential name survives free text", () => {
+  // Round 9's repro end to end. Collected by name, so the value gate is the
+  // only thing standing between these words and a hole in the transcript.
+  const text = "preserve naïveté and façade during développement, конфигурация";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        PROJECT_TOKEN: "naïveté",
+        OTHER_SECRET: "façade",
+        THIRD_TOKEN: "développement",
+        FOURTH_KEY: "конфигурация",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("the field itself is still masked whatever the value looks like", () => {
+  // Nothing above weakens the pass that does not guess. Declining to hunt a
+  // value in free text is not declining to mask it where it sits, which is
+  // the whole reason the free-text gap is an acceptable trade.
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { values: {
+      PLATFORM_KEY: "naïveté", OTHER_SECRET: "конфигурация", PROJECT_TOKEN: "hunter2",
+    } } },
+    runtimeSecrets(request({ user_env: { PLATFORM_KEY: "naïveté" } })),
+  ) as { argumentsDetail: { values: Record<string, string> } };
+  assert.deepEqual(evt.argumentsDetail.values, {
+    PLATFORM_KEY: "<redacted>", OTHER_SECRET: "<redacted>", PROJECT_TOKEN: "<redacted>",
+  });
+});
