@@ -106,3 +106,20 @@ test("keeps claim_count required, since takeClaim increments it on every claim",
   const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
   assert.ok(tasks?.columns.includes("claim_count"));
 });
+
+test("names the throwaway-workspace column, which every task insert writes", () => {
+  // Not a column only the tasks that set it touch: insertTask names it in the
+  // INSERT for every run, so a database missing it fails run creation outright.
+  // Startup is where that has to be said, while the deployment can still be
+  // rolled back, rather than on the first dispatch after it.
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_tasks", "workspace_throwaway"]]),
+  );
+  assert.deepEqual(problems, ["claw_tasks is missing column(s): workspace_throwaway"]);
+});
+
+test("keeps workspace_throwaway required, since insertTask names it on every row", () => {
+  const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
+  assert.ok(tasks?.columns.includes("workspace_throwaway"));
+});
