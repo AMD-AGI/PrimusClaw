@@ -58,7 +58,6 @@ function buildFallbackSpec(): Record<string, unknown> {
   return {
     authMode: "none",
     runtimePolicy: "agent-default",
-    // The platform's own default, restated so the skeleton is self-contained.
     // The platform's own defaults, restated so the skeleton is self-contained.
     // Not a ceiling either of them: the Workload Manager takes both per template
     // and per request and says so ("no hard cap"). A deployment that wants
