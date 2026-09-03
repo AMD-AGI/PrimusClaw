@@ -23,6 +23,19 @@ export interface SandboxCreateParams {
   env: Record<string, string>;
   labels?: Record<string, string>;
   timeoutSec?: number;
+  /**
+   * Idle timeout for this sandbox, as a Go duration ("6h"). Overrides
+   * AGENT_SANDBOX_SESSION_TIMEOUT, which is the deployment-wide default.
+   *
+   * For the workload whose useful life outlasts the agent turn that started it:
+   * the platform stops counting a sandbox as active the moment nothing is
+   * talking to it through the Router, and Brain stops the keepalive at the end
+   * of the task, so anything still running inside is on borrowed time. Set this
+   * to cover the run rather than raising the floor for every sandbox.
+   *
+   * Ignored by safe-workload, which has no equivalent knob.
+   */
+  sessionTimeout?: string;
   /** safe-workload: idle TTL (ttlSecondsAfterFinished). Ignored by agent-sandbox. */
   ttlSec?: number;
   /** safe-workload: platform key (bearer) for SaFE workload create/poll/stop. */

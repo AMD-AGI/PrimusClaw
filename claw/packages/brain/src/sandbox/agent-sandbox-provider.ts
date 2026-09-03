@@ -22,6 +22,7 @@ import {
   AGENT_SANDBOX_NAMESPACE,
   AGENT_SANDBOX_TEMPLATE_FILE,
   AGENT_SANDBOX_WARM_POOL_SIZE,
+  AGENT_SANDBOX_SESSION_TIMEOUT,
 } from "../config.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -56,6 +57,9 @@ function buildFallbackSpec(): Record<string, unknown> {
   return {
     authMode: "none",
     runtimePolicy: "agent-default",
+    // The platform's own default, restated so the skeleton is self-contained.
+    // Reachable now: renderTemplate replaces it when a deployment sets
+    // AGENT_SANDBOX_SESSION_TIMEOUT or a caller passes params.sessionTimeout.
     sessionTimeout: "15m",
     maxSessionDuration: "24h",
     template: {
@@ -145,12 +149,22 @@ function extractHost(entryPoint?: string): string {
  * templates are private to the Router user unless marked public — one BYOK user
  * must never collide with another's.
  */
+/**
+ * The idle timeout this sandbox should carry: the caller's, else the
+ * deployment default, else nothing -- "nothing" leaving the base template's own
+ * value in place rather than substituting one.
+ */
+function resolveSessionTimeout(params: SandboxCreateParams): string {
+  return params.sessionTimeout?.trim() || AGENT_SANDBOX_SESSION_TIMEOUT;
+}
+
 export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams): string {
   const r = params.resources;
   return [
     base.digest, params.userId ?? "", params.image,
     r.cpu, r.memory, r.ephemeralStorage, r.gpu,
     `warm=${AGENT_SANDBOX_WARM_POOL_SIZE}`,
+    `idle=${resolveSessionTimeout(params)}`,
   ].join("|");
 }
 
@@ -191,6 +205,13 @@ export function renderTemplate(base: BaseTemplate, params: SandboxCreateParams):
   // skeleton alike. What raising it costs, and what had to change before it
   // could be raised at all, is in the AGENT_SANDBOX_WARM_POOL_SIZE comment.
   spec.warmPoolSize = AGENT_SANDBOX_WARM_POOL_SIZE;
+
+  // Only when asked for. Unlike the warm pool, unset here does not mean "use the
+  // default" but "whatever the base decided": a mounted ConfigMap may carry a
+  // deliberate sessionTimeout, and overwriting that with a value nobody asked
+  // for would quietly shorten every sandbox the deployment builds.
+  const idleTimeout = resolveSessionTimeout(params);
+  if (idleTimeout) spec.sessionTimeout = idleTimeout;
 
   const name = "primus-claw-" + sha256Short(templateHashKey(base, params));
   logger.info({ source: base.source, digest: base.digest, renderedName: name, image: params.image, resources: r }, "agent-sandbox.template_rendered");

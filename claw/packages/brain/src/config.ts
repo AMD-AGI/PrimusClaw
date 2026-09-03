@@ -183,6 +183,47 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
   0,
   envInt("AGENT_SANDBOX_WARM_POOL_SIZE", 0),
 );
+
+/**
+ * Idle timeout for sandboxes this Brain creates, as a Go duration ("2h", "90m").
+ *
+ * The platform deletes a Sandbox once `lastActivity + timeout` passes, and
+ * `lastActivity` only moves for traffic through the Router -- a request in
+ * flight, or the Brain keepalive exec. Work running *inside* the pod does not
+ * move it, so a sandbox busy with a long computation looks exactly like an
+ * abandoned one. Brain also stops the keepalive the moment a task reaches a
+ * terminal state (see stopKeepaliveAfterTask), which is right when the sandbox
+ * is only a warm cache for the next message -- and wrong when something the
+ * task started is still running in there. That combination reclaims a working
+ * sandbox 15 minutes after the agent turn ends.
+ *
+ * The platform has always taken a per-sandbox override
+ * (`runtime.agent-sandbox.io/idle-timeout`, no upper bound, with
+ * maxSessionDuration as the real backstop) and the Workload Manager writes it
+ * from the CodeInterpreter spec -- Brain simply never set the field, so every
+ * sandbox took the controller default of 15m no matter what it was for.
+ *
+ * Empty means "leave whatever the base template says", which is what every
+ * deployment gets until it opts in: a mounted ConfigMap that sets its own
+ * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
+ * costs held nodes -- the sandbox survives that much longer after everyone has
+ * stopped asking it for anything -- so prefer the per-request
+ * `SandboxCreateParams.sessionTimeout` for the one workload that needs it over
+ * moving the floor for all of them.
+ */
+function resolveAgentSandboxSessionTimeout(): string {
+  const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
+  if (!configured) return "";
+  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(configured)) {
+    settingProblems.push(
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a Go duration ` +
+        `(e.g. "90m", "2h30m"); leaving the template's own value`,
+    );
+    return "";
+  }
+  return configured;
+}
+export const AGENT_SANDBOX_SESSION_TIMEOUT = resolveAgentSandboxSessionTimeout();
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,

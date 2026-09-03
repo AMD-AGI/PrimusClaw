@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-// Warm pool sizing on rendered CodeInterpreter templates.
+// Deployment-level knobs on rendered CodeInterpreter templates: warm pool size
+// and idle timeout.
 //
 // The size used to be a literal inside the inline fallback skeleton, so it was
 // unreachable for any deployment that mounted its own base ConfigMap or let the
@@ -17,7 +18,9 @@ import {
   renderTemplate, templateHashKey, type BaseTemplate,
 } from "../src/sandbox/agent-sandbox-provider.js";
 import type { SandboxCreateParams } from "../src/sandbox/provider.js";
-import { AGENT_SANDBOX_WARM_POOL_SIZE } from "../src/config.js";
+import {
+  AGENT_SANDBOX_WARM_POOL_SIZE, AGENT_SANDBOX_SESSION_TIMEOUT,
+} from "../src/config.js";
 
 const params: SandboxCreateParams = {
   image: "example.io/img:1",
@@ -81,4 +84,63 @@ test("a differing pool size would select a differing template", () => {
 
   assert.notEqual(key, key.replace(/warm=\d+/, "warm=99"),
     "the key has to actually vary with the size, not merely mention it");
+});
+
+// --- idle timeout ---
+//
+// The sandbox is deleted once `lastActivity + sessionTimeout` passes, and only
+// Router traffic moves lastActivity -- computation inside the pod does not. So
+// the timeout is what decides whether a long job that outlives its agent turn
+// survives, and until this knob existed every sandbox took the controller
+// default of 15m no matter what it was built for. Two properties matter: an
+// unset knob must not overwrite a base that made its own choice, and a set one
+// must reach the content-addressed name.
+
+test("an unset timeout leaves the base's own value alone", () => {
+  const { spec } = renderTemplate(foreignBase, params);
+
+  assert.equal(
+    spec.sessionTimeout,
+    AGENT_SANDBOX_SESSION_TIMEOUT || "30m",
+    "a ConfigMap that sets sessionTimeout meant it; substituting a default "
+      + "here would silently shorten every sandbox that deployment builds",
+  );
+});
+
+test("a per-request timeout wins over both the base and the deployment default", () => {
+  const { spec } = renderTemplate(foreignBase, { ...params, sessionTimeout: "6h" });
+
+  assert.equal(spec.sessionTimeout, "6h",
+    "the per-request knob is the one a long-running workload can reach without "
+      + "moving the floor for every other sandbox");
+});
+
+test("a blank per-request timeout falls through rather than clearing the value", () => {
+  const { spec } = renderTemplate(foreignBase, { ...params, sessionTimeout: "   " });
+
+  assert.equal(
+    spec.sessionTimeout,
+    AGENT_SANDBOX_SESSION_TIMEOUT || "30m",
+    "whitespace is not a request for a zero-length idle window",
+  );
+});
+
+test("the timeout reaches the template name", () => {
+  // Same limitation as the pool size: one process reads the env once, so this
+  // pins the hashable property rather than two live values. Without it, asking
+  // for a longer timeout would resolve back to the template built with the old
+  // one and change nothing.
+  assert.match(
+    templateHashKey(foreignBase, { ...params, sessionTimeout: "6h" }),
+    /idle=6h/,
+    "a timeout that is not hashed is a timeout that cannot be changed",
+  );
+});
+
+test("a differing timeout selects a differing template", () => {
+  const a = templateHashKey(foreignBase, { ...params, sessionTimeout: "6h" });
+  const b = templateHashKey(foreignBase, { ...params, sessionTimeout: "12h" });
+
+  assert.notEqual(a, b,
+    "two workloads with different lifetimes must not share one template");
 });
