@@ -462,7 +462,25 @@ function assertRepeatIsBounded(nodeId: string, step: ScriptStepDef): void {
       `${where}.until.path must name the structured field that says the work is done`,
     );
   }
-  if (repeat.until.equals === undefined || repeat.until.equals === null) {
-    throw new BadRequestError(`${where}.until.equals must be the value that means done`);
+  // Narrowed to what the comparison can actually match. `repeatSatisfied`
+  // decides the loop with `===` against the value the tool reported, so an
+  // object or an array here compares by identity and is unequal to every
+  // structured result the step could ever return -- and the loop it can never
+  // leave is not refused, it is run: the step repeats until max_attempts,
+  // max_seconds, or the 72h ceiling stops it. NaN is the same shape of bug
+  // without the excuse of a type error, since it is not even equal to itself.
+  // The declared type is `string | number | boolean`; a JSON request body is
+  // not bound by it, so it is enforced here rather than assumed.
+  const equals: unknown = repeat.until.equals;
+  const kind = typeof equals;
+  if (kind !== "string" && kind !== "boolean" && kind !== "number") {
+    throw new BadRequestError(
+      `${where}.until.equals must be a string, number, or boolean -- the value that means done`,
+    );
+  }
+  if (kind === "number" && !Number.isFinite(equals)) {
+    throw new BadRequestError(
+      `${where}.until.equals must be a finite number: NaN and Infinity match nothing`,
+    );
   }
 }
