@@ -175,6 +175,27 @@ set -a
 source "$_VALUES_FILE"
 set +a
 
+# Backfill BRAIN_CHECKPOINT_KEY.
+#
+# The block above only writes a values file that does not exist yet, so a
+# namespace installed before this key existed sources a file without it. Append
+# rather than regenerate: this key must be stable for as long as any sealed
+# checkpoint is still within the bucket's 24h TTL, and rewriting the file would
+# also disturb USER_ENV_ENCRYPTION_KEY and AUTH_INTERNAL_TOKEN, neither of which
+# may ever change.
+#
+# Generated even while checkpointWriteVersion is 3, so that flipping to 4 later
+# is a one-line change rather than a key-distribution exercise. An unused key
+# costs nothing; discovering at cutover that there isn't one costs a rollout.
+if [ -z "${BRAIN_CHECKPOINT_KEY:-}" ]; then
+  BRAIN_CHECKPOINT_KEY="$(openssl rand -base64 32)"
+  if [ -w "$_VALUES_FILE" ]; then
+    echo "BRAIN_CHECKPOINT_KEY=\"$BRAIN_CHECKPOINT_KEY\"" >> "$_VALUES_FILE"
+    log "  BRAIN_CHECKPOINT_KEY: auto-generated (preserved in $_VALUES_FILE — back it up)"
+  fi
+fi
+export BRAIN_CHECKPOINT_KEY
+
 # Reinstate shell-supplied values where the file left the field blank.
 [ -z "${DOMAIN:-}" ]              && DOMAIN="$_SHELL_DOMAIN"
 [ -z "${AUTH_INTERNAL_TOKEN:-}" ] && AUTH_INTERNAL_TOKEN="$_SHELL_AUTH_INTERNAL_TOKEN"

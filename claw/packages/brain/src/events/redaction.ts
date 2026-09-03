@@ -96,9 +96,26 @@ export function redactPersistedEvent(
 /** Backwards-compatible name retained for existing callers and tests. */
 export const redactToolEvent = redactPersistedEvent;
 
-export function redactCheckpointState<T>(
-  state: T,
-  runtimeSecrets: readonly string[] = [],
+/**
+ * Mask a value on its way OUT of this process -- into NATS, the event
+ * database, the transcript archive, the SSE stream, or the ExecuteResult that
+ * becomes a downstream node's prompt.
+ *
+ * Previously called redactEgressPayload, which is how it came to be applied
+ * to the checkpoint: a name that says "checkpoint" makes redacting one look
+ * like the intended use. It never was. A checkpoint is the conversation a
+ * resumed run replays to the model, and mutating it deletes content the agent
+ * then no longer has. The five callers that use this are all genuine egress;
+ * the checkpoint writer takes it as an explicit parameter for the v3 format
+ * only, and cannot import it at all (see checkpoint-codec.ts).
+ *
+ * `runtimeSecrets` is required rather than defaulted. An optional parameter is
+ * one a caller can omit and still typecheck, and `redactEgressPayload(x)` with
+ * no secrets does no exact-value replacement at all while looking like it did.
+ */
+export function redactEgressPayload<T>(
+  value: T,
+  runtimeSecrets: readonly string[],
 ): T {
-  return redactValue(state, new WeakSet<object>(), runtimeSecrets) as T;
+  return redactValue(value, new WeakSet<object>(), runtimeSecrets) as T;
 }

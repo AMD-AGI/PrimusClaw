@@ -122,6 +122,15 @@ spec:
         - secretRef:
             name: primus-claw-secrets
         env:
+        - name: CHECKPOINT_WRITE_VERSION
+          value: {{ .Values.brain.checkpointWriteVersion | quote }}
+        {{- if .Values.secret.brainCheckpointKey }}
+        - name: BRAIN_CHECKPOINT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-brain-checkpoint
+              key: BRAIN_CHECKPOINT_KEY
+        {{- end }}
         {{- with (get .Values.secret.natsUsers "brain") }}
         {{- if .password }}
         # A container-level env entry overrides the same name coming from envFrom,

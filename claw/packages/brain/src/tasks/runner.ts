@@ -27,9 +27,10 @@ import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { classifyResumeOutcome } from "./resume-outcome.js";
-import { sleep, redactSecrets, isSensitiveKey } from "@claw/utils";
+import { sleep, redactSecrets, isSensitiveKey, decodeAeadKey } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
+  CHECKPOINT_WRITE_VERSION, BRAIN_CHECKPOINT_KEY,
   WORKSPACE_SYNC_INTERVAL_MS, WORKSPACE_SYNC_GRACE_MS,
   WORKSPACE_RESTORE_TIMEOUT_MS, WORKSPACE_PERSIST_BASE, SIGTERM_PENDING_SYNC_WAIT_MS,
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
@@ -61,12 +62,33 @@ import {
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
-import { redactCheckpointState, redactPersistedEvent } from "../events/redaction.js";
+import { redactEgressPayload, redactPersistedEvent } from "../events/redaction.js";
+import {
+  encodeCheckpoint, decodeCheckpoint, type CheckpointEnvelope,
+} from "./checkpoint-codec.js";
 import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
+
+/**
+ * The v4 seal key, decoded once.
+ *
+ * Validated eagerly so a malformed key is a boot failure rather than a write
+ * failure on the first interesting turn, and null when unset so the v3 path
+ * needs no key at all. encodeCheckpoint throws if a v4 write is asked for
+ * without one -- there is deliberately no "fall back to plaintext" branch.
+ */
+const CHECKPOINT_SEAL_KEY: Buffer | null = BRAIN_CHECKPOINT_KEY
+  ? decodeAeadKey(BRAIN_CHECKPOINT_KEY, "BRAIN_CHECKPOINT_KEY")
+  : null;
+
+if (CHECKPOINT_WRITE_VERSION === 4 && !CHECKPOINT_SEAL_KEY) {
+  throw new Error(
+    "CHECKPOINT_WRITE_VERSION=4 requires BRAIN_CHECKPOINT_KEY (base64 of 32 bytes)",
+  );
+}
 
 /**
  * The exact credential strings this run knows about, for the substring pass in
@@ -619,7 +641,7 @@ async function maybeRunSandboxlessTask(
       result = await fx().runScript(request, { hands: null, signal: abortCtrl.signal }, onEvent);
     } catch (e) {
       const errMsg = (e as Error).message;
-      const safeErrMsg = redactCheckpointState(errMsg, runtimeSecrets(request));
+      const safeErrMsg = redactEgressPayload(errMsg, runtimeSecrets(request));
       logger.error({ sessionId, taskId: request.task_id, err: safeErrMsg }, "task.sandboxless.failed");
       await deliverAgentDone(kvCkpt, request, {
         finalText: "",
@@ -640,7 +662,7 @@ async function maybeRunSandboxlessTask(
     await deliverAgentDone(
       kvCkpt,
       request,
-      redactCheckpointState(result, runtimeSecrets(request)),
+      redactEgressPayload(result, runtimeSecrets(request)),
     );
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info(
@@ -788,6 +810,9 @@ class TaskRunner {
   private lastSyncAt = 0;
   private pendingSync: Promise<unknown> | null = null;
   private lastSyncedTurn = 0; // updated post-sync; gates has_workspace_sync KV bit
+  /** Monotonic write counter; see CheckpointEnvelope.seq. */
+  private checkpointSeq = 0;
+  private lastWrittenSeq = 0;
 
   private platformKey: string;
   private hands: HandsClient | null = null;
@@ -883,10 +908,13 @@ class TaskRunner {
       );
       return;
     }
-    const safeState = redactCheckpointState(
-      state,
-      runtimeSecrets(this.request, this.platformKey),
-    );
+    // Held verbatim. This is the conversation a resumed run replays to the
+    // model, and mutating it here is what deleted file paths and identifiers
+    // out of live sessions. The v3 write path still redacts on its way to the
+    // bucket (see encodeCheckpointV3); v4 seals instead. Anything that takes a
+    // string out of this object and sends it somewhere -- the partial summary
+    // below is the one that does -- has to redact for itself now.
+    const safeState = state;
     this.latestCheckpointState = safeState;
     const written = await this.writeKvCheckpoint(
       safeState,
@@ -1256,23 +1284,42 @@ class TaskRunner {
     workspaceInfo?: { has_workspace_sync: boolean; last_sync_turn: number },
     kind: "turn" | "sigterm" | "post_sync" = "turn",
   ): Promise<boolean> {
-    const payload: TaskCheckpoint = {
-      ...state,
-      version: 3,
+    const seq = ++this.checkpointSeq;
+    // A post-workspace-sync rewrite runs in a `.then()` and can land after a
+    // later turn has already written. Dropping the older one keeps the key
+    // moving forward; without this the run silently rewinds a turn.
+    if (seq < this.lastWrittenSeq) {
+      metrics.onCheckpointSeqRegressed();
+      logger.debug(
+        { sessionId: this.sessionId, kind, seq, lastWritten: this.lastWrittenSeq },
+        "checkpoint.seq_regressed",
+      );
+      return true;
+    }
+    const envelope: CheckpointEnvelope = {
       session_id: this.sessionId,
       message_id: this.messageId,
       user_id: this.userId,
       has_workspace_sync: workspaceInfo?.has_workspace_sync ?? false,
       last_sync_turn: workspaceInfo?.last_sync_turn ?? 0,
       checkpointed_at: Date.now(),
+      turns_completed: state.turns_completed,
+      seq,
     };
     const sSerialize = Date.now();
-    const encoded = sc.encode(JSON.stringify(payload));
+    const encoded = encodeCheckpoint(state, envelope, {
+      writeVersion: CHECKPOINT_WRITE_VERSION === 4 ? 4 : 3,
+      key: CHECKPOINT_SEAL_KEY,
+      redactV3: (s) => redactEgressPayload(s, runtimeSecrets(this.request, this.platformKey)),
+    });
     const serializeSec = (Date.now() - sSerialize) / 1000;
+    if (CHECKPOINT_WRITE_VERSION === 4) metrics.onCheckpointSeal(serializeSec);
+    metrics.onCheckpointVersion("write", CHECKPOINT_WRITE_VERSION);
     const payloadBytes = encoded.length;
     const t0 = Date.now();
     try {
       await this.kvCkpt.put(checkpointKey(this.sessionId, this.messageId), encoded);
+      this.lastWrittenSeq = seq;
       metrics.onCheckpointWrite(
         kind, "success", (Date.now() - t0) / 1000, payloadBytes, serializeSec,
       );
@@ -1312,21 +1359,48 @@ class TaskRunner {
    *     parseable as JSON but semantically broken (Plan Y v2 §5.2)
    */
   private async readKvCheckpoint(): Promise<TaskCheckpoint | null> {
+    const miss = (reason: Parameters<typeof metrics.onCheckpointRead>[0]) => {
+      metrics.onCheckpointRead(reason);
+      return null;
+    };
     try {
       const entry = await this.kvCkpt
         .get(checkpointKey(this.sessionId, this.messageId)).catch(() => null);
-      if (!entry) return null;
-      const ckpt = JSON.parse(sc.decode(entry.value)) as TaskCheckpoint;
-      if (ckpt.version !== 3) return null;
-      if (ckpt.message_id !== this.messageId) return null;
-      if (Date.now() - ckpt.checkpointed_at > CHECKPOINT_TTL_MS) return null;
-      if (!Array.isArray(ckpt.messages) || typeof ckpt.turns_completed !== "number") {
-        logger.warn({ sessionId: this.sessionId, ckpt_keys: Object.keys(ckpt) }, "ckpt.schema_invalid");
-        return null;
+      if (!entry) return miss("absent");
+
+      const decoded = decodeCheckpoint(entry.value, CHECKPOINT_SEAL_KEY);
+      if (!decoded.ok) {
+        // Every one of these used to be a bare `return null`, which is why a
+        // run restarting from turn zero was indistinguishable from one that
+        // never had a checkpoint. During a format rollout that difference is
+        // the whole signal.
+        logger.warn(
+          { sessionId: this.sessionId, reason: decoded.reason, version: decoded.version },
+          "ckpt.read_rejected",
+        );
+        return miss(decoded.reason);
       }
-      return ckpt;
+      metrics.onCheckpointVersion("read", decoded.version);
+
+      const { envelope, state } = decoded.value;
+      // Checked after the seal, not before: on v4 these fields are only
+      // trustworthy once the AAD and the sealed counters have agreed.
+      if (envelope.message_id !== this.messageId) return miss("envelope_mismatch");
+      if (Date.now() - envelope.checkpointed_at > CHECKPOINT_TTL_MS) return miss("absent");
+
+      metrics.onCheckpointRead("ok");
+      return {
+        ...state,
+        version: 3,
+        session_id: envelope.session_id,
+        message_id: envelope.message_id,
+        user_id: envelope.user_id,
+        has_workspace_sync: envelope.has_workspace_sync,
+        last_sync_turn: envelope.last_sync_turn,
+        checkpointed_at: envelope.checkpointed_at,
+      };
     } catch {
-      return null;
+      return miss("not_json");
     }
   }
 
@@ -1995,7 +2069,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         result,
         runtimeSecrets(this.request, this.platformKey),
       ),
@@ -2301,8 +2375,17 @@ class TaskRunner {
         by_tool: ckptState.tool_calls_by_name,
       }
       : undefined;
+    // Redact BEFORE truncating, and redact at all: latestCheckpointState is
+    // held verbatim now, and this string becomes the interrupted run's
+    // final_text -- it reaches NATS, the event DB, SSE and any downstream node
+    // that templates this task's output. Truncating first would also cut a
+    // credential in half, and an exact-substring pass cannot match a fragment,
+    // so the tail would survive. Same order safePreview() settled on.
     const partialSummary = ckptState?.text_parts?.length
-      ? ckptState.text_parts.join("\n\n").slice(-4000)
+      ? redactEgressPayload(
+        ckptState.text_parts.join("\n\n"),
+        runtimeSecrets(this.request, this.platformKey),
+      ).slice(-4000)
       : "";
     const interruptMarker = `[Interrupted by user${turnsCompleted ? ` after ${turnsCompleted} turns` : " before any turn completed"}]`;
     const finalText = partialSummary
@@ -2365,7 +2448,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         {
           finalText,
           // Absent rather than zeroed when nothing recorded them, which is the
@@ -2591,7 +2674,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         {
           finalText: finalText,
           // The same partial progress the `exec_complete` above reports. These

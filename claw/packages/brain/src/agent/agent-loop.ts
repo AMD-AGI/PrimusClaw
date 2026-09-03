@@ -1437,7 +1437,13 @@ class AgentLoopRunner {
       // fallback stopped retrying and the run kept going with no durable state.
       try {
         await this.opts.onCheckpoint({
-          messages: this.workingMessages,
+          // A snapshot, like every other field in this literal. workingMessages
+          // is mutated in place -- compaction does `length = 0` then pushes the
+          // replacement -- so handing over the live array lets the writer
+          // serialize a conversation from after the counters beside it were
+          // read. The deep copy the checkpoint redactor used to make hid this;
+          // it does not run on this path any more.
+          messages: this.workingMessages.slice(),
           last_cache_use_at: this.lastCacheUseAt,
           turns_completed: turn + 1,
           usage: { ...this.usage },
