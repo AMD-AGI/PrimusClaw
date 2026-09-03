@@ -388,6 +388,39 @@ helm_set_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/,/\\,/g'
 }
 
+# Helm recomputes values from what this run passes; it does not keep what the
+# last one set. So an upgrade run without the provider config -- a CI job, or a
+# terminal where the operator answered "no" -- would hand Helm an empty
+# modelList and no providerApiKey, and the proxy would come back with no models
+# and no key env var. Carry forward what the release already has whenever this
+# run did not produce its own.
+CARRIED_VALUES_FILE=""
+if [ -z "$GENERATED_MODELS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
+  carried="$(helm -n "$LITELLM_NAMESPACE" get values "$LITELLM_RELEASE" -o json 2>/dev/null || true)"
+  if [ -n "$carried" ]; then
+    CARRIED_VALUES_FILE="$(mktemp)"
+    chmod 600 "$CARRIED_VALUES_FILE"
+    MODELS_TMP_FILES+=("$CARRIED_VALUES_FILE")
+    if printf '%s' "$carried" | python3 -c '
+import json, sys
+try:
+    cur = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+keep = {k: cur[k] for k in ("modelList", "providerApiKey") if cur.get(k)}
+if not keep:
+    sys.exit(1)
+json.dump(keep, open(sys.argv[1], "w"), indent=2)
+sys.stderr.write(" ".join(sorted(keep)) + "\n")
+' "$CARRIED_VALUES_FILE" 2>/tmp/.litellm-carried.$$; then
+      log "carrying forward from the current release: $(tr -d '\n' </tmp/.litellm-carried.$$)"
+    else
+      CARRIED_VALUES_FILE=""
+    fi
+    rm -f /tmp/.litellm-carried.$$
+  fi
+fi
+
 helm_args=(
   upgrade --install "$LITELLM_RELEASE" "$CHART_DIR"
   --namespace "$LITELLM_NAMESPACE"
@@ -399,6 +432,7 @@ helm_args=(
   --set "serverRootPath=$LITELLM_SERVER_ROOT_PATH"
 )
 [ -n "$LITELLM_SAFE_API_URL" ] && helm_args+=(--set "safeApiUrl=$LITELLM_SAFE_API_URL")
+[ -n "$CARRIED_VALUES_FILE" ] && helm_args+=(-f "$CARRIED_VALUES_FILE")
 [ -n "$LITELLM_VALUES_FILE" ] && helm_args+=(-f "$LITELLM_VALUES_FILE")
 [ -n "$LITELLM_EXISTING_SECRET" ] && helm_args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
 if [ "$USE_EXISTING_SECRET" = "true" ]; then
