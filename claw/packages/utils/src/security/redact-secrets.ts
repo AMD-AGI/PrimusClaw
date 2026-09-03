@@ -15,6 +15,25 @@ const X_API_KEY_RE = /(x-api-key\s*[:=]\s*["']?)([^\s"',;]{20,})/gi;
 // alone catches stray tokens that lost their CLAW_INTERNAL_TOKEN prefix
 // during transformation (e.g. logged "token=<hex>").
 const HEX_TOKEN_32B_RE = /\b[A-Fa-f0-9]{64}\b/g;
+// Vendor token shapes. These are matched by what the value looks like, not by
+// the name of the field holding it, which is the only thing that works when a
+// credential is stored somewhere unremarkable -- `CONFIG=ghp_...`, a token
+// pasted into a comment, a key echoed by a tool. The name-based passes cannot
+// see any of those.
+const VENDOR_TOKEN_RE = new RegExp([
+  "gh[pousr]_[A-Za-z0-9]{16,}",           // GitHub classic
+  "github_pat_[A-Za-z0-9_]{20,}",         // GitHub fine-grained
+  "xox[baprs]-[A-Za-z0-9-]{10,}",         // Slack
+  "sk-[A-Za-z0-9_-]{16,}",                // OpenAI / Anthropic style
+  "hf_[A-Za-z0-9]{20,}",                  // Hugging Face
+  "AKIA[0-9A-Z]{16}",                     // AWS access key id
+  "glpat-[A-Za-z0-9_-]{16,}",             // GitLab
+  "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", // JWT
+].join("|"), "g");
+// A URL carrying inline credentials is a password with a hostname attached.
+// Only the credential half is replaced so the endpoint stays legible -- knowing
+// which host a run talked to is usually the point of the log line.
+const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/g;
 
 export interface RedactResult {
   text: string;
@@ -47,6 +66,14 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
   out = out.replace(HEX_TOKEN_32B_RE, () => {
     hits += 1;
     return "<redacted>";
+  });
+  out = out.replace(VENDOR_TOKEN_RE, () => {
+    hits += 1;
+    return "<redacted>";
+  });
+  out = out.replace(URL_CREDENTIALS_RE, (_, scheme) => {
+    hits += 1;
+    return `${scheme}<redacted>@`;
   });
   for (const secret of extraSecrets) {
     if (!secret || secret.length < 16) continue;

@@ -14,7 +14,7 @@ import {
   TASK_LOCK_NAK_BASE_MS,
   TASK_LOCK_NAK_CEILING_NS,
 } from "@claw/protocol";
-import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readIntSetting, isSensitiveKey, type IntSettingBounds } from "@claw/utils";
 
 // Re-exported so the budget and the poison threshold derived from it stay
 // reachable from one import, the way they were when this file owned both.
@@ -950,9 +950,21 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  * debugs the gateway instead of their own typo.
  */
 const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/**
+ * Names that carry a credential but do not read as one word-by-word, so
+ * `isSensitiveKey` cannot see them: `cookie` is in its word list, but
+ * `authorization` as a whole header name and the various `www-authenticate`
+ * spellings are header-specific.
+ *
+ * The word-level predicate does the rest, and doing it that way is the point:
+ * a fixed list only ever rejects the names someone thought of, and
+ * `x-client-secret`, `x-access-token` and `x-goog-api-key` are exactly the
+ * ones that get thought of second. Sharing the predicate with the redactor
+ * also means a credential word added for one is added for both.
+ */
 const CREDENTIAL_HEADERS: ReadonlySet<string> = new Set([
   "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
-  "cookie", "set-cookie", "x-api-key", "api-key", "x-auth-token", "x-amz-security-token",
+  "x-amz-security-token", "x-csrf-token", "x-xsrf-token",
 ]);
 
 export function assertDiagnosableHeaderName(name: string): void {
@@ -962,7 +974,7 @@ export function assertDiagnosableHeaderName(name: string): void {
       + `HTTP header name. Reading it would throw on every response.`,
     );
   }
-  if (CREDENTIAL_HEADERS.has(name)) {
+  if (CREDENTIAL_HEADERS.has(name) || isSensitiveKey(name)) {
     throw new Error(
       `LLM_DEBUG_RESPONSE_HEADERS names ${JSON.stringify(name)}, which carries a credential. `
       + `Captured headers are logged; pick a header that identifies the upstream instead.`,
