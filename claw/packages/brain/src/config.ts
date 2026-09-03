@@ -392,11 +392,18 @@ export const AGENT_SANDBOX_MAX_SESSION_DURATION = resolveAgentSandboxMaxSessionD
 /**
  * The same ceiling in whole seconds, for the backend that wants it that way.
  *
- * safe-workload's `timeout` is seconds counted from dispatch, which is the same
- * thing `maxSessionDuration` means -- so the value has to reach both providers,
- * and converting it here rather than in each one is what keeps them from
- * drifting into two nearly-identical parsers. Null when unset or refused, which
- * leaves each provider on its own default.
+ * safe-workload's `timeout` is seconds, and it answers the same question
+ * `maxSessionDuration` does -- do not let this run forever -- so the value has
+ * to reach both providers, and converting it here rather than in each one is
+ * what keeps them from drifting into two nearly-identical parsers.
+ *
+ * Near-equivalent, not identical: `maxSessionDuration` becomes an absolute
+ * ShutdownTime from creation, while SaFE counts `timeout` from
+ * `Status.StartTime` and explicitly excludes queue time, so a workload that
+ * waited an hour to be dispatched gets that hour on top. Close enough to carry
+ * one setting; not close enough to describe as one guarantee.
+ *
+ * Null when unset or refused, which leaves each provider on its own default.
  */
 export const AGENT_SANDBOX_MAX_SESSION_SECONDS: number | null = (() => {
   const ns = AGENT_SANDBOX_MAX_SESSION_DURATION

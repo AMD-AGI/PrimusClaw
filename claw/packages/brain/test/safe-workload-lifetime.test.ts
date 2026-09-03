@@ -10,10 +10,16 @@
 // SANDBOX_DEFAULT_TIMEOUT_SECONDS put there: no error, no warning, the setting
 // simply did not exist on that path.
 //
-// SaFE's `timeout` is seconds from dispatch, which is the same quantity
-// agent-sandbox calls maxSessionDuration, so that is where it goes. Its idle
-// counterpart has nowhere to go and deliberately stays unwired -- see the note
-// on workloadTimeoutSeconds.
+// SaFE's `timeout` answers the same question agent-sandbox's maxSessionDuration
+// does, so that is where it goes -- while measuring it differently: from
+// `Status.StartTime`, with queue time excluded, against an absolute
+// ShutdownTime from creation. Its idle counterpart has nowhere to go and
+// deliberately stays unwired -- see the note on workloadTimeoutSeconds.
+//
+// This file imports config under the runner's own (empty) environment, so
+// every assertion here about a *configured* value is necessarily conditional.
+// The set-value behaviour is tested where it can be: config-sandbox-lifetime,
+// -refused, and -safe each own an environment.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
