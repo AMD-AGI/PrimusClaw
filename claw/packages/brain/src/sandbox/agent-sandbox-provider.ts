@@ -23,6 +23,7 @@ import {
   AGENT_SANDBOX_TEMPLATE_FILE,
   AGENT_SANDBOX_WARM_POOL_SIZE,
   AGENT_SANDBOX_SESSION_TIMEOUT,
+  AGENT_SANDBOX_MAX_SESSION_DURATION,
 } from "../config.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -61,6 +62,9 @@ function buildFallbackSpec(): Record<string, unknown> {
     // Reachable now: renderTemplate replaces it when a deployment sets
     // AGENT_SANDBOX_SESSION_TIMEOUT or a caller passes params.sessionTimeout.
     sessionTimeout: "15m",
+    // Likewise, via AGENT_SANDBOX_MAX_SESSION_DURATION or
+    // params.maxSessionDuration. Not a platform ceiling -- the Workload Manager
+    // takes any value and says so -- just this skeleton's default.
     maxSessionDuration: "24h",
     template: {
       fromImage: "<PLACEHOLDER_IMAGE>",
@@ -158,6 +162,15 @@ function resolveSessionTimeout(params: SandboxCreateParams): string {
   return params.sessionTimeout?.trim() || AGENT_SANDBOX_SESSION_TIMEOUT;
 }
 
+/**
+ * The absolute lifetime this sandbox should carry, resolved the same way and
+ * meaning the same thing by its absence: nothing here leaves the base
+ * template's own value in place.
+ */
+function resolveMaxSessionDuration(params: SandboxCreateParams): string {
+  return params.maxSessionDuration?.trim() || AGENT_SANDBOX_MAX_SESSION_DURATION;
+}
+
 export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams): string {
   const r = params.resources;
   return [
@@ -165,6 +178,7 @@ export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams)
     r.cpu, r.memory, r.ephemeralStorage, r.gpu,
     `warm=${AGENT_SANDBOX_WARM_POOL_SIZE}`,
     `idle=${resolveSessionTimeout(params)}`,
+    `life=${resolveMaxSessionDuration(params)}`,
   ].join("|");
 }
 
@@ -212,6 +226,13 @@ export function renderTemplate(base: BaseTemplate, params: SandboxCreateParams):
   // for would quietly shorten every sandbox the deployment builds.
   const idleTimeout = resolveSessionTimeout(params);
   if (idleTimeout) spec.sessionTimeout = idleTimeout;
+
+  // Same rule, same reason. Worth stating separately because the failure is
+  // quieter: an idle timeout that is too short reclaims a sandbox that could
+  // have been kept alive, while this one reclaims it no matter what anybody
+  // does, so a base that raised it deliberately must not be talked back down.
+  const maxLifetime = resolveMaxSessionDuration(params);
+  if (maxLifetime) spec.maxSessionDuration = maxLifetime;
 
   const name = "primus-claw-" + sha256Short(templateHashKey(base, params));
   logger.info({ source: base.source, digest: base.digest, renderedName: name, image: params.image, resources: r }, "agent-sandbox.template_rendered");

@@ -36,6 +36,19 @@ export interface SandboxCreateParams {
    * Ignored by safe-workload, which has no equivalent knob.
    */
   sessionTimeout?: string;
+  /**
+   * Absolute lifetime for this sandbox, as a Go duration ("48h"). Overrides
+   * AGENT_SANDBOX_MAX_SESSION_DURATION.
+   *
+   * Distinct from `sessionTimeout`, which measures idleness and is pushed back
+   * by activity. This one is a wall-clock deadline written onto the CR, enforced
+   * without reading any state, and nothing on this side can extend it once the
+   * sandbox exists -- so a run that will outlast the default has to say so here,
+   * before it starts.
+   *
+   * Ignored by safe-workload, which has no equivalent knob.
+   */
+  maxSessionDuration?: string;
   /** safe-workload: idle TTL (ttlSecondsAfterFinished). Ignored by agent-sandbox. */
   ttlSec?: number;
   /** safe-workload: platform key (bearer) for SaFE workload create/poll/stop. */

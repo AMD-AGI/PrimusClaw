@@ -20,6 +20,7 @@ import {
 import type { SandboxCreateParams } from "../src/sandbox/provider.js";
 import {
   AGENT_SANDBOX_WARM_POOL_SIZE, AGENT_SANDBOX_SESSION_TIMEOUT,
+  AGENT_SANDBOX_MAX_SESSION_DURATION,
 } from "../src/config.js";
 
 const params: SandboxCreateParams = {
@@ -35,6 +36,7 @@ const foreignBase: BaseTemplate = {
   spec: {
     authMode: "none",
     sessionTimeout: "30m",
+    maxSessionDuration: "48h",
     template: { fromImage: "<PLACEHOLDER>", steps: [] },
   },
 };
@@ -143,4 +145,57 @@ test("a differing timeout selects a differing template", () => {
 
   assert.notEqual(a, b,
     "two workloads with different lifetimes must not share one template");
+});
+
+// --- absolute lifetime ---
+//
+// The other end of the clamp, and the one nothing recovers from: sessionTimeout
+// is pushed back by activity, while maxSessionDuration lands on the CR as an
+// absolute ShutdownTime enforced by a controller that reads no state. Keeping a
+// sandbox past it is not possible from this side, so a run that needs longer has
+// to say so before it starts. The platform sets no ceiling -- the 24h everything
+// got came from a literal in the inline skeleton.
+
+test("an unset lifetime leaves the base's own value alone", () => {
+  const { spec } = renderTemplate(foreignBase, params);
+
+  assert.equal(
+    spec.maxSessionDuration,
+    AGENT_SANDBOX_MAX_SESSION_DURATION || "48h",
+    "a base that raised the ceiling deliberately must not be talked back down: "
+      + "nothing can extend this one once the sandbox exists",
+  );
+});
+
+test("a per-request lifetime wins over both the base and the deployment default", () => {
+  const { spec } = renderTemplate(foreignBase, { ...params, maxSessionDuration: "72h" });
+
+  assert.equal(spec.maxSessionDuration, "72h");
+});
+
+test("the two clamps are set independently", () => {
+  const { spec } = renderTemplate(foreignBase, {
+    ...params, sessionTimeout: "6h", maxSessionDuration: "72h",
+  });
+
+  assert.equal(spec.sessionTimeout, "6h");
+  assert.equal(spec.maxSessionDuration, "72h",
+    "asking for a longer idle window is not the same as asking to live longer, "
+      + "and a sandbox given the first without the second still dies on schedule");
+});
+
+test("the lifetime reaches the template name", () => {
+  assert.match(
+    templateHashKey(foreignBase, { ...params, maxSessionDuration: "72h" }),
+    /life=72h/,
+    "a lifetime that is not hashed resolves back to the template built with the "
+      + "old one, and asking for longer changes nothing",
+  );
+});
+
+test("a differing lifetime selects a differing template", () => {
+  const a = templateHashKey(foreignBase, { ...params, maxSessionDuration: "48h" });
+  const b = templateHashKey(foreignBase, { ...params, maxSessionDuration: "72h" });
+
+  assert.notEqual(a, b);
 });

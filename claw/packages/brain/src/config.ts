@@ -224,6 +224,43 @@ function resolveAgentSandboxSessionTimeout(): string {
   return configured;
 }
 export const AGENT_SANDBOX_SESSION_TIMEOUT = resolveAgentSandboxSessionTimeout();
+
+/**
+ * Absolute lifetime for sandboxes this Brain creates, as a Go duration.
+ *
+ * The other end of the same clamp as AGENT_SANDBOX_SESSION_TIMEOUT, and the one
+ * nothing can talk its way out of: the idle timeout is a deadline the sandbox
+ * pushes back every time something touches it, while this one is written onto
+ * the CR as an absolute ShutdownTime and enforced by a controller that reads no
+ * store and takes no heartbeat. Keeping a sandbox alive past it is not possible
+ * from Brain's side at all -- not by pinging, not by holding work open.
+ *
+ * The platform puts no ceiling on it ("no hard cap -- longer values pass through
+ * as-is") and takes it per template or per request, so the 24h every sandbox
+ * gets here is not a platform limit. It is a literal in this file's inline
+ * fallback skeleton, which is to say it was unreachable for a deployment that
+ * mounted its own base ConfigMap and unreachable per request for anyone --
+ * exactly the gap AGENT_SANDBOX_SESSION_TIMEOUT closed for the idle side, left
+ * open on the line below it.
+ *
+ * Empty leaves whatever the base template says, so nothing changes until a
+ * deployment opts in. Raise it only for work that genuinely runs that long: it
+ * is a ceiling on leaked sandboxes too, and the thing that bounds what a lost
+ * activity record can cost.
+ */
+function resolveAgentSandboxMaxSessionDuration(): string {
+  const configured = env("AGENT_SANDBOX_MAX_SESSION_DURATION");
+  if (!configured) return "";
+  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(configured)) {
+    settingProblems.push(
+      `AGENT_SANDBOX_MAX_SESSION_DURATION=${configured} is not a Go duration `
+        + `(e.g. "48h", "36h30m"); leaving the template's own value`,
+    );
+    return "";
+  }
+  return configured;
+}
+export const AGENT_SANDBOX_MAX_SESSION_DURATION = resolveAgentSandboxMaxSessionDuration();
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,
