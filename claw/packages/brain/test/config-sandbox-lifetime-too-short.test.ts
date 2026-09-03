@@ -14,13 +14,14 @@
  * setting they got wrong.
  *
  * The value here is one nanosecond under the floor rather than something
- * plainly silly. A comparison is only wrong at its boundary: `<=` where `<` was
- * meant, or a floor constant off by any amount at all, still refuse "30s" --
- * and a whole second under would still miss a floor off by less than that,
- * which is why this is written to the nanosecond the floor is counted in. The accepting side of the same
- * boundary is config-sandbox-lifetime-at-floor.test.ts, and the two have to be
- * read together -- either alone is satisfied by a check that refuses
- * everything, or nothing.
+ * plainly silly. A comparison is only wrong at its boundary: `<=` where `<`
+ * was meant, or a floor constant off by any amount at all, still refuse "30s"
+ * -- and a whole second under would still miss a floor off by less than a
+ * second, which is why this is written to the nanosecond the floor is counted
+ * in. The accepting side of the same boundary is
+ * config-sandbox-lifetime-at-floor.test.ts, exactly one nanosecond above, and
+ * the two have to be read together -- either alone is satisfied by a check
+ * that refuses everything, or nothing.
  *
  * Sibling environments: config-sandbox-lifetime.test.ts (a value well clear of
  * the boundary), config-sandbox-lifetime-refused.test.ts (does not parse at
@@ -34,7 +35,11 @@ process.env.CLAW_DEPLOY_MODE = "kubernetes";
 // 660_000_000_000ns. The floor is a nanosecond quantity, so a whole second
 // under it is not the boundary -- it leaves a second of slack in which the
 // constant could be wrong and every test still agree. This is the largest
-// value that must still be refused.
+// value that must still be refused, and it is refused for the reason the floor
+// exists: the liveness write that would have moved the deadline is not
+// guaranteed to land first, and nothing downstream is obliged to wait for it
+// -- agentd's `+ time.Second` requeue schedules its own next look, it does not
+// hold off a deletion.
 process.env.AGENT_SANDBOX_SESSION_TIMEOUT = "10m59.999999999s";
 // The ceiling has no floor of its own -- a short absolute lifetime is a short
 // sandbox, not a raced one -- so it is set here to stay accepted, which is
