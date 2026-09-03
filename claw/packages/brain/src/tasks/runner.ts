@@ -1304,6 +1304,23 @@ class TaskRunner {
     this.handsIdentity = newIdentity ?? null;
     this.handsWorkloadId = newIdentity?.workloadId ?? "";
     this.hands = newHands;
+    // The facts explained a sandbox that no longer has anything to do with how
+    // this run ends. They were read to account for an ending, and the rebuild
+    // is the proof there was no ending: the task keeps going on a live sandbox,
+    // and whatever it does next is its own. Left set, a run preempted at turn
+    // three and finished normally at turn forty delivered that preemption's
+    // message, node, and exit code on a successful completion -- the platform
+    // read is attached to every terminal path by design, and the success path
+    // is one of them -- so the row said "the cluster took this run away" about
+    // a run that returned an answer.
+    //
+    // Cleared here rather than at the top of the recovery, so that everything
+    // between the capture and a working sandbox still carries them: a destroy
+    // that succeeded and a provision that then did not is exactly the ending
+    // the facts were read for. And cleared rather than merely ignored, so a
+    // second sandbox death later in the same run captures its own account
+    // instead of finding the first one already held.
+    this.platformFacts = null;
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
