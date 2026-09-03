@@ -13,9 +13,10 @@
 # is the conversation a resumed run replays to the model. It used to be written
 # through the same redactor that masks events on their way to NATS, and that
 # redactor mutates -- correctly, for a log line. Applied to replayable state it
-# deletes content: nearly every session in one week on one deployment resumed
-# with `<redacted>` where a file path or an identifier had been, and every one
-# of those turns was also a total prompt-cache miss.
+# deletes content: a resumed session comes back with `<redacted>` where a file
+# path or an identifier had been, because the substring pass matches on shape
+# rather than on provenance, and every such turn is also a total prompt-cache
+# miss.
 #
 # Confidentiality of the bucket is answered by sealing (v4), not by rewriting
 # the conversation. So:

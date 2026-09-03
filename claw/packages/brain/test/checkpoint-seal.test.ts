@@ -10,10 +10,12 @@
  * dropping the envelope cross-check to simplify the reader turns the splice
  * test red. A change that satisfies all of them has kept the property.
  *
- * The fixtures are transcribed from the corpus this was diagnosed on: a model
- * root, a word that is also a git subcommand, and a path with that word inside
- * an identifier. Every one is >= 4 characters and every one appeared verbatim
- * in transcripts that came back from a resume with holes cut in them.
+ * The fixture is built to the shape that loses characters to a substring
+ * redactor: a model root, a word that is also a git subcommand, and a path
+ * with that word buried inside a longer identifier. Every one is >= 4
+ * characters, which is what the substring pass matches on -- so a redactor
+ * applied to this path cuts holes in a transcript that contains no credential
+ * at all.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -33,8 +35,8 @@ const OTHER_KEY = randomBytes(32);
 const HF_TOKEN = `hf_${"b".repeat(34)}`;
 
 const TRANSCRIPT =
-  "sed -n '140,340p' /models/qwen3-8b/backends/remote_runner.py"
-  + " && export MODEL_PATH=/models/qwen3-8b/Qwen3-8B";
+  "sed -n '140,340p' /srv/models/example-8b/backends/remote_runner.py"
+  + " && export MODEL_PATH=/srv/models/example-8b/Example-8B";
 
 /** What runtimeSecrets() yields for this run: the credential, not the config. */
 const SECRETS = [HF_TOKEN];
@@ -101,8 +103,71 @@ test("v4 is unreadable without the key, and not merely encoded", () => {
   const missingKey = decodeCheckpoint(bytes, null, AS_A);
   assert.equal(!missingKey.ok && missingKey.reason, "seal_key_missing");
 
-  const blob = Buffer.from(JSON.parse(raw).state_enc as string, "base64");
-  assert.throws(() => gunzipSync(blob), "the sealed core must not be plain gzip");
+  // Gunzipping the whole frame proves nothing -- it fails on the version byte
+  // and the nonce whatever follows them. Reach the payload region the codec
+  // actually writes the conversation into: one version byte, a 12-byte nonce,
+  // then ciphertext, then a 16-byte tag.
+  const frame = Buffer.from(JSON.parse(raw).state_enc as string, "base64");
+  assert.equal(frame[0], 0x01, "the frame must start with the AEAD version byte");
+  const payload = frame.subarray(1 + 12, frame.length - 16);
+  assert.ok(payload.length > 0, "there is no payload region to test");
+  assert.ok(
+    !(payload[0] === 0x1f && payload[1] === 0x8b),
+    "the payload region is a gzip stream in the clear",
+  );
+  assert.throws(() => gunzipSync(payload), "the sealed core must not be plain gzip");
+});
+
+test("a flipped byte anywhere in the frame is refused, not decoded", () => {
+  // GCM's tag covers nonce and ciphertext alike, so both of these have to fail
+  // the same way. A nonce that is merely wrong would decrypt to garbage under a
+  // cipher with no tag, and this is the assertion that says we are not using
+  // one.
+  const raw = JSON.parse(new TextDecoder().decode(encodeCheckpoint(state(), envelope(), v4)));
+  const frame = Buffer.from(raw.state_enc as string, "base64");
+
+  for (const [what, at] of [
+    ["nonce", 1],
+    ["ciphertext", 1 + 12],
+    ["tag", frame.length - 1],
+  ] as const) {
+    const tampered = Buffer.from(frame);
+    tampered[at] ^= 0x01;
+    const bytes = new TextEncoder().encode(JSON.stringify({
+      ...raw, state_enc: tampered.toString("base64"),
+    }));
+    const decoded = decodeCheckpoint(bytes, KEY, AS_A);
+    assert.equal(decoded.ok, false, `a flipped ${what} byte was accepted`);
+    assert.equal(!decoded.ok && decoded.reason, "seal_open_failed", `flipped ${what}`);
+  }
+});
+
+test("identity fields that run together cannot be re-split", () => {
+  // The AAD binds session, message and user. Joined with a delimiter, the
+  // identity ("a|b", "c", "u1") and the identity ("a", "b|c", "u1") produce the
+  // same bytes -- so a checkpoint sealed for the first opens for the second,
+  // and the binding that the whole v4 format rests on is decorative.
+  //
+  // The envelope cross-check further down would still catch a naive move, so
+  // this rewrites the plaintext envelope too: after the splice every field the
+  // reader compares agrees with the reader's own identity, and the seal is the
+  // only thing left standing between run A's conversation and run B.
+  const raw = JSON.parse(new TextDecoder().decode(encodeCheckpoint(
+    state(), envelope({ session_id: "a|b", message_id: "c", user_id: "u1" }), v4,
+  )));
+  raw.session_id = "a";
+  raw.message_id = "b|c";
+
+  const asSplit: CheckpointIdentity = { sessionId: "a", messageId: "b|c", userId: "u1" };
+  const moved = decodeCheckpoint(
+    new TextEncoder().encode(JSON.stringify(raw)), KEY, asSplit,
+  );
+  assert.equal(moved.ok, false, "a re-split identity must not open another run's seal");
+  assert.equal(
+    !moved.ok && moved.reason,
+    "seal_open_failed",
+    "the seal itself must refuse this, not the envelope comparison after it",
+  );
 });
 
 test("the envelope carries counters and no conversation at all", () => {
