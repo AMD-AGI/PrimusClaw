@@ -524,3 +524,36 @@ export async function withHandsTimeout<T>(
     if (signal && abortListener) signal.removeEventListener("abort", abortListener);
   }
 }
+
+/**
+ * How many background shells are still running for `owner`.
+ *
+ * A free function rather than a method because the caller that needs it most is
+ * the keepalive sweep, which walks KV entries and has a URL and a token but no
+ * client: building one there would mean constructing an MCP client to make one
+ * plain HTTP call.
+ *
+ * Throws on transport or status failure rather than reporting zero. Zero and
+ * "could not tell" lead to opposite decisions -- the first says a sandbox is
+ * free, the second says nothing at all -- and a caller that cannot see the
+ * difference will eventually reclaim a sandbox because Hands was briefly
+ * unreachable.
+ */
+export async function countActiveShells(
+  url: string,
+  token: string,
+  owner: string,
+  timeoutMs = 5_000,
+): Promise<number> {
+  if (!owner) return 0;
+  const resp = await undiciFetch(handsEndpoint(url, "/internal/shells/active"), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ owner }),
+    signal: AbortSignal.timeout(timeoutMs),
+    dispatcher: HANDS_DISPATCHER,
+  } as Parameters<typeof undiciFetch>[1]);
+  if (!resp.ok) throw new Error(`hands_active_shells_failed: status=${resp.status}`);
+  const body = await resp.json() as { running?: number };
+  return body?.running ?? 0;
+}

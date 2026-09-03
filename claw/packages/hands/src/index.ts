@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { constantTimeEquals } from "@claw/utils";
 import { tools } from "./tools/index.js";
-import { shutdownAllShells, shutdownRunShells } from "./tools/shell/bg-manager.js";
+import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
 import { OWNER_HEADER, RUN_HEADER, normalizeOwner, normalizeRun, withCaller } from "./runtime/owner-context.js";
 import { INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
@@ -71,13 +71,27 @@ app.all("/mcp", async (req, reply) => {
 });
 
 /**
- * End the background shells a finished run started.
+ * How much background work is still running in this sandbox.
  *
- * Brain calls this instead of doing it through a tool because by the time it
- * knows a run is over the model is no longer being asked anything, and because
- * the decision is Brain's: a batch node's shells go, a conversation's stay. Not
- * an MCP tool, so the model cannot invoke it on itself or on another run.
+ * Brain asks when a task reaches a terminal state, because "the turn ended" and
+ * "this sandbox is free" are not the same thing: a background shell is expected
+ * to outlive the turn that started it, and the sandbox has to stay alive while
+ * one is running or the control plane reclaims it out from under the work.
+ *
+ * Read-only, and internal rather than an MCP tool for the same reason the reap
+ * is: this is Brain's bookkeeping, not something the model should be able to ask
+ * on its own behalf or about another caller.
  */
+app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, reply) => {
+  const denied = authFailure(req);
+  if (denied) return reply.status(denied.status).send({ error: denied.error });
+
+  const owner = normalizeOwner(req.body?.owner);
+  if (!owner) return reply.status(400).send({ error: "owner_required" });
+
+  return { running: runningShellCount(owner) };
+});
+
 app.post<{ Body?: { run?: unknown } }>("/internal/shells/reap", async (req, reply) => {
   const denied = authFailure(req);
   if (denied) return reply.status(denied.status).send({ error: denied.error });

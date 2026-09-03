@@ -12,6 +12,7 @@ import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../ta
 import { destroyHands } from "./reaper.js";
 import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
+import { countActiveShells } from "../clients/hands.js";
 import pino from "pino";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -61,6 +62,12 @@ interface HandsKvEntry {
 
 interface KeepaliveDeps {
   kv: KV;
+  /**
+   * Test seam for the background-work probe, which is otherwise a live HTTP call
+   * to a Hands that does not exist under test -- and whose failure path answers
+   * "no work", so the interesting branch would never be reached.
+   */
+  countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -256,6 +263,56 @@ export function markHandsIdle(
  * Build the merged ping target list: in-memory registry (primary) + NATS KV
  * (secondary, for crash-recovery of sessions created by a previous Brain pod).
  */
+/**
+ * Whether an idle handle's sandbox still has background work running in it.
+ *
+ * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
+ * idle handle is never pinged, so the control-plane GC reclaims the pod about
+ * fifteen minutes later. That is right when the sandbox is only a warm cache for
+ * the next message. It is wrong when the turn left something running: Claw's own
+ * rule is that a `run_in_background` shell outlives the turn that started it --
+ * "the user is still there, and a shell started this turn is expected to still
+ * be running when they ask about it in the next one, which is the reason
+ * background shells exist at all" -- and reclaiming the pod kills it anyway. The
+ * two policies contradicted each other; this is the side that reads the fact.
+ *
+ * Asked with the session as the owner, which is the key Hands files shells under
+ * for everything except a DAG node (there it is the DAG root, and a DAG node's
+ * shells are reaped when it finishes, so there is nothing left to protect). Not
+ * `runScope`: that is the run *lease* key, a workspace id under
+ * RUN_GATE_KEY=workspace, and it would match no owner at all.
+ *
+ * A failure answers false -- the same decision this code made before the check
+ * existed, so an unreachable Hands cannot make things worse than they were. It
+ * does leave a hole worth naming: Hands keeps this registry in memory, so a
+ * Hands that restarted reports zero for shells that are still running, and the
+ * sandbox is then reclaimed as if the turn had left nothing behind.
+ */
+async function idleHandleHasBackgroundWork(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  info: HandsKvEntry,
+): Promise<boolean> {
+  if (!info.handsUrl || !info.token) return false;
+  try {
+    const probe = deps.countActiveShells ?? countActiveShells;
+    const running = await probe(info.handsUrl, info.token, sessionId);
+    if (running > 0) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, running },
+        "keepalive.idle_handle_kept_background_work",
+      );
+    }
+    return running > 0;
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error)?.message ?? err, sessionId },
+      "keepalive.background_work_check_failed",
+    );
+    return false;
+  }
+}
+
 async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
 
@@ -286,7 +343,7 @@ async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, Register
         // Post-task idle reuse handle: keep it for reuse but never ping it, so
         // the pod idles out via the control-plane GC (no extra cost). Refresh
         // its TTL within the reuse window; expire it afterwards.
-        if (info.keepalive === false) {
+        if (info.keepalive === false && !(await idleHandleHasBackgroundWork(deps, sessionId, info))) {
           const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
           const expired = Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
           // A session this replica is actively running is not idle, whatever

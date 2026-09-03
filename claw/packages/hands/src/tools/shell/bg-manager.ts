@@ -281,6 +281,31 @@ export async function shutdownAllShells(graceMs = 2000): Promise<number> {
  * A run that started nothing is not an error -- most runs never spawn a shell --
  * so this reports zero rather than refusing.
  */
+/**
+ * How many of `owner`'s background shells are still running.
+ *
+ * The same predicate the reap uses, asked without reaping. Brain needs it when a
+ * task reaches a terminal state: a background shell is meant to outlive the turn
+ * that started it -- that is the whole point of `run_in_background` -- but the
+ * sandbox is marked idle on every terminal task regardless, and the control
+ * plane reclaims an idle sandbox 15 minutes later, taking the shell with it.
+ *
+ * Scoped to the owner rather than the run because that is the key the keepalive
+ * sweep can address: it walks `hands.<session>` entries and knows the session,
+ * while the run is a per-task id it never sees. The owner is also the right
+ * granularity for the question being asked -- "is anything still running in this
+ * sandbox" -- which is about the pod, not about one task that used it.
+ *
+ * Only `running` counts. An exited shell is one nobody is waiting on, and
+ * counting it would hold a sandbox open for a process that ended hours ago.
+ */
+export function runningShellCount(owner: string): number {
+  if (!owner) return 0;
+  return [...shells.values()].filter(
+    (e) => e.owner === owner && e.shell.status === "running",
+  ).length;
+}
+
 export async function shutdownRunShells(run: string, graceMs = 2000): Promise<number> {
   // NO_RUN would otherwise match every shell spawned without a run header, which
   // is precisely the set nothing is entitled to reap.
