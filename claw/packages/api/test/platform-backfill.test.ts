@@ -160,3 +160,75 @@ test("R5 a lost lease backfills the platform account of the dead worker", async 
   assert.deepEqual(h.fetched, ["http://safe.test/api/v1/workloads/wl-lost"]);
   assert.equal(h.updates.length, 1, "the platform facts were not written to the reaped row");
 });
+
+// ── The drain: what the per-sweep cap defers ─────────────────────────────────
+//
+// Swept rows are already terminal, so the sweeper's UPDATE cannot select them
+// again. Before the drain existed, anything over the cap was dropped in memory
+// and revisited by nothing. It was pinned only by a test that grepped the
+// source for the function's name -- which proves it exists, not that it selects
+// the right rows. These drive it.
+
+const { drainPendingPlatformFacts } = await import("../src/tasks/platform-backfill.js");
+
+/** Captures the SELECT the drain issues, and hands back rows for it. */
+function drainHarness(rows: Array<Record<string, unknown>>) {
+  const seen: string[] = [];
+  db.query = (async (text: string, params: unknown[] = []) => {
+    seen.push(text);
+    if (/FROM claw_tasks/.test(text) && /SELECT/i.test(text)) {
+      return { rows, rowCount: rows.length };
+    }
+    if (/FROM claw_sessions/.test(text)) {
+      return { rows: [{ config: { platform_key: "pk-1" } }], rowCount: 1 };
+    }
+    if (/UPDATE claw_tasks/.test(text)) return { rows: [], rowCount: 1 };
+    throw new Error(`unexpected query: ${text}`);
+  }) as typeof db.query;
+  globalThis.fetch = (async () =>
+    ({ ok: true, status: 200, json: async () => DETAIL }) as unknown as Response
+  ) as unknown as typeof globalThis.fetch;
+  return { seen };
+}
+
+test("R6 the drain asks only for terminal rows that still have no account", async () => {
+  // Each clause is load-bearing: a non-terminal row is still running and must
+  // not be answered for; a row with no workload id has nothing to ask about;
+  // a row that already carries facts has been answered, possibly by a late
+  // Brain callback that must win.
+  const h = drainHarness([]);
+  await drainPendingPlatformFacts();
+  const sel = h.seen.find((t) => /SELECT/i.test(t) && /FROM claw_tasks/.test(t));
+  assert.ok(sel, "the drain must issue a select");
+  assert.match(sel!, /status IN \('completed', 'failed', 'cancelled'\)/, "terminal only");
+  assert.match(sel!, /sandbox_workload_id IS NOT NULL/, "something to ask about");
+  assert.match(sel!, /platform_message IS NULL/, "not already answered");
+  assert.match(sel!, /platform_kill_reason IS NULL/, "nor already killed-reasoned");
+  assert.match(sel!, /LIMIT/, "and bounded, since this runs inside a sweeper tick");
+});
+
+test("R7 the drain works the backlog oldest-first", async () => {
+  // Newest-first would starve the tail of a large backlog: every tick would
+  // re-answer the same recent rows while the oldest -- the ones closest to
+  // having their platform facts garbage-collected -- never come up.
+  const h = drainHarness([]);
+  await drainPendingPlatformFacts();
+  const sel = h.seen.find((t) => /SELECT/i.test(t) && /FROM claw_tasks/.test(t))!;
+  assert.match(sel, /ORDER BY completed_at ASC/, "oldest first");
+});
+
+test("R8 a drained row is actually asked about and recorded", async () => {
+  const h = drainHarness([
+    { task_id: "t-drained", session_id: "s-1", sandbox_workload_id: "wl-drained" },
+  ]);
+  const n = await drainPendingPlatformFacts();
+  assert.equal(n, 1, "the row gains facts");
+  assert.ok(h.seen.some((t) => /UPDATE claw_tasks/.test(t)), "and they are written");
+});
+
+test("R9 an empty backlog costs nothing", async () => {
+  const h = drainHarness([]);
+  assert.equal(await drainPendingPlatformFacts(), 0);
+  assert.equal(h.seen.filter((t) => /FROM claw_sessions/.test(t)).length, 0,
+    "no key lookups, no SaFE calls");
+});

@@ -201,3 +201,54 @@ test("R7 the terminal index follows the cursor's complete ordering", () => {
     "the keyset query would sort instead of stopping at the page boundary",
   );
 });
+
+// ── The cursor's tiebreaker ──────────────────────────────────────────────────
+//
+// Paging on completed_at alone drops runs whenever more than `limit` of them
+// share a timestamp: the cut falls in DB-arbitrary order, and a caller
+// advancing past the last timestamp it saw never comes back for the rest. A
+// sweeping dispatcher loses completions silently. The tiebreaker is what makes
+// the cut deterministic and the cursor resumable, and nothing exercised it.
+
+test("R20 terminal listings are ordered by a total key, not by timestamp alone", async () => {
+  serve([]);
+  await app.inject({ method: "GET", url: "/v1/runs?state=terminal&limit=2" });
+  assert.match(lastSql, /ORDER BY completed_at DESC NULLS LAST, task_id DESC/,
+    "task_id must break ties, or equal timestamps are cut arbitrarily");
+});
+
+test("R21 the cursor is a compound keyset, and it is exclusive", async () => {
+  // Inclusive would re-serve the boundary row forever; comparing only the
+  // timestamp would skip the rest of a tied group.
+  serve([]);
+  await app.inject({
+    method: "GET",
+    url: "/v1/runs?state=terminal&limit=2&cursor="
+      + Buffer.from(JSON.stringify(["2026-09-01T01:00:00Z", "ktsk_b"]), "utf8").toString("base64url"),
+  });
+  assert.match(lastSql, /\(completed_at, task_id\) < \(\$\d+::timestamptz, \$\d+\)/,
+    "a row-value comparison over both columns");
+  assert.ok(
+    lastParams.some((p) => String(p).includes("ktsk_b")),
+    "and the task_id half must actually be bound",
+  );
+});
+
+test("R22 a full page hands back a cursor naming its last row", async () => {
+  // Without this the caller has to synthesise one, which is where the
+  // timestamp-only shortcut comes back in. The route over-fetches by one to
+  // know whether more exist, so a full page needs limit+1 rows served.
+  serve([row("ktsk_a"), row("ktsk_b"), row("ktsk_c")]);
+  const body = (await app.inject({ method: "GET", url: "/v1/runs?state=terminal&limit=2" })).json();
+  assert.equal(body.runs.length, 2, "the probe row is not returned");
+  assert.ok(body.next_cursor, "a full page must be resumable");
+  const [ts, id] = JSON.parse(Buffer.from(body.next_cursor, "base64url").toString("utf8"));
+  assert.equal(id, "ktsk_b", "the cursor names the last returned row, not the probe");
+  assert.ok(ts, "and carries its timestamp");
+});
+
+test("R23 a short page ends the walk", async () => {
+  serve([row("ktsk_a")]);
+  const body = (await app.inject({ method: "GET", url: "/v1/runs?state=terminal&limit=2" })).json();
+  assert.ok(!body.next_cursor, "nothing left to continue from");
+});
