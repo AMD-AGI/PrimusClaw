@@ -31,6 +31,9 @@ cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *"config current-context"*) echo release-test ;;
+  # base64 of "fake": the wrapper reads the credentials Secret to hash it into a
+  # pod annotation, so that rotating the Secret rolls the Pods.
+  *"get secret"*) echo "ZmFrZQ==" ;;
 esac
 exit 0
 EOF
@@ -71,6 +74,12 @@ refute 'stale-master-in-values' \
   "a stale master key in the values file was passed to Helm anyway"
 refute 'stale@example.invalid' \
   "a stale database URL in the values file was passed to Helm anyway"
+# Credentials arrive by secretKeyRef, so rewriting the Secret leaves the
+# Deployment identical and the Pods keep the old ones. The name is resolved from
+# the rendered Deployment, which is the only way to find it when the flag came
+# from the values file and LITELLM_EXISTING_SECRET is empty.
+has_arg_re() { grep -qE "^$1\$" "$capture"; }
+has_arg_re 'podAnnotations\.checksum/credentials=[0-9a-f]{32}'
 
 # 2. The same flag through the environment.
 run LITELLM_EXISTING_SECRET=release-env-credentials \
@@ -90,5 +99,22 @@ run LITELLM_MASTER_KEY=release-inline-master \
   LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm
 has_arg 'secrets.masterKey=release-inline-master'
 has_arg 'secrets.databaseUrl=postgresql://release@example.invalid/litellm'
+
+# config.yaml is mounted with subPath, which kubelet never refreshes, so the only
+# thing that can move a running Pod onto a new model list is a changed pod
+# template. The hash has to follow the rendered ConfigMap.
+chart="$repo_root/deploy/litellm/charts/litellm"
+sum_of() {
+  "$real_helm" template release "$chart" \
+    --set-string secrets.masterKey=x --set-string secrets.databaseUrl=y \
+    --set "modelList[0].model_name=$1" --set "modelList[0].litellm_params.model=openai/$1" \
+    2>/dev/null | grep -o 'checksum/config: [0-9a-f]*' | head -1
+}
+sum_a="$(sum_of alpha)"; sum_b="$(sum_of beta)"
+[ -n "$sum_a" ] || { echo "the pod template carries no checksum for the rendered config" >&2; exit 1; }
+[ "$sum_a" != "$sum_b" ] || {
+  echo "the pod template does not change when the rendered config does" >&2
+  exit 1
+}
 
 echo "LiteLLM existingSecret handling: ok"

@@ -41,6 +41,10 @@ ingress:
   host: ""
   priority: "10"
 
+# Extra pod-template annotations. deploy.sh puts a hash of the credentials
+# Secret here so that rotating it actually rolls the Pods.
+podAnnotations: {}
+
 nodeSelector: {}
 tolerations: []
 

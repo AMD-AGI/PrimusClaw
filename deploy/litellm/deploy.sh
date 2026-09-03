@@ -387,6 +387,56 @@ else
   helm_args+=(--set "ingress.enabled=false")
 fi
 
+# A rotated database password or master key has to reach the running Pods. Both
+# arrive by secretKeyRef, so rewriting the Secret leaves the Deployment
+# unchanged: helm reports success, rollout status waits on nothing, and the old
+# credentials keep being used. Hashing them into a pod annotation makes the
+# rotation a pod-template change.
+#
+# The Secret name comes out of the rendered Deployment rather than
+# LITELLM_EXISTING_SECRET: secrets.existingSecret can equally be set in a values
+# file, and then that variable is empty while the chart already points the Pods
+# somewhere else.
+tmpl_args=()
+for a in "${helm_args[@]}"; do
+  case "$a" in
+    upgrade) tmpl_args+=(template) ;;
+    --install|--create-namespace) ;;
+    *) tmpl_args+=("$a") ;;
+  esac
+done
+if ! rendered="$(helm "${tmpl_args[@]}" 2>&1)"; then
+  printf '%s\n' "$rendered" | sed 's/^/  /' >&2
+  fail "could not render the chart with the values for this deploy"
+fi
+creds_secret="$(printf '%s' "$rendered" | python3 -c '
+import re, sys
+m = re.search(
+    r"name:\s*DATABASE_URL\s*\n\s*valueFrom:\s*\n\s*secretKeyRef:\s*\n\s*name:\s*(\S+)",
+    sys.stdin.read(),
+)
+print(m.group(1).strip("\"" + chr(39)) if m else "")
+')"
+[ -n "$creds_secret" ] \
+  || fail "could not tell which Secret the Pods read their credentials from"
+
+if creds_raw="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$creds_secret" \
+     -o jsonpath='{.data.master_key}{.data.database_url}' 2>/dev/null)"; then
+  [ -n "$creds_raw" ] || fail "Secret/$creds_secret has neither master_key nor database_url"
+  helm_args+=(--set-string \
+    "podAnnotations.checksum/credentials=$(printf '%s' "$creds_raw" | sha256sum | cut -c1-32)")
+elif [ "$USE_EXISTING_SECRET" = "true" ]; then
+  # The chart renders no Secret in this mode, so an unreadable one is not "not
+  # created yet": the Pods would come up unable to read their credentials.
+  fail "could not read Secret/$creds_secret, which the Pods take their credentials from"
+else
+  # First install: the chart is about to create it, so hash what it will hold.
+  helm_args+=(--set-string \
+    "podAnnotations.checksum/credentials=$(printf '%s%s' "$LITELLM_MASTER_KEY" \
+      "$LITELLM_DATABASE_URL" | sha256sum | cut -c1-32)")
+fi
+
+
 if [ "$DRY_RUN" = "true" ]; then
   helm "${helm_args[@]}" --dry-run --debug >/dev/null
   log "dry-run complete"

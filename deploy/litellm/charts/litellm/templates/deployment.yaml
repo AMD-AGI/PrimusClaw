@@ -26,6 +26,17 @@ spec:
         is what makes Kubernetes replace the Pods.
         */}}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- /*
+        DATABASE_URL and LITELLM_MASTER_KEY reach the container by
+        secretKeyRef, so rewriting that Secret leaves this Deployment
+        byte-identical: no rollout, and the Pods keep the credentials they
+        started with. The chart cannot hash a Secret it does not render --
+        which is exactly the secrets.existingSecret case -- so the wrapper
+        passes a token here.
+        */}}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         app: litellm
         app.kubernetes.io/instance: {{ .Release.Name }}
