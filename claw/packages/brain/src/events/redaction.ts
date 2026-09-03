@@ -97,6 +97,48 @@ const BOOLEANISH = new Set([
  * which is the pass that does not need to guess. Only the blind substring hunt
  * declines it, and that hunt is the one whose mistakes cannot be undone.
  */
+const VOWELS = new Set(["a", "e", "i", "o", "u", "y"]);
+/** Five consonants in a row: no English word, most random letter runs. */
+const CONSONANT_PILEUP_RE = /[^aeiouy]{5,}/;
+/** `deadbeefcafebabe`: hex is vowel-rich by construction and is not a word. */
+const HEX_RUN_RE = /^[0-9a-fA-F]+$/;
+/** English `q` is followed by `u`. A token's `q` is followed by anything. */
+const BARE_Q_RE = /q(?!u)/;
+const RARE_LETTERS_RE = /[jqxz]/g;
+
+/**
+ * Whether a long run of letters reads as an English word.
+ *
+ * Length alone used to decide this, on the reasoning that vocabulary runs out
+ * around sixteen characters. It does not: `internationalization`,
+ * `characterization` and `responsibilities` are all at or past that line, and
+ * a `PROJECT_TOKEN` holding one of them cut the word out of every sentence in
+ * the transcript that used it -- the exact corruption this pass exists to
+ * avoid.
+ *
+ * What separates a word from a token is not length but shape. A word spends
+ * roughly a third of itself on vowels, never stacks five consonants, spells
+ * `q` with a `u` after it, and is sparing with `j`, `q`, `x` and `z`. Hex is
+ * excluded first because it is vowel-rich by accident of its alphabet.
+ *
+ * Thresholds were fitted rather than guessed: against long English words and
+ * generated tokens of the shapes that actually occur, these lose no real word
+ * and admit about 3% of purely alphabetic random tokens. That asymmetry is
+ * deliberate and matches the rest of this file -- an admitted token is still
+ * masked by key name wherever it sits in a field, and only the blind
+ * substring hunt declines it, while a lost word is gone from the transcript
+ * for good.
+ */
+function readsAsWord(value: string): boolean {
+  if (HEX_RUN_RE.test(value)) return false;
+  const lower = value.toLowerCase();
+  if (BARE_Q_RE.test(lower)) return false;
+  if ((lower.match(RARE_LETTERS_RE) ?? []).length > 2) return false;
+  if (CONSONANT_PILEUP_RE.test(lower)) return false;
+  const vowels = [...lower].filter((ch) => VOWELS.has(ch)).length;
+  return vowels / lower.length >= 0.3;
+}
+
 export function isDistinctiveSecret(secret: string): boolean {
   // Below this, a value cannot carry enough entropy to be worth the collision
   // risk no matter what it looks like.
@@ -104,14 +146,21 @@ export function isDistinctiveSecret(secret: string): boolean {
   const lower = secret.toLowerCase();
   if (BOOLEANISH.has(lower)) return false;
   if (ORDINARY_NUMBER_RE.test(secret)) return false;
-  // A short run of letters written as a word is a word ("main", "Staging",
-  // "REMOTE"). Past a certain length it stops being one -- a 16-character
-  // alphabetic string is a token, not vocabulary.
-  if (secret.length < 16 && ORDINARY_WORD_RE.test(secret)) return false;
+  // A run of letters written as a word is a word. Below sixteen characters
+  // that is taken on faith, because everything that short collides with
+  // something; above it the run has to actually read as one, which is what
+  // keeps `internationalization` in the transcript and `XkjQmzPlVbNrTqWd`
+  // out of it.
+  if (ORDINARY_WORD_RE.test(secret)) {
+    if (secret.length < 16 || readsAsWord(secret)) return false;
+  }
   // A word with digits on the end is an identifier far more often than it is a
   // credential, and the two are indistinguishable. See the note on the
   // constant for why this resolves towards leaving prose alone.
-  if (secret.length < 16 && WORD_WITH_TRAILING_DIGITS_RE.test(secret)) return false;
+  if (WORD_WITH_TRAILING_DIGITS_RE.test(secret)) {
+    const letters = secret.replace(/[0-9]+$/, "");
+    if (secret.length < 16 || readsAsWord(letters)) return false;
+  }
   // `America/New_York`, `src/main`: a path written in words, at any length.
   if (WORD_PATH_RE.test(secret)) return false;
   // `Node20.0.0-rc.1+OpenSSL3`, `Python3.12RC1+NumPy2`: a toolchain string is

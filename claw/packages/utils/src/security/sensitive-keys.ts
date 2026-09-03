@@ -25,6 +25,20 @@ const SENSITIVE_WORDS = new Set([
   "password",
   "passwords",
   "authorization",
+  // The whole auth family, as words rather than as a list of header names.
+  // `x-auth`, `x-auth-key`, `authentication-info` and
+  // `proxy-authentication-info` are all credential-bearing and none of them
+  // was caught by naming `authorization` alone -- which is the failure mode a
+  // fixed list has, and the reason this file matches by word.
+  //
+  // Splitting by word is what makes this safe to state so broadly: `oauth`,
+  // `author`, `authors`, `authored` and `authenticated` are each a single
+  // word and none of them is `auth`, so none of them trips this.
+  "auth",
+  "auths",
+  "authentication",
+  "authenticate",
+  "authorisation",
   "credential",
   "credentials",
   "cookie",

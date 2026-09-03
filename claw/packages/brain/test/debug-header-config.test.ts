@@ -115,3 +115,30 @@ test("a name that merely contains credential letters is still accepted", () => {
     );
   }
 });
+
+test("the auth family is rejected as a word, not as a list of names", () => {
+  // A fixed list only rejects what someone thought of, and these are what
+  // gets thought of second. All four passed validation before, and any of
+  // them would have carried a credential into the cache-loss log.
+  for (const name of [
+    "x-auth", "x-auth-key", "authentication-info", "proxy-authentication-info",
+    // Header names are case-insensitive on the wire, so the check has to be.
+    "X-Auth", "X-AUTH-KEY", "Authentication-Info", "Proxy-Authentication-Info",
+    // Shapes the word rule picks up without anyone listing them.
+    "auth-token", "x-auth-token", "x-authentication",
+  ]) {
+    assert.throws(
+      () => assertDiagnosableHeaderName(name),
+      /carries a credential/,
+      `${JSON.stringify(name)} must be rejected`,
+    );
+  }
+});
+
+test("headers that merely contain the letters auth are still diagnosable", () => {
+  // The word split is what makes the rule above safe to state so broadly:
+  // none of these contains `auth` as a word, so none of them is caught.
+  for (const name of ["x-author", "oauth-provider", "x-authored-by", "x-request-id"]) {
+    assert.doesNotThrow(() => assertDiagnosableHeaderName(name), `${name} is safe`);
+  }
+});

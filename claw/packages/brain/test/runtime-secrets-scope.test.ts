@@ -340,3 +340,19 @@ test("a toolchain string under a credential name survives free text", () => {
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command, text);
 });
+
+test("a long ordinary word under a credential name survives free text", () => {
+  // The repro exactly: a var named like a credential, holding a word, and a
+  // sentence that uses the word for its own reasons.
+  const text = "enable internationalization support and check responsibilities";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        PROJECT_TOKEN: "internationalization",
+        FEATURE_SECRET: "responsibilities",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});

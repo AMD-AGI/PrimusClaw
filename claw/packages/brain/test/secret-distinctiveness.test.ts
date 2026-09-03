@@ -80,15 +80,19 @@ test("a value too short to carry entropy is never substituted", () => {
 
 // ── Boundaries ──────────────────────────────────────────────────────────────
 
-test("the lowercase-word exemption ends exactly where the docstring says", () => {
-  // A plain lowercase run is vocabulary below 16 characters and a token at or
-  // above it. Both sides are load-bearing and neither is obvious from the
-  // code, so the step is pinned rather than left to be rediscovered: moving it
-  // down leaks a generated lowercase token, moving it up excises a word.
-  assert.equal(isDistinctiveSecret("a".repeat(15)), false, "15 lowercase letters may be prose");
-  assert.equal(isDistinctiveSecret("a".repeat(16)), true, "16 is past what vocabulary reaches");
+test("past sixteen characters the run has to actually read as a word", () => {
+  // This test used to assert that sixteen letters is "past what vocabulary
+  // reaches", and that claim was simply false: `internationalization` is
+  // twenty and `characterization` is exactly sixteen. Length still admits
+  // anything shorter on faith, because everything that short collides with
+  // something, but above the line the run is now judged on shape.
+  assert.equal(isDistinctiveSecret("a".repeat(15)), false, "15 letters may be prose");
   assert.equal(isDistinctiveSecret("A".repeat(15)), false, "shouting does not add entropy");
-  assert.equal(isDistinctiveSecret("A".repeat(16)), true, "the step is the same on both cases");
+  // A sixteen-character run of one letter is not a word by any reading, and
+  // stays distinctive -- so the old assertions still hold, for a better
+  // reason than the one they were written with.
+  assert.equal(isDistinctiveSecret("a".repeat(16)), true, "one letter repeated is not a word");
+  assert.equal(isDistinctiveSecret("A".repeat(16)), true, "the shape is the same in either case");
   // Casing is not consulted at all. It was, once, on the premise that a
   // mid-word capital meant a generated token -- but `GitHub`, `macOS` and
   // `iPhone` all change case mid-word, and the premise cost more than it
@@ -169,5 +173,32 @@ test("a toolchain string is not distinctive however punctuated it is", () => {
   // version rule had to be narrower than the prose rule.
   for (const secret of ["abc-123", "vault/kv2/db-password", "prod/a9f3c2b1d4e5"]) {
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is still a secret`);
+  }
+});
+
+test("a long ordinary word is not a secret however it is named", () => {
+  // PROJECT_TOKEN=internationalization is collected by name, by design, and
+  // the shape gate is the only thing left. Getting this wrong turned "enable
+  // internationalization support" into "enable <redacted> support" -- the
+  // exact corruption this whole pass exists to avoid.
+  for (const word of [
+    "internationalization", "characterization", "responsibilities",
+    "institutionalization", "telecommunications", "indistinguishable",
+    "juxtapositioning", "Internationalization", "CHARACTERIZATION",
+  ]) {
+    assert.ok(!isDistinctiveSecret(word), `${JSON.stringify(word)} is a word`);
+  }
+});
+
+test("a long run of letters that is not a word is still a secret", () => {
+  // The other direction, and the reason the fix could not simply be "letters
+  // are always prose". None of these reads as English: no vowels to speak of,
+  // consonants stacked, or hex -- which is vowel-rich only by accident of its
+  // alphabet and is excluded before the vowel count is taken.
+  for (const secret of [
+    "XkjQmzPlVbNrTqWd", "zxjqvbnmwrtplkgf", "deadbeefcafebabe",
+    "abcdefabcdefabcd", "qwrtpsdfghjklzxc",
+  ]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is not a word`);
   }
 });
