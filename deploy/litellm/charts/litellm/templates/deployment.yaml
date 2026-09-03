@@ -54,11 +54,18 @@ spec:
           value: {{ .Values.safeApiUrl | quote }}
         {{- with .Values.providerApiKey }}
         {{- if .secretName }}
-        - name: {{ .envName | default "LITELLM_PROVIDER_API_KEY" }}
+        {{- /*
+        Quoted, all three. Unquoted, YAML resolves `true`/`false`/`null` and
+        bare digits to their scalar types, so a Secret genuinely named "true"
+        renders a boolean the API server rejects, and one named "null" or
+        "false" makes the `if` above falsy -- the env var silently disappears
+        and the proxy starts with no provider key rather than failing.
+        */}}
+        - name: {{ .envName | default "LITELLM_PROVIDER_API_KEY" | quote }}
           valueFrom:
             secretKeyRef:
-              name: {{ .secretName }}
-              key: {{ .secretKey | default "api_key" }}
+              name: {{ .secretName | quote }}
+              key: {{ .secretKey | default "api_key" | quote }}
         {{- end }}
         {{- end }}
         {{- with .Values.extraEnv }}

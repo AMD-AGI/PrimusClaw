@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "litellm chart values",
+  "type": "object",
+  "properties": {
+    "providerApiKey": {
+      "type": "object",
+      "description": "Secret holding the provider API key that a modelList entry references as api_key: os.environ/<envName>.",
+      "properties": {
+        "secretName": { "type": "string" },
+        "secretKey": { "type": "string", "minLength": 1 },
+        "envName": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+      },
+      "additionalProperties": false
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "masterKey": { "type": "string" },
+        "databaseUrl": { "type": "string" }
+      }
+    },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "litellmSettings": { "type": "object" },
+    "generalSettings": { "type": "object" }
+  }
+}
