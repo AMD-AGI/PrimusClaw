@@ -58,6 +58,7 @@ LITELLM_SAFE_API_URL="${LITELLM_SAFE_API_URL:-${SAFE_API_URL:-}}"
 LITELLM_DATABASE_URL="${LITELLM_DATABASE_URL:-}"
 LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
 LITELLM_VALUES_FILE="${LITELLM_VALUES_FILE:-}"
+LITELLM_EXISTING_SECRET="${LITELLM_EXISTING_SECRET:-}"
 LITELLM_INSTALL_INGRESS="${LITELLM_INSTALL_INGRESS:-true}"
 LITELLM_INGRESS_HOST="${LITELLM_INGRESS_HOST:-}"
 LITELLM_INGRESS_CLASS="${LITELLM_INGRESS_CLASS:-higress}"
@@ -90,6 +91,7 @@ Key env:
   LITELLM_NAME=litellm
   LITELLM_IMAGE=docker.io/primussafe/litellm:20260331111348
   LITELLM_VALUES_FILE=/path/private-values.yaml # optional modelList overrides
+  LITELLM_EXISTING_SECRET=litellm-credentials   # Secret with master_key/database_url
   LITELLM_INGRESS_HOST=<host>       # optional; enables ingress when set
   LITELLM_SERVER_ROOT_PATH=/llm-gateway
   LITELLM_SAFE_API_URL=https://safe.example.com
@@ -107,7 +109,8 @@ done
 MODELS_TMP_FILES=()
 # `return 0` because this runs as the EXIT trap and its status becomes the
 # script's. With no temp files the loop's last command is a false test, so a
-# successful `--dry-run` exited 1.
+# successful `--dry-run` exited 1 -- the check below could not tell that from a
+# real failure.
 cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; return 0; }
 trap cleanup_tmp EXIT
 GENERATED_MODELS_FILE=""
@@ -240,9 +243,26 @@ discover_pgo_database_url() {
   printf 'postgresql://%s:%s@%s:%s/%s' "$user" "$pass" "$host" "${port:-5432}" "${db:-$user}"
 }
 
+# Whether the chart will render its own Secret, given everything this run will
+# pass it. Asked by rendering rather than by reading LITELLM_EXISTING_SECRET,
+# because secrets.existingSecret can just as well be set in the values file.
+chart_uses_existing_secret() {
+  local rendered
+  local -a args=(
+    template "$LITELLM_RELEASE" "$CHART_DIR"
+    --namespace "$LITELLM_NAMESPACE"
+    --show-only templates/secret.yaml
+    --set-string "secrets.masterKey=probe"
+    --set-string "secrets.databaseUrl=postgresql://probe.invalid/litellm"
+  )
+  [ -n "$LITELLM_VALUES_FILE" ] && args+=(-f "$LITELLM_VALUES_FILE")
+  [ -n "$LITELLM_EXISTING_SECRET" ] && args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+  rendered="$(helm "${args[@]}")" || fail "could not resolve the chart's Secret configuration"
+  ! grep -q '^kind: Secret$' <<<"$rendered"
+}
+
 command -v kubectl >/dev/null || fail "kubectl not found"
 command -v helm >/dev/null || fail "helm not found"
-command -v openssl >/dev/null || fail "openssl not found"
 command -v python3 >/dev/null || fail "python3 not found"
 [[ -f "$CHART_DIR/Chart.yaml" ]] || fail "missing Helm chart: $CHART_DIR"
 
@@ -250,33 +270,41 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl cluster-info >/dev/null 2>&1 || fail "kubectl cannot reach cluster"
 fi
 
-if [ -z "$LITELLM_DATABASE_URL" ]; then
-  if [ "$DRY_RUN" = "true" ]; then
-    LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
-  else
-    # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
-    LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
-    if [ -n "$LITELLM_DATABASE_URL" ]; then
-      log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
-    elif [ -t 0 ]; then
-      read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
-      [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+USE_EXISTING_SECRET=false
+if chart_uses_existing_secret; then
+  USE_EXISTING_SECRET=true
+  log "using an existing Secret for database and master credentials"
+else
+  command -v openssl >/dev/null || fail "openssl not found"
+
+  if [ -z "$LITELLM_DATABASE_URL" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+      LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
     else
-      fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
+      LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
+      if [ -n "$LITELLM_DATABASE_URL" ]; then
+        log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
+      elif [ -t 0 ]; then
+        read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
+        [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+      else
+        fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      fi
     fi
   fi
-fi
 
-if [ -z "$LITELLM_MASTER_KEY" ]; then
-  if [ "$DRY_RUN" != "true" ]; then
-    LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
-      -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-  fi
   if [ -z "$LITELLM_MASTER_KEY" ]; then
-    LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
-    log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
-  else
-    log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    if [ "$DRY_RUN" != "true" ]; then
+      LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
+        -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
+    if [ -z "$LITELLM_MASTER_KEY" ]; then
+      LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
+      log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
+    else
+      log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    fi
   fi
 fi
 
@@ -314,9 +342,20 @@ helm_args=(
   --set "image.tag=$image_tag"
   --set "image.pullPolicy=$LITELLM_IMAGE_PULL_POLICY"
   --set "serverRootPath=$LITELLM_SERVER_ROOT_PATH"
-  --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
-  --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
 )
+[ -n "$LITELLM_EXISTING_SECRET" ] && helm_args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+if [ "$USE_EXISTING_SECRET" = "true" ]; then
+  # Explicitly blanked rather than simply not set: a values file may carry stale
+  # inline credentials, and anything passed here is what Helm stores -- in the
+  # release values and in every revision after it -- whether the chart renders a
+  # Secret from it or not.
+  helm_args+=(--set-string "secrets.masterKey=" --set-string "secrets.databaseUrl=")
+else
+  helm_args+=(
+    --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
+    --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
+  )
+fi
 [ -n "$LITELLM_SAFE_API_URL" ] && helm_args+=(--set "safeApiUrl=$LITELLM_SAFE_API_URL")
 [ -n "$LITELLM_VALUES_FILE" ] && helm_args+=(-f "$LITELLM_VALUES_FILE")
 if [ -n "$GENERATED_MODELS_FILE" ]; then
