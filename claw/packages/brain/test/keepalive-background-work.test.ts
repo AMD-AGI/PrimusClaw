@@ -394,3 +394,99 @@ test("the ping fan-out is bounded too, not just the probes", async () => {
   assert.ok(peak > 0, "nothing was pinged at all");
   assert.ok(peak <= 16, `${peak} pings were in flight at once`);
 });
+
+test("a probe still in the air when a task takes the sandbox back is discarded", async () => {
+  // The race the identity key does not cover: reuse hands the next task the
+  // *same* pod, so a probe that started before it lands on the very key the
+  // next sweep reads. Dropping the cached answer at registerSandbox does not
+  // help -- the promise writes when it lands, not when it started. Without a
+  // generation the stale `idle` sits there for the cache TTL, and a turn that
+  // left a background shell behind reads as one that left nothing.
+  const { kv } = fakeKv({ idleSince: Date.now() });
+  stubPingableProvider();
+  let release: (() => void) | null = null;
+  const inFlight = new Promise<void>((r) => { release = r; });
+
+  const deps = {
+    kv,
+    countActiveShells: async () => {
+      await inFlight;          // still probing while the task starts
+      return 0;                // the answer it would have written: "idle"
+    },
+  };
+
+  await runKeepaliveTickForTest(deps);        // starts the probe
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  release!();                                  // now it lands
+  await new Promise((r) => setImmediate(r));
+
+  // A fresh probe must be started rather than the stale answer being reused.
+  let asked = false;
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => { asked = true; return 1; },
+  });
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(asked, "the sweep answered from a probe that predates the task");
+});
+
+test("a target's record is renewed before it waits its turn to be pinged", async () => {
+  // Pings are bounded and take turns, and one can take its whole command
+  // timeout plus transport slack. On a large enough fleet the tail waits longer
+  // than the bucket's TTL, so a handle would expire before its ping arrived --
+  // and the sweep guard means no other sweep is coming to renew it.
+  const { kv, revision } = fakeKv({ keepalive: true });
+  const before = revision();
+  let revisionAtPing: number | null = null;
+  const provider = {
+    kind: "safe-workload",
+    async exec() {
+      revisionAtPing = revision();
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    async get() { return { running: true, healthy: true }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.notEqual(revisionAtPing, null, "nothing was pinged, so the ordering was never exercised");
+  assert.ok(
+    (revisionAtPing as unknown as number) > before,
+    "the record still had its old TTL while the ping was queued behind others",
+  );
+});
+
+test("probe slots rotate, so a slow head of the list does not starve the tail", async () => {
+  // The cap alone is not fair. Handing the slots to whichever candidates the KV
+  // walk yields first means a handful that always time out keep the quota to
+  // themselves, and everything behind them waits however many sweeps it takes
+  // for those to be given up on -- which is five, by which point the tail has
+  // been unpinged for as long again.
+  const kv = manyIdleHandles(20);
+  stubPingableProvider();
+  const asked = new Set<string>();
+
+  const deps = {
+    kv,
+    countActiveShells: async (_u: string, _t: string, owner: string) => {
+      asked.add(owner);
+      throw new Error("this one never answers");
+    },
+  };
+
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+  const afterFirst = asked.size;
+
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(afterFirst <= 8, `${afterFirst} probes went out in one sweep`);
+  assert.ok(
+    asked.size > afterFirst,
+    `the second sweep asked the same ${afterFirst} again instead of moving on`,
+  );
+});

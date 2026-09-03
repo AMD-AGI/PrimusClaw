@@ -341,11 +341,24 @@ const PING_MAX_IN_FLIGHT = 16;
 const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
 const bgUnknownStreak = new Map<string, number>();
 const bgProbeInFlight = new Set<string>();
+/**
+ * Bumped whenever something makes an in-flight answer obsolete.
+ *
+ * Dropping the cached answer is not enough on its own: a probe already in the
+ * air writes when it lands, and for a reused sandbox it lands on the very key
+ * the next sweep reads. So the probe carries the generation it started under
+ * and its result is discarded if that has moved -- which is what "a task took
+ * this sandbox back" looks like from inside a promise that started before it.
+ */
+const bgGeneration = new Map<string, number>();
+/** Where the last sweep stopped handing out probe slots. */
+let bgProbeCursor = 0;
 
 /** Drop bookkeeping for sessions this sweep no longer sees. */
 function forgetBackgroundWork(identity: string): void {
   bgProbeCache.delete(identity);
   bgUnknownStreak.delete(identity);
+  bgGeneration.set(identity, (bgGeneration.get(identity) ?? 0) + 1);
 }
 
 /**
@@ -357,6 +370,8 @@ export function resetBackgroundWorkStateForTest(): void {
   bgProbeCache.clear();
   bgUnknownStreak.clear();
   bgProbeInFlight.clear();
+  bgGeneration.clear();
+  bgProbeCursor = 0;
 }
 
 /**
@@ -411,48 +426,87 @@ function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWor
  * queueing when the limit is reached: the handle stays `unknown`, which keeps
  * and pings it, and the next tick continues down the list.
  */
-function refreshBackgroundWork(
-  deps: KeepaliveDeps,
-  identity: string,
-  sessionId: string,
-  info: HandsKvEntry,
-): void {
-  if (!info.handsUrl || !info.token) return;
+function needsProbe(identity: string, info: HandsKvEntry): boolean {
+  if (!info.handsUrl || !info.token) return false;
   const cached = bgProbeCache.get(identity);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return;
-  if (bgProbeInFlight.has(identity)) return;
-  if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) return;
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
+  return !bgProbeInFlight.has(identity);
+}
 
-  bgProbeInFlight.add(identity);
+/**
+ * Start up to BG_PROBE_MAX_IN_FLIGHT probes, resuming where the last sweep left
+ * off.
+ *
+ * Rotating matters as much as the cap. Handing the slots to whichever
+ * candidates the KV walk happened to yield first means a handful that always
+ * time out keep the quota to themselves, and everything behind them waits
+ * however many sweeps it takes for those to be given up on. The cursor makes
+ * the wait bounded and roughly fair instead.
+ *
+ * Fire-and-forget on purpose: awaiting a probe puts it in front of every ping
+ * in the fleet. The answer is for the next sweep, which is never more than one
+ * tick away, and until it arrives the handle reads `unknown` -- kept and pinged,
+ * the safe direction for a sweep whose job is to keep things alive.
+ */
+function dispatchProbes(
+  deps: KeepaliveDeps,
+  candidates: Array<{ identity: string; sessionId: string; info: HandsKvEntry }>,
+): void {
+  if (candidates.length === 0) return;
   const probe = deps.countActiveShells ?? countActiveShells;
-  void probe(info.handsUrl, info.token, sessionId)
-    .then((running) => {
-      const state: BackgroundWork = running > 0 ? "running" : "idle";
-      bgProbeCache.set(identity, { at: Date.now(), state });
-      bgUnknownStreak.delete(identity);
-      if (state === "running") {
-        logger.info(
-          { sessionId, workloadId: info.workloadId, running },
-          "keepalive.idle_handle_kept_background_work",
-        );
-      }
-    })
-    .catch((err) => {
-      const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
-      bgUnknownStreak.set(identity, streak);
-      logger.warn(
-        { err: (err as Error)?.message ?? err, sessionId, streak },
-        "keepalive.background_work_check_failed",
-      );
-      if (streak > BG_UNKNOWN_TOLERANCE) {
-        bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
+  const start = bgProbeCursor % candidates.length;
+
+  let started = 0;
+  for (let n = 0; n < candidates.length; n++) {
+    if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) break;
+    const { identity, sessionId, info } = candidates[(start + n) % candidates.length];
+    if (bgProbeInFlight.has(identity)) continue;
+
+    // The generation this answer will be about. Anything that invalidates the
+    // identity between here and the promise landing moves it, and the result is
+    // dropped rather than written over whatever replaced it.
+    const generation = bgGeneration.get(identity) ?? 0;
+    bgProbeInFlight.add(identity);
+    started += 1;
+
+    void probe(info.handsUrl!, info.token!, sessionId)
+      .then((running) => {
+        if ((bgGeneration.get(identity) ?? 0) !== generation) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_answer_stale",
+          );
+          return;
+        }
+        const state: BackgroundWork = running > 0 ? "running" : "idle";
+        bgProbeCache.set(identity, { at: Date.now(), state });
+        bgUnknownStreak.delete(identity);
+        if (state === "running") {
+          logger.info(
+            { sessionId, workloadId: info.workloadId, running },
+            "keepalive.idle_handle_kept_background_work",
+          );
+        }
+      })
+      .catch((err) => {
+        if ((bgGeneration.get(identity) ?? 0) !== generation) return;
+        const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
+        bgUnknownStreak.set(identity, streak);
         logger.warn(
-          { sessionId, workloadId: info.workloadId, streak },
-          "keepalive.background_work_unknown_giving_up",
+          { err: (err as Error)?.message ?? err, sessionId, streak },
+          "keepalive.background_work_check_failed",
         );
-      }
-    })
-    .finally(() => { bgProbeInFlight.delete(identity); });
+        if (streak > BG_UNKNOWN_TOLERANCE) {
+          bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
+          logger.warn(
+            { sessionId, workloadId: info.workloadId, streak },
+            "keepalive.background_work_unknown_giving_up",
+          );
+        }
+      })
+      .finally(() => { bgProbeInFlight.delete(identity); });
+  }
+  bgProbeCursor = start + started;
 }
 
 /**
@@ -513,6 +567,7 @@ async function collectTargets(
   seenIdentities: Set<string>,
 ): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
+  const probeCandidates: Array<{ identity: string; sessionId: string; info: HandsKvEntry }> = [];
 
   // 1. In-memory registry — always authoritative for this process.
   for (const [key, registered] of localRegistry) {
@@ -568,8 +623,8 @@ async function collectTargets(
         const bgWork = info.keepalive === false
           ? peekBackgroundWork(identity, info)
           : "idle";
-        if (info.keepalive === false) {
-          refreshBackgroundWork(deps, identity, sessionId, info);
+        if (info.keepalive === false && needsProbe(identity, info)) {
+          probeCandidates.push({ identity, sessionId, info });
         }
         if (info.keepalive === false && bgWork === "running") {
           await refreshIdleSince(deps, key, e.revision, info);
@@ -638,6 +693,16 @@ async function collectTargets(
           userId: info.userId,
         };
         if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry)) continue;
+
+        // Renew the record here rather than after the ping it is waiting for.
+        // Pings run bounded and in turn, and one can take its whole command
+        // timeout plus transport slack, so a large enough fleet leaves the tail
+        // of the queue waiting longer than the bucket's own TTL: the handle would
+        // expire before its ping ever arrived, and the sweep guard means no other
+        // sweep is coming to renew it. The revision is already in hand, so this
+        // costs a write and no read.
+        await deps.kv.update(key, e.value, e.revision).catch(() => {});
+
         const targetKey = sandboxRegistryKey(sessionId, entry);
         if (!targets.has(targetKey)) targets.set(targetKey, { sessionId, entry });
       } catch { /* malformed — skip */ }
@@ -645,6 +710,10 @@ async function collectTargets(
   } catch (err) {
     logger.warn({ err }, "keepalive.kv_scan_failed");
   }
+
+  // After the walk, not during it: the cap is global and the cursor rotates, so
+  // who gets a slot has to be decided once the candidates are all known.
+  dispatchProbes(deps, probeCandidates);
 
   return targets;
 }
