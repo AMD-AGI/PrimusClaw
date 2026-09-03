@@ -29,7 +29,21 @@ import type { ExecuteRequest } from "@claw/protocol";
 import { __test__ } from "../src/tasks/runner.js";
 import { redactPersistedEvent } from "../src/events/redaction.js";
 
-const { runtimeSecrets } = __test__;
+const { runtimeSecrets: collect } = __test__;
+
+/**
+ * Every value the run will hunt, both provenances together.
+ *
+ * runtimeSecrets() keeps the run's own credentials apart from the values it
+ * merely nominated out of an environment, because only the second kind is
+ * filtered by shape. Most assertions here are about whether a value was
+ * collected at all, which is the same question for both, so they read the
+ * flattened list; the tests that care which side a value landed on say so.
+ */
+function runtimeSecrets(...args: Parameters<typeof collect>): string[] {
+  const { certain, nominated } = collect(...args);
+  return [...certain, ...nominated];
+}
 
 /** A live token: credential-named, credential-shaped, long. */
 const HF_TOKEN = `hf_${"b".repeat(34)}`;
@@ -102,7 +116,7 @@ test("ordinary configuration survives a round trip through the redactor", () => 
   // actually sent.
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: TRANSCRIPT } } },
-    runtimeSecrets(request()),
+    collect(request()),
   );
   assert.equal(
     (evt.argumentsDetail as any).bash.command,
@@ -120,7 +134,7 @@ test("a real credential in the same payload is still masked", () => {
       argumentsDetail: { bash: { command: `${TRANSCRIPT} # HF_TOKEN=${HF_TOKEN}` } },
       full_output: `auth failed for ${LLM_KEY}`,
     },
-    runtimeSecrets(request()),
+    collect(request()),
   );
   const encoded = JSON.stringify(evt);
   assert.ok(!encoded.includes(HF_TOKEN), "a credential-named env value must not survive");
@@ -135,7 +149,7 @@ test("a short value cannot excise a word from prose even when its name says secr
   // to err towards redacting.
   const evt = redactPersistedEvent(
     { type: "toolUsed", description: "git remote add origin https://example.invalid/main.git" },
-    runtimeSecrets(request({ user_env: { FEATURE_TOKEN: "true", BRANCH_TOKEN: "main" } })),
+    collect(request({ user_env: { FEATURE_TOKEN: "true", BRANCH_TOKEN: "main" } })),
   );
   assert.equal(
     evt.description,
@@ -150,7 +164,7 @@ test("a whole environment block is still masked by key name", () => {
   const evt = redactPersistedEvent({
     type: "toolUsed",
     argumentsDetail: { bash: { command: "env", env: { MODEL_PATH: "/models/qwen3-8b" } } },
-  }, runtimeSecrets(request()));
+  }, collect(request()));
   assert.equal((evt.argumentsDetail as any).bash.env, "<redacted>");
 });
 
@@ -187,7 +201,7 @@ test("a URI carrying inline credentials loses the credentials and keeps the host
   const evt = redactPersistedEvent({
     type: "toolUsed",
     full_output: "connect mongodb://svc:s3cr3t@mongo.internal:27017/claw failed",
-  }, runtimeSecrets(request({ user_env: {} })));
+  }, collect(request({ user_env: {} })));
 
   const text = String(evt.full_output);
   assert.ok(!text.includes("s3cr3t"), "the inline password must not survive");
@@ -202,7 +216,7 @@ test("a plain endpoint URL is not mistaken for a credential-bearing one", () => 
   const ordinary = "curl https://api.example.invalid:8443/v1/models && ls pkgs/@scope/name";
   const evt = redactPersistedEvent(
     { type: "toolUsed", description: ordinary },
-    runtimeSecrets(request({ user_env: {} })),
+    collect(request({ user_env: {} })),
   );
   assert.equal(evt.description, ordinary, "no part of an ordinary URL may be rewritten");
 });
@@ -293,7 +307,7 @@ test("an ordinary word is never hunted whatever case it is written in", () => {
   const text = "checkout MAIN then Staging then main";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: { A_TOKEN: "MAIN", B_TOKEN: "Staging", C_TOKEN: "main" },
     })),
   ) as { argumentsDetail: { bash: { command: string } } };
@@ -308,7 +322,7 @@ test("an identifier or a timezone under a credential name survives free text", (
   const text = "call getUserById2 with TZ America/New_York then retry3";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         PROJECT_TOKEN: "getUserById2",
         TZ_SECRET: "America/New_York",
@@ -323,7 +337,7 @@ test("a real credential under the same names is still hunted", () => {
   // The other half: the gate above rejects shapes, not the name path itself.
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: "auth Tr0ub4dor&3x now" } } },
-    runtimeSecrets(request({ user_env: { PROJECT_TOKEN: "Tr0ub4dor&3x" } })),
+    collect(request({ user_env: { PROJECT_TOKEN: "Tr0ub4dor&3x" } })),
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command.includes("Tr0ub4dor"), false);
 });
@@ -335,7 +349,7 @@ test("a toolchain string under a credential name survives free text", () => {
   const text = "build with Python3.12RC1+NumPy2 then Node20.0.0-rc.1+OpenSSL3";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         TOOLCHAIN: "Python3.12RC1+NumPy2",
         RUNTIME_TOKEN: "Node20.0.0-rc.1+OpenSSL3",
@@ -351,7 +365,7 @@ test("a long ordinary word under a credential name survives free text", () => {
   const text = "enable internationalization support and check responsibilities";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         PROJECT_TOKEN: "internationalization",
         FEATURE_SECRET: "responsibilities",
@@ -367,7 +381,7 @@ test("a long compound word under a credential name survives free text", () => {
   const text = "preserve straightforwardly exactly and log misunderstandings";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         PROJECT_TOKEN: "straightforwardly",
         OTHER_SECRET: "misunderstandings",
@@ -384,7 +398,7 @@ test("a non-ASCII word under a credential name survives free text", () => {
   const text = "preserve naïveté and façade during développement, конфигурация";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         PROJECT_TOKEN: "naïveté",
         OTHER_SECRET: "façade",
@@ -404,7 +418,7 @@ test("the field itself is still masked whatever the value looks like", () => {
     { type: "toolUsed", argumentsDetail: { values: {
       PLATFORM_KEY: "naïveté", OTHER_SECRET: "конфигурация", PROJECT_TOKEN: "hunter2",
     } } },
-    runtimeSecrets(request({ user_env: { PLATFORM_KEY: "naïveté" } })),
+    collect(request({ user_env: { PLATFORM_KEY: "naïveté" } })),
   ) as { argumentsDetail: { values: Record<string, string> } };
   assert.deepEqual(evt.argumentsDetail.values, {
     PLATFORM_KEY: "<redacted>", OTHER_SECRET: "<redacted>", PROJECT_TOKEN: "<redacted>",
@@ -418,7 +432,7 @@ test("a year-stamped identifier under a credential name survives free text", () 
   const text = "call getUserById2024 then load snapshot20240115 and report2024";
   const evt = redactPersistedEvent(
     { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
-    runtimeSecrets(request({
+    collect(request({
       user_env: {
         PROJECT_TOKEN: "getUserById2024",
         OTHER_SECRET: "snapshot20240115",
@@ -443,4 +457,122 @@ test("vendor spellings of a password name are masked at their field", () => {
     PGPASSWORD: "<redacted>", MYSQL_PWD: "<redacted>", SSH_PASSPHRASE: "<redacted>",
     PG_HOST: "db.internal",
   });
+});
+
+// ── Provenance: what the run was handed vs. what it guessed ─────────────────
+//
+// The shape gate above exists because two of the three collection grounds are
+// guesses -- a name that reads like a credential, and a value that looks like
+// one. The run's OWN credentials are not guesses: they arrived as
+// `llm_api_key`, `platform_key`, `backend_internal_token`, fields that mean
+// exactly one thing. Judging those by shape only creates a way to be wrong
+// about a value nothing was ever uncertain about.
+
+test("the run's own credentials are hunted whatever they look like", () => {
+  // The counterexample that retired the shape gate for this side: a generated
+  // key is under no obligation to interleave its digits, and this one ends in
+  // a date. Under a single shared gate it reads as a year-stamped identifier
+  // and walks out of the run verbatim.
+  const key = "XkjQmzPlVbNrTqWd20240903";
+  const { certain, nominated } = collect(request({ llm_api_key: key, user_env: {} }));
+  assert.ok(certain.includes(key), "a handed-in credential is certain, not nominated");
+  assert.ok(!nominated.includes(key));
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `auth failed for ${key}` },
+    { certain, nominated },
+  );
+  assert.ok(
+    !String(evt.full_output).includes(key),
+    "and being certain, it is hunted without consulting its shape",
+  );
+});
+
+test("the same string merely nominated out of an environment is not", () => {
+  // The other direction, and the reason the split is the fix rather than
+  // dropping the gate: an identifier that happens to look like that key is
+  // still a guess, and still survives. Same bytes, different provenance.
+  const text = "load snapshot20240115 and call getUserById2024";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    collect(request({
+      user_env: { PROJECT_TOKEN: "getUserById2024", OTHER_SECRET: "snapshot20240115" },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("a certain secret too short or too plain to identify is still declined", () => {
+  // Certainty is about provenance, not about licence to cut any string out of
+  // a transcript. A run handed "true" as its key would otherwise delete that
+  // word from every command in the payload.
+  const text = "set flag true and retry";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", description: text },
+    { certain: ["true", "abc"], nominated: [] },
+  );
+  assert.equal(evt.description, text);
+});
+
+test("an exact secret is matched before the shape scan can eat half of it", () => {
+  // Ordering. A composite credential -- a vendor-prefixed token joined to a
+  // second half -- is matched by the shape pass on its prefix alone. If that
+  // pass runs first it replaces the prefix, the exact string no longer occurs,
+  // and the second half is stranded in the transcript in the clear.
+  const secondary = "Zq7Wm2Rt9Kd4Nb6H";
+  const composite = `ghp_${"a".repeat(36)}:${secondary}`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `login ${composite} ok` },
+    { certain: [composite], nominated: [] },
+  );
+  const text = String(evt.full_output);
+  assert.ok(!text.includes(secondary), "no part of the credential may be left behind");
+  assert.equal(text, "login <redacted> ok");
+});
+
+// ── PWD is a working directory ──────────────────────────────────────────────
+
+test("the working directory is not collected and not cut out of commands", () => {
+  // Round 14's repro, which this PR's own earlier round introduced: PWD is in
+  // essentially every container's environment. Treating it as a password by
+  // name collects an absolute path, and a collected path is substring-replaced
+  // out of every transcript string -- recreating the exact bug this file is
+  // about, from the other end.
+  const text = "cd /workspace/project && ls /workspace/project/src";
+  const secrets = runtimeSecrets(request({
+    user_env: { PWD: "/workspace/project", OLDPWD: "/workspace" },
+  }));
+  assert.ok(!secrets.includes("/workspace/project"), "PWD's value is not a credential");
+  assert.ok(!secrets.includes("/workspace"));
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    collect(request({ user_env: { PWD: "/workspace/project", OLDPWD: "/workspace" } })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("a path that is collected anyway is still not cut out of a command", () => {
+  // Belt to the braces: the name list is a heuristic and will be wrong again.
+  // A var that does read as a credential, holding a path, must still not
+  // excise that path -- the value gate answers this independently of which
+  // names happen to be on the list today.
+  const text = "cd /workspace/project && cat etc/config";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    collect(request({
+      user_env: { PROJECT_TOKEN: "/workspace/project", OTHER_SECRET: "etc/config" },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
+test("a real credential under a database password name is still hunted", () => {
+  // And the direction that keeps the PWD fix honest: qualified, it is a
+  // password again, and a password-shaped value under it does not survive.
+  const secrets = runtimeSecrets(request({
+    user_env: { MYSQL_PWD: "Tr0ub4dor&3x", DB_PWD: "P@ssw0rd!42" },
+  }));
+  assert.ok(secrets.includes("Tr0ub4dor&3x"));
+  assert.ok(secrets.includes("P@ssw0rd!42"));
 });

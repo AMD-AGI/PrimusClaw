@@ -37,7 +37,18 @@ record it.
   credentials) regardless of the field they sit in. The name rule knows the
   spellings a real config file uses, not just the word `password`:
   `PGPASSWORD`, `MYSQL_PWD` and `SSH_PASSPHRASE` are each masked at their
-  field.
+  field, while the standalone `PWD` — the shell's working directory, present
+  in every container — is not, so an absolute path is never cut out of a
+  command.
+
+  Credentials the run was **handed** (`llm_api_key`, `platform_key`,
+  `backend_internal_token`) are hunted without consulting their shape at all.
+  The shape rules exist to keep guesses from destroying ordinary text, and
+  nothing is being guessed about a field that means exactly one thing — a real
+  key ending in a date (`XkjQmzPlVbNrTqWd20240903`) is indistinguishable from
+  an ordinary `snapshot20240903`, and only provenance separates them. Exact
+  values are matched before the shape scan runs, so a composite credential
+  cannot lose its recognizable half and strand the rest in the clear.
 
   **Still open — among other shapes, two are knowingly not caught in free
   text.** A purely alphabetic secret at any length and in any script
@@ -66,7 +77,12 @@ record it.
   broken marker chain, no longer claims the provider reported cache fields it
   did not, and compares gaps against the TTL the deployment configured rather
   than a hardcoded five minutes. Its metric labels are now `over_ttl` /
-  `under_ttl`.
+  `under_ttl`. A SIGTERM arriving inside a turn's tool batch now persists that
+  turn's cache-use timestamp rather than the previous turn boundary's, so a
+  resumed run does not read a long-running tool call as an expired cache
+  entry. A run SIGTERMed during its **first** tool batch still writes no
+  checkpoint at all — that case resumes with no timestamp, which reads as
+  "no evidence", the detector's under-reporting default.
 
 ### Changed
 - `secret.yaml` gains `LLM_DEBUG_RESPONSE_HEADERS` (empty by default). It

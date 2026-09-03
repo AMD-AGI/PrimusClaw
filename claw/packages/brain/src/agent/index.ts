@@ -159,6 +159,9 @@ export interface ExecuteExtras {
   ) => Promise<HandsClient | RecreateHandsResult>;
   /** Called after each complete turn to persist execution state. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
+  /** Called when a turn uses the prefix cache, so a SIGTERM mid-tool-batch can
+   *  persist a fresher last_cache_use_at than the last turn boundary wrote. */
+  onCacheUse?: (at: number) => void;
   /** If present, resume from this checkpoint instead of starting fresh. */
   resumeCheckpoint?: CheckpointState;
   /**

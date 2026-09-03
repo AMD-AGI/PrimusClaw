@@ -115,7 +115,7 @@ test("vendor spellings of 'password' are sensitive", () => {
   // calls it a passphrase, and the Unix spelling drops the vowel.
   assertSensitive([
     "PGPASSWORD", "pgpassword", "pgPassword", "PGPASS",
-    "MYSQL_PWD", "mysql_pwd", "mysqlPwd", "pwd", "db_pwd", "pwd_hash",
+    "MYSQL_PWD", "mysql_pwd", "mysqlPwd", "db_pwd", "pwd_hash", "mysql_pwd_hash",
     "SSH_PASSPHRASE", "ssh_passphrase", "sshPassphrase", "key_passphrase",
     "passphrases", "PASSWD", "passwd", "user_passwd",
   ], true);
@@ -129,4 +129,18 @@ test("adding the vendor spellings did not widen anything else", () => {
     "cwd", "upwd", "pwdless", "passphraseless", "passwdless",
     "pg_host", "pg_database", "mysql_host", "ssh_host", "ssh_port",
   ], false);
+});
+
+test("the standalone PWD variable is the working directory, not a password", () => {
+  // PWD is in essentially every container's environment, and its value is a
+  // path. Calling it sensitive collects that path as a secret, and a collected
+  // secret is substring-replaced out of every transcript string the model is
+  // replayed -- so `cd /workspace/project` comes back as `cd <redacted>`.
+  // Losing a password costs a rotation; losing the working directory out of a
+  // transcript costs the agent the ability to read its own history.
+  assertSensitive(["PWD", "pwd", "OLDPWD", "oldpwd", "$PWD"], false);
+  // Qualified by anything at all, it is a password again.
+  assertSensitive([
+    "MYSQL_PWD", "DB_PWD", "mysql_pwd_hash", "pwd_hash", "app.pwd",
+  ], true);
 });

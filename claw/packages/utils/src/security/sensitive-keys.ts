@@ -30,13 +30,11 @@ const SENSITIVE_WORDS = new Set([
   // named the field `passwd`. Each is a password under another name and none
   // of them contains the word.
   //
-  // `pwd` is also the shell builtin that prints a directory, so it is worth
-  // saying why that is not a collision worth worrying about: this list matches
-  // the name of a field holding a value, and a field named `pwd` holds a
-  // password. A working directory travels under `cwd`, `dir` or `path`. The
-  // predicate errs towards masking in any case, and a wrongly masked directory
-  // is cosmetic where a leaked password is not.
-  "pwd",
+  // `pwd` is NOT here. It is in QUALIFIED_WORDS below: bare `PWD` is the shell
+  // working directory, which every container sets, and treating it as a
+  // credential collected `/workspace/project` as a secret and cut it out of
+  // every transcript that named a path. That is the bug this whole pass
+  // exists to prevent, caused by the pass itself.
   "passwd",
   "passphrase",
   "passphrases",
@@ -85,6 +83,26 @@ const SENSITIVE_WORDS = new Set([
   "dsn",
   "connectionstring",
 ]);
+
+/**
+ * Words that are a credential only when something qualifies them, because
+ * standing alone they name something else entirely.
+ *
+ * `pwd` is the case that forced this category to exist. `MYSQL_PWD`, `DB_PWD`
+ * and `mysql_pwd_hash` are passwords; bare `PWD` is the shell's working
+ * directory, set in every container that has ever run, and its value is an
+ * absolute path. Reading that as a credential does not merely mask a field --
+ * it puts the path on the substring-replacement list and deletes it from every
+ * line of the transcript that mentions it.
+ *
+ * The rule is "not the whole key" rather than a list of permitted qualifiers,
+ * so `DB_PWD` and a vendor prefix nobody has thought of yet are both covered
+ * without anyone maintaining a set of prefixes. What it gives up is a field
+ * named exactly `pwd` that really does hold a password; that value is still
+ * caught by shape if it has one, and the alternative was corrupting every
+ * transcript in the fleet.
+ */
+const QUALIFIED_WORDS = new Set(["pwd"]);
 
 /**
  * Adjacent word pairs that are sensitive together but harmless apart -- `key`
@@ -165,6 +183,8 @@ export function isSensitiveKey(key: string): boolean {
   if (ENV_KEYS.has(normalized)) return true;
   for (let i = 0; i < words.length; i += 1) {
     if (SENSITIVE_WORDS.has(words[i]!)) return true;
+    // Qualified only: sensitive as part of a name, never as the whole of one.
+    if (words.length > 1 && QUALIFIED_WORDS.has(words[i]!)) return true;
     if (i + 1 < words.length && SENSITIVE_PAIRS.has(`${words[i]} ${words[i + 1]}`)) return true;
   }
   return false;

@@ -61,7 +61,9 @@ import {
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
-import { redactCheckpointState, redactPersistedEvent } from "../events/redaction.js";
+import {
+  redactCheckpointState, redactPersistedEvent, type RuntimeSecrets,
+} from "../events/redaction.js";
 import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
 
@@ -101,20 +103,31 @@ const sc = StringCodec();
  * do not answer yes -- anything with a slash or a space is out before the test
  * begins.
  *
- * Both grounds feed one list, and everything on that list is filtered the same
- * way by isDistinctiveSecret at the point of use. Collection decides what is
- * worth looking at; distinctiveness decides what is safe to cut. Neither rule
- * gets its own exemption from the other.
+ * The two grounds are kept apart on the way out, because they are not equally
+ * true. The run's own keys were handed to it AS credentials and nothing about
+ * them is inferred; the env values were picked by a name rule or a shape rule,
+ * and both of those are guesses. Only the guesses are filtered by shape at the
+ * point of use -- applying a heuristic to a value already known to be a key
+ * only creates a way to be wrong about it, which is how
+ * `llm_api_key=XkjQmzPlVbNrTqWd20240903` came to be spared for looking like a
+ * dated identifier. Collection decides what is worth looking at;
+ * distinctiveness decides which of the guesses is safe to cut.
  */
-function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): string[] {
-  return [
-    request.platform_key,
-    resolvedPlatformKey,
-    request.llm_api_key,
-    request.backend_internal_token,
-    ...sensitiveEnvValues(request.user_env),
-    ...sensitiveEnvValues(request.session_env),
-  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): RuntimeSecrets {
+  const present = (values: (string | undefined)[]) =>
+    values.filter((value): value is string => typeof value === "string" && value.length > 0);
+  return {
+    certain: present([
+      request.platform_key,
+      resolvedPlatformKey,
+      request.llm_api_key,
+      request.backend_internal_token,
+    ]),
+    nominated: present([
+      ...sensitiveEnvValues(request.user_env),
+      ...sensitiveEnvValues(request.session_env),
+    ]),
+  };
 }
 
 /** Values of the env vars whose name -- or whose own shape -- reads as a credential. */
@@ -480,12 +493,36 @@ function classifyRetryableReason(err: unknown): string {
 }
 
 // Exported for unit tests; not used by production code paths.
+/**
+ * `state` with the freshest cache-use timestamp the run has seen.
+ *
+ * Kept apart from the checkpoint the agent loop hands over because the two
+ * know different things: the loop's state is what was true at the last turn
+ * BOUNDARY, and `fresh` is what was true inside the turn still running. A
+ * terminal path that persists the former alone reports a cache entry as older
+ * than it is by the length of that turn's tool batch.
+ *
+ * Returns the same object whenever there is nothing fresher to say, so the
+ * common path allocates nothing. Never moves the timestamp backwards: a
+ * resumed run's checkpoint carries a timestamp from a previous attempt, and
+ * that is evidence too.
+ */
+function freshenCacheUse(
+  state: CheckpointState, fresh: number | undefined,
+): CheckpointState {
+  if (fresh === undefined) return state;
+  const known = state.last_cache_use_at;
+  if (known !== undefined && known >= fresh) return state;
+  return { ...state, last_cache_use_at: fresh };
+}
+
 export const __test__ = {
   classifyTaskFailure,
   classifyRetryableReason,
   checkpointKey,
   checkpointS3Prefix,
   runtimeSecrets,
+  freshenCacheUse,
 };
 
 // ===== Post-task keepalive teardown =====
@@ -890,6 +927,32 @@ class TaskRunner {
     if (this.messageId) safeEvent.message_id = this.messageId;
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
     await this.emitter.emit(this.sessionId, safeEvent);
+  };
+
+  /**
+   * Freshest proof the run's prefix cache entry existed, ahead of the
+   * checkpoint that would record it.
+   *
+   * The agent loop learns a turn used the cache from that turn's response, and
+   * persists it at the NEXT turn boundary -- with the turn's whole tool batch
+   * in between. A SIGTERM landing in that window writes the previous turn's
+   * timestamp, so on resume the detector measures a gap that is too long by
+   * the length of the batch and calls a live entry expired.
+   *
+   * A field and not a write: the SIGTERM path is already about to persist a
+   * checkpoint, so the fix is to hand that write a fresher number, not to add
+   * a second one. The periodic cadence is untouched.
+   *
+   * Only ever moves forward, and only overlays when it is strictly fresher
+   * than what the checkpoint already carries -- a resumed run's checkpoint can
+   * hold a timestamp from before this attempt began.
+   */
+  private latestCacheUseAt: number | undefined;
+
+  private readonly onCacheUse = (at: number): void => {
+    if (this.latestCacheUseAt === undefined || at > this.latestCacheUseAt) {
+      this.latestCacheUseAt = at;
+    }
   };
 
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
@@ -1770,6 +1833,7 @@ class TaskRunner {
         result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.hands, {
           recreateHands: this.recreateHands,
           onCheckpoint: this.onCheckpoint,
+          onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
         });
@@ -2171,7 +2235,12 @@ class TaskRunner {
         new Promise<void>((r) => setTimeout(r, SIGTERM_PENDING_SYNC_WAIT_MS)),
       ]);
     }
-    const ckptState = this.latestCheckpointState;
+    // Overlay the freshest cache-use timestamp: the last turn boundary wrote
+    // whatever was true before this turn's tool batch, and this SIGTERM is
+    // landing inside that batch. See `latestCacheUseAt`.
+    const ckptState = this.latestCheckpointState
+      ? freshenCacheUse(this.latestCheckpointState, this.latestCacheUseAt)
+      : null;
     if (ckptState && ckptState.turns_completed > 0 && this.hands) {
       // ① Priority workspace_sync (§5.5.1) — independent semaphore so
       // rolling-restart SIGTERMs are never starved by routine syncs.

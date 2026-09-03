@@ -252,6 +252,24 @@ export interface LoopOptions {
   /** Called after each complete turn (tool results appended to messages).
    *  Caller persists state to NATS KV for cross-Brain resume. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
+  /**
+   * Called the moment a turn's response shows the prefix cache was used, with
+   * the timestamp that goes into `last_cache_use_at`.
+   *
+   * A checkpoint is written at a turn BOUNDARY, so between the response that
+   * updates this timestamp and the checkpoint that persists it lies the whole
+   * of that turn's tool batch -- which can be half an hour of one bash call.
+   * A SIGTERM in that window persists the PREVIOUS turn's timestamp, and the
+   * gap the detector computes on resume is overstated by the length of the
+   * batch, which biases the diagnosis towards "over_ttl" on exactly the runs
+   * where a tool call ran long.
+   *
+   * Synchronous, in-memory, no I/O: this is a notification, not a write, and
+   * deliberately does not touch the checkpoint cadence. It exists so the
+   * SIGTERM path can overlay a fresher timestamp on the state it is already
+   * about to persist. See the note on `latestCacheUseAt` in the runner.
+   */
+  onCacheUse?: (at: number) => void;
   /** Resume from a prior checkpoint. Skips turns 0..resumeFrom.turns_completed-1.
    *  Messages, usage, stats are pre-populated from checkpoint values. */
   resumeFrom?: CheckpointState;
@@ -1224,7 +1242,12 @@ class AgentLoopRunner {
     // because the write happened hours ago. And the gateway's clock starts
     // when it receives the prompt, so timing from the response charges this
     // turn's own generation time to the gap.
-    if (turnUsage.cache_create > 0 || turnUsage.cache_read > 0) this.lastCacheUseAt = turnStart;
+    if (turnUsage.cache_create > 0 || turnUsage.cache_read > 0) {
+      this.lastCacheUseAt = turnStart;
+      // Tell the caller now rather than at the next checkpoint: the tool batch
+      // that follows this line is exactly the window a SIGTERM would land in.
+      this.opts.onCacheUse?.(turnStart);
+    }
 
     metrics.onLlmTurnCache({
       inputTokens: turnUsage.input_tokens,

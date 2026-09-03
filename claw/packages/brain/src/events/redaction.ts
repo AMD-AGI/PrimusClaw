@@ -83,14 +83,22 @@ const ORDINARY_NUMBER_RE = /^[0-9]+([.,][0-9]+)?$/;
  * exists -- was spared. A boundary that spares the password and cuts the
  * timestamp is exactly backwards.
  *
- * Four digits do not raise the collision risk above the three already
- * accepted, because the shape this matches is a word and then nothing but
- * digits, and generated credentials do not have that shape: they interleave.
- * `x9k2m4p7`, `a1b2c3d4e5f6a7b8` and every vendor format keep their digits
- * mixed in with the letters and are still hunted. What is given up is the
- * free-text echo of a password that happens to end in a digit run, which is
- * the same thing already given up for `hunter2`, bounded the same way, and
- * still masked wherever the value sits in a field.
+ * The justification first written here was that generated credentials do not
+ * have this shape because they interleave their digits. That is not true, and
+ * review produced the counterexample: `llm_api_key=XkjQmzPlVbNrTqWd20240903`
+ * is a key that ends in a date, and it is indistinguishable by shape from
+ * `snapshot20240903`. No digit boundary separates them, at three or at four or
+ * anywhere else -- the two strings have the same shape because there is only
+ * one shape.
+ *
+ * What separates them is not shape but provenance, which is why the answer is
+ * `RuntimeSecrets` below rather than a different number here. A key handed to
+ * the run as `llm_api_key` is hunted without this rule ever being consulted; a
+ * value merely nominated out of an environment reaches this rule, and there
+ * the tie is broken towards leaving the transcript intact. What is given up is
+ * the free-text echo of a nominated value ending in digits -- the same thing
+ * already given up for `hunter2`, and still masked wherever the value sits in
+ * a field.
  */
 const WORD_WITH_TRAILING_DIGITS_RE = /^[\p{L}\p{M}]+[0-9]+$/u;
 /**
@@ -99,8 +107,16 @@ const WORD_WITH_TRAILING_DIGITS_RE = /^[\p{L}\p{M}]+[0-9]+$/u;
  * Slash-separated word segments are how a transcript writes paths, and a
  * credential does not look like this. Base64 is not caught by it: its segments
  * are not words.
+ *
+ * The leading slash is optional because it was not, and that was a hole. The
+ * pattern required the value to START with a letter, so `src/main` was spared
+ * and `/workspace/project` -- the same path, written the way a shell actually
+ * writes it -- was not. Absolute paths are the single most common thing in a
+ * transcript this pass must not touch, and they were the one form of path it
+ * could not see. The predicate below still requires a slash somewhere, so a
+ * bare word does not reach this rule and change meaning.
  */
-const WORD_PATH_RE = /^[\p{L}][\p{L}\p{M}_]*(\/[\p{L}][\p{L}\p{M}_]*)+$/u;
+const WORD_PATH_RE = /^\/?[\p{L}][\p{L}\p{M}_]*(?:\/[\p{L}][\p{L}\p{M}_]*)*$/u;
 const BOOLEANISH = new Set([
   "true", "false", "yes", "no", "on", "off", "none", "null", "nil",
   "enabled", "disabled", "auto", "default", "debug", "info", "warn", "error",
@@ -163,8 +179,10 @@ export function isDistinctiveSecret(secret: string): boolean {
   // credential, and the two are indistinguishable. See the note on the
   // constant for why this resolves towards leaving prose alone.
   if (WORD_WITH_TRAILING_DIGITS_RE.test(secret)) return false;
-  // `America/New_York`, `src/main`: a path written in words, at any length.
-  if (WORD_PATH_RE.test(secret)) return false;
+  // `America/New_York`, `src/main`, `/workspace/project`: a path written in
+  // words, at any length. The slash test is what keeps a bare word out of the
+  // pattern, which now tolerates a leading one.
+  if (secret.includes("/") && WORD_PATH_RE.test(secret)) return false;
   // `Node20.0.0-rc.1+OpenSSL3`, `Python3.12RC1+NumPy2`: a toolchain string is
   // long and punctuated enough to look distinctive by every measure above,
   // and cutting it takes the build out of every command that mentions it. A
@@ -173,22 +191,79 @@ export function isDistinctiveSecret(secret: string): boolean {
   return true;
 }
 
+/**
+ * The credentials a run holds, split by how much is actually known about them.
+ *
+ * This distinction is the whole reason isDistinctiveSecret has to guess. A
+ * value in `certain` was handed to the run AS a credential -- the platform
+ * key, the LLM API key, the internal token. There is no inference involved and
+ * nothing to be wrong about. A value in `nominated` was picked out of an
+ * environment because its NAME read like a credential or its VALUE looked like
+ * one, and both of those are guesses that have been wrong in every round of
+ * review this file has been through.
+ *
+ * Shape rules were being applied to both, which meant the only values the
+ * process is certain about were being second-guessed by heuristics built for
+ * the values it is not. `llm_api_key=XkjQmzPlVbNrTqWd20240903` is a real key
+ * that happens to end in a date, and no shape rule can tell it from
+ * `snapshot20240903` -- but nothing has to, because the run was told it is a
+ * key. Certainty answers what shape cannot.
+ */
+export interface RuntimeSecrets {
+  /** Handed to the run as credentials. Known, not inferred. */
+  readonly certain: readonly string[];
+  /** Picked out of an environment by name or by shape. Guesses. */
+  readonly nominated: readonly string[];
+}
+
+/** Either form: a bare list is all-nominated, which is what callers passed before. */
+export type RuntimeSecretsInput = readonly string[] | RuntimeSecrets;
+
+function asRuntimeSecrets(input: RuntimeSecretsInput): RuntimeSecrets {
+  return Array.isArray(input) ? { certain: [], nominated: input } : input as RuntimeSecrets;
+}
+
+/**
+ * The floor under a credential the run was handed.
+ *
+ * Certainty removes the shape question but not the collision one: a blind
+ * substring replace of a four-character value would still shred a transcript,
+ * and a credential that short does not exist. Eight is the same floor
+ * looksLikeCredentialValue uses to decide a value is worth considering at all,
+ * so the two passes agree on what is too small to be a secret. The booleanish
+ * guard stays for the degenerate case of an unset key defaulting to a word.
+ */
+function isHuntableCertainSecret(secret: string): boolean {
+  return secret.length >= 8 && !BOOLEANISH.has(secret.toLowerCase());
+}
+
+function redactString(text: string, secrets: RuntimeSecrets): string {
+  let out = text;
+  // Exact matches first, shape scan second. The shape pass rewrites what it
+  // recognizes, so running it first can consume PART of a known secret --
+  // `ghp_...:second-half` loses its vendor-shaped prefix to redactSecrets and
+  // then no longer contains the string the exact pass is looking for, leaving
+  // the other half in the clear. An exact match cannot make that mistake, and
+  // shape-scanning what is left over afterwards is still correct.
+  for (const secret of secrets.certain) {
+    if (isHuntableCertainSecret(secret)) out = out.split(secret).join("<redacted>");
+  }
+  for (const secret of secrets.nominated) {
+    if (isDistinctiveSecret(secret)) out = out.split(secret).join("<redacted>");
+  }
+  return redactSecrets(out).text;
+}
+
 function redactValue(
   value: unknown,
   seen: WeakSet<object>,
-  runtimeSecrets: readonly string[],
+  runtimeSecrets: RuntimeSecrets,
   key?: string,
 ): unknown {
   if (key && isSensitiveKey(key) && value !== null && value !== undefined && value !== "") {
     return "<redacted>";
   }
-  if (typeof value === "string") {
-    let text = redactSecrets(value).text;
-    for (const secret of runtimeSecrets) {
-      if (isDistinctiveSecret(secret)) text = text.split(secret).join("<redacted>");
-    }
-    return text;
-  }
+  if (typeof value === "string") return redactString(value, runtimeSecrets);
   if (Array.isArray(value)) {
     return value.map((item) => redactValue(item, seen, runtimeSecrets));
   }
@@ -246,9 +321,11 @@ function redactValue(
  */
 export function redactPersistedEvent(
   evt: Record<string, unknown>,
-  runtimeSecrets: readonly string[] = [],
+  runtimeSecrets: RuntimeSecretsInput = [],
 ): Record<string, unknown> {
-  return redactValue(evt, new WeakSet<object>(), runtimeSecrets) as Record<string, unknown>;
+  return redactValue(
+    evt, new WeakSet<object>(), asRuntimeSecrets(runtimeSecrets),
+  ) as Record<string, unknown>;
 }
 
 /** Backwards-compatible name retained for existing callers and tests. */
@@ -256,7 +333,7 @@ export const redactToolEvent = redactPersistedEvent;
 
 export function redactCheckpointState<T>(
   state: T,
-  runtimeSecrets: readonly string[] = [],
+  runtimeSecrets: RuntimeSecretsInput = [],
 ): T {
-  return redactValue(state, new WeakSet<object>(), runtimeSecrets) as T;
+  return redactValue(state, new WeakSet<object>(), asRuntimeSecrets(runtimeSecrets)) as T;
 }

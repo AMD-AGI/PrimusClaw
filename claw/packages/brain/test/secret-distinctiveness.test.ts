@@ -279,9 +279,11 @@ test("the trailing-digit exemption does not stop at three digits", () => {
   // a year-stamped identifier -- the single most ordinary thing in a
   // transcript -- was cut out of every line that mentioned it.
   //
-  // The shape being matched is a word and then nothing but digits. Generated
-  // credentials do not have that shape; they interleave, and the test below
-  // pins that they are still hunted.
+  // Round 14 revisited the reasoning, not the boundary: review produced
+  // `XkjQmzPlVbNrTqWd20240903`, a generated key that ends in a date, and it is
+  // the same shape as `snapshot20240903`. No digit count separates them. The
+  // shape rule stays where it is and the key is answered by provenance instead
+  // -- see the certain/nominated split, pinned in runtime-secrets-scope.
   for (const identifier of [
     "getUserById2024", "report2024", "snapshot20240115", "migration20231115",
     "batch1000", "run123456789", "année2024",
@@ -291,7 +293,7 @@ test("the trailing-digit exemption does not stop at three digits", () => {
       `${JSON.stringify(identifier)} is an identifier, not a credential`,
     );
   }
-  // The other direction, and the reason widening the digit run is safe: the
+  // The other direction, and what widening the digit run costs nothing: the
   // moment digits sit among the letters rather than after them, the value is
   // hunted again, at any length.
   for (const secret of [
@@ -300,4 +302,29 @@ test("the trailing-digit exemption does not stop at three digits", () => {
   ]) {
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
   }
+  // And the counterexample itself, pinned as NOT distinguishable by shape --
+  // so that a future patch claiming to have found the separating rule has to
+  // reckon with it here rather than rediscover it in a transcript.
+  assert.ok(!isDistinctiveSecret("XkjQmzPlVbNrTqWd20240903"));
+  assert.ok(!isDistinctiveSecret("snapshot20240903"));
+});
+
+test("an absolute path is a path, not a token", () => {
+  // Round 14. The rule required a value to START with a letter, so `src/main`
+  // was exempt and `/workspace/project` -- the same path as a shell writes it
+  // -- was not. Absolute paths are the most common thing in a transcript this
+  // pass must leave alone, and they were the one form it could not see.
+  for (const ordinary of [
+    "/workspace/project", "/workspace", "/usr/local/bin", "/models/qwen",
+    "/home/user/src/Main_Handler",
+  ]) {
+    assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is a path`);
+  }
+  // Unchanged in the other direction: a path is exempt because its segments
+  // are words, not because it begins with a slash.
+  for (const secret of ["/prod/a9f3c2b1d4e5", "/vault/kv2/db-password", "/tmp/x9k2m4p7"]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is not just words`);
+  }
+  // A bare word does not reach the path rule and did not change meaning.
+  assert.ok(!isDistinctiveSecret("workspace"));
 });
