@@ -65,24 +65,12 @@ provider_render="$tmp/provider-render.yaml"
 helm template release "$chart" --values "$values" \
   --set-string providerApiKey.secretName=release-provider-key \
   >"$provider_render"
-rg -q 'name: LITELLM_PROVIDER_API_KEY' "$provider_render"
-rg -q 'name: release-provider-key' "$provider_render"
+rg -q 'name: "LITELLM_PROVIDER_API_KEY"' "$provider_render"
+rg -q 'name: "release-provider-key"' "$provider_render"
 # the operator's own extraEnv entry survives alongside it
 rg -q 'name: RELEASE_TEST_TOKEN' "$provider_render"
-if rg -q 'name: LITELLM_PROVIDER_API_KEY' "$existing_render"; then
+if rg -q 'name: "LITELLM_PROVIDER_API_KEY"' "$existing_render"; then
   echo "provider key env rendered with no providerApiKey.secretName set" >&2
-  exit 1
-fi
-
-# The interactive discovery path writes an os.environ reference, not the key.
-if rg -q 'api_key: os.environ/' "$deploy_script"; then
-  :
-else
-  echo "deploy.sh no longer writes modelList api_key as an os.environ reference" >&2
-  exit 1
-fi
-if rg -q -- '--from-literal=.*pkey|"api_key": api_key' "$deploy_script"; then
-  echo "deploy.sh passes the provider key by argument or embeds it in modelList" >&2
   exit 1
 fi
 
@@ -226,5 +214,132 @@ if ! env "${mock_env[@]}" \
 fi
 rg -qx 'secrets.masterKey=release-inline-master' "$capture"
 rg -qx 'secrets.databaseUrl=postgresql://release:release@example.invalid/litellm' "$capture"
+
+
+# --- the provider discovery path, actually executed -------------------------
+# Grepping deploy.sh for `os.environ/` was not coverage: the only match was a
+# comment, so the assertion held no matter what the code did. The path is now
+# drivable without a TTY, so drive it and look at what it produced.
+prov_bin="$tmp/provbin"
+mkdir -p "$prov_bin"
+cp "$tmp/bin/helm" "$prov_bin/helm"
+cat >"$prov_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >"$CURL_CAPTURE"
+for a in "$@"; do
+  case "$a" in @*) cp "${a#@}" "$CURL_HEADER_COPY" ;; esac
+done
+echo '{"data":[{"id":"model-one"},{"id":"model-two"}]}'
+EOF
+cat >"$prov_bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >>"$KUBECTL_CAPTURE"
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"create namespace"*) echo "CALL:namespace" >>"$KUBECTL_ORDER"; echo "apiVersion: v1"; echo "kind: Namespace" ;;
+  *"create secret"*) echo "CALL:secret" >>"$KUBECTL_ORDER"; cat >"$SECRET_STDIN_COPY"; echo "kind: Secret" ;;
+  *apply*) cat >/dev/null ;;
+  *"exec deployment/litellm"*"import yaml"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$prov_bin/curl" "$prov_bin/kubectl"
+
+prov_values="$tmp/provider-values.json"
+: >"$tmp/kubectl.args"
+if ! env "PATH=$prov_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "CURL_CAPTURE=$tmp/curl.args" "CURL_HEADER_COPY=$tmp/curl.headers" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" "KUBECTL_ORDER=$tmp/kubectl.order" \
+  LITELLM_PROVIDER_TYPE=openai \
+  LITELLM_PROVIDER_URL=https://provider.invalid/v1 \
+  LITELLM_PROVIDER_API_KEY=release-provider-secret \
+  LITELLM_PROVIDER_VALUES_FILE="$prov_values" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+
+# The key reaches the cluster only through the Secret, on stdin.
+[[ "$(command cat "$tmp/secret.stdin")" == "release-provider-secret" ]]
+for f in "$capture" "$prov_values" "$tmp/curl.args" "$tmp/kubectl.args"; do
+  if rg -q 'release-provider-secret' "$f"; then
+    echo "provider key leaked into $(basename "$f")" >&2
+    exit 1
+  fi
+done
+# curl took it from a header file, and that file was not world-readable.
+rg -q '^@' "$tmp/curl.args"
+rg -q 'Authorization: Bearer release-provider-secret' "$tmp/curl.headers"
+
+# modelList references the env var; providerApiKey names the Secret.
+rg -q '"api_key": "os.environ/LITELLM_PROVIDER_API_KEY"' "$prov_values"
+rg -q '"model": "openai/model-one"' "$prov_values"
+rg -q '"envName": "LITELLM_PROVIDER_API_KEY"' "$prov_values"
+# Secret name is content-addressed, so a new key rolls the pods.
+prov_secret="$(rg -o 'litellm-provider-[0-9a-f]{10}' "$prov_values" | head -1)"
+[[ -n "$prov_secret" ]]
+# The namespace is ensured before the Secret is written into it.
+# Compared as an ordered list of calls, not line numbers: `[[ a -lt b ]]`
+# evaluates its operands arithmetically, so a non-numeric value there fails as
+# "unbound variable" rather than as the assertion it is.
+[[ "$(head -1 "$tmp/kubectl.order")" == "CALL:namespace" ]]
+rg -qx 'CALL:secret' "$tmp/kubectl.order"
+
+# --- what a later non-interactive upgrade keeps -----------------------------
+# Helm recomputes values from what the run passes, so an upgrade that does not
+# repeat the provider config would hand it an empty modelList and no
+# providerApiKey: the proxy comes back with no models and no key env var. The
+# wrapper carries them forward instead.
+carry_bin="$tmp/carrybin"
+mkdir -p "$carry_bin"
+cp "$prov_bin/kubectl" "$carry_bin/kubectl"
+cat >"$carry_bin/helm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then
+  echo '{"modelList":[{"model_name":"carried-model","litellm_params":{"model":"openai/carried-model","api_key":"os.environ/LITELLM_PROVIDER_API_KEY"}}],"providerApiKey":{"secretName":"litellm-provider-deadbeef00","secretKey":"api_key","envName":"LITELLM_PROVIDER_API_KEY"}}'
+  exit 0
+fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+# The wrapper deletes its temp values files on exit, so copy them while they
+# still exist -- this is the only moment their contents are observable.
+: >"$VALUES_COPY"
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "-f" && -e "$a" ]] && command cat "$a" >>"$VALUES_COPY"
+  prev="$a"
+done
+EOF
+chmod +x "$carry_bin/helm"
+
+: >"$tmp/kubectl.order"
+if ! env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "CURL_CAPTURE=$tmp/curl.args" "CURL_HEADER_COPY=$tmp/curl.headers" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+# awk rather than `rg -A1`: the capture is one argument per line, and this
+# keeps the assertion independent of which grep-alike is installed.
+# awk rather than `rg -A1`: the capture is one argument per line, and this
+# keeps the assertion independent of which grep-alike is installed.
+[[ -n "$(awk '/^-f$/{getline; print}' "$capture" | head -1)" ]] || {
+  echo "no values file was passed to carry the release's modelList forward" >&2
+  command cat "$capture" >&2
+  exit 1
+}
+rg -q 'carried-model' "$tmp/carried.values"
+rg -q 'litellm-provider-deadbeef00' "$tmp/carried.values"
 
 echo "LiteLLM deployment behavior: ok"
