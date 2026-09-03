@@ -144,3 +144,34 @@ test("the standalone PWD variable is the working directory, not a password", () 
     "MYSQL_PWD", "DB_PWD", "mysql_pwd_hash", "pwd_hash", "app.pwd",
   ], true);
 });
+
+test("a qualified credential name is sensitive in the plural too", () => {
+  // `API_KEYS` and `ACCESS_TOKENS` are as much a credential as their
+  // singulars, and both went straight through -- collection and response
+  // header rejection alike -- because the rule spelled the head out letter for
+  // letter and every plural had to be added by hand.
+  for (const key of [
+    "API_KEYS", "api_keys", "apiKeys", "x-api-keys",
+    "ACCESS_TOKENS", "access_tokens", "accessTokens",
+    "SSH_KEYS", "private_keys", "secret_keys", "signing_keys",
+    "refresh_tokens", "bearer_tokens", "auth_tokens", "session_tokens",
+  ]) {
+    assert.equal(isSensitiveKey(key), true, key);
+  }
+});
+
+test("the usage counters keep their names in the plural", () => {
+  // The reason `tokens` is not simply added to the word list. Every one of
+  // these is a number the UI renders, and masking them blanks what a user
+  // reads about their own run. `keys` is the same argument: most keys are map
+  // keys and sort keys.
+  for (const key of [
+    "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+    "max_tokens", "cached_tokens", "reasoning_tokens", "total_tokens",
+    "x-ratelimit-remaining-tokens",
+    "foreign_keys", "object_keys", "sort_keys", "partition_keys",
+    "tokens", "TOKENS", "keys", "KEYS",
+  ]) {
+    assert.equal(isSensitiveKey(key), false, key);
+  }
+});

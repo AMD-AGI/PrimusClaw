@@ -18,6 +18,11 @@
  * persist a checkpoint -- persists a fresher number in it. The periodic
  * checkpoint cadence is untouched.
  *
+ * The three ways the freshened value could still fail to reach KV -- a resumed
+ * run with no checkpoint of its own yet, a run that never opened a sandbox, and
+ * a compaction the runner was never told about -- are driven through the runner
+ * in sigterm-cache-use-lifecycle. This file is the overlay and the wiring.
+ *
  * Residual, accepted: a run SIGTERMed during its FIRST tool batch has
  * `turns_completed === 0` and the SIGTERM path writes no checkpoint at all, so
  * there is nothing to freshen. That run resumes with no timestamp, which reads
@@ -100,8 +105,11 @@ test("the notification is wired from the loop through to the SIGTERM path", () =
     "the runner must supply it",
   );
   assert.ok(
-    /freshenCacheUse\(this\.latestCheckpointState, this\.latestCacheUseAt\)/.test(RUNNER),
+    /sigtermCheckpointState\(\s*this\.latestCheckpointState, this\.pendingResumeCkpt, this\.latestCacheUseAt,?\s*\)/
+      .test(RUNNER),
     "and the SIGTERM checkpoint must be the freshened one -- a callback whose "
-      + "value never reaches a write is the same as no callback",
+      + "value never reaches a write is the same as no callback. What that "
+      + "write then contains is asserted end to end in "
+      + "sigterm-cache-use-lifecycle.",
   );
 });

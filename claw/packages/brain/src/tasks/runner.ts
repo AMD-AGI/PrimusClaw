@@ -27,7 +27,9 @@ import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { classifyResumeOutcome } from "./resume-outcome.js";
-import { sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue } from "@claw/utils";
+import {
+  sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
+} from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
   WORKSPACE_SYNC_INTERVAL_MS, WORKSPACE_SYNC_GRACE_MS,
@@ -130,11 +132,30 @@ function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): Runt
   };
 }
 
-/** Values of the env vars whose name -- or whose own shape -- reads as a credential. */
+/**
+ * Values of the env vars whose name -- or whose own shape -- reads as a
+ * credential, minus the ones whose name is the only thing that says so.
+ *
+ * The name rule is broad on purpose, and a credential-named variable holding a
+ * location rather than a credential is the ordinary case, not the exotic one:
+ * `TOKEN_ENDPOINT` is where a token is fetched from, `SSH_KEY_PATH` is where a
+ * key lives, and an OAuth client and an SSH config are supposed to name them
+ * exactly that way. Collected, each was blind-substring-replaced out of every
+ * transcript line that mentioned the endpoint or ran a command against the
+ * path -- and those transcripts are replayed to the model.
+ *
+ * The exemption applies ONLY to the name branch. A value that answers
+ * looksLikeCredentialValue was collected for what it is rather than for what
+ * it is called, and nothing about its name can talk it back out of the list.
+ */
 function sensitiveEnvValues(env: Record<string, string> | undefined): string[] {
   if (!env) return [];
   return Object.entries(env)
-    .filter(([name, value]) => isSensitiveKey(name) || looksLikeCredentialValue(value))
+    .filter(([name, value]) => {
+      if (looksLikeCredentialValue(value)) return true;
+      if (!isSensitiveKey(name)) return false;
+      return !isCredentialFreeLocator(value);
+    })
     .map(([, value]) => value);
 }
 
@@ -516,6 +537,36 @@ function freshenCacheUse(
   return { ...state, last_cache_use_at: fresh };
 }
 
+/**
+ * The state a SIGTERM should persist, or null if it has nothing to say.
+ *
+ * `attempt` is this attempt's own last checkpoint and `resume` is the one the
+ * run was resumed from. Persisting the attempt's is the ordinary case and the
+ * only one that used to exist -- which meant a run SIGTERMed during its FIRST
+ * new tool batch after a resume had no attempt checkpoint yet, so the fresh
+ * cache-use timestamp that batch produced was computed and then dropped. That
+ * is exactly the window the freshening was added for, missed in exactly the
+ * runs most likely to hit it: a run is resumed because it was interrupted
+ * once, and a rolling restart interrupts it again.
+ *
+ * The resume checkpoint is used only when there is something fresher to write
+ * onto it. Re-persisting it unchanged would republish a checkpoint this
+ * attempt did not produce for no gain, which is the reason the attempt's own
+ * state was the only source in the first place; returning null keeps that
+ * property. `freshenCacheUse` returning its argument by identity is what makes
+ * "nothing fresher" a test rather than a second comparison.
+ */
+function sigtermCheckpointState(
+  attempt: CheckpointState | null,
+  resume: CheckpointState | null,
+  fresh: number | undefined,
+): CheckpointState | null {
+  if (attempt) return freshenCacheUse(attempt, fresh);
+  if (!resume) return null;
+  const freshened = freshenCacheUse(resume, fresh);
+  return freshened === resume ? null : freshened;
+}
+
 export const __test__ = {
   classifyTaskFailure,
   classifyRetryableReason,
@@ -523,6 +574,7 @@ export const __test__ = {
   checkpointS3Prefix,
   runtimeSecrets,
   freshenCacheUse,
+  sigtermCheckpointState,
 };
 
 // ===== Post-task keepalive teardown =====
@@ -968,6 +1020,18 @@ class TaskRunner {
       runtimeSecrets(this.request, this.platformKey),
     );
     this.latestCheckpointState = safeState;
+    // The checkpoint is authoritative about cache use, so this assignment can
+    // move the timestamp BACKWARDS -- or clear it -- where `onCacheUse` only
+    // ever moves it forward. That asymmetry is the fix: compaction discards
+    // the cache entry and the agent loop clears its own timestamp to say so,
+    // but said it by omission, and the runner kept the pre-compaction value.
+    // A SIGTERM then freshened the checkpoint with a timestamp for an entry
+    // compaction had already destroyed, and the resumed run measured a gap
+    // against it and reported a cache loss that never happened -- the exact
+    // false positive the clear exists to prevent, reintroduced downstream of
+    // it. Within a turn `onCacheUse` is still the fresher of the two; at a
+    // turn boundary the loop's state is the one that knows.
+    this.latestCacheUseAt = safeState.last_cache_use_at;
     const written = await this.writeKvCheckpoint(
       safeState,
       this.lastSyncedTurn > 0
@@ -2238,16 +2302,24 @@ class TaskRunner {
     // Overlay the freshest cache-use timestamp: the last turn boundary wrote
     // whatever was true before this turn's tool batch, and this SIGTERM is
     // landing inside that batch. See `latestCacheUseAt`.
-    const ckptState = this.latestCheckpointState
-      ? freshenCacheUse(this.latestCheckpointState, this.latestCacheUseAt)
-      : null;
-    if (ckptState && ckptState.turns_completed > 0 && this.hands) {
+    const ckptState = sigtermCheckpointState(
+      this.latestCheckpointState, this.pendingResumeCkpt, this.latestCacheUseAt,
+    );
+    if (ckptState && ckptState.turns_completed > 0) {
       // ① Priority workspace_sync (§5.5.1) — independent semaphore so
       // rolling-restart SIGTERMs are never starved by routine syncs.
       // Falls back to a KV-only checkpoint if the sync fails or is
       // skipped (no hex user id, no hands client, sync throws).
       let syncedFlag = false;
-      if (WORKSPACE_PERSIST_BASE && this.userIdHex) {
+      // The workspace half is everything a sandbox is needed for; the KV write
+      // below is not. They used to share this branch's condition, so a run
+      // that never attached one -- network and backend MCP tools need no
+      // sandbox, and the client is attached lazily -- wrote no checkpoint at
+      // all on SIGTERM, however many turns it had completed. The conversation
+      // and its timestamp were lost for want of a workspace that did not
+      // exist. Without hands there is simply nothing to sync, and
+      // `sigtermSyncResult` stays "skipped", which is what it means.
+      if (this.hands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
         try {
           await workspaceSigtermSyncSemaphore.run(() =>
             fx().syncWorkspace(this.hands!, this.sessionId, this.userIdHex!, ckptState.turns_completed,
@@ -2272,10 +2344,11 @@ class TaskRunner {
       // started. Writing to the session prefix is what the terminal path
       // already does, and it is where resolveResumeState's fall-through reads
       // from, so the resumed run finds these files.
-      if (!syncedFlag) {
+      if (!syncedFlag && this.hands) {
+        const hands = this.hands;
         try {
           const r = await fx().syncWorkspaceToS3(
-            this.hands!, this.sessionId, this.userIdForSync,
+            hands, this.sessionId, this.userIdForSync,
           );
           if (!r.empty) {
             sigtermSyncResult = r.exhausted ? "timeout" : "success";
@@ -2311,6 +2384,7 @@ class TaskRunner {
     } else {
       logger.info({ sessionId: this.sessionId }, "task.sigterm.no_completed_turns_skip_checkpoint");
     }
+
     // INV-8 (checkpoint-architecture-redesign §5.3): announce the
     // interruption so api-side event-consumer flips agent_status to
     // 'interrupted'. wallclock_ms is used by the consumer's monotonic

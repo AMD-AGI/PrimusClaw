@@ -68,6 +68,25 @@ record it.
   ordinary string a heuristic had read as a key, so treat free text as
   unredacted. Do not put a secret in an env var the agent can print.
 
+- A credential-named variable holding a *location* is no longer treated as
+  holding a credential. `TOKEN_ENDPOINT=https://…/oauth/token` and
+  `SSH_KEY_PATH=/home/user/.ssh/id_ed25519` are what an OAuth client and an SSH
+  config are supposed to be called; collected for their names alone, both were
+  cut out of every transcript line that named the endpoint or ran a command
+  against the path. A URL carrying inline userinfo, a credential in a query
+  parameter, and any documented vendor shape anywhere in the value all keep the
+  value collected, and a value picked for its own shape is unaffected.
+
+- Overlapping exact secrets are now replaced longest first. Whatever is
+  replaced first rewrites the text the rest are searched in, so a platform key
+  that is a prefix of a token derived from it used to leave the derived token's
+  signed half in the clear.
+
+- `API_KEYS` and `ACCESS_TOKENS` are recognized as credentials. Only qualified
+  compounds are: bare `keys` and `tokens` stay non-sensitive, because
+  `input_tokens`, `max_tokens`, `foreign_keys` and their kin are counters and
+  map keys that the UI renders.
+
 - `LLM_DEBUG_RESPONSE_HEADERS` rejects credential-bearing header names and
   names that are not valid HTTP tokens, at boot rather than per request.
 
@@ -80,9 +99,16 @@ record it.
   `under_ttl`. A SIGTERM arriving inside a turn's tool batch now persists that
   turn's cache-use timestamp rather than the previous turn boundary's, so a
   resumed run does not read a long-running tool call as an expired cache
-  entry. A run SIGTERMed during its **first** tool batch still writes no
-  checkpoint at all — that case resumes with no timestamp, which reads as
-  "no evidence", the detector's under-reporting default.
+  entry. Three ways that timestamp still went wrong are closed with it: a
+  resumed run's first new tool batch had no checkpoint of its own to carry the
+  timestamp and dropped it, a run that never opened a sandbox wrote no SIGTERM
+  checkpoint at all because the KV write was gated on having one, and a
+  context compaction discarded the cache entry without the runner hearing about
+  it, so a SIGTERM wrote the pre-compaction timestamp back and the resumed run
+  reported a cache loss that had not happened. A run SIGTERMed during its
+  **first** tool batch still writes no checkpoint at all — that case resumes
+  with no timestamp, which reads as "no evidence", the detector's
+  under-reporting default.
 
 ### Changed
 - `secret.yaml` gains `LLM_DEBUG_RESPONSE_HEADERS` (empty by default). It

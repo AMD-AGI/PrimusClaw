@@ -237,6 +237,46 @@ function isHuntableCertainSecret(secret: string): boolean {
   return secret.length >= 8 && !BOOLEANISH.has(secret.toLowerCase());
 }
 
+/**
+ * Every secret worth hunting, deduped, longest first.
+ *
+ * The order is the point. Replacing one secret rewrites the text the next one
+ * is searched in, so a secret that is a PREFIX of another destroys the longer
+ * match if it goes first: a platform key `Xk9$mzPl2vQr7Tn4` replaced ahead of
+ * a `SERVICE_TOKEN` of `Xk9$mzPl2vQr7Tn4.sig9f3c2b1d4e5a` leaves
+ * `<redacted>.sig9f3c2b1d4e5a` -- the signed half of a live credential, in the
+ * clear, put there by the pass that exists to remove it. Longest first cannot
+ * make that mistake: the longer secret has already claimed its occurrences by
+ * the time the shorter one is looked for, and the shorter one still catches
+ * every place it appears on its own.
+ *
+ * Sorted rather than relied upon to arrive in a useful order, because the
+ * order it arrives in is the order two env blocks happened to be iterated in.
+ * Ties break on the string itself so the same set of secrets always produces
+ * the same output whichever way it was assembled.
+ *
+ * Which gate each candidate passes still depends on where it came from --
+ * certainty is a fact about provenance and survives being put in one list. A
+ * value named in both is treated as certain: the run was told it is a key, and
+ * a shape rule has nothing to add to that.
+ */
+function huntableSecrets(secrets: RuntimeSecrets): string[] {
+  const byOrigin = new Map<string, boolean>();
+  for (const secret of secrets.certain) {
+    if (!byOrigin.has(secret)) byOrigin.set(secret, true);
+  }
+  for (const secret of secrets.nominated) {
+    if (!byOrigin.has(secret)) byOrigin.set(secret, false);
+  }
+  const hunt: string[] = [];
+  for (const [secret, certain] of byOrigin) {
+    if (certain ? isHuntableCertainSecret(secret) : isDistinctiveSecret(secret)) {
+      hunt.push(secret);
+    }
+  }
+  return hunt.sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+}
+
 function redactString(text: string, secrets: RuntimeSecrets): string {
   let out = text;
   // Exact matches first, shape scan second. The shape pass rewrites what it
@@ -245,11 +285,12 @@ function redactString(text: string, secrets: RuntimeSecrets): string {
   // then no longer contains the string the exact pass is looking for, leaving
   // the other half in the clear. An exact match cannot make that mistake, and
   // shape-scanning what is left over afterwards is still correct.
-  for (const secret of secrets.certain) {
-    if (isHuntableCertainSecret(secret)) out = out.split(secret).join("<redacted>");
-  }
-  for (const secret of secrets.nominated) {
-    if (isDistinctiveSecret(secret)) out = out.split(secret).join("<redacted>");
+  //
+  // The two halves of that argument are the same one: whatever runs first
+  // rewrites what the rest can still find. It applies between the exact
+  // secrets as well, which is what the ordering in huntableSecrets is for.
+  for (const secret of huntableSecrets(secrets)) {
+    out = out.split(secret).join("<redacted>");
   }
   return redactSecrets(out).text;
 }

@@ -576,3 +576,138 @@ test("a real credential under a database password name is still hunted", () => {
   assert.ok(secrets.includes("Tr0ub4dor&3x"));
   assert.ok(secrets.includes("P@ssw0rd!42"));
 });
+
+// ── Overlapping secrets ─────────────────────────────────────────────────────
+
+test("a secret that is a prefix of another does not strand the longer one's tail", () => {
+  // Whatever is replaced first rewrites the text everything after it is
+  // searched in. The platform key is a prefix of a signed token derived from
+  // it, so replacing the key first left `<redacted>.sig...` -- the signed half
+  // of a live credential, put in the clear by the pass that exists to remove
+  // it. Both provenances are represented because certain values are replaced
+  // as a group, which used to guarantee this ordering rather than merely
+  // permit it.
+  const key = "Xk9$mzPl2vQr7Tn4";
+  const derived = `${key}.sig9f3c2b1d4e5a`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `auth ${derived} failed` },
+    { certain: [key], nominated: [derived] },
+  );
+  const text = String(evt.full_output);
+  assert.ok(!text.includes("sig9f3c2b1d4e5a"), "the tail of the longer secret must not survive");
+  assert.equal(text, "auth <redacted> failed");
+});
+
+test("the result does not depend on which order the secrets arrived in", () => {
+  // The order they arrive in is the order two env blocks happened to be
+  // iterated in, which is not a security property. Sorting is what makes it
+  // one.
+  const key = "Xk9$mzPl2vQr7Tn4";
+  const derived = `${key}.sig9f3c2b1d4e5a`;
+  const line = `auth ${derived} and bare ${key} failed`;
+  const forwards = redactPersistedEvent(
+    { type: "toolUsed", full_output: line }, { certain: [key], nominated: [derived] },
+  );
+  const backwards = redactPersistedEvent(
+    { type: "toolUsed", full_output: line }, { certain: [derived], nominated: [key] },
+  );
+  assert.equal(forwards.full_output, "auth <redacted> and bare <redacted> failed");
+  assert.equal(backwards.full_output, forwards.full_output);
+});
+
+test("the shorter secret is still hunted where it stands on its own", () => {
+  // Longest-first is an ordering, not a filter: every secret still gets every
+  // occurrence it actually has.
+  const key = "Xk9$mzPl2vQr7Tn4";
+  const derived = `${key}.sig9f3c2b1d4e5a`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `bare ${key} only` },
+    { certain: [key], nominated: [derived] },
+  );
+  assert.equal(evt.full_output, "bare <redacted> only");
+});
+
+test("a certain secret named twice is hunted on the certain terms", () => {
+  // The same string can be handed to the run and also read out of an
+  // environment. Deduplication must not demote it: a shape rule has nothing to
+  // add to a value the run was told is a key.
+  const dated = "XkjQmzPlVbNrTqWd20240903";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `key ${dated} rejected` },
+    { certain: [dated], nominated: [dated] },
+  );
+  assert.equal(evt.full_output, "key <redacted> rejected",
+    "certainty is a fact about provenance and survives being deduped");
+});
+
+// ── A credential-shaped NAME over an ordinary value ─────────────────────────
+
+test("an endpoint URL under a token name survives the transcript intact", () => {
+  // `TOKEN_ENDPOINT` is what an OAuth client is supposed to call the URL it
+  // fetches tokens from, and the URL is public. Collected for its name alone,
+  // it was cut out of every line that mentioned the endpoint.
+  const endpoint = "https://example.invalid/oauth/token";
+  const req = request({ user_env: { TOKEN_ENDPOINT: endpoint } });
+  assert.ok(!runtimeSecrets(req).includes(endpoint), "an endpoint is a location, not a secret");
+
+  const line = `curl ${endpoint} -d grant_type=client_credentials`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: line } } }, collect(req),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, line);
+});
+
+test("a key path under a key name survives the transcript intact", () => {
+  // `SSH_KEY_PATH` is where the key lives. The path is not the key, and a run
+  // that loses it from its own transcript resumes unable to name the file it
+  // was working with.
+  const path = "/home/user/.ssh/id_ed25519";
+  const req = request({ user_env: { SSH_KEY_PATH: path, API_KEY_FILE: "/etc/claw/api.key" } });
+  const secrets = runtimeSecrets(req);
+  assert.ok(!secrets.includes(path));
+  assert.ok(!secrets.includes("/etc/claw/api.key"));
+
+  const line = `ssh-keygen -y -f ${path} && ls -l /etc/claw/api.key`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: line } } }, collect(req),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, line);
+});
+
+test("a URL carrying its own credentials is still collected and still cut", () => {
+  // The direction that keeps the exemption honest. `database url` is in the
+  // sensitive-pair list precisely because a DSN carries userinfo inline, so
+  // the URL IS the credential and none of it may reach a transcript.
+  const dsn = "postgres://svc:Tr0ub4dor3@db.internal:5432/app";
+  const req = request({ user_env: { DATABASE_URL: dsn } });
+  assert.ok(runtimeSecrets(req).includes(dsn), "inline userinfo makes the URL the secret");
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", full_output: `connect ${dsn} refused` }, collect(req),
+  );
+  const text = String(evt.full_output);
+  assert.ok(!text.includes("Tr0ub4dor3"), "the password must not survive anywhere");
+});
+
+test("a token in a query string is still collected", () => {
+  // Same leak, spelled as a parameter rather than as userinfo.
+  const url = "https://example.invalid/v1/models?access_token=Xk9mzPl2vQr7TnA4";
+  const req = request({ user_env: { TOKEN_ENDPOINT: url } });
+  assert.ok(runtimeSecrets(req).includes(url), "the credential is in the query, so the URL is one");
+});
+
+test("a vendor-shaped key inside a path-looking value is still collected", () => {
+  // A documented key shape anywhere in the value means part of it is a key,
+  // whatever the rest of it reads as.
+  const value = `/opt/creds/sk-ant-${"a".repeat(40)}`;
+  const req = request({ user_env: { API_KEY_PATH: value } });
+  assert.ok(runtimeSecrets(req).includes(value));
+});
+
+test("a credential-shaped value keeps being collected whatever its name says", () => {
+  // The exemption is scoped to the name branch. A value collected for its own
+  // shape was never taking anyone's word for anything, and nothing about the
+  // name it sits under can talk it back out of the list.
+  const req = request({ user_env: { BUILD_CONFIG: "P@ssw0rd-9fX2q" } });
+  assert.ok(runtimeSecrets(req).includes("P@ssw0rd-9fX2q"));
+});

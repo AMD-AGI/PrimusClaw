@@ -132,6 +132,56 @@ const SENSITIVE_PAIRS = new Set([
 ]);
 
 /**
+ * Heads that are the same word in the plural, and the singular they normalize
+ * to before the pair rule below is consulted.
+ *
+ * Only the pair rule sees this. `keys` and `tokens` standing alone stay
+ * non-sensitive, which is not an oversight in either direction: bare `key` is
+ * already excluded because most keys are map keys and sort keys, and bare
+ * `tokens` is the usage counter every agent_done payload carries. What was
+ * missing is the qualified compound -- `API_KEYS` and `ACCESS_TOKENS` are as
+ * much a credential as their singulars, and both slipped through collection
+ * and header rejection alike because the singular was matched by a rule that
+ * spelled the head out letter for letter.
+ *
+ * A map rather than a suffix rule: stripping a trailing `s` would turn
+ * `address` into `addres` and `status` into `statu`, and would pluralize the
+ * exclusion list by accident. Two entries, both written down.
+ */
+const PLURAL_HEADS = new Map([["keys", "key"], ["tokens", "token"]]);
+
+/**
+ * Qualifiers that make a PLURALIZED head sensitive.
+ *
+ * The `key` half is exactly {@link SENSITIVE_PAIRS}, which already says which
+ * qualifiers turn a key into a credential; deriving it means a pair added
+ * there is covered in both numbers rather than in one.
+ *
+ * The `token` half has to be written out, because in the singular `token` is
+ * sensitive on its own and no pair was ever needed. The list is the qualifiers
+ * that actually name a credential, and it is deliberately NOT every word that
+ * can precede `tokens`: `input`, `output`, `prompt`, `completion`, `max`,
+ * `cached`, `reasoning`, `total` and `remaining` are all usage counters, they
+ * are all rendered by the UI, and masking them would blank the numbers a user
+ * reads. Those are pinned as negatives in the tests.
+ */
+const SENSITIVE_PLURAL_PAIRS = new Set([
+  ...[...SENSITIVE_PAIRS].filter((pair) => pair.endsWith(" key")),
+  "api token",
+  "access token",
+  "auth token",
+  "authorization token",
+  "bearer token",
+  "refresh token",
+  "session token",
+  "service token",
+  "secret token",
+  "private token",
+  "id token",
+  "identity token",
+]);
+
+/**
  * Whole keys that carry an entire environment block. Matched against the full
  * normalized key rather than word-by-word so that `env` stays narrow: an
  * `environment` field of prose, or an `env_count`, is not a credential dump.
@@ -185,7 +235,15 @@ export function isSensitiveKey(key: string): boolean {
     if (SENSITIVE_WORDS.has(words[i]!)) return true;
     // Qualified only: sensitive as part of a name, never as the whole of one.
     if (words.length > 1 && QUALIFIED_WORDS.has(words[i]!)) return true;
-    if (i + 1 < words.length && SENSITIVE_PAIRS.has(`${words[i]} ${words[i + 1]}`)) return true;
+    if (i + 1 < words.length) {
+      const next = words[i + 1]!;
+      if (SENSITIVE_PAIRS.has(`${words[i]} ${next}`)) return true;
+      // `API_KEYS`, `ACCESS_TOKENS`: the same compound in the plural. Only the
+      // head is normalized, and only to a singular this file lists, so a
+      // qualifier that means nothing here still means nothing pluralized.
+      const singular = PLURAL_HEADS.get(next);
+      if (singular && SENSITIVE_PLURAL_PAIRS.has(`${words[i]} ${singular}`)) return true;
+    }
   }
   return false;
 }

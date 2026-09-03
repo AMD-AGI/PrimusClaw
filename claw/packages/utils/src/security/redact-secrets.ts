@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { isSensitiveKey } from "./sensitive-keys.js";
+
 // Secret redaction utilities used across Brain / API before any out-bound
 // write. redactSecrets() overwrites secret-shaped literals with
 // "<redacted>"; scanForSecretLeak() is a non-mutating probe over the same
@@ -254,6 +256,98 @@ export function looksLikeCredentialValue(value: string): boolean {
   if (isProseOrVersion(value)) return false;
   if (!/[a-z]/.test(value) || !/[A-Z]/.test(value) || !/[0-9]/.test(value)) return false;
   return new Set(value).size >= 6;
+}
+
+/**
+ * A URI, split far enough to ask whether it carries a credential.
+ *
+ * Deliberately not `new URL()`: that accepts far more than this needs to
+ * admit, normalizes what it parses, and throws on the relative forms a config
+ * file is full of. The groups are scheme, authority, path, query.
+ */
+const URI_RE = /^([A-Za-z][A-Za-z0-9+.\-]*):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#.*)?$/;
+
+/** `/etc/hosts`, `./build`, `../shared`, `~/.ssh/config`. */
+const FS_PATH_RE = /^(?:~|\.{1,2})?\/[^\s]*$/;
+
+/**
+ * An unbroken alphanumeric run mixing all three cases of character.
+ *
+ * looksLikeCredentialValue requires a symbol, which is right for the value of
+ * a whole variable and wrong for one component of a path or a query: the
+ * separator that would have been the symbol is what split the component off in
+ * the first place. `/etc/creds/Xk9mzPl2vQr7TnA4` is a secret filed under a
+ * directory, and nothing but this rule sees it.
+ *
+ * Twelve characters and all three cases, because that is what an ordinary file
+ * name is not: `id_ed25519` and `qwen3-8b` have separators, `README` has no
+ * digits, `Qwen3-8B` is short. What it costs is the exemption for a path with
+ * a long unpunctuated CamelCase-plus-digits component -- such a path stays
+ * collected, which is the behaviour that was already there, and this is the
+ * side to be wrong on for a rule that decides what NOT to redact.
+ */
+const OPAQUE_TOKEN_RE =
+  /^(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{12,}$/;
+
+function carriesCredential(part: string): boolean {
+  return part.length > 0
+    && (looksLikeCredentialValue(part) || OPAQUE_TOKEN_RE.test(part));
+}
+
+function segmentCarriesCredential(path: string): boolean {
+  return path.split("/").some(carriesCredential);
+}
+
+/**
+ * Whether a value is a location rather than a credential: an endpoint URL or a
+ * filesystem path that carries no secret of its own.
+ *
+ * This exists because of what a credential-shaped NAME does to a harmless
+ * value. `TOKEN_ENDPOINT=https://example.invalid/oauth/token` and
+ * `SSH_KEY_PATH=/home/user/.ssh/id_ed25519` are both named exactly the way an
+ * OAuth client and an SSH config are supposed to name them, and neither value
+ * is a secret -- the endpoint is public and the path is where the key lives,
+ * not the key. The name pass collected both, and once collected a value is
+ * blind-substring-replaced across payloads REPLAYED TO THE MODEL, so every
+ * mention of the endpoint and every command naming that path lost the string
+ * out of the middle of it. Masking the field would have been free; deleting
+ * the path from the transcript is what the agent then resumes without.
+ *
+ * What is checked, and why each: userinfo in the authority
+ * (`postgres://user:pass@host/db`) means the URL IS the credential -- that is
+ * the case `database url` is in the pair list for, and it must keep being
+ * collected. A query parameter named like a credential, or holding a
+ * credential-shaped value, is the same leak with a different spelling. And any
+ * documented vendor shape anywhere in the string means part of it is a key
+ * however the rest reads, so the whole value stays a secret.
+ *
+ * The predicate answers only "is this worth hunting by substring". The field
+ * itself is still masked by name wherever it appears as a field, which is the
+ * pass that does not guess.
+ */
+export function isCredentialFreeLocator(value: string): boolean {
+  if (!value || /\s/.test(value)) return false;
+  // A vendor-shaped token anywhere in it: part of this string is a key.
+  if (redactSecrets(value).hits > 0) return false;
+  const uri = URI_RE.exec(value);
+  if (uri) {
+    const [, , authority = "", path = "", query] = uri;
+    // `user:pass@host` -- the URL carries its own credentials inline.
+    if (authority.includes("@")) return false;
+    if (query) {
+      for (const param of query.split("&")) {
+        if (!param) continue;
+        const eq = param.indexOf("=");
+        const name = eq === -1 ? param : param.slice(0, eq);
+        const paramValue = eq === -1 ? "" : param.slice(eq + 1);
+        if (isSensitiveKey(name)) return false;
+        if (carriesCredential(paramValue)) return false;
+      }
+    }
+    return !segmentCarriesCredential(path);
+  }
+  if (FS_PATH_RE.test(value)) return !segmentCarriesCredential(value);
+  return false;
 }
 
 export interface RedactResult {
