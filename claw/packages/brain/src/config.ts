@@ -329,9 +329,10 @@ export function goDurationNs(input: string): bigint | null {
 /**
  * A Go duration in whole seconds, for a backend that counts in seconds.
  *
- * Rounded up rather than down: sub-second is not a lifetime anyone means, but
- * truncating it to zero would be read by SaFE as "no timeout at all" -- the
- * exact opposite of a short one.
+ * Truncated, with a floor of one second. Truncation is right above the floor --
+ * 1.5s of lifetime is 1s, not 2 -- and the floor is there because truncating a
+ * sub-second value to zero would be read by SaFE as "no timeout at all", the
+ * exact opposite of the shortest possible one.
  */
 export function goDurationSeconds(ns: bigint): number {
   return Math.max(1, Number(ns / 1_000_000_000n));
@@ -403,6 +404,20 @@ export const AGENT_SANDBOX_MAX_SESSION_SECONDS: number | null = (() => {
     : null;
   return ns === null ? null : goDurationSeconds(ns);
 })();
+
+// A setting that quietly does nothing is worse than one that is refused, and
+// this one does nothing on the default deployment mode: SaFE's Workload has no
+// idle timeout to map it onto -- `timeout` runs whether or not anyone is using
+// the sandbox, and `ttlSecondsAfterFinished` is cleanup after it ends. Said at
+// startup so it is read once by the person who set it, rather than discovered
+// from a sandbox that was reclaimed on a schedule they thought they had changed.
+if (AGENT_SANDBOX_SESSION_TIMEOUT && CLAW_DEPLOY_MODE !== "kubernetes") {
+  settingProblems.push(
+    `AGENT_SANDBOX_SESSION_TIMEOUT=${AGENT_SANDBOX_SESSION_TIMEOUT} has no effect `
+      + `with CLAW_DEPLOY_MODE=${CLAW_DEPLOY_MODE}: safe-workload has no idle `
+      + `timeout. AGENT_SANDBOX_MAX_SESSION_DURATION does apply there`,
+  );
+}
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,

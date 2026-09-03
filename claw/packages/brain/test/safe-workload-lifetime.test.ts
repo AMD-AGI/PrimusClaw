@@ -39,13 +39,27 @@ test("no ceiling configured leaves the existing default alone", () => {
   );
 });
 
-test("an explicit run deadline wins over the ceiling", () => {
+test("an explicit run deadline is honoured, buffer and all", () => {
   assert.equal(
     workloadTimeoutSeconds(600, 48 * HOUR),
     600 + HOUR,
-    "a caller naming a deadline is describing this run, and is closer to the "
-      + "truth than a deployment-wide number",
+    "a caller naming a deadline is describing this run; the extra hour is the "
+      + "room the platform needs to stop it cleanly at that deadline",
   );
+});
+
+test("a deadline longer than the ceiling is clamped to it", () => {
+  // A maximum that any caller can walk past by naming a timeout is a default
+  // wearing a ceiling's name.
+  assert.equal(
+    workloadTimeoutSeconds(72 * HOUR, 48 * HOUR),
+    48 * HOUR,
+    "the deployment said 48h; the run does not get 73",
+  );
+});
+
+test("with no ceiling a deadline is not clamped", () => {
+  assert.equal(workloadTimeoutSeconds(72 * HOUR, null), 72 * HOUR + HOUR);
 });
 
 test("the ceiling does not get the shutdown buffer", () => {

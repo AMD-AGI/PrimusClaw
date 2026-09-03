@@ -42,31 +42,37 @@ const HANDS_MCP_PORT = "9100";
 const SHUTDOWN_BUFFER_SECONDS = 3600;
 
 /**
- * How long SaFE lets this workload live, in seconds.
+ * How long SaFE lets this workload run, in seconds.
  *
- * `timeout` is counted from dispatch, which makes it the same quantity
- * agent-sandbox calls `maxSessionDuration` -- so AGENT_SANDBOX_MAX_SESSION_DURATION
- * has to land here too, or the knob works on one backend and silently does
- * nothing on the other. Which is what it did: on a `safe` deployment, setting
- * 48h left every Sandbox with the 24h SANDBOX_DEFAULT_TIMEOUT_SECONDS put there,
- * because CLAW_DEPLOY_MODE picks the provider and only the other one was wired.
+ * Not the same clock as agent-sandbox. `maxSessionDuration` there becomes an
+ * absolute ShutdownTime from creation; SaFE measures `timeout` from
+ * `Status.StartTime` and explicitly does not count queue time. So this is a cap
+ * on running, not on existing, and a workload that sat in the queue for an hour
+ * gets that hour on top. Close enough in intent to carry the same setting --
+ * both answer "do not let this run forever" -- and not close enough to describe
+ * as the same guarantee.
  *
- * Order: an explicit run deadline, then the configured ceiling, then the
- * default. A caller that named a deadline is describing this run and is closer
- * to the truth than a deployment-wide number.
+ * The knob was reaching neither backend on a `safe` deployment, which is where
+ * this started: CLAW_DEPLOY_MODE picks the provider, "kubernetes" gets
+ * agent-sandbox and everything else including unset falls here, and only the
+ * other one was wired. Setting 48h left every Sandbox on the 24h that
+ * SANDBOX_DEFAULT_TIMEOUT_SECONDS put there, with no error and no warning.
  *
- * The buffer belongs to the deadline alone. `timeoutSec` is how long the task
- * may take and the extra hour is the room the platform needs to stop it cleanly
- * afterwards; a ceiling is already the final answer to "how long may this
- * exist", so adding to it would hand out more than was asked for.
+ * A ceiling caps, it does not merely default. An explicit run deadline is still
+ * honoured, and still gets the shutdown buffer -- that hour is the room the
+ * platform needs to stop a run cleanly at its deadline -- but the result is
+ * clamped: a caller asking for longer than the deployment allows gets the
+ * deployment's answer, which is what a maximum means. Without the clamp the
+ * setting was a default wearing a ceiling's name, and any caller naming a
+ * timeout walked straight past it.
  *
- * AGENT_SANDBOX_SESSION_TIMEOUT is deliberately absent. It is an *idle* timeout
- * -- reclaim once nothing has touched the sandbox for this long -- and SaFE's
- * Workload has no such concept: `timeout` runs whether or not anyone is using
- * it, and `ttlSecondsAfterFinished` is cleanup after the workload ends. Mapping
- * it onto either would make the setting look like it took effect while doing
- * something else, which is worse for an operator than it plainly not applying
- * to this backend.
+ * AGENT_SANDBOX_SESSION_TIMEOUT is deliberately absent, and startup says so
+ * rather than leaving it silently inert. It is an *idle* timeout -- reclaim once
+ * nothing has touched the sandbox for this long -- and SaFE's Workload has no
+ * such concept: `timeout` runs whether or not anyone is using it, and
+ * `ttlSecondsAfterFinished` is cleanup after the workload ends. Mapping it onto
+ * either would make the setting look like it took effect while doing something
+ * else.
  *
  * Takes the ceiling as an argument rather than reading the module constant, so
  * every branch is reachable in one process: the constant is resolved at import.
@@ -75,8 +81,9 @@ export function workloadTimeoutSeconds(
   timeoutSec: number | undefined,
   ceilingSec: number | null,
 ): number {
-  if (timeoutSec !== undefined) return timeoutSec + SHUTDOWN_BUFFER_SECONDS;
-  return ceilingSec ?? SANDBOX_DEFAULT_TIMEOUT_SECONDS;
+  if (timeoutSec === undefined) return ceilingSec ?? SANDBOX_DEFAULT_TIMEOUT_SECONDS;
+  const wanted = timeoutSec + SHUTDOWN_BUFFER_SECONDS;
+  return ceilingSec === null ? wanted : Math.min(wanted, ceilingSec);
 }
 
 export class SafeWorkloadProvider implements SandboxProvider {
