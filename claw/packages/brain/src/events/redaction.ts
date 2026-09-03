@@ -82,63 +82,36 @@ const BOOLEANISH = new Set([
  * third of them -- a `BRANCH_TOKEN=Staging` still cut "Staging" out of every
  * line that mentioned the environment.
  *
- * The obvious next step was to keep an exemption for internally-mixed casing,
- * on the theory that a generated token switches case mid-word (`XkjQmzPl`) and
- * vocabulary does not. That theory is false, and expensively so: `GitHub`,
- * `OpenAI`, `iPhone`, `macOS`, and every camelCase identifier a transcript is
- * full of switch case mid-word too. Under a name like `PROJECT_TOKEN` the
- * exemption's absence would have cut "GitHub" out of every sentence that used
- * it.
+ * Three rules were tried for telling a long word from a long token, and each
+ * was defeated by ordinary English within a round of review:
  *
- * So casing is not consulted at all. A run of nothing but letters, below the
- * length at which vocabulary runs out, is prose -- full stop. What is given up
- * is a generated all-alphabetic token of fewer than 16 characters, and it is
- * not given up to nothing: it stays masked by key name wherever it is a field,
- * which is the pass that does not need to guess. Only the blind substring hunt
- * declines it, and that hunt is the one whose mistakes cannot be undone.
+ *   - mixed-case means generated. `GitHub`, `macOS`, `iPhone`, and every
+ *     camelCase identifier a transcript is full of.
+ *   - sixteen letters is past what vocabulary reaches. `internationalization`
+ *     is twenty, `characterization` is exactly sixteen.
+ *   - a word is a third vowels and never stacks five consonants.
+ *     `straightforwardly`, `straightforwardness`, `misunderstandings` and
+ *     `strengthlessness` are none of those things and are all words.
+ *
+ * The fourth attempt is to stop. A run of nothing but letters is never hunted,
+ * at any length and in any casing, because every rule that separates the two
+ * has been wrong and the failures all land on the destructive side: the value
+ * being judged is blind-substring-replaced across payloads REPLAYED TO THE
+ * MODEL, so a wrong answer does not mask a secret, it deletes a word from a
+ * conversation the agent then resumes without.
+ *
+ * What is given up is real and is written down at {@link redactPersistedEvent}
+ * as a known limitation: an all-alphabetic secret is not hunted in free text.
+ * It is not given up to nothing. Such a value is still masked by key name
+ * wherever it sits in a field, which is the pass that does not guess, and a
+ * missed secret is bounded and fixed by rotating the credential. A hole in a
+ * replayed transcript is fixed by nothing.
+ *
+ * An earlier version of this note claimed a fitted false-positive rate for a
+ * shape heuristic. That number came from a corpus that was never checked in
+ * and could not be reproduced from this repository, which is its own argument
+ * against deciding anything this way.
  */
-const VOWELS = new Set(["a", "e", "i", "o", "u", "y"]);
-/** Five consonants in a row: no English word, most random letter runs. */
-const CONSONANT_PILEUP_RE = /[^aeiouy]{5,}/;
-/** `deadbeefcafebabe`: hex is vowel-rich by construction and is not a word. */
-const HEX_RUN_RE = /^[0-9a-fA-F]+$/;
-/** English `q` is followed by `u`. A token's `q` is followed by anything. */
-const BARE_Q_RE = /q(?!u)/;
-const RARE_LETTERS_RE = /[jqxz]/g;
-
-/**
- * Whether a long run of letters reads as an English word.
- *
- * Length alone used to decide this, on the reasoning that vocabulary runs out
- * around sixteen characters. It does not: `internationalization`,
- * `characterization` and `responsibilities` are all at or past that line, and
- * a `PROJECT_TOKEN` holding one of them cut the word out of every sentence in
- * the transcript that used it -- the exact corruption this pass exists to
- * avoid.
- *
- * What separates a word from a token is not length but shape. A word spends
- * roughly a third of itself on vowels, never stacks five consonants, spells
- * `q` with a `u` after it, and is sparing with `j`, `q`, `x` and `z`. Hex is
- * excluded first because it is vowel-rich by accident of its alphabet.
- *
- * Thresholds were fitted rather than guessed: against long English words and
- * generated tokens of the shapes that actually occur, these lose no real word
- * and admit about 3% of purely alphabetic random tokens. That asymmetry is
- * deliberate and matches the rest of this file -- an admitted token is still
- * masked by key name wherever it sits in a field, and only the blind
- * substring hunt declines it, while a lost word is gone from the transcript
- * for good.
- */
-function readsAsWord(value: string): boolean {
-  if (HEX_RUN_RE.test(value)) return false;
-  const lower = value.toLowerCase();
-  if (BARE_Q_RE.test(lower)) return false;
-  if ((lower.match(RARE_LETTERS_RE) ?? []).length > 2) return false;
-  if (CONSONANT_PILEUP_RE.test(lower)) return false;
-  const vowels = [...lower].filter((ch) => VOWELS.has(ch)).length;
-  return vowels / lower.length >= 0.3;
-}
-
 export function isDistinctiveSecret(secret: string): boolean {
   // Below this, a value cannot carry enough entropy to be worth the collision
   // risk no matter what it looks like.
@@ -146,21 +119,14 @@ export function isDistinctiveSecret(secret: string): boolean {
   const lower = secret.toLowerCase();
   if (BOOLEANISH.has(lower)) return false;
   if (ORDINARY_NUMBER_RE.test(secret)) return false;
-  // A run of letters written as a word is a word. Below sixteen characters
-  // that is taken on faith, because everything that short collides with
-  // something; above it the run has to actually read as one, which is what
-  // keeps `internationalization` in the transcript and `XkjQmzPlVbNrTqWd`
-  // out of it.
-  if (ORDINARY_WORD_RE.test(secret)) {
-    if (secret.length < 16 || readsAsWord(secret)) return false;
-  }
+  // Nothing but letters is never hunted, at any length. See the note above
+  // this function for why the shape of a letter run is not a question worth
+  // asking.
+  if (ORDINARY_WORD_RE.test(secret)) return false;
   // A word with digits on the end is an identifier far more often than it is a
   // credential, and the two are indistinguishable. See the note on the
   // constant for why this resolves towards leaving prose alone.
-  if (WORD_WITH_TRAILING_DIGITS_RE.test(secret)) {
-    const letters = secret.replace(/[0-9]+$/, "");
-    if (secret.length < 16 || readsAsWord(letters)) return false;
-  }
+  if (WORD_WITH_TRAILING_DIGITS_RE.test(secret)) return false;
   // `America/New_York`, `src/main`: a path written in words, at any length.
   if (WORD_PATH_RE.test(secret)) return false;
   // `Node20.0.0-rc.1+OpenSSL3`, `Python3.12RC1+NumPy2`: a toolchain string is
@@ -219,15 +185,20 @@ function redactValue(
  * not where it ends. Treat free text as unredacted and do not echo
  * credentials into it; that is the only guarantee available here.
  *
- *  1. A short, purely alphabetic secret (`DB_PASSWORD=XkjQmzPl`). The field is
- *     masked by the key-name pass, but `auth failed XkjQmzPl` written loose in
- *     a log line or tool output is not.
- *  2. A short secret that is a word with digits on the end (`hunter2`). Same:
- *     the field is masked, a free-text echo of it is not.
+ *  1. A purely alphabetic secret, at ANY length (`DB_PASSWORD=XkjQmzPl`, or a
+ *     32-character generated one). The field is masked by the key-name pass,
+ *     but `auth failed XkjQmzPl` written loose in a log line or tool output is
+ *     not.
+ *  2. A secret that is a word with digits on the end (`hunter2`). Same: the
+ *     field is masked, a free-text echo of it is not.
  *
  * Both survive free text because the only rules that would catch them also
  * catch ordinary prose -- `GitHub` and `macOS` for the first, `getUserById2`
- * and `retry3` for the second. This pass is a blind substring replace over
+ * and `retry3` for the second. The first limitation used to be qualified as
+ * "short", on the strength of a rule that judged longer runs by shape. Three
+ * such rules were tried and English broke all three (see the note on
+ * isDistinctiveSecret), so the qualifier is gone and the limitation is now
+ * simply the whole class. This pass is a blind substring replace over
  * payloads that are REPLAYED TO THE MODEL, so a false positive does not mask a
  * secret; it deletes text from a conversation, and the agent resumes without
  * it. A missed secret in free text is bounded and recoverable by rotating the

@@ -356,3 +356,20 @@ test("a long ordinary word under a credential name survives free text", () => {
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command, text);
 });
+
+test("a long compound word under a credential name survives free text", () => {
+  // Round 8's repro. These stack consonants (ghtf, rdl, ndst) and fall under
+  // a third vowels, which is what a shape heuristic read as "generated".
+  const text = "preserve straightforwardly exactly and log misunderstandings";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        PROJECT_TOKEN: "straightforwardly",
+        OTHER_SECRET: "misunderstandings",
+        THIRD_TOKEN: "straightforwardness",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});

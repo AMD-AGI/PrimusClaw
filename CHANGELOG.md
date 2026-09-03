@@ -37,18 +37,20 @@ record it.
   credentials) regardless of the field they sit in.
 
   **Still open — among other shapes, two are knowingly not caught in free
-  text.** A short, purely alphabetic secret (`XkjQmzPl`) and a word with
-  digits on the end (`hunter2`) are both masked wherever they sit in a field,
-  but an echo of either in free text — a log line, tool output — is left
-  alone. The only rules that would catch them also catch ordinary prose
-  (`GitHub`, `macOS`, `getUserById2`), and this pass is a blind substring
-  replace over payloads that are replayed to the model: a false positive does
-  not mask a secret, it deletes text from a conversation and the agent resumes
-  without it. A missed secret is bounded and fixed by rotating the credential;
-  a corrupted transcript is neither. These two are examples rather than an
-  inventory: each round of review found another ordinary string a heuristic
-  had read as a key, so treat free text as unredacted. Do not put a secret in
-  an env var the agent can print.
+  text.** A purely alphabetic secret at any length (`XkjQmzPl`) and a word
+  with digits on the end (`hunter2`) are both masked wherever they sit in a
+  field, but an echo of either in free text — a log line, tool output — is
+  left alone. The only rules that would catch them also catch ordinary prose:
+  three attempts to tell a long word from a long token by its shape were each
+  broken by ordinary English (`GitHub`, `internationalization`,
+  `straightforwardly`), so letters are no longer judged at all. This pass is a
+  blind substring replace over payloads that are replayed to the model: a
+  false positive does not mask a secret, it deletes text from a conversation
+  and the agent resumes without it. A missed secret is bounded and fixed by
+  rotating the credential; a corrupted transcript is neither. These are
+  examples rather than an inventory: each round of review found another
+  ordinary string a heuristic had read as a key, so treat free text as
+  unredacted. Do not put a secret in an env var the agent can print.
 
 - `LLM_DEBUG_RESPONSE_HEADERS` rejects credential-bearing header names and
   names that are not valid HTTP tokens, at boot rather than per request.

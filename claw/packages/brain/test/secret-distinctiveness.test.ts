@@ -19,6 +19,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { isDistinctiveSecret } from "../src/events/redaction.js";
 
 test("a short but distinctive credential is still hunted", () => {
@@ -35,7 +36,7 @@ test("a short but distinctive credential is still hunted", () => {
 test("long or structured values are hunted whatever they contain", () => {
   for (const secret of [
     `ghp_${"a".repeat(36)}`, "postgres://user:pw@host:5432/db",
-    "sk-ant-api03-xxxxxxxxxxxx", "abcdefghijklmnop",
+    "sk-ant-api03-xxxxxxxxxxxx", "aB3-dE6-fG9-hJ2",
   ]) {
     assert.ok(isDistinctiveSecret(secret));
   }
@@ -80,25 +81,21 @@ test("a value too short to carry entropy is never substituted", () => {
 
 // ── Boundaries ──────────────────────────────────────────────────────────────
 
-test("past sixteen characters the run has to actually read as a word", () => {
-  // This test used to assert that sixteen letters is "past what vocabulary
-  // reaches", and that claim was simply false: `internationalization` is
-  // twenty and `characterization` is exactly sixteen. Length still admits
-  // anything shorter on faith, because everything that short collides with
-  // something, but above the line the run is now judged on shape.
-  assert.equal(isDistinctiveSecret("a".repeat(15)), false, "15 letters may be prose");
-  assert.equal(isDistinctiveSecret("A".repeat(15)), false, "shouting does not add entropy");
-  // A sixteen-character run of one letter is not a word by any reading, and
-  // stays distinctive -- so the old assertions still hold, for a better
-  // reason than the one they were written with.
-  assert.equal(isDistinctiveSecret("a".repeat(16)), true, "one letter repeated is not a word");
-  assert.equal(isDistinctiveSecret("A".repeat(16)), true, "the shape is the same in either case");
-  // Casing is not consulted at all. It was, once, on the premise that a
-  // mid-word capital meant a generated token -- but `GitHub`, `macOS` and
-  // `iPhone` all change case mid-word, and the premise cost more than it
-  // bought. What earns the exemption now is being letters and nothing else;
-  // anything the number row or the punctuation keys touched is distinctive
-  // above the floor, whatever case it is written in.
+test("length is not the axis, and neither is the shape of the letters", () => {
+  // This test has been wrong twice, in the same direction both times. It once
+  // asserted that sixteen letters is "past what vocabulary reaches"
+  // (`internationalization` is twenty). It was then rewritten to assert that
+  // a letter run is judged on shape, and that was wrong too
+  // (`straightforwardly` stacks consonants and is still a word).
+  //
+  // Letters are now never hunted, at any length, in any casing. These four
+  // are the assertions the two failed rules disagreed about, and they all
+  // resolve the same way now.
+  for (const letters of ["a".repeat(15), "A".repeat(15), "a".repeat(16), "A".repeat(16)]) {
+    assert.equal(isDistinctiveSecret(letters), false, "letters are never hunted");
+  }
+  // What is still distinctive is anything that is not only letters. This is
+  // the line that carries the whole predicate now, so it is the one to pin.
   for (const short of ["ma1n", "ma-n", "m.in", "s3cr3t", "P@ssw0rd", "abc-123"]) {
     assert.ok(isDistinctiveSecret(short), `${JSON.stringify(short)} does not occur in prose`);
   }
@@ -185,20 +182,54 @@ test("a long ordinary word is not a secret however it is named", () => {
     "internationalization", "characterization", "responsibilities",
     "institutionalization", "telecommunications", "indistinguishable",
     "juxtapositioning", "Internationalization", "CHARACTERIZATION",
+    // Round 8: consonant clusters (ghtf, rdl, ndst) and a vowel ratio under
+    // a third. Every one of these is an ordinary English word.
+    "straightforwardly", "straightforwardness", "misunderstandings",
+    "strengthlessness", "twelfthstreets", "chrysanthemums",
   ]) {
     assert.ok(!isDistinctiveSecret(word), `${JSON.stringify(word)} is a word`);
   }
 });
 
-test("a long run of letters that is not a word is still a secret", () => {
-  // The other direction, and the reason the fix could not simply be "letters
-  // are always prose". None of these reads as English: no vowels to speak of,
-  // consonants stacked, or hex -- which is vowel-rich only by accident of its
-  // alphabet and is excluded before the vowel count is taken.
-  for (const secret of [
+test("a letter run that is obviously a token is still not hunted, on purpose", () => {
+  // These do read as generated, and under a credential name they are not
+  // substituted out of free text anyway. That is the accepted cost of giving
+  // up on letter-shape rules, and it is documented at redactPersistedEvent
+  // rather than left for a reader to discover here.
+  //
+  // The exposure is bounded: each is still masked by key name wherever it
+  // sits in a field, so what is missed is a free-text echo, and a missed
+  // secret is fixed by rotating it. A deleted word is fixed by nothing.
+  for (const token of [
     "XkjQmzPlVbNrTqWd", "zxjqvbnmwrtplkgf", "deadbeefcafebabe",
-    "abcdefabcdefabcd", "qwrtpsdfghjklzxc",
   ]) {
-    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is not a word`);
+    assert.ok(!isDistinctiveSecret(token), `${JSON.stringify(token)} is letters only`);
+  }
+  // The moment anything other than a letter appears, it is hunted again --
+  // which is what most generated credentials actually look like.
+  for (const token of ["Xk9$mzPl2vQ", "deadbeef-cafe-babe", "a1b2c3d4e5f6a7b8"]) {
+    assert.ok(isDistinctiveSecret(token), `${JSON.stringify(token)} is not letters only`);
+  }
+});
+
+test("no word in the checked-in corpus is ever hunted", () => {
+  // The corpus is the audit trail. Three shape heuristics were tried here and
+  // each was defeated by an ordinary word within a round of review; the words
+  // that broke them are checked in beside this test so the next person to
+  // propose a shape rule can run it against them first.
+  //
+  // Under the current rule -- letters are never hunted -- this passes
+  // trivially. That is the point: it stops being trivial the moment someone
+  // reintroduces a heuristic, and then it fails loudly instead of quietly
+  // deleting words from transcripts.
+  const corpus = readFileSync(
+    new URL("./fixtures/english-words.txt", import.meta.url), "utf8",
+  )
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  assert.ok(corpus.length >= 30, "corpus should not have been emptied");
+  for (const word of corpus) {
+    assert.ok(!isDistinctiveSecret(word), `${JSON.stringify(word)} is an ordinary word`);
   }
 });
