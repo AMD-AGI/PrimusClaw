@@ -153,3 +153,21 @@ test("a slash-joined pair of words is a path or a zone, not a token", () => {
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is not just words`);
   }
 });
+
+test("a toolchain string is not distinctive however punctuated it is", () => {
+  // These are long, mixed-case and full of symbols, so every length-and-
+  // entropy measure calls them distinctive. They are still build strings, and
+  // a var named RUNTIME_TOKEN holding one is ordinary.
+  for (const build of [
+    "Node20.0.0-rc.1+OpenSSL3", "Python3.12RC1+NumPy2", "Rust1.80.0-beta.1+LLVM18",
+    "x86_64+AVX2", "Python3.13t+NumPy2",
+  ]) {
+    assert.ok(!isDistinctiveSecret(build), `${JSON.stringify(build)} is a toolchain`);
+  }
+  // The exemption is for versions, not for anything with a word and a number
+  // in it. These stay huntable, and `abc-123` is the one that says why the
+  // version rule had to be narrower than the prose rule.
+  for (const secret of ["abc-123", "vault/kv2/db-password", "prod/a9f3c2b1d4e5"]) {
+    assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} is still a secret`);
+  }
+});

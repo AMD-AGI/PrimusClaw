@@ -5,6 +5,7 @@ export { sleep } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
 export {
   redactSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
+  looksLikeVersionString,
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";

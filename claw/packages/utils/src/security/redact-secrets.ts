@@ -186,12 +186,23 @@ const ACRONYM_SEGMENT_RE = /^[A-Z]{2,}[0-9]{0,3}$/;
  * the words without deciding anything -- the decision is left to the rule
  * that at least one segment must be a real word or acronym.
  *
- * A number may carry a release tag: `12rc1`, `13t`, `0b1`, `2post1`. This is
- * PEP 440 read loosely rather than parsed, which is all that is wanted here
- * -- the tag says "still a version", and getting the grammar exactly right
- * would buy nothing that the word-or-acronym rule is not already deciding.
+ * A number may carry a release tag: `12rc1`, `13t`, `0b1`, `2post1`. The tag
+ * is a fixed vocabulary rather than any short letter run, and it is matched
+ * without regard to case, because PEP 440 normalises `RC`, `Rc` and `rc` to
+ * the same thing and all three get typed. It may also stand on its own --
+ * SemVer spells the same release `20.0.0-rc.1`, where `rc` is a segment by
+ * itself, below the word floor and carrying no digits to make it a version.
+ *
+ * Naming the tags is what keeps the floor where round 4 put it. Admitting any
+ * two-letter segment here would let `aB12+cD34+eF56` back in; admitting `rc`
+ * by name does not, because a value still has to contain a real word or
+ * acronym somewhere before any of this filler counts for anything.
  */
-const VERSION_SEGMENT_RE = /^(?:[0-9]{1,4}(?:[a-z]{1,4}[0-9]{0,3})?|[A-Za-z]{1,4}[0-9]{1,3})$/;
+const RELEASE_TAG = "(?:alpha|beta|pre(?:view)?|post|rev|dev|rc|[abct]|r)";
+const VERSION_SEGMENT_RE = new RegExp(
+  `^(?:[0-9]{1,4}(?:${RELEASE_TAG}[0-9]{0,3})?|${RELEASE_TAG}|[A-Za-z]{1,4}[0-9]{1,3})$`,
+  "i",
+);
 
 /**
  * Whether every symbol-delimited piece reads as prose or as a version.
@@ -213,6 +224,27 @@ function isProseOrVersion(value: string): boolean {
   if (!segments.some(isWord)) return false;
   return segments.every((seg) => isWord(seg) || VERSION_SEGMENT_RE.test(seg));
 }
+/**
+ * Whether a value reads as a version or toolchain string.
+ *
+ * Narrower than the prose exemption above, and deliberately so: `abc-123` is
+ * a word beside a number and satisfies that one, but it is also exactly what
+ * a short credential looks like, and it is pinned as distinctive elsewhere.
+ * What a real version has that `abc-123` does not is digits welded onto a
+ * word -- `Node20`, `Python3`, `OpenSSL3`, `AVX2` -- or a release tag naming
+ * itself. Requiring one of those keeps the two apart.
+ *
+ * Exported because the brain filters runtime secrets through a second gate of
+ * its own, and a build string has to survive both. One definition here beats
+ * two that drift.
+ */
+export function looksLikeVersionString(value: string): boolean {
+  if (!isProseOrVersion(value)) return false;
+  const segments = value.split(/[^A-Za-z0-9]+/).filter((seg) => seg.length > 0);
+  const versioned = new RegExp(`^(?:[A-Za-z]{2,}[0-9]{1,3}|${RELEASE_TAG}[0-9]{0,3})$`, "i");
+  return segments.some((seg) => versioned.test(seg));
+}
+
 export function looksLikeCredentialValue(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
   if (!CREDENTIAL_CHARSET_RE.test(value)) return false;

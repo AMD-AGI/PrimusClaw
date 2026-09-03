@@ -323,3 +323,20 @@ test("a real credential under the same names is still hunted", () => {
   ) as { argumentsDetail: { bash: { command: string } } };
   assert.equal(evt.argumentsDetail.bash.command.includes("Tr0ub4dor"), false);
 });
+
+test("a toolchain string under a credential name survives free text", () => {
+  // TOOLCHAIN is named like a credential to the key pass, so the shape gate
+  // is the only thing between a build string and a hole in the transcript.
+  // Both spellings of the same release have to come back whole.
+  const text = "build with Python3.12RC1+NumPy2 then Node20.0.0-rc.1+OpenSSL3";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: {
+        TOOLCHAIN: "Python3.12RC1+NumPy2",
+        RUNTIME_TOKEN: "Node20.0.0-rc.1+OpenSSL3",
+      },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});

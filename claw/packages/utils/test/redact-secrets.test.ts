@@ -327,6 +327,14 @@ test("a toolchain or version string is not a credential", () => {
     // build. Read loosely as PEP 440 rather than parsed.
     "Python3.12rc1+NumPy2", "Python3.13t+NumPy2",
     "Django4.2post1+Celery5", "Ruby3.4dev0+Rails8",
+    // PEP 440 normalises the tag's case, so all of these get typed by hand
+    // and all of them mean the same release.
+    "Python3.12RC1+NumPy2", "Python3.13T+NumPy2", "Django4.2POST1+Celery5",
+    // SemVer spells the same prerelease with the tag as its own segment,
+    // which is neither long enough to be a word nor carrying the digits that
+    // would make it a version on its own.
+    "Node20.0.0-rc.1+OpenSSL3", "Node20.0.0-alpha.2+ICU74",
+    "Rust1.80.0-beta.1+LLVM18",
   ]) {
     assert.equal(
       looksLikeCredentialValue(build), false,

@@ -5,7 +5,7 @@
 // duplicated: both passes mask the same agent-loop events (here on the way into
 // NATS, there on the way out over SSE), and a sensitive name added to one copy
 // would have left the other leaking.
-import { isSensitiveKey, redactSecrets } from "@claw/utils";
+import { isSensitiveKey, looksLikeVersionString, redactSecrets } from "@claw/utils";
 
 /**
  * Whether a credential value is distinctive enough to hunt by substring.
@@ -114,6 +114,11 @@ export function isDistinctiveSecret(secret: string): boolean {
   if (secret.length < 16 && WORD_WITH_TRAILING_DIGITS_RE.test(secret)) return false;
   // `America/New_York`, `src/main`: a path written in words, at any length.
   if (WORD_PATH_RE.test(secret)) return false;
+  // `Node20.0.0-rc.1+OpenSSL3`, `Python3.12RC1+NumPy2`: a toolchain string is
+  // long and punctuated enough to look distinctive by every measure above,
+  // and cutting it takes the build out of every command that mentions it. A
+  // var named RUNTIME_TOKEN really does get set to one of these.
+  if (looksLikeVersionString(secret)) return false;
   return true;
 }
 
