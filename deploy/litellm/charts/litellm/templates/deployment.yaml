@@ -15,6 +15,17 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
+      annotations:
+        {{- /*
+        config.yaml is mounted with subPath, and a subPath mount is a copy taken
+        at start: kubelet never refreshes it when the ConfigMap changes. With no
+        annotation tied to that config either, a changed model list, api_base or
+        provider reached the ConfigMap and stopped there -- no rollout, and the
+        running Pods kept serving what they booted with, indefinitely. Hashing
+        the rendered ConfigMap makes any of those a pod-template change, which
+        is what makes Kubernetes replace the Pods.
+        */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         app: litellm
         app.kubernetes.io/instance: {{ .Release.Name }}
