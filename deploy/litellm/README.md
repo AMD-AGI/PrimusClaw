@@ -37,6 +37,8 @@ Environment surface:
 | `LITELLM_MASTER_KEY` | Generated on first install, then reused from the existing Secret |
 | `LITELLM_VALUES_FILE` | Private Helm values carrying `modelList` and provider credentials |
 | `LITELLM_EXISTING_SECRET` | Existing Secret containing `master_key` and `database_url`; prevents either value from entering Helm release values |
+| `LITELLM_PROVIDER_TYPE` / `_URL` / `_API_KEY` | Supply the provider instead of answering the prompt; all three together. The key is stored in a Secret and referenced as `os.environ/`, never written into values |
+| `LITELLM_PROVIDER_VALUES_FILE` | Where to keep the discovered `modelList`; without it the discovery lives only for that run |
 | `LITELLM_INGRESS_HOST` | Enables ingress for `/llm-gateway` when set |
 | `LITELLM_IMAGE` | Defaults to a pinned `docker.io/primussafe/litellm` timestamp tag |
 
@@ -48,6 +50,30 @@ LiteLLM sections. The `AMD_HYPERLOOM_APIM_KEY` and
 `AMD_HYPERLOOM_APIM_USER` environment variables only support shared-key user
 attribution; APIM authentication still comes from Virtual Key
 `metadata.apim_key` or model configuration.
+
+## Model discovery and later upgrades
+
+Discovery writes `modelList` and `providerApiKey`; the key goes into a Secret
+named from a hash of the key, so replacing the key changes the Secret name,
+which changes the pod template, which is what rolls the Pods. `config.yaml` is
+mounted with `subPath`, and a `subPath` mount is a copy made at start — kubelet
+never refreshes it — so the chart hashes the rendered ConfigMap into the pod
+template as well. Without that, a changed model list or `api_base` would reach
+the ConfigMap and stop there.
+
+Helm keeps nothing from the previous run, so an upgrade that does not repeat the
+provider config would hand it an empty `modelList`. The wrapper reads what the
+deployed release has and passes it again. Two cases it refuses rather than
+guesses:
+
+- **A literal `api_key` in the deployed values.** That is a release from before
+  the key moved into a Secret; carrying it forward would copy the plaintext into
+  the new revision. Re-run with `LITELLM_PROVIDER_TYPE`/`_URL`/`_API_KEY` to
+  rewrite `modelList` against a Secret, or supply a corrected
+  `LITELLM_VALUES_FILE`.
+- **A failed read.** An unreachable API server is not an empty release;
+  upgrading anyway would take the models away. Only `release: not found` is
+  treated as a first install.
 
 ## Credentials already in the release history
 

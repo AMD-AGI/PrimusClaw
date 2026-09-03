@@ -290,6 +290,20 @@ prov_secret="$(rg -o 'litellm-provider-[0-9a-f]{10}' "$prov_values" | head -1)"
 [[ "$(head -1 "$tmp/kubectl.order")" == "CALL:namespace" ]]
 rg -qx 'CALL:secret' "$tmp/kubectl.order"
 
+# config.yaml is mounted with subPath, which kubelet never refreshes, so the
+# only thing that can move a running Pod onto a new model list is a changed pod
+# template. Hash has to follow the ConfigMap.
+sum_a="$(helm template release "$chart" --values "$values" \
+  --set 'modelList[0].model_name=a' --set 'modelList[0].litellm_params.model=openai/a' \
+  | rg -o 'checksum/config: [0-9a-f]+' | head -1)"
+sum_b="$(helm template release "$chart" --values "$values" \
+  --set 'modelList[0].model_name=b' --set 'modelList[0].litellm_params.model=openai/b' \
+  | rg -o 'checksum/config: [0-9a-f]+' | head -1)"
+[[ -n "$sum_a" && "$sum_a" != "$sum_b" ]] || {
+  echo "the pod template does not follow the rendered config" >&2
+  exit 1
+}
+
 # --- what a later non-interactive upgrade keeps -----------------------------
 # Helm recomputes values from what the run passes, so an upgrade that does not
 # repeat the provider config would hand it an empty modelList and no
@@ -332,8 +346,6 @@ if ! env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" 
 fi
 # awk rather than `rg -A1`: the capture is one argument per line, and this
 # keeps the assertion independent of which grep-alike is installed.
-# awk rather than `rg -A1`: the capture is one argument per line, and this
-# keeps the assertion independent of which grep-alike is installed.
 [[ -n "$(awk '/^-f$/{getline; print}' "$capture" | head -1)" ]] || {
   echo "no values file was passed to carry the release's modelList forward" >&2
   command cat "$capture" >&2
@@ -341,5 +353,70 @@ fi
 }
 rg -q 'carried-model' "$tmp/carried.values"
 rg -q 'litellm-provider-deadbeef00' "$tmp/carried.values"
+
+# A release from before the key moved into a Secret has a literal api_key in
+# its values. Carrying that forward would write the plaintext into the new
+# revision, quietly undoing the fix, so it has to stop instead.
+cat >"$carry_bin/helm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then
+  echo '{"modelList":[{"model_name":"legacy","litellm_params":{"model":"openai/legacy","api_key":"sk-plaintext-legacy"}}]}'
+  exit 0
+fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+EOF
+chmod +x "$carry_bin/helm"
+if env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "carried a literal api_key forward instead of refusing" >&2
+  exit 1
+fi
+rg -q 'literal api_key' "$output"
+
+# A failed read is not an empty release. Continuing would hand Helm an empty
+# modelList and take the models away.
+cat >"$carry_bin/helm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then echo "Error: Kubernetes cluster unreachable" >&2; exit 1; fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+EOF
+chmod +x "$carry_bin/helm"
+if env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "upgraded with an empty modelList after failing to read the release" >&2
+  exit 1
+fi
+rg -q 'refusing to upgrade with an empty modelList' "$output"
+
+# "not found" is different: that is a first install, and it proceeds.
+cat >"$carry_bin/helm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then echo "Error: release: not found" >&2; exit 1; fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+EOF
+chmod +x "$carry_bin/helm"
+if ! env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
 
 echo "LiteLLM deployment behavior: ok"
