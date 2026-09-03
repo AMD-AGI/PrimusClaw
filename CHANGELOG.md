@@ -36,7 +36,11 @@ record it.
 
 ### Fixed
 - LiteLLM deployment now handles callback lists and existing Secrets without
-  copying database or master credentials into Helm release values.
+  copying database or master credentials into Helm release values. This applies
+  from the next revision onward; revisions written earlier still hold both in
+  plain text. See "Credentials already in the release history" in
+  `deploy/litellm/README.md` for removing them and for the rotation order that
+  does not strand model credentials encrypted with the old master key.
 
 <!--
 Template for the next release. Drop the sections that do not apply.

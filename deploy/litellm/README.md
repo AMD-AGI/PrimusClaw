@@ -49,6 +49,44 @@ LiteLLM sections. The `AMD_HYPERLOOM_APIM_KEY` and
 attribution; APIM authentication still comes from Virtual Key
 `metadata.apim_key` or model configuration.
 
+## Credentials already in the release history
+
+`secrets.existingSecret` keeps the master key and the database URL out of the
+values Helm stores **from the next revision onward**. It does not reach back:
+revisions written before it was set still carry both in plain text, and an
+upgrade does not rewrite them.
+
+Each revision is a Secret named `sh.helm.release.v1.<release>.v<N>` in the
+release namespace, so `helm get values <release> --revision N` — or plain read
+access to Secrets there — returns what that revision held. `helm history` lists
+which revisions exist.
+
+Deleting those Secrets removes the values, and with them the ability to roll
+back to those points. It does not undo the exposure: anyone who could read them
+already could. Treat both values as compromised and rotate.
+
+**Rotating the database URL.** Change the password on the database, update the
+Secret named by `secrets.existingSecret`, and redeploy. Nothing else derives
+from it.
+
+**Rotating the master key.** Do this in two steps, not one. The master key is
+the proxy's admin credential, and when `LITELLM_SALT_KEY` is unset it is *also*
+the key that encrypts model credentials stored in the database under
+`STORE_MODEL_IN_DB` — LiteLLM falls back to the master key when no salt key is
+configured. Changing it on such a deployment leaves every stored model
+credential undecryptable. So:
+
+1. Set `LITELLM_SALT_KEY` to the master key's **current** value (via `extraEnv`)
+   and redeploy. Nothing is re-encrypted and nothing changes behaviourally —
+   the value the code was already using is now pinned explicitly — but the
+   encryption key is no longer tied to the admin credential.
+2. Verify the proxy still answers and still resolves models from the database,
+   then rotate the master key on its own.
+
+Virtual keys already issued keep working across a master-key rotation: they are
+stored as a plain SHA-256 hash of the key itself, with the master key playing no
+part.
+
 ## Model routing is deployment-specific
 
 The chart ships **no model list**. Which providers and models a deployment
