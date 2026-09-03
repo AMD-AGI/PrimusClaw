@@ -239,7 +239,7 @@ printf '%s\n' "$@" >>"$KUBECTL_CAPTURE"
 case "$*" in
   *"config current-context"*) echo release-test ;;
   *"create namespace"*) echo "CALL:namespace" >>"$KUBECTL_ORDER"; echo "apiVersion: v1"; echo "kind: Namespace" ;;
-  *"create secret"*) echo "CALL:secret" >>"$KUBECTL_ORDER"; cat >"$SECRET_STDIN_COPY"; echo "kind: Secret" ;;
+  *"create secret"*) echo "CALL:secret" >>"$KUBECTL_ORDER"; cat >"$SECRET_STDIN_COPY"; echo '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"stub"}}' ;;
   *apply*) cat >/dev/null ;;
   *"exec deployment/litellm"*"import yaml"*) printf '%s\n' prometheus ;;
 esac
@@ -278,6 +278,10 @@ rg -q 'Authorization: Bearer release-provider-secret' "$tmp/curl.headers"
 
 # modelList references the env var; providerApiKey names the Secret.
 rg -q '"api_key": "os.environ/LITELLM_PROVIDER_API_KEY"' "$prov_values"
+# Credentials arrive by secretKeyRef, so rewriting the Secret leaves the
+# Deployment identical and the Pods keep the old ones. The wrapper hashes them
+# into a pod annotation to make the rotation a template change.
+rg -qx 'podAnnotations.checksum/credentials=[0-9a-f]{32}' "$capture"
 rg -q '"model": "openai/model-one"' "$prov_values"
 rg -q '"envName": "LITELLM_PROVIDER_API_KEY"' "$prov_values"
 # Secret name is content-addressed, so a new key rolls the pods.
@@ -418,5 +422,90 @@ if ! env "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" 
   command cat "$output" >&2
   exit 1
 fi
+
+# A corrected values file has to be able to get past the refusal -- that is the
+# migration the message tells the operator to perform. The check therefore runs
+# on what Helm merges, not on the carried copy alone.
+fixed_values="$tmp/fixed-values.yaml"
+cat >"$fixed_values" <<'EOF'
+modelList:
+  - model_name: fixed
+    litellm_params:
+      model: openai/fixed
+      api_key: os.environ/LITELLM_PROVIDER_API_KEY
+EOF
+cat >"$carry_bin/helm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then
+  echo '{"modelList":[{"model_name":"legacy","litellm_params":{"model":"openai/legacy","api_key":"sk-plaintext-legacy"}}]}'
+  exit 0
+fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+EOF
+chmod +x "$carry_bin/helm"
+carry_env=(
+  "PATH=$carry_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture"
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin"
+  "KUBECTL_ORDER=$tmp/kubectl.order" "VALUES_COPY=$tmp/carried.values"
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true
+)
+if ! env "${carry_env[@]}" LITELLM_VALUES_FILE="$fixed_values" \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "a corrected values file still could not get past the literal-key refusal" >&2
+  command cat "$output" >&2
+  exit 1
+fi
+# ...and without that file, the literal one is still refused.
+if env "${carry_env[@]}" bash "$deploy_script" >"$output" 2>&1; then
+  echo "deployed a modelList holding a provider key in plain text" >&2
+  exit 1
+fi
+rg -q 'literal api_key' "$output"
+
+# A read failure on the credentials Secret must not be read as "first install":
+# generating a new master key over a live one makes every model credential
+# encrypted with the old one undecryptable.
+cat >"$carry_bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "Error from server (Forbidden): secrets is forbidden" >&2; exit 1 ;;
+  *"exec deployment/litellm"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$carry_bin/kubectl"
+if env "${carry_env[@]}" LITELLM_VALUES_FILE="$fixed_values" LITELLM_MASTER_KEY= \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "generated a new master key after failing to read the existing Secret" >&2
+  exit 1
+fi
+rg -q 'refusing to generate a new master key' "$output"
+cp "$prov_bin/kubectl" "$carry_bin/kubectl"
+
+# The discovered-values file is only replaced once the response has parsed.
+kept="$tmp/kept-values.json"
+echo '{"modelList":[{"model_name":"previous"}]}' >"$kept"
+cat >"$prov_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+echo '{"data":{"not":"a list"}}'
+EOF
+if env "PATH=$prov_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "CURL_CAPTURE=$tmp/curl.args" "CURL_HEADER_COPY=$tmp/curl.headers" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" \
+  LITELLM_PROVIDER_TYPE=openai LITELLM_PROVIDER_URL=https://provider.invalid/v1 \
+  LITELLM_PROVIDER_API_KEY=release-provider-secret LITELLM_PROVIDER_VALUES_FILE="$kept" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "accepted a /models response whose data was not a list" >&2
+  exit 1
+fi
+rg -q 'previous' "$kept"
 
 echo "LiteLLM deployment behavior: ok"
