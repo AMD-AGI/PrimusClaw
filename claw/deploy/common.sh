@@ -105,6 +105,8 @@ S3_SECRET_KEY="${S3_SECRET_KEY:-dry-run-secret}"
 USER_ENV_ENCRYPTION_KEY="${USER_ENV_ENCRYPTION_KEY:-01234567890123456789012345678901}"
 CLAW_DEPLOY_ROOT="${CLAW_DEPLOY_ROOT:-}"
 BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
+AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
+AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   log "dry-run: using ephemeral placeholder values"
@@ -153,6 +155,15 @@ USER_ENV_ENCRYPTION_KEY="${_BOOT_USER_ENV_KEY}"
 
 CLAW_DEPLOY_ROOT="${CLAW_DEPLOY_ROOT:-}"
 BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
+
+# Sandbox lifetime, as Go durations ("6h", "48h"). Empty means "whatever the
+# chart and the sandbox template already say", which is what an install that
+# sets neither gets. They live here rather than only in the shell because
+# upgrade.sh re-renders the Brain Deployment from this file alone -- a value
+# passed once on the deploy command line and not written down is a value the
+# next upgrade silently reverts.
+AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
+AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -169,6 +180,8 @@ _SHELL_S3_ENDPOINT="${S3_ENDPOINT:-}"
 _SHELL_S3_API_ENDPOINT="${S3_API_ENDPOINT:-}"
 _SHELL_S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
 _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
+_SHELL_AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
+_SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
 
 set -a
 # shellcheck disable=SC1090
@@ -182,8 +195,37 @@ set +a
 [ -z "${S3_API_ENDPOINT:-}" ]     && S3_API_ENDPOINT="$_SHELL_S3_API_ENDPOINT"
 [ -z "${S3_ACCESS_KEY:-}" ]       && S3_ACCESS_KEY="$_SHELL_S3_ACCESS_KEY"
 [ -z "${S3_SECRET_KEY:-}" ]       && S3_SECRET_KEY="$_SHELL_S3_SECRET_KEY"
+[ -z "${AGENT_SANDBOX_SESSION_TIMEOUT:-}" ]      && AGENT_SANDBOX_SESSION_TIMEOUT="$_SHELL_AGENT_SANDBOX_SESSION_TIMEOUT"
+[ -z "${AGENT_SANDBOX_MAX_SESSION_DURATION:-}" ] && AGENT_SANDBOX_MAX_SESSION_DURATION="$_SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION"
+
+# Write the shell's choice back, so the run that turns a knob on is the only
+# run that has to name it. This mirrors the override policy just above: the
+# shell only reaches here when the file had nothing to say, so persisting it
+# never overwrites an operator-pinned value -- it fills in the blank the shell
+# just answered. Two shapes of blank exist: a file written before these knobs
+# existed has no line at all, and a file written by an install that set neither
+# has the key with an empty value.
+#
+# Not during a dry-run: a preview that edits the values file is a side effect,
+# and scripts/release-tests/dry-run-no-side-effects.sh says so.
+if [ "${DRY_RUN:-false}" != "true" ]; then
+  for _lifetime_key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION; do
+    eval "_lifetime_val=\${$_lifetime_key:-}"
+    [ -n "$_lifetime_val" ] || continue
+    if grep -q "^${_lifetime_key}=\(\"\"\)\?$" "$_VALUES_FILE"; then
+      sed -i "s|^${_lifetime_key}=.*\$|${_lifetime_key}=\"${_lifetime_val}\"|" "$_VALUES_FILE"
+      log "$_lifetime_key: recorded in $_VALUES_FILE"
+    elif ! grep -q "^${_lifetime_key}=" "$_VALUES_FILE"; then
+      printf '\n# Sandbox lifetime; recorded so the next upgrade re-renders with it.\n%s="%s"\n' \
+        "$_lifetime_key" "$_lifetime_val" >> "$_VALUES_FILE"
+      log "$_lifetime_key: recorded in $_VALUES_FILE"
+    fi
+  done
+  unset _lifetime_key _lifetime_val
+fi
 unset _SHELL_DOMAIN _SHELL_AUTH_INTERNAL_TOKEN _SHELL_S3_ENDPOINT \
-      _SHELL_S3_API_ENDPOINT _SHELL_S3_ACCESS_KEY _SHELL_S3_SECRET_KEY
+      _SHELL_S3_API_ENDPOINT _SHELL_S3_ACCESS_KEY _SHELL_S3_SECRET_KEY \
+      _SHELL_AGENT_SANDBOX_SESSION_TIMEOUT _SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION
 # Defaults for any placeholder not provided by the values file. Fallback to
 # the literal "<KEY>" so render output keeps the placeholder, and the
 # deploy.sh guard fails loudly rather than silently shipping empty secrets.

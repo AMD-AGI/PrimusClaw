@@ -48,6 +48,7 @@ bash -n \
 bash "$repo_root/scripts/release-tests/deploy-auth-forwarding.sh"
 bash "$repo_root/scripts/release-tests/installer-behavior.sh"
 bash "$repo_root/scripts/release-tests/dry-run-no-side-effects.sh"
+bash "$repo_root/scripts/release-tests/deploy-values-persistence.sh"
 
 require_tool helm
 echo "==> Helm lint and render"

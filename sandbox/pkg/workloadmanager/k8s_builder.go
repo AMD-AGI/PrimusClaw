@@ -1054,22 +1054,14 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 		// The Pod's error is kept, and it also gates what happens next.
 		// Dropping it was the zombie this function's own comment describes: the
 		// Pod has no OwnerReference, so nothing cascades to it, and deleting the
-		// Claim below removes the last record anyone could find it through.
-		// A nil error here does not mean the Pod is gone; it means the API server
-		// accepted the deletion and set deletionTimestamp, after which kubelet
-		// takes up to terminationGracePeriodSeconds (never set on these Pods, so
-		// the API default of 30s) to finish. That asynchrony is fine, and waiting
-		// it out would be worse: it would add the grace period to every teardown,
-		// and on an unreachable node it would time out and leave the Sandbox and
-		// Claim behind instead of the Pod. What matters is that removal is now
-		// certain, and it is -- nothing in this repository attaches a finalizer
-		// to a Pod (the only Pod finalizers in the tree are in tests, and the
-		// RBAC grants /finalizers on this project's own CRDs, not on pods), and
-		// there are no admission webhooks that could add one.
+		// Claim below removes the annotation above that names it -- leaving a
+		// Pod that nothing in this teardown path will come back for.
 		//
-		// The case worth stopping for is the other one: an error means the
-		// deletion may never have been accepted at all, so the Pod may have no
-		// deletionTimestamp and no reason to ever go away.
+		// A nil error is enough to go on. It does not mean the Pod is gone, only
+		// that the API server accepted the deletion and set deletionTimestamp,
+		// and finishing is then the kubelet's. An error is the case worth
+		// stopping for: the deletion may never have been accepted at all, so the
+		// Pod may have no deletionTimestamp and no reason to ever go away.
 		podErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
 		if podErr != nil {
 			// The Claim carries no Pod reference, and this annotation is the
