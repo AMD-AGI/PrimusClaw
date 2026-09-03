@@ -121,96 +121,130 @@ PROVIDER_KEY_ENV="LITELLM_PROVIDER_API_KEY"
 # non-interactive/CI deploys are unaffected.
 configure_models_interactive() {
   [ "$DRY_RUN" = "true" ] && return 0
-  [ -t 0 ] || { log "non-interactive shell; skipping model provider prompt"; return 0; }
 
-  local ans
-  read -r -p "[litellm] Configure an LLM provider and auto-discover models now? [y/N] " ans
-  case "${ans:-}" in
-    y|Y|yes|YES) ;;
-    *) log "skipping model provider configuration"; return 0 ;;
-  esac
+  # The provider can also be supplied non-interactively. That is what makes this
+  # path testable at all -- everything below (the key never reaching argv, the
+  # Secret being namespaced and content-addressed, the values file that survives
+  # the next upgrade) used to be reachable only by a human at a terminal, and so
+  # was covered by nothing.
+  local ptype="${LITELLM_PROVIDER_TYPE:-}" purl="${LITELLM_PROVIDER_URL:-}"
+  local pkey="${LITELLM_PROVIDER_API_KEY:-}"
 
-  command -v curl >/dev/null || fail "curl not found (required for model discovery)"
+  if [ -n "$ptype$purl$pkey" ]; then
+    [ -n "$ptype" ] && [ -n "$purl" ] && [ -n "$pkey" ] \
+      || fail "LITELLM_PROVIDER_TYPE, _URL and _API_KEY must be set together"
+    case "$ptype" in anthropic|openai) ;; *) fail "LITELLM_PROVIDER_TYPE must be anthropic or openai" ;; esac
+  else
+    [ -t 0 ] || { log "non-interactive shell; skipping model provider prompt"; return 0; }
+    local ans
+    read -r -p "[litellm] Configure an LLM provider and auto-discover models now? [y/N] " ans
+    case "${ans:-}" in
+      y|Y|yes|YES) ;;
+      *) log "skipping model provider configuration"; return 0 ;;
+    esac
+    while :; do
+      read -r -p "[litellm] Provider type (anthropic/openai): " ptype
+      case "${ptype:-}" in anthropic|openai) break ;; *) echo "  enter 'anthropic' or 'openai'" ;; esac
+    done
+    read -r -p "[litellm] Provider base URL (e.g. https://api.anthropic.com or https://host/v1): " purl
+    read -r -s -p "[litellm] Provider API key: " pkey; echo
+  fi
 
-  local ptype
-  while :; do
-    read -r -p "[litellm] Provider type (anthropic/openai): " ptype
-    case "${ptype:-}" in anthropic|openai) break ;; *) echo "  enter 'anthropic' or 'openai'" ;; esac
-  done
-
-  local purl pkey
-  read -r -p "[litellm] Provider base URL (e.g. https://api.anthropic.com or https://host/v1): " purl
   purl="${purl%/}"
   [ -n "$purl" ] || fail "provider base URL is required"
-  read -r -s -p "[litellm] Provider API key: " pkey; echo
   [ -n "$pkey" ] || fail "provider API key is required"
+  command -v curl >/dev/null || fail "curl not found (required for model discovery)"
 
-  # Derive the /models endpoint and per-provider auth header + litellm prefix.
   local models_url model_prefix
-  local -a auth_hdr
   case "$purl" in */v1) models_url="$purl/models" ;; *) models_url="$purl/v1/models" ;; esac
+  [ "$ptype" = "anthropic" ] && model_prefix="anthropic" || model_prefix="openai"
+
+  # Headers go in a 0600 file, not on the command line. `-H "x-api-key: $pkey"`
+  # puts the key in curl's argv, where /proc and any exec auditing can read it
+  # for as long as the request runs -- up to the 20s timeout.
+  local hdr_file
+  hdr_file="$(mktemp)"; chmod 600 "$hdr_file"
+  MODELS_TMP_FILES+=("$hdr_file")
   if [ "$ptype" = "anthropic" ]; then
-    model_prefix="anthropic"
-    auth_hdr=(-H "x-api-key: $pkey" -H "anthropic-version: 2023-06-01")
+    printf 'x-api-key: %s\nanthropic-version: 2023-06-01\n' "$pkey" >"$hdr_file"
   else
-    model_prefix="openai"
-    auth_hdr=(-H "Authorization: Bearer $pkey")
+    printf 'Authorization: Bearer %s\n' "$pkey" >"$hdr_file"
   fi
 
   log "querying models: GET $models_url"
   local resp
-  resp="$(curl -sf -m 20 "${auth_hdr[@]}" "$models_url")" \
+  resp="$(curl -sf -m 20 -H "@$hdr_file" "$models_url")" \
     || fail "failed to fetch models from $models_url (check URL / key / network)"
 
-  GENERATED_MODELS_FILE="$(mktemp)"
+  # Content-addressed, so a changed key means a changed Secret name means a
+  # changed pod template. A fixed name would leave the rollout untriggered and
+  # the pods on the old key, and a Helm failure later would leave the new key
+  # already written under the name the old release still points at.
+  local key_hash
+  key_hash="$(printf '%s' "$pkey" | sha256sum | cut -c1-10)"
+  PROVIDER_KEY_SECRET="$LITELLM_NAME-provider-$key_hash"
+
+  GENERATED_MODELS_FILE="${LITELLM_PROVIDER_VALUES_FILE:-}"
+  if [ -z "$GENERATED_MODELS_FILE" ]; then
+    GENERATED_MODELS_FILE="$(mktemp)"
+    MODELS_TMP_FILES+=("$GENERATED_MODELS_FILE")
+  fi
+  : >"$GENERATED_MODELS_FILE"
   chmod 600 "$GENERATED_MODELS_FILE"
-  MODELS_TMP_FILES+=("$GENERATED_MODELS_FILE")
 
   # Parse an OpenAI/Anthropic-style {"data":[{"id":...}]} payload and emit
-  # modelList as JSON (a valid YAML subset, so ids/urls/keys stay safely quoted).
-  # The key itself never reaches this file. `api_key: os.environ/NAME` is
-  # resolved by LiteLLM at request time from the container's environment, and
-  # the environment entry comes from a Secret -- because this file is handed to
-  # Helm with -f, and a literal key in it would sit in the release values, and
-  # in every stored revision, for anyone who can run `helm get values`.
+  # modelList as JSON (a valid YAML subset, so ids/urls stay safely quoted).
+  # The key itself never reaches this file: LiteLLM resolves the os.environ
+  # reference per request from the container environment, and that entry comes
+  # from the Secret below. A literal here would travel into the release values
+  # and sit in every stored revision.
   local count
   count="$(printf '%s' "$resp" | python3 -c '
 import json, sys
-prefix, api_base, env_name, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+prefix, api_base, env_name, secret, secret_key, out = sys.argv[1:7]
 data = json.load(sys.stdin)
 items = data.get("data") if isinstance(data, dict) else data
-ids = []
-for it in (items or []):
-    mid = it.get("id") if isinstance(it, dict) else it
-    if mid:
-        ids.append(mid)
+ids = [it.get("id") if isinstance(it, dict) else it for it in (items or [])]
+ids = [i for i in ids if i]
 if not ids:
     sys.stderr.write("no models found in /models response\n"); sys.exit(1)
-model_list = [
-    {"model_name": m, "litellm_params": {
-        "model": f"{prefix}/{m}",
-        "api_base": api_base,
-        "api_key": f"os.environ/{env_name}",
-    }}
-    for m in ids
-]
-json.dump({"modelList": model_list}, open(out, "w"), indent=2)
+json.dump({
+    "modelList": [
+        {"model_name": m, "litellm_params": {
+            "model": f"{prefix}/{m}",
+            "api_base": api_base,
+            "api_key": f"os.environ/{env_name}",
+        }}
+        for m in ids
+    ],
+    "providerApiKey": {"secretName": secret, "secretKey": secret_key, "envName": env_name},
+}, open(out, "w"), indent=2)
 print(len(ids))
-' "$model_prefix" "$purl" "$PROVIDER_KEY_ENV" "$GENERATED_MODELS_FILE")" \
+' "$model_prefix" "$purl" "$PROVIDER_KEY_ENV" "$PROVIDER_KEY_SECRET" "$PROVIDER_KEY_SECRET_KEY" \
+  "$GENERATED_MODELS_FILE")" \
     || fail "could not parse models response from $models_url"
 
-  # Written through stdin rather than --from-literal: an argument is visible in
-  # /proc and to anything auditing process starts, and this is the one moment
-  # the plaintext key exists outside the operator's terminal.
-  PROVIDER_KEY_SECRET="$LITELLM_NAME-provider"
+  # helm --create-namespace has not run yet, so a first install into a fresh
+  # namespace would have nowhere to put this Secret.
+  kubectl create namespace "$LITELLM_NAMESPACE" --dry-run=client -o yaml \
+    | kubectl apply -f - >/dev/null 2>&1 || true
+
+  # Through stdin, not --from-literal: an argument is visible in /proc and to
+  # anything auditing process starts.
   printf '%s' "$pkey" \
     | kubectl -n "$LITELLM_NAMESPACE" create secret generic "$PROVIDER_KEY_SECRET" \
         --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o yaml \
     | kubectl -n "$LITELLM_NAMESPACE" apply -f - >/dev/null \
     || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
-  log "provider API key stored in Secret/$PROVIDER_KEY_SECRET (referenced as os.environ/$PROVIDER_KEY_ENV)"
 
-  log "discovered $count model(s) from $ptype provider; configuring modelList"
+  log "discovered $count model(s) from $ptype provider"
+  log "provider API key in Secret/$PROVIDER_KEY_SECRET, referenced as os.environ/$PROVIDER_KEY_ENV"
+  if [ -n "${LITELLM_PROVIDER_VALUES_FILE:-}" ]; then
+    log "wrote modelList and providerApiKey to $GENERATED_MODELS_FILE"
+  else
+    log "note: this modelList lives only in this run. Set LITELLM_PROVIDER_VALUES_FILE"
+    log "      to keep it, or pass it as LITELLM_VALUES_FILE on later upgrades."
+  fi
 }
 
 # When LITELLM_DATABASE_URL is unset, try to reuse a CrunchyData PGO
