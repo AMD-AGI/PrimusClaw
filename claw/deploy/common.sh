@@ -461,22 +461,60 @@ _nats_workload_adoption() {
       # Deployment owns, so it is the field that says whether any old pod is
       # left; `updatedReplicas` alone cannot, because it only ever describes
       # the new one.
-      local want have ready total gen seen
+      local want have ready total gen seen unverifiable=()
       _dep() {
         kubectl get deployment "$name" -n "$NAMESPACE" -o jsonpath="{$1}" 2>/dev/null || true
       }
-      want=$(_dep .spec.replicas);            want="${want:-0}"
-      have=$(_dep .status.updatedReplicas);   have="${have:-0}"
-      ready=$(_dep .status.readyReplicas);    ready="${ready:-0}"
-      total=$(_dep .status.replicas);         total="${total:-0}"
-      gen=$(_dep .metadata.generation);       gen="${gen:-0}"
-      seen=$(_dep .status.observedGeneration); seen="${seen:-0}"
+      # Read one field into _DEP_VALUE, recording anything that is not a count.
+      #
+      # Empty means two different things depending on the field, and reading
+      # both as 0 is how a gate ends up passing on no evidence at all.
+      # Kubernetes omits a zero-valued status counter, so an absent
+      # updatedReplicas/readyReplicas/replicas genuinely is zero. An absent
+      # generation, observedGeneration or spec.replicas is not a zero: it means
+      # the Deployment could not be read, or the controller has never written a
+      # status. Non-numeric is never a count, whichever field it came from --
+      # `[ "$seen" -lt "$gen" ]` on a word is an error, and an error swallowed
+      # here reads as "no blocker".
+      _dep_field() {
+        local v; v="$(_dep "$1")"
+        case "$v" in
+          "")       if [ "$2" = required ]; then
+                      unverifiable+=("$1 was not reported")
+                    fi
+                    _DEP_VALUE=0 ;;
+          *[!0-9]*) unverifiable+=("$1 came back as \"$v\", which is not a count")
+                    _DEP_VALUE=0 ;;
+          *)        _DEP_VALUE="$v" ;;
+        esac
+      }
+      _dep_field .spec.replicas required;          want="$_DEP_VALUE"
+      _dep_field .status.updatedReplicas count;    have="$_DEP_VALUE"
+      _dep_field .status.readyReplicas count;      ready="$_DEP_VALUE"
+      _dep_field .status.replicas count;           total="$_DEP_VALUE"
+      _dep_field .metadata.generation required;    gen="$_DEP_VALUE"
+      _dep_field .status.observedGeneration required; seen="$_DEP_VALUE"
+      if [ ${#unverifiable[@]} -ne 0 ]; then
+        local why; why="$(IFS='; '; printf '%s' "${unverifiable[*]}")"
+        echo "the $name Deployment's rollout cannot be verified ($why), and an unverified rollout is not a finished one"
+        return 1
+      fi
       local state="$have/$want updated, $ready ready, $total pods, generation $seen/$gen observed"
-      if [ "$seen" -lt "$gen" ] 2>/dev/null; then
+      if [ "$seen" -lt "$gen" ]; then
         echo "the $name Deployment has been changed since the controller last acted on it ($state), so what is running is not what the spec asks for"
         return 1
       fi
-      if [ "$want" = "0" ] || [ "$have" != "$want" ]; then
+      # Scaled to zero on purpose is a finished rollout: there is nothing left
+      # to wait for and nothing left holding a credential. Pods still owned say
+      # otherwise -- that is a scale-down in progress, and they are serving.
+      if [ "$want" = "0" ]; then
+        if [ "$total" != "0" ]; then
+          echo "the $name Deployment is scaled to zero but still owns $total pod(s) ($state), which are serving on whatever credential they started with"
+          return 1
+        fi
+        return 0
+      fi
+      if [ "$have" != "$want" ]; then
         echo "the $name rollout has not finished ($state), so pods on the old credential are still serving"
         return 1
       fi

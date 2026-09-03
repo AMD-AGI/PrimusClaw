@@ -171,6 +171,12 @@ cat >"$tmp/bin/kubectl" <<'EOF'
 args="$*"
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 val() { [ -f "$CLUSTER_DIR/$1" ] && cat "$CLUSTER_DIR/$1" || return 1; }
+fld() {
+  local v
+  v="$(val "replicas-$1" | awk -v n="$2" '{print $n}')" || exit 1
+  [ "$v" = "-" ] && exit 0          # the field is simply not there
+  printf '%s' "$v"
+}
 
 case "$args" in
   *"exec"*"nats rtt"*)
@@ -199,13 +205,15 @@ case "$args" in
     name="${args#*get deployment }"; name="${name%% *}"; comp="${name#primus-claw-}"
     case "$args" in
       *secretKeyRef.name*) val "refs-$comp" || exit 0 ;;
-      # replicas-<comp> is: desired updated ready total generation observed
-      *".spec.replicas}"*)       val "replicas-$comp" | awk '{print $1}' ;;
-      *updatedReplicas*)         val "replicas-$comp" | awk '{print $2}' ;;
-      *readyReplicas*)           val "replicas-$comp" | awk '{print $3}' ;;
-      *".status.replicas}"*)     val "replicas-$comp" | awk '{print $4}' ;;
-      *".metadata.generation}"*) val "replicas-$comp" | awk '{print $5}' ;;
-      *observedGeneration*)      val "replicas-$comp" | awk '{print $6}' ;;
+      # replicas-<comp> is: desired updated ready total generation observed.
+      # A field written as `-` is one the API server does not report at all --
+      # a zero-valued status counter, or an object that has no such field.
+      *".spec.replicas}"*)       fld "$comp" 1 ;;
+      *updatedReplicas*)         fld "$comp" 2 ;;
+      *readyReplicas*)           fld "$comp" 3 ;;
+      *".status.replicas}"*)     fld "$comp" 4 ;;
+      *".metadata.generation}"*) fld "$comp" 5 ;;
+      *observedGeneration*)      fld "$comp" 6 ;;
       *) exit 1 ;;
     esac
     exit 0 ;;
@@ -333,6 +341,62 @@ out="$(blockers)"
 grep -q "^brain (the primus-claw-brain Deployment has been changed since" <<<"$out" \
   || bad "an unobserved spec change must block retirement, got: $out"
 ok "status from a generation older than the spec blocks retirement"
+
+# 5e. The fields the comparisons are made of can be absent or be something
+#     other than a number, and every one of those readings used to become a 0
+#     -- which compares equal, compares not-less-than, and reports a finished
+#     rollout on no evidence whatsoever. On a decision that cannot be undone,
+#     "I could not read it" has to land on the same side as "no".
+adopted
+echo "2 2 2 2 - 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment's rollout cannot be verified" <<<"$out" \
+  || bad "a missing generation must block retirement, got: $out"
+grep -q "metadata.generation was not reported" <<<"$out" \
+  || bad "the blocker must name the field it could not read, got: $out"
+ok "a Deployment with no generation reported blocks retirement"
+
+adopted
+echo "2 2 2 2 - -" >"$cluster/replicas-brain"
+out="$(blockers)"
+grep -q "^brain (the primus-claw-brain Deployment's rollout cannot be verified" <<<"$out" \
+  || bad "two missing generations must block retirement, got: $out"
+ok "a Deployment with neither generation reported blocks retirement"
+
+adopted
+echo "2 2 2 2 v9 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment's rollout cannot be verified" <<<"$out" \
+  || bad "a non-numeric generation must block retirement, got: $out"
+ok "a generation that is not a number blocks retirement"
+
+# A word compares equal to itself, so counts that match and are not numbers
+# satisfy every equality below while meaning nothing.
+adopted
+echo "two two two two 8 8" >"$cluster/replicas-brain"
+out="$(blockers)"
+grep -q "^brain (the primus-claw-brain Deployment's rollout cannot be verified" <<<"$out" \
+  || bad "non-numeric replica counts must block retirement, got: $out"
+ok "replica counts that are not numbers block retirement"
+
+# 5f. Scaled to zero on purpose, with the status counters Kubernetes omits
+#     when they are zero. Nothing is running, so nothing holds a credential and
+#     there is nothing left to wait for -- blocking here would be the gate
+#     refusing a state that is already finished.
+adopted
+echo "0 - - - 8 8" >"$cluster/replicas-api"
+out="$(blockers)"
+[ -z "$out" ] || bad "a Deployment intentionally scaled to zero must not block retirement, got: $out"
+ok "a Deployment scaled to zero with no pods left allows retirement"
+
+# The same zero with a pod still owned is a scale-down in flight, and that pod
+# is serving.
+adopted
+echo "0 - - 1 8 8" >"$cluster/replicas-api"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api Deployment is scaled to zero but still owns 1 pod" <<<"$out" \
+  || bad "a scale-down still holding a pod must block retirement, got: $out"
+ok "a scale-down that still owns a pod blocks retirement"
 
 # 6. The reaper's CronJob is the case a connection census cannot see at all:
 #    between sweeps there is nothing connected to count, so the spec is the
