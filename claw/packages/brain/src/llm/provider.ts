@@ -92,6 +92,16 @@ export interface LlmCacheReport {
    */
   reported: ReadonlyArray<"cache_read" | "cache_create">;
   /**
+   * Allowlisted response headers from the attempt that served this turn.
+   *
+   * The counter can say a read was lost; it cannot say which backend lost it,
+   * and on a miss that is the first question worth asking. Populated only when
+   * the deployment names headers in LLM_DEBUG_RESPONSE_HEADERS, because which
+   * header identifies a backend is a property of the gateway in front of Claw,
+   * not of Claw.
+   */
+  upstreamHeaders?: Record<string, string>;
+  /**
    * Where this turn's markers sat, as ordinals in a flat walk over the blocks
    * actually sent, and how many blocks that walk had.
    *

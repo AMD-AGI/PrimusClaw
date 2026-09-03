@@ -907,6 +907,34 @@ function resolvePromptCacheTtl(): PromptCacheTtl {
 export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
 
 /**
+ * Response headers to carry into the cache-loss log, lowercased, comma-separated.
+ *
+ * `claw_brain_llm_cache_entry_lost_total` can say a read was lost and cannot say
+ * which upstream lost it. Every deployment reaches the model through something
+ * -- a gateway, a proxy, a cloud API front door -- and when a cache entry does
+ * not come back, the first question is whether the turn that wrote it and the
+ * turn that missed it were served by the same backend. Nothing in the request
+ * can answer that; only the response can.
+ *
+ * An allowlist rather than a header name baked in, because the header that
+ * identifies a backend is a property of the deployment, not of Claw: it is
+ * `x-litellm-model-id` behind one proxy, an Azure APIM request id behind
+ * another, a plain `request-id` when talking to the provider directly.
+ *
+ * An allowlist rather than capturing everything, because response headers carry
+ * credentials -- echoed authorization, set-cookie -- and this value is logged.
+ * Naming what you want is the difference between a diagnostic and a leak.
+ *
+ * Empty by default: off, no capture, no allocation, no log field.
+ */
+export const LLM_DEBUG_RESPONSE_HEADERS: ReadonlyArray<string> =
+  env("LLM_DEBUG_RESPONSE_HEADERS")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+
+
+/**
  * Turns off client-side cache breakpoints entirely.
  *
  * The provider already disables itself for the rest of a session when the

@@ -356,6 +356,7 @@ async function streamingTurn(
         ...(reportedCacheRead ? ["cache_read" as const] : []),
         ...(reportedCacheCreate ? ["cache_create" as const] : []),
       ],
+      upstreamHeaders: capture.headers,
       markerBlockOffsets,
       promptBlocks: decorated.totalBlocks,
       createdEphemeral5m: created5m,

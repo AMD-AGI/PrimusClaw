@@ -1158,6 +1158,7 @@ class AgentLoopRunner {
           promptBlocks: blocks,
           rollingMaxGap,
           anchorGap,
+          upstreamHeaders: cacheReport.upstreamHeaders,
           cacheCreate: turnUsage.cache_create,
           inputTokens: turnUsage.input_tokens,
           promptTokens: streamResult.promptTokens,
