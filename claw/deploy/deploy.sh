@@ -235,10 +235,23 @@ if ! $SKIP_NATS; then
     done < <(grep -E '^NATS_PASSWORD_DEV_' "$NATS_CREDS_FILE" || true)
   fi
 
+  # NATS_RETIRE_PROD=true removes the all-access user from the rendered config.
+  # Off by default, and deliberately NOT inferred from "are all four
+  # per-workload passwords set": a cluster can have them set and still have an
+  # out-of-tree client authenticating as prod, and the failure mode of guessing
+  # wrong is that client silently losing its connection. It has to be an
+  # explicit decision, taken after the connection census described in
+  # nats-values.yaml.
+  _strip_prod=""
+  if [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
+    log "  NATS: retiring the all-access prod user (NATS_RETIRE_PROD=true)"
+    _strip_prod='/__PROD_USER_BEGIN__/,/__PROD_USER_END__/d'
+  fi
   awk -v block="$DEV_BLOCKS" '
     /# \{\{DEV_ACCOUNTS\}\}/ { printf "%s", block; next }
     { print }
   ' "$SCRIPT_DIR/nats-values.yaml" \
+    | { [ -n "$_strip_prod" ] && sed -e "$_strip_prod" || cat; } \
     | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
           -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
           -e "s|__API_NATS_PASSWORD__|${NATS_PASSWORD_API}|g" \
@@ -501,11 +514,26 @@ values = {
         "authInternalToken": env("AUTH_INTERNAL_TOKEN"),
         "userEnvEncryptionKey": env("USER_ENV_ENCRYPTION_KEY"),
         "brainCheckpointKey": env("BRAIN_CHECKPOINT_KEY"),
+        # A workload switches to its own NATS user only when it is named in
+        # NATS_PER_USER_WORKLOADS. Passing all four at once would move the
+        # whole fleet in one step, and the rollout order exists because the
+        # components fail at very different volumes: reaper exits non-zero, api
+        # is fatal on consumer setup, brain is mostly fail-open and is the one
+        # where a missing subject looks like nothing at all.
+        #
+        # Empty by default, which keeps every component on the shared
+        # credential. The users still get created in nats.conf either way, so
+        # adopting one later is a redeploy and not a NATS change.
         "natsUsers": {
-          "api":    { "user": "api",    "password": env("NATS_PASSWORD_API") },
-          "brain":  { "user": "brain",  "password": env("NATS_PASSWORD_BRAIN") },
-          "reaper": { "user": "reaper", "password": env("NATS_PASSWORD_REAPER") },
-          "ops":    { "user": "ops",    "password": env("NATS_PASSWORD_OPS") },
+            c: {
+                "user": c,
+                "password": (
+                    env("NATS_PASSWORD_" + c.upper())
+                    if c in {w.strip() for w in env("NATS_PER_USER_WORKLOADS").split(",") if w.strip()}
+                    else ""
+                ),
+            }
+            for c in ("api", "brain", "reaper", "ops")
         },
         "natsPassword": env("NATS_PASSWORD_EFFECTIVE"),
         "clawDeployMode": env("CLAW_DEPLOY_MODE", "kubernetes"),

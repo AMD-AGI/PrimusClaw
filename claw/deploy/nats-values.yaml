@@ -72,8 +72,15 @@ config:
           # `external.push_received` had never been logged -- so there was
           # nothing else to migrate. That is a per-site fact, not a property of
           # the chart.
+          # __PROD_USER_BEGIN__  (deploy.sh strips this block when
+          # NATS_RETIRE_PROD=true, which is how the account stops having an
+          # all-access user at all. Retiring it is a one-way step per cluster:
+          # anything still authenticating as `prod` -- including a publisher
+          # that is not in this repo -- stops working at that moment, which is
+          # the intent, but run the census in the comment above first.)
           - user: prod
             password: "__PROD_NATS_PASSWORD__"
+          # __PROD_USER_END__
 
           # --- Least-privilege users, one per workload ------------------------
           #

@@ -146,6 +146,8 @@ verify-lint:
 	@bash claw/scripts/lint-metrics-must-register.sh --all
 	@echo "==> lint: session-event redaction"
 	@bash claw/scripts/lint-session-events-must-redact.sh --all
+	@echo "==> lint: checkpoints are sealed, not redacted"
+	@bash claw/scripts/lint-checkpoint-must-seal.sh
 	@echo "==> lint: tenant-route authorization"
 	@bash claw/scripts/lint-tenant-routes-must-authorize.sh --all
 	@echo "==> lint: brain drain shutdown guard"
