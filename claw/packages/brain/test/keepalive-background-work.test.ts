@@ -70,7 +70,10 @@ function stubPingableProvider(): void {
  * seed value hides whichever write came first -- including the one these tests
  * are about.
  */
-function fakeKv(): { kv: KV; deleted: string[]; current: () => Record<string, unknown> } {
+function fakeKv(): {
+  kv: KV; deleted: string[];
+  current: () => Record<string, unknown>; revision: () => number;
+} {
   const deleted: string[] = [];
   let value = sc.encode(JSON.stringify(ENTRY));
   let revision = 5;
@@ -95,14 +98,29 @@ function fakeKv(): { kv: KV; deleted: string[]; current: () => Record<string, un
   return {
     kv, deleted,
     current: () => JSON.parse(sc.decode(value)) as Record<string, unknown>,
+    revision: () => revision,
   };
+}
+
+
+/**
+ * Run a sweep, let the background probe land, then run another.
+ *
+ * The probe deliberately does not block the sweep, so the first one decides on
+ * `unknown` and the answer is there for the second. Tests that care about the
+ * answer have to let it arrive.
+ */
+async function sweepUntilProbed(deps: Parameters<typeof runKeepaliveTickForTest>[0]): Promise<void> {
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+  await runKeepaliveTickForTest(deps);
 }
 
 test("an idle handle is kept while the session still has a background shell running", async () => {
   const { kv, deleted } = fakeKv();
   stubPingableProvider();
 
-  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 1 });
+  await sweepUntilProbed({ kv, countActiveShells: async () => 1 });
 
   assert.ok(
     !deleted.includes(`hands.${SESSION}`),
@@ -116,7 +134,7 @@ test("the probe is asked for the session, which is the owner Hands files shells 
   stubPingableProvider();
   const asked: Array<[string, string, string]> = [];
 
-  await runKeepaliveTickForTest({
+  await sweepUntilProbed({
     kv,
     countActiveShells: async (url, token, owner) => { asked.push([url, token, owner]); return 1; },
   });
@@ -132,7 +150,7 @@ test("the probe is asked for the session, which is the owner Hands files shells 
 test("no background work leaves the existing expiry untouched", async () => {
   const { kv, deleted } = fakeKv();
 
-  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  await sweepUntilProbed({ kv, countActiveShells: async () => 0 });
 
   assert.ok(
     deleted.includes(`hands.${SESSION}`),
@@ -145,7 +163,7 @@ test("a probe that cannot answer holds the handle instead of expiring it", async
   const { kv, deleted } = fakeKv();
   stubPingableProvider();
 
-  await runKeepaliveTickForTest({
+  await sweepUntilProbed({
     kv,
     countActiveShells: async () => { throw new Error("hands unreachable"); },
   });
@@ -164,11 +182,12 @@ test("a probe that never answers eventually stops holding the handle", async () 
 
   // Unknown is for a blip, not forever: a sandbox that has stopped answering
   // entirely would otherwise be pinned until its absolute deadline.
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 16; i++) {
     await runKeepaliveTickForTest({
       kv,
       countActiveShells: async () => { throw new Error("hands unreachable"); },
     });
+    await new Promise((r) => setImmediate(r));
     if (deleted.includes(`hands.${SESSION}`)) break;
   }
 
@@ -186,7 +205,7 @@ test("work that outlasts the reuse window still leaves a window behind it", asyn
   const { kv, current } = fakeKv();
   stubPingableProvider();
 
-  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 1 });
+  await sweepUntilProbed({ kv, countActiveShells: async () => 1 });
 
   const idleSince = current().idleSince;
   assert.equal(typeof idleSince, "number", "the idle clock was never moved while work ran");
@@ -205,9 +224,30 @@ test("the probe is not repeated on every tick", async () => {
   let probes = 0;
   const deps = { kv, countActiveShells: async () => { probes += 1; return 1; } };
 
-  await runKeepaliveTickForTest(deps);
-  await runKeepaliveTickForTest(deps);
+  await sweepUntilProbed(deps);
   await runKeepaliveTickForTest(deps);
 
   assert.equal(probes, 1, `three sweeps asked Hands ${probes} times`);
+});
+
+test("an unanswered probe also keeps the record from expiring underneath it", async () => {
+  // Holding the handle in memory is not holding it: the bucket drops entries on
+  // its own after BRAIN_REGISTRY_TTL_MS, which is the same five minutes as the
+  // unknown tolerance. Without a write here the handle would be kept by this
+  // code and expired by the store at the same moment, and the tolerance would
+  // buy nothing at all.
+  const { kv, revision } = fakeKv();
+  stubPingableProvider();
+  const before = revision();
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  });
+
+  assert.ok(
+    revision() > before,
+    "the entry was never re-put, so its TTL is still counting down from the "
+      + "moment the task ended",
+  );
 });

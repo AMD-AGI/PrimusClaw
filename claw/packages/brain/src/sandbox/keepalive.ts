@@ -71,6 +71,10 @@ interface KeepaliveDeps {
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
+/** Module-level so the immediate sweep at startup is under the same guard as
+ *  the interval's: the first one can outlast a whole period, and it used to be
+ *  the one sweep nothing stopped the timer from starting a second copy of. */
+let sweeping = false;
 const failCounts = new Map<string, number>();
 
 // ── In-memory registry: the primary source of truth for active sandboxes ──
@@ -302,6 +306,7 @@ const BG_UNKNOWN_TOLERANCE = 5;
 
 const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
 const bgUnknownStreak = new Map<string, number>();
+const bgProbeInFlight = new Set<string>();
 
 /** Drop bookkeeping for sessions this sweep no longer sees. */
 function forgetBackgroundWork(sessionId: string): void {
@@ -317,6 +322,7 @@ function forgetBackgroundWork(sessionId: string): void {
 export function resetBackgroundWorkStateForTest(): void {
   bgProbeCache.clear();
   bgUnknownStreak.clear();
+  bgProbeInFlight.clear();
 }
 
 /**
@@ -341,47 +347,69 @@ export function resetBackgroundWorkStateForTest(): void {
  * A handle with no URL or token predates this and cannot be asked; it answers
  * idle, which is what the sweep did before the question existed.
  */
-async function backgroundWorkState(
+function peekBackgroundWork(sessionId: string, info: HandsKvEntry): BackgroundWork {
+  if (!info.handsUrl || !info.token) return "idle";
+  const cached = bgProbeCache.get(sessionId);
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
+  return "unknown";
+}
+
+/**
+ * Ask Hands in the background and remember the answer for the next sweep.
+ *
+ * Not awaited, which is the point. The sweep walks every KV handle in one
+ * sequence and then pings from what it collected, so an awaited probe is in
+ * front of every ping in the fleet: a handful of handles whose Hands takes its
+ * five-second timeout to fail is a sweep that outlasts its own interval, and
+ * the sandboxes that were answering fine get pinged late or not at all. Reading
+ * the last answer costs nothing and is never more than one tick stale; the
+ * refresh catches up behind it.
+ *
+ * `unknown` until the first answer arrives, which keeps the handle and pings it
+ * -- the safe direction for a sweep whose job is to keep things alive.
+ */
+function refreshBackgroundWork(
   deps: KeepaliveDeps,
   sessionId: string,
   info: HandsKvEntry,
-): Promise<BackgroundWork> {
-  if (!info.handsUrl || !info.token) return "idle";
-
+): void {
+  if (!info.handsUrl || !info.token) return;
   const cached = bgProbeCache.get(sessionId);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return;
+  if (bgProbeInFlight.has(sessionId)) return;
 
-  try {
-    const probe = deps.countActiveShells ?? countActiveShells;
-    const running = await probe(info.handsUrl, info.token, sessionId);
-    const state: BackgroundWork = running > 0 ? "running" : "idle";
-    bgProbeCache.set(sessionId, { at: Date.now(), state });
-    bgUnknownStreak.delete(sessionId);
-    if (state === "running") {
-      logger.info(
-        { sessionId, workloadId: info.workloadId, running },
-        "keepalive.idle_handle_kept_background_work",
-      );
-    }
-    return state;
-  } catch (err) {
-    const streak = (bgUnknownStreak.get(sessionId) ?? 0) + 1;
-    bgUnknownStreak.set(sessionId, streak);
-    logger.warn(
-      { err: (err as Error)?.message ?? err, sessionId, streak },
-      "keepalive.background_work_check_failed",
-    );
-    // Give up only after the streak, and say so: from here the handle is on the
-    // ordinary expiry path and whatever was running goes with the sandbox.
-    if (streak > BG_UNKNOWN_TOLERANCE) {
+  bgProbeInFlight.add(sessionId);
+  const probe = deps.countActiveShells ?? countActiveShells;
+  void probe(info.handsUrl, info.token, sessionId)
+    .then((running) => {
+      const state: BackgroundWork = running > 0 ? "running" : "idle";
+      bgProbeCache.set(sessionId, { at: Date.now(), state });
+      bgUnknownStreak.delete(sessionId);
+      if (state === "running") {
+        logger.info(
+          { sessionId, workloadId: info.workloadId, running },
+          "keepalive.idle_handle_kept_background_work",
+        );
+      }
+    })
+    .catch((err) => {
+      const streak = (bgUnknownStreak.get(sessionId) ?? 0) + 1;
+      bgUnknownStreak.set(sessionId, streak);
       logger.warn(
-        { sessionId, workloadId: info.workloadId, streak },
-        "keepalive.background_work_unknown_giving_up",
+        { err: (err as Error)?.message ?? err, sessionId, streak },
+        "keepalive.background_work_check_failed",
       );
-      return "idle";
-    }
-    return "unknown";
-  }
+      // Give up only after the streak, and say so: from here the handle is on
+      // the ordinary expiry path and whatever was running goes with the sandbox.
+      if (streak > BG_UNKNOWN_TOLERANCE) {
+        bgProbeCache.set(sessionId, { at: Date.now(), state: "idle" });
+        logger.warn(
+          { sessionId, workloadId: info.workloadId, streak },
+          "keepalive.background_work_unknown_giving_up",
+        );
+      }
+    })
+    .finally(() => { bgProbeInFlight.delete(sessionId); });
 }
 
 /**
@@ -411,7 +439,10 @@ async function refreshIdleSince(
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
-async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, RegisteredSandbox>> {
+async function collectTargets(
+  deps: KeepaliveDeps,
+  seenSessions: Set<string>,
+): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
 
   // 1. In-memory registry — always authoritative for this process.
@@ -433,6 +464,10 @@ async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, Register
     const keys = await deps.kv.keys("hands.*");
     for await (const key of keys) {
       const sessionId = key.slice("hands.".length);
+      // Seen, whatever the sweep then decides to do with it: the cache reaper
+      // below keys on this rather than on the ping list, because an `idle` answer
+      // is exactly the case that never becomes a ping target.
+      seenSessions.add(sessionId);
       const e = await deps.kv.get(key).catch(() => null);
       if (!e) continue;
       try {
@@ -448,15 +483,24 @@ async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, Register
         //   running  ping it, and move the idle clock forward so the reuse
         //            window starts when the work stops rather than when the
         //            turn did
-        //   unknown  ping it and leave the clock alone -- a blip must not be
-        //            what decides this, and the streak inside the probe is what
-        //            stops that becoming forever
+        //   unknown  ping it and refresh the record's TTL, but leave the clock
+        //            alone -- a blip must not decide this, and without the TTL
+        //            write the bucket drops the entry on its own inside the
+        //            tolerance window (both are five minutes), so holding the
+        //            handle here would mean nothing
         //   idle     the handle really is spare; the expiry below is unchanged
+        //
+        // Read, not asked: the probe runs behind the sweep and leaves its answer
+        // for the next one, because an awaited probe sits in front of every ping
+        // in the fleet.
         const bgWork = info.keepalive === false
-          ? await backgroundWorkState(deps, sessionId, info)
+          ? peekBackgroundWork(sessionId, info)
           : "idle";
+        if (info.keepalive === false) refreshBackgroundWork(deps, sessionId, info);
         if (info.keepalive === false && bgWork === "running") {
           await refreshIdleSince(deps, key, e.revision, info);
+        } else if (info.keepalive === false && bgWork === "unknown") {
+          await deps.kv.update(key, e.value, e.revision).catch(() => {});
         }
         if (info.keepalive === false && bgWork === "idle") {
           const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
@@ -547,7 +591,8 @@ export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void
 }
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
-  const targets = await collectTargets(deps);
+  const seenSessions = new Set<string>();
+  const targets = await collectTargets(deps, seenSessions);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
@@ -556,9 +601,12 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // Same for the background-work bookkeeping, which is keyed by session rather
   // than by target: a session with no target left is one nothing will ask about
   // again, and its cached answer would otherwise outlive the sandbox.
-  const live = new Set([...targets.values()].map((t) => t.sessionId));
+  // Keyed on what the sweep saw, not on what it decided to ping: an `idle`
+  // answer is exactly the case where the handle does not become a target, so
+  // reaping on targets threw away the answer at the end of every tick and asked
+  // again on the next one -- which is the load the cache exists to remove.
   for (const sessionId of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
-    if (!live.has(sessionId)) forgetBackgroundWork(sessionId);
+    if (!seenSessions.has(sessionId)) forgetBackgroundWork(sessionId);
   }
 
   if (!targets.size) return;
@@ -666,24 +714,34 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
     },
     "keepalive.start",
   );
-  tick(deps).catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"));
+  runGuardedSweep(deps);
   // Guarded, because a sweep is not guaranteed to finish inside its interval:
   // it walks every KV handle serially and can make a network call per idle one.
   // Overlapping sweeps would double every write in here and race each other's
   // conditional updates, and the symptom -- handles refreshed twice, others not
   // at all -- would read as KV flakiness rather than as this.
-  let sweeping = false;
-  timer = setInterval(() => {
-    if (sweeping) {
-      logger.warn({}, "keepalive.tick_still_running");
-      return;
-    }
-    sweeping = true;
-    tick(deps)
-      .catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"))
-      .finally(() => { sweeping = false; });
-  }, SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
+  timer = setInterval(() => runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
   timer.unref?.();
+}
+
+/**
+ * One sweep, never two at once.
+ *
+ * A sweep is not guaranteed to finish inside its interval -- it walks every KV
+ * handle in sequence and writes as it goes -- and overlapping sweeps double
+ * every write and race each other's conditional updates. The symptom would be
+ * handles refreshed twice and others not at all, which reads as KV flakiness
+ * rather than as this.
+ */
+function runGuardedSweep(deps: KeepaliveDeps): void {
+  if (sweeping) {
+    logger.warn({}, "keepalive.tick_still_running");
+    return;
+  }
+  sweeping = true;
+  tick(deps)
+    .catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"))
+    .finally(() => { sweeping = false; });
 }
 
 /** Stop the periodic keepalive. */
