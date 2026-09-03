@@ -385,6 +385,22 @@ function resolveAgentSandboxMaxSessionDuration(): string {
   return configured;
 }
 export const AGENT_SANDBOX_MAX_SESSION_DURATION = resolveAgentSandboxMaxSessionDuration();
+
+/**
+ * The same ceiling in whole seconds, for the backend that wants it that way.
+ *
+ * safe-workload's `timeout` is seconds counted from dispatch, which is the same
+ * thing `maxSessionDuration` means -- so the value has to reach both providers,
+ * and converting it here rather than in each one is what keeps them from
+ * drifting into two nearly-identical parsers. Null when unset or refused, which
+ * leaves each provider on its own default.
+ */
+export const AGENT_SANDBOX_MAX_SESSION_SECONDS: number | null = (() => {
+  const ns = AGENT_SANDBOX_MAX_SESSION_DURATION
+    ? goDurationNs(AGENT_SANDBOX_MAX_SESSION_DURATION)
+    : null;
+  return ns === null ? null : goDurationSeconds(ns);
+})();
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,
