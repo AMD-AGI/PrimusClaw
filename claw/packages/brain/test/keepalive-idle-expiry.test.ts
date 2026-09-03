@@ -20,6 +20,7 @@ import {
   registerSandbox,
   runKeepaliveTickForTest,
   unregisterSandbox,
+  resetBackgroundWorkStateForTest,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -40,9 +41,21 @@ const ENTRY = {
   idleSince: 0,
 };
 
+/**
+ * "Nothing is running in there" as a fact rather than an absence.
+ *
+ * The sweep asks Hands before treating an idle handle as spare, and a probe it
+ * cannot complete answers `unknown`, which holds the handle rather than
+ * expiring it. Without this stub these tests would reach a real socket, get
+ * `unknown`, and pass or fail on which of those two the sweep happened to do --
+ * which is not what any of them is about.
+ */
+const idle = async () => 0;
+
 let restoreProviders: (() => void) | null = null;
 
 afterEach(() => {
+  resetBackgroundWorkStateForTest();
   unregisterSandbox(SESSION);
   restoreProviders?.();
   restoreProviders = null;
@@ -97,7 +110,7 @@ function fakeKv(opts: { runLease?: boolean } = {}): { kv: KV; deleted: string[];
 
 test("an idle handle past its window is expired when nothing is running on it", async () => {
   const { kv, deleted } = fakeKv();
-  await runKeepaliveTickForTest({ kv });
+  await runKeepaliveTickForTest({ kv, countActiveShells: idle });
   assert.ok(deleted.includes(`hands.${SESSION}`),
     "the reuse window is over and no run holds it, so the handle goes");
 });
@@ -107,7 +120,7 @@ test("the same handle is kept while this replica is running the session", async 
   stubPingableProvider();
   registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
 
-  await runKeepaliveTickForTest({ kv });
+  await runKeepaliveTickForTest({ kv, countActiveShells: idle });
 
   // Only this key matters: registering the sandbox also makes it a ping target,
   // and a ping that fails against the stub touches unrelated bookkeeping keys.
@@ -125,7 +138,7 @@ test("a handle kept because the session is live also gets its TTL refreshed", as
   stubPingableProvider();
   registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
 
-  await runKeepaliveTickForTest({ kv });
+  await runKeepaliveTickForTest({ kv, countActiveShells: idle });
 
   assert.ok(!deleted.includes(`hands.${SESSION}`), "kept, as before");
   assert.ok(updated.includes(5),
@@ -142,7 +155,7 @@ test("the handle is kept when the session is running on a DIFFERENT replica", as
   // other replica's view.
   const { kv, deleted } = fakeKv({ runLease: true });
 
-  await runKeepaliveTickForTest({ kv });
+  await runKeepaliveTickForTest({ kv, countActiveShells: idle });
 
   assert.ok(!deleted.includes(`hands.${SESSION}`),
     `a run holds this session somewhere in the fleet, so its handle must survive `

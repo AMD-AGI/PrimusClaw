@@ -19,7 +19,9 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
 import type { KV } from "nats";
-import { runKeepaliveTickForTest, unregisterSandbox } from "../src/sandbox/keepalive.js";
+import {
+  runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
+} from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
@@ -42,6 +44,7 @@ const ENTRY = {
 let restoreProviders: (() => void) | null = null;
 
 afterEach(() => {
+  resetBackgroundWorkStateForTest();
   unregisterSandbox(SESSION);
   restoreProviders?.();
   restoreProviders = null;
@@ -59,8 +62,18 @@ function stubPingableProvider(): void {
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
 }
 
-function fakeKv(): { kv: KV; deleted: string[] } {
+/**
+ * A KV that remembers what was written to it.
+ *
+ * Worth the extra few lines: the sweep writes the entry in one place and re-reads
+ * it in another within the same tick, so a stub whose `get` always answers the
+ * seed value hides whichever write came first -- including the one these tests
+ * are about.
+ */
+function fakeKv(): { kv: KV; deleted: string[]; current: () => Record<string, unknown> } {
   const deleted: string[] = [];
+  let value = sc.encode(JSON.stringify(ENTRY));
+  let revision = 5;
   const kv = {
     async keys(filter = ">") {
       const key = `hands.${SESSION}`;
@@ -69,13 +82,20 @@ function fakeKv(): { kv: KV; deleted: string[] } {
     },
     async get(key: string) {
       if (key !== `hands.${SESSION}` || deleted.includes(key)) return null;
-      return { key, value: sc.encode(JSON.stringify(ENTRY)), revision: 5 };
+      return { key, value, revision };
     },
     async delete(key: string) { deleted.push(key); },
-    async put() { return 1; },
-    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
+    async put() { return ++revision; },
+    async update(_k: string, v: unknown, rev: number) {
+      if (rev !== revision) throw new Error("revision conflict");
+      value = v as Uint8Array;
+      return ++revision;
+    },
   } as unknown as KV;
-  return { kv, deleted };
+  return {
+    kv, deleted,
+    current: () => JSON.parse(sc.decode(value)) as Record<string, unknown>,
+  };
 }
 
 test("an idle handle is kept while the session still has a background shell running", async () => {
@@ -121,8 +141,9 @@ test("no background work leaves the existing expiry untouched", async () => {
   );
 });
 
-test("a probe that throws falls back to the behaviour from before it existed", async () => {
+test("a probe that cannot answer holds the handle instead of expiring it", async () => {
   const { kv, deleted } = fakeKv();
+  stubPingableProvider();
 
   await runKeepaliveTickForTest({
     kv,
@@ -130,9 +151,63 @@ test("a probe that throws falls back to the behaviour from before it existed", a
   });
 
   assert.ok(
-    deleted.includes(`hands.${SESSION}`),
-    "an unreachable Hands must not be able to make things worse than they were; "
-      + "the hole this leaves -- a restarted Hands reports zero for shells that "
-      + "are still running -- is named in the helper, not hidden here",
+    !deleted.includes(`hands.${SESSION}`),
+    "folding \"could not ask\" into \"no work\" is what makes this feature "
+      + "unreliable: over a job long enough to need it, at one probe a minute, "
+      + "a single timeout is close to certain and would delete the handle",
   );
+});
+
+test("a probe that never answers eventually stops holding the handle", async () => {
+  const { kv, deleted } = fakeKv();
+  stubPingableProvider();
+
+  // Unknown is for a blip, not forever: a sandbox that has stopped answering
+  // entirely would otherwise be pinned until its absolute deadline.
+  for (let i = 0; i < 8; i++) {
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async () => { throw new Error("hands unreachable"); },
+    });
+    if (deleted.includes(`hands.${SESSION}`)) break;
+  }
+
+  assert.ok(
+    deleted.includes(`hands.${SESSION}`),
+    "a permanently unreachable Hands must not hold a handle open indefinitely",
+  );
+});
+
+test("work that outlasts the reuse window still leaves a window behind it", async () => {
+  // The bug this pins: idleSince is stamped when the task ends, so a job that
+  // runs longer than the window means the handle is already expired the moment
+  // the job finishes -- deleted by the very next sweep, before the session can
+  // reuse the pod or read what the job wrote.
+  const { kv, current } = fakeKv();
+  stubPingableProvider();
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 1 });
+
+  const idleSince = current().idleSince;
+  assert.equal(typeof idleSince, "number", "the idle clock was never moved while work ran");
+  assert.ok(
+    Date.now() - (idleSince as number) < 60_000,
+    `the stamp has to track the work, not the turn that started it; got ${idleSince}`,
+  );
+});
+
+test("the probe is not repeated on every tick", async () => {
+  // The sweep walks KV serially and this is a network call, so one probe per
+  // handle per tick is what pushes a tick past its own interval once a few
+  // handles stop answering quickly.
+  const { kv } = fakeKv();
+  stubPingableProvider();
+  let probes = 0;
+  const deps = { kv, countActiveShells: async () => { probes += 1; return 1; } };
+
+  await runKeepaliveTickForTest(deps);
+  await runKeepaliveTickForTest(deps);
+  await runKeepaliveTickForTest(deps);
+
+  assert.equal(probes, 1, `three sweeps asked Hands ${probes} times`);
 });

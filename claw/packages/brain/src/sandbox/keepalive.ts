@@ -264,6 +264,62 @@ export function markHandsIdle(
  * (secondary, for crash-recovery of sessions created by a previous Brain pod).
  */
 /**
+ * What a probe of Hands' background-shell registry can tell us.
+ *
+ * Three states rather than a boolean, because "no work" and "could not ask" lead
+ * to opposite decisions and only one of them is safe to guess at. A caller that
+ * folds `unknown` into `idle` deletes the handle the moment a probe times out --
+ * and over a job long enough to need this, at one probe a minute, a single blip
+ * is close to certain.
+ */
+type BackgroundWork = "running" | "idle" | "unknown";
+
+/**
+ * Last probe answer per session, so the sweep does not ask once per handle per
+ * tick.
+ *
+ * The sweep has to know on every tick -- the answer decides whether the sandbox
+ * is pinged, and an unpinged sandbox is reclaimed -- but the answer does not
+ * change on that timescale. Without the cache each idle handle costs an HTTP
+ * round trip inside the sweep's serial KV walk, so a handful of unreachable ones
+ * push a tick past its own interval and the next one starts on top of it.
+ *
+ * The TTL is what an ended job costs: up to this long being pinged after the
+ * last shell exited. That is the harmless direction, and it is why the entry is
+ * not invalidated eagerly.
+ */
+const BG_PROBE_TTL_MS = 5 * 60_000;
+
+/**
+ * Consecutive unanswered probes before a handle is treated as idle after all.
+ *
+ * `unknown` holds the handle, which is right for a blip and wrong forever: a
+ * sandbox that has stopped answering entirely would otherwise be pinned until
+ * its absolute deadline. Five ticks is long enough that no single failure
+ * decides anything and short enough that a dead sandbox is not held for hours.
+ */
+const BG_UNKNOWN_TOLERANCE = 5;
+
+const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
+const bgUnknownStreak = new Map<string, number>();
+
+/** Drop bookkeeping for sessions this sweep no longer sees. */
+function forgetBackgroundWork(sessionId: string): void {
+  bgProbeCache.delete(sessionId);
+  bgUnknownStreak.delete(sessionId);
+}
+
+/**
+ * Clear the probe bookkeeping. Exported for tests, which drive several sweeps
+ * over one session id in one process and would otherwise read each other's
+ * cached answers -- the cache being module state is the point of it.
+ */
+export function resetBackgroundWorkStateForTest(): void {
+  bgProbeCache.clear();
+  bgUnknownStreak.clear();
+}
+
+/**
  * Whether an idle handle's sandbox still has background work running in it.
  *
  * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
@@ -282,35 +338,77 @@ export function markHandsIdle(
  * `runScope`: that is the run *lease* key, a workspace id under
  * RUN_GATE_KEY=workspace, and it would match no owner at all.
  *
- * A failure answers false -- the same decision this code made before the check
- * existed, so an unreachable Hands cannot make things worse than they were. It
- * does leave a hole worth naming: Hands keeps this registry in memory, so a
- * Hands that restarted reports zero for shells that are still running, and the
- * sandbox is then reclaimed as if the turn had left nothing behind.
+ * A handle with no URL or token predates this and cannot be asked; it answers
+ * idle, which is what the sweep did before the question existed.
  */
-async function idleHandleHasBackgroundWork(
+async function backgroundWorkState(
   deps: KeepaliveDeps,
   sessionId: string,
   info: HandsKvEntry,
-): Promise<boolean> {
-  if (!info.handsUrl || !info.token) return false;
+): Promise<BackgroundWork> {
+  if (!info.handsUrl || !info.token) return "idle";
+
+  const cached = bgProbeCache.get(sessionId);
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
+
   try {
     const probe = deps.countActiveShells ?? countActiveShells;
     const running = await probe(info.handsUrl, info.token, sessionId);
-    if (running > 0) {
+    const state: BackgroundWork = running > 0 ? "running" : "idle";
+    bgProbeCache.set(sessionId, { at: Date.now(), state });
+    bgUnknownStreak.delete(sessionId);
+    if (state === "running") {
       logger.info(
         { sessionId, workloadId: info.workloadId, running },
         "keepalive.idle_handle_kept_background_work",
       );
     }
-    return running > 0;
+    return state;
   } catch (err) {
+    const streak = (bgUnknownStreak.get(sessionId) ?? 0) + 1;
+    bgUnknownStreak.set(sessionId, streak);
     logger.warn(
-      { err: (err as Error)?.message ?? err, sessionId },
+      { err: (err as Error)?.message ?? err, sessionId, streak },
       "keepalive.background_work_check_failed",
     );
-    return false;
+    // Give up only after the streak, and say so: from here the handle is on the
+    // ordinary expiry path and whatever was running goes with the sandbox.
+    if (streak > BG_UNKNOWN_TOLERANCE) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, streak },
+        "keepalive.background_work_unknown_giving_up",
+      );
+      return "idle";
+    }
+    return "unknown";
   }
+}
+
+/**
+ * Move the idle clock forward on a handle whose sandbox is still working.
+ *
+ * `idleSince` is stamped once, when the task ended, and the reuse window is
+ * measured from it. Left alone, a background job that outlasts the window means
+ * the handle is already expired the moment the job finishes: the next sweep
+ * deletes it, the next message in the session cannot reuse the pod, and whatever
+ * the job wrote that has not been synced goes with it. Keeping the stamp at the
+ * last moment work was seen gives the session the full window it would have had
+ * if the job had never run.
+ *
+ * Conditional and best-effort, like every other write in this sweep: losing the
+ * race means somebody else just wrote the entry, and their value is the newer
+ * one.
+ */
+async function refreshIdleSince(
+  deps: KeepaliveDeps,
+  key: string,
+  revision: number,
+  info: HandsKvEntry,
+): Promise<void> {
+  try {
+    const next = sc.encode(JSON.stringify({ ...info, idleSince: Date.now() }));
+    await deps.kv.update(key, next, revision);
+  } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
 async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, RegisteredSandbox>> {
@@ -343,7 +441,24 @@ async function collectTargets(deps: KeepaliveDeps): Promise<Map<string, Register
         // Post-task idle reuse handle: keep it for reuse but never ping it, so
         // the pod idles out via the control-plane GC (no extra cost). Refresh
         // its TTL within the reuse window; expire it afterwards.
-        if (info.keepalive === false && !(await idleHandleHasBackgroundWork(deps, sessionId, info))) {
+        // An idle handle whose sandbox is still working is not idle. Three
+        // answers, because "no work" and "could not ask" are not the same
+        // question and only one of them is safe to act on:
+        //
+        //   running  ping it, and move the idle clock forward so the reuse
+        //            window starts when the work stops rather than when the
+        //            turn did
+        //   unknown  ping it and leave the clock alone -- a blip must not be
+        //            what decides this, and the streak inside the probe is what
+        //            stops that becoming forever
+        //   idle     the handle really is spare; the expiry below is unchanged
+        const bgWork = info.keepalive === false
+          ? await backgroundWorkState(deps, sessionId, info)
+          : "idle";
+        if (info.keepalive === false && bgWork === "running") {
+          await refreshIdleSince(deps, key, e.revision, info);
+        }
+        if (info.keepalive === false && bgWork === "idle") {
           const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
           const expired = Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
           // A session this replica is actively running is not idle, whatever
@@ -437,6 +552,13 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
+  }
+  // Same for the background-work bookkeeping, which is keyed by session rather
+  // than by target: a session with no target left is one nothing will ask about
+  // again, and its cached answer would otherwise outlive the sandbox.
+  const live = new Set([...targets.values()].map((t) => t.sessionId));
+  for (const sessionId of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
+    if (!live.has(sessionId)) forgetBackgroundWork(sessionId);
   }
 
   if (!targets.size) return;
@@ -545,8 +667,21 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
     "keepalive.start",
   );
   tick(deps).catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"));
+  // Guarded, because a sweep is not guaranteed to finish inside its interval:
+  // it walks every KV handle serially and can make a network call per idle one.
+  // Overlapping sweeps would double every write in here and race each other's
+  // conditional updates, and the symptom -- handles refreshed twice, others not
+  // at all -- would read as KV flakiness rather than as this.
+  let sweeping = false;
   timer = setInterval(() => {
-    tick(deps).catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"));
+    if (sweeping) {
+      logger.warn({}, "keepalive.tick_still_running");
+      return;
+    }
+    sweeping = true;
+    tick(deps)
+      .catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"))
+      .finally(() => { sweeping = false; });
   }, SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
   timer.unref?.();
 }
