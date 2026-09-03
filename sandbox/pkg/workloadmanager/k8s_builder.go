@@ -1036,99 +1036,144 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 	key := types.NamespacedName{Name: info.SandboxName, Namespace: info.Namespace}
 
 	// Step 1: Find the Sandbox to get the adopted Pod's real name.
-	// The Sandbox name equals the SandboxClaim name (set by the claim controller).
 	// Held rather than deleted here: the Claim has to go first (Step 3).
-	var sandboxToDelete *sandboxv1alpha1.Sandbox
-	sandbox := &sandboxv1alpha1.Sandbox{}
-	if err := c.client.Get(ctx, key, sandbox); err == nil {
-		// Step 2: Delete the adopted Pod directly.
-		// The Pod name may differ from the Sandbox name (WarmPool pod naming).
-		podName := sandbox.Name
-		if annotated, ok := sandbox.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
-			podName = annotated
-		}
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      podName,
-				Namespace: info.Namespace,
-			},
-		}
-		// The Pod's error is kept, and it also gates what happens next.
-		// Dropping it was the zombie this function's own comment describes: the
-		// Pod has no OwnerReference, so nothing cascades to it, and deleting the
-		// Claim below removes the annotation above that names it -- leaving a
-		// Pod that nothing in this teardown path will come back for.
-		//
-		// A nil error is enough to go on. It does not mean the Pod is gone, only
-		// that the API server accepted the deletion and set deletionTimestamp,
-		// and finishing is then the kubelet's. An error is the case worth
-		// stopping for: the deletion may never have been accepted at all, so the
-		// Pod may have no deletionTimestamp and no reason to ever go away.
-		podErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
-		if podErr != nil {
-			// The Claim carries no Pod reference, and this annotation is the
-			// only thing that names the Pod *directly*. Deleting the Sandbox now
-			// would take that name with it, for a Pod that may not be going
-			// anywhere. It would still be reachable the long way round -- the
-			// claim controller labels an adopted Pod with sandbox-name-hash,
-			// which is fnv-1a of this same name and so recomputable without any
-			// of these objects -- but a teardown should not have to be recovered
-			// from by search. So it stops here, with both objects intact.
-			return fmt.Errorf("delete warm-pool pod %s/%s (sandbox %s retained so its %s annotation still names it): %w",
-				info.Namespace, podName, info.SandboxName, "agents.x-k8s.io/pod-name", podErr)
-		}
-
-		sandboxToDelete = sandbox
-	} else if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("get sandbox %s/%s: %w", info.Namespace, info.SandboxName, err)
-	}
-
-	// Step 3: Delete the SandboxClaim -- before the Sandbox, not after.
-	//
-	// The Claim is what the claim controller reconciles, and a live Claim whose
-	// Sandbox has gone missing is precisely its cue to build another one: it
-	// watches Sandboxes it owns, so the deletion below wakes it, and it returns
-	// early only for a Claim that is absent or already terminating. Deleting the
-	// Sandbox first opens a window where neither is true, and what it does in
-	// that window is adopt a second Pod out of the warm pool and strip its
-	// OwnerReferences -- which this teardown then walks away from, having
-	// already accounted for the first one. A second orphan, made by the
-	// rollback, of exactly the kind the Pod handling above exists to prevent.
-	//
-	// Ordering closes it rather than racing it. Once the Claim is gone or
-	// carries a deletionTimestamp there is no reconcile that recreates
-	// anything, so the Sandbox delete that follows cannot be undone.
-	//
-	// It stays after the Pod for the reason it always did: a Pod that would not
-	// delete keeps both records, because the Claim is what a retry finds this
-	// through and the Sandbox is the only thing that still names the Pod. That
-	// gate is above and unchanged -- this step is only reached once the Pod is
-	// gone or was already absent.
-	claim := &extensionsv1alpha1.SandboxClaim{}
-	if err := c.client.Get(ctx, key, claim); err == nil {
-		if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, claim)); err != nil {
-			// The Sandbox is deliberately left behind: it is still the only
-			// thing naming the adopted Pod, and the Claim that survived is what
-			// a retry comes back through.
-			return fmt.Errorf("delete warm-pool claim %s/%s: %w",
-				info.Namespace, info.SandboxName, err)
-		}
-	} else if !k8serrors.IsNotFound(err) {
+	sandbox, err := c.findClaimSandbox(ctx, key, info)
+	if err != nil {
 		return err
 	}
 
-	// Step 4: Delete the Sandbox (triggers Service cleanup by the sandbox
-	// controller). Only reached once the Pod is gone or was already absent, so
-	// the pod-name annotation is being discarded with nothing left to find
-	// through it -- and once the Claim can no longer recreate it.
-	//
-	// The Claim controls the Sandbox, so its deletion may well have taken this
-	// one with it already; IgnoreNotFound is what makes that the same outcome
-	// rather than a failure.
-	if sandboxToDelete == nil {
+	// Step 2: Delete the adopted Pod, before anything that names it.
+	if sandbox != nil {
+		if err := c.deleteAdoptedPod(ctx, info, sandbox); err != nil {
+			return err
+		}
+	}
+
+	// Step 3: Delete the SandboxClaim -- before the Sandbox, not after.
+	if err := c.deleteWarmPoolClaim(ctx, key, info); err != nil {
+		return err
+	}
+
+	// Step 4: Delete the Sandbox, if there was one to begin with.
+	if sandbox == nil {
 		return nil
 	}
-	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandboxToDelete)); err != nil {
+	return c.deleteWarmPoolSandbox(ctx, info, sandbox)
+}
+
+// findClaimSandbox reads the Sandbox a claim-based session was created as.
+//
+// The Sandbox name equals the SandboxClaim name (set by the claim controller),
+// so the claim's key finds it. A Sandbox that is already gone is not a failure
+// -- teardown has less to do, not something to report -- and comes back as a
+// nil Sandbox and a nil error, which is what the caller's steps are written
+// against.
+func (c *K8sSandboxCreator) findClaimSandbox(ctx context.Context, key types.NamespacedName, info *store.SandboxInfo) (*sandboxv1alpha1.Sandbox, error) {
+	sandbox := &sandboxv1alpha1.Sandbox{}
+	if err := c.client.Get(ctx, key, sandbox); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get sandbox %s/%s: %w", info.Namespace, info.SandboxName, err)
+	}
+	return sandbox, nil
+}
+
+// deleteAdoptedPod deletes the Pod the claim controller took out of the warm
+// pool, and gates the rest of the teardown on having done so.
+//
+// The Pod name may differ from the Sandbox name (WarmPool pod naming), and the
+// annotation the claim controller writes is what says so.
+//
+// The Pod's error is kept, and it also gates what happens next.
+// Dropping it was the zombie DeleteSandboxClaim's own comment describes: the
+// Pod has no OwnerReference, so nothing cascades to it, and deleting the
+// Claim afterwards removes the annotation that names it -- leaving a
+// Pod that nothing in this teardown path will come back for.
+//
+// A nil error is enough to go on. It does not mean the Pod is gone, only
+// that the API server accepted the deletion and set deletionTimestamp,
+// and finishing is then the kubelet's. An error is the case worth
+// stopping for: the deletion may never have been accepted at all, so the
+// Pod may have no deletionTimestamp and no reason to ever go away.
+func (c *K8sSandboxCreator) deleteAdoptedPod(ctx context.Context, info *store.SandboxInfo, sandbox *sandboxv1alpha1.Sandbox) error {
+	podName := sandbox.Name
+	if annotated, ok := sandbox.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
+		podName = annotated
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: info.Namespace,
+		},
+	}
+	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod)); err != nil {
+		// The Claim carries no Pod reference, and this annotation is the
+		// only thing that names the Pod *directly*. Deleting the Sandbox now
+		// would take that name with it, for a Pod that may not be going
+		// anywhere. It would still be reachable the long way round -- the
+		// claim controller labels an adopted Pod with sandbox-name-hash,
+		// which is fnv-1a of this same name and so recomputable without any
+		// of these objects -- but a teardown should not have to be recovered
+		// from by search. So it stops here, with both objects intact.
+		return fmt.Errorf("delete warm-pool pod %s/%s (sandbox %s retained so its %s annotation still names it): %w",
+			info.Namespace, podName, info.SandboxName, "agents.x-k8s.io/pod-name", err)
+	}
+	return nil
+}
+
+// deleteWarmPoolClaim deletes the SandboxClaim -- before the Sandbox, not
+// after.
+//
+// The Claim is what the claim controller reconciles, and a live Claim whose
+// Sandbox has gone missing is precisely its cue to build another one: it
+// watches Sandboxes it owns, so deleting one wakes it, and it returns
+// early only for a Claim that is absent or already terminating. Deleting the
+// Sandbox first opens a window where neither is true, and what it does in
+// that window is adopt a second Pod out of the warm pool and strip its
+// OwnerReferences -- which this teardown then walks away from, having
+// already accounted for the first one. A second orphan, made by the
+// rollback, of exactly the kind the Pod handling exists to prevent.
+//
+// Ordering closes it rather than racing it. Once the Claim is gone or
+// carries a deletionTimestamp there is no reconcile that recreates
+// anything, so the Sandbox delete that follows cannot be undone.
+//
+// It stays after the Pod for the reason it always did: a Pod that would not
+// delete keeps both records, because the Claim is what a retry finds this
+// through and the Sandbox is the only thing that still names the Pod. That
+// gate is the caller's and unchanged -- this step is only reached once the Pod
+// is gone or was already absent.
+func (c *K8sSandboxCreator) deleteWarmPoolClaim(ctx context.Context, key types.NamespacedName, info *store.SandboxInfo) error {
+	claim := &extensionsv1alpha1.SandboxClaim{}
+	if err := c.client.Get(ctx, key, claim); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, claim)); err != nil {
+		// The Sandbox is deliberately left behind: it is still the only
+		// thing naming the adopted Pod, and the Claim that survived is what
+		// a retry comes back through.
+		return fmt.Errorf("delete warm-pool claim %s/%s: %w",
+			info.Namespace, info.SandboxName, err)
+	}
+	return nil
+}
+
+// deleteWarmPoolSandbox deletes the Sandbox (triggering Service cleanup by the
+// sandbox controller).
+//
+// Only reached once the Pod is gone or was already absent, so the pod-name
+// annotation is being discarded with nothing left to find through it -- and
+// once the Claim can no longer recreate it.
+//
+// The Claim controls the Sandbox, so its deletion may well have taken this
+// one with it already; IgnoreNotFound is what makes that the same outcome
+// rather than a failure.
+func (c *K8sSandboxCreator) deleteWarmPoolSandbox(ctx context.Context, info *store.SandboxInfo, sandbox *sandboxv1alpha1.Sandbox) error {
+	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox)); err != nil {
 		return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
 			info.Namespace, info.SandboxName, err)
 	}
