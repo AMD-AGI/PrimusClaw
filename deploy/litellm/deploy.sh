@@ -201,7 +201,12 @@ configure_models_interactive() {
     read -r -s -p "[litellm] Provider API key: " pkey; echo
   fi
 
-    purl="${purl%/}"
+  # Out of the environment now that they are in locals: everything below runs
+  # helm, kubectl and python as children, and each would otherwise inherit the
+  # key -- visible in /proc/<child>/environ for the life of those processes.
+  unset LITELLM_PROVIDER_TYPE LITELLM_PROVIDER_URL LITELLM_PROVIDER_API_KEY
+
+  purl="${purl%/}"
   [ -n "$purl" ] || fail "provider base URL is required"
   [ -n "$pkey" ] || fail "provider API key is required"
   command -v curl >/dev/null || fail "curl not found (required for model discovery)"
