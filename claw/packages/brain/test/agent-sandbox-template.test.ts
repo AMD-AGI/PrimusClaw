@@ -15,7 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  renderTemplate, templateHashKey, type BaseTemplate,
+  renderTemplate, templateHashKey, lifetimeOverrides, type BaseTemplate,
 } from "../src/sandbox/agent-sandbox-provider.js";
 import type { SandboxCreateParams } from "../src/sandbox/provider.js";
 import {
@@ -88,114 +88,74 @@ test("a differing pool size would select a differing template", () => {
     "the key has to actually vary with the size, not merely mention it");
 });
 
-// --- idle timeout ---
+// --- lifetime overrides ---
 //
 // The sandbox is deleted once `lastActivity + sessionTimeout` passes, and only
 // Router traffic moves lastActivity -- computation inside the pod does not. So
-// the timeout is what decides whether a long job that outlives its agent turn
-// survives, and until this knob existed every sandbox took the controller
-// default of 15m no matter what it was built for. Two properties matter: an
-// unset knob must not overwrite a base that made its own choice, and a set one
-// must reach the content-addressed name.
+// the timeout decides whether a job that outlives its agent turn survives, and
+// maxSessionDuration is the deadline underneath it that nothing moves at all.
+// Until these existed every sandbox took 15m and 24h no matter what it was for.
+//
+// They travel as Workload Manager create overrides, not in the rendered
+// template, and the second half of that is what these pin: the template name is
+// a content hash, so baking a per-workload value into the spec would give every
+// distinct timeout its own CodeInterpreter -- and its own warm pool.
 
-test("an unset timeout leaves the base's own value alone", () => {
-  const { spec } = renderTemplate(foreignBase, params);
-
-  assert.equal(
-    spec.sessionTimeout,
-    AGENT_SANDBOX_SESSION_TIMEOUT || "30m",
-    "a ConfigMap that sets sessionTimeout meant it; substituting a default "
-      + "here would silently shorten every sandbox that deployment builds",
+test("nothing is sent when neither the caller nor the deployment asked", () => {
+  assert.deepEqual(
+    lifetimeOverrides(params),
+    {
+      ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
+      ...(AGENT_SANDBOX_MAX_SESSION_DURATION ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
+    },
+    "an override that is sent empty is still an override: it would replace a "
+      + "base template's own value with nothing",
   );
 });
 
-test("a per-request timeout wins over both the base and the deployment default", () => {
-  const { spec } = renderTemplate(foreignBase, { ...params, sessionTimeout: "6h" });
+test("a caller's values are sent as overrides", () => {
+  assert.deepEqual(
+    lifetimeOverrides({ ...params, sessionTimeout: "6h", maxSessionDuration: "72h" }),
+    { sessionTimeout: "6h", maxSessionDuration: "72h" },
+  );
+});
 
-  assert.equal(spec.sessionTimeout, "6h",
+test("a caller beats the deployment default", () => {
+  const got = lifetimeOverrides({ ...params, sessionTimeout: "6h" });
+
+  assert.equal(got.sessionTimeout, "6h",
     "the per-request knob is the one a long-running workload can reach without "
       + "moving the floor for every other sandbox");
 });
 
-test("a blank per-request timeout falls through rather than clearing the value", () => {
-  const { spec } = renderTemplate(foreignBase, { ...params, sessionTimeout: "   " });
+test("whitespace is not a request for a zero-length window", () => {
+  const got = lifetimeOverrides({ ...params, sessionTimeout: "   " });
+
+  assert.equal(got.sessionTimeout, AGENT_SANDBOX_SESSION_TIMEOUT || undefined);
+});
+
+test("the two are independent", () => {
+  assert.deepEqual(
+    lifetimeOverrides({ ...params, maxSessionDuration: "72h" }),
+    {
+      ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
+      maxSessionDuration: "72h",
+    },
+    "asking to live longer is not asking for a longer idle window, and a "
+      + "sandbox given the second without the first is still reclaimed early",
+  );
+});
+
+test("neither value reaches the template name", () => {
+  // The regression this exists for: adding them to the hash renamed every
+  // template on upgrade even for deployments that set nothing, orphaning the
+  // old CodeInterpreters and -- with a warm pool -- leaving a pool behind each.
+  const plain = templateHashKey(foreignBase, params);
 
   assert.equal(
-    spec.sessionTimeout,
-    AGENT_SANDBOX_SESSION_TIMEOUT || "30m",
-    "whitespace is not a request for a zero-length idle window",
+    templateHashKey(foreignBase, { ...params, sessionTimeout: "6h", maxSessionDuration: "72h" }),
+    plain,
+    "these are per-request overrides; a template that varies with them is a "
+      + "template per workload",
   );
-});
-
-test("the timeout reaches the template name", () => {
-  // Same limitation as the pool size: one process reads the env once, so this
-  // pins the hashable property rather than two live values. Without it, asking
-  // for a longer timeout would resolve back to the template built with the old
-  // one and change nothing.
-  assert.match(
-    templateHashKey(foreignBase, { ...params, sessionTimeout: "6h" }),
-    /idle=6h/,
-    "a timeout that is not hashed is a timeout that cannot be changed",
-  );
-});
-
-test("a differing timeout selects a differing template", () => {
-  const a = templateHashKey(foreignBase, { ...params, sessionTimeout: "6h" });
-  const b = templateHashKey(foreignBase, { ...params, sessionTimeout: "12h" });
-
-  assert.notEqual(a, b,
-    "two workloads with different lifetimes must not share one template");
-});
-
-// --- absolute lifetime ---
-//
-// The other end of the clamp, and the one nothing recovers from: sessionTimeout
-// is pushed back by activity, while maxSessionDuration lands on the CR as an
-// absolute ShutdownTime enforced by a controller that reads no state. Keeping a
-// sandbox past it is not possible from this side, so a run that needs longer has
-// to say so before it starts. The platform sets no ceiling -- the 24h everything
-// got came from a literal in the inline skeleton.
-
-test("an unset lifetime leaves the base's own value alone", () => {
-  const { spec } = renderTemplate(foreignBase, params);
-
-  assert.equal(
-    spec.maxSessionDuration,
-    AGENT_SANDBOX_MAX_SESSION_DURATION || "48h",
-    "a base that raised the ceiling deliberately must not be talked back down: "
-      + "nothing can extend this one once the sandbox exists",
-  );
-});
-
-test("a per-request lifetime wins over both the base and the deployment default", () => {
-  const { spec } = renderTemplate(foreignBase, { ...params, maxSessionDuration: "72h" });
-
-  assert.equal(spec.maxSessionDuration, "72h");
-});
-
-test("the two clamps are set independently", () => {
-  const { spec } = renderTemplate(foreignBase, {
-    ...params, sessionTimeout: "6h", maxSessionDuration: "72h",
-  });
-
-  assert.equal(spec.sessionTimeout, "6h");
-  assert.equal(spec.maxSessionDuration, "72h",
-    "asking for a longer idle window is not the same as asking to live longer, "
-      + "and a sandbox given the first without the second still dies on schedule");
-});
-
-test("the lifetime reaches the template name", () => {
-  assert.match(
-    templateHashKey(foreignBase, { ...params, maxSessionDuration: "72h" }),
-    /life=72h/,
-    "a lifetime that is not hashed resolves back to the template built with the "
-      + "old one, and asking for longer changes nothing",
-  );
-});
-
-test("a differing lifetime selects a differing template", () => {
-  const a = templateHashKey(foreignBase, { ...params, maxSessionDuration: "48h" });
-  const b = templateHashKey(foreignBase, { ...params, maxSessionDuration: "72h" });
-
-  assert.notEqual(a, b);
 });

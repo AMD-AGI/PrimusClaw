@@ -154,21 +154,25 @@ function extractHost(entryPoint?: string): string {
  * must never collide with another's.
  */
 /**
- * The idle timeout this sandbox should carry: the caller's, else the
- * deployment default, else nothing -- "nothing" leaving the base template's own
- * value in place rather than substituting one.
+ * The lifetime overrides this sandbox should be created with: the caller's
+ * value, else the deployment default, else nothing.
+ *
+ * Sent as Workload Manager create overrides rather than written into the
+ * rendered template, which is the difference between a knob and a template
+ * explosion. The template name is a content hash, so a value baked into the
+ * spec makes every distinct timeout its own CodeInterpreter -- and a knob whose
+ * whole point is to differ per workload would then leave one template, and one
+ * warm pool, per value. Overrides are the path the Workload Manager documents
+ * for exactly this, they cost no template, and an empty one is simply not sent,
+ * so a base template that set its own value keeps it.
  */
-function resolveSessionTimeout(params: SandboxCreateParams): string {
-  return params.sessionTimeout?.trim() || AGENT_SANDBOX_SESSION_TIMEOUT;
-}
-
-/**
- * The absolute lifetime this sandbox should carry, resolved the same way and
- * meaning the same thing by its absence: nothing here leaves the base
- * template's own value in place.
- */
-function resolveMaxSessionDuration(params: SandboxCreateParams): string {
-  return params.maxSessionDuration?.trim() || AGENT_SANDBOX_MAX_SESSION_DURATION;
+export function lifetimeOverrides(params: SandboxCreateParams): Record<string, string> {
+  const idle = params.sessionTimeout?.trim() || AGENT_SANDBOX_SESSION_TIMEOUT;
+  const life = params.maxSessionDuration?.trim() || AGENT_SANDBOX_MAX_SESSION_DURATION;
+  return {
+    ...(idle ? { sessionTimeout: idle } : {}),
+    ...(life ? { maxSessionDuration: life } : {}),
+  };
 }
 
 export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams): string {
@@ -177,8 +181,6 @@ export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams)
     base.digest, params.userId ?? "", params.image,
     r.cpu, r.memory, r.ephemeralStorage, r.gpu,
     `warm=${AGENT_SANDBOX_WARM_POOL_SIZE}`,
-    `idle=${resolveSessionTimeout(params)}`,
-    `life=${resolveMaxSessionDuration(params)}`,
   ].join("|");
 }
 
@@ -219,20 +221,6 @@ export function renderTemplate(base: BaseTemplate, params: SandboxCreateParams):
   // skeleton alike. What raising it costs, and what had to change before it
   // could be raised at all, is in the AGENT_SANDBOX_WARM_POOL_SIZE comment.
   spec.warmPoolSize = AGENT_SANDBOX_WARM_POOL_SIZE;
-
-  // Only when asked for. Unlike the warm pool, unset here does not mean "use the
-  // default" but "whatever the base decided": a mounted ConfigMap may carry a
-  // deliberate sessionTimeout, and overwriting that with a value nobody asked
-  // for would quietly shorten every sandbox the deployment builds.
-  const idleTimeout = resolveSessionTimeout(params);
-  if (idleTimeout) spec.sessionTimeout = idleTimeout;
-
-  // Same rule, same reason. Worth stating separately because the failure is
-  // quieter: an idle timeout that is too short reclaims a sandbox that could
-  // have been kept alive, while this one reclaims it no matter what anybody
-  // does, so a base that raised it deliberately must not be talked back down.
-  const maxLifetime = resolveMaxSessionDuration(params);
-  if (maxLifetime) spec.maxSessionDuration = maxLifetime;
 
   const name = "primus-claw-" + sha256Short(templateHashKey(base, params));
   logger.info({ source: base.source, digest: base.digest, renderedName: name, image: params.image, resources: r }, "agent-sandbox.template_rendered");
@@ -277,6 +265,7 @@ export class AgentSandboxProvider implements SandboxProvider {
         overrides: {
           environment: params.env,
           ...(params.labels ? { labels: params.labels } : {}),
+          ...lifetimeOverrides(params),
         },
       }),
       timeoutMs: CREATE_TIMEOUT_MS,

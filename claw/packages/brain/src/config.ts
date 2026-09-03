@@ -211,13 +211,43 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * `SandboxCreateParams.sessionTimeout` for the one workload that needs it over
  * moving the floor for all of them.
  */
+/**
+ * A Go duration in whole nanoseconds, or null if it is not one worth sending.
+ *
+ * Three ways a well-formed string is still not a value the Workload Manager will
+ * use, and it refuses all three the same way -- silently, leaving the default in
+ * place while the operator believes they configured something:
+ *
+ *   `0s`       parses, but the override is only applied when positive
+ *   `0.1ns`    parses to zero, because a Go duration is whole nanoseconds
+ *   `1e6h`     overflows int64 and does not parse at all
+ *
+ * Nanoseconds rather than milliseconds so the truncation happens here, in the
+ * same units and the same direction Go does it.
+ */
+const GO_DURATION_NS: Record<string, number> = {
+  ns: 1, us: 1e3, "\u00b5s": 1e3, ms: 1e6, s: 1e9, m: 6e10, h: 3.6e12,
+};
+const GO_DURATION_MAX_NS = 2 ** 63 - 1;
+
+export function goDurationNs(value: string): number | null {
+  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(value)) return null;
+  let total = 0;
+  for (const [, n, unit] of value.matchAll(/(\d+(?:\.\d+)?)(ns|us|\u00b5s|ms|s|m|h)/g)) {
+    total += Number(n) * GO_DURATION_NS[unit];
+  }
+  const whole = Math.trunc(total);
+  if (!Number.isFinite(whole) || whole <= 0 || whole > GO_DURATION_MAX_NS) return null;
+  return whole;
+}
+
 function resolveAgentSandboxSessionTimeout(): string {
   const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
   if (!configured) return "";
-  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(configured)) {
+  if (goDurationNs(configured) === null) {
     settingProblems.push(
-      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a Go duration ` +
-        `(e.g. "90m", "2h30m"); leaving the template's own value`,
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a positive Go duration `
+        + `(e.g. "90m", "2h30m"); leaving the template's own value`,
     );
     return "";
   }
@@ -251,10 +281,10 @@ export const AGENT_SANDBOX_SESSION_TIMEOUT = resolveAgentSandboxSessionTimeout()
 function resolveAgentSandboxMaxSessionDuration(): string {
   const configured = env("AGENT_SANDBOX_MAX_SESSION_DURATION");
   if (!configured) return "";
-  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(configured)) {
+  if (goDurationNs(configured) === null) {
     settingProblems.push(
-      `AGENT_SANDBOX_MAX_SESSION_DURATION=${configured} is not a Go duration `
-        + `(e.g. "48h", "36h30m"); leaving the template's own value`,
+      `AGENT_SANDBOX_MAX_SESSION_DURATION=${configured} is not a positive Go `
+        + `duration (e.g. "48h", "36h30m"); leaving the template's own value`,
     );
     return "";
   }
