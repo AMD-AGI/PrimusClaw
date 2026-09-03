@@ -20,7 +20,10 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
@@ -152,5 +155,72 @@ func TestNoEventWhenTheDeleteIsRefused(t *testing.T) {
 	}
 	if events := drain(rec); len(events) != 0 {
 		t.Errorf("the sandbox is still there; got %v", events)
+	}
+}
+
+func TestNoEventWhenSomethingElseDeletedItFirst(t *testing.T) {
+	// A user deleting their own sandbox, or another controller tearing it down,
+	// races this reconcile and wins. The delete comes back NotFound, which is a
+	// fine outcome -- the sandbox is gone -- but filing it as IdleReclaimed
+	// attributes their action to the idle collector and counts it against a
+	// timeout that had nothing to do with it.
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sandboxCR(testSession)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object, ...ctrlclient.DeleteOption) error {
+				return apierrors.NewNotFound(
+					schema.GroupResource{
+						Group:    sandboxv1alpha1.GroupVersion.Group,
+						Resource: "sandboxes",
+					}, testSandbox)
+			},
+		}).Build()
+	st := store.NewMemoryStore()
+	rec := record.NewFakeRecorder(8)
+	r := &SandboxReconciler{
+		Client: c, Scheme: scheme, SessionTimeout: 15 * time.Minute,
+		Store: st, Recorder: rec, startedAt: time.Now().Add(-72 * time.Hour),
+	}
+	seedSession(t, st, testSession, 30*time.Minute)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testSandbox, Namespace: testNamespace},
+	}); err != nil {
+		t.Fatalf("a NotFound on delete is not an error: %v", err)
+	}
+	if events := drain(rec); len(events) != 0 {
+		t.Errorf("somebody else's teardown, filed as ours; got %v", events)
+	}
+}
+
+func TestATerminatingSandboxIsLeftAlone(t *testing.T) {
+	// Something already asked for it to go. Re-issuing the delete changes
+	// nothing, and claiming the reclaim takes credit for a decision made
+	// elsewhere.
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	sb := sandboxCR(testSession)
+	now := metav1.NewTime(time.Now())
+	sb.DeletionTimestamp = &now
+	sb.Finalizers = []string{"test/hold"}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).Build()
+	st := store.NewMemoryStore()
+	rec := record.NewFakeRecorder(8)
+	r := &SandboxReconciler{
+		Client: c, Scheme: scheme, SessionTimeout: 15 * time.Minute,
+		Store: st, Recorder: rec, startedAt: time.Now().Add(-72 * time.Hour),
+	}
+	seedSession(t, st, testSession, 30*time.Minute)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testSandbox, Namespace: testNamespace},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if events := drain(rec); len(events) != 0 {
+		t.Errorf("it was already going; got %v", events)
 	}
 }

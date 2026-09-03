@@ -136,6 +136,13 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// Already on its way out, by somebody else's decision. Reconciling it would
+	// at best re-issue a delete that changes nothing and at worst attribute
+	// another controller's teardown -- or a user's -- to the idle collector.
+	if !sandbox.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
 	lastActivity, err := r.resolveLastActivity(ctx, sandbox)
 	if err != nil {
 		// Neither case reclaims, but they are not the same event and should not
@@ -201,15 +208,22 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Emit audit event BEFORE deletion so callers can observe the cause.
 		// Fire-and-forget: never block the GC on audit failures.
 		r.emitIdleDeletedEvent(ctx, sandbox, lastActivity, timeout)
-		if err := r.Delete(ctx, sandbox); err != nil && client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, err
+		deleteErr := r.Delete(ctx, sandbox)
+		if deleteErr != nil && client.IgnoreNotFound(deleteErr) != nil {
+			return ctrl.Result{}, deleteErr
 		}
-		// After the delete, not before it: an Event saying a sandbox was reclaimed
-		// while it is still there because RBAC, a webhook or a flaky API call
-		// refused the delete is worse than no Event -- it is the one an operator
-		// would trust. A NotFound is a success here; something else got there
-		// first and the sandbox is gone either way.
-		r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
+		// Only when this call is the one that removed it, and only after it did.
+		//
+		// Before the delete, an Event would claim a reclaim that RBAC, a webhook
+		// or a flaky API call then refused -- and the Event is the thing an
+		// operator trusts, so it would send them looking for a pod still sitting
+		// there. On a NotFound it would claim someone else's teardown: a user
+		// deleting their own sandbox, or another controller, filed under
+		// IdleReclaimed and counted against an idle timeout that had nothing to
+		// do with it.
+		if deleteErr == nil {
+			r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
+		}
 		// Reached whether this call removed the Sandbox or found it already gone --
 		// something else deleting it first still leaves the mapping stale, and the
 		// session id is in hand either way. Safe to run on that path because
