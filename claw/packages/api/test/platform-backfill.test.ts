@@ -15,6 +15,7 @@
  *   R2 a row whose columns are already filled is not overwritten
  *   R3 rows with no sandbox are not asked about
  *   R4 a SaFE that is down does not fail the sweep
+ *   R5 the lost-lease reaper asks while the workload detail still exists
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -27,6 +28,7 @@ process.env.SAFE_API_URL = "http://safe.test";
 
 const { db } = await import("../src/infra/db.js");
 const { backfillPlatformFacts } = await import("../src/tasks/platform-backfill.js");
+const { reapLostLeases } = await import("../src/tasks/sweeper.js");
 
 const originalQuery = db.query;
 const originalFetch = globalThis.fetch;
@@ -122,4 +124,39 @@ test("R4 a SaFE that is down does not fail the sweep", async () => {
     ]),
     0,
   );
+});
+
+test("R5 a lost lease backfills the platform account of the dead worker", async () => {
+  const h: Harness = { updates: [], fetched: [] };
+  db.query = (async (text: string, params: unknown[] = []) => {
+    if (/lease_expires_at IS NOT NULL/.test(text)) {
+      return {
+        rows: [{
+          task_id: "ktsk_lost",
+          session_id: "s1",
+          origin: "dag_node",
+          lease_owner: "brain-1",
+          message_id: null,
+          sandbox_workload_id: "wl-lost",
+        }],
+        rowCount: 1,
+      };
+    }
+    if (/FROM claw_sessions/.test(text)) {
+      return { rows: [{ config: { platform_key: "pk-1" } }], rowCount: 1 };
+    }
+    if (/UPDATE claw_tasks/.test(text)) {
+      h.updates.push(params);
+      return { rows: [], rowCount: 1 };
+    }
+    throw new Error(`unexpected query: ${text}`);
+  }) as typeof db.query;
+  globalThis.fetch = (async (url: string) => {
+    h.fetched.push(String(url));
+    return { ok: true, status: 200, json: async () => DETAIL } as unknown as Response;
+  }) as typeof globalThis.fetch;
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(h.fetched, ["http://safe.test/api/v1/workloads/wl-lost"]);
+  assert.equal(h.updates.length, 1, "the platform facts were not written to the reaped row");
 });

@@ -373,6 +373,13 @@ function buildExecuteRequest(opts: {
     callback_url: updated.callback_url ?? undefined,
     backend_mcp_url: updated.backend_mcp_url ?? undefined,
     backend_internal_token: internalToken,
+    // The same per-task token authenticates callbacks, backend MCP calls, and
+    // this task's lease endpoint. Brain renews immediately and then
+    // periodically, so a long budget controls policy while the lease answers
+    // the independent question of whether a worker is still alive.
+    run_lease: updated.callback_url
+      ? { url: `${updated.callback_url}/lease`, token: internalToken }
+      : undefined,
     mode: (updated.mode as "llm" | "script") ?? "llm",
     workspace_throwaway: updated.workspace_throwaway === true ? true : undefined,
     sandbox_spec: sandboxSpecForBrain,

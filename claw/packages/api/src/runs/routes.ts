@@ -6,7 +6,7 @@
  *
  *   GET /v1/runs/:runId
  *   GET /v1/runs?ids=a,b,c
- *   GET /v1/runs?state=terminal&since=<iso>&limit=N
+ *   GET /v1/runs?state=terminal&since=<iso>&limit=N&cursor=<opaque>
  *
  * Separate from `/v1/tasks/:id` on purpose. That surface answers in session
  * terms -- prompts, captures, DAG structure -- and a dispatcher above Claw needs
@@ -42,6 +42,7 @@ const logger = pino({ name: "runs-routes" });
  */
 const MAX_BATCH = 1000;
 const DEFAULT_LIMIT = 200;
+const MAX_CURSOR_LENGTH = 2048;
 
 /**
  * Ids one `?ids=` call may name, which is a smaller number than MAX_BATCH.
@@ -70,6 +71,8 @@ interface RunRow {
   started_at: string | Date | null;
   completed_at: string | Date | null;
   deadline_at: string | Date | null;
+  /** PostgreSQL's exact text, preserving precision beyond JavaScript milliseconds. */
+  cursor_completed_at?: string;
 }
 
 const SELECT_COLUMNS = `
@@ -126,6 +129,38 @@ function parseIds(raw: string): string[] {
   return [...seen];
 }
 
+interface RunCursor {
+  completedAt: string;
+  taskId: string;
+}
+
+function encodeCursor(row: RunRow): string {
+  const completedAt = row.cursor_completed_at ?? iso(row.completed_at);
+  return Buffer.from(JSON.stringify([completedAt, row.task_id]), "utf8").toString("base64url");
+}
+
+function decodeCursor(raw: string): RunCursor | null {
+  if (!raw || raw.length > MAX_CURSOR_LENGTH || !/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  try {
+    const value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as unknown;
+    if (!Array.isArray(value) || value.length !== 2) return null;
+    const [completedAt, taskId] = value;
+    if (
+      typeof completedAt !== "string"
+      || Number.isNaN(new Date(completedAt).getTime())
+      || typeof taskId !== "string"
+      || taskId.trim() === ""
+    ) {
+      return null;
+    }
+    // Keep the timestamp exactly as PostgreSQL returned it. Reformatting through
+    // Date would truncate microseconds and can skip a neighbouring row.
+    return { completedAt, taskId };
+  } catch {
+    return null;
+  }
+}
+
 export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
   // No auth hook here on purpose: index.ts registers authMiddleware once for the
   // whole app, and this instance is not encapsulated, so adding one here runs
@@ -168,10 +203,15 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
       state?: string;
       since?: string;
       limit?: string;
+      cursor?: string;
     };
     const s = scope(req);
+    const hasCursor = q.cursor !== undefined;
 
     if (q.ids) {
+      if (hasCursor) {
+        return reply.status(400).send({ ok: false, error: "cursor_not_allowed_with_ids" });
+      }
       const ids = parseIds(q.ids);
       if (ids.length === 0) {
         return reply.status(400).send({ ok: false, error: "ids must not be empty" });
@@ -201,10 +241,29 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
       return { runs: (r.rows as RunRow[]).map(toRunView), requested: ids.length };
     }
 
-    const limit = Math.min(Math.max(Number(q.limit) || DEFAULT_LIMIT, 1), MAX_BATCH);
+    let limit = DEFAULT_LIMIT;
+    if (q.limit !== undefined) {
+      if (!/^\d+$/.test(q.limit)) {
+        return reply.status(400).send({ ok: false, error: "limit must be a whole number" });
+      }
+      limit = Number(q.limit);
+      if (limit < 1 || limit > MAX_BATCH) {
+        return reply.status(400).send({
+          ok: false,
+          error: `limit must be between 1 and ${MAX_BATCH}`,
+        });
+      }
+    }
     const wantsTerminal = (q.state ?? "").toLowerCase() === "terminal";
-    const since = q.since ? new Date(q.since) : null;
-    if (since && Number.isNaN(since.getTime())) {
+    if (hasCursor && !wantsTerminal) {
+      return reply.status(400).send({ ok: false, error: "cursor_requires_terminal_state" });
+    }
+    const cursor = hasCursor ? decodeCursor(q.cursor ?? "") : null;
+    if (hasCursor && !cursor) {
+      return reply.status(400).send({ ok: false, error: "invalid_cursor" });
+    }
+    const since = q.since?.trim() || null;
+    if (since && Number.isNaN(new Date(since).getTime())) {
       return reply.status(400).send({ ok: false, error: "since must be an ISO timestamp" });
     }
 
@@ -212,21 +271,39 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
     const filters: string[] = [];
     if (wantsTerminal) filters.push(`status IN ('completed','failed','cancelled')`);
     if (since) {
-      params.push(since.toISOString());
+      params.push(since);
       filters.push(`completed_at >= $${params.length}`);
+    }
+    if (cursor) {
+      params.push(cursor.completedAt, cursor.taskId);
+      filters.push(
+        `(completed_at, task_id) < ($${params.length - 1}::timestamptz, $${params.length})`,
+      );
     }
     const scoped = s.clause.replace("$USER", `$${params.length + 1}`);
     if (s.params.length) params.push(...s.params);
-    params.push(limit);
+    params.push(wantsTerminal ? limit + 1 : limit);
 
     const r = await db.query(
-      `SELECT ${SELECT_COLUMNS} FROM claw_tasks
+      `SELECT ${SELECT_COLUMNS}${wantsTerminal
+        ? ", completed_at::text AS cursor_completed_at"
+        : ""} FROM claw_tasks
         WHERE ${filters.length ? filters.join(" AND ") : "TRUE"} ${scoped}
-        ORDER BY completed_at DESC NULLS LAST
+        ORDER BY completed_at DESC NULLS LAST, task_id DESC
         LIMIT $${params.length}`,
       params,
     );
     logger.debug({ count: r.rowCount, wantsTerminal }, "runs.list");
-    return { runs: (r.rows as RunRow[]).map(toRunView), limit };
+    const fetched = r.rows as RunRow[];
+    if (!wantsTerminal) return { runs: fetched.map(toRunView), limit };
+
+    const hasMore = fetched.length > limit;
+    const page = hasMore ? fetched.slice(0, limit) : fetched;
+    return {
+      runs: page.map(toRunView),
+      limit,
+      has_more: hasMore,
+      next_cursor: hasMore ? encodeCursor(page.at(-1)!) : null,
+    };
   });
 }

@@ -23,9 +23,11 @@
  *   B8 a refused publish fails the row; one that only went quiet leaves it open
  *   B9 a payload that will not serialise is a publish that certainly failed
  *   B10 a queued chat doorbell is put back without moving a claimed lease
+ *   B11 dispatched task and DAG runs carry their scoped lease credential
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import { db } from "../src/infra/db.js";
 
@@ -249,6 +251,38 @@ test("B7 the run that took it does not claim the write side at dispatch time", a
   assert.ok(
     !seen.some((q) => /SET writer_run_id = \$2/.test(q.sql)),
     "a measurement of dispatch batches is not a measurement of concurrent writes",
+  );
+});
+
+test("B11 a dispatched task carries the lease credential Brain renews", async () => {
+  const callbackUrl = "http://api.test/v1/internal/tasks/ktsk_1";
+  const seen = stubDb(
+    new Date().toISOString(),
+    WORKSPACE_BOUND,
+    {},
+    { callback_url: callbackUrl },
+  );
+  let request: Record<string, unknown> = {};
+  taskPublisher.publish = async (payload) => {
+    request = JSON.parse(payload) as Record<string, unknown>;
+  };
+
+  assert.equal((await dispatchTask("ktsk_1")).ok, true);
+
+  const token = String(request.backend_internal_token ?? "");
+  assert.match(token, /^[a-f0-9]{64}$/);
+  assert.deepEqual(request.run_lease, {
+    url: `${callbackUrl}/lease`,
+    token,
+  });
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  assert.ok(
+    seen.some((query) => query.params.includes(tokenHash)),
+    "the database must hold only the token hash used by internalTaskAuth",
+  );
+  assert.ok(
+    !seen.some((query) => query.params.includes(token)),
+    "the bearer token must exist only in the request sent to Brain",
   );
 });
 

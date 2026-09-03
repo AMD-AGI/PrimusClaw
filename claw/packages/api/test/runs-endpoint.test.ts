@@ -9,13 +9,18 @@
  * rested on reading two constants. Numbers in constants are exactly what drifts.
  *
  * Coverage:
- *   R1 one sweep's worth of runs comes back in a single call
+ *   R1 a full batch of runs comes back in a single call
  *   R2 more ids than a call may carry is refused, not silently trimmed
- *   R3 the terminal listing defaults to the width the dispatcher needs
+ *   R3 the terminal listing reads one extra row to report whether a page follows
  *   R4 a run is rendered with the platform's account of its ending
+ *   R5 equal timestamps paginate by task id without overlap
+ *   R6 malformed cursors and limits fail before querying
+ *   R7 the database index follows the cursor's complete ordering
  */
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { db } from "../src/infra/db.js";
@@ -24,6 +29,8 @@ import { registerRunRoutes } from "../src/runs/routes.js";
 const originalQuery = db.query;
 let app: FastifyInstance;
 let lastParams: unknown[] = [];
+let lastSql = "";
+let queryCalls = 0;
 
 before(async () => {
   app = Fastify();
@@ -48,16 +55,15 @@ function row(id: string, over: Record<string, unknown> = {}) {
 }
 
 function serve(rows: unknown[]): void {
-  db.query = (async (_text: string, params: unknown[] = []) => {
+  db.query = (async (text: string, params: unknown[] = []) => {
+    queryCalls++;
+    lastSql = text.replace(/\s+/g, " ").trim();
     lastParams = params;
     return { rows, rowCount: rows.length };
   }) as typeof db.query;
 }
 
-test("R1 one sweep's worth of runs comes back in a single call", async () => {
-  // 200 concurrent runs is the stated width of one reconcile pass at full
-  // concurrency, and the reason the batch form exists at all: point queries
-  // would be 200 calls per 30-second tick.
+test("R1 a full batch of runs comes back in a single call", async () => {
   const ids = Array.from({ length: 200 }, (_, i) => `ktsk_${String(i).padStart(4, "0")}`);
   serve(ids.map((id) => row(id)));
   const resp = await app.inject({ method: "GET", url: `/v1/runs?ids=${ids.join(",")}` });
@@ -81,14 +87,20 @@ test("R2 more ids than a call may carry is refused, not trimmed", async () => {
   assert.equal(body.max_ids, 500);
 });
 
-test("R3 the terminal listing defaults to the width the dispatcher needs", async () => {
+test("R3 terminal listing reads one extra row and reports a finished page", async () => {
   serve([]);
   const resp = await app.inject({ method: "GET", url: "/v1/runs?state=terminal" });
   assert.equal(resp.statusCode, 200);
   assert.ok(
-    (lastParams as number[]).includes(200),
-    `no default limit of 200 in ${JSON.stringify(lastParams)}`,
+    (lastParams as number[]).includes(201),
+    `the default 200-row page did not request its lookahead row: ${JSON.stringify(lastParams)}`,
   );
+  assert.deepEqual(resp.json(), {
+    runs: [],
+    limit: 200,
+    has_more: false,
+    next_cursor: null,
+  });
 });
 
 test("R4 a run is rendered with the platform's account of its ending", async () => {
@@ -111,4 +123,81 @@ test("R4 a run is rendered with the platform's account of its ending", async () 
     class: "killed", kill_reason: "preempted", exit_code: 137, signal: "SIGKILL",
   });
   assert.equal(body.placement.node, "gpu-node-7");
+});
+
+test("R5 equal timestamps paginate by task id without overlap", async () => {
+  const exactCompletedAt = "2026-09-01 01:00:00.123456+00";
+  serve([
+    row("ktsk_c", { cursor_completed_at: exactCompletedAt }),
+    row("ktsk_b", { cursor_completed_at: exactCompletedAt }),
+    row("ktsk_a", { cursor_completed_at: exactCompletedAt }),
+  ]);
+
+  const first = await app.inject({
+    method: "GET",
+    url: "/v1/runs?state=terminal&since=2026-09-01T00%3A00%3A00Z&limit=2",
+  });
+  assert.equal(first.statusCode, 200);
+  const firstBody = first.json() as {
+    runs: Array<{ run_id: string }>;
+    has_more: boolean;
+    next_cursor: string | null;
+  };
+  assert.deepEqual(firstBody.runs.map((run) => run.run_id), ["ktsk_c", "ktsk_b"]);
+  assert.equal(firstBody.has_more, true);
+  assert.ok(firstBody.next_cursor);
+  assert.match(lastSql, /ORDER BY completed_at DESC NULLS LAST, task_id DESC/);
+  assert.equal(lastParams.at(-1), 3, "limit=2 needs one lookahead row");
+
+  serve([row("ktsk_a", { cursor_completed_at: exactCompletedAt })]);
+  const second = await app.inject({
+    method: "GET",
+    url: `/v1/runs?state=terminal&since=2026-09-01T00%3A00%3A00Z&limit=2&cursor=${firstBody.next_cursor}`,
+  });
+  assert.equal(second.statusCode, 200);
+  const secondBody = second.json() as {
+    runs: Array<{ run_id: string }>;
+    has_more: boolean;
+    next_cursor: string | null;
+  };
+  assert.deepEqual(secondBody.runs.map((run) => run.run_id), ["ktsk_a"]);
+  assert.equal(secondBody.has_more, false);
+  assert.equal(secondBody.next_cursor, null);
+  assert.match(lastSql, /\(completed_at, task_id\) < \(\$\d+::timestamptz, \$\d+\)/);
+  assert.ok(
+    lastParams.includes(exactCompletedAt),
+    "the cursor timestamp lost PostgreSQL microsecond precision",
+  );
+  assert.ok(lastParams.includes("ktsk_b"), "the task id tiebreaker was not applied");
+});
+
+test("R6 malformed cursors and limits fail before querying", async () => {
+  serve([]);
+  const before = queryCalls;
+  for (const url of [
+    "/v1/runs?state=terminal&cursor=",
+    "/v1/runs?state=terminal&cursor=not%2Bbase64",
+    "/v1/runs?state=terminal&cursor=e30",
+    "/v1/runs?cursor=WyIyMDI2LTA5LTAxVDAwOjAwOjAwWiIsInQiXQ",
+    "/v1/runs?ids=ktsk_1&cursor=e30",
+    "/v1/runs?state=terminal&limit=0",
+    "/v1/runs?state=terminal&limit=1001",
+    "/v1/runs?state=terminal&limit=1.5",
+  ]) {
+    const response = await app.inject({ method: "GET", url });
+    assert.equal(response.statusCode, 400, url);
+  }
+  assert.equal(queryCalls, before, "invalid pagination input reached the database");
+});
+
+test("R7 the terminal index follows the cursor's complete ordering", () => {
+  const source = readFileSync(
+    fileURLToPath(new URL("../src/infra/db.ts", import.meta.url)),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /idx_tasks_terminal_completed_task[\s\S]*completed_at DESC, task_id DESC/,
+    "the keyset query would sort instead of stopping at the page boundary",
+  );
 });

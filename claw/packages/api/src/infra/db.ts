@@ -1081,16 +1081,17 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON claw_tasks(batch_id) WHERE batch_id IS NOT NULL",
     ).catch(() => {});
-    // GET /v1/runs?state=terminal&since= -- the dispatcher's reconcile, every 30
-    // seconds. Partial on the three terminal statuses because that is the whole
-    // of what the query matches, and ordered the way it reads so the LIMIT stops
-    // early instead of sorting the table. claw_tasks is never pruned, so without
-    // this the cost of that sweep grows with the fleet's whole history.
+    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
+    // statuses and ordered by the exact keyset cursor. The task id is the stable
+    // tiebreaker when one statement completes many rows at the same timestamp.
     await client.query(
-      `CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed
-         ON claw_tasks(completed_at DESC)
+      `CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed_task
+         ON claw_tasks(completed_at DESC, task_id DESC)
        WHERE status IN ('completed','failed','cancelled')`,
     ).catch(() => {});
+    // Superseded by the composite cursor index above. Created first so an
+    // upgrade never leaves the terminal query without an ordered index.
+    await client.query("DROP INDEX IF EXISTS idx_tasks_terminal_completed").catch(() => {});
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});

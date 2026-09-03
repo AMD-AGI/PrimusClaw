@@ -261,24 +261,23 @@ test("a run reaped for never being claimed is not called a budget failure", asyn
   );
 });
 
-test("a run with a budget of its own is not closed by the legacy timeout", () => {
-  // REGRESSION GUARD.
-  //
-  // A DAG node is dispatched by a path that issues no run_lease, so
-  // `lease_expires_at` stays NULL for its whole life. That made the never-claimed
-  // arm decisive for every graph node, and RUN_BUDGET_DAG_NODE_SEC therefore only
-  // worked downwards: a node given three days was closed as `brain_timeout` after
-  // BRAIN_TASK_TIMEOUT_SEC -- an hour by default -- with the budget above it dead
-  // letter. A long training run is hours to days, so every one of them
-  // would have died in the first hour.
+test("a future budget does not hide a run that never received its first lease", () => {
+  // Healthy task and DAG workers renew immediately, so a NULL lease after the
+  // legacy timeout means no worker claimed the run. The execution deadline is a
+  // separate policy clock and may be days away without making that row alive.
   const seen = stubDb([]);
   stubBus();
   return reapStaleTasks().then(() => {
     const sql = seen[0]?.sql ?? "";
     assert.match(
       sql,
+      /lease_expires_at IS NULL AND started_at IS NOT NULL/,
+      "the never-claimed arm must remain independent of deadline_at",
+    );
+    assert.doesNotMatch(
+      sql,
       /deadline_at IS NULL AND lease_expires_at IS NULL/,
-      "the never-claimed arm still fires on rows that carry an explicit budget",
+      "a future execution budget must not conceal a missing worker",
     );
     // The budget arm is untouched: a row past its own deadline is still reaped.
     assert.match(sql, /deadline_at IS NOT NULL AND deadline_at < NOW\(\)/);

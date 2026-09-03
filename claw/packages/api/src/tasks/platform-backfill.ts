@@ -161,13 +161,13 @@ export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
     `SELECT task_id, session_id, sandbox_workload_id
        FROM claw_tasks
-      WHERE status NOT IN ('preparing', 'running', 'cancelling')
+      WHERE status IN ('completed', 'failed', 'cancelled')
         AND sandbox_workload_id IS NOT NULL
         AND sandbox_workload_id <> ''
         AND platform_message IS NULL
         AND platform_kill_reason IS NULL
         AND completed_at > NOW() - INTERVAL '1 hour'
-      ORDER BY completed_at DESC
+      ORDER BY completed_at ASC, task_id ASC
       LIMIT $1`,
     [MAX_PER_SWEEP],
   );

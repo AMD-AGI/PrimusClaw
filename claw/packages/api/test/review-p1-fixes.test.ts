@@ -41,9 +41,13 @@ test("the backfill backlog is re-drivable, not discarded", async () => {
   assert.ok(q.includes("platform_message IS NULL"), "select rows with no facts");
   assert.ok(q.includes("platform_kill_reason IS NULL"), "and no kill reason");
   assert.ok(q.includes("sandbox_workload_id IS NOT NULL"), "that have something to ask about");
-  assert.ok(q.includes("status NOT IN"), "terminal rows only");
+  assert.ok(q.includes("status IN ('completed', 'failed', 'cancelled')"), "terminal rows only");
 
   const sweeper = await import("node:fs/promises")
     .then((fs) => fs.readFile(new URL("../src/tasks/sweeper.ts", import.meta.url), "utf8"));
-  assert.ok(sweeper.includes("drainPendingPlatformFacts()"), "and the sweeper must call it");
+  const tick = sweeper.slice(sweeper.indexOf("export async function sweeperTick"));
+  assert.ok(
+    tick.includes('runContained("sweeper.platform_backfill_drain_failed", drainPendingPlatformFacts)'),
+    "every tick must drain even when reapStaleTasks returned no rows",
+  );
 });

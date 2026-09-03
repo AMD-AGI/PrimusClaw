@@ -50,6 +50,7 @@ function stubDb(): string[] {
 
 /** The last sweep of the tick, and the one furthest from the lock. */
 const IDEMPOTENCY_PRUNE = /DELETE FROM claw_idempotency_keys/;
+const PLATFORM_FACT_DRAIN = /sandbox_workload_id IS NOT NULL[\s\S]*platform_message IS NULL/;
 
 test("a lock pool that cannot hand out a connection costs one sweep, not the tick", async () => {
   const seen = stubDb();
@@ -77,6 +78,21 @@ test("the tick reaches its end when the lock pool is healthy too", async () => {
   await sweeperTick();
 
   assert.ok(seen.some((sql) => IDEMPOTENCY_PRUNE.test(sql)));
+});
+
+test("platform fact backlog drains even when no new stale row was reaped", async () => {
+  const seen = stubDb();
+  db.lockPool.connect = (async () => ({
+    query: async () => ({ rows: [{ ok: false }] }),
+    release: () => {},
+  })) as unknown as typeof db.lockPool.connect;
+
+  await sweeperTick();
+
+  assert.ok(
+    seen.some((sql) => PLATFORM_FACT_DRAIN.test(sql)),
+    "the drain was hidden behind reapStaleTasks' empty-result return",
+  );
 });
 
 test("a scan that throws inside the lock is contained the same way", async () => {
@@ -183,6 +199,7 @@ test("every contained failure is still reported, at a level somebody sees", () =
     "sweeper.expired_queue_failed",
     "sweeper.wait_external_failed",
     "sweeper.stuck_sessions_failed",
+    "sweeper.platform_backfill_drain_failed",
     "sweeper.release_finished_refs_failed",
     "sweeper.release_deleted_refs_failed",
     "sweeper.release_idle_refs_failed",

@@ -106,6 +106,7 @@ CREATE TABLE claw_tasks (
   metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
   origin               TEXT,
   workspace_id         TEXT,
+  sandbox_workload_id  TEXT,
   lease_owner          TEXT,
   lease_expires_at     TIMESTAMPTZ,
   heartbeat_at         TIMESTAMPTZ,
