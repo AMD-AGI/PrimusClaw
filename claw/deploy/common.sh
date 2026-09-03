@@ -235,6 +235,11 @@ trap cleanup_deploy_temp_files EXIT
 #
 # helm template does NOT stamp metadata.namespace onto rendered objects, so the
 # imperative kubectl_apply below always passes -n "$NAMESPACE".
+# Sandbox lifetime settings ride along here rather than at each call site.
+# Both deploy.sh and upgrade.sh render through this, and upgrade.sh re-renders
+# the whole Deployment every time -- so a value only some callers pass is a value
+# the next upgrade silently drops. Empty stays unset, which leaves the chart
+# default, which leaves the sandbox template's own numbers.
 render_chart() {
   local template="$1" dst="$2"; shift 2
   helm template primus-claw "$CLAW_CHART_DIR" \
@@ -245,6 +250,8 @@ render_chart() {
     --set-string image.registry="$REGISTRY" \
     --set-string image.repository=claw \
     --set-string image.tag="$TAG" \
+    ${AGENT_SANDBOX_SESSION_TIMEOUT:+--set-string brain.sessionTimeout="$AGENT_SANDBOX_SESSION_TIMEOUT"} \
+    ${AGENT_SANDBOX_MAX_SESSION_DURATION:+--set-string brain.maxSessionDuration="$AGENT_SANDBOX_MAX_SESSION_DURATION"} \
     "$@" \
     --show-only "templates/$template" > "$dst"
 }
