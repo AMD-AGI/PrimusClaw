@@ -38,6 +38,14 @@ const SENSITIVE_WORDS = new Set([
   "privatekey",
   "platformkey",
   "virtualkey",
+  // A personal access token is a credential whose name says "token" only in
+  // expanded form; the spelling that reaches a config file is GITHUB_PAT.
+  "pat",
+  "pats",
+  // A DSN is a connection string, and a connection string is a password with
+  // a hostname attached.
+  "dsn",
+  "connectionstring",
 ]);
 
 /**
@@ -54,6 +62,17 @@ const SENSITIVE_PAIRS = new Set([
   "virtual key",
   "signing key",
   "encryption key",
+  // An SSH key is the private half often enough that the qualified pair is
+  // worth treating as sensitive; `key` alone stays too broad to use.
+  "ssh key",
+  // A database URL carries its own credentials inline
+  // (postgres://user:password@host/db), so the URL *is* the secret. `url`
+  // alone is not: most of them are endpoints.
+  "database url",
+  "db url",
+  "database uri",
+  "db uri",
+  "connection string",
 ]);
 
 /**
