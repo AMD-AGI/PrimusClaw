@@ -333,6 +333,46 @@ helm_set_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/,/\\,/g'
 }
 
+# Helm recomputes values from what this run passes; it keeps nothing from the
+# last one. So the modelList the interactive discovery produced lives exactly
+# one run: the next upgrade -- a CI job, or a terminal where the operator
+# answered "no" to the prompt -- hands Helm an empty modelList and the proxy
+# comes back serving no models. Nothing fails; the gateway just quietly stops
+# working. Carry forward what the release already has when this run has none.
+CARRIED_VALUES_FILE=""
+if [ -z "$GENERATED_MODELS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
+  carried_err="$(mktemp)"; MODELS_TMP_FILES+=("$carried_err")
+  if carried="$(helm -n "$LITELLM_NAMESPACE" get values "$LITELLM_RELEASE" -o json 2>"$carried_err")"; then
+    :
+  elif grep -qi "release: not found" "$carried_err"; then
+    carried=""   # first install; there is nothing to carry
+  else
+    # An unreachable API server or an RBAC change is not "nothing to carry".
+    # Continuing would hand Helm an empty modelList and take the models away.
+    sed 's/^/  /' "$carried_err" >&2
+    fail "could not read the current values of release $LITELLM_RELEASE; refusing to upgrade with an empty modelList"
+  fi
+  if [ -n "$carried" ]; then
+    CARRIED_VALUES_FILE="$(mktemp)"; chmod 600 "$CARRIED_VALUES_FILE"
+    MODELS_TMP_FILES+=("$CARRIED_VALUES_FILE")
+    carried_keys="$(printf '%s' "$carried" | python3 -c '
+import json, sys
+cur = json.load(sys.stdin)
+keep = {k: cur[k] for k in ("modelList",) if cur.get(k)}
+if not keep:
+    sys.exit(0)
+json.dump(keep, open(sys.argv[1], "w"), indent=2)
+print(" ".join(sorted(keep)))
+' "$CARRIED_VALUES_FILE")" || fail "refusing to carry the current release's values forward"
+    if [ -n "$carried_keys" ]; then
+      log "carrying forward from the current release: $carried_keys"
+    else
+      CARRIED_VALUES_FILE=""
+    fi
+  fi
+fi
+
+
 helm_args=(
   upgrade --install "$LITELLM_RELEASE" "$CHART_DIR"
   --namespace "$LITELLM_NAMESPACE"
@@ -357,6 +397,8 @@ else
   )
 fi
 [ -n "$LITELLM_SAFE_API_URL" ] && helm_args+=(--set "safeApiUrl=$LITELLM_SAFE_API_URL")
+# Ahead of the operator's own file, so anything they state explicitly wins.
+[ -n "$CARRIED_VALUES_FILE" ] && helm_args+=(-f "$CARRIED_VALUES_FILE")
 [ -n "$LITELLM_VALUES_FILE" ] && helm_args+=(-f "$LITELLM_VALUES_FILE")
 if [ -n "$GENERATED_MODELS_FILE" ]; then
   [ -n "$LITELLM_VALUES_FILE" ] && log "note: discovered modelList overrides any modelList in LITELLM_VALUES_FILE"

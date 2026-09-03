@@ -100,6 +100,99 @@ run LITELLM_MASTER_KEY=release-inline-master \
 has_arg 'secrets.masterKey=release-inline-master'
 has_arg 'secrets.databaseUrl=postgresql://release@example.invalid/litellm'
 
+# Helm keeps nothing from the previous run, so an upgrade that does not repeat
+# the discovered modelList would hand it an empty one and the proxy would come
+# back serving no models. Driven through a real (mocked) upgrade rather than
+# --dry-run, because that is the path the carry-forward is on.
+mkdir -p "$tmp/upbin"
+cat >"$tmp/upbin/helm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "template" ]]; then exec "$REAL_HELM" "$@"; fi
+if [[ "$*" == *"get values"* ]]; then
+  if [[ "${GET_VALUES_FAILS:-false}" == "true" ]]; then
+    echo "Error: Kubernetes cluster unreachable" >&2; exit 1
+  fi
+  echo '{"modelList":[{"model_name":"carried-model","litellm_params":{"model":"openai/carried-model"}}]}'
+  exit 0
+fi
+printf '%s\n' "$@" >"$HELM_CAPTURE"
+: >"$VALUES_COPY"
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "-f" && -e "$a" ]] && command cat "$a" >>"$VALUES_COPY"
+  prev="$a"
+done
+EOF
+cat >"$tmp/upbin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "ZmFrZQ==" ;;
+  *"exec deployment/litellm"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/upbin/helm" "$tmp/upbin/kubectl"
+
+if ! env "PATH=$tmp/upbin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_MASTER_KEY=release-master \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -qF 'carried-model' "$tmp/carried.values" || {
+  echo "the release's modelList was not carried into the upgrade" >&2
+  exit 1
+}
+
+# An exec that cannot run at all is not "no callbacks configured": continuing
+# leaves the hook silently inactive, which is what the probe exists to catch.
+cat >"$tmp/upbin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "ZmFrZQ==" ;;
+  *"exec deployment/litellm"*) echo "error: unable to upgrade connection" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/upbin/kubectl"
+if env "PATH=$tmp/upbin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "VALUES_COPY=$tmp/carried.values" \
+  LITELLM_MASTER_KEY=release-master \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "continued past a callback probe that could not run" >&2
+  exit 1
+fi
+grep -q 'could not read the configured callbacks' "$output"
+cat >"$tmp/upbin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "ZmFrZQ==" ;;
+  *"exec deployment/litellm"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/upbin/kubectl"
+
+# A failed read is not an empty release: upgrading anyway takes the models away.
+if env "PATH=$tmp/upbin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "VALUES_COPY=$tmp/carried.values" GET_VALUES_FAILS=true \
+  LITELLM_MASTER_KEY=release-master \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "upgraded with an empty modelList after failing to read the release" >&2
+  exit 1
+fi
+grep -q 'refusing to upgrade with an empty modelList' "$output"
+
 # config.yaml is mounted with subPath, which kubelet never refreshes, so the only
 # thing that can move a running Pod onto a new model list is a changed pod
 # template. The hash has to follow the rendered ConfigMap.
