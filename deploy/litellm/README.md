@@ -35,7 +35,7 @@ Environment surface:
 |---|---|
 | `LITELLM_DATABASE_URL` | PostgreSQL URL. Optional when the wrapper can discover Claw's PGO cluster in the namespace |
 | `LITELLM_MASTER_KEY` | Generated on first install, then reused from the existing Secret |
-| `LITELLM_VALUES_FILE` | Private Helm values carrying `modelList` and provider credentials |
+| `LITELLM_VALUES_FILE` | Private Helm values carrying `modelList`. Provider keys belong in a Secret referenced as `api_key: os.environ/<NAME>`, not in this file — a literal here goes into the release values and every revision after it, and the deploy refuses it |
 | `LITELLM_EXISTING_SECRET` | Existing Secret containing `master_key` and `database_url`; prevents either value from entering Helm release values |
 | `LITELLM_PROVIDER_TYPE` / `_URL` / `_API_KEY` | Supply the provider instead of answering the prompt; all three together. The key is stored in a Secret and referenced as `os.environ/`, never written into values |
 | `LITELLM_PROVIDER_VALUES_FILE` | Writes the discovered `modelList` to a file you keep. Without it there is no copy on disk — the wrapper still carries the deployed one forward on later upgrades, but nothing outside the release holds it |
@@ -185,8 +185,10 @@ readable.
 ## Model routing is deployment-specific
 
 The chart ships **no model list**. Which providers and models a deployment
-exposes, and with which credentials, belongs in a private values file — never in
-this repository.
+exposes belongs in a private values file — never in this repository. The
+credentials do not: reference them as `api_key: os.environ/<NAME>` and point
+`providerApiKey` at the Secret holding them, so the values file carries only the
+reference.
 
 [`values.autorouting.example.yaml`](values.autorouting.example.yaml) shows the
 structure, including the `claude-auto` complexity router that dispatches to a
