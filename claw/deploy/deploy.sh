@@ -490,6 +490,21 @@ if default_sandbox_image:
         if env(var):
             values["defaultSandbox"][key] = env(var)
 
+# Sandbox lifetime. Only sent when the operator set one, so a deployment that
+# configures nothing renders exactly what the chart already rendered -- and
+# so a base sandbox template that carries its own value keeps it.
+#
+# These have to be here and not only in render_chart: this script installs the
+# whole release with `helm upgrade --install -f`, so a knob wired only into
+# render_chart reaches upgrade.sh's re-rendered Deployment and never reaches a
+# fresh deploy at all.
+for _key, _var in (
+    ("sessionTimeout", "AGENT_SANDBOX_SESSION_TIMEOUT"),
+    ("maxSessionDuration", "AGENT_SANDBOX_MAX_SESSION_DURATION"),
+):
+    if env(_var):
+        values["brain"][_key] = env(_var)
+
 if sandbox_workload_namespace:
     values["secret"]["sandboxNamespace"] = sandbox_workload_namespace
 
