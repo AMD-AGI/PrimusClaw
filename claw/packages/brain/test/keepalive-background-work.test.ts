@@ -21,7 +21,7 @@ import { StringCodec } from "nats";
 import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
-  registerSandbox,
+  registerSandbox, markHandsIdle, backgroundWorkStateSizesForTest,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -489,4 +489,146 @@ test("probe slots rotate, so a slow head of the list does not starve the tail", 
     asked.size > afterFirst,
     `the second sweep asked the same ${afterFirst} again instead of moving on`,
   );
+});
+
+// ── Boundaries a probe answer must not cross ────────────────────────────────
+//
+// The three below are the second-order faults of the tri-state probe: it makes
+// an answer that outlives the question cheaper to produce, so every edge where
+// the question changes has to invalidate.
+
+test("a task ending re-opens the question the probe answered mid-task", async () => {
+  // The gap markHandsIdle closes. A probe that lands while a task holds the
+  // sandbox is about a moment before the task's own background shell exists,
+  // so putting the handle back in the idle pool has to discard it. Otherwise
+  // the shell that outlives the turn -- the entire case this file is about --
+  // is invisible for the length of the cache TTL.
+  stubPingableProvider();
+  const { kv } = fakeKv();
+  let running = 0;
+  const deps = { kv, countActiveShells: async () => running };
+
+  // The turn: registered, probed, nothing running yet.
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  await sweepUntilProbed(deps);
+
+  // The turn leaves a shell behind and the handle goes idle.
+  running = 1;
+  unregisterSandbox(SESSION);
+  markHandsIdle(kv, SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  await new Promise((r) => setImmediate(r));
+
+  const pings: string[] = [];
+  await sweepUntilProbed({ ...deps, countActiveShells: async () => { pings.push("asked"); return running; } });
+  assert.ok(pings.length > 0, "the question must be re-asked, not answered from before the task");
+});
+
+test("a probe in the air when a task takes the sandbox cannot report it idle", async () => {
+  // registerSandbox bumps the generation, which covers a probe dispatched
+  // before it. This covers the other order: the probe lands after, finds no
+  // shells because the task has not started one yet, and would file `idle`
+  // about a sandbox that is demonstrably in use.
+  stubPingableProvider();
+  const { kv } = fakeKv();
+  let release: (n: number) => void = () => {};
+  const deps = {
+    kv,
+    countActiveShells: () => new Promise<number>((r) => { release = r; }),
+  };
+
+  await runKeepaliveTickForTest(deps);          // probe dispatched, unresolved
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  release(0);                                   // "no shells" -- but a task holds it
+  await new Promise((r) => setImmediate(r));
+
+  let asked = 0;
+  await sweepUntilProbed({ ...deps, countActiveShells: async () => { asked += 1; return 0; } });
+  assert.ok(asked > 0, "a verdict formed while the sandbox was held must not be cached");
+});
+
+test("generation bookkeeping does not grow without bound", async () => {
+  // bgGeneration has to outlive the cache it guards -- that is what discards a
+  // late answer -- but not outlive the sandbox. Nothing in production deleted
+  // from it, so a long-lived Brain kept an integer per sandbox it had ever
+  // seen.
+  stubPingableProvider();
+  const deps = { kv: manyIdleHandles(40), countActiveShells: async () => 0 };
+  await sweepUntilProbed(deps);
+  // Sanity via the cache, not the generations: nothing writes a generation for
+  // an identity that is behaving. The entry appears when the identity is
+  // invalidated -- which for a vanishing session is the cleanup below, and is
+  // exactly why the leak was one integer per sandbox ever seen rather than
+  // per sandbox currently alive.
+  assert.ok(
+    backgroundWorkStateSizesForTest().cache > 0,
+    "sanity: the sweep must have cached some answers",
+  );
+
+  // The whole fleet goes away.
+  const empty = {
+    kv: manyIdleHandles(0), countActiveShells: async () => 0,
+  };
+  await runKeepaliveTickForTest(empty);
+  await new Promise((r) => setImmediate(r));
+  await runKeepaliveTickForTest(empty);
+  assert.equal(
+    backgroundWorkStateSizesForTest().generations, 0,
+    "identities nothing is asking about and nothing is probing must be collected",
+  );
+});
+
+test("a verdict formed while a task held the sandbox is not cached", async () => {
+  // Isolates the held check from the two generation bumps around it. The task
+  // leaves without markHandsIdle -- a DAG sibling, a torn-down session, any
+  // path that unregisters and does not hand the handle back -- so nothing on
+  // the way out invalidates, and registerSandbox's bump on the way in happened
+  // before the candidate was even formed. If an `idle` answer computed while
+  // the pod was in use can be cached, this is where it survives.
+  stubPingableProvider();
+  const { kv } = fakeKv();
+  let release: (n: number) => void = () => {};
+  let asked = 0;
+  const deps = {
+    kv,
+    countActiveShells: () => {
+      asked += 1;
+      return new Promise<number>((r) => { release = r; });
+    },
+  };
+
+  // Registered first, so the candidate the scan forms already carries the
+  // current generation and the probe is dispatched about a held sandbox.
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  await runKeepaliveTickForTest(deps);
+  release(0);
+  await new Promise((r) => setImmediate(r));
+
+  unregisterSandbox(SESSION);
+  asked = 0;
+  await runKeepaliveTickForTest(deps);
+  assert.ok(asked > 0, "an idle verdict about a held sandbox must not be believed later");
+});
+
+test("handing a handle back to the idle pool re-opens the question", async () => {
+  // Isolates markHandsIdle's invalidation. A verdict cached from a clean idle
+  // probe is believed for the whole TTL -- correctly, while nothing happens.
+  // A task running in between changes the answer, and the handle re-entering
+  // the pool is the last moment anything can say so.
+  stubPingableProvider();
+  // Inside the reuse window: the shared ENTRY is deliberately long expired, and
+  // an expired idle handle is deleted by the sweep -- which would remove the
+  // thing this test hands back.
+  const { kv } = fakeKv({ idleSince: Date.now() });
+  let asked = 0;
+  const deps = { kv, countActiveShells: async () => { asked += 1; return 0; } };
+
+  await sweepUntilProbed(deps);           // clean idle verdict, now cached
+  asked = 0;
+  await runKeepaliveTickForTest(deps);
+  assert.equal(asked, 0, "sanity: a fresh verdict is believed, not re-asked every sweep");
+
+  markHandsIdle(kv, SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  await new Promise((r) => setImmediate(r));
+  await runKeepaliveTickForTest(deps);
+  assert.ok(asked > 0, "the handle going back into the pool must discard the old answer");
 });

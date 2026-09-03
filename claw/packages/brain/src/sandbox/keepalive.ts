@@ -246,6 +246,22 @@ export function markHandsIdle(
         ? !(known && info.workloadId && info.workloadId !== known)
         : sameRegisteredSandbox(known, info);
       if (!sameTarget) return;
+
+      // The handle is going back into the idle pool, which is the moment its
+      // background-work verdict starts being acted on -- so nothing concluded
+      // while a task held it may carry over. A probe that ran mid-task and
+      // found no shells is the case that matters: the task may have started one
+      // afterwards, and an `idle` answer from before would suppress pinging for
+      // the rest of the cache TTL. registerSandbox invalidates on the way in;
+      // this is the way out, and without it the boundary is only half closed.
+      forgetBackgroundWork(sandboxRegistryKey(sessionId, {
+        provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+        workloadId: info.workloadId,
+        sessionId: info.sessionId,
+        sandboxName: info.sandboxName,
+        namespace: info.namespace,
+      }));
+
       info.keepalive = false;
       info.idleSince = Date.now();
       // Conditioned on the revision just read, because a session teardown can
@@ -337,6 +353,7 @@ const BG_PROBE_MAX_IN_FLIGHT = 8;
  */
 const PING_MAX_IN_FLIGHT = 16;
 
+
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
 const bgUnknownStreak = new Map<string, number>();
@@ -366,6 +383,18 @@ function forgetBackgroundWork(identity: string): void {
  * over one session id in one process and would otherwise read each other's
  * cached answers -- the cache being module state is the point of it.
  */
+/** Sizes of the background-work bookkeeping, so a leak in it can be asserted. */
+export function backgroundWorkStateSizesForTest(): {
+  cache: number; streaks: number; generations: number; inFlight: number;
+} {
+  return {
+    cache: bgProbeCache.size,
+    streaks: bgUnknownStreak.size,
+    generations: bgGeneration.size,
+    inFlight: bgProbeInFlight.size,
+  };
+}
+
 export function resetBackgroundWorkStateForTest(): void {
   bgProbeCache.clear();
   bgUnknownStreak.clear();
@@ -450,7 +479,9 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
  */
 function dispatchProbes(
   deps: KeepaliveDeps,
-  candidates: Array<{ identity: string; sessionId: string; info: HandsKvEntry }>,
+  candidates: Array<{
+    identity: string; sessionId: string; info: HandsKvEntry; generation: number;
+  }>,
 ): void {
   if (candidates.length === 0) return;
   const probe = deps.countActiveShells ?? countActiveShells;
@@ -459,22 +490,41 @@ function dispatchProbes(
   let started = 0;
   for (let n = 0; n < candidates.length; n++) {
     if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) break;
-    const { identity, sessionId, info } = candidates[(start + n) % candidates.length];
+    const { identity, sessionId, info, generation } =
+      candidates[(start + n) % candidates.length];
     if (bgProbeInFlight.has(identity)) continue;
 
-    // The generation this answer will be about. Anything that invalidates the
-    // identity between here and the promise landing moves it, and the result is
-    // dropped rather than written over whatever replaced it.
-    const generation = bgGeneration.get(identity) ?? 0;
+    // `generation` came from the scan that formed this candidate, not from
+    // here. Anything that invalidates the identity between the scan and the
+    // promise landing moves it, and the result is dropped on arrival rather
+    // than written over whatever replaced it. Checking again here would only
+    // save a probe, and no test can tell the two apart -- the guard that
+    // matters is the one at the landing.
     bgProbeInFlight.add(identity);
     started += 1;
 
     void probe(info.handsUrl!, info.token!, sessionId)
-      .then((running) => {
+      .then(async (running) => {
         if ((bgGeneration.get(identity) ?? 0) !== generation) {
           logger.info(
             { sessionId, workloadId: info.workloadId },
             "keepalive.background_work_answer_stale",
+          );
+          return;
+        }
+        // A live registration outranks the count. `idle` is the only verdict
+        // that suppresses pinging, so it has to mean "nothing is holding this
+        // sandbox" -- and a task that took the pod while the probe was in the
+        // air is holding it, whatever the shell count said. Recording `idle`
+        // here would be believed for the whole TTL, including after the task
+        // ends and markHandsIdle puts the handle back in the idle pool with a
+        // background shell the probe never saw.
+        const held = localRegistry.has(identity)
+          || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope).catch(() => false);
+        if (held && running === 0) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_answer_held",
           );
           return;
         }
@@ -567,7 +617,9 @@ async function collectTargets(
   seenIdentities: Set<string>,
 ): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
-  const probeCandidates: Array<{ identity: string; sessionId: string; info: HandsKvEntry }> = [];
+  const probeCandidates: Array<{
+    identity: string; sessionId: string; info: HandsKvEntry; generation: number;
+  }> = [];
 
   // 1. In-memory registry — always authoritative for this process.
   for (const [key, registered] of localRegistry) {
@@ -624,7 +676,15 @@ async function collectTargets(
           ? peekBackgroundWork(identity, info)
           : "idle";
         if (info.keepalive === false && needsProbe(identity, info)) {
-          probeCandidates.push({ identity, sessionId, info });
+          // The generation is read here, not at dispatch. The candidate is a
+          // judgement about the handle as this scan found it -- idle, unprobed
+          // -- and dispatch happens after the whole walk, so a registerSandbox
+          // landing in between would bump the generation and then be read as
+          // the generation this candidate was formed under. The answer would
+          // survive a reuse it should have been discarded by.
+          probeCandidates.push({
+            identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0,
+          });
         }
         if (info.keepalive === false && bgWork === "running") {
           await refreshIdleSince(deps, key, e.revision, info);
@@ -750,6 +810,21 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // again on the next one -- which is the load the cache exists to remove.
   for (const identity of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
     if (!seenIdentities.has(identity)) forgetBackgroundWork(identity);
+  }
+  // Generations outlive the two maps above on purpose -- a bumped generation is
+  // what discards an in-flight answer, so it has to survive the answer -- but
+  // only that long. forgetBackgroundWork writes an entry every time, including
+  // for identities it is forgetting, so a Brain that has seen a lot of
+  // sandboxes would keep one integer per sandbox it has ever seen, forever.
+  //
+  // With nothing in flight there is no token anyone still holds, so the entry
+  // can go entirely; a later probe under the same identity starts from 0 again
+  // with no stale answer able to match it. An identity still being probed keeps
+  // its entry and is collected on a later sweep.
+  for (const identity of [...bgGeneration.keys()]) {
+    if (!seenIdentities.has(identity) && !bgProbeInFlight.has(identity)) {
+      bgGeneration.delete(identity);
+    }
   }
 
   if (!targets.size) return;
