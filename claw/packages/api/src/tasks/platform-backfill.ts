@@ -22,6 +22,7 @@
  */
 import pino from "pino";
 import { platformFactsFromWorkloadDetail } from "@claw/protocol";
+import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { SAFE_API_URL } from "../config.js";
 
@@ -40,11 +41,35 @@ const FETCH_TIMEOUT_MS = 10_000;
 const MAX_PER_SWEEP = 50;
 /** Concurrent reads. Small: SaFE is shared, and nothing here is urgent. */
 const CONCURRENCY = 5;
+/** Back off transient reads so old failures cannot monopolise every batch. */
+// Claimed immediately before one bounded fetch, so this only has to outlive one
+// request plus its two small database writes.
+const RETRY_BASE_SEC = 60;
+const RETRY_MAX_SEC = 10 * 60;
 
 export interface SweptRow {
   task_id: string;
   session_id: string | null;
   sandbox_workload_id?: string | null;
+}
+
+async function claimRow(row: SweptRow): Promise<SweptRow | null> {
+  if (!SAFE_API_URL) return null;
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET platform_facts_attempts = platform_facts_attempts + 1,
+            platform_facts_next_retry_at = NOW() + (
+              LEAST($3::int, $2::int * (1 << LEAST(platform_facts_attempts, 4)))
+              * INTERVAL '1 second'
+            )
+      WHERE task_id = $1
+        AND status IN ('completed', 'failed', 'cancelled')
+        AND platform_facts_resolved_at IS NULL
+        AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
+      RETURNING task_id, session_id, sandbox_workload_id`,
+    [row.task_id, RETRY_BASE_SEC, RETRY_MAX_SEC],
+  );
+  return (r.rows[0] as SweptRow | undefined) ?? null;
 }
 
 async function platformKeyForSession(sessionId: string | null): Promise<string> {
@@ -54,8 +79,7 @@ async function platformKeyForSession(sessionId: string | null): Promise<string> 
     [sessionId],
   );
   if (r.rowCount === 0) return "";
-  const cfg = (r.rows[0].config ?? {}) as Record<string, unknown>;
-  return typeof cfg.platform_key === "string" ? cfg.platform_key : "";
+  return readTrustedSessionCredentials(r.rows[0].config).platformKey;
 }
 
 async function readAndStore(row: SweptRow): Promise<boolean> {
@@ -70,6 +94,17 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
+    if (resp.status === 404 || resp.status === 410) {
+      const resolved = await db.query(
+        `UPDATE claw_tasks
+            SET platform_facts_resolved_at = NOW(),
+                platform_facts_next_retry_at = NULL
+          WHERE task_id = $1
+            AND platform_facts_resolved_at IS NULL`,
+        [row.task_id],
+      );
+      return Boolean(resolved.rowCount);
+    }
     if (!resp.ok) return false;
     detail = (await resp.json()) as Record<string, unknown>;
   } catch (err) {
@@ -80,19 +115,20 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
   const facts = platformFactsFromWorkloadDetail(detail);
   if (!facts) return false;
 
-  // Guarded on the columns still being empty rather than on the read being new:
-  // a late callback from a Brain that survived after all is the better source,
-  // and it may land between the sweep's UPDATE and this one.
+  // COALESCE preserves a late Brain callback that reached the row between the
+  // sweeper's terminal update and this read. The explicit resolved stamp is
+  // separate from content: an empty pod message is still a successful read.
   const r = await db.query(
     `UPDATE claw_tasks
-        SET platform_message         = COALESCE(NULLIF(platform_message, ''), $2),
+        SET platform_message         = COALESCE(platform_message, $2),
             platform_node            = COALESCE(NULLIF(platform_node, ''), $3),
             platform_container_reason= COALESCE(NULLIF(platform_container_reason, ''), $4),
-            platform_exit_code       = COALESCE(platform_exit_code, $5)
+            platform_exit_code       = COALESCE(platform_exit_code, $5),
+            platform_facts_resolved_at = NOW(),
+            platform_facts_next_retry_at = NULL
       WHERE task_id = $1
-        AND platform_message IS NULL
-        AND platform_kill_reason IS NULL`,
-    [row.task_id, facts.message || null, facts.node || null,
+        AND platform_facts_resolved_at IS NULL`,
+    [row.task_id, facts.message, facts.node || null,
       facts.containerReason || null, facts.exitCode],
   );
   if (r.rowCount) {
@@ -107,14 +143,14 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
 /**
  * Record what the platform says about each swept row that had a sandbox.
  *
- * Returns how many rows gained facts. Never throws: a caller is a sweeper arm
+ * Returns how many rows reached a conclusive answer. Never throws: a caller is a sweeper arm
  * that has already closed these rows, and the close must stand whatever SaFE
  * does.
  */
 export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
   const withWorkload = rows.filter((r) => r.sandbox_workload_id);
-  const targets = withWorkload.slice(0, MAX_PER_SWEEP);
-  if (targets.length === 0) return 0;
+  const candidates = withWorkload.slice(0, MAX_PER_SWEEP);
+  if (candidates.length === 0) return 0;
   if (withWorkload.length > MAX_PER_SWEEP) {
     // The overflow is not lost, only deferred: the rows are already terminal
     // and the sweeper's UPDATE cannot select them again, so before this they
@@ -127,47 +163,61 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
       "platform_backfill.capped",
     );
   }
-
-  let recorded = 0;
-  const queue = [...targets];
+  let resolved = 0;
+  const queue = [...candidates];
   const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
     for (;;) {
-      const row = queue.shift();
-      if (!row) return;
+      const candidate = queue.shift();
+      if (!candidate) return;
+      const row = await claimRow(candidate).catch((err) => {
+        logger.warn({ err, taskId: candidate.task_id }, "platform_backfill.claim_failed");
+        return null;
+      });
+      if (!row) continue;
       const ok = await readAndStore(row).catch((err) => {
-        logger.warn({ err, taskId: row.task_id }, "platform_backfill.failed");
+        logger.warn({ err, taskId: candidate.task_id }, "platform_backfill.failed");
         return false;
       });
-      if (ok) recorded++;
+      if (ok) resolved++;
     }
   });
   await Promise.all(workers);
-  return recorded;
+  return resolved;
 }
 
 /**
  * Work down the backlog the per-sweep cap leaves behind.
  *
- * Selected by outcome rather than by remembering a list: a row that has a
- * workload id and no facts is one nobody has answered for yet, whether it was
- * capped, raced, or failed its first read. Terminal rows only, so this cannot
- * touch a run still in flight, and the same NULL guards on the write mean a
- * late Brain callback still wins.
+ * Selected by outcome rather than by remembering a list. Only failures written
+ * by a liveness reaper need this fallback; normal terminal callbacks either
+ * carried their own facts or ended for a reason where platform attribution does
+ * not change the answer.
  *
  * Bounded per tick for the same reason the sweep is: this runs inside the
  * sweeper's tick and talks to SaFE one workload at a time.
  */
 export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
-    `SELECT task_id, session_id, sandbox_workload_id
-       FROM claw_tasks
-      WHERE status IN ('completed', 'failed', 'cancelled')
-        AND sandbox_workload_id IS NOT NULL
-        AND sandbox_workload_id <> ''
-        AND platform_message IS NULL
-        AND platform_kill_reason IS NULL
-        AND completed_at > NOW() - INTERVAL '1 hour'
-      ORDER BY completed_at ASC, task_id ASC
+    `WITH eligible AS (
+       SELECT task_id, session_id, sandbox_workload_id,
+              platform_facts_next_retry_at IS NOT NULL AS retried,
+              ROW_NUMBER() OVER (
+                PARTITION BY (platform_facts_next_retry_at IS NOT NULL)
+                ORDER BY platform_facts_next_retry_at ASC NULLS LAST,
+                         completed_at ASC, task_id ASC
+              ) AS lane_position
+         FROM claw_tasks
+        WHERE status = 'failed'
+          AND failure_reason IN ('brain_timeout', 'worker_lost')
+          AND sandbox_workload_id IS NOT NULL
+          AND sandbox_workload_id <> ''
+          AND platform_facts_resolved_at IS NULL
+          AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
+          AND completed_at > NOW() - INTERVAL '1 hour'
+     )
+     SELECT task_id, session_id, sandbox_workload_id
+       FROM eligible
+      ORDER BY lane_position ASC, retried ASC
       LIMIT $1`,
     [MAX_PER_SWEEP],
   );

@@ -203,6 +203,37 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
   }
 }
 
+async function ensureConcurrentIndex(
+  client: pg.PoolClient,
+  name: string,
+  createSql: string,
+): Promise<void> {
+  if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
+    throw new Error(`unsafe index name: ${name}`);
+  }
+  const readValidity = () => client.query<{ indisvalid: boolean }>(
+    `SELECT i.indisvalid
+       FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1
+        AND n.nspname = CURRENT_SCHEMA()`,
+    [name],
+  );
+  let existing = await readValidity();
+  if (existing.rowCount && existing.rows[0].indisvalid) return;
+  if (existing.rowCount) {
+    // Interrupted concurrent builds leave an INVALID index that IF NOT EXISTS
+    // would skip forever. Remove only that unusable object before rebuilding.
+    await client.query(`DROP INDEX CONCURRENTLY "${name}"`);
+  }
+  await client.query(createSql);
+  existing = await readValidity();
+  if (!existing.rowCount || !existing.rows[0].indisvalid) {
+    throw new Error(`index ${name} was not created as a valid index`);
+  }
+}
+
 /** Run schema migrations on startup. */
 export async function initDb(): Promise<void> {
   const client = await pool.connect();
@@ -1012,20 +1043,22 @@ export async function initDb(): Promise<void> {
     // that point would be two hundred calls per sweep, and it would be asking for
     // facts that stopped changing when the run did. Written once at the terminal,
     // the batch read is one query.
-    //
-    // `platform_kill_reason` is the field the whole thing is for: only the platform
-    // knows it, and without it a reclaimed node is indistinguishable from a crash.
-    await addTaskCol("platform_kill_reason", "TEXT");
     await addTaskCol("platform_exit_code", "INT");
     await addTaskCol("platform_node", "TEXT");
-    // The pod's own account, kept verbatim. The reason above is a reading of it,
-    // and a reading that turns out to be wrong is worth being able to re-derive.
+    // The pod's own account is kept verbatim so kill-reason vocabulary can
+    // evolve without rewriting stored history.
     await addTaskCol("platform_message", "TEXT");
     // The container's own termination reason. Separate from the message above
     // because the pod-level one describes the kills decided above the container
     // and is empty for an OOM -- which is the ending exit code 137 alone cannot
     // tell from an eviction or a deliberate stop.
     await addTaskCol("platform_container_reason", "TEXT");
+    // Content cannot say whether a read happened: an empty pod message is a
+    // valid answer. These fields separate a conclusive read from a transient
+    // failure and keep multiple API replicas from fetching the same workload.
+    await addTaskCol("platform_facts_resolved_at", "TIMESTAMPTZ");
+    await addTaskCol("platform_facts_next_retry_at", "TIMESTAMPTZ");
+    await addTaskCol("platform_facts_attempts", "INT NOT NULL DEFAULT 0");
     // Declared by a task whose workspace is throwaway -- it has already delivered
     // its output somewhere else, so uploading the tree afterwards copies it a
     // second time to a prefix nobody reads. Default false: with the shared-disk
@@ -1053,6 +1086,20 @@ export async function initDb(): Promise<void> {
        WHERE lease_expires_at IS NOT NULL
          AND status IN ('preparing','running','cancelling')`,
     ).catch(() => {});
+    await ensureConcurrentIndex(
+      client,
+      "idx_tasks_platform_facts_pending",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
+         ON claw_tasks(
+           platform_facts_next_retry_at ASC NULLS FIRST,
+           completed_at ASC,
+           task_id ASC
+         )
+       WHERE status = 'failed'
+         AND failure_reason IN ('brain_timeout','worker_lost')
+         AND sandbox_workload_id IS NOT NULL
+         AND platform_facts_resolved_at IS NULL`,
+    );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
     ).catch(() => {});
@@ -1084,14 +1131,17 @@ export async function initDb(): Promise<void> {
     // GET /v1/runs?state=terminal&since= -- partial on the three terminal
     // statuses and ordered by the exact keyset cursor. The task id is the stable
     // tiebreaker when one statement completes many rows at the same timestamp.
-    await client.query(
-      `CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed_task
-         ON claw_tasks(completed_at DESC, task_id DESC)
+    await ensureConcurrentIndex(
+      client,
+      "idx_tasks_terminal_completed_task_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
+         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
        WHERE status IN ('completed','failed','cancelled')`,
-    ).catch(() => {});
-    // Superseded by the composite cursor index above. Created first so an
-    // upgrade never leaves the terminal query without an ordered index.
-    await client.query("DROP INDEX IF EXISTS idx_tasks_terminal_completed").catch(() => {});
+    );
+    // Older variants are intentionally retained during this rolling upgrade.
+    // Dropping them after a swallowed concurrent-create failure could leave the
+    // route with no ordered index; a later maintenance migration can remove
+    // them after every deployment reports the replacement present.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});

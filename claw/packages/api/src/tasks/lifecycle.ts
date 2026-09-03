@@ -40,11 +40,10 @@ export interface AgentDonePayload {
    * each against SaFE at read time would be two hundred calls per sweep, for
    * facts that stopped changing when the run did.
    *
-   * `platform_kill_reason` is the one that cannot be obtained anywhere else: no
-   * layer above the platform can observe a preemption, and without it a
-   * reclaimed node and a crashed agent are the same row.
+   * The raw pod and container fields are retained so the API can derive the
+   * platform reason under its current vocabulary without freezing that reading
+   * into the row.
    */
-  platform_kill_reason?: string;
   /** The container's own termination reason, the only source for an OOM. */
   platform_container_reason?: string;
   platform_exit_code?: number;
@@ -87,8 +86,7 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
 
   // Only written when the callback carried them. A run that ended for its own
   // reasons has no platform facts, and stamping empty strings over a row that a
-  // previous callback did fill would erase the one field nothing else can supply.
-  if (payload.platform_kill_reason) patch.platform_kill_reason = payload.platform_kill_reason;
+  // previous path filled would erase the platform's recorded account.
   if (payload.platform_message) patch.platform_message = payload.platform_message;
   if (payload.platform_container_reason) {
     patch.platform_container_reason = payload.platform_container_reason;

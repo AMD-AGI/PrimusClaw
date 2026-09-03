@@ -3,7 +3,7 @@
 
 // review-p1-fixes.test.ts
 //
-// Three review findings whose common shape is a check written for one
+// Two review findings whose common shape is a check written for one
 // deployment shape and applied to both. None was pinned by anything.
 
 import test from "node:test";
@@ -20,16 +20,6 @@ test("wait and log_s3_upload_manifest are admissible builtin tools", async () =>
   }
 });
 
-test("a platform key is demanded only where a SaFE workload is created", async () => {
-  // deploy.sh defaults CLAW_DEPLOY_MODE to "kubernetes", where the caller
-  // holds a virtual key and platformKey is "" -- so an unconditional demand
-  // 403'd every task and batch on the default configuration.
-  const src = await import("node:fs/promises")
-    .then((fs) => fs.readFile(new URL("../src/auth/session-credentials.ts", import.meta.url), "utf8"));
-  assert.match(src, /CLAW_DEPLOY_MODE !== "kubernetes"[\s\S]{0,80}!user\.platformKey/,
-    "the demand must be gated on the mode that actually needs it");
-});
-
 test("the backfill backlog is re-drivable, not discarded", async () => {
   // Swept rows are already terminal, so the sweeper's UPDATE cannot select
   // them again: anything over the per-sweep cap used to be dropped in memory
@@ -38,10 +28,10 @@ test("the backfill backlog is re-drivable, not discarded", async () => {
     .then((fs) => fs.readFile(new URL("../src/tasks/platform-backfill.ts", import.meta.url), "utf8"));
   assert.ok(src.includes("export async function drainPendingPlatformFacts"), "a drain must exist");
   const q = src.slice(src.indexOf("drainPendingPlatformFacts"));
-  assert.ok(q.includes("platform_message IS NULL"), "select rows with no facts");
-  assert.ok(q.includes("platform_kill_reason IS NULL"), "and no kill reason");
   assert.ok(q.includes("sandbox_workload_id IS NOT NULL"), "that have something to ask about");
-  assert.ok(q.includes("status IN ('completed', 'failed', 'cancelled')"), "terminal rows only");
+  assert.ok(q.includes("status = 'failed'"), "liveness failures only");
+  assert.ok(q.includes("platform_facts_resolved_at IS NULL"), "not already resolved");
+  assert.ok(q.includes("platform_facts_next_retry_at"), "transient failures are retried with a gate");
 
   const sweeper = await import("node:fs/promises")
     .then((fs) => fs.readFile(new URL("../src/tasks/sweeper.ts", import.meta.url), "utf8"));

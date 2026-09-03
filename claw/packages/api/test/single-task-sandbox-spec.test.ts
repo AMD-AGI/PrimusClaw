@@ -7,8 +7,8 @@
 // maps to {kind:"none"} and ensureHands throws on -- while the agent was still
 // handed the full tool schema. Every sandbox tool was advertised and the first
 // call died, the run ended in two turns having called nothing, and
-// sandbox_workload_id was NULL for all 167 rows the cluster had ever written,
-// which left the platform-facts backfill filtering out every row it was given.
+// sandbox_workload_id stayed NULL, which left the platform-facts backfill
+// filtering out every row it was given.
 //
 // Nothing pinned the value, on either path. This is the producer.
 

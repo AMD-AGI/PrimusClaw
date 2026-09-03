@@ -72,7 +72,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // applied migration here means every chat dispatch fails on insert --
       // which is the failure this guard exists to move to startup.
       "origin", "workspace_id", "lease_owner", "lease_expires_at", "heartbeat_at", "event_seq",
-      "claim_count",
+      "claim_count", "sandbox_workload_id",
+      "platform_message", "platform_node", "platform_exit_code", "platform_container_reason",
+      "platform_facts_resolved_at", "platform_facts_next_retry_at", "platform_facts_attempts",
       "created_at", "queued_at", "started_at", "completed_at",
     ],
   },

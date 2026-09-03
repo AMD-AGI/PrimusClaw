@@ -62,7 +62,6 @@ interface RunRow {
   status: string;
   failure_reason: string | null;
   sandbox_workload_id: string | null;
-  platform_kill_reason: string | null;
   platform_exit_code: number | null;
   platform_node: string | null;
   platform_message: string | null;
@@ -77,8 +76,7 @@ interface RunRow {
 
 const SELECT_COLUMNS = `
   task_id, session_id, status, failure_reason, sandbox_workload_id,
-  platform_kill_reason, platform_exit_code, platform_node, platform_message,
-  platform_container_reason,
+  platform_exit_code, platform_node, platform_message, platform_container_reason,
   created_at, started_at, completed_at, deadline_at
 `;
 
@@ -96,13 +94,6 @@ export function toRunView(row: RunRow): RunView {
     container_reason: row.platform_container_reason ?? "",
     exit_code: row.platform_exit_code,
   });
-  // A reason recorded at the terminal wins over one re-derived here: it was read
-  // from the platform at the moment the run ended, and the message it came from
-  // may since have been trimmed or the pod garbage-collected.
-  if (terminal && row.platform_kill_reason) {
-    terminal.kill_reason = row.platform_kill_reason as typeof terminal.kill_reason;
-    if (terminal.class !== "cancelled") terminal.class = "killed";
-  }
   return {
     run_id: row.task_id,
     phase: phaseOf(row.status),
@@ -136,6 +127,10 @@ interface RunCursor {
 
 function encodeCursor(row: RunRow): string {
   const completedAt = row.cursor_completed_at ?? iso(row.completed_at);
+  if (!completedAt) {
+    logger.error({ runId: row.task_id }, "runs.terminal_missing_completed_at");
+    throw new Error(`terminal run ${row.task_id} has no completed_at`);
+  }
   return Buffer.from(JSON.stringify([completedAt, row.task_id]), "utf8").toString("base64url");
 }
 
@@ -241,6 +236,13 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
       return { runs: (r.rows as RunRow[]).map(toRunView), requested: ids.length };
     }
 
+    const state = (q.state ?? "").trim().toLowerCase();
+    if (state !== "terminal") {
+      return reply.status(400).send({
+        ok: false,
+        error: "state must be 'terminal' when ids are not provided",
+      });
+    }
     let limit = DEFAULT_LIMIT;
     if (q.limit !== undefined) {
       if (!/^\d+$/.test(q.limit)) {
@@ -254,10 +256,6 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
         });
       }
     }
-    const wantsTerminal = (q.state ?? "").toLowerCase() === "terminal";
-    if (hasCursor && !wantsTerminal) {
-      return reply.status(400).send({ ok: false, error: "cursor_requires_terminal_state" });
-    }
     const cursor = hasCursor ? decodeCursor(q.cursor ?? "") : null;
     if (hasCursor && !cursor) {
       return reply.status(400).send({ ok: false, error: "invalid_cursor" });
@@ -268,8 +266,7 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const params: unknown[] = [];
-    const filters: string[] = [];
-    if (wantsTerminal) filters.push(`status IN ('completed','failed','cancelled')`);
+    const filters = [`status IN ('completed','failed','cancelled')`];
     if (since) {
       params.push(since);
       filters.push(`completed_at >= $${params.length}`);
@@ -282,21 +279,26 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
     }
     const scoped = s.clause.replace("$USER", `$${params.length + 1}`);
     if (s.params.length) params.push(...s.params);
-    params.push(wantsTerminal ? limit + 1 : limit);
+    params.push(limit + 1);
 
     const r = await db.query(
-      `SELECT ${SELECT_COLUMNS}${wantsTerminal
-        ? ", completed_at::text AS cursor_completed_at"
-        : ""} FROM claw_tasks
-        WHERE ${filters.length ? filters.join(" AND ") : "TRUE"} ${scoped}
+      `SELECT ${SELECT_COLUMNS}, completed_at::text AS cursor_completed_at
+         FROM claw_tasks
+        WHERE ${filters.join(" AND ")} ${scoped}
         ORDER BY completed_at DESC NULLS LAST, task_id DESC
         LIMIT $${params.length}`,
       params,
     );
-    logger.debug({ count: r.rowCount, wantsTerminal }, "runs.list");
+    logger.debug({ count: r.rowCount, state }, "runs.list");
     const fetched = r.rows as RunRow[];
-    if (!wantsTerminal) return { runs: fetched.map(toRunView), limit };
-
+    const malformed = fetched.find((row) => !(row.cursor_completed_at ?? iso(row.completed_at)));
+    if (malformed) {
+      logger.error({ runId: malformed.task_id }, "runs.terminal_missing_completed_at");
+      return reply.status(500).send({
+        ok: false,
+        error: "terminal_run_missing_completed_at",
+      });
+    }
     const hasMore = fetched.length > limit;
     const page = hasMore ? fetched.slice(0, limit) : fetched;
     return {

@@ -50,7 +50,8 @@ function stubDb(): string[] {
 
 /** The last sweep of the tick, and the one furthest from the lock. */
 const IDEMPOTENCY_PRUNE = /DELETE FROM claw_idempotency_keys/;
-const PLATFORM_FACT_DRAIN = /sandbox_workload_id IS NOT NULL[\s\S]*platform_message IS NULL/;
+const PLATFORM_FACT_DRAIN =
+  /sandbox_workload_id IS NOT NULL[\s\S]*platform_facts_resolved_at IS NULL/;
 
 test("a lock pool that cannot hand out a connection costs one sweep, not the tick", async () => {
   const seen = stubDb();

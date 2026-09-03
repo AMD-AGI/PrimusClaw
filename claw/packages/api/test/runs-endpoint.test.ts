@@ -46,7 +46,7 @@ after(async () => { db.query = originalQuery; await app.close(); });
 function row(id: string, over: Record<string, unknown> = {}) {
   return {
     task_id: id, session_id: "s1", status: "failed", failure_reason: "brain_timeout",
-    sandbox_workload_id: "wl-1", platform_kill_reason: null, platform_exit_code: null,
+    sandbox_workload_id: "wl-1", platform_exit_code: null,
     platform_node: null, platform_message: null, platform_container_reason: null,
     created_at: "2026-09-01T00:00:00Z", started_at: "2026-09-01T00:00:01Z",
     completed_at: "2026-09-01T01:00:00Z", deadline_at: null,
@@ -175,6 +175,10 @@ test("R6 malformed cursors and limits fail before querying", async () => {
   serve([]);
   const before = queryCalls;
   for (const url of [
+    "/v1/runs",
+    "/v1/runs?state=active",
+    "/v1/runs?state=running",
+    "/v1/runs?state=termnial",
     "/v1/runs?state=terminal&cursor=",
     "/v1/runs?state=terminal&cursor=not%2Bbase64",
     "/v1/runs?state=terminal&cursor=e30",
@@ -197,7 +201,7 @@ test("R7 the terminal index follows the cursor's complete ordering", () => {
   );
   assert.match(
     source,
-    /idx_tasks_terminal_completed_task[\s\S]*completed_at DESC, task_id DESC/,
+    /idx_tasks_terminal_completed_task_v2[\s\S]*completed_at DESC NULLS LAST, task_id DESC/,
     "the keyset query would sort instead of stopping at the page boundary",
   );
 });
@@ -251,4 +255,23 @@ test("R23 a short page ends the walk", async () => {
   serve([row("ktsk_a")]);
   const body = (await app.inject({ method: "GET", url: "/v1/runs?state=terminal&limit=2" })).json();
   assert.ok(!body.next_cursor, "nothing left to continue from");
+});
+
+test("R24 a malformed terminal row never produces a cursor the API rejects itself", async () => {
+  serve([
+    row("ktsk_a"),
+    row("ktsk_missing_time", { completed_at: null, cursor_completed_at: undefined }),
+    row("ktsk_probe"),
+  ]);
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/v1/runs?state=terminal&limit=2",
+  });
+
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(response.json(), {
+    ok: false,
+    error: "terminal_run_missing_completed_at",
+  });
 });
