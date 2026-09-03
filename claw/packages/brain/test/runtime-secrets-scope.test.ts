@@ -149,3 +149,71 @@ test("a whole environment block is still masked by key name", () => {
   }, runtimeSecrets(request()));
   assert.equal((evt.argumentsDetail as any).bash.env, "<redacted>");
 });
+
+// ── The other half: shape ───────────────────────────────────────────────────
+//
+// Narrowing runtimeSecrets() to credential-NAMED env vars leaves a real gap by
+// construction: a token stored under an unremarkable name is not collected, so
+// the exact-value pass never sees it. That gap is covered by redactSecrets(),
+// which matches on what a value looks like instead. The two halves are only
+// safe together, so the seam is tested rather than each half alone.
+
+test("a token under an unremarkable name is still caught, by its shape", () => {
+  // The case the name filter cannot answer and must not be widened to answer:
+  // widening it back is what deleted MODEL_PATH out of the transcript.
+  const ghp = `ghp_${"a".repeat(36)}`;
+  const secrets = runtimeSecrets(request({ user_env: { BUILD_CONFIG: ghp } }));
+  assert.ok(
+    !secrets.includes(ghp),
+    "BUILD_CONFIG does not read as a credential, so the exact-value pass must not collect it",
+  );
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: `git clone https://${ghp}@host/r` } } },
+    secrets,
+  );
+  assert.ok(!JSON.stringify(evt).includes(ghp), "…and the shape pass must catch it anyway");
+});
+
+test("a URI carrying inline credentials loses the credentials and keeps the host", () => {
+  // Which host a run talked to is usually the point of the log line, so only
+  // the credential half goes. Both halves of that are asserted: a redactor
+  // that blanked the whole URI would pass a test that only checked the
+  // password was gone.
+  const evt = redactPersistedEvent({
+    type: "toolUsed",
+    full_output: "connect mongodb://svc:s3cr3t@mongo.internal:27017/claw failed",
+  }, runtimeSecrets(request({ user_env: {} })));
+
+  const text = String(evt.full_output);
+  assert.ok(!text.includes("s3cr3t"), "the inline password must not survive");
+  assert.ok(!text.includes("svc:"), "nor the user it belongs to");
+  assert.ok(text.includes("mongo.internal:27017/claw"), "the endpoint stays legible");
+});
+
+test("a plain endpoint URL is not mistaken for a credential-bearing one", () => {
+  // The other direction on the same rule. A URL with a port, a path, or an @
+  // in a path segment carries no inline credentials, and rewriting it would
+  // cut the endpoint out of the very log line that needs it.
+  const ordinary = "curl https://api.example.invalid:8443/v1/models && ls pkgs/@scope/name";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", description: ordinary },
+    runtimeSecrets(request({ user_env: {} })),
+  );
+  assert.equal(evt.description, ordinary, "no part of an ordinary URL may be rewritten");
+});
+
+test("a credential-named var holding an ordinary word is collected but never hunted", () => {
+  // The seam between the two guards, stated directly: the name filter lets the
+  // value through (it errs towards redacting, by design) and the
+  // distinctiveness filter is what stops it from cutting the word out of
+  // prose. A patch that drops either one has to fail something here.
+  const secrets = runtimeSecrets(request({ user_env: { BRANCH_TOKEN: "main" } }));
+  assert.ok(secrets.includes("main"), "the name filter errs towards collecting");
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", description: "git switch main" },
+    secrets,
+  );
+  assert.equal(evt.description, "git switch main", "and the distinctiveness filter declines it");
+});
