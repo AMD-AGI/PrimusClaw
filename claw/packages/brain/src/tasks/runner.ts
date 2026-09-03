@@ -538,6 +538,19 @@ function freshenCacheUse(
 }
 
 /**
+ * The same state with no cache-use timestamp at all.
+ *
+ * The counterpart to freshening, and the direction that only compaction can
+ * ask for: a fresher number says the entry is still being read, and this says
+ * there is no entry. Returns its argument by identity when there was nothing
+ * to remove, so callers can keep testing "did anything change" by identity.
+ */
+function clearCacheUse(state: CheckpointState): CheckpointState {
+  if (state.last_cache_use_at === undefined) return state;
+  return { ...state, last_cache_use_at: undefined };
+}
+
+/**
  * The state a SIGTERM should persist, or null if it has nothing to say.
  *
  * `attempt` is this attempt's own last checkpoint and `resume` is the one the
@@ -560,11 +573,15 @@ function sigtermCheckpointState(
   attempt: CheckpointState | null,
   resume: CheckpointState | null,
   fresh: number | undefined,
+  cleared: boolean,
 ): CheckpointState | null {
-  if (attempt) return freshenCacheUse(attempt, fresh);
+  const overlay = (state: CheckpointState): CheckpointState => (
+    cleared ? clearCacheUse(state) : freshenCacheUse(state, fresh)
+  );
+  if (attempt) return overlay(attempt);
   if (!resume) return null;
-  const freshened = freshenCacheUse(resume, fresh);
-  return freshened === resume ? null : freshened;
+  const overlaid = overlay(resume);
+  return overlaid === resume ? null : overlaid;
 }
 
 export const __test__ = {
@@ -574,6 +591,7 @@ export const __test__ = {
   checkpointS3Prefix,
   runtimeSecrets,
   freshenCacheUse,
+  clearCacheUse,
   sigtermCheckpointState,
 };
 
@@ -1001,7 +1019,27 @@ class TaskRunner {
    */
   private latestCacheUseAt: number | undefined;
 
-  private readonly onCacheUse = (at: number): void => {
+  /**
+   * Whether the loop has told this runner that the cache entry is GONE.
+   *
+   * `latestCacheUseAt === undefined` cannot say this on its own: it is also
+   * what "nothing heard yet" looks like, and those two want opposite things
+   * from a checkpoint that carries a timestamp. Nothing-heard must leave it
+   * alone; compaction must take it off.
+   */
+  private cacheUseCleared = false;
+
+  private readonly onCacheUse = (at: number | undefined): void => {
+    // `undefined` is compaction: the entry the timestamp described no longer
+    // exists. It arrives on the line that destroys the entry rather than at
+    // the next turn boundary, because the checkpoint holding the stale value
+    // is already written and a SIGTERM in between would persist it.
+    if (at === undefined) {
+      this.latestCacheUseAt = undefined;
+      this.cacheUseCleared = true;
+      return;
+    }
+    this.cacheUseCleared = false;
     if (this.latestCacheUseAt === undefined || at > this.latestCacheUseAt) {
       this.latestCacheUseAt = at;
     }
@@ -1032,6 +1070,7 @@ class TaskRunner {
     // it. Within a turn `onCacheUse` is still the fresher of the two; at a
     // turn boundary the loop's state is the one that knows.
     this.latestCacheUseAt = safeState.last_cache_use_at;
+    this.cacheUseCleared = safeState.last_cache_use_at === undefined;
     const written = await this.writeKvCheckpoint(
       safeState,
       this.lastSyncedTurn > 0
@@ -2304,6 +2343,7 @@ class TaskRunner {
     // landing inside that batch. See `latestCacheUseAt`.
     const ckptState = sigtermCheckpointState(
       this.latestCheckpointState, this.pendingResumeCkpt, this.latestCacheUseAt,
+      this.cacheUseCleared,
     );
     if (ckptState && ckptState.turns_completed > 0) {
       // ① Priority workspace_sync (§5.5.1) — independent semaphore so

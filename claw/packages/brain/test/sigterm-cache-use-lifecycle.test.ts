@@ -318,3 +318,56 @@ test("cache use inside the batch after a checkpoint is still the freshest thing 
 
   assert.equal(r.persisted!.last_cache_use_at, 9_000);
 });
+
+// ── The window between the clear and the next checkpoint ───────────────────
+//
+// Compaction clears the loop's timestamp and then awaits an event publish
+// before it reaches the checkpoint call at the bottom of the turn. A SIGTERM
+// inside that await used to persist the checkpoint written BEFORE the
+// compaction, timestamp and all -- a live-looking entry for one that had just
+// been destroyed, which is the false loss this whole path exists to prevent.
+
+test("a SIGTERM between the compaction clear and the next checkpoint drops the stale timestamp", async () => {
+  const r = await runScenario({
+    async turn(extras) {
+      // The turn before the compaction: a real cache use, checkpointed.
+      extras.onCacheUse!(7_000);
+      await extras.onCheckpoint!(checkpointState({ last_cache_use_at: 7_000 }));
+      // Compaction, reported on the line that clears it. No checkpoint
+      // follows -- that is the window.
+      extras.onCacheUse!(undefined);
+    },
+  });
+  assert.ok(r.persisted, "the conversation still has to be persisted");
+  assert.equal(r.persisted!.last_cache_use_at, undefined,
+    "the entry it described was compacted away before the SIGTERM landed");
+  assert.equal(r.persisted!.turns_completed, 4,
+    "and everything else about the checkpoint is unchanged");
+});
+
+test("the same window on a resumed run does not republish the resume timestamp", async () => {
+  // No checkpoint of this attempt's own: the fallback to the resume
+  // checkpoint must not carry that checkpoint's timestamp forward either.
+  const r = await runScenario({
+    resumeFrom: seededResumeCheckpoint({ last_cache_use_at: 7_000 }),
+    async turn(extras) { extras.onCacheUse!(undefined); },
+  });
+  assert.ok(r.persisted, "the resumed conversation must still be there");
+  assert.equal(r.persisted!.last_cache_use_at, undefined,
+    "a compacted run has no live entry, whichever checkpoint carries the state");
+});
+
+test("cache use after a compaction is evidence again", async () => {
+  // The clear is not sticky: the next read writes a new entry, and the run
+  // that is SIGTERMed after that one has something true to say.
+  const r = await runScenario({
+    async turn(extras) {
+      extras.onCacheUse!(7_000);
+      await extras.onCheckpoint!(checkpointState({ last_cache_use_at: 7_000 }));
+      extras.onCacheUse!(undefined);
+      extras.onCacheUse!(9_500);
+    },
+  });
+  assert.equal(r.persisted!.last_cache_use_at, 9_500,
+    "the post-compaction read is a fresh entry, not a resurrected one");
+});

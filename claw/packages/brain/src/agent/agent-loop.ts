@@ -269,7 +269,7 @@ export interface LoopOptions {
    * SIGTERM path can overlay a fresher timestamp on the state it is already
    * about to persist. See the note on `latestCacheUseAt` in the runner.
    */
-  onCacheUse?: (at: number) => void;
+  onCacheUse?: (at: number | undefined) => void;
   /** Resume from a prior checkpoint. Skips turns 0..resumeFrom.turns_completed-1.
    *  Messages, usage, stats are pre-populated from checkpoint values. */
   resumeFrom?: CheckpointState;
@@ -1436,6 +1436,17 @@ class AgentLoopRunner {
         // the pre-compaction timestamp standing, and the SECOND miss after a
         // compaction was reported as an expired entry.
         this.lastCacheUseAt = undefined;
+        // Say the clear out loud, here, before the await below. The caller is
+        // told about cache USE on the same line it happens for the same
+        // reason, and a clear is the half that matters more: the checkpoint
+        // that would otherwise carry the pre-compaction timestamp already
+        // exists, so a SIGTERM landing between this line and the checkpoint
+        // call at the bottom of the turn would persist a timestamp for an
+        // entry this compaction just destroyed -- and the resumed run would
+        // measure a gap against it and report a loss that never happened.
+        // Waiting for `onCheckpoint` to carry the news is a window, and it is
+        // an `await onEvent` wide.
+        this.opts.onCacheUse?.(undefined);
         this.workingMessages.length = 0;
         this.workingMessages.push(...compacted);
         await this.onEvent({

@@ -86,3 +86,79 @@ test("anything that is not a location is not exempted", () => {
     assert.equal(isCredentialFreeLocator(value), false, JSON.stringify(value));
   }
 });
+
+// ── A query parameter is not a credential because it is escaped ────────────
+
+test("an ordinary redirect_uri survives its own percent-encoding", () => {
+  // Encoded, `https%3A%2F%2Fapp.example%2Fcb` satisfies every clause of
+  // looksLikeCredentialValue: the upper-case letters are the hex digits of
+  // `%3A` and `%2F` and the symbols are the percent signs. An OAuth client is
+  // required to send this parameter, and reading it as a key deleted the
+  // authorization URL out of the transcript.
+  assert.equal(
+    isCredentialFreeLocator(
+      "https://login.example.invalid/oauth?redirect_uri=https%3A%2F%2Fapp.example%2Fcb",
+    ),
+    true,
+  );
+  assert.equal(
+    isCredentialFreeLocator("https://example.invalid/a?next=%2Fdashboard%2Fhome"),
+    true,
+  );
+  assert.equal(
+    isCredentialFreeLocator(
+      "https://example.invalid/oauth?client_id=web-app&scope=read%20write&state=abc",
+    ),
+    true,
+  );
+});
+
+test("a credential in a query parameter is still a credential, encoded or not", () => {
+  for (const url of [
+    "https://example.invalid/v1?api_key=abc123",
+    "https://example.invalid/v1?x=Xk9mzPl2vQr7TnA4",
+    "https://example.invalid/v1?redirect_uri=https%3A%2F%2Fapp.example%2Fcb%3Ftoken%3DXk9mzPl2vQr7TnA4",
+  ]) {
+    assert.equal(isCredentialFreeLocator(url), false, url);
+  }
+});
+
+// ── The half of a URL that never reaches the server ───────────────────────
+
+test("a token in the fragment disqualifies the URL", () => {
+  // The OAuth implicit flow returns the access token after the `#` precisely
+  // because that half is not sent to the server. Dropping the fragment read
+  // the whole callback URL as credential-free and left the token standing.
+  for (const url of [
+    "https://example.invalid/cb#access_token=Xk9mzPl2vQr7TnA4",
+    "https://example.invalid/cb#Xk9mzPl2vQr7TnA4",
+    "https://example.invalid/cb#state=ok&id_token=Xk9mzPl2vQr7TnA4",
+  ]) {
+    assert.equal(isCredentialFreeLocator(url), false, url);
+  }
+});
+
+test("an ordinary fragment is still ordinary", () => {
+  for (const url of [
+    "https://example.invalid/docs/guide#section-2",
+    "https://example.invalid/docs#installation",
+    "https://example.invalid/oauth/token",
+  ]) {
+    assert.equal(isCredentialFreeLocator(url), true, url);
+  }
+});
+
+test("the scheme/authority/path split does not backtrack", () => {
+  // The path alternative used to be `[^?#]*`, which every character the
+  // authority could match could also match -- so a non-matching input made
+  // the engine try every split between the two, quadratically. This input is
+  // the shape CodeQL named (`A://` then a long run of one character); it must
+  // answer in constant-ish time, not seconds.
+  const hostile = `A://${'"'.repeat(60_000)}`;
+  const started = Date.now();
+  // The verdict is beside the point -- there is no credential in 60,000 quote
+  // marks either way. What is being asserted is that answering is cheap.
+  assert.equal(typeof isCredentialFreeLocator(hostile), "boolean");
+  assert.ok(Date.now() - started < 1_000,
+    "a locator test must not be a way to stall the process");
+});

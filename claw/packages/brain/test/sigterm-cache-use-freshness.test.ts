@@ -105,7 +105,13 @@ test("the notification is wired from the loop through to the SIGTERM path", () =
     "the runner must supply it",
   );
   assert.ok(
-    /sigtermCheckpointState\(\s*this\.latestCheckpointState, this\.pendingResumeCkpt, this\.latestCacheUseAt,?\s*\)/
+    /this\.opts\.onCacheUse\?\.\(undefined\);/.test(LOOP),
+    "and the loop must report the compaction clear on the same callback, on "
+      + "the line that clears it -- a clear delivered at the next turn "
+      + "boundary is a window, not a notification",
+  );
+  assert.ok(
+    /sigtermCheckpointState\(\s*this\.latestCheckpointState, this\.pendingResumeCkpt, this\.latestCacheUseAt,\s*this\.cacheUseCleared,?\s*\)/
       .test(RUNNER),
     "and the SIGTERM checkpoint must be the freshened one -- a callback whose "
       + "value never reaches a write is the same as no callback. What that "

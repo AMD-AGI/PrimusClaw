@@ -263,9 +263,26 @@ export function looksLikeCredentialValue(value: string): boolean {
  *
  * Deliberately not `new URL()`: that accepts far more than this needs to
  * admit, normalizes what it parses, and throws on the relative forms a config
- * file is full of. The groups are scheme, authority, path, query.
+ * file is full of. The groups are scheme, authority, path, query, fragment.
+ *
+ * The path alternative must start with `/`, and that is not cosmetic. Written
+ * as a bare `[^?#]*` it overlapped the authority's `[^/?#]*` -- every
+ * character either could match, both could match, and a non-matching input
+ * made the engine try every split between them. That is quadratic on the
+ * length of the input, on a predicate that runs over environment values, and
+ * CodeQL is right to call it a denial of service (js/polynomial-redos).
+ * Requiring the leading `/` makes the split unambiguous: exactly one place in
+ * any input can begin the path.
+ *
+ * The fragment is CAPTURED rather than skipped. Discarding it read
+ * `https://example.invalid/cb#access_token=<token>` as credential-free and
+ * left a real token standing in the transcript -- an implicit-flow callback
+ * puts the credential after the `#` precisely because that half does not
+ * travel to the server, and there is nothing about it that is less of a
+ * secret for that.
  */
-const URI_RE = /^([A-Za-z][A-Za-z0-9+.\-]*):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#.*)?$/;
+const URI_RE =
+  /^([A-Za-z][A-Za-z0-9+.\-]*):\/\/([^/?#]*)((?:\/[^?#]*)?)(?:\?([^#]*))?(?:#(.*))?$/;
 
 /** `/etc/hosts`, `./build`, `../shared`, `~/.ssh/config`. */
 const FS_PATH_RE = /^(?:~|\.{1,2})?\/[^\s]*$/;
@@ -298,6 +315,68 @@ function segmentCarriesCredential(path: string): boolean {
   return path.split("/").some(carriesCredential);
 }
 
+/** `%2F` back to `/`, and the raw text when the escaping is malformed. */
+function percentDecode(value: string): string {
+  if (!value.includes("%")) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Enough for a callback URL inside a callback URL, and not enough to recurse. */
+const MAX_LOCATOR_DEPTH = 3;
+
+/**
+ * Whether one `name=value` pair of a query string or fragment is a credential.
+ *
+ * The value is percent-decoded first, and that is the whole of the fix for the
+ * case this got wrong: `redirect_uri=https%3A%2F%2Fapp.example%2Fcb` is a URL
+ * an OAuth client is required to send, and encoded it satisfies every clause
+ * of `looksLikeCredentialValue` -- the upper-case letters are the hex digits
+ * of `%3A` and `%2F`, and the symbols are the percent signs. It was read as a
+ * credential because of its escaping, which is the one property of a string
+ * that says nothing at all about whether it is secret.
+ *
+ * Decoded, a value that is itself a location is judged as one, recursively --
+ * a nested callback URL is not a key however deeply it is nested. The
+ * recursion terminates because each level takes a strict substring: the inner
+ * value begins after a `?` or `#` the outer one had.
+ */
+function paramCarriesCredential(rawValue: string, depth: number): boolean {
+  const value = percentDecode(rawValue);
+  if (!value) return false;
+  if (depth < MAX_LOCATOR_DEPTH && (URI_RE.test(value) || FS_PATH_RE.test(value))) {
+    return !locatorIsCredentialFree(value, depth + 1);
+  }
+  return carriesCredential(value);
+}
+
+/**
+ * Whether a query string or fragment carries a credential.
+ *
+ * Both halves are `name=value&...` in practice -- the implicit OAuth flow
+ * returns `access_token=...` in the fragment for the same reason a form posts
+ * it in the query -- so both are read the same way. A bare component with no
+ * `=` is tested as a value in its own right, which is what a fragment that is
+ * just an opaque token looks like.
+ */
+function paramsCarryCredential(params: string, depth: number): boolean {
+  for (const param of params.split(/[&;]/)) {
+    if (!param) continue;
+    const eq = param.indexOf("=");
+    if (eq === -1) {
+      if (paramCarriesCredential(param, depth)) return true;
+      continue;
+    }
+    if (isSensitiveKey(param.slice(0, eq))) return true;
+    if (paramCarriesCredential(param.slice(eq + 1), depth)) return true;
+  }
+  return false;
+}
+
+
 /**
  * Whether a value is a location rather than a credential: an endpoint URL or a
  * filesystem path that carries no secret of its own.
@@ -317,7 +396,9 @@ function segmentCarriesCredential(path: string): boolean {
  * (`postgres://user:pass@host/db`) means the URL IS the credential -- that is
  * the case `database url` is in the pair list for, and it must keep being
  * collected. A query parameter named like a credential, or holding a
- * credential-shaped value, is the same leak with a different spelling. And any
+ * credential-shaped value, is the same leak with a different spelling -- as is
+ * one in the FRAGMENT, which is where the OAuth implicit flow puts the token
+ * it returns. And any
  * documented vendor shape anywhere in the string means part of it is a key
  * however the rest reads, so the whole value stays a secret.
  *
@@ -326,25 +407,21 @@ function segmentCarriesCredential(path: string): boolean {
  * pass that does not guess.
  */
 export function isCredentialFreeLocator(value: string): boolean {
+  return locatorIsCredentialFree(value, 0);
+}
+
+function locatorIsCredentialFree(value: string, depth: number): boolean {
   if (!value || /\s/.test(value)) return false;
   // A vendor-shaped token anywhere in it: part of this string is a key.
   if (redactSecrets(value).hits > 0) return false;
   const uri = URI_RE.exec(value);
   if (uri) {
-    const [, , authority = "", path = "", query] = uri;
+    const [, , authority = "", path = "", query, fragment] = uri;
     // `user:pass@host` -- the URL carries its own credentials inline.
     if (authority.includes("@")) return false;
-    if (query) {
-      for (const param of query.split("&")) {
-        if (!param) continue;
-        const eq = param.indexOf("=");
-        const name = eq === -1 ? param : param.slice(0, eq);
-        const paramValue = eq === -1 ? "" : param.slice(eq + 1);
-        if (isSensitiveKey(name)) return false;
-        if (carriesCredential(paramValue)) return false;
-      }
-    }
-    return !segmentCarriesCredential(path);
+    if (query && paramsCarryCredential(query, depth)) return false;
+    if (fragment && paramsCarryCredential(fragment, depth)) return false;
+    return !segmentCarriesCredential(percentDecode(path));
   }
   if (FS_PATH_RE.test(value)) return !segmentCarriesCredential(value);
   return false;

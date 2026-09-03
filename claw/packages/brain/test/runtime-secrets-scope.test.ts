@@ -648,7 +648,8 @@ test("an endpoint URL under a token name survives the transcript intact", () => 
   // it was cut out of every line that mentioned the endpoint.
   const endpoint = "https://example.invalid/oauth/token";
   const req = request({ user_env: { TOKEN_ENDPOINT: endpoint } });
-  assert.ok(!runtimeSecrets(req).includes(endpoint), "an endpoint is a location, not a secret");
+  assert.ok(!runtimeSecrets(req).some((s) => s === endpoint),
+  "an endpoint is a location, not a secret");
 
   const line = `curl ${endpoint} -d grant_type=client_credentials`;
   const evt = redactPersistedEvent(
@@ -680,7 +681,8 @@ test("a URL carrying its own credentials is still collected and still cut", () =
   // the URL IS the credential and none of it may reach a transcript.
   const dsn = "postgres://svc:Tr0ub4dor3@db.internal:5432/app";
   const req = request({ user_env: { DATABASE_URL: dsn } });
-  assert.ok(runtimeSecrets(req).includes(dsn), "inline userinfo makes the URL the secret");
+  assert.ok(runtimeSecrets(req).some((s) => s === dsn),
+  "inline userinfo makes the URL the secret");
 
   const evt = redactPersistedEvent(
     { type: "toolUsed", full_output: `connect ${dsn} refused` }, collect(req),
@@ -693,7 +695,8 @@ test("a token in a query string is still collected", () => {
   // Same leak, spelled as a parameter rather than as userinfo.
   const url = "https://example.invalid/v1/models?access_token=Xk9mzPl2vQr7TnA4";
   const req = request({ user_env: { TOKEN_ENDPOINT: url } });
-  assert.ok(runtimeSecrets(req).includes(url), "the credential is in the query, so the URL is one");
+  assert.ok(runtimeSecrets(req).some((s) => s === url),
+  "the credential is in the query, so the URL is one");
 });
 
 test("a vendor-shaped key inside a path-looking value is still collected", () => {
@@ -710,4 +713,37 @@ test("a credential-shaped value keeps being collected whatever its name says", (
   // name it sits under can talk it back out of the list.
   const req = request({ user_env: { BUILD_CONFIG: "P@ssw0rd-9fX2q" } });
   assert.ok(runtimeSecrets(req).includes("P@ssw0rd-9fX2q"));
+});
+
+test("an authorization URL survives its own percent-encoded redirect_uri", () => {
+  // The parameter every OAuth client is required to send. Encoded, its value
+  // reads as credential-shaped -- upper-case hex digits and percent signs --
+  // and the whole authorization URL was cut out of the transcript for it.
+  const url = "https://login.example.invalid/oauth/authorize"
+    + "?client_id=web-app&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&scope=read%20write";
+  const req = request({ user_env: { TOKEN_ENDPOINT: url } });
+  assert.ok(!runtimeSecrets(req).some((s) => s === url),
+    "an escaped location is a location");
+
+  const line = `curl -sSL "${url}"`;
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: line } } }, collect(req),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, line);
+});
+
+test("a token in a callback fragment is collected and cut", () => {
+  // The implicit flow returns the token after the `#`, and the fragment used
+  // to be discarded before anything looked at it -- so the URL read as
+  // credential-free and the token stayed in the transcript intact.
+  const token = "Xk9mzPl2vQr7TnA4";
+  const url = `https://app.example.invalid/cb#access_token=${token}&state=ok`;
+  const req = request({ user_env: { TOKEN_ENDPOINT: url } });
+  assert.ok(runtimeSecrets(req).some((s) => s === url),
+    "a URL carrying a token is not a location");
+
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: `open ${url}` } } }, collect(req),
+  );
+  assert.ok(!JSON.stringify(evt).includes(token), "the token must not survive");
 });

@@ -75,12 +75,28 @@ record it.
   cut out of every transcript line that named the endpoint or ran a command
   against the path. A URL carrying inline userinfo, a credential in a query
   parameter, and any documented vendor shape anywhere in the value all keep the
-  value collected, and a value picked for its own shape is unaffected.
+  value collected, and a value picked for its own shape is unaffected. That
+  test now percent-decodes query values before judging them -- an ordinary
+  `redirect_uri=https%3A%2F%2Fapp.example%2Fcb` reads as credential-shaped only
+  because of its escaping -- and reads the URL FRAGMENT the same way it reads
+  the query, so a callback URL carrying an implicit-flow `#access_token=…` is
+  no longer mistaken for a plain location.
 
 - Overlapping exact secrets are now replaced longest first. Whatever is
   replaced first rewrites the text the rest are searched in, so a platform key
   that is a prefix of a token derived from it used to leave the derived token's
   signed half in the clear.
+
+- A compaction no longer leaves a stale cache-use timestamp reachable. The
+  agent loop clears the timestamp and then publishes an event before it reaches
+  its next checkpoint; a SIGTERM inside that await persisted the checkpoint
+  written before the compaction, describing an entry that no longer existed.
+  The clear is now reported to the runner on the line that performs it.
+
+- The URI split used to decide whether a value is a location no longer
+  backtracks quadratically on a long non-matching input (CodeQL
+  `js/polynomial-redos`): the path alternative must begin with `/`, so exactly
+  one split of any input is possible.
 
 - `API_KEYS` and `ACCESS_TOKENS` are recognized as credentials. Only qualified
   compounds are: bare `keys` and `tokens` stay non-sensitive, because

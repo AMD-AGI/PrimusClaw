@@ -161,7 +161,7 @@ export interface ExecuteExtras {
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
   /** Called when a turn uses the prefix cache, so a SIGTERM mid-tool-batch can
    *  persist a fresher last_cache_use_at than the last turn boundary wrote. */
-  onCacheUse?: (at: number) => void;
+  onCacheUse?: (at: number | undefined) => void;
   /** If present, resume from this checkpoint instead of starting fresh. */
   resumeCheckpoint?: CheckpointState;
   /**
