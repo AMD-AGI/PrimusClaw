@@ -10,8 +10,9 @@
 # or add streaming patches. Point Brain at glm-5.3 separately (LLM_API_STYLE=openai,
 # DEFAULT_MODEL=glm-5.3 matching model_name below).
 #
-# glm-5.3 has no dedicated upstream key. LiteLLM still requires a non-empty
-# api_key on openai/* routes; the placeholder is not read by the backend.
+# glm-5.3 has no dedicated upstream key. api_key: dummy is only for an
+# unauthenticated local backend. LiteLLM still requires a non-empty api_key
+# on openai/* routes; the placeholder is not read by the backend.
 
 modelList:
   - model_name: glm-5.3
