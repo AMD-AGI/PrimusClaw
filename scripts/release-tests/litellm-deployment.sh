@@ -109,6 +109,9 @@ cat >"$tmp/bin/kubectl" <<'EOF'
 set -euo pipefail
 case "$*" in
   *"config current-context"*) echo release-test ;;
+  # base64 of "fake": the wrapper reads the credentials Secret to hash it into a
+  # pod annotation, and refuses to deploy if it cannot.
+  *"get secret"*) echo "ZmFrZQ==" ;;
   *"exec deployment/litellm"*"import yaml"*)
     [[ "${CALLBACK_READ_FAIL:-false}" != "true" ]] || exit 1
     printf '%s\n' \
@@ -173,6 +176,11 @@ if rg -q 'unused-master-value|postgresql://unused' "$capture"; then
 fi
 [[ ! -e "$tmp/openssl.called" ]]
 [[ -e "$tmp/callback.checked" ]]
+# secrets.existingSecret came from the values file, so LITELLM_EXISTING_SECRET is
+# empty here. The credentials hash still has to be set: the Secret name is
+# resolved from the rendered Deployment, not from that variable, or a rotation
+# in this mode would never reach the Pods.
+rg -qx 'podAnnotations.checksum/credentials=[0-9a-f]{32}' "$capture"
 rg -q "callback 'prometheus'.*nothing to import" "$output"
 rg -q "callback litellm.proxy.hooks.apim_key_hook.proxy_handler_instance resolves" "$output"
 
@@ -238,6 +246,7 @@ set -euo pipefail
 printf '%s\n' "$@" >>"$KUBECTL_CAPTURE"
 case "$*" in
   *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "ZmFrZQ==" ;;
   *"create namespace"*) echo "CALL:namespace" >>"$KUBECTL_ORDER"; echo "apiVersion: v1"; echo "kind: Namespace" ;;
   *"create secret"*) echo "CALL:secret" >>"$KUBECTL_ORDER"; cat >"$SECRET_STDIN_COPY"; echo '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"stub"}}' ;;
   *apply*) cat >/dev/null ;;
@@ -464,6 +473,14 @@ if env "${carry_env[@]}" bash "$deploy_script" >"$output" 2>&1; then
   exit 1
 fi
 rg -q 'literal api_key' "$output"
+# The refusal names the model, never the value. The value is the credential, and
+# putting it on a terminal and into a CI log is the leak the check exists to
+# prevent.
+rg -q 'legacy' "$output"
+if rg -q 'sk-plaintext-legacy' "$output"; then
+  echo "the refusal printed the provider key it was refusing" >&2
+  exit 1
+fi
 
 # A read failure on the credentials Secret must not be read as "first install":
 # generating a new master key over a live one makes every model credential
@@ -507,5 +524,77 @@ if env "PATH=$prov_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
   exit 1
 fi
 rg -q 'previous' "$kept"
+
+# A Secret that exists but has no master_key is not a first install. Generating
+# one would re-key a deployment whose stored model credentials were encrypted
+# with whatever used to be in that field.
+mkdir -p "$tmp/h3bin"
+cp "$prov_bin/helm" "$tmp/h3bin/helm" 2>/dev/null || cp "$tmp/bin/helm" "$tmp/h3bin/helm"
+cat >"$tmp/h3bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"jsonpath={.data.master_key}") ;;   # the Secret is there; the field is not
+  *"get secret"*) echo "ZmFrZQ==" ;;
+  *"exec deployment/litellm"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/h3bin/kubectl"
+if env "PATH=$tmp/h3bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "generated a master key over a Secret that exists without one" >&2
+  exit 1
+fi
+rg -q 'has no master_key' "$output"
+
+# With secrets.existingSecret the chart renders no Secret, so one that cannot be
+# read is not "not created yet": the Pods would come up unable to read their
+# credentials, and a rotation would never reach them. Noting it and carrying on
+# is the fail-open this replaced.
+mkdir -p "$tmp/q4bin"
+cp "$tmp/bin/helm" "$tmp/q4bin/helm"
+cat >"$tmp/q4bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get secret"*) echo "Error from server (Forbidden)" >&2; exit 1 ;;
+  *"exec deployment/litellm"*) printf '%s\n' prometheus ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/q4bin/kubectl"
+if env "PATH=$tmp/q4bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  LITELLM_VALUES_FILE="$values" LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1; then
+  echo "continued past an unreadable credentials Secret in existingSecret mode" >&2
+  exit 1
+fi
+rg -q 'take their credentials from' "$output"
+
+# The two values files are compared after resolving: `f` and `./f` are the same
+# file, and writing the discovery over the operator's own would take their
+# configuration with it.
+same_file="$tmp/same-values.yaml"
+echo 'modelList: []' >"$same_file"
+if (cd "$tmp" && env "PATH=$prov_bin:$PATH" "REAL_HELM=$real_helm" "HELM_CAPTURE=$capture" \
+  "CURL_CAPTURE=$tmp/curl.args" "CURL_HEADER_COPY=$tmp/curl.headers" \
+  "KUBECTL_CAPTURE=$tmp/kubectl.args" "SECRET_STDIN_COPY=$tmp/secret.stdin" \
+  "KUBECTL_ORDER=$tmp/kubectl.order" \
+  LITELLM_PROVIDER_TYPE=openai LITELLM_PROVIDER_URL=https://provider.invalid/v1 \
+  LITELLM_PROVIDER_API_KEY=release-provider-secret \
+  LITELLM_PROVIDER_VALUES_FILE="./same-values.yaml" \
+  LITELLM_VALUES_FILE="$same_file" \
+  LITELLM_DATABASE_URL=postgresql://release@example.invalid/litellm \
+  LITELLM_MASTER_KEY=release-master LITELLM_INSTALL_INGRESS=false SKIP_HEALTH=true \
+  bash "$deploy_script" >"$output" 2>&1); then
+  echo "accepted two spellings of the same path for the two values files" >&2
+  exit 1
+fi
+rg -q 'resolve to the same file' "$output"
 
 echo "LiteLLM deployment behavior: ok"
