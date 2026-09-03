@@ -77,11 +77,15 @@ test("only credential-named env vars are collected as exact secrets", () => {
 });
 
 test("session_env is filtered by the same rule as user_env", () => {
+  // The two names are placeholders and deliberately generic: what is under
+  // test is the rule, not any deployment's variables. One name reads as a
+  // credential and its value must be collected; the other does not and its
+  // value must be left alone, whatever either happens to hold.
   const secrets = runtimeSecrets(request({
     user_env: {},
-    session_env: { GBRAIN_TOKEN: `gb_${"d".repeat(30)}`, RECIPE_KB_REMOTE: "remote" },
+    session_env: { CUSTOM_SERVICE_TOKEN: `xyz_${"d".repeat(30)}`, WIDGET_KB_REMOTE: "remote" },
   }));
-  assert.ok(secrets.includes(`gb_${"d".repeat(30)}`));
+  assert.ok(secrets.includes(`xyz_${"d".repeat(30)}`));
   assert.ok(!secrets.includes("remote"));
 });
 

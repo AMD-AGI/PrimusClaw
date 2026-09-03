@@ -299,7 +299,7 @@ test("an email or a glob is not a credential whatever variable holds it", () => 
   // no charset or character-class rule separates them. Structure does: a
   // domain-shaped tail, or symbol-delimited pieces that are all plain words.
   for (const ordinary of [
-    "User1@example.com", "First.Last2@sub.example.co.uk", "Ops1@corp-mail.io",
+    "User1@example.com", "First.Last2@sub.example.co.uk", "Ops1@mail-relay.example",
     "Foo1.*Bar2", "Abc1+Def2", "Alpha1~Beta2", "Report2.Summary3",
   ]) {
     assert.equal(
