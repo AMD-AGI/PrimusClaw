@@ -93,4 +93,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # The runner image does not carry ripgrep, and the test greps rendered
+      # manifests with it. Without this step the job fails on the first
+      # assertion with `rg: command not found` -- which reads like a broken
+      # chart rather than a missing tool.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - run: bash scripts/release-tests/litellm-deployment.sh

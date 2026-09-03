@@ -30,6 +30,7 @@ NPM  := $(shell command -v npm 2>/dev/null)
 GO   := $(shell command -v go 2>/dev/null)
 PY   := $(shell command -v python3 2>/dev/null)
 HELM := $(shell command -v helm 2>/dev/null)
+RG   := $(shell command -v rg 2>/dev/null)
 
 define require
 	@if [ -z "$($(1))" ]; then \
@@ -79,6 +80,7 @@ release-verify-k8s:
 .PHONY: verify-deployment
 verify-deployment:
 	$(call require,HELM,helm)
+	$(call require,RG,ripgrep)
 	@bash scripts/release-tests/litellm-deployment.sh
 
 # --- TypeScript --------------------------------------------------------------

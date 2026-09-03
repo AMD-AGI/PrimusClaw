@@ -12,6 +12,13 @@ real_helm="$(command -v helm || true)"
   echo "error: helm is required for LiteLLM deployment verification" >&2
   exit 1
 }
+# Checked up front rather than left to the first assertion: without it a
+# missing ripgrep surfaces as `rg: command not found` partway through, which
+# reads like a chart that stopped rendering what the test expects.
+command -v rg >/dev/null || {
+  echo "error: ripgrep (rg) is required for LiteLLM deployment verification" >&2
+  exit 1
+}
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
