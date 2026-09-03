@@ -85,6 +85,11 @@ chmod +x "$tmp/bin/helm"
 
 cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
+# `set -e` matters here: a bare `[[ ]]` below would otherwise only set the exit
+# status of that one line, and the mock would carry on to drop its "I checked"
+# marker and exit 0 -- so an assertion about what the deploy script passed could
+# never fail the test that depends on it.
+set -euo pipefail
 case "$*" in
   *"config current-context"*) echo release-test ;;
   *"exec deployment/litellm"*"import yaml"*)
@@ -94,7 +99,16 @@ case "$*" in
       litellm.proxy.hooks.apim_key_hook.proxy_handler_instance
     ;;
   *"exec deployment/litellm"*"import importlib"*)
-    [[ "${!#}" == "litellm.proxy.hooks.apim_key_hook.proxy_handler_instance" ]]
+    # The callback has to arrive as the final argument -- that is the contract
+    # the deploy script's `python3 -c '...' "$callback"` form exists to keep.
+    # The value goes to a file, not stderr: the deploy script runs this command
+    # with 2>/dev/null, so a message written here would vanish and the failure
+    # would surface only as its generic "cannot resolve it" -- which blames the
+    # image for what is actually a wrong argument.
+    if [[ "${!#}" != "litellm.proxy.hooks.apim_key_hook.proxy_handler_instance" ]]; then
+      printf '%s\n' "${!#}" >"$CALLBACK_CAPTURE.unexpected"
+      exit 1
+    fi
     : >"$CALLBACK_CAPTURE"
     ;;
 esac
@@ -125,6 +139,10 @@ if ! env "${mock_env[@]}" \
   SKIP_HEALTH=true \
   bash "$deploy_script" >"$output" 2>&1; then
   command cat "$output" >&2
+  if [[ -e "$tmp/callback.checked.unexpected" ]]; then
+    echo "the deploy script passed this callback to the import check:" >&2
+    command cat "$tmp/callback.checked.unexpected" >&2
+  fi
   exit 1
 fi
 
