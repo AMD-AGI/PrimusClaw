@@ -17,7 +17,9 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -74,6 +76,16 @@ type SandboxReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
 	SessionTimeout time.Duration
+	// Recorder publishes the reclaim as a Kubernetes Event on the Sandbox.
+	//
+	// The audit store already records it, but only somewhere a person has to
+	// know to look: `kubectl describe sandbox` and every dashboard built on
+	// Events show nothing, so a sandbox that was deleted while its work was
+	// still running is indistinguishable from one that was never created --
+	// which is how one reclaim cost three hours of log archaeology across a
+	// 120-hour control-plane window to attribute. Nil disables it; the audit
+	// event is written either way.
+	Recorder record.EventRecorder
 	// Store is the Redis-backed session store (optional).
 	//
 	// When non-nil it carries the most recent activity time, written by the
@@ -325,6 +337,8 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 	lastActivity time.Time,
 	timeout time.Duration,
 ) {
+	r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
+
 	if r.Audit == nil {
 		return
 	}
@@ -374,6 +388,38 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 			"session_id", sessionID,
 			"error", err)
 	}
+}
+
+// recordIdleDeletedEvent publishes the reclaim where a person will find it.
+//
+// Same facts the audit event carries -- when the sandbox was last active, and
+// the timeout it outran -- because those two are what turn "the pod vanished"
+// into "the pod was reclaimed for being idle, and here is the window it missed
+// by". Without them the Event only restates the disappearance.
+//
+// Normal rather than Warning: reclaiming an idle sandbox is this controller
+// working, and a Warning would put every routine reclaim in front of whatever
+// watches for Warnings. That it is sometimes wrong -- the pod was busy in a way
+// nothing outside it could see -- is an argument for saying so, not for
+// alarming on every one.
+//
+// Emitted before the delete for the same reason the audit event is: an Event
+// referencing an object that is already gone is still recorded, but it races
+// with anything reading the object to enrich it, and there is no reason to run
+// that race. Events also expire on their own (an hour, in a default cluster),
+// so this is a debugging aid on top of the audit trail, not a replacement for
+// it.
+func (r *SandboxReconciler) recordIdleDeletedEvent(
+	sandbox *sandboxv1alpha1.Sandbox,
+	lastActivity time.Time,
+	timeout time.Duration,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(sandbox, corev1.EventTypeNormal, "IdleReclaimed",
+		"Deleted after %s idle (last activity %s)",
+		timeout, lastActivity.UTC().Format(time.RFC3339))
 }
 
 // SetupWithManager registers the controller.

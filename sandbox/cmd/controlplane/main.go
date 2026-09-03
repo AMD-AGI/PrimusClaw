@@ -281,6 +281,7 @@ func main() {
 		SessionTimeout: sessionTimeout,
 		Store:          st,
 		Audit:          auditStore,
+		Recorder:       mgr.GetEventRecorderFor("sandbox-idle-gc"),
 	}).SetupWithManager(mgr); err != nil {
 		slog.Error("unable to setup idle GC controller", "error", err)
 		os.Exit(1)
