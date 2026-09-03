@@ -105,7 +105,10 @@ done
 
 # Temp files may hold a provider API key; remove them on any exit.
 MODELS_TMP_FILES=()
-cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; }
+# `return 0` because this runs as the EXIT trap and its status becomes the
+# script's. With no temp files the loop's last command is a false test, so a
+# successful `--dry-run` exited 1.
+cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; return 0; }
 trap cleanup_tmp EXIT
 GENERATED_MODELS_FILE=""
 
