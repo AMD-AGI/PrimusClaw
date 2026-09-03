@@ -205,10 +205,12 @@ test("the count is scoped to the owner asked for, so a DAG node's work does not 
 });
 
 test("an owner nothing was started under, or none at all, answers zero rather than everything", async () => {
-  // The mirror of the unclaimed-shell case above: an older Brain sends no owner
-  // header, so its shells are filed under the empty string. Matching "" against
-  // those would report a busy sandbox to every session that asked without one,
-  // and no idle pod in the fleet would ever be reclaimed.
+  // Note this is the defensive layer, not the live one: over HTTP an absent
+  // owner header is normalized to the shared `unowned` bucket, never to "", and
+  // the route now refuses a value that only landed there by failing
+  // normalization. This pins the predicate itself -- reached directly, and by
+  // anything that files a shell without going through that normalization -- so
+  // that "" matches nothing rather than every shell stored without an owner.
   const unclaimed = spawnBackground("", RUN_1, "sleep 60", "unclaimed");
   const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine");
 

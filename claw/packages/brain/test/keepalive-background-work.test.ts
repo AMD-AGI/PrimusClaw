@@ -567,6 +567,69 @@ test("a probe in the air when a task takes the sandbox cannot report it idle", a
   assert.ok(asked > 0, "a verdict formed while the sandbox was held must not be cached");
 });
 
+test("a task taking the sandbox while the lease query is in flight discards the verdict", async () => {
+  // The generation is checked when the probe lands, and then the landing itself
+  // suspends: `held` consults the run lease, which is a KV read. Everything
+  // after that await was decided before it, so a task taking the pod during the
+  // query would be filed as `idle` -- about the previous occupant, believed for
+  // the whole cache TTL, and the pod reclaimed out from under a live shell.
+  //
+  // The two tests above bump the generation before the probe promise settles,
+  // which the pre-await check already caught. This one lets the probe settle,
+  // clear that check, and then moves the generation while the lease read is
+  // still outstanding. Only a re-check immediately before the write sees it.
+  stubPingableProvider();
+  const base = fakeKv();
+
+  let releaseLease: (() => void) | null = null;
+  const leaseInFlight = new Promise<void>((r) => { releaseLease = r; });
+  let leaseAsked = false;
+
+  const kv = {
+    ...base.kv,
+    async keys(filter = ">") { return base.kv.keys(filter); },
+    async get(key: string) {
+      if (key.startsWith("lock.")) {
+        leaseAsked = true;
+        await leaseInFlight;   // the task takes the sandbox while we are here
+        return null;           // no lease -- so `held` is false and `idle` would be written
+      }
+      return base.kv.get(key);
+    },
+  } as unknown as KV;
+
+  // Zero shells: the verdict that suppresses pinging, and the only one that is
+  // dangerous to record late.
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  await new Promise((r) => setImmediate(r));
+  assert.ok(leaseAsked, "sanity: the landing must actually reach the lease query");
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 0,
+    "sanity: nothing may be cached while the lease read is still outstanding",
+  );
+
+  // The pod is handed to a new task with the answer still mid-flight.
+  registerSandbox(SESSION, { provider: "safe-workload", workloadId: "wl-1", platformKey: "pk" });
+  releaseLease!();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 0,
+    "an answer that lost its generation during the lease query must not be filed",
+  );
+
+  // And the next sweep asks again rather than reading the discarded verdict.
+  let asked = false;
+  await runKeepaliveTickForTest({
+    kv: base.kv,
+    countActiveShells: async () => { asked = true; return 1; },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.ok(asked, "the discarded answer must not stand in for a fresh probe");
+});
+
+
 test("generation bookkeeping does not grow without bound", async () => {
   // bgGeneration has to outlive the cache it guards -- that is what discards a
   // late answer -- but not outlive the sandbox. Nothing in production deleted
@@ -592,9 +655,15 @@ test("generation bookkeeping does not grow without bound", async () => {
   await runKeepaliveTickForTest(empty);
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest(empty);
-  assert.equal(
-    backgroundWorkStateSizesForTest().generations, 0,
-    "identities nothing is asking about and nothing is probing must be collected",
+  // Every map the helper exposes, not just the generations: "nothing is left
+  // behind" is the claim, and each of these is a separate per-identity entry
+  // that would grow with every sandbox the Brain ever saw if its own reap were
+  // dropped. Asserting one of four would let the other three leak silently.
+  assert.deepEqual(
+    backgroundWorkStateSizesForTest(),
+    { cache: 0, streaks: 0, generations: 0, inFlight: 0 },
+    "identities nothing is asking about and nothing is probing must be collected, "
+      + "in every map that holds them",
   );
 });
 
@@ -636,6 +705,10 @@ test("a sweep too large to finish defers the tail instead of letting it expire",
   await runKeepaliveTickForTest(deps);
   const elapsed = Date.now() - started;
 
+  // Generous on purpose: the budget gates when a ping may *start*, so the
+  // PING_MAX_IN_FLIGHT pings already running continue past it. The bound being
+  // asserted is "budget plus about one ping", not the budget itself -- what
+  // must not happen is the phase running for the length of the whole queue.
   assert.ok(elapsed < BUDGET * 6, `the phase must be bounded, took ${elapsed}ms`);
   assert.ok(asked.size > 0, "sanity: it must have pinged something");
   assert.ok(asked.size < 200, `the budget must have cut the phase short, reached ${asked.size}`);

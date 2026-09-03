@@ -538,6 +538,17 @@ export async function withHandsTimeout<T>(
  * free, the second says nothing at all -- and a caller that cannot see the
  * difference will eventually reclaim a sandbox because Hands was briefly
  * unreachable.
+ *
+ * That applies to every way the answer can fail to arrive, not just the ones
+ * with a status code. A 200 whose body is missing `running`, or carries
+ * something that is not a count, is a Hands that did not answer the question --
+ * an older build without the route behind a proxy that rewrites 404s, a
+ * truncated body, a JSON error object. Defaulting those to zero reports a
+ * confirmed absence of work, which is the one thing this must never invent.
+ *
+ * An empty owner is refused for the same reason and in the same direction: it
+ * names no bucket, so no count about it can be true. Reporting zero would say
+ * the sandbox is free on the strength of a question nobody asked.
  */
 export async function countActiveShells(
   url: string,
@@ -545,7 +556,7 @@ export async function countActiveShells(
   owner: string,
   timeoutMs = 5_000,
 ): Promise<number> {
-  if (!owner) return 0;
+  if (!owner) throw new Error("hands_active_shells_failed: empty owner");
   const resp = await undiciFetch(handsEndpoint(url, "/internal/shells/active"), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -554,6 +565,10 @@ export async function countActiveShells(
     dispatcher: HANDS_DISPATCHER,
   } as Parameters<typeof undiciFetch>[1]);
   if (!resp.ok) throw new Error(`hands_active_shells_failed: status=${resp.status}`);
-  const body = await resp.json() as { running?: number };
-  return body?.running ?? 0;
+  const body = await resp.json().catch(() => null) as { running?: unknown } | null;
+  const running = body?.running;
+  if (typeof running !== "number" || !Number.isFinite(running) || running < 0) {
+    throw new Error(`hands_active_shells_failed: malformed body running=${String(running)}`);
+  }
+  return running;
 }

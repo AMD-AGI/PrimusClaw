@@ -65,8 +65,10 @@ interface KeepaliveDeps {
   kv: KV;
   /**
    * Test seam for the background-work probe, which is otherwise a live HTTP call
-   * to a Hands that does not exist under test -- and whose failure path answers
-   * "no work", so the interesting branch would never be reached.
+   * to a Hands that does not exist under test -- so every probe would fail, and
+   * a failed probe answers `unknown`. That keeps the handle, which is the safe
+   * direction but only one of three branches: neither a confirmed `running` nor
+   * a confirmed `idle` could be reached without stubbing the call.
    */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
   /**
@@ -296,10 +298,6 @@ export function markHandsIdle(
 }
 
 /**
- * Build the merged ping target list: in-memory registry (primary) + NATS KV
- * (secondary, for crash-recovery of sessions created by a previous Brain pod).
- */
-/**
  * What a probe of Hands' background-shell registry can tell us.
  *
  * Three states rather than a boolean, because "no work" and "could not ask" lead
@@ -311,8 +309,8 @@ export function markHandsIdle(
 type BackgroundWork = "running" | "idle" | "unknown";
 
 /**
- * Last probe answer per session, so the sweep does not ask once per handle per
- * tick.
+ * Last probe answer per sandbox identity, so the sweep does not ask once per
+ * handle per tick.
  *
  * The sweep has to know on every tick -- the answer decides whether the sandbox
  * is pinged, and an unpinged sandbox is reclaimed -- but the answer does not
@@ -371,10 +369,18 @@ const PING_MAX_IN_FLIGHT = 16;
  * then waits past its own expiry, and the sweep guard means no other sweep is
  * coming to renew it.
  *
- * Half the record's lifetime is the budget, so anything reached this sweep was
- * reached with the other half to spare. Whatever is not reached keeps the
- * renewal it already got and goes first next time -- the cursor below is what
- * makes deferral fair rather than starvation for whoever sorts last.
+ * Half the record's lifetime is the budget. Precisely, it is a cutoff on
+ * *starting* a ping, not on the phase finishing: the deadline is tested as each
+ * target is picked up, so up to PING_MAX_IN_FLIGHT pings already in progress run
+ * past it, each bounded by its own command timeout. The phase can therefore
+ * overrun the budget by roughly one ping's timeout, not by the length of the
+ * remaining queue -- which is the property that matters, since the queue is what
+ * grows with the fleet and the timeout does not.
+ *
+ * So a ping started this sweep began with the other half of the TTL to spare,
+ * and anything not started keeps the renewal it already got and goes first next
+ * time -- the cursor below is what makes deferral fair rather than starvation
+ * for whoever sorts last.
  */
 const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
 /** Where the last sweep stopped handing out pings. */
@@ -398,18 +404,14 @@ const bgGeneration = new Map<string, number>();
 /** Where the last sweep stopped handing out probe slots. */
 let bgProbeCursor = 0;
 
-/** Drop bookkeeping for sessions this sweep no longer sees. */
+/** Drop the cached verdict for one sandbox identity, and invalidate any
+ *  answer still in the air about it. */
 function forgetBackgroundWork(identity: string): void {
   bgProbeCache.delete(identity);
   bgUnknownStreak.delete(identity);
   bgGeneration.set(identity, (bgGeneration.get(identity) ?? 0) + 1);
 }
 
-/**
- * Clear the probe bookkeeping. Exported for tests, which drive several sweeps
- * over one session id in one process and would otherwise read each other's
- * cached answers -- the cache being module state is the point of it.
- */
 /** Sizes of the background-work bookkeeping, so a leak in it can be asserted. */
 export function backgroundWorkStateSizesForTest(): {
   cache: number; streaks: number; generations: number; inFlight: number;
@@ -422,6 +424,11 @@ export function backgroundWorkStateSizesForTest(): {
   };
 }
 
+/**
+ * Clear the probe bookkeeping. Exported for tests, which drive several sweeps
+ * over one sandbox identity in one process and would otherwise read each
+ * other's cached answers -- the cache being module state is the point of it.
+ */
 export function resetBackgroundWorkStateForTest(): void {
   bgProbeCache.clear();
   bgUnknownStreak.clear();
@@ -530,9 +537,14 @@ function dispatchProbes(
     bgProbeInFlight.add(identity);
     started += 1;
 
+    // True once anything has invalidated this identity since the candidate was
+    // formed. Called again after every suspension point below, not once at the
+    // top: each await is a window the generation can move in.
+    const stale = () => (bgGeneration.get(identity) ?? 0) !== generation;
+
     void probe(info.handsUrl!, info.token!, sessionId)
       .then(async (running) => {
-        if ((bgGeneration.get(identity) ?? 0) !== generation) {
+        if (stale()) {
           logger.info(
             { sessionId, workloadId: info.workloadId },
             "keepalive.background_work_answer_stale",
@@ -548,6 +560,25 @@ function dispatchProbes(
         // background shell the probe never saw.
         const held = localRegistry.has(identity)
           || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope).catch(() => false);
+
+        // Re-read, because the lease query is a suspension point and the check
+        // above was made before it. registerSandbox and markHandsIdle both bump
+        // the generation from outside this promise, so a task can take the pod
+        // while the query is outstanding -- and then the `idle` below would be
+        // filed about the previous occupant and believed for the whole cache
+        // TTL. That is the exact failure the generation exists to prevent,
+        // arriving one await later than the guard that was watching for it.
+        //
+        // Guarding the write rather than the question is the general rule here:
+        // any await added between these two points needs the check to stay
+        // immediately before the write, not wherever the await was introduced.
+        if (stale()) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_answer_stale",
+          );
+          return;
+        }
         if (held && running === 0) {
           logger.info(
             { sessionId, workloadId: info.workloadId },
@@ -566,7 +597,7 @@ function dispatchProbes(
         }
       })
       .catch((err) => {
-        if ((bgGeneration.get(identity) ?? 0) !== generation) return;
+        if (stale()) return;
         const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
         bgUnknownStreak.set(identity, streak);
         logger.warn(
@@ -639,6 +670,10 @@ async function forEachWithLimit<T>(
   await Promise.all(workers);
 }
 
+/**
+ * Build the merged ping target list: in-memory registry (primary) + NATS KV
+ * (secondary, for crash-recovery of sessions created by a previous Brain pod).
+ */
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
@@ -828,9 +863,10 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
   }
-  // Same for the background-work bookkeeping, which is keyed by session rather
-  // than by target: a session with no target left is one nothing will ask about
-  // again, and its cached answer would otherwise outlive the sandbox.
+  // Same for the background-work bookkeeping, which is keyed by sandbox identity
+  // rather than by target: an identity the sweep no longer sees is one nothing
+  // will ask about again, and its cached answer would otherwise outlive the pod
+  // it was about.
   // Keyed on what the sweep saw, not on what it decided to ping: an `idle`
   // answer is exactly the case where the handle does not become a target, so
   // reaping on targets threw away the answer at the end of every tick and asked
@@ -874,6 +910,9 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   let deferred = 0;
 
   await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
+    // Checked as each target is picked up, so this bounds when a ping may
+    // start, not when the phase ends: the pings already running continue past
+    // the deadline. See PING_PHASE_BUDGET_MS.
     if (Date.now() >= pingDeadline) {
       deferred += 1;
       return;
