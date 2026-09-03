@@ -48,7 +48,10 @@
       "type": "object"
     },
     "podAnnotations": {
-      "type": "object"
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
     }
   }
 }
