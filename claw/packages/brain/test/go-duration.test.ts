@@ -141,6 +141,33 @@ const ORACLE: ReadonlyArray<readonly [string, bigint | null]> = [
   ["153722867280912931m", null],
   ["2562047788015215h", null],
   ["2562047788015216h", null],
+
+  // Terms that carry the uint64 total past 2^64, where Go's `d += v` wraps
+  // instead of erroring. Captured from the same binary as everything above.
+  ["9223372036854775808ns1ns", null],
+  ["9223372036854775808ns9223372036854775808ns", null],
+  ["9223372036854775808ns9223372036854775808ns1ns", 1n],
+  ["9223372036854775808ns9223372036854775808ns9223372036854775807ns", 9223372036854775807n],
+  ["9223372036854775808ns9223372036854775808ns9223372036854775808ns", null],
+  ["1ns9223372036854775808ns9223372036854775808ns", null],
+  ["9223372036854775808ns1ns9223372036854775808ns", null],
+  ["9223372036854775807ns9223372036854775808ns1ns", null],
+  ["9223372036854775808ns9223372036854775807ns1ns", null],
+  ["9223372036854775808ns9223372036854775808ns1ns9223372036854775808ns9223372036854775808ns1ns", null],
+  ["9223372036854775808ns9223372036854775808ns0.5s", 500000000n],
+  ["-9223372036854775808ns9223372036854775808ns1ns", null],
+  ["9223372036854775808ns9223372036854775808ns-1ns", null],
+  ["9223372036854775806ns2ns", null],
+  ["4611686018427387904ns4611686018427387904ns1ns", null],
+  ["9223372036854775808ns9223372036854775808ns9223372036854775808ns9223372036854775808ns1ns", 1n],
+  ["0.9223372036854775808h9223372036854775808ns9223372036854775808ns", null],
+  ["9223372036854775808ns0.9223372036854775808h9223372036854775808ns", null],
+  ["+9223372036854775808ns9223372036854775808ns.9999999999999999999s", 1000000000n],
+  ["+9223372036854775808ns9223372036854775808ns0.9223372036854775808h", 3320413933267n],
+  ["0ns9223372036854775808ns9223372036854775808ns4611686018427387902ns4611686018427387904ns", 9223372036854775806n],
+  ["4611686018427387903ns4611686018427387905ns9223372036854775808ns1h", 3600000000000n],
+  ["4611686018427387904ns0ns4611686018427387904ns9223372036854775808ns4611686018427387904ns", 4611686018427387904n],
+  ["9223372036854775808ns9223372036854775808ns9223372036854775808ns9223372036854775808ns9223372036854775808ns9223372036854775808ns1ns", 1n],
 ];
 
 test("every case agrees with what time.ParseDuration actually returned", () => {
@@ -151,8 +178,42 @@ test("every case agrees with what time.ParseDuration actually returned", () => {
 });
 
 test("the corpus is big enough to be worth the name", () => {
-  // The number this file used to claim without pinning anything.
-  assert.ok(ORACLE.length >= 91, `only ${ORACLE.length} cases`);
+  // 91 is the number this file used to claim while pinning 31. The floor is
+  // above it so the claim cannot quietly become false again by deletion.
+  assert.ok(ORACLE.length >= 130, `only ${ORACLE.length} cases`);
+});
+
+// ── The wraparound a third review round put a name to ────────────────────────
+//
+// Go's running total is a uint64 and `d += v` is checked only afterwards, with
+// `d > 1<<63`. A sum large enough to pass 2^64 therefore wraps under that
+// question rather than failing it: two terms of exactly 1<<63 land on 0, and a
+// third of 1ns makes the whole string 1ns. Accumulating in BigInt and rejecting
+// on the way past looked like the more defensible reading, and it is -- but the
+// Workload Manager is the one that decides, in uint64, and a value it accepts
+// that this rejects is a lifetime refused at startup for being valid.
+//
+// This is the case an earlier 280,560-input random corpus could not reach,
+// because nothing in it summed several terms across 2^64. Pinned here by hand.
+test("the total wraps where Go's uint64 total wraps", () => {
+  const P = "9223372036854775808ns"; // exactly 1<<63, which Go's leadingInt allows
+
+  assert.equal(goDurationNs(P), null, "one of them is over int64 at the end");
+  assert.equal(goDurationNs(P + "1ns"), null, "and so is one plus a little");
+  assert.equal(goDurationNs(P + P), null, "two wrap to zero, which is not a lifetime");
+  assert.equal(goDurationNs(P + P + "1ns"), 1n, "two wrap to zero, then 1ns is 1ns");
+  assert.equal(goDurationNs(P + P + P + P + "1ns"), 1n, "four wrap twice, same answer");
+  assert.equal(goDurationNs(P + P + "9223372036854775807ns"), 9223372036854775807n);
+  assert.equal(goDurationNs(P + P + P), null, "three land back on 1<<63, over int64");
+
+  // Order matters, because the check runs after every single add: the wrap only
+  // survives when nothing in between has already been caught above 1<<63.
+  assert.equal(goDurationNs("1ns" + P + P), null, "1ns first pushes the sum over");
+  assert.equal(goDurationNs(P + "1ns" + P), null, "and so does 1ns in the middle");
+
+  // A fraction after the wrap is measured from the wrapped total, not a bigger one.
+  assert.equal(goDurationNs(P + P + "0.5s"), 500000000n);
+  assert.equal(goDurationNs("-" + P + P + "1ns"), null, "negative is still refused");
 });
 
 // ── The boundary a cross-vendor review put a name to ─────────────────────────

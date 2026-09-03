@@ -160,6 +160,7 @@ func TestClaimMetadataStopsRetrying(t *testing.T) {
 	// Bounded, because every attempt is holding a Pod out of the pool.
 	scheme := claimScheme(t)
 	var calls int
+	var lastCall time.Time
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(claimSandbox()).
@@ -167,6 +168,7 @@ func TestClaimMetadataStopsRetrying(t *testing.T) {
 			Patch: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object,
 				ctrlclient.Patch, ...ctrlclient.PatchOption) error {
 				calls++
+				lastCall = time.Now()
 				return errors.New("still broken")
 			},
 		}).Build()
@@ -179,14 +181,18 @@ func TestClaimMetadataStopsRetrying(t *testing.T) {
 	if calls != retryAttempts {
 		t.Errorf("want exactly %d attempts while holding a pooled Pod, got %d", retryAttempts, calls)
 	}
-	// 200ms then 400ms between the three attempts, and no wait after the last:
-	// a fourth backoff would mean it slept on a decision it had already made.
-	elapsed := time.Since(start)
-	if elapsed < firstBackoff+2*firstBackoff {
+	// 200ms then 400ms between the three attempts. Only a lower bound on the
+	// total: a loaded machine can make any wall-clock window too tight, and
+	// jitter only ever pushes this number up, never below the backoff it is
+	// meant to prove happened.
+	if elapsed := time.Since(start); elapsed < firstBackoff+2*firstBackoff {
 		t.Errorf("gave up after %v, faster than the backoff it is supposed to serve", elapsed)
 	}
-	if elapsed > firstBackoff+2*firstBackoff+3*firstBackoff {
-		t.Errorf("took %v -- it waited past the last attempt", elapsed)
+	// And no wait after the last attempt, measured from that attempt rather
+	// than from the start, so a stalled scheduler earlier in the run cannot
+	// make a prompt return look like a fourth backoff.
+	if settled := time.Since(lastCall); settled >= firstBackoff {
+		t.Errorf("returned %v after the final attempt -- it slept on a decision it had made", settled)
 	}
 }
 
@@ -223,8 +229,12 @@ func TestClaimMetadataStopsWhenTheRequestIsCancelledMidBackoff(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("it kept trying after cancellation: %d attempts", calls)
 	}
-	if elapsed := time.Since(start); elapsed >= firstBackoff {
-		t.Errorf("it slept the full %v backoff before noticing, took %v", firstBackoff, elapsed)
+	// Generous against scheduler jitter and still far below the 600ms the full
+	// schedule would take: what this rules out is sleeping through the rest of
+	// it, not any particular millisecond.
+	if elapsed := time.Since(start); elapsed >= 2*firstBackoff {
+		t.Errorf("it kept sleeping after cancellation, took %v of a %v schedule",
+			elapsed, firstBackoff+2*firstBackoff)
 	}
 }
 

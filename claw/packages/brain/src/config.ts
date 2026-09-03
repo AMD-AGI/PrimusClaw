@@ -233,8 +233,10 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * accumulating when it would overflow but stops scaling too, which is why Go
  * reads 309 nines as 1s rather than as anything smaller; the fractional term is
  * computed in float64 and truncated per segment, which is why `0.6ns` is zero
- * and `0.6ns0.6ns` is zero twice; and every multiply is overflow-checked before
- * it happens. Cross-checked against `time.ParseDuration` on 91 inputs.
+ * and `0.6ns0.6ns` is zero twice; every multiply is overflow-checked before it
+ * happens; and the running total is a uint64 that wraps rather than a number
+ * that grows. Every case in test/go-duration.test.ts is an answer captured from
+ * `time.ParseDuration` itself.
  *
  * Zero and negative come back as null. Both parse in Go, and neither is a value
  * worth sending: the Workload Manager applies an override only when positive.
@@ -258,6 +260,7 @@ const INT64_MAX = (1n << 63n) - 1n;
 // two terms are then equal only by a float64 coincidence. The final result is
 // still held to INT64_MAX, at the end, exactly where Go holds it.
 const UINT64_HALF = 1n << 63n;
+const UINT64_MASK = (1n << 64n) - 1n;
 
 const isDigit = (c: string): boolean => c >= "0" && c <= "9";
 
@@ -329,7 +332,13 @@ export function goDurationNs(input: string): bigint | null {
         if (v > UINT64_HALF) return null;
       }
 
-      total += v;
+      // Go adds into a uint64 and only then asks whether it went too far, so a
+      // sum that goes far enough wraps past the question: two terms of exactly
+      // 1<<63 land on 0, not on an error, and `...ns...ns1ns` is 1ns to Go.
+      // Rejecting it here would be the safer answer to a string nobody means,
+      // but "safer than Go" is the drift this parser exists to not have -- the
+      // Workload Manager is the one that decides, and it decides in uint64.
+      total = (total + v) & UINT64_MASK;
       if (total > UINT64_HALF) return null;
     }
     // Go's own last word: everything above runs to 1<<63, and a positive result
