@@ -183,7 +183,6 @@ if ! $SKIP_NATS; then
   elif $DRY_RUN; then
     NATS_PASSWORD_PROD="dry-run-prod-password"
     NATS_PASSWORD_SYS="dry-run-sys-password"
-    NATS_PASSWORD_DISPATCH="dry-run-dispatch-password"
   else
     log "  Generating PROD + SYS NATS passwords -> $NATS_CREDS_FILE"
     {
@@ -191,19 +190,8 @@ if ! $SKIP_NATS; then
       echo "# DO NOT COMMIT. Operator-managed; required for helm upgrades."
       echo "NATS_PASSWORD_PROD=$(openssl rand -hex 16)"
       echo "NATS_PASSWORD_SYS=$(openssl rand -hex 16)"
-      echo "NATS_PASSWORD_DISPATCH=$(openssl rand -hex 16)"
     } > "$NATS_CREDS_FILE"
     chmod 600 "$NATS_CREDS_FILE"
-    # shellcheck disable=SC1090
-    source "$NATS_CREDS_FILE"
-  fi
-
-  # A credentials file written before the dispatch user existed has no entry for
-  # it, and an empty substitution renders `password: ""` -- an account anyone can
-  # authenticate to. Append rather than regenerate: the other two are in use.
-  if [ -z "${NATS_PASSWORD_DISPATCH:-}" ] && ! $DRY_RUN; then
-    log "  Adding NATS_PASSWORD_DISPATCH -> $NATS_CREDS_FILE"
-    echo "NATS_PASSWORD_DISPATCH=$(openssl rand -hex 16)" >> "$NATS_CREDS_FILE"
     # shellcheck disable=SC1090
     source "$NATS_CREDS_FILE"
   fi
@@ -230,8 +218,6 @@ if ! $SKIP_NATS; then
   ' "$SCRIPT_DIR/nats-values.yaml" \
     | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
           -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
-          -e "s|__DISPATCH_NATS_PASSWORD__|${NATS_PASSWORD_DISPATCH}|g" \
-        -e "s|__DISPATCH_SUBJECT_PREFIX__|${DISPATCH_SUBJECT_PREFIX:-dispatch.v1}|g" \
     > "$RENDERED_NATS_VALUES"
 
   if $DRY_RUN; then

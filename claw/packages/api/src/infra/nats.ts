@@ -7,8 +7,7 @@ import {
   TASK_MAX_DELIVER, TASK_MAX_ACK_PENDING,
   BRAIN_REGISTRY_TTL_MS,
   BRAIN_REGISTRY_REPLICAS, BRAIN_CHECKPOINTS_REPLICAS, SYSTEM_ENV_REPLICAS,
-  TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS, DISPATCH_STREAM_REPLICAS,
-  DISPATCH_SUBJECT_PREFIX,
+  TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS,
 } from "../config.js";
 import {
   TASK_CONSUMER_ACK_WAIT_NS, TASK_CONSUMER_NAME, TASK_STREAM_NAME,
@@ -34,20 +33,6 @@ export const EVENT_STREAM = "PRIMUS_CLAW_EVENTS";
 // From @claw/protocol because brain names the same stream when it attaches to
 // the durable living on it, and a second literal is a second thing to edit.
 export const TASK_STREAM = TASK_STREAM_NAME;
-/**
- * A dispatch control plane's terminal events.
- *
- * Claw hosts the bus and owns the stream; a dispatcher above it publishes, and
- * nothing here reads. It exists so a consumer can be added later without a
- * migration -- and so the retention is a decision somebody made rather than
- * whatever a first publish happens to create.
- *
- * The prefix is versioned, and configurable because the publisher names it: a
- * deployment whose dispatcher publishes under some other prefix sets
- * DISPATCH_SUBJECT_PREFIX rather than running a stream that matches nothing it
- * sends. Both halves have to agree, and only one of them is this repo.
- */
-export const DISPATCH_STREAM = "PRIMUS_DISPATCH_EVENTS";
 
 // KV bucket names (Plan Y v2). Must match brain/src/config.ts mirror values.
 // Authority for bucket lifecycle is initNats() below; brain pods attach the
@@ -93,18 +78,6 @@ const SYSTEM_ENV_TTL_MS = 0;
  * would size it for a window the stream stopped having.
  */
 export const EVENT_STREAM_RETENTION_MS = 24 * 3600 * 1000;
-/**
- * Retention for the dispatch stream: the pair agreed with the dispatcher owner.
- *
- * A troubleshooting window, not a delivery guarantee. Seven days is long enough
- * to reconstruct what was dispatched across a weekend; 100k messages bounds a
- * runaway publisher on a fileStore shared with the streams carrying real
- * traffic. With no subscriber yet, trimming the tail costs nothing -- which is
- * what makes both limits safe to set now rather than after someone depends on
- * them.
- */
-export const DISPATCH_STREAM_RETENTION_MS = 7 * 24 * 3600 * 1000;
-export const DISPATCH_STREAM_MAX_MSGS = 100_000;
 
 /** What the event stream keeps, and whether the server said so. */
 export interface EventStreamRetention {
@@ -232,7 +205,7 @@ export async function initNats(): Promise<void> {
 
   await ensureStream(
     jsm, EVENT_STREAM, ["events.>"], EVENT_STREAM_RETENTION_MS * 1_000_000,
-    0, EVENT_STREAM_REPLICAS, 0,
+    0, EVENT_STREAM_REPLICAS,
   );
   // Read back here, ahead of the bucket that is sized from it, because no later
   // start corrects a bucket sized from the constant instead. What would be wrong
@@ -256,22 +229,7 @@ export async function initNats(): Promise<void> {
   // redelivery.
   const taskRetentionNs = resolveTaskStreamMaxAgeNs(TASK_MAX_DELIVER);
   await ensureStream(
-    jsm, TASK_STREAM, ["tasks.>"], taskRetentionNs, taskRetentionNs, TASK_STREAM_REPLICAS, 0,
-  );
-  // The dispatcher's own terminal events. Claw hosts the bus and owns the
-  // stream; it neither publishes nor subscribes here, which is why this is the
-  // one stream with no consumer created beside it.
-  //
-  // Retention is the pair agreed with the dispatcher owner and is a
-  // troubleshooting window, not a delivery guarantee: 7 days is long enough to
-  // reconstruct what was dispatched across a weekend, and 100k messages bounds
-  // a runaway publisher on a fileStore shared with the streams that carry real
-  // traffic. There is no subscriber yet -- the events exist so one can be added
-  // without a migration -- so nothing breaks if either limit trims the tail.
-  await ensureStream(
-    jsm, DISPATCH_STREAM, [`${DISPATCH_SUBJECT_PREFIX}.>`],
-    DISPATCH_STREAM_RETENTION_MS * 1_000_000, 0,
-    DISPATCH_STREAM_REPLICAS, DISPATCH_STREAM_MAX_MSGS,
+    jsm, TASK_STREAM, ["tasks.>"], taskRetentionNs, taskRetentionNs, TASK_STREAM_REPLICAS,
   );
   await ensureTaskConsumer();
 
@@ -287,7 +245,6 @@ export async function initNats(): Promise<void> {
       account: NATS_USER || "(default)",
       EVENT_STREAM,
       TASK_STREAM,
-      DISPATCH_STREAM,
       BRAIN_REGISTRY_BUCKET,
       BRAIN_CHECKPOINTS_BUCKET,
       SYSTEM_ENV_BUCKET,
@@ -440,18 +397,6 @@ export async function ensureStream(
   maxAgeNs: number,
   duplicateWindowNs: number,
   replicas: number,
-  /**
-   * Message ceiling, or 0 for none.
-   *
-   * Widened rather than reconciled, like max_age and unlike replicas: lowering
-   * it discards messages that are inside the retention an operator chose, and a
-   * process that starts with a stale constant must not do that on its own.
-   *
-   * Required, with no default, for the reason the replica count is: a defaulted
-   * parameter is one a new call site never has to think about, and that is how
-   * PRIMUS_CLAW_TASKS came to be created at one replica.
-   */
-  maxMsgs: number,
 ): Promise<void> {
   let existing: Awaited<ReturnType<JetStreamManager["streams"]["info"]>> | null = null;
   try {
@@ -471,13 +416,6 @@ export async function ensureStream(
     }
     if (duplicateWindowNs && existing.config.duplicate_window < duplicateWindowNs) {
       widened.duplicate_window = duplicateWindowNs;
-    }
-    // Same reading of zero as max_age above: -1 and 0 both spell "unlimited"
-    // for max_msgs, and a stream an operator made unbounded must not be cut
-    // back to a constant compiled in here.
-    const existingMaxMsgs = existing.config.max_msgs;
-    if (maxMsgs && existingMaxMsgs > 0 && existingMaxMsgs < maxMsgs) {
-      widened.max_msgs = maxMsgs;
     }
     // Replicas are reconciled to the exact figure rather than only widened,
     // which is the rule the KV buckets have always followed, and safe here for
@@ -512,7 +450,6 @@ export async function ensureStream(
       subjects,
       storage: StorageType.File,
       max_age: maxAgeNs,
-      ...(maxMsgs ? { max_msgs: maxMsgs } : {}),
       retention: RetentionPolicy.Limits,
       num_replicas: replicas,
       ...(duplicateWindowNs ? { duplicate_window: duplicateWindowNs } : {}),

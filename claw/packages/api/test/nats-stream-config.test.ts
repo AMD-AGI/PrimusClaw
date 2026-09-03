@@ -294,7 +294,7 @@ function ensureStreamSites(source: string): EnsureStreamSite[] {
   return sites;
 }
 
-test("each ensureStream call site in the source names its own replica variable", () => {
+test("the two ensureStream call sites in the source each name their own replica variable", () => {
   // Everything above calls `ensureStream` directly with a number, which holds
   // that the reconciliation is correct and nothing at all about the number it
   // is given. `initNats` is where that number is chosen, and it needs a live
@@ -316,26 +316,16 @@ test("each ensureStream call site in the source names its own replica variable",
   // no longer satisfy it and a wrapped argument can no longer break it. The
   // fallback chain behind each variable is pinned behaviourally in
   // config-nats-replicas.test.ts.
-  //
-  // Read by the replica parameter's position rather than as the last argument:
-  // it was last until `maxMsgs` was added behind it, and "last" is a property of
-  // the signature rather than of the thing being checked.
   const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
-  const sites = ensureStreamSites(src);
-  const declaration = sites.find((s) => s.isDeclaration);
-  assert.ok(declaration, "the parameter list is what gives the positions below meaning");
-  const replicaIndex = declaration.args.findIndex((p) => /^replicas\b/.test(p));
-  assert.notEqual(replicaIndex, -1, "the replica count is still its own parameter");
-  const calls = sites.filter((s) => !s.isDeclaration).map((s) => s.args);
+  const calls = ensureStreamSites(src).filter((s) => !s.isDeclaration).map((s) => s.args);
 
   const taskCalls = calls.filter((args) => args[1] === "TASK_STREAM");
   const eventCalls = calls.filter((args) => args[1] === "EVENT_STREAM");
-  const dispatchCalls = calls.filter((args) => args[1] === "DISPATCH_STREAM");
 
   assert.equal(taskCalls.length, 1,
     "exactly one call site creates the task stream, or the one being read here "
     + "is not the one start-up runs");
-  assert.equal(taskCalls[0][replicaIndex], "TASK_STREAM_REPLICAS",
+  assert.equal(taskCalls[0].at(-1), "TASK_STREAM_REPLICAS",
     "this is the stream the outage was on, so a literal in the last argument is "
     + "the defect reappearing exactly as it was; EVENT_STREAM_REPLICAS here is "
     + "the quieter version -- both settings fall back to NATS_REPLICAS, so in a "
@@ -345,15 +335,9 @@ test("each ensureStream call site in the source names its own replica variable",
 
   assert.equal(eventCalls.length, 1,
     "and exactly one creates the event stream");
-  assert.equal(eventCalls[0][replicaIndex], "EVENT_STREAM_REPLICAS",
+  assert.equal(eventCalls[0].at(-1), "EVENT_STREAM_REPLICAS",
     "an event stream on one server loses session history to the same lost pod, "
     + "and there is nothing to rebuild it from");
-
-  assert.equal(dispatchCalls.length, 1,
-    "and exactly one creates the dispatch stream");
-  assert.equal(dispatchCalls[0][replicaIndex], "DISPATCH_STREAM_REPLICAS",
-    "the dispatcher's events are the record of what was dispatched; on one "
-    + "server they go with the pod");
 });
 
 test("no ensureStream call site can leave the replica count to a default", () => {
