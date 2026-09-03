@@ -12,16 +12,16 @@
  * than merely untidy: a value cut there is not masked for a reader, it is gone
  * from the conversation, and the agent resumes without it.
  *
- * It used to return every user_env / session_env value. On one live deployment
- * that put a `<redacted>` into the persisted history of nearly every session in
- * a week, and what it had destroyed was ordinary content -- a FORGE_PATH inside
- * `sed -n '140,340p' ...`, a MODEL_PATH inside `export MODEL_PATH=.../Qwen3-8B`,
- * and a word excised from the middle of `backends/remote_runner.py`.
+ * It used to return every user_env / session_env value, which put a
+ * `<redacted>` into the persisted history of any session whose environment
+ * named a path. What it destroyed was ordinary content -- a build path inside
+ * `sed -n '140,340p' ...`, a model root inside `export MODEL_PATH=...`, and a
+ * word excised from the middle of `backends/remote_runner.py`.
  *
  * Two guards now stand between a config value and that outcome, and this file
  * pins both, in both directions. Narrowing them re-opens the bug; removing
- * them the other way leaks a credential. The fixtures below are transcribed
- * from the real corpus that was being mangled.
+ * them the other way leaks a credential. The fixtures below are illustrative
+ * of the shapes that were being mangled, not of any one deployment.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -53,7 +53,7 @@ function request(overrides: Partial<ExecuteRequest> = {}): ExecuteRequest {
       // destroyed it.
       MODEL_PATH: "/models/qwen3-8b",
       GIT_SUBCOMMAND: "remote",
-      FORGE_PATH: "/models/qwen3-8b/backends",
+      BUILD_ROOT: "/models/qwen3-8b/backends",
       // A credential, by name and by length.
       HF_TOKEN,
     },
@@ -231,6 +231,33 @@ test("a credential-shaped value under an unremarkable name is collected by shape
   assert.ok(secrets.includes("Xk9$mzPl2vQ"));
 });
 
+test("build flags and product names under the same names are left alone", () => {
+  // BUILD_CONFIG really does hold cmake flags, and DEPLOY_OPTS really does
+  // hold `-D...=...`. A shape rule that fires on "symbol plus mixed case"
+  // catches those too, and then cuts them out of every command in the
+  // transcript that used them -- the same failure as the name rule it was
+  // added to complement, arriving by a different door.
+  const env = {
+    BUILD_CONFIG: "-DFoo=Bar1",
+    CMAKE_FLAGS: "-DCMAKE_BUILD_TYPE=Release",
+    VENDOR: "GitHub",
+    HOST_OS: "macOS",
+    HANDLER: "getUserById2",
+    COMMENT_ANCHOR: "#Aa12Bb34",
+  };
+  const secrets = runtimeSecrets(request({ user_env: env }));
+  for (const value of Object.values(env)) {
+    assert.ok(!secrets.includes(value), `${JSON.stringify(value)} is ordinary configuration`);
+  }
+  // And end to end: a command line mentioning all of them comes back intact.
+  const text = "cmake -DFoo=Bar1 -DCMAKE_BUILD_TYPE=Release # GitHub on macOS, see getUserById2";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    secrets,
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});
+
 test("the shape ground stays narrow enough not to re-open the incident", () => {
   // Every value below is distinctive by the length-and-entropy test, so a
   // shape rule written as "anything distinctive" would collect all of them --
@@ -241,7 +268,7 @@ test("the shape ground stays narrow enough not to re-open the incident", () => {
     user_env: {
       MODEL_PATH: "/models/qwen3-8b",
       MODEL_NAME: "Qwen3-8B",
-      FORGE_PATH: "/models/qwen3-8b/backends",
+      BUILD_ROOT: "/models/qwen3-8b/backends",
       APP_VERSION: "v1.2.3",
       ENDPOINT: "https://api.internal/v1",
       GIT_SUBCOMMAND: "remote",

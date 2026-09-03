@@ -31,15 +31,36 @@ const HEX_TOKEN_32B_RE = /\b[A-Fa-f0-9]{64}\b/g;
 //
 // `sk-` additionally needs more than a boundary, because its charset includes
 // the hyphen and so a boundary alone still swallows any hyphenated phrase
-// beginning with those two letters. A real OpenAI/Anthropic key ends in one
-// long unbroken run (`sk-ant-api03-<48 chars>`, `sk-proj-<48 chars>`), while a
-// phrase is short segments all the way down, so the run is what distinguishes
-// them: `sk-learn-is-a-typo` has no segment near key length and is left alone.
+// beginning with those two letters -- `sk-learn-is-a-typo`.
+//
+// Two rules matter here and they are easy to conflate. What the pattern
+// CONSUMES has to be the whole token, separators and all. What it REQUIRES in
+// order to fire has to be something a phrase does not have. Writing the
+// requirement as the final consumed segment -- `sk-(?:seg-)*<long run>` --
+// broke the first rule: the match stopped at the last long run, so
+// `sk-ant-api03-<93 chars>-<6 chars>AA` redacted to `<redacted>-BBBBBBAA` and
+// published the key's last eight characters. A partial redaction is the worst
+// of both outcomes: it mangles the text AND it leaks. So the requirements are
+// lookaheads, and the consuming half takes everything.
+//
+// There are two requirements because keys come in two spellings. Either the
+// token contains one unbroken key-length run (`sk-proj-<48 chars>`), or it is
+// long and carries both a digit and a capital -- which is what a base64url
+// body looks like when its separators fall every few characters, and which no
+// hyphenated English phrase does. `sk-learn-is-a-typo-but-a-common-one` is 35
+// characters and satisfies neither: no long run, no digit, no capital.
 const VENDOR_TOKEN_RE = new RegExp([
   "\\bgh[pousr]_[A-Za-z0-9]{16,}",                      // GitHub classic
   "\\bgithub_pat_[A-Za-z0-9_]{20,}",                    // GitHub fine-grained
   "\\bxox[baprs]-[A-Za-z0-9-]{10,}",                    // Slack
-  "\\bsk-(?:[A-Za-z0-9_]{1,20}-)*[A-Za-z0-9_]{16,}",    // OpenAI / Anthropic style
+  // sk-: OpenAI / Anthropic. See the note above -- requirements are
+  // lookaheads so that the consuming half can take the whole token.
+  "\\bsk-"
+    + "(?:"
+    +   "(?=[A-Za-z0-9_-]*[A-Za-z0-9_]{16,})"                 // one long run, or
+    +   "|(?=[A-Za-z0-9_-]{32,})(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])"
+    + ")"
+    + "[A-Za-z0-9_-]{16,}",
   "\\bhf_[A-Za-z0-9]{20,}",                             // Hugging Face
   "\\bAKIA[0-9A-Z]{16}",                                // AWS access key id
   "\\bglpat-[A-Za-z0-9_-]{16,}",                        // GitLab
@@ -71,26 +92,51 @@ const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
  * credential under a name that reads as configuration, so no name rule sees
  * it, and it carries no vendor prefix, so no shape regex sees it either.
  *
- * The conditions are narrow on purpose, and each one is a value the previous
- * rule destroyed. Rejecting anything containing a slash or whitespace keeps
- * `/models/qwen3-8b` and `sed -n '140,340p' ...` out. Requiring a character
- * outside `[A-Za-z0-9._-]` keeps `Qwen3-8B`, every version string and every
- * dotted hostname out -- those are the shapes ordinary configuration takes.
- * Requiring all three of lower, upper and digit alongside it is what is left
- * of "password" once the guessable parts are gone.
+ * The conditions are narrow on purpose, and each one is a value some earlier
+ * version of this rule destroyed.
+ *
+ * A credential candidate must be spelled entirely in the alphabet a password
+ * uses, `[A-Za-z0-9._~+@!$%^&*-]`. That single condition rejects most of what
+ * goes wrong, because ordinary configuration is not spelled that way: a path
+ * or URL has `/`, a command has spaces, and a flag or an assignment has `=`.
+ * `-DFoo=Bar1` is a real cmake value and reads as a credential to any rule
+ * built on "has a symbol and mixes case"; here the `=` disqualifies it before
+ * anything else is asked. `#Aa12Bb34` goes the same way on the `#`.
+ *
+ * It must then carry a symbol from `[@!$%^&*+~]` specifically -- the ones that
+ * appear in passwords and essentially nowhere in configuration. `-`, `.` and
+ * `_` are excluded from that set even though they are allowed in the value,
+ * because they are how ordinary config spells everything: `Qwen3-8B`,
+ * `v1.2.3`, `some.host.internal`.
+ *
+ * A leading `-` or `+` is flag syntax, never a credential.
+ *
+ * All three of lower, upper and digit must be present, and at least six
+ * DISTINCT characters. The distinct-character floor is the entropy half, and
+ * it is what stops a short repeating pattern from qualifying on the strength
+ * of one symbol. A real credential that fails it is not left in the clear --
+ * it is left to the name-based pass, which is the correct place for a value
+ * with no shape.
  *
  * What it deliberately does NOT catch: an all-lowercase value like `hunter2`
  * under an unremarkable name. Nothing distinguishes that from ordinary config,
- * and a rule loose enough to catch it is the rule that deleted MODEL_PATH out
- * of a thousand transcripts. It stays covered by its name (`DB_PASSWORD`) and
- * by the key-name mask, which is where a value with no shape has to be caught.
+ * and a rule loose enough to catch it is the rule that deleted model paths out
+ * of the transcripts they appeared in. It stays covered by its name (`DB_PASSWORD`) and by
+ * the key-name mask, which is where a value with no shape has to be caught.
+ *
+ * The asymmetry driving all of this: a missed credential here is still caught
+ * by name and still masked at the key; a false positive is blind-substituted
+ * out of a transcript that gets replayed to the model, and cannot be undone.
  */
-const STRONG_SYMBOL_RE = /[^A-Za-z0-9._-]/;
+const CREDENTIAL_CHARSET_RE = /^[A-Za-z0-9._~+@!$%^&*-]+$/;
+const CREDENTIAL_SYMBOL_RE = /[@!$%^&*+~]/;
 export function looksLikeCredentialValue(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
-  if (/[\s/]/.test(value)) return false;
-  if (!STRONG_SYMBOL_RE.test(value)) return false;
-  return /[a-z]/.test(value) && /[A-Z]/.test(value) && /[0-9]/.test(value);
+  if (!CREDENTIAL_CHARSET_RE.test(value)) return false;
+  if (!CREDENTIAL_SYMBOL_RE.test(value)) return false;
+  if (value.startsWith("-") || value.startsWith("+")) return false;
+  if (!/[a-z]/.test(value) || !/[A-Z]/.test(value) || !/[0-9]/.test(value)) return false;
+  return new Set(value).size >= 6;
 }
 
 export interface RedactResult {

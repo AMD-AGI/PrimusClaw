@@ -50,6 +50,19 @@ test("a value that collides with prose is left alone whatever its name claims", 
   for (const ordinary of ["MAIN", "Staging", "Prod", "REMOTE", "Master", "Hunter", "TRUE", "Debug"]) {
     assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is the same word shouted`);
   }
+  // Nor does internal casing make a word into a token. Product and API names
+  // are written this way constantly, and a transcript is full of camelCase
+  // identifiers; under a name like PROJECT_TOKEN the old mixed-case exemption
+  // would have cut "GitHub" out of every sentence that used it.
+  for (const ordinary of [
+    "GitHub", "OpenAI", "iPhone", "macOS", "PyTorch", "JavaScript",
+    "getUserById", "myVariable", "XkjQmzPl",
+  ]) {
+    assert.ok(
+      !isDistinctiveSecret(ordinary),
+      `${JSON.stringify(ordinary)} is spelled the way identifiers and product names are`,
+    );
+  }
   for (const ordinary of ["8080", "3", "1.5", "2024"]) {
     assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is a number`);
   }
@@ -75,7 +88,7 @@ test("the lowercase-word exemption ends exactly where the docstring says", () =>
   // punctuation keys touched is distinctive at any length above the floor, and
   // so is a run that changes case mid-word -- no vocabulary does that, but a
   // generated token does it constantly.
-  for (const short of ["ma1n", "ma-n", "m.in", "s3cr3t", "mAin", "XkjQmzPl", "PrOd"]) {
+  for (const short of ["ma1n", "ma-n", "m.in", "s3cr3t", "P@ssw0rd", "abc-123"]) {
     assert.ok(isDistinctiveSecret(short), `${JSON.stringify(short)} does not occur in prose`);
   }
 });

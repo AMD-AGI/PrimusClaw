@@ -5,11 +5,11 @@
  * The anchor is geometry; only the rolling chain is evidence.
  *
  * `cacheChainGaps` exists because folding the two into one maximum sent the
- * first investigation of this bug after the wrong cause: the field read as
- * "the chain broke" on every conversation past ~57 blocks, and it was constant
- * across 310 cache hits and 5 losses of one session alike -- i.e. it was
- * measuring the conversation's length, not its health. These pin the two
- * numbers apart, and pin the one case where neither can be measured.
+ * first investigation of this bug after the wrong cause: past a certain
+ * conversation length the field always read as "the chain broke", and it read
+ * the same on the healthy turns as on the lost ones -- i.e. it was measuring
+ * the conversation's length, not its health. These pin the two numbers apart,
+ * and pin the one case where neither can be measured.
  */
 import test from "node:test";
 import assert from "node:assert/strict";

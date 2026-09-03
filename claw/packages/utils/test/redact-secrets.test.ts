@@ -164,16 +164,39 @@ test("scanForSecretLeak covers the shapes the redactor redacts", () => {
 // ── Credential-shaped values under unremarkable names ───────────────────────
 
 test("looksLikeCredentialValue catches a symbol-bearing credential", () => {
-  for (const secret of ["P@ssw0rd", "Xk9$mzPl2", "aB3!aB3!aB3!"]) {
+  for (const secret of ["P@ssw0rd", "Xk9$mzPl2", "Tr0ub4dor&3x", "n7%Qw2Lz!pE"]) {
     assert.ok(looksLikeCredentialValue(secret), `${JSON.stringify(secret)} reads as a credential`);
+  }
+  // Six distinct characters is the entropy floor, and a repeating pattern
+  // fails it however many symbols it carries. Not a gap: a value with no
+  // shape is the name-based pass's job, and that pass does not have to guess.
+  assert.equal(looksLikeCredentialValue("aB3!aB3!aB3!"), false, "four distinct characters is a pattern");
+});
+
+test("flag syntax and product names are not credentials", () => {
+  // The premise "has a symbol and mixes case" is not enough on its own. Real
+  // build config is written exactly that way, and so are product names. Each
+  // of these was accepted by the previous rule; under a credential-sounding
+  // var name that means the string is cut out of every transcript it appears
+  // in, which for `GitHub` or `macOS` is most of them.
+  for (const ordinary of [
+    "-DFoo=Bar1", "-DCMAKE_BUILD_TYPE=Release", "--enable-Feature1", "+RTS -N4x",
+    "#Aa12Bb34", "GitHub", "OpenAI", "iPhone", "macOS", "getUserById2",
+    "TZ=America/New_York", "key=Value1", "Model-V2.1", "some.Host1.internal",
+  ]) {
+    assert.equal(
+      looksLikeCredentialValue(ordinary), false,
+      `${JSON.stringify(ordinary)} is ordinary configuration or prose`,
+    );
   }
 });
 
 test("looksLikeCredentialValue leaves paths, versions and prose alone", () => {
-  // The incident this whole predicate is bounded by: MODEL_PATH=/models/Qwen3-8B
-  // was collected as a secret and blind-substituted out of a thousand
-  // transcripts. Anything with a slash or a space is a path or a sentence, and
-  // a value with no symbol at all is not distinctive enough to hunt blind.
+  // The failure this whole predicate is bounded by: a MODEL_PATH was collected
+  // as a secret and blind-substituted out of the transcripts it appeared in.
+  // Anything with a slash or a space is a path or a sentence; anything with an
+  // `=` is a flag or an assignment; and a value carrying only the punctuation
+  // ordinary config uses (`-`, `.`, `_`) is not distinctive enough to hunt.
   for (const ordinary of [
     "/models/Qwen3-8B", "Qwen3-8B", "v1.2.3", "https://api.internal/v1",
     "sed -n '140,340p'", "backends/vllm_runner.py", "Staging", "abcdef123456",
@@ -183,5 +206,49 @@ test("looksLikeCredentialValue leaves paths, versions and prose alone", () => {
       looksLikeCredentialValue(ordinary), false,
       `${JSON.stringify(ordinary)} must not be hunted by shape`,
     );
+  }
+});
+
+test("a redacted vendor token leaves not one character of itself behind", () => {
+  // Stronger than "the substring is gone": a partial match mangles the text
+  // AND publishes the tail. The Anthropic shape below redacted to
+  // `<redacted>-BBBBBBAA` when the key-length run was the thing consumed
+  // rather than merely asserted, so the last eight characters went out in the
+  // clear. Checking character-by-character is what catches that class.
+  const secrets = [
+    `sk-ant-api03-${"A".repeat(93)}-${"B".repeat(6)}AA`,
+    `sk-ant-api03-${"Ab9_-".repeat(20)}xY7`,
+    `sk-proj-${"a".repeat(48)}`,
+    `sk-${"Q".repeat(20)}_${"z".repeat(20)}-${"7".repeat(8)}`,
+    `github_pat_11ABCDEFG0${"x".repeat(30)}_${"y".repeat(20)}`,
+    `glpat-${"a".repeat(10)}-${"B9_".repeat(6)}`,
+    `xoxb-1234567890-0987654321-${"AbCdEf".repeat(4)}`,
+    `ghp_${"z".repeat(36)}`,
+    `hf_${"m".repeat(34)}`,
+    "AKIAIOSFODNN7EXAMPLE",
+  ];
+  for (const secret of secrets) {
+    for (const text of [secret, `KEY=${secret}`, `use ${secret} here`]) {
+      const out = redactSecrets(text).text;
+      const leftover = out.replace(/<redacted>/g, "");
+      // Every character of the secret that is not also part of the surrounding
+      // text must be gone. Checked as runs of 4+ so an incidental single
+      // character shared with "KEY=" or "use" is not a false alarm.
+      for (let i = 0; i + 4 <= secret.length; i++) {
+        const run = secret.slice(i, i + 4);
+        assert.equal(
+          leftover.includes(run), false,
+          `${JSON.stringify(run)} (offset ${i}) survived in ${JSON.stringify(out)}`,
+        );
+      }
+    }
+  }
+});
+
+test("a hyphenated phrase beginning sk- is still not a token", () => {
+  // The lookahead has to keep this side working too: widening what the pattern
+  // consumes must not widen what it matches.
+  for (const prose of ["sk-learn-is-a-typo", "sk-load-the-data", "ask-me-anything-now"]) {
+    assert.equal(redactSecrets(prose).text, prose);
   }
 });

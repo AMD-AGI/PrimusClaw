@@ -559,9 +559,10 @@ export const metrics = {
    * A run redelivered onto another pod builds a fresh AgentLoop, so the
    * in-process "when did we last use the cache" clock is unset and the
    * detector's guard drops the turn -- which is how the single most expensive
-   * class of loss stayed invisible: the whole prompt, rewritten, on the first
-   * turn back, at 150k tokens a time. Counting it under a time bucket would be
-   * a lie about what was measured; counting it not at all was worse.
+   * class of loss stayed invisible: on a long conversation the whole prompt is
+   * rewritten on the first turn back, which is the largest single bill any one
+   * turn can produce. Counting it under a time bucket would be a lie about
+   * what was measured; counting it not at all was worse.
    */
   onCacheEntryLost(gap: "over_ttl" | "under_ttl"): void {
     cacheEntryLostTotal.inc({ gap });

@@ -26,8 +26,8 @@ import { isSensitiveKey, redactSecrets } from "@claw/utils";
  * is a bare word, a bare number, or a boolean spelling collides with prose by
  * construction and cannot be hunted safely whatever its name says -- mask the
  * field by key name and leave the substring pass out of it. Anything else --
- * mixed case, digits with letters, punctuation, or simply long -- does not
- * appear in a transcript by accident.
+ * digits mixed with letters, punctuation, or simply long -- does not appear in
+ * a transcript by accident. Casing is not one of the signals; see below.
  *
  * Applied to every candidate, whichever rule nominated it. runtimeSecrets()
  * collects on two grounds now -- the name reads as a credential, or the value
@@ -44,28 +44,28 @@ const BOOLEANISH = new Set([
 ]);
 
 /**
- * Whether an all-letters value is written the way a word is written.
+ * Whether an all-letters value collides with prose. All of them do.
  *
- * `main`, `MAIN` and `Main` are one word in three casings and collide with
- * prose identically, so exempting only the lowercase spelling exempted the
- * wrong third of them -- a `BRANCH_TOKEN=Staging` still cut "Staging" out of
- * every line that mentioned the environment. Case is not evidence of anything
- * here; a shift key is not entropy.
+ * `main`, `MAIN` and `Main` are one word in three casings and collide
+ * identically, so exempting only the lowercase spelling exempted the wrong
+ * third of them -- a `BRANCH_TOKEN=Staging` still cut "Staging" out of every
+ * line that mentioned the environment.
  *
- * Casing still carries one real signal, which is why this is not simply
- * `toLowerCase()`. A generated alphabetic token switches case mid-word
- * (`XkjQmzPl`) and no vocabulary does, so an internally-mixed run stays
- * distinctive while all-lower, all-upper and Capitalized do not.
+ * The obvious next step was to keep an exemption for internally-mixed casing,
+ * on the theory that a generated token switches case mid-word (`XkjQmzPl`) and
+ * vocabulary does not. That theory is false, and expensively so: `GitHub`,
+ * `OpenAI`, `iPhone`, `macOS`, and every camelCase identifier a transcript is
+ * full of switch case mid-word too. Under a name like `PROJECT_TOKEN` the
+ * exemption's absence would have cut "GitHub" out of every sentence that used
+ * it.
+ *
+ * So casing is not consulted at all. A run of nothing but letters, below the
+ * length at which vocabulary runs out, is prose -- full stop. What is given up
+ * is a generated all-alphabetic token of fewer than 16 characters, and it is
+ * not given up to nothing: it stays masked by key name wherever it is a field,
+ * which is the pass that does not need to guess. Only the blind substring hunt
+ * declines it, and that hunt is the one whose mistakes cannot be undone.
  */
-function isWordCased(value: string): boolean {
-  if (!ORDINARY_WORD_RE.test(value)) return false;
-  const lower = value.toLowerCase();
-  const upper = value.toUpperCase();
-  return value === lower
-    || value === upper
-    || value === value[0]!.toUpperCase() + lower.slice(1);
-}
-
 export function isDistinctiveSecret(secret: string): boolean {
   // Below this, a value cannot carry enough entropy to be worth the collision
   // risk no matter what it looks like.
@@ -76,7 +76,7 @@ export function isDistinctiveSecret(secret: string): boolean {
   // A short run of letters written as a word is a word ("main", "Staging",
   // "REMOTE"). Past a certain length it stops being one -- a 16-character
   // alphabetic string is a token, not vocabulary.
-  if (secret.length < 16 && isWordCased(secret)) return false;
+  if (secret.length < 16 && ORDINARY_WORD_RE.test(secret)) return false;
   return true;
 }
 

@@ -76,12 +76,13 @@ const sc = StringCodec();
  * Only env vars whose NAME reads as a credential are included, because that
  * pass is an exact-substring replace with no notion of what it is cutting.
  * Feeding it every user_env / session_env value made it delete ordinary
- * content: on one live deployment nearly every session in a week carried a
- * `<redacted>` in their persisted history, and what had been destroyed was
- * things like `sed -n '140,340p' <redacted>` (a FORGE_PATH), `MODEL_PATH=<redacted>/Qwen3-8B`,
- * and `backends/<redacted>_runner.py` -- a word excised from the middle of an
- * identifier. Those strings are also replayed to the model, so the agent came
- * back from a resume having lost the paths it was itself working with.
+ * content. Any session whose environment named a path put that path's text
+ * into the hunt, so `sed -n '140,340p' <redacted>` came back for a command
+ * that had named a directory, `MODEL_PATH=<redacted>/model-name` for one that
+ * had named a model root, and `backends/<redacted>_runner.py` for a word that
+ * merely happened to occur in the middle of an identifier. Those strings are
+ * also replayed to the model, so the agent came back from a resume having lost
+ * the paths it was itself working with.
  *
  * isSensitiveKey is the same predicate the key-name pass uses, so a name that
  * gets a field masked also gets its value hunted; the two halves cannot drift

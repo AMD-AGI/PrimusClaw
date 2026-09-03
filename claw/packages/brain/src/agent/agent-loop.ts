@@ -1179,11 +1179,12 @@ class AgentLoopRunner {
       //                          MAX_STRIDE_BLOCKS), so it grows with the
       //                          conversation and is identical on the healthy
       //                          turns. Folding it into one maximum, as this
-      //                          did, made every conversation past ~57 blocks
-      //                          report a broken chain -- the field was
-      //                          constant across 310 hits and 5 losses of one
-      //                          session alike, and it sent the first
-      //                          investigation after the wrong cause.
+      //                          did, made every long conversation report a
+      //                          broken chain: the field read the same on the
+      //                          hits as on the losses, because it was
+      //                          measuring the conversation's length, and it
+      //                          sent the first investigation after the wrong
+      //                          cause.
       //   neither                the entry was not where we left it -- eviction,
       //                          or a gateway that routed to a backend without
       //                          it. Not ours, and the gateway has to answer.
