@@ -13,7 +13,7 @@
  * from the conversation, and the agent resumes without it.
  *
  * It used to return every user_env / session_env value. On one live deployment
- * that put a `<redacted>` into the persisted history of 342 of 344 sessions in
+ * that put a `<redacted>` into the persisted history of nearly every session in
  * a week, and what it had destroyed was ordinary content -- a FORGE_PATH inside
  * `sed -n '140,340p' ...`, a MODEL_PATH inside `export MODEL_PATH=.../Qwen3-8B`,
  * and a word excised from the middle of `backends/remote_runner.py`.

@@ -927,11 +927,57 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  *
  * Empty by default: off, no capture, no allocation, no log field.
  */
-export const LLM_DEBUG_RESPONSE_HEADERS: ReadonlyArray<string> =
-  env("LLM_DEBUG_RESPONSE_HEADERS")
+/**
+ * Header names an operator may ask to have captured off an LLM response.
+ *
+ * Two kinds of entry are rejected outright rather than filtered quietly at
+ * request time, because both are configuration mistakes and both are worse
+ * than they look:
+ *
+ * A name that is not a valid HTTP token makes `Headers.get()` throw. That call
+ * happens inside the fetch wrapper, after the response has already arrived, so
+ * a typo here does not degrade a diagnostic -- it turns every successful LLM
+ * request into a failure.
+ *
+ * A name that carries a credential turns the diagnostic into the leak it was
+ * written to avoid. The captured value is logged, and `authorization` is
+ * usually echoed straight back by a gateway. Naming what you want is the whole
+ * safety property of an allowlist, and it is not a property if the list may
+ * name the Authorization header.
+ *
+ * Failing at boot rather than dropping the bad entry: a silently ignored name
+ * looks exactly like a gateway that does not send that header, so the operator
+ * debugs the gateway instead of their own typo.
+ */
+const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const CREDENTIAL_HEADERS: ReadonlySet<string> = new Set([
+  "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
+  "cookie", "set-cookie", "x-api-key", "api-key", "x-auth-token", "x-amz-security-token",
+]);
+
+export function assertDiagnosableHeaderName(name: string): void {
+  if (!HTTP_TOKEN_RE.test(name)) {
+    throw new Error(
+      `LLM_DEBUG_RESPONSE_HEADERS contains ${JSON.stringify(name)}, which is not a valid `
+      + `HTTP header name. Reading it would throw on every response.`,
+    );
+  }
+  if (CREDENTIAL_HEADERS.has(name)) {
+    throw new Error(
+      `LLM_DEBUG_RESPONSE_HEADERS names ${JSON.stringify(name)}, which carries a credential. `
+      + `Captured headers are logged; pick a header that identifies the upstream instead.`,
+    );
+  }
+}
+
+export const LLM_DEBUG_RESPONSE_HEADERS: ReadonlyArray<string> = (() => {
+  const names = env("LLM_DEBUG_RESPONSE_HEADERS")
     .split(",")
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean);
+  for (const name of names) assertDiagnosableHeaderName(name);
+  return names;
+})();
 
 
 /**

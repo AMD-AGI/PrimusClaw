@@ -76,7 +76,7 @@ const sc = StringCodec();
  * Only env vars whose NAME reads as a credential are included, because that
  * pass is an exact-substring replace with no notion of what it is cutting.
  * Feeding it every user_env / session_env value made it delete ordinary
- * content: on one live deployment 342 of 344 sessions in a week carried a
+ * content: on one live deployment nearly every session in a week carried a
  * `<redacted>` in their persisted history, and what had been destroyed was
  * things like `sed -n '140,340p' <redacted>` (a FORGE_PATH), `MODEL_PATH=<redacted>/Qwen3-8B`,
  * and `backends/<redacted>_runner.py` -- a word excised from the middle of an

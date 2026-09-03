@@ -544,7 +544,9 @@ export const metrics = {
     llmCacheTurnsTotal.inc({ state });
   },
   /**
-   * `resume_first_turn` is its own bucket because it is not a gap at all.
+   * The gap is always a real measurement now: the timestamp it is taken
+   * from survives a redelivery inside the checkpoint, so a resume no longer
+   * needs a bucket meaning "we could not measure this".
    * A run redelivered onto another pod builds a fresh AgentLoop, so the
    * in-process "when did we last use the cache" clock is unset and the
    * detector's guard drops the turn -- which is how the single most expensive
@@ -552,7 +554,7 @@ export const metrics = {
    * turn back, at 150k tokens a time. Counting it under a time bucket would be
    * a lie about what was measured; counting it not at all was worse.
    */
-  onCacheEntryLost(gap: "over_5m" | "under_5m" | "resume_first_turn"): void {
+  onCacheEntryLost(gap: "over_5m" | "under_5m"): void {
     cacheEntryLostTotal.inc({ gap });
   },
   onPromptSizeUnknown(): void {

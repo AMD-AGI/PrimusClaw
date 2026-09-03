@@ -663,6 +663,9 @@ class AgentLoopRunner {
       resumeFrom?.setup_commands ? [...resumeFrom.setup_commands] : [];
     this.startTime = Date.now() - (resumeFrom?.elapsed_ms_before ?? 0);
     this.initialTurn = resumeFrom?.turns_completed ?? 0;
+    // Carried across the redelivery rather than re-inferred. See
+    // CheckpointState.last_cache_use_at.
+    this.lastCacheUseAt = resumeFrom?.last_cache_use_at;
     this.lastCheckpointAt = this.startTime;
     this.todoState = resumeFrom?.todo_state ? [...resumeFrom.todo_state] : [];
     this.rebuildsUsed = resumeFrom?.rebuilds_used ?? 0;
@@ -1087,21 +1090,25 @@ class AgentLoopRunner {
       // `reported` was built to tell those apart; it has to be consumed.
       && (cacheReport.reported ?? []).includes("cache_read")
       && turnUsage.cache_read === 0
-      // Either this loop watched a write land, or an earlier incarnation of
-      // this run did. `lastCacheUseAt` only ever answers the first: a
-      // redelivery resumed on another pod arrives with it unset, and the guard
-      // it protects -- do not blame a cold start for having nothing to read --
-      // does not apply to a conversation that is already hundreds of turns
-      // deep. `initialTurn` is non-zero exactly when this loop resumed from a
-      // checkpoint, so it separates "we cannot know" from "we were not here".
-      && (this.lastCacheUseAt !== undefined || this.initialTurn > 0)
+      // An entry has to have existed. This used to fall back to
+      // `initialTurn > 0` when the timestamp was unset, so that a redelivery
+      // resumed on another pod -- which arrives with nothing in memory -- was
+      // not written off as a cold start. That fallback was too coarse. It also
+      // fired for a resumed run that had just compacted, where the timestamp is
+      // cleared precisely because the entry is gone, and for one whose markers
+      // had been refused before the interruption. Both were counted as losses
+      // that never had anything to lose, and the guards meant to prevent that
+      // -- `cacheReport.enabled` above and the compaction clear -- were being
+      // routed around by the very disjunct added to catch resumes.
+      //
+      // The timestamp now survives the redelivery inside the checkpoint, so
+      // this is answered with evidence rather than a proxy. A checkpoint
+      // written before that field existed leaves it unset, which under-reports
+      // instead of inventing.
+      && this.lastCacheUseAt !== undefined
     ) {
-      const gapMs = this.lastCacheUseAt !== undefined
-        ? turnStart - this.lastCacheUseAt
-        : undefined;
-      const gap = gapMs === undefined
-        ? "resume_first_turn"
-        : gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
+      const gapMs = turnStart - this.lastCacheUseAt;
+      const gap = gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
       metrics.onCacheEntryLost(gap);
       // Everything needed to tell the three causes apart, on the one turn that
       // can still tell them apart -- the next turn re-plans and the evidence is
@@ -1421,6 +1428,7 @@ class AgentLoopRunner {
       try {
         await this.opts.onCheckpoint({
           messages: this.workingMessages,
+          last_cache_use_at: this.lastCacheUseAt,
           turns_completed: turn + 1,
           usage: { ...this.usage },
           text_parts: [...this.textParts],
