@@ -115,7 +115,7 @@ test("R4 a run is rendered with the platform's account of its ending", async () 
   assert.equal(resp.statusCode, 200);
   const body = resp.json() as {
     phase: string;
-    terminal: { class: string; kill_reason: string; exit_code: number };
+    terminal: { class: string; kill_reason: string; exit_code: number | null };
     placement: { node: string };
   };
   assert.equal(body.phase, "terminal");
@@ -123,6 +123,18 @@ test("R4 a run is rendered with the platform's account of its ending", async () 
     class: "killed", kill_reason: "preempted", exit_code: 137, signal: "SIGKILL",
   });
   assert.equal(body.placement.node, "gpu-node-7");
+});
+
+test("R4b a run with no reported exit code serialises null, not zero", async () => {
+  // The JSON a dispatcher actually reads. `exit_code: 0` here would tell it the
+  // process ran to completion successfully, which is the opposite of what a row
+  // with no exit code means.
+  serve([row("ktsk_u", { status: "failed", failure_reason: "agent_error" })]);
+  const resp = await app.inject({ method: "GET", url: "/v1/runs/ktsk_u" });
+  assert.equal(resp.statusCode, 200);
+  const body = resp.json() as { terminal: { exit_code: number | null; signal: string } };
+  assert.equal(body.terminal.exit_code, null);
+  assert.equal(body.terminal.signal, "");
 });
 
 test("R5 equal timestamps paginate by task id without overlap", async () => {

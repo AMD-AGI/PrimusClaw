@@ -54,7 +54,10 @@ test("R3 with nothing from the platform, brain_timeout still means deadline", ()
   // performed rather than an unexplained failure.
   assert.deepEqual(
     terminalFacts({ status: "failed", failure_reason: "brain_timeout" }),
-    { class: "killed", kill_reason: "deadline", exit_code: 0, signal: "" },
+    // No exit code: the run stopped reporting, so nothing ever reported one
+    // either. `null`, not `0` -- a clean exit is the one thing that did not
+    // happen here.
+    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
   );
 });
 

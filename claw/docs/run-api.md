@@ -16,6 +16,16 @@ caller's sessions are absent from `runs`; `requested` reports how many unique ID
 asked for. Each result includes its phase and, once terminal, the platform's
 classification and kill reason.
 
+## The terminal block
+
+A terminal run carries `class`, `kill_reason`, `exit_code`, and `signal`.
+
+`exit_code` is `null` when no exit code was ever reported -- most often because the
+run's worker went away with its node. Null means unknown; it is not a success and not
+a failure, and callers must not read it as `0`. `signal` is `""` unless the exit code
+genuinely encodes one (`128 + N` for a signal number `N`); an exit status that names
+no signal is reported without one rather than given an invented name.
+
 ## Walk terminal runs
 
 ```text

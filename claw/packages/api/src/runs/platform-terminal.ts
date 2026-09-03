@@ -40,7 +40,16 @@ export type KillReason = "deadline" | "preempted" | "oom" | "node_lost" | "user"
 export interface TerminalFacts {
   class: TerminalClass;
   kill_reason: KillReason;
-  exit_code: number;
+  /**
+   * The process's exit status, or `null` when nobody reported one.
+   *
+   * Null is a real answer and has to stay distinguishable from zero: a run whose
+   * worker vanished with the node reports no exit code at all, and calling that a
+   * clean `0` says the process ran to completion successfully -- the one thing we
+   * know did not happen. Consumers must treat `null` as "unknown", not as a
+   * success and not as a failure.
+   */
+  exit_code: number | null;
   signal: string;
 }
 
@@ -83,16 +92,33 @@ const POD_REASON_TO_KILL: ReadonlyMap<string, KillReason> = new Map([
 
 /** Exit code a process killed by a signal reports: 128 + the signal number. */
 const SIGNAL_BASE = 128;
+/**
+ * The highest signal number a name may be invented for.
+ *
+ * Above `128 + 64` there is no signal on any platform we run on, so `SIG72` from
+ * an exit code of 200 is not a reading of the code -- it is arithmetic wearing the
+ * costume of one. An ordinary program is free to exit 200, and a caller shown a
+ * signal name believes the kernel killed it.
+ */
+const MAX_SIGNAL = 64;
 const SIGNAL_NAMES: Readonly<Record<number, string>> = {
   2: "SIGINT",
   9: "SIGKILL",
   15: "SIGTERM",
 };
 
-/** The signal an exit code encodes, or "" when it encodes none. */
-export function signalOf(exitCode: number): string {
-  if (!Number.isInteger(exitCode) || exitCode <= SIGNAL_BASE) return "";
-  return SIGNAL_NAMES[exitCode - SIGNAL_BASE] ?? `SIG${exitCode - SIGNAL_BASE}`;
+/**
+ * The signal an exit code encodes, or "" when it encodes none.
+ *
+ * "" for a missing code as well as for a code that names no signal: with nothing
+ * to read, there is nothing to report, and a guess here is indistinguishable from
+ * a fact for everyone downstream.
+ */
+export function signalOf(exitCode: number | null | undefined): string {
+  if (typeof exitCode !== "number" || !Number.isInteger(exitCode)) return "";
+  const signal = exitCode - SIGNAL_BASE;
+  if (signal < 1 || signal > MAX_SIGNAL) return "";
+  return SIGNAL_NAMES[signal] ?? `SIG${signal}`;
 }
 
 /**
@@ -177,7 +203,12 @@ export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
   if (status !== "completed" && status !== "failed" && status !== "cancelled") {
     return null;
   }
-  const exitCode = typeof input.exit_code === "number" ? input.exit_code : 0;
+  // Unknown stays unknown. Substituting 0 here used to make every run without a
+  // reported exit code -- which is every run whose node was taken away, since the
+  // worker that would have reported it went with the node -- claim it exited
+  // cleanly, and then fed that invented 0 to `signalOf` as though it were read
+  // from a process.
+  const exitCode = typeof input.exit_code === "number" ? input.exit_code : null;
   const signal = signalOf(exitCode);
 
   if (status === "cancelled") {

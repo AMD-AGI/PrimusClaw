@@ -165,7 +165,38 @@ test("D5 a signal is read off the exit code", () => {
   assert.equal(signalOf(143), "SIGTERM");
   assert.equal(signalOf(0), "");
   assert.equal(signalOf(1), "");
-  assert.equal(signalOf(128 + 99), "SIG99");
+  assert.equal(signalOf(128 + 7), "SIG7");
+});
+
+test("D5b a code that encodes no signal is not given a signal's name", () => {
+  // 200 is an exit status a program is free to choose. Subtracting 128 from it
+  // produces 72, and no system we run on has a signal 72 -- so `SIG72` would be
+  // arithmetic presented to a caller as a kernel action.
+  assert.equal(signalOf(200), "");
+  assert.equal(signalOf(128 + 65), "");
+  assert.equal(signalOf(128 + 64), "SIG64");
+  assert.equal(signalOf(128), "");
+});
+
+test("D5c an unknown exit code is null, and names no signal", () => {
+  // The node went away with the worker that would have reported the code. Every
+  // ending has to say so rather than borrow a 0 from nowhere: 0 is the value
+  // that means the agent finished its work successfully.
+  for (const t of [
+    terminalFacts({ status: "completed", failure_reason: null }),
+    terminalFacts({ status: "cancelled", failure_reason: null }),
+    terminalFacts({ status: "failed", failure_reason: "agent_error" }),
+    terminalFacts({ status: "failed", failure_reason: "sandbox_died", pod_failed_message: "Preempted" }),
+    terminalFacts({ status: "failed", failure_reason: null, exit_code: null }),
+  ]) {
+    assert.equal(t?.exit_code, null, `${t?.class} must not invent an exit code`);
+    assert.equal(t?.signal, "", `${t?.class} must not invent a signal`);
+  }
+
+  // And a code that is reported is still carried through untouched, including
+  // the one value the old fallback was indistinguishable from.
+  assert.equal(terminalFacts({ status: "completed", failure_reason: null, exit_code: 0 })?.exit_code, 0);
+  assert.equal(terminalFacts({ status: "failed", failure_reason: "x", exit_code: 137 })?.signal, "SIGKILL");
 });
 
 test("D6 a live run has no terminal block at all", () => {
