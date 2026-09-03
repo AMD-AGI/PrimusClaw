@@ -1026,12 +1026,22 @@ func (c *K8sSandboxCreator) DeleteSandbox(ctx context.Context, info *store.Sandb
 //  3. Sets agents.x-k8s.io/pod-name annotation on the Sandbox
 //
 // Because the Pod has no OwnerReference, K8s GC will NOT cascade-delete it
-// when the Sandbox or SandboxClaim is deleted. We must explicitly delete
-// the Pod, the Sandbox, and the SandboxClaim in order.
+// when the Sandbox or SandboxClaim is deleted. We must explicitly delete the
+// Pod, the SandboxClaim, and the Sandbox — in that order.
 //
 // Without this, adopted Pods become permanent zombies — consuming resources,
 // blocking WarmPool replenishment, and (with authMode=none) remaining
 // accessible without authentication.
+//
+// The order is load-bearing, and the Claim precedes the Sandbox rather than
+// following it. The claim controller watches the Sandboxes its Claims own, so
+// deleting the Sandbox wakes it, and it declines to act only for a Claim that
+// is absent or already carries a deletionTimestamp. A live Claim whose Sandbox
+// has just gone is instead its cue to build another one — adopting a second
+// Pod out of the warm pool and stripping its OwnerReferences, which is the
+// zombie above, made by the teardown itself. Deleting the Claim first means
+// there is no reconcile left to recreate anything, so the Sandbox delete that
+// follows cannot be undone. Reordering these two reopens that race.
 func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.SandboxInfo) error {
 	key := types.NamespacedName{Name: info.SandboxName, Namespace: info.Namespace}
 
