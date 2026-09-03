@@ -66,12 +66,12 @@ config:
           #   done
           #
           # then map each `ip` back to a pod. Anything that is not api or brain
-          # needs a user of its own first. On the deployment this was written
-          # against the census came back as exactly 4 api and 6 brain
-          # connections, no external_id had ever been set on a task, and
-          # `external.push_received` had never been logged -- so there was
-          # nothing else to migrate. That is a per-site fact, not a property of
-          # the chart.
+          # needs a user of its own first. A clean census is one where every
+          # connection maps to an api or brain pod of this release, no task row
+          # has ever had an external_id set, and `external.push_received` has
+          # never been logged -- at which point there is nothing else to
+          # migrate. What that census returns is a per-site fact, not a
+          # property of the chart, so run it rather than assuming this shape.
           # __PROD_USER_BEGIN__  (deploy.sh strips this block when
           # NATS_RETIRE_PROD=true, which is how the account stops having an
           # all-access user at all. Retiring it is a one-way step per cluster:
@@ -134,7 +134,16 @@ config:
                   - "$JS.API.CONSUMER.INFO.PRIMUS_CLAW_EVENTS.*"
                   - "$JS.API.CONSUMER.MSG.NEXT.PRIMUS_CLAW_EVENTS.*"
                   - "$JS.API.CONSUMER.DELETE.PRIMUS_CLAW_EVENTS.*"
-                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_TASKS.>"
+                  # Named, not wildcarded. api creates exactly one consumer on
+                  # this stream -- the `brain-workers` durable, from
+                  # TASK_CONSUMER_NAME in packages/protocol/src/task-consumer.ts
+                  # -- so `.>` here would have let a compromised api stand up
+                  # arbitrarily named consumers on the stream brain reads its
+                  # work from. Both forms are needed: newer servers address the
+                  # request as <stream>.<name>, and as <stream>.<name>.<filter>
+                  # when a filter subject is set, and the filter contains dots.
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_TASKS.brain-workers.>"
                   - "$JS.API.CONSUMER.DURABLE.CREATE.PRIMUS_CLAW_TASKS.brain-workers"
                   - "$JS.API.CONSUMER.UPDATE.PRIMUS_CLAW_TASKS.brain-workers"
                   - "$JS.API.CONSUMER.INFO.PRIMUS_CLAW_TASKS.brain-workers"
@@ -277,11 +286,11 @@ config:
                   - "_INBOX.>"
                   - "interrupt.*"
                   - "cleanup.*"
-                  # Dead at runtime today -- nothing constructs the decision
-                  # dispatcher -- but the HITL path is one wiring line away,
-                  # and a missing subscribe permission is exactly the kind of
-                  # failure that would then be blamed on the wiring.
-                  - "decision.*"
+                  # `decision.*` is deliberately absent. Nothing constructs the
+                  # decision dispatcher today, and a permission granted for a
+                  # subscriber that does not exist is scope that no test and no
+                  # reader can justify. Add it back in the change that wires
+                  # the HITL path up, where it can be seen to be needed.
 
           # Reads two buckets, writes nothing. It is a CronJob that deletes
           # directories, so the smallest possible grant matters. It is

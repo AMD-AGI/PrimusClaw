@@ -244,7 +244,28 @@ if ! $SKIP_NATS; then
   # nats-values.yaml.
   _strip_prod=""
   if [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
+    # Retirement is gated on all four built-in identities actually being
+    # provisioned, not on the operator having looked at a connection census.
+    # reaper is a CronJob and ops runs only during an upgrade, so a census
+    # taken at any given moment can easily show neither -- and reading that as
+    # "nothing else uses prod" retires it out from under the workloads that
+    # were merely idle. See _missing_nats_identities in common.sh.
+    #
+    # Loud rather than skipped: an operator who asked for retirement and got a
+    # silently unretired cluster would believe the all-access user was gone.
+    if ! _missing="$(_missing_nats_identities)"; then
+      echo "ERROR: NATS_RETIRE_PROD=true, but these identities are not provisioned:" >&2
+      printf '%s\n' "$_missing" | sed 's/^/  - /' >&2
+      echo "" >&2
+      echo "  Removing the all-access 'prod' user would cut off every workload still" >&2
+      echo "  using the shared credential. Add each component to" >&2
+      echo "  NATS_PER_USER_WORKLOADS, deploy so it adopts its own identity, and" >&2
+      echo "  retire prod after that -- having also run the connection census in" >&2
+      echo "  deploy/nats-values.yaml for clients that are not in this repo." >&2
+      exit 1
+    fi
     log "  NATS: retiring the all-access prod user (NATS_RETIRE_PROD=true)"
+    log "  NATS: all four built-in identities are provisioned"
     _strip_prod='/__PROD_USER_BEGIN__/,/__PROD_USER_END__/d'
   fi
   awk -v block="$DEV_BLOCKS" '

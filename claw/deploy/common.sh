@@ -283,13 +283,69 @@ _preserve_security_values() {
       2>/dev/null || true)
   [ -n "$v" ] && out+=(--set-string "brain.checkpointWriteVersion=$v")
 
-  local c
+  # Username and password are read and restored as a PAIR. Restoring the
+  # password alone leaves the chart's default username (api/brain/reaper/ops)
+  # next to a password that belongs to whatever the operator actually named the
+  # user, and NATS then rejects every connection from that workload -- an
+  # upgrade that authenticates nobody, produced by the code whose job is to
+  # keep the deployment working. The username is only forwarded when the
+  # password came back too: half a credential is not one.
+  local c u
   for c in api brain reaper ops; do
     v=$(kubectl get secret "primus-claw-nats-$c" -n "$NAMESPACE" \
         -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
-    [ -n "$v" ] && out+=(--set-string "secret.natsUsers.$c.password=$v")
+    [ -n "$v" ] || continue
+    out+=(--set-string "secret.natsUsers.$c.password=$v")
+    u=$(kubectl get secret "primus-claw-nats-$c" -n "$NAMESPACE" \
+        -o jsonpath='{.data.NATS_USER}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    [ -n "$u" ] && out+=(--set-string "secret.natsUsers.$c.user=$u")
   done
-  printf '%s\n' "${out[@]+"${out[@]}"}"
+  # An empty array must produce zero lines, not one empty one. `printf '%s\n'`
+  # with no arguments still prints a newline, and mapfile turns that into a
+  # single empty element, which reaches helm as an empty positional argument
+  # and fails the render -- on exactly the first-time upgrade where nothing has
+  # been preserved yet, i.e. the path this function exists to keep working.
+  [ ${#out[@]} -eq 0 ] && return 0
+  printf '%s\n' "${out[@]}"
+}
+
+# ── Are all four built-in NATS identities actually provisioned? ──────────
+#
+# The gate on retiring the legacy all-access `prod` user. Retirement is
+# one-way per cluster: the moment the user is gone, anything still
+# authenticating as it stops working.
+#
+# A connection census cannot answer this on its own, which is the trap. reaper
+# is a CronJob and ops runs only during an upgrade, so neither is reliably
+# connected when anyone looks -- a census taken between sweeps shows api and
+# brain, and concluding "everything is migrated" from that retires prod out
+# from under the two workloads that were not running. So check what is
+# PROVISIONED rather than what happens to be connected: every one of the four
+# must be named in NATS_PER_USER_WORKLOADS and must have a password, because
+# those two together are what make the chart render its Secret and the workload
+# adopt its own identity. Anything missing keeps using the shared credential,
+# and retiring prod would cut it off.
+#
+# Prints the missing identities and returns non-zero; prints nothing and
+# returns 0 when all four are covered.
+_missing_nats_identities() {
+  local workloads="${NATS_PER_USER_WORKLOADS:-}" missing=() c var
+  local -A named=()
+  local w
+  for w in ${workloads//,/ }; do
+    [ -n "$w" ] && named["$w"]=1
+  done
+  for c in api brain reaper ops; do
+    var="NATS_PASSWORD_$(echo "$c" | tr '[:lower:]' '[:upper:]')"
+    if [ -z "${named[$c]:-}" ]; then
+      missing+=("$c (not in NATS_PER_USER_WORKLOADS)")
+    elif [ -z "${!var:-}" ]; then
+      missing+=("$c (no $var)")
+    fi
+  done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  printf '%s\n' "${missing[@]}"
+  return 1
 }
 
 render_chart() {

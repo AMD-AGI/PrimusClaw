@@ -1,6 +1,20 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
+{{- /*
+v4 checkpoints are sealed, and a seal needs a key. Brain refuses to start on
+CHECKPOINT_WRITE_VERSION=4 with no BRAIN_CHECKPOINT_KEY -- deliberately, since
+the alternative is writing verbatim conversations to a bucket whose threat
+model just changed -- but that refusal lands as a CrashLoopBackOff after the
+rollout has begun. Say it here instead, where `helm template` and `helm lint`
+can see it and no pod has been replaced yet.
+
+Same shape as the reaper.enabled guards in workspace-reaper-cronjob.yaml: a
+setting whose prerequisites the chart can check is one the chart should check.
+*/ -}}
+{{- if and (eq (int .Values.brain.checkpointWriteVersion) 4) (not .Values.secret.brainCheckpointKey) }}
+{{- fail "brain.checkpointWriteVersion=4 requires secret.brainCheckpointKey: v4 checkpoints are sealed, and Brain refuses to start without the key rather than writing plaintext. Generate one with 'openssl rand -base64 32'." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -42,7 +56,12 @@ spec:
         # their environment -- with a NATS password that is one rotation out
         # of date, or a seal key that no longer opens what the fleet is
         # writing. Hash them here so a rotation actually rolls.
-        checksum/nats-user: {{ include (print $.Template.BasePath "/nats-user-secrets.yaml") . | sha256sum }}
+        #
+        # Scoped to THIS workload's Secret, not to the file that renders all
+        # four: hashing the whole file made rotating any one credential restart
+        # every workload that reads it, so a routine api rotation also bounced
+        # brain and threw away its in-flight turns.
+        checksum/nats-user: {{ include "primus-claw.natsUserSecret" (dict "root" . "component" "brain") | sha256sum }}
         checksum/checkpoint-key: {{ include (print $.Template.BasePath "/brain-checkpoint-secret.yaml") . | sha256sum }}
     spec:
       securityContext:

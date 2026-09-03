@@ -47,7 +47,12 @@ spec:
         # their environment -- with a NATS password that is one rotation out
         # of date, or a seal key that no longer opens what the fleet is
         # writing. Hash them here so a rotation actually rolls.
-        checksum/nats-user: {{ include (print $.Template.BasePath "/nats-user-secrets.yaml") . | sha256sum }}
+        #
+        # Scoped to THIS workload's Secret, not to the file that renders all
+        # four: hashing the whole file made rotating any one credential restart
+        # every workload that reads it, so a routine api rotation also bounced
+        # brain and threw away its in-flight turns.
+        checksum/nats-user: {{ include "primus-claw.natsUserSecret" (dict "root" . "component" "api") | sha256sum }}
     spec:
       securityContext:
         runAsNonRoot: true
