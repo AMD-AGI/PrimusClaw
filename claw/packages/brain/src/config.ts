@@ -206,10 +206,12 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * Empty means "leave whatever the base template says", which is what every
  * deployment gets until it opts in: a mounted ConfigMap that sets its own
  * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
- * costs held nodes -- the sandbox survives that much longer after everyone has
- * stopped asking it for anything -- so prefer the per-request
- * `SandboxCreateParams.sessionTimeout` for the one workload that needs it over
- * moving the floor for all of them.
+ * costs held nodes -- every sandbox survives that much longer after everyone has
+ * stopped asking it for anything -- so raise it for a deployment whose work
+ * needs it, not as a default. Per-workload is not offered: the value would have
+ * to reach the create path through the protocol and request normalisation and
+ * join the sandbox reuse fingerprint, or a session would reuse a pod built with
+ * a different lifetime and the caller's value would silently not apply.
  */
 /**
  * A Go duration in whole nanoseconds, or null if `time.ParseDuration` would not

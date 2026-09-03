@@ -59,12 +59,13 @@ function buildFallbackSpec(): Record<string, unknown> {
     authMode: "none",
     runtimePolicy: "agent-default",
     // The platform's own default, restated so the skeleton is self-contained.
-    // Reachable now: renderTemplate replaces it when a deployment sets
-    // AGENT_SANDBOX_SESSION_TIMEOUT or a caller passes params.sessionTimeout.
+    // The platform's own defaults, restated so the skeleton is self-contained.
+    // Not a ceiling either of them: the Workload Manager takes both per template
+    // and per request and says so ("no hard cap"). A deployment that wants
+    // different numbers sets AGENT_SANDBOX_SESSION_TIMEOUT /
+    // AGENT_SANDBOX_MAX_SESSION_DURATION, which are sent as create overrides and
+    // win over whatever the template carries -- including these.
     sessionTimeout: "15m",
-    // Likewise, via AGENT_SANDBOX_MAX_SESSION_DURATION or
-    // params.maxSessionDuration. Not a platform ceiling -- the Workload Manager
-    // takes any value and says so -- just this skeleton's default.
     maxSessionDuration: "24h",
     template: {
       fromImage: "<PLACEHOLDER_IMAGE>",
