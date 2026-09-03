@@ -90,6 +90,10 @@ Key env:
   LITELLM_IMAGE=docker.io/primussafe/litellm:20260331111348
   LITELLM_VALUES_FILE=/path/private-values.yaml # optional modelList overrides
   LITELLM_EXISTING_SECRET=litellm-credentials   # skips inline database/master credentials
+  LITELLM_PROVIDER_TYPE=anthropic|openai        # supply the provider without the prompt
+  LITELLM_PROVIDER_URL=https://host/v1          #   (all three required together)
+  LITELLM_PROVIDER_API_KEY=...                  #   stored in a Secret, never in values
+  LITELLM_PROVIDER_VALUES_FILE=/path/models.json # keep the discovered modelList
   LITELLM_INGRESS_HOST=<host>       # optional; enables ingress when set
   LITELLM_SERVER_ROOT_PATH=/llm-gateway
   LITELLM_SAFE_API_URL=https://safe.example.com
@@ -119,6 +123,53 @@ PROVIDER_KEY_ENV="LITELLM_PROVIDER_API_KEY"
 # /models endpoint, and render the discovered models into a temp Helm values
 # file (modelList). Skipped on --dry-run or a non-TTY stdin so existing
 # non-interactive/CI deploys are unaffected.
+# Reads the provider key on stdin and puts it in the Secret the chart points
+# at. Ensures the namespace first: helm --create-namespace has not run yet, so a
+# first install into a namespace that does not exist would have nowhere to put
+# it. The key travels on stdin rather than --from-literal because an argument is
+# visible in /proc and to anything auditing process starts.
+# Turns a /models payload on stdin into a values file holding modelList and
+# providerApiKey, and prints how many models it found. The key never reaches
+# this file: LiteLLM resolves the os.environ reference per request from the
+# container environment, and that entry comes from the Secret. A literal here
+# would travel into the release values and sit in every stored revision.
+write_provider_values() {
+  local prefix="$1" api_base="$2" out="$3"
+  python3 -c '
+import json, sys
+prefix, api_base, env_name, secret, secret_key, out = sys.argv[1:7]
+data = json.load(sys.stdin)
+items = data.get("data") if isinstance(data, dict) else data
+ids = [it.get("id") if isinstance(it, dict) else it for it in (items or [])]
+ids = [i for i in ids if i]
+if not ids:
+    sys.exit("no models found in /models response")
+json.dump({
+    "modelList": [
+        {"model_name": m, "litellm_params": {
+            "model": f"{prefix}/{m}",
+            "api_base": api_base,
+            "api_key": f"os.environ/{env_name}",
+        }}
+        for m in ids
+    ],
+    "providerApiKey": {"secretName": secret, "secretKey": secret_key, "envName": env_name},
+}, open(out, "w"), indent=2)
+print(len(ids))
+' "$prefix" "$api_base" "$PROVIDER_KEY_ENV" "$PROVIDER_KEY_SECRET" "$PROVIDER_KEY_SECRET_KEY" "$out"
+}
+
+store_provider_key() {
+  local key; key="$(cat)"
+  kubectl create namespace "$LITELLM_NAMESPACE" --dry-run=client -o yaml \
+    | kubectl apply -f - >/dev/null 2>&1 || true
+  printf '%s' "$key" \
+    | kubectl -n "$LITELLM_NAMESPACE" create secret generic "$PROVIDER_KEY_SECRET" \
+        --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o yaml \
+    | kubectl -n "$LITELLM_NAMESPACE" apply -f - >/dev/null \
+    || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
+}
+
 configure_models_interactive() {
   [ "$DRY_RUN" = "true" ] && return 0
 
@@ -150,7 +201,7 @@ configure_models_interactive() {
     read -r -s -p "[litellm] Provider API key: " pkey; echo
   fi
 
-  purl="${purl%/}"
+    purl="${purl%/}"
   [ -n "$purl" ] || fail "provider base URL is required"
   [ -n "$pkey" ] || fail "provider API key is required"
   command -v curl >/dev/null || fail "curl not found (required for model discovery)"
@@ -192,50 +243,11 @@ configure_models_interactive() {
   : >"$GENERATED_MODELS_FILE"
   chmod 600 "$GENERATED_MODELS_FILE"
 
-  # Parse an OpenAI/Anthropic-style {"data":[{"id":...}]} payload and emit
-  # modelList as JSON (a valid YAML subset, so ids/urls stay safely quoted).
-  # The key itself never reaches this file: LiteLLM resolves the os.environ
-  # reference per request from the container environment, and that entry comes
-  # from the Secret below. A literal here would travel into the release values
-  # and sit in every stored revision.
   local count
-  count="$(printf '%s' "$resp" | python3 -c '
-import json, sys
-prefix, api_base, env_name, secret, secret_key, out = sys.argv[1:7]
-data = json.load(sys.stdin)
-items = data.get("data") if isinstance(data, dict) else data
-ids = [it.get("id") if isinstance(it, dict) else it for it in (items or [])]
-ids = [i for i in ids if i]
-if not ids:
-    sys.stderr.write("no models found in /models response\n"); sys.exit(1)
-json.dump({
-    "modelList": [
-        {"model_name": m, "litellm_params": {
-            "model": f"{prefix}/{m}",
-            "api_base": api_base,
-            "api_key": f"os.environ/{env_name}",
-        }}
-        for m in ids
-    ],
-    "providerApiKey": {"secretName": secret, "secretKey": secret_key, "envName": env_name},
-}, open(out, "w"), indent=2)
-print(len(ids))
-' "$model_prefix" "$purl" "$PROVIDER_KEY_ENV" "$PROVIDER_KEY_SECRET" "$PROVIDER_KEY_SECRET_KEY" \
-  "$GENERATED_MODELS_FILE")" \
+  count="$(printf '%s' "$resp" | write_provider_values "$model_prefix" "$purl" "$GENERATED_MODELS_FILE")" \
     || fail "could not parse models response from $models_url"
 
-  # helm --create-namespace has not run yet, so a first install into a fresh
-  # namespace would have nowhere to put this Secret.
-  kubectl create namespace "$LITELLM_NAMESPACE" --dry-run=client -o yaml \
-    | kubectl apply -f - >/dev/null 2>&1 || true
-
-  # Through stdin, not --from-literal: an argument is visible in /proc and to
-  # anything auditing process starts.
-  printf '%s' "$pkey" \
-    | kubectl -n "$LITELLM_NAMESPACE" create secret generic "$PROVIDER_KEY_SECRET" \
-        --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o yaml \
-    | kubectl -n "$LITELLM_NAMESPACE" apply -f - >/dev/null \
-    || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
+  printf '%s' "$pkey" | store_provider_key
 
   log "discovered $count model(s) from $ptype provider"
   log "provider API key in Secret/$PROVIDER_KEY_SECRET, referenced as os.environ/$PROVIDER_KEY_ENV"
@@ -388,36 +400,66 @@ helm_set_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/,/\\,/g'
 }
 
-# Helm recomputes values from what this run passes; it does not keep what the
-# last one set. So an upgrade run without the provider config -- a CI job, or a
+# Helm recomputes values from what this run passes; it keeps nothing from the
+# last one. So an upgrade run without the provider config -- a CI job, or a
 # terminal where the operator answered "no" -- would hand Helm an empty
-# modelList and no providerApiKey, and the proxy would come back with no models
-# and no key env var. Carry forward what the release already has whenever this
-# run did not produce its own.
+# modelList and no providerApiKey, and the proxy would come back serving no
+# models with no key in its environment. Carry forward what the release already
+# has whenever this run did not produce its own.
 CARRIED_VALUES_FILE=""
 if [ -z "$GENERATED_MODELS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
-  carried="$(helm -n "$LITELLM_NAMESPACE" get values "$LITELLM_RELEASE" -o json 2>/dev/null || true)"
+  carried_err="$(mktemp)"; MODELS_TMP_FILES+=("$carried_err")
+  if carried="$(helm -n "$LITELLM_NAMESPACE" get values "$LITELLM_RELEASE" -o json 2>"$carried_err")"; then
+    :
+  elif grep -qi "not found" "$carried_err"; then
+    # No release yet: this is a first install, and there is nothing to carry.
+    carried=""
+  else
+    # Anything else -- an unreachable API server, RBAC, a broken release -- is
+    # not "there is nothing to carry". Proceeding would hand Helm an empty
+    # modelList and take the models away, so stop instead.
+    sed 's/^/  /' "$carried_err" >&2
+    fail "could not read the current values of release $LITELLM_RELEASE; refusing to upgrade with an empty modelList"
+  fi
+
   if [ -n "$carried" ]; then
     CARRIED_VALUES_FILE="$(mktemp)"
     chmod 600 "$CARRIED_VALUES_FILE"
     MODELS_TMP_FILES+=("$CARRIED_VALUES_FILE")
-    if printf '%s' "$carried" | python3 -c '
+    # The parser refuses a literal api_key. A release installed before the key
+    # moved into a Secret has one sitting in its values, and copying it forward
+    # would write the plaintext into the new revision too -- quietly undoing the
+    # thing this is all for.
+    carried_keys="$(printf '%s' "$carried" | python3 -c '
 import json, sys
-try:
-    cur = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
+out = sys.argv[1]
+cur = json.load(sys.stdin)
+models = cur.get("modelList") or []
+literal = sorted({
+    m.get("model_name", "?") for m in models
+    if isinstance(m, dict)
+    and isinstance(m.get("litellm_params"), dict)
+    and isinstance(m["litellm_params"].get("api_key"), str)
+    and not m["litellm_params"]["api_key"].startswith("os.environ/")
+})
+if literal:
+    sys.exit(
+        "the deployed release stores a literal api_key for: " + ", ".join(literal)
+        + "\nCarrying that forward would copy the plaintext into the new revision."
+        + "\nRe-run with LITELLM_PROVIDER_TYPE/_URL/_API_KEY to rewrite modelList"
+        + "\nagainst a Secret, or supply a corrected LITELLM_VALUES_FILE."
+    )
 keep = {k: cur[k] for k in ("modelList", "providerApiKey") if cur.get(k)}
 if not keep:
-    sys.exit(1)
-json.dump(keep, open(sys.argv[1], "w"), indent=2)
-sys.stderr.write(" ".join(sorted(keep)) + "\n")
-' "$CARRIED_VALUES_FILE" 2>/tmp/.litellm-carried.$$; then
-      log "carrying forward from the current release: $(tr -d '\n' </tmp/.litellm-carried.$$)"
+    sys.exit(0)
+json.dump(keep, open(out, "w"), indent=2)
+print(" ".join(sorted(keep)))
+' "$CARRIED_VALUES_FILE")" || fail "refusing to carry the current release's values forward"
+    if [ -n "$carried_keys" ]; then
+      log "carrying forward from the current release: $carried_keys"
     else
       CARRIED_VALUES_FILE=""
     fi
-    rm -f /tmp/.litellm-carried.$$
   fi
 fi
 
