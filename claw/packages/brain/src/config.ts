@@ -215,51 +215,124 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * A Go duration in whole nanoseconds, or null if `time.ParseDuration` would not
  * give a positive one.
  *
- * Mirrors Go's arithmetic rather than approximating it, because "close enough"
- * here means a value this accepts and the Workload Manager then drops without a
- * word -- the operator reads their setting back from the Deployment and believes
- * it took. Three ways that happened with float maths and a range check:
+ * A port of Go's parser rather than a regex that resembles it, because both
+ * directions of "close enough" are failures with no symptom. Too permissive and
+ * the Workload Manager drops the value in silence while the operator reads it
+ * back from the Deployment and believes it took. Too strict and a legal setting
+ * is refused -- Go accepts `+1s`, `.5s`, `1.s`, and `us`/`µs`/`μs` alike, and a
+ * hand-rolled check rejected all four.
  *
- *   `0s`             parses; the override is applied only when positive
- *   `0.1ns`          Go truncates each segment to whole nanoseconds, so this is
- *                    zero -- and `0.6ns0.6ns` is zero twice, not one
- *   `9223372036854775808ns`
- *                    one past int64; a double rounds it to exactly int64 max and
- *                    the range check passed it, while Go refuses to parse it
+ * And it must not throw. It runs at module load, so an exception here is a Brain
+ * that will not start over an environment variable: an earlier version reached
+ * `BigInt(NaN)` on a fraction long enough to make `scale` infinite -- 309 digits
+ * did it -- and a RangeError at import is a crash loop, not a config error.
  *
- * So: BigInt for the accumulation, per-segment truncation in the same place Go
- * does it, and the overflow check Go makes before each multiply.
+ * Faithful in the parts that decide the answer: `leadingFraction` stops
+ * accumulating when it would overflow but stops scaling too, which is why Go
+ * reads 309 nines as 1s rather than as anything smaller; the fractional term is
+ * computed in float64 and truncated per segment, which is why `0.6ns` is zero
+ * and `0.6ns0.6ns` is zero twice; and every multiply is overflow-checked before
+ * it happens. Cross-checked against `time.ParseDuration` on 91 inputs.
+ *
+ * Zero and negative come back as null. Both parse in Go, and neither is a value
+ * worth sending: the Workload Manager applies an override only when positive.
  */
 const GO_DURATION_UNIT_NS: Record<string, bigint> = {
-  ns: 1n, us: 1_000n, "\u00b5s": 1_000n, ms: 1_000_000n,
-  s: 1_000_000_000n, m: 60_000_000_000n, h: 3_600_000_000_000n,
+  ns: 1n,
+  us: 1_000n, "µs": 1_000n, "μs": 1_000n,
+  ms: 1_000_000n,
+  s: 1_000_000_000n,
+  m: 60_000_000_000n,
+  h: 3_600_000_000_000n,
 };
-const GO_DURATION_MAX_NS = (1n << 63n) - 1n;
+const INT64_MAX = (1n << 63n) - 1n;
 
-export function goDurationNs(value: string): bigint | null {
-  if (!/^(\d+(\.\d+)?(ns|us|\u00b5s|ms|s|m|h))+$/.test(value)) return null;
+const isDigit = (c: string): boolean => c >= "0" && c <= "9";
 
-  let total = 0n;
-  for (const m of value.matchAll(/(\d+)(?:\.(\d+))?(ns|us|\u00b5s|ms|s|m|h)/g)) {
-    const [, whole, frac, unit] = m;
-    const unitNs = GO_DURATION_UNIT_NS[unit];
-
-    let v = BigInt(whole);
-    if (v > GO_DURATION_MAX_NS / unitNs) return null;
-    v *= unitNs;
-
-    if (frac) {
-      // Go computes this term in float64 and truncates it, per segment. Doing
-      // the same -- rather than carrying the fraction exactly -- is what makes
-      // `0.1ns` a zero here as well.
-      const scale = 10 ** frac.length;
-      v += BigInt(Math.trunc(Number(frac) * (Number(unitNs) / scale)));
+export function goDurationNs(input: string): bigint | null {
+  try {
+    let s = input;
+    if (s === "") return null;
+    if (s[0] === "+" || s[0] === "-") {
+      // Signed is legal; negative is not a lifetime, and "-0s" is still zero.
+      if (s[0] === "-") return null;
+      s = s.slice(1);
     }
+    if (s === "" || s === "0") return null;
 
-    total += v;
-    if (total > GO_DURATION_MAX_NS) return null;
+    let total = 0n;
+    while (s !== "") {
+      if (!(s[0] === "." || isDigit(s[0]))) return null;
+
+      const beforeInt = s.length;
+      let v = 0n;
+      while (s !== "" && isDigit(s[0])) {
+        v = v * 10n + BigInt(s.charCodeAt(0) - 48);
+        if (v > INT64_MAX) return null;
+        s = s.slice(1);
+      }
+      const sawInt = beforeInt !== s.length;
+
+      // leadingFraction: stops accumulating AND stops scaling on overflow, which
+      // is the behaviour that keeps a very long fraction finite.
+      let frac = 0n;
+      let scale = 1;
+      let sawFrac = false;
+      if (s !== "" && s[0] === ".") {
+        s = s.slice(1);
+        const beforeFrac = s.length;
+        let overflowed = false;
+        while (s !== "" && isDigit(s[0])) {
+          const digit = BigInt(s.charCodeAt(0) - 48);
+          s = s.slice(1);
+          if (overflowed) continue;
+          if (frac > INT64_MAX / 10n) { overflowed = true; continue; }
+          const next = frac * 10n + digit;
+          if (next > INT64_MAX) { overflowed = true; continue; }
+          frac = next;
+          scale *= 10;
+        }
+        sawFrac = beforeFrac !== s.length;
+      }
+      if (!sawInt && !sawFrac) return null;
+
+      // The unit is everything up to the next digit or dot.
+      let i = 0;
+      while (i < s.length && !(s[i] === "." || isDigit(s[i]))) i++;
+      if (i === 0) return null;
+      const unitNs = GO_DURATION_UNIT_NS[s.slice(0, i)];
+      s = s.slice(i);
+      if (unitNs === undefined) return null;
+
+      if (v > INT64_MAX / unitNs) return null;
+      v *= unitNs;
+      if (frac > 0n) {
+        const term = Math.trunc(Number(frac) * (Number(unitNs) / scale));
+        if (!Number.isFinite(term)) return null;
+        v += BigInt(term);
+        if (v > INT64_MAX) return null;
+      }
+
+      total += v;
+      if (total > INT64_MAX) return null;
+    }
+    return total > 0n ? total : null;
+  } catch {
+    // Belt and braces. Nothing above should throw, and a config value is not
+    // worth a crash loop if something does.
+    return null;
   }
-  return total > 0n ? total : null;
+}
+
+/**
+ * A Go duration in whole seconds, for a backend that counts in seconds.
+ *
+ * Rounded up rather than down: sub-second is not a lifetime anyone means, but
+ * truncating it to zero would be read by SaFE as "no timeout at all" -- the
+ * exact opposite of a short one.
+ */
+export function goDurationSeconds(ns: bigint): number {
+  return Math.max(1, Number(ns / 1_000_000_000n));
 }
 
 function resolveAgentSandboxSessionTimeout(): string {

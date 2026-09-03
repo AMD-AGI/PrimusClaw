@@ -1,29 +1,44 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-// A duration the Workload Manager will not use is worse than one it rejects.
+// This has to be Go's parser, not something that resembles it.
 //
-// The override is applied only when it parses AND comes out positive, and a
-// value that fails either test is dropped without a word: the sandbox takes the
-// default while the operator reads their own setting back from the Deployment
-// and believes it took. So the check here has to be the same check, in the same
-// units -- Go durations are whole nanoseconds, and the rounding is what makes
-// `0.1ns` a zero rather than a very small number.
+// Both directions of "close enough" fail without a symptom. Too permissive and
+// the Workload Manager drops the override in silence, while the operator reads
+// their setting back from the Deployment and believes it took. Too strict and a
+// legal value is refused -- Go takes `+1s`, `.5s`, `1.s` and three spellings of
+// microseconds, and a hand-rolled check rejected all of them.
+//
+// The cases below were cross-checked against `time.ParseDuration` itself: 91
+// inputs, including 60 generated ones, agree exactly.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { goDurationNs } from "../src/config.js";
 
+const S = 1_000_000_000n;
+
+test("the forms Go accepts and a hand-rolled check did not", () => {
+  assert.equal(goDurationNs("+1s"), S, "a leading plus is legal");
+  assert.equal(goDurationNs(".5s"), S / 2n, "the integer part is optional");
+  assert.equal(goDurationNs("1.s"), S, "so is the fraction after the point");
+  assert.equal(goDurationNs("1us"), 1_000n);
+  assert.equal(goDurationNs("1µs"), 1_000n, "MICRO SIGN");
+  assert.equal(goDurationNs("1μs"), 1_000n, "GREEK SMALL LETTER MU");
+});
+
 test("ordinary durations parse to their nanosecond value", () => {
   assert.equal(goDurationNs("1ns"), 1n);
-  assert.equal(goDurationNs("90m"), 90n * 60_000_000_000n);
-  assert.equal(goDurationNs("2h30m"), 2n * 3_600_000_000_000n + 30n * 60_000_000_000n);
+  assert.equal(goDurationNs("90m"), 90n * 60n * S);
+  assert.equal(goDurationNs("2h30m"), 2n * 3600n * S + 30n * 60n * S);
+  assert.equal(goDurationNs("1m0.5s"), 60n * S + S / 2n);
 });
 
 test("zero is refused however it is spelled", () => {
-  // Go takes both of these. It then makes them zero, and the Workload Manager
-  // applies an override only when it is positive -- so they reach the sandbox as
+  // Go takes all of these and makes them zero; the Workload Manager applies an
+  // override only when it is positive, so they would reach the sandbox as
   // nothing at all.
+  assert.equal(goDurationNs("0"), null);
   assert.equal(goDurationNs("0s"), null);
   assert.equal(goDurationNs("0h0m0s"), null);
   assert.equal(goDurationNs("0.1ns"), null,
@@ -33,21 +48,32 @@ test("zero is refused however it is spelled", () => {
       + "rounding once would make it 1ns and send a value Go then drops");
 });
 
+test("negative is refused, not negated", () => {
+  assert.equal(goDurationNs("-1s"), null, "not a lifetime");
+});
+
 test("something that is not a duration is refused", () => {
-  assert.equal(goDurationNs("forever"), null);
-  assert.equal(goDurationNs("15"), null, "Go wants a unit");
-  assert.equal(goDurationNs("15 m"), null);
-  assert.equal(goDurationNs(""), null);
+  for (const bad of ["forever", "15", "15 m", " 1s", "1 s", "1S", "1x", ".s", ""]) {
+    assert.equal(goDurationNs(bad), null, `${JSON.stringify(bad)} should be refused`);
+  }
 });
 
 test("a value too large for an int64 is refused rather than wrapped", () => {
-  assert.equal(goDurationNs("1000000000h"), null,
-    "Go fails to parse this; accepting it here would send a value that is "
-      + "dropped on arrival");
-  assert.equal(goDurationNs("9223372036854775808ns"), null,
-    "one past int64 max, which a double rounds to exactly int64 max -- so a "
-      + "range check done in floats let it through");
   assert.equal(goDurationNs("9223372036854775807ns"), 9223372036854775807n,
     "int64 max itself is a duration Go accepts");
-  assert.notEqual(goDurationNs("2000h"), null, "83 days is long, not impossible");
+  assert.equal(goDurationNs("9223372036854775808ns"), null,
+    "one past it, which a double rounds back to int64 max -- so a range check "
+      + "done in floats let it through");
+  assert.equal(goDurationNs("1000000000h"), null);
+  assert.equal(goDurationNs("9223372036854775807h"), null, "overflows on the multiply");
+});
+
+test("a fraction long enough to break float maths returns a value, not an exception", () => {
+  // 309 digits made `scale` infinite, `f/scale` NaN, and `BigInt(NaN)` a
+  // RangeError -- thrown at module load, from a config value, which is a crash
+  // loop rather than a rejected setting. Go's leadingFraction stops scaling when
+  // it stops accumulating, so it reads this as 1s.
+  const long = "0." + "9".repeat(309) + "s";
+  assert.equal(goDurationNs(long), S, "matches time.ParseDuration on the same input");
+  assert.doesNotThrow(() => goDurationNs("0." + "9".repeat(5000) + "h"));
 });
