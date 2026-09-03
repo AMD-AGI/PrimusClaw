@@ -14,7 +14,24 @@ import { randomBytes } from "node:crypto";
 
 import { decodeAeadKey, AEAD_KEY_LEN } from "../src/crypto/aead.js";
 
-const GOOD = randomBytes(AEAD_KEY_LEN).toString("base64");
+/**
+ * A random 32-byte key encodes without a single '+' or '/' about a quarter of
+ * the time -- 43 characters drawn from an alphabet where those two are 2 of
+ * 64. The url-safe case below rewrites exactly those characters, so on such a
+ * key it hands `decodeAeadKey` the canonical string unchanged and is correctly
+ * accepted: a test that passes three runs in four and fails the fourth for a
+ * reason that has nothing to do with the code. Force one quantum of each --
+ * 0xfb 0xef 0xbe is "++++" and 0xff 0xff 0xff is "////" -- and leave the rest
+ * random, so the fixture exercises both characters on every run.
+ */
+function goodKey(): string {
+  const bytes = randomBytes(AEAD_KEY_LEN);
+  Buffer.from([0xfb, 0xef, 0xbe]).copy(bytes, 0);
+  Buffer.from([0xff, 0xff, 0xff]).copy(bytes, 3);
+  return bytes.toString("base64");
+}
+
+const GOOD = goodKey();
 
 test("decodeAeadKey accepts the canonical encoding of a key", () => {
   const key = decodeAeadKey(GOOD, "BRAIN_CHECKPOINT_KEY");
@@ -36,6 +53,9 @@ test("decodeAeadKey refuses input Buffer.from would quietly repair", () => {
     ["shell quotes", `"${GOOD}"`],
     ["a url-safe alphabet", GOOD.replace(/\+/g, "-").replace(/\//g, "_")],
   ] as const) {
+    // A mangling that leaves the string untouched proves nothing, and would be
+    // accepted -- rightly -- by any correct implementation.
+    assert.notEqual(bad, GOOD, `${what} did not actually change the key`);
     assert.throws(
       () => decodeAeadKey(bad, "BRAIN_CHECKPOINT_KEY"),
       /canonical base64/,
