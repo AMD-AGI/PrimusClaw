@@ -390,12 +390,23 @@ export function goDurationSeconds(ns: bigint): number {
  * because the signal saying so was not due yet -- and nothing reports that as a
  * misconfiguration, it looks like a sandbox that died.
  *
- * Ten minutes is two refresh intervals: one missed tick must not be fatal. It
- * is deliberately looser than the 3x implied by the shipped 15m default,
- * because this rejects a setting outright rather than quietly clamping it, and
- * what it has to establish is only the floor of what can work at all.
+ * The floor is two refresh intervals plus slack: one missed tick must not be
+ * fatal, and at exactly two intervals it still is. Miss the tick at 5m and the
+ * next write is due at 10m -- but the write is not instant (the Router gives it
+ * its own 2s timeout) while the reclaim is not patient (agentd re-checks 1s
+ * after the deadline, `time.Until(expiresAt) + time.Second`). A 10m timeout
+ * puts the GC pass at 10m1s and the recovering write as late as 10m2s: the
+ * sandbox is reclaimed one second before the signal that would have saved it.
+ *
+ * So 2 x 5m + 1m. The slack has to cover 2s of write plus 1s of grace, and a
+ * minute is chosen over those 3s because 3s of headroom is a knife-edge held
+ * up by nothing -- ticker drift, a scheduler that is late, a store write slower
+ * than usual, all of which land inside a margin that thin. It stays looser than
+ * the 3x implied by the shipped 15m default, because this rejects a setting
+ * outright rather than quietly clamping it, and what it has to establish is
+ * only the floor of what can work at all.
  */
-const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 600_000_000_000n; // 10m
+const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 660_000_000_000n; // 2 x 5m + 1m
 
 function resolveAgentSandboxSessionTimeout(): string {
   const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
@@ -410,8 +421,9 @@ function resolveAgentSandboxSessionTimeout(): string {
   }
   if (ns < AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS) {
     settingProblems.push(
-      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is below the 10m floor: the `
-        + `liveness signal that holds a sandbox open only arrives every 5m, so a `
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is below the 11m floor: the `
+        + `liveness signal that holds a sandbox open only arrives every 5m, and `
+        + `the floor is two of those plus a minute for the write to land, so a `
         + `sandbox still in use would be reclaimed before the signal saying so is `
         + `due; leaving the template's own value`,
     );

@@ -262,10 +262,7 @@ func teardownScheme(t *testing.T) *k8sruntime.Scheme {
 // Sandbox pointing at its adopted Pod, that Pod, and the Claim.
 func adoptedSet() []ctrlclient.Object {
 	return []ctrlclient.Object{
-		&sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{
-			Name: "sbx-claimed", Namespace: "sandboxes",
-			Annotations: map[string]string{"agents.x-k8s.io/pod-name": "pool-pod-7"},
-		}},
+		adoptedSandbox(),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Name: "pool-pod-7", Namespace: "sandboxes",
 		}},
@@ -385,7 +382,7 @@ func TestClaimTeardownRunsOnACancelledRequestContext(t *testing.T) {
 	}
 }
 
-// The same detachment, but reached the way production reaches it.
+// ── Driving a rollback through createViaClaim ────────────────────────────────
 //
 // TestClaimTeardownRunsOnACancelledRequestContext above hands DeleteSandboxClaim
 // a context it built itself, so what it demonstrates is that context.WithoutCancel
@@ -394,30 +391,43 @@ func TestClaimTeardownRunsOnACancelledRequestContext(t *testing.T) {
 // whether the rollback rides the request context or its own. Revert that one
 // call and the test above still passes.
 //
-// So this drives the real thing. The patch fails, and it fails by cancelling
-// the request context on its way out, which is how it fails in production --
-// the client gives up, and that is both why the patch failed and why a rollback
-// on that context would do nothing. What is asserted is the context the
-// rollback's deletes actually ran under: still live, and on a deadline of its
-// own so a wedged API server cannot hold the request open either.
-func TestCreateViaClaimDetachesTheRollbackFromTheRequestContext(t *testing.T) {
-	var cancelRequest context.CancelFunc
+// The helpers below assemble the real thing instead: a cluster where the patch
+// fails the way it fails in production, a stand-in for the controller that
+// hands over the Sandbox, and assertions on the context the rollback's deletes
+// actually ran under.
 
-	type seen struct {
-		kind     string
-		err      error
-		deadline time.Duration
-		hasDL    bool
+// deletion is what a Delete looked like from inside the client: which object,
+// and -- the whole point -- the state of the context it arrived on.
+type deletion struct {
+	kind        string
+	ctxErr      error
+	deadline    time.Duration
+	hasDeadline bool
+}
+
+func deletionKindOf(obj ctrlclient.Object) string {
+	switch obj.(type) {
+	case *corev1.Pod:
+		return "pod"
+	case *extensionsv1alpha1.SandboxClaim:
+		return "claim"
+	default:
+		return "sandbox"
 	}
-	var deletes []seen
+}
 
+// rollbackProbeClient is a cluster holding an adopted Pod and the Sandbox that
+// names it, in which the claim-metadata patch always fails -- and fails by
+// calling onPatchFailure first, which is how the caller passes in the
+// cancellation that a client giving up would have caused. Every deletion that
+// follows is recorded, context and all, into the returned slice.
+func rollbackProbeClient(t *testing.T, onPatchFailure func()) (ctrlclient.WithWatch, *[]deletion) {
+	t.Helper()
+	seen := &[]deletion{}
 	c := fake.NewClientBuilder().
 		WithScheme(teardownScheme(t)).
 		WithObjects(
-			&sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{
-				Name: "sbx-claimed", Namespace: "sandboxes",
-				Annotations: map[string]string{"agents.x-k8s.io/pod-name": "pool-pod-7"},
-			}},
+			adoptedSandbox(),
 			&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 				Name: "pool-pod-7", Namespace: "sandboxes",
 			}},
@@ -426,91 +436,74 @@ func TestCreateViaClaimDetachesTheRollbackFromTheRequestContext(t *testing.T) {
 			Patch: func(ctx context.Context, cl ctrlclient.WithWatch, obj ctrlclient.Object,
 				p ctrlclient.Patch, opts ...ctrlclient.PatchOption) error {
 				if _, isSandbox := obj.(*sandboxv1alpha1.Sandbox); isSandbox {
-					// The client hanging up is what the patch failure *is*.
-					cancelRequest()
+					onPatchFailure()
 					return errors.New("the client gave up")
 				}
 				return cl.Patch(ctx, obj, p, opts...)
 			},
 			Delete: func(ctx context.Context, cl ctrlclient.WithWatch, obj ctrlclient.Object,
 				opts ...ctrlclient.DeleteOption) error {
-				kind := "sandbox"
-				switch obj.(type) {
-				case *corev1.Pod:
-					kind = "pod"
-				case *extensionsv1alpha1.SandboxClaim:
-					kind = "claim"
-				}
-				rec := seen{kind: kind, err: ctx.Err()}
+				d := deletion{kind: deletionKindOf(obj), ctxErr: ctx.Err()}
 				if dl, ok := ctx.Deadline(); ok {
-					rec.hasDL, rec.deadline = true, time.Until(dl)
+					d.hasDeadline, d.deadline = true, time.Until(dl)
 				}
-				deletes = append(deletes, rec)
+				*seen = append(*seen, d)
 				return cl.Delete(ctx, obj, opts...)
 			},
 		}).Build()
+	return c, seen
+}
 
-	// The reconciler is concrete, so the notification is delivered by handing
-	// the watcher createViaClaim registers the Sandbox it is waiting for.
-	rec := &SandboxReconciler{}
-	creator := &K8sSandboxCreator{client: c, reconciler: rec}
+// adoptedSandbox is the Sandbox the pool hands over: the one object that names
+// the adopted Pod, which is what makes it recoverable at teardown.
+func adoptedSandbox() *sandboxv1alpha1.Sandbox {
+	return &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{
+		Name: "sbx-claimed", Namespace: "sandboxes",
+		Annotations: map[string]string{"agents.x-k8s.io/pod-name": "pool-pod-7"},
+	}}
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancelRequest = cancel
-	defer cancel()
-
-	key := types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}
+// deliverAdoptedSandbox stands in for the WarmPool controller. createViaClaim
+// registers its watcher itself, so there is nothing to pre-seed -- this waits
+// for that registration to appear and then sends what the controller would
+// have. The returned function blocks until the hand-off is done.
+func deliverAdoptedSandbox(t *testing.T, r *SandboxReconciler, key types.NamespacedName) func() {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			rec.mu.RLock()
-			ch := rec.watchers[key]
-			rec.mu.RUnlock()
+			r.mu.RLock()
+			ch := r.watchers[key]
+			r.mu.RUnlock()
 			if ch != nil {
-				ch <- SandboxStatusUpdate{Sandbox: &sandboxv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "sbx-claimed", Namespace: "sandboxes",
-						Annotations: map[string]string{"agents.x-k8s.io/pod-name": "pool-pod-7"},
-					},
-				}}
+				ch <- SandboxStatusUpdate{Sandbox: adoptedSandbox()}
 				return
 			}
 			time.Sleep(time.Millisecond)
 		}
 		t.Error("createViaClaim never registered a watcher")
 	}()
+	return func() { <-done }
+}
 
-	ci := &runtimev1alpha1.CodeInterpreter{
-		ObjectMeta: metav1.ObjectMeta{Name: "tmpl", Namespace: "sandboxes"},
-		Spec: runtimev1alpha1.CodeInterpreterSpec{
-			AuthMode: runtimev1alpha1.AuthModeNone,
-		},
-	}
-	res, err := creator.createViaClaim(ctx, ci, "sbx-claimed", "sess_1", nil, nil)
-	<-done
-
-	if err == nil {
-		t.Fatalf("a claim whose metadata never landed must not look created, got %+v", res)
-	}
-	if !strings.Contains(err.Error(), "sbx-claimed") {
-		t.Errorf("the error should name the sandbox: %v", err)
-	}
-
-	// The point of the test. Had the rollback been built on ctx it would have
-	// been dead on arrival -- cancelled above, inside the very failure it exists
-	// to clean up after.
-	if len(deletes) == 0 {
+// assertDeletedDetached is the property the whole exercise exists for. Had the
+// rollback been built on the request context it would have been dead on
+// arrival -- cancelled inside the very failure it exists to clean up after --
+// and every deletion here would carry that cancellation.
+func assertDeletedDetached(t *testing.T, seen []deletion) {
+	t.Helper()
+	if len(seen) == 0 {
 		t.Fatal("the rollback deleted nothing")
 	}
-	for _, d := range deletes {
-		if d.err != nil {
+	for _, d := range seen {
+		if d.ctxErr != nil {
 			t.Errorf("the %s was deleted on an already-cancelled context (%v); "+
 				"the rollback is riding the request context, so in production it "+
-				"would have deleted nothing at all", d.kind, d.err)
+				"would have deleted nothing at all", d.kind, d.ctxErr)
 		}
-		if !d.hasDL {
+		if !d.hasDeadline {
 			t.Errorf("the %s deletion had no deadline; a wedged API server would "+
 				"hold the request open indefinitely", d.kind)
 		} else if d.deadline <= 0 || d.deadline > claimRollbackTimeout {
@@ -518,20 +511,57 @@ func TestCreateViaClaimDetachesTheRollbackFromTheRequestContext(t *testing.T) {
 				d.kind, d.deadline, claimRollbackTimeout)
 		}
 	}
+}
 
-	// And it has to have actually finished: the Pod is the one that costs, since
-	// nothing cascades to it and the Claim it was reachable through is going too.
+// assertNothingAdoptedSurvives checks the rollback actually finished. The Pod
+// is the one that costs: nothing cascades to it, and the Claim it was
+// reachable through is going too.
+func assertNothingAdoptedSurvives(t *testing.T, c ctrlclient.Client) {
+	t.Helper()
 	for name, obj := range map[string]ctrlclient.Object{
 		"pod":     &corev1.Pod{},
 		"sandbox": &sandboxv1alpha1.Sandbox{},
 		"claim":   &extensionsv1alpha1.SandboxClaim{},
 	} {
-		k := key
+		key := types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}
 		if name == "pod" {
-			k.Name = "pool-pod-7"
+			key.Name = "pool-pod-7"
 		}
-		if getErr := c.Get(context.Background(), k, obj); !k8serrors.IsNotFound(getErr) {
-			t.Errorf("%s survived the rollback, got: %v", name, getErr)
+		if err := c.Get(context.Background(), key, obj); !k8serrors.IsNotFound(err) {
+			t.Errorf("%s survived the rollback, got: %v", name, err)
 		}
 	}
+}
+
+// The patch fails, and it fails by cancelling the request context on its way
+// out -- which is how it fails in production: the client gives up, and that is
+// both why the patch failed and why a rollback on that context would do
+// nothing. What is asserted is the context the deletes actually ran under.
+func TestCreateViaClaimDetachesTheRollbackFromTheRequestContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, seen := rollbackProbeClient(t, cancel)
+	reconciler := &SandboxReconciler{}
+	creator := &K8sSandboxCreator{client: c, reconciler: reconciler}
+
+	handedOver := deliverAdoptedSandbox(t, reconciler, types.NamespacedName{
+		Namespace: "sandboxes", Name: "sbx-claimed",
+	})
+
+	ci := &runtimev1alpha1.CodeInterpreter{
+		ObjectMeta: metav1.ObjectMeta{Name: "tmpl", Namespace: "sandboxes"},
+		Spec:       runtimev1alpha1.CodeInterpreterSpec{AuthMode: runtimev1alpha1.AuthModeNone},
+	}
+	res, err := creator.createViaClaim(ctx, ci, "sbx-claimed", "sess_1", nil, nil)
+	handedOver()
+
+	if err == nil {
+		t.Fatalf("a claim whose metadata never landed must not look created, got %+v", res)
+	}
+	if !strings.Contains(err.Error(), "sbx-claimed") {
+		t.Errorf("the error should name the sandbox: %v", err)
+	}
+	assertDeletedDetached(t, *seen)
+	assertNothingAdoptedSurvives(t, c)
 }
