@@ -1051,21 +1051,30 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 				Namespace: info.Namespace,
 			},
 		}
-		// Both errors are kept. Dropping the Pod's was the zombie this
-		// function's own comment describes: the Pod has no OwnerReference, so
-		// nothing cascades to it, and deleting the Claim below removes the last
-		// record anyone could find it through. A Pod that would not delete
-		// therefore stops the teardown rather than being outlived by it.
+		// The Pod's error is kept, and it also gates what happens next.
+		// Dropping it was the zombie this function's own comment describes: the
+		// Pod has no OwnerReference, so nothing cascades to it, and deleting the
+		// Claim below removes the last record anyone could find it through.
 		podErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
+		if podErr != nil {
+			// The Claim carries no Pod reference; the annotation read above is
+			// the only thing in the cluster that names this Pod. Deleting the
+			// Sandbox now would take that name with it and leave a running Pod
+			// nothing can address -- worse than the Sandbox outliving its Pod,
+			// which a retry can still finish. So the teardown stops here, with
+			// both objects intact and the failure returned to the caller.
+			return fmt.Errorf("delete warm-pool pod %s/%s (sandbox %s retained so its %s annotation still names it): %w",
+				info.Namespace, podName, info.SandboxName, "agents.x-k8s.io/pod-name", podErr)
+		}
 
 		// Step 3: Delete the Sandbox (triggers Service cleanup by the sandbox controller).
-		sandboxErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox))
-
-		if podErr != nil || sandboxErr != nil {
+		// Only reached once the Pod is gone or was already absent, so the
+		// annotation is being discarded with nothing left to find through it.
+		if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox)); err != nil {
 			// Deliberately before Step 4: the Claim is what a retry finds all of
 			// this through, so it outlives anything that failed to go.
 			return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
-				info.Namespace, info.SandboxName, errors.Join(podErr, sandboxErr))
+				info.Namespace, info.SandboxName, err)
 		}
 	} else if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("get sandbox %s/%s: %w", info.Namespace, info.SandboxName, err)

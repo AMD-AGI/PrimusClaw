@@ -177,6 +177,13 @@ brain:
   # with its work running, so raise them together or not at all. A value that is
   # not a positive Go duration is refused at startup rather than dropped by the
   # Workload Manager's parse.
+  #
+  # sessionTimeout is an agent-sandbox concept and only reaches a sandbox when
+  # deployMode is kubernetes. SaFE has no idle clock to map it onto, so in the
+  # default safe mode it does nothing at all -- the startup log names it as an
+  # inert setting rather than letting it read back as applied. maxSessionDuration
+  # is honoured in both modes, and on SaFE it is the ceiling a per-request
+  # deadline is clamped to.
   sessionTimeout: ""
   maxSessionDuration: ""
   bashDefaultTimeoutSec: ""

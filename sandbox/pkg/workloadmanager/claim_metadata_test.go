@@ -19,6 +19,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -140,12 +141,18 @@ func TestClaimMetadataRetriesBeforeGivingUp(t *testing.T) {
 			},
 		}).Build()
 
+	start := time.Now()
 	if err := applyClaimMetadataWithRetry(context.Background(), c, claimSandbox(),
 		nil, map[string]string{"runtime.agent-sandbox.io/idle-timeout": "48h"}); err != nil {
 		t.Fatalf("a transient conflict should not fail the claim: %v", err)
 	}
-	if calls < 2 {
-		t.Errorf("it gave up after %d attempt(s)", calls)
+	if calls != 2 {
+		t.Errorf("one conflict should cost exactly one retry, took %d attempt(s)", calls)
+	}
+	// The first backoff is 200ms; a retry that does not wait is a hot loop
+	// against the same conflict it is trying to let clear.
+	if elapsed := time.Since(start); elapsed < firstBackoff {
+		t.Errorf("retried after %v, before the %v backoff had elapsed", elapsed, firstBackoff)
 	}
 }
 
@@ -164,12 +171,60 @@ func TestClaimMetadataStopsRetrying(t *testing.T) {
 			},
 		}).Build()
 
+	start := time.Now()
 	if err := applyClaimMetadataWithRetry(context.Background(), c, claimSandbox(),
 		nil, map[string]string{"x": "y"}); err == nil {
 		t.Fatal("a claim that never got its metadata must not report success")
 	}
-	if calls > 5 {
-		t.Errorf("retried %d times while holding a pooled Pod", calls)
+	if calls != retryAttempts {
+		t.Errorf("want exactly %d attempts while holding a pooled Pod, got %d", retryAttempts, calls)
+	}
+	// 200ms then 400ms between the three attempts, and no wait after the last:
+	// a fourth backoff would mean it slept on a decision it had already made.
+	elapsed := time.Since(start)
+	if elapsed < firstBackoff+2*firstBackoff {
+		t.Errorf("gave up after %v, faster than the backoff it is supposed to serve", elapsed)
+	}
+	if elapsed > firstBackoff+2*firstBackoff+3*firstBackoff {
+		t.Errorf("took %v -- it waited past the last attempt", elapsed)
+	}
+}
+
+// The retry schedule the two tests above pin, named where they can both see it.
+const (
+	retryAttempts = 3
+	firstBackoff  = 200 * time.Millisecond
+)
+
+func TestClaimMetadataStopsWhenTheRequestIsCancelledMidBackoff(t *testing.T) {
+	// Between attempts it is asleep, and shutdown is exactly when a pooled Pod
+	// is worth the least. Waking only to make another doomed attempt would hold
+	// the caller for the rest of the schedule after its context was already gone.
+	scheme := claimScheme(t)
+	var calls int
+	ctx, cancel := context.WithCancel(context.Background())
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claimSandbox()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object,
+				ctrlclient.Patch, ...ctrlclient.PatchOption) error {
+				calls++
+				cancel() // cancelled while the first backoff is running
+				return errors.New("still broken")
+			},
+		}).Build()
+
+	start := time.Now()
+	err := applyClaimMetadataWithRetry(ctx, c, claimSandbox(), nil, map[string]string{"x": "y"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled claim must report the cancellation, got: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("it kept trying after cancellation: %d attempts", calls)
+	}
+	if elapsed := time.Since(start); elapsed >= firstBackoff {
+		t.Errorf("it slept the full %v backoff before noticing, took %v", firstBackoff, elapsed)
 	}
 }
 
@@ -234,12 +289,27 @@ func TestClaimTeardownKeepsTheClaimWhenThePodSurvives(t *testing.T) {
 		t.Fatalf("the underlying cause must survive: %v", err)
 	}
 
-	// The Claim is the only handle a retry has on that Pod.
+	key := types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}
+
+	// The Claim is the handle a retry finds the teardown through.
 	claim := &extensionsv1alpha1.SandboxClaim{}
-	if getErr := c.Get(context.Background(), types.NamespacedName{
-		Namespace: "sandboxes", Name: "sbx-claimed",
-	}, claim); getErr != nil {
+	if getErr := c.Get(context.Background(), key, claim); getErr != nil {
 		t.Fatalf("claim must outlive a failed teardown, got: %v", getErr)
+	}
+
+	// And the Sandbox is the only thing that says which Pod. The Claim holds no
+	// Pod reference, so a Sandbox deleted here takes the pod-name annotation
+	// with it and the surviving Pod becomes unaddressable -- a zombie no retry
+	// can reach, which is the failure the Claim was being kept for.
+	sandbox := &sandboxv1alpha1.Sandbox{}
+	if getErr := c.Get(context.Background(), key, sandbox); getErr != nil {
+		t.Fatalf("sandbox must be retained so its annotation still names the pod, got: %v", getErr)
+	}
+	if got := sandbox.Annotations["agents.x-k8s.io/pod-name"]; got != "pool-pod-7" {
+		t.Fatalf("the surviving pod must still be named by the sandbox, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "pool-pod-7") {
+		t.Errorf("the error should say which pod was left behind: %v", err)
 	}
 }
 

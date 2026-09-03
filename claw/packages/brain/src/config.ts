@@ -248,6 +248,16 @@ const GO_DURATION_UNIT_NS: Record<string, bigint> = {
   h: 3_600_000_000_000n,
 };
 const INT64_MAX = (1n << 63n) - 1n;
+// Go does this arithmetic in uint64, and every one of its overflow guards
+// compares against 1<<63 rather than int64's maximum -- the headroom that lets
+// `-9223372036854775808ns` parse. Ported as the same bound and not the tighter
+// one, because the fraction accumulator's limit is not only a range check: it
+// decides where `leadingFraction` stops scaling, and so which (value, scale)
+// pair the fractional term is computed from. INT64_MAX there makes a fraction
+// beginning 9223372036854775808 stop one digit earlier than Go stops, and the
+// two terms are then equal only by a float64 coincidence. The final result is
+// still held to INT64_MAX, at the end, exactly where Go holds it.
+const UINT64_HALF = 1n << 63n;
 
 const isDigit = (c: string): boolean => c >= "0" && c <= "9";
 
@@ -266,17 +276,21 @@ export function goDurationNs(input: string): bigint | null {
     while (s !== "") {
       if (!(s[0] === "." || isDigit(s[0]))) return null;
 
+      // leadingInt: bails at 1<<63, not at INT64_MAX.
       const beforeInt = s.length;
       let v = 0n;
       while (s !== "" && isDigit(s[0])) {
+        if (v > UINT64_HALF / 10n) return null;
         v = v * 10n + BigInt(s.charCodeAt(0) - 48);
-        if (v > INT64_MAX) return null;
+        if (v > UINT64_HALF) return null;
         s = s.slice(1);
       }
       const sawInt = beforeInt !== s.length;
 
       // leadingFraction: stops accumulating AND stops scaling on overflow, which
-      // is the behaviour that keeps a very long fraction finite.
+      // is the behaviour that keeps a very long fraction finite. The outer guard
+      // is INT64_MAX/10 and the inner one is 1<<63 -- they are different bounds
+      // in Go too, and the inner one is what decides the final digit.
       let frac = 0n;
       let scale = 1;
       let sawFrac = false;
@@ -290,7 +304,7 @@ export function goDurationNs(input: string): bigint | null {
           if (overflowed) continue;
           if (frac > INT64_MAX / 10n) { overflowed = true; continue; }
           const next = frac * 10n + digit;
-          if (next > INT64_MAX) { overflowed = true; continue; }
+          if (next > UINT64_HALF) { overflowed = true; continue; }
           frac = next;
           scale *= 10;
         }
@@ -306,18 +320,22 @@ export function goDurationNs(input: string): bigint | null {
       s = s.slice(i);
       if (unitNs === undefined) return null;
 
-      if (v > INT64_MAX / unitNs) return null;
+      if (v > UINT64_HALF / unitNs) return null;
       v *= unitNs;
       if (frac > 0n) {
         const term = Math.trunc(Number(frac) * (Number(unitNs) / scale));
         if (!Number.isFinite(term)) return null;
         v += BigInt(term);
-        if (v > INT64_MAX) return null;
+        if (v > UINT64_HALF) return null;
       }
 
       total += v;
-      if (total > INT64_MAX) return null;
+      if (total > UINT64_HALF) return null;
     }
+    // Go's own last word: everything above runs to 1<<63, and a positive result
+    // is then held to what an int64 can carry. Without this the relaxed bounds
+    // above would let 1<<63 itself through as a duration Go refuses.
+    if (total > INT64_MAX) return null;
     return total > 0n ? total : null;
   } catch {
     // Belt and braces. Nothing above should throw, and a config value is not
