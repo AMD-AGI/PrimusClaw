@@ -4,7 +4,7 @@
 /**
  * Whose identity a DAG-dispatched workload runs as.
  *
- * It ran as the cluster's. `loadSessionPlatformKey` fell back to the shared
+ * It ran as the cluster's. The session credential loader fell back to the shared
  * `SAFE_PLATFORM_KEY` whenever a session carried no key of its own, and the only
  * entry point that recorded one was the workbench route -- so every task created
  * through `POST /v1/sessions/:id/tasks` or `POST /v1/batches` dispatched under a
@@ -25,13 +25,17 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
-import { db } from "../src/infra/db.js";
-
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.SAFE_PLATFORM_KEY = "pk-CLUSTER-SHARED";
+process.env.CLAW_DEPLOY_MODE = "safe";
 
+const { db } = await import("../src/infra/db.js");
 const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
-const { sessionCredentialPatch, MissingPlatformKeyError } = await import(
+const {
+  sessionCredentialPatch,
+  readTrustedSessionCredentials,
+  MissingPlatformKeyError,
+} = await import(
   "../src/auth/session-credentials.js"
 );
 
@@ -172,9 +176,37 @@ test("C5 the patch every entry point writes carries the marker", () => {
   });
   assert.equal(patch._server_managed_credentials, true);
   assert.equal(patch.platform_key, "pk-user-1");
+  assert.equal(patch.llm_api_key, "vk-1");
 });
 
-test("C5b a caller with no key is refused before anything is queued", async () => {
+test("C5a an absent credential explicitly clears a stale session value", () => {
+  const patch = sessionCredentialPatch({
+    userId: "u-1",
+    userName: "u",
+    roles: [],
+    platformKey: "",
+    virtualKey: "",
+  });
+  assert.equal(patch.platform_key, null);
+  assert.equal(patch.llm_api_key, null);
+});
+
+test("C5b only server-managed session credentials are readable", () => {
+  assert.deepEqual(
+    readTrustedSessionCredentials({ platform_key: "pk-forged", llm_api_key: "vk-forged" }),
+    { platformKey: "", llmApiKey: "" },
+  );
+  assert.deepEqual(
+    readTrustedSessionCredentials({
+      platform_key: "pk-user-1",
+      llm_api_key: "vk-user-1",
+      _server_managed_credentials: true,
+    }),
+    { platformKey: "pk-user-1", llmApiKey: "vk-user-1" },
+  );
+});
+
+test("C5c a caller with no key is refused before anything is queued", async () => {
   const { stampSessionCredentials } = await import("../src/auth/session-credentials.js");
   await assert.rejects(
     () =>

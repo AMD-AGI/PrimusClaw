@@ -24,17 +24,19 @@
  *   B9 a payload that will not serialise is a publish that certainly failed
  *   B10 a queued chat doorbell is put back without moving a claimed lease
  *   B11 dispatched task and DAG runs carry their scoped lease credential
+ *   B12 kubernetes/BYOK dispatch needs an LLM key, not a SaFE platform key
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
-import { db } from "../src/infra/db.js";
-
 // The stage timeout has to be reachable without waiting the shipped fifteen
 // seconds for one, and the dispatcher reads it once at import. Long enough that
 // the stages which answer immediately below are never caught by it.
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
+process.env.CLAW_DEPLOY_MODE = "kubernetes";
+process.env.LLM_KEY_SOURCE = "virtualKey";
+const { db } = await import("../src/infra/db.js");
 const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
 
 interface SeenQuery { sql: string; params: unknown[] }
@@ -91,6 +93,7 @@ function stubDb(
   workspace: DbAnswer = WORKSPACE_UNREACHABLE,
   input: Record<string, unknown> = {},
   rowPatch: Record<string, unknown> = {},
+  sessionConfig: Record<string, unknown> = SERVER_MANAGED_CONFIG,
 ): SeenQuery[] {
   const seen: SeenQuery[] = [];
   const row = () => ({ ...taskRow(startedAt, input), ...rowPatch });
@@ -104,7 +107,7 @@ function stubDb(
       // A session carrying its submitter's key, which is what every entry point
       // now stamps before queueing a task. An empty config here used to dispatch
       // anyway, under the cluster's shared identity.
-      return { rows: [{ user_id: "u-1", config: SERVER_MANAGED_CONFIG }], rowCount: 1 };
+      return { rows: [{ user_id: "u-1", config: sessionConfig }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
@@ -284,6 +287,24 @@ test("B11 a dispatched task carries the lease credential Brain renews", async ()
     !seen.some((query) => query.params.includes(token)),
     "the bearer token must exist only in the request sent to Brain",
   );
+});
+
+test("B12 kubernetes dispatch accepts a trusted LLM key without a platform key", async () => {
+  stubDb(
+    new Date().toISOString(),
+    WORKSPACE_BOUND,
+    {},
+    {},
+    { llm_api_key: "vk-user-1", _server_managed_credentials: true },
+  );
+  let request: Record<string, unknown> = {};
+  taskPublisher.publish = async (payload) => {
+    request = JSON.parse(payload) as Record<string, unknown>;
+  };
+
+  assert.equal((await dispatchTask("ktsk_1")).ok, true);
+  assert.equal(request.platform_key, "");
+  assert.equal(request.llm_api_key, "vk-user-1");
 });
 
 test("B8 a publish the server refused fails the row; one that only went quiet does not", async () => {

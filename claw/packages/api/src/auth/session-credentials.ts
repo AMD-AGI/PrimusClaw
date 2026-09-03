@@ -36,6 +36,33 @@ export class MissingPlatformKeyError extends Error {
   }
 }
 
+export interface TrustedSessionCredentials {
+  platformKey: string;
+  llmApiKey: string;
+}
+
+/**
+ * Read only credentials this service previously stamped.
+ *
+ * Session config also contains caller-controlled fields, so checking for strings
+ * alone turns arbitrary JSON into a bearer token. Keep the trust decision in one
+ * helper so dispatch, platform backfill, and teardown cannot drift.
+ */
+export function readTrustedSessionCredentials(config: unknown): TrustedSessionCredentials {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return { platformKey: "", llmApiKey: "" };
+  }
+  const cfg = config as Record<string, unknown>;
+  if (cfg._server_managed_credentials !== true) {
+    return { platformKey: "", llmApiKey: "" };
+  }
+  const platformKey = typeof cfg.platform_key === "string" ? cfg.platform_key : "";
+  const llmApiKey = typeof cfg.llm_api_key === "string"
+    ? cfg.llm_api_key
+    : (typeof cfg.virtual_key === "string" ? cfg.virtual_key : "");
+  return { platformKey, llmApiKey };
+}
+
 /**
  * The config fields a session must carry for its tasks to run as their submitter.
  *
@@ -47,10 +74,23 @@ export class MissingPlatformKeyError extends Error {
 export function sessionCredentialPatch(user: UserInfo): Record<string, unknown> {
   const llmKey = resolveUserLlmKey(user);
   return {
-    ...(user.platformKey ? { platform_key: user.platformKey } : {}),
-    ...(llmKey ? { llm_api_key: llmKey } : {}),
+    // Explicit nulls clear a key from an earlier submission. Omitting the field
+    // would leave session-level credentials at their previous value after a
+    // caller rotated or revoked one.
+    platform_key: user.platformKey || null,
+    llm_api_key: llmKey || null,
     _server_managed_credentials: true,
   };
+}
+
+/** Refuse only the deployment mode that must authenticate to SaFE. */
+export function assertSessionCredentialsForDispatch(
+  sessionId: string,
+  user: UserInfo,
+): void {
+  if (CLAW_DEPLOY_MODE !== "kubernetes" && !user.platformKey) {
+    throw new MissingPlatformKeyError(`session ${sessionId}`);
+  }
 }
 
 /**
@@ -75,9 +115,7 @@ export async function stampSessionCredentials(
   // demanding a platform key rejected every task and batch on a deployment
   // whose own deploy.sh defaults CLAW_DEPLOY_MODE to "kubernetes" -- a 403 on
   // the default configuration, from a check written for the other one.
-  if (CLAW_DEPLOY_MODE !== "kubernetes" && !user.platformKey) {
-    throw new MissingPlatformKeyError(`session ${sessionId}`);
-  }
+  assertSessionCredentialsForDispatch(sessionId, user);
   const runner = client ?? db;
   await runner.query(
     `UPDATE claw_sessions

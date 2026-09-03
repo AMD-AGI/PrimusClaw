@@ -17,6 +17,7 @@ import { interruptSubject } from "@claw/protocol";
 import pino from "pino";
 import { getUser } from "../auth/middleware.js";
 import {
+  canAccessSession,
   canAccessSessionAsOperator,
   canWriteSessionAsOperator,
 } from "../auth/models.js";
@@ -109,6 +110,7 @@ async function requireSessionAccess(
   reply: FastifyReply,
   sessionId: string,
   write: boolean,
+  ownerOnly = false,
 ): Promise<boolean> {
   const session = (await db.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -119,9 +121,11 @@ async function requireSessionAccess(
     return false;
   }
   const user = getUser(req);
-  const allowed = write
-    ? canWriteSessionAsOperator(session.user_id, user)
-    : canAccessSessionAsOperator(session.user_id, user);
+  const allowed = ownerOnly
+    ? canAccessSession(session.user_id, user?.userId)
+    : write
+      ? canWriteSessionAsOperator(session.user_id, user)
+      : canAccessSessionAsOperator(session.user_id, user);
   if (!allowed) {
     reply.status(403).send({ ok: false, error: "access_denied" });
     return false;
@@ -134,13 +138,14 @@ async function requireTaskAccess(
   reply: FastifyReply,
   taskId: string,
   write: boolean,
+  ownerOnly = false,
 ): Promise<ClawTaskRow | null> {
   const task = await getTask(taskId);
   if (!task) {
     reply.status(404).send({ ok: false, error: "not_found" });
     return null;
   }
-  if (!await requireSessionAccess(req, reply, task.session_id, write)) return null;
+  if (!await requireSessionAccess(req, reply, task.session_id, write, ownerOnly)) return null;
   return task;
 }
 
@@ -175,7 +180,10 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       const sessionId = req.params.sessionId;
       const body = req.body ?? {};
 
-      if (!await requireSessionAccess(req, reply, sessionId, true)) return reply;
+      // Submission stamps the caller's credentials onto the session. Operators
+      // may inspect and stop tenant work, but submitting here would replace the
+      // owner's credentials while their queued tasks still read from this row.
+      if (!await requireSessionAccess(req, reply, sessionId, true, true)) return reply;
 
       let dag = body.dag_id ? await getTaskDag(body.dag_id) : null;
       let plugin = body.plugin_id ? await loadPluginRow(body.plugin_id) : null;
@@ -243,7 +251,7 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       if (!Array.isArray(body.inputs) || body.inputs.length === 0) {
         return reply.status(400).send({ ok: false, error: "inputs[] required" });
       }
-      if (!await requireSessionAccess(req, reply, body.session_id, true)) return reply;
+      if (!await requireSessionAccess(req, reply, body.session_id, true, true)) return reply;
 
       const dag = await getTaskDag(body.dag_id);
       if (!dag || !canExecuteTaskDag(dag, user)) {
@@ -351,7 +359,11 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { taskId: string } }>(
     "/v1/tasks/:taskId/retry",
     async (req, reply) => {
-      if (!await requireTaskAccess(req, reply, req.params.taskId, true)) return reply;
+      const task = await requireTaskAccess(req, reply, req.params.taskId, true, true);
+      if (!task) return reply;
+      const user = getUser(req);
+      if (!user) return reply.status(401).send({ ok: false, error: "unauthorized" });
+      if (!(await stampCredentialsOr403(reply, task.session_id, user))) return reply;
       const r = await retryTask(req.params.taskId);
       if (!r.ok) return reply.status(409).send({ ok: false, error: "not_retryable" });
       return { ok: true, new_task_id: r.new_task_id };

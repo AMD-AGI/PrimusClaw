@@ -18,7 +18,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
 import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
-import { MissingPlatformKeyError } from "../auth/session-credentials.js";
+import {
+  MissingPlatformKeyError,
+  readTrustedSessionCredentials,
+} from "../auth/session-credentials.js";
+import { CLAW_DEPLOY_MODE } from "../config.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
@@ -134,7 +138,7 @@ async function publishExecuteRequest(payload: string): Promise<void> {
   }
 }
 
-async function loadSessionPlatformKey(sessionId: string): Promise<{
+async function loadSessionCredentials(sessionId: string): Promise<{
   user_id: string;
   platform_key: string;
   workspace_id: string;
@@ -153,10 +157,9 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   // owner, so the submitter of a run could not stop or delete it -- and nothing
   // anywhere said why.
   //
-  // Failing here instead is the point. Every entry point now stamps the key
-  // before the task is queued (see auth/session-credentials.ts), so a session
-  // that reaches this line without one is a path that forgot to, and running it
-  // as somebody else is the wrong way to find that out.
+  // Failing here in SaFE mode is the point. Every entry point stamps the
+  // caller's credentials before queueing; Kubernetes mode legitimately has no
+  // platform key and uses the stamped LLM key instead.
   const r = await db.query(
     `SELECT user_id, config FROM claw_sessions WHERE session_id = $1`,
     [sessionId],
@@ -164,20 +167,21 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   if (r.rowCount === 0) throw new Error(`session ${sessionId} not found`);
   const row = r.rows[0] as { user_id: string; config: Record<string, unknown> | null };
   const cfg = (row.config ?? {}) as Record<string, unknown>;
-  const trustedCredentials = cfg._server_managed_credentials === true;
-  const sessionPlatformKey = trustedCredentials && typeof cfg.platform_key === "string" ? cfg.platform_key : "";
+  const credentials = readTrustedSessionCredentials(cfg);
   const sessionWorkspaceId = typeof cfg.workspace_id === "string" ? cfg.workspace_id : "";
-  const sessionLlmApiKey = trustedCredentials && typeof cfg.llm_api_key === "string"
-    ? cfg.llm_api_key
-    : (trustedCredentials && typeof cfg.virtual_key === "string" ? cfg.virtual_key : "");
-  if (!sessionPlatformKey) throw new MissingPlatformKeyError(`session ${sessionId}`);
+  // Only SaFE creates a workload with this credential. Kubernetes/BYOK uses the
+  // caller's LLM key and the agent-sandbox provider, so requiring platformKey
+  // here made every task-system dispatch fail on the shipped default mode.
+  if (CLAW_DEPLOY_MODE !== "kubernetes" && !credentials.platformKey) {
+    throw new MissingPlatformKeyError(`session ${sessionId}`);
+  }
   return {
     user_id: row.user_id ?? "",
-    platform_key: sessionPlatformKey,
+    platform_key: credentials.platformKey,
     // The namespace is not a credential: it names where the work runs, not who
     // it runs as, and a deployment-wide default for it grants nothing.
     workspace_id: sessionWorkspaceId || process.env.SANDBOX_NAMESPACE || "",
-    llm_api_key: sessionLlmApiKey,
+    llm_api_key: credentials.llmApiKey,
   };
 }
 
@@ -344,7 +348,7 @@ async function bindRunFiles(
 function buildExecuteRequest(opts: {
   updated: ClawTaskRow;
   rendered: RenderedTask;
-  session: Awaited<ReturnType<typeof loadSessionPlatformKey>>;
+  session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
 }): ExecuteRequest {
@@ -541,7 +545,7 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
 
     // 4. Build the ExecuteRequest, over the files this run is bound to.
     const session = await withTimeout(
-      "loadSessionPlatformKey", loadSessionPlatformKey(updated.session_id),
+      "loadSessionCredentials", loadSessionCredentials(updated.session_id),
     );
     logger.info(
       {

@@ -21,11 +21,15 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import pino from "pino";
 import { authMiddleware, getUser } from "../auth/middleware.js";
 import {
-  canWriteSessionAsOperator,
+  canAccessSession,
   isAdmin,
   type UserInfo,
 } from "../auth/models.js";
-import { sessionCredentialPatch } from "../auth/session-credentials.js";
+import {
+  assertSessionCredentialsForDispatch,
+  MissingPlatformKeyError,
+  sessionCredentialPatch,
+} from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -48,6 +52,10 @@ async function ensureSession(
   user: UserInfo,
   body: Record<string, unknown>,
 ): Promise<string> {
+  assertSessionCredentialsForDispatch(
+    (body.session_id as string | undefined) ?? "new workbench session",
+    user,
+  );
   // The shared patch, not a second copy of it. This route was the only one that
   // recorded the caller's key, and the bug was the other paths not doing what it
   // did -- keeping two spellings of it is how they drift apart again.
@@ -61,17 +69,18 @@ async function ensureSession(
       [provided],
     );
     if ((r.rowCount ?? 0) > 0) {
-      if (!canWriteSessionAsOperator(r.rows[0].user_id, user)) {
+      // This call replaces session credentials before queueing work. Support
+      // operators may inspect and stop a tenant run, but must not make the
+      // tenant's already-queued nodes execute under the operator's identity.
+      if (!canAccessSession(r.rows[0].user_id, user.userId)) {
         throw new Error("session_access_denied");
       }
-      if (Object.keys(runConfigPatch).length > 0) {
-        await db.query(
-          `UPDATE claw_sessions
-              SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
-            WHERE session_id = $1`,
-          [provided, JSON.stringify(runConfigPatch)],
-        );
-      }
+      await db.query(
+        `UPDATE claw_sessions
+            SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
+          WHERE session_id = $1`,
+        [provided, JSON.stringify(runConfigPatch)],
+      );
       return provided;
     }
   }
@@ -229,6 +238,9 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
       } catch (e) {
         if ((e as Error)?.message === "session_access_denied") {
           return reply.status(403).send({ ok: false, error: "session_access_denied" });
+        }
+        if (e instanceof MissingPlatformKeyError) {
+          return reply.status(403).send({ ok: false, error: "missing_platform_key" });
         }
         throw e;
       }
