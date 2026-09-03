@@ -1037,6 +1037,8 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 
 	// Step 1: Find the Sandbox to get the adopted Pod's real name.
 	// The Sandbox name equals the SandboxClaim name (set by the claim controller).
+	// Held rather than deleted here: the Claim has to go first (Step 3).
+	var sandboxToDelete *sandboxv1alpha1.Sandbox
 	sandbox := &sandboxv1alpha1.Sandbox{}
 	if err := c.client.Get(ctx, key, sandbox); err == nil {
 		// Step 2: Delete the adopted Pod directly.
@@ -1076,28 +1078,61 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 				info.Namespace, podName, info.SandboxName, "agents.x-k8s.io/pod-name", podErr)
 		}
 
-		// Step 3: Delete the Sandbox (triggers Service cleanup by the sandbox controller).
-		// Only reached once the Pod is gone or was already absent, so the
-		// annotation is being discarded with nothing left to find through it.
-		if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox)); err != nil {
-			// Deliberately before Step 4: the Claim is what a retry finds all of
-			// this through, so it outlives anything that failed to go.
-			return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
-				info.Namespace, info.SandboxName, err)
-		}
+		sandboxToDelete = sandbox
 	} else if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("get sandbox %s/%s: %w", info.Namespace, info.SandboxName, err)
 	}
 
-	// Step 4: Delete the SandboxClaim.
+	// Step 3: Delete the SandboxClaim -- before the Sandbox, not after.
+	//
+	// The Claim is what the claim controller reconciles, and a live Claim whose
+	// Sandbox has gone missing is precisely its cue to build another one: it
+	// watches Sandboxes it owns, so the deletion below wakes it, and it returns
+	// early only for a Claim that is absent or already terminating. Deleting the
+	// Sandbox first opens a window where neither is true, and what it does in
+	// that window is adopt a second Pod out of the warm pool and strip its
+	// OwnerReferences -- which this teardown then walks away from, having
+	// already accounted for the first one. A second orphan, made by the
+	// rollback, of exactly the kind the Pod handling above exists to prevent.
+	//
+	// Ordering closes it rather than racing it. Once the Claim is gone or
+	// carries a deletionTimestamp there is no reconcile that recreates
+	// anything, so the Sandbox delete that follows cannot be undone.
+	//
+	// It stays after the Pod for the reason it always did: a Pod that would not
+	// delete keeps both records, because the Claim is what a retry finds this
+	// through and the Sandbox is the only thing that still names the Pod. That
+	// gate is above and unchanged -- this step is only reached once the Pod is
+	// gone or was already absent.
 	claim := &extensionsv1alpha1.SandboxClaim{}
-	if err := c.client.Get(ctx, key, claim); err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
+	if err := c.client.Get(ctx, key, claim); err == nil {
+		if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, claim)); err != nil {
+			// The Sandbox is deliberately left behind: it is still the only
+			// thing naming the adopted Pod, and the Claim that survived is what
+			// a retry comes back through.
+			return fmt.Errorf("delete warm-pool claim %s/%s: %w",
+				info.Namespace, info.SandboxName, err)
 		}
+	} else if !k8serrors.IsNotFound(err) {
 		return err
 	}
-	return ctrlclient.IgnoreNotFound(c.client.Delete(ctx, claim))
+
+	// Step 4: Delete the Sandbox (triggers Service cleanup by the sandbox
+	// controller). Only reached once the Pod is gone or was already absent, so
+	// the pod-name annotation is being discarded with nothing left to find
+	// through it -- and once the Claim can no longer recreate it.
+	//
+	// The Claim controls the Sandbox, so its deletion may well have taken this
+	// one with it already; IgnoreNotFound is what makes that the same outcome
+	// rather than a failure.
+	if sandboxToDelete == nil {
+		return nil
+	}
+	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandboxToDelete)); err != nil {
+		return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
+			info.Namespace, info.SandboxName, err)
+	}
+	return nil
 }
 
 // ── Overrides ────────────────────────────────────────────────────────────────

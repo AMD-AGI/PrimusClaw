@@ -6,10 +6,11 @@
 // idle-gc has always written an audit event, but only to the audit store. On a
 // cluster where nothing ingests that, `kubectl describe sandbox` and every
 // dashboard built on Events show nothing at all, so a sandbox deleted while its
-// work was still running looks exactly like one that was never created. Working
-// out that a single pod had been reclaimed for idleness -- and what window it
-// missed by -- took reading a 120-hour control-plane log, and only one of the
-// four cases under investigation still had the line.
+// work was still running looks exactly like one that was never created.
+// Establishing that a pod was reclaimed for idleness -- and by what margin --
+// then means reading raw control-plane logs, which answer only for as long as
+// they are retained. An Event on the Sandbox puts it where it is already
+// looked for.
 
 package agentd
 

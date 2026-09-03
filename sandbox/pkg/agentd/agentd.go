@@ -82,9 +82,9 @@ type SandboxReconciler struct {
 	// know to look: `kubectl describe sandbox` and every dashboard built on
 	// Events show nothing, so a sandbox that was deleted while its work was
 	// still running is indistinguishable from one that was never created --
-	// which is how one reclaim cost three hours of log archaeology across a
-	// 120-hour control-plane window to attribute. Nil disables it; the audit
-	// event is written either way.
+	// leaving the reclaim to be reconstructed from control-plane logs, if they
+	// still reach back far enough. Nil disables it; the audit event is written
+	// either way.
 	Recorder record.EventRecorder
 	// Store is the Redis-backed session store (optional).
 	//

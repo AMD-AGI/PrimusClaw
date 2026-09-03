@@ -392,19 +392,22 @@ export function goDurationSeconds(ns: bigint): number {
  *
  * The floor is two refresh intervals plus slack: one missed tick must not be
  * fatal, and at exactly two intervals it still is. Miss the tick at 5m and the
- * next write is due at 10m -- but the write is not instant (the Router gives it
- * its own 2s timeout) while the reclaim is not patient (agentd re-checks 1s
- * after the deadline, `time.Until(expiresAt) + time.Second`). A 10m timeout
- * puts the GC pass at 10m1s and the recovering write as late as 10m2s: the
- * sandbox is reclaimed one second before the signal that would have saved it.
+ * next write is due at 10m -- but the write is not instant, the Router gives it
+ * its own 2s timeout, so at a 10m timeout the deadline can fall while the write
+ * that would have moved it is still in flight. Nothing on the other side is
+ * obliged to wait that out. agentd asks to be re-queued a second past expiry
+ * (`time.Until(expiresAt) + time.Second`), and that is a request for when to
+ * look again, not a grace period: it is one reconcile's own schedule, and any
+ * unrelated event on the Sandbox can bring a pass forward. So a second is the
+ * most that can be assumed, and not even that reliably.
  *
- * So 2 x 5m + 1m. The slack has to cover 2s of write plus 1s of grace, and a
- * minute is chosen over those 3s because 3s of headroom is a knife-edge held
- * up by nothing -- ticker drift, a scheduler that is late, a store write slower
- * than usual, all of which land inside a margin that thin. It stays looser than
- * the 3x implied by the shipped 15m default, because this rejects a setting
- * outright rather than quietly clamping it, and what it has to establish is
- * only the floor of what can work at all.
+ * So 2 x 5m + 1m. A minute rather than the ~3s the write and the requeue
+ * account for, because 3s of headroom is a knife-edge held up by nothing --
+ * ticker drift, a scheduler that is late, a store write slower than usual, an
+ * early reconcile, all of which land inside a margin that thin. It stays looser
+ * than the 3x implied by the shipped 15m default, because this rejects a
+ * setting outright rather than quietly clamping it, and what it has to
+ * establish is only the floor of what can work at all.
  */
 const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 660_000_000_000n; // 2 x 5m + 1m
 

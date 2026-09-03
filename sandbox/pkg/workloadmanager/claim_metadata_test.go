@@ -382,6 +382,103 @@ func TestClaimTeardownRunsOnACancelledRequestContext(t *testing.T) {
 	}
 }
 
+// ── Ordering the teardown against the claim controller ───────────────────────
+
+// A live Claim whose Sandbox has gone missing is the claim controller's cue to
+// build another one -- it owns the Sandbox, so the deletion wakes it, and it
+// stands down only for a Claim that is absent or already terminating. Deleting
+// the Sandbox while the Claim is still active opens a window in which it adopts
+// a second warm-pool Pod and strips its OwnerReferences; the teardown, already
+// done accounting for the first Pod, then removes the Claim and leaves that one
+// with no owner and nothing to reap it.
+//
+// So the Claim goes first. What this pins is the precondition the controller
+// actually reads, checked at the instant it would be read: by the time the
+// Sandbox is deleted, the Claim must already be gone or terminating.
+func TestClaimTeardownRemovesTheClaimBeforeTheSandbox(t *testing.T) {
+	var claimStillActive bool
+	var sawSandboxDelete bool
+
+	var c ctrlclient.WithWatch
+	c = fake.NewClientBuilder().
+		WithScheme(teardownScheme(t)).
+		WithObjects(adoptedSet()...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, cl ctrlclient.WithWatch, obj ctrlclient.Object,
+				opts ...ctrlclient.DeleteOption) error {
+				if _, isSandbox := obj.(*sandboxv1alpha1.Sandbox); isSandbox {
+					sawSandboxDelete = true
+					claimStillActive = claimWouldReconcile(ctx, c)
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+
+	creator := &K8sSandboxCreator{client: c}
+	if err := creator.DeleteSandboxClaim(context.Background(), &store.SandboxInfo{
+		Namespace: "sandboxes", SandboxName: "sbx-claimed",
+	}); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if !sawSandboxDelete {
+		t.Fatal("the sandbox was never deleted, so the ordering was not exercised")
+	}
+	if claimStillActive {
+		t.Error("the sandbox was deleted while the claim was still active; the claim " +
+			"controller would recreate it and adopt a second pod, which this " +
+			"teardown has already stopped accounting for")
+	}
+}
+
+// claimWouldReconcile reports whether the Claim is in the state that makes the
+// claim controller act: present, and not already terminating.
+func claimWouldReconcile(ctx context.Context, c ctrlclient.Client) bool {
+	claim := &extensionsv1alpha1.SandboxClaim{}
+	err := c.Get(ctx, types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}, claim)
+	if k8serrors.IsNotFound(err) {
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	return claim.DeletionTimestamp.IsZero()
+}
+
+// The other half of the reorder: a Claim that will not delete now stops the
+// teardown where a Sandbox that would not delete used to. Both records have to
+// survive it -- the Claim because it is what a retry comes back through, the
+// Sandbox because it is still the only thing naming the adopted Pod.
+func TestClaimTeardownKeepsTheSandboxWhenTheClaimSurvives(t *testing.T) {
+	c := fake.NewClientBuilder().
+		WithScheme(teardownScheme(t)).
+		WithObjects(adoptedSet()...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, cl ctrlclient.WithWatch, obj ctrlclient.Object,
+				opts ...ctrlclient.DeleteOption) error {
+				if _, isClaim := obj.(*extensionsv1alpha1.SandboxClaim); isClaim {
+					return errors.New("admission webhook denied the request")
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+
+	creator := &K8sSandboxCreator{client: c}
+	err := creator.DeleteSandboxClaim(context.Background(), &store.SandboxInfo{
+		Namespace: "sandboxes", SandboxName: "sbx-claimed",
+	})
+	if err == nil {
+		t.Fatal("a claim that would not delete must be reported, not dropped")
+	}
+	if !strings.Contains(err.Error(), "admission webhook") {
+		t.Errorf("the underlying cause must survive: %v", err)
+	}
+
+	key := types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}
+	if getErr := c.Get(context.Background(), key, &sandboxv1alpha1.Sandbox{}); getErr != nil {
+		t.Fatalf("the sandbox must outlive a claim that would not go, got: %v", getErr)
+	}
+}
+
 // ── Driving a rollback through createViaClaim ────────────────────────────────
 //
 // TestClaimTeardownRunsOnACancelledRequestContext above hands DeleteSandboxClaim
