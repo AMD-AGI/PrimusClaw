@@ -7,6 +7,7 @@ import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
   SANDBOX_IDLE_REUSE_MS,
+  BRAIN_REGISTRY_TTL_MS,
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
@@ -68,6 +69,13 @@ interface KeepaliveDeps {
    * "no work", so the interesting branch would never be reached.
    */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /**
+   * Test seam for the ping-phase budget. The real one is derived from the
+   * record TTL and is minutes long, which no test can exhaust without sleeping
+   * for minutes -- so a test that wants to see the deferral path has to shorten
+   * it. Never set in production.
+   */
+  pingBudgetMs?: number;
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -352,6 +360,25 @@ const BG_PROBE_MAX_IN_FLIGHT = 8;
  * how a sandbox dies.
  */
 const PING_MAX_IN_FLIGHT = 16;
+/**
+ * How long the ping phase may run before it defers the rest to the next sweep.
+ *
+ * Renewing a record when it is queued gives it a full TTL from that moment,
+ * which is not the same as guaranteeing its ping arrives inside one. Pings run
+ * bounded and in turn and one can take its whole command timeout, so a fleet
+ * large enough makes the queue itself longer than the TTL: with the default 16
+ * at a time and a 15s ceiling per ping, the tail of ~320 targets is renewed and
+ * then waits past its own expiry, and the sweep guard means no other sweep is
+ * coming to renew it.
+ *
+ * Half the record's lifetime is the budget, so anything reached this sweep was
+ * reached with the other half to spare. Whatever is not reached keeps the
+ * renewal it already got and goes first next time -- the cursor below is what
+ * makes deferral fair rather than starvation for whoever sorts last.
+ */
+const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
+/** Where the last sweep stopped handing out pings. */
+let pingCursor = 0;
 
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
@@ -837,7 +864,21 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     "keepalive.tick_scan",
   );
 
-  await forEachWithLimit([...targets.entries()], PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
+  // Rotated, so a sweep that cannot finish does not always give up on the same
+  // tail. Ordering is otherwise insertion order, which is stable across sweeps.
+  const ordered = [...targets.entries()];
+  const pingStart = pingCursor % ordered.length;
+  const rotated = ordered.slice(pingStart).concat(ordered.slice(0, pingStart));
+  const pingDeadline = Date.now() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
+  let pinged = 0;
+  let deferred = 0;
+
+  await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
+    if (Date.now() >= pingDeadline) {
+      deferred += 1;
+      return;
+    }
+    pinged += 1;
     const { sessionId, entry } = target;
     const isAgent = entry.provider === "agent-sandbox";
     if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return;
@@ -916,6 +957,19 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       }
     }
   });
+
+  // Advance past what was actually pinged, so the deferred tail leads the next
+  // sweep. Reported rather than silent: a sweep that cannot cover the fleet
+  // inside half a TTL is a capacity signal, and the failure it precedes -- a
+  // handle expiring un-pinged -- looks like nothing at all from the outside.
+  pingCursor = (pingStart + pinged) % ordered.length;
+  if (deferred > 0) {
+    logger.warn(
+      { pinged, deferred, total: ordered.length,
+        budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
+      "keepalive.ping_budget_exhausted",
+    );
+  }
 }
 
 /** Start the periodic keepalive. Idempotent. */

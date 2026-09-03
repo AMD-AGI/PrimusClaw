@@ -137,6 +137,27 @@ function manyIdleHandles(n: number): KV {
   } as unknown as KV;
 }
 
+/** `n` live (pinged) handles. */
+function manyPingableHandles(n: number): KV {
+  const entries = new Map<string, Record<string, unknown>>();
+  for (let i = 0; i < n; i++) {
+    entries.set(`hands.live-${i}`, { ...ENTRY, keepalive: true, workloadId: `wl-live-${i}` });
+  }
+  return {
+    async keys(filter = ">") {
+      const keys = [...entries.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* keys; })();
+    },
+    async get(key: string) {
+      const v = entries.get(key);
+      if (!v) return null;
+      return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
+    },
+    async delete() {}, async put() { return 1; },
+    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
+  } as unknown as KV;
+}
+
 test("an idle handle is kept while the session still has a background shell running", async () => {
   const { kv, deleted } = fakeKv();
   stubPingableProvider();
@@ -574,6 +595,59 @@ test("generation bookkeeping does not grow without bound", async () => {
   assert.equal(
     backgroundWorkStateSizesForTest().generations, 0,
     "identities nothing is asking about and nothing is probing must be collected",
+  );
+});
+
+test("a sweep too large to finish defers the tail instead of letting it expire", async () => {
+  // Renewing a record when it is queued gives it a full TTL from that moment,
+  // which is not a guarantee its ping arrives inside one: pings run bounded and
+  // in turn, so a large enough fleet makes the queue longer than the TTL and
+  // the tail expires still waiting. The sweep guard means no other sweep is
+  // coming to renew it.
+  //
+  // Slow pings, so the budget is what ends the phase.
+  // Recorded in the provider, not the KV: the scan reads every key before the
+  // ping phase begins, so counting KV gets would count the scan.
+  const asked = new Set<string>();
+  const slow = {
+    kind: "safe-workload",
+    async exec(h: { id: string }) {
+      asked.add(h.id);
+      await new Promise((r) => setTimeout(r, 25));
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    async get(h: { id: string }) {
+      asked.add(h.id);
+      await new Promise((r) => setTimeout(r, 25));
+      return { running: true, healthy: true };
+    },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: slow, agentSandbox: slow });
+
+  const kv = manyPingableHandles(200);
+  // The real budget is half the record TTL -- minutes -- so it is shortened
+  // here rather than slept through. The property under test is the deferral,
+  // not the number.
+  const BUDGET = 120;
+  const deps = { kv, countActiveShells: async () => 1, pingBudgetMs: BUDGET };
+
+  const started = Date.now();
+  await runKeepaliveTickForTest(deps);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < BUDGET * 6, `the phase must be bounded, took ${elapsed}ms`);
+  assert.ok(asked.size > 0, "sanity: it must have pinged something");
+  assert.ok(asked.size < 200, `the budget must have cut the phase short, reached ${asked.size}`);
+
+  // And the deferred tail leads the next sweep rather than being starved.
+  const firstRound = new Set(asked);
+  asked.clear();
+  await runKeepaliveTickForTest(deps);
+  const fresh = [...asked].filter((k) => !firstRound.has(k));
+  assert.ok(
+    fresh.length > 0,
+    "the second sweep must reach targets the first one deferred, not repeat its prefix",
   );
 });
 
