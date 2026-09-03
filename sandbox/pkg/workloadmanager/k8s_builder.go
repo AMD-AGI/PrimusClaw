@@ -407,6 +407,11 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 //  3. The SandboxClaim controller adopts a warm Pod (sets the agents.x-k8s.io/pod-name annotation).
 //  4. SandboxReconciler fires when the Sandbox reaches Ready state → we get ServiceFQDN.
 //
+// How long a rollback gets once the request it belongs to is already over.
+// Generous: it is deleting three objects, and the alternative to it finishing
+// is a Pod held out of the pool until its absolute deadline.
+const claimRollbackTimeout = 30 * time.Second
+
 // applyClaimMetadataWithRetry gives the patch a few goes before giving up on
 // the whole claim.
 //
@@ -592,10 +597,19 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 				// did not happen and should not look like it half did.
 				if err := applyClaimMetadataWithRetry(waitCtx, c.client, createdSandbox,
 					patchLabels, patchAnnotations); err != nil {
-					if rbErr := c.DeleteSandboxClaim(ctx, &store.SandboxInfo{
+					// Not on ctx. The usual way this patch fails is the client
+					// giving up, and that cancels ctx -- so a rollback riding it
+					// is cancelled before it deletes anything, in precisely the
+					// case it exists for. Detached, with its own deadline so a
+					// wedged API server cannot hold the request open either.
+					rbCtx, rbCancel := context.WithTimeout(
+						context.WithoutCancel(ctx), claimRollbackTimeout)
+					rbErr := c.DeleteSandboxClaim(rbCtx, &store.SandboxInfo{
 						Namespace:   namespace,
 						SandboxName: sandboxName,
-					}); rbErr != nil {
+					})
+					rbCancel()
+					if rbErr != nil {
 						slog.Error("warm-pool claim rollback failed; pod may be held until its deadline",
 							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
 					}
@@ -1037,10 +1051,22 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 				Namespace: info.Namespace,
 			},
 		}
-		_ = ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
+		// Both errors are kept. Dropping the Pod's was the zombie this
+		// function's own comment describes: the Pod has no OwnerReference, so
+		// nothing cascades to it, and deleting the Claim below removes the last
+		// record anyone could find it through. A Pod that would not delete
+		// therefore stops the teardown rather than being outlived by it.
+		podErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
 
 		// Step 3: Delete the Sandbox (triggers Service cleanup by the sandbox controller).
-		_ = ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox))
+		sandboxErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox))
+
+		if podErr != nil || sandboxErr != nil {
+			// Deliberately before Step 4: the Claim is what a retry finds all of
+			// this through, so it outlives anything that failed to go.
+			return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
+				info.Namespace, info.SandboxName, errors.Join(podErr, sandboxErr))
+		}
 	} else if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("get sandbox %s/%s: %w", info.Namespace, info.SandboxName, err)
 	}

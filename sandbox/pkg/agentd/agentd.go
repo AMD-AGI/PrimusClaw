@@ -233,8 +233,8 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// operator trusts, so it would send them looking for a pod still sitting
 		// there. On a NotFound it would claim someone else's teardown: a user
 		// deleting their own sandbox, or another controller, filed under
-		// IdleReclaimed and counted against an idle timeout that had nothing to
-		// do with it.
+		// IdleReclaimRequested and counted against an idle timeout that had
+		// nothing to do with it.
 		if deleteErr == nil {
 			r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
 		}
