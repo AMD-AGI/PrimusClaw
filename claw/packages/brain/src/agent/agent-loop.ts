@@ -1087,10 +1087,21 @@ class AgentLoopRunner {
       // `reported` was built to tell those apart; it has to be consumed.
       && (cacheReport.reported ?? []).includes("cache_read")
       && turnUsage.cache_read === 0
-      && this.lastCacheUseAt !== undefined
+      // Either this loop watched a write land, or an earlier incarnation of
+      // this run did. `lastCacheUseAt` only ever answers the first: a
+      // redelivery resumed on another pod arrives with it unset, and the guard
+      // it protects -- do not blame a cold start for having nothing to read --
+      // does not apply to a conversation that is already hundreds of turns
+      // deep. `initialTurn` is non-zero exactly when this loop resumed from a
+      // checkpoint, so it separates "we cannot know" from "we were not here".
+      && (this.lastCacheUseAt !== undefined || this.initialTurn > 0)
     ) {
-      const gapMs = turnStart - this.lastCacheUseAt;
-      const gap = gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
+      const gapMs = this.lastCacheUseAt !== undefined
+        ? turnStart - this.lastCacheUseAt
+        : undefined;
+      const gap = gapMs === undefined
+        ? "resume_first_turn"
+        : gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
       metrics.onCacheEntryLost(gap);
       // Everything needed to tell the three causes apart, on the one turn that
       // can still tell them apart -- the next turn re-plans and the evidence is
@@ -1100,9 +1111,21 @@ class AgentLoopRunner {
       //   cacheCreate > 0        the prefix was rewritten, not dropped. Cost is
       //                          a write instead of a read, not a full-price
       //                          prompt, which is why the bill does not show it.
-      //   maxMarkerGap large     the chain broke: two markers further apart
-      //                          than the lookback, which one turn appending
-      //                          many blocks opens in a single step. Ours.
+      //   rollingMaxGap large    the chain broke: two ROLLING markers further
+      //                          apart than the lookback, which one turn
+      //                          appending many blocks opens in a single step.
+      //                          Ours. `anchorGap` is logged beside it and is
+      //                          NOT this: the distance from the anchor to the
+      //                          first rolling marker is planCacheBreakpoints'
+      //                          own geometry (ROLLING_TARGET x
+      //                          MAX_STRIDE_BLOCKS), so it grows with the
+      //                          conversation and is identical on the healthy
+      //                          turns. Folding it into one maximum, as this
+      //                          did, made every conversation past ~57 blocks
+      //                          report a broken chain -- the field was
+      //                          constant across 310 hits and 5 losses of one
+      //                          session alike, and it sent the first
+      //                          investigation after the wrong cause.
       //   neither                the entry was not where we left it -- eviction,
       //                          or a gateway that routed to a backend without
       //                          it. Not ours, and the gateway has to answer.
@@ -1111,13 +1134,17 @@ class AgentLoopRunner {
       // an absent measurement must not read as a zero-width gap.
       const offsets = cacheReport.markerBlockOffsets;
       const blocks = cacheReport.promptBlocks;
-      let maxMarkerGap: number | undefined;
+      let rollingMaxGap: number | undefined;
+      let anchorGap: number | undefined;
       if (offsets && offsets.length > 0 && blocks !== undefined) {
-        maxMarkerGap = offsets[0];
-        for (let i = 1; i < offsets.length; i++) {
-          maxMarkerGap = Math.max(maxMarkerGap, offsets[i] - offsets[i - 1]);
+        // Only the rolling markers form a chain that can break. The anchor is
+        // pinned to the end of the system run and never moves, so its distance
+        // to the first rolling marker is structural, not evidence.
+        if (offsets.length > 1) anchorGap = offsets[1] - offsets[0];
+        rollingMaxGap = blocks - offsets[offsets.length - 1];
+        for (let i = 2; i < offsets.length; i++) {
+          rollingMaxGap = Math.max(rollingMaxGap, offsets[i] - offsets[i - 1]);
         }
-        maxMarkerGap = Math.max(maxMarkerGap, blocks - offsets[offsets.length - 1]);
       }
       logger.warn(
         {
@@ -1129,7 +1156,8 @@ class AgentLoopRunner {
           breakpointsSent: cacheReport.breakpointsSent,
           markerBlockOffsets: offsets,
           promptBlocks: blocks,
-          maxMarkerGap,
+          rollingMaxGap,
+          anchorGap,
           cacheCreate: turnUsage.cache_create,
           inputTokens: turnUsage.input_tokens,
           promptTokens: streamResult.promptTokens,

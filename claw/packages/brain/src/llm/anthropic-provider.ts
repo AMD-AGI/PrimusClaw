@@ -189,6 +189,10 @@ async function streamingTurn(
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
   let sawUsage = false;
+  // Which cache numbers this response actually spoke to. Declared beside
+  // sawUsage because they answer the same question one field at a time.
+  let reportedCacheRead = false;
+  let reportedCacheCreate = false;
   let created5m: number | undefined;
   let created1h: number | undefined;
   let bodyModel: string | undefined;
@@ -204,6 +208,11 @@ async function streamingTurn(
           const u = evt.message.usage;
           if (u) {
             sawUsage = true;
+            // Presence, recorded before `?? 0` erases it. A field that was not
+            // in the payload and a field that was there saying zero are the
+            // same number afterwards, and only one of them is an observation.
+            reportedCacheRead = u.cache_read_input_tokens != null;
+            reportedCacheCreate = u.cache_creation_input_tokens != null;
             usage.input_tokens = u.input_tokens ?? 0;
             usage.cache_create = u.cache_creation_input_tokens ?? 0;
             usage.cache_read = u.cache_read_input_tokens ?? 0;
@@ -337,8 +346,16 @@ async function streamingTurn(
     cacheReport: {
       breakpointsSent,
       enabled: PROMPT_CACHE_ENABLED && !cacheState.disabled,
-      // This path reads both numbers straight off message_start.
-      reported: ["cache_read", "cache_create"] as const,
+      // Measured, not assumed. This was hardcoded to both, which made the
+      // "the response has to have SAID zero" guard in agent-loop a no-op on
+      // this path: a turn whose usage never arrived was indistinguishable from
+      // a genuine miss, and the detector would blame the cache for a turn it
+      // could not measure. That is the exact shape of the incident the guard
+      // exists to catch, so the claim has to come from the payload.
+      reported: [
+        ...(reportedCacheRead ? ["cache_read" as const] : []),
+        ...(reportedCacheCreate ? ["cache_create" as const] : []),
+      ],
       markerBlockOffsets,
       promptBlocks: decorated.totalBlocks,
       createdEphemeral5m: created5m,
