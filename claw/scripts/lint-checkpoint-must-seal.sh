@@ -13,7 +13,7 @@
 # is the conversation a resumed run replays to the model. It used to be written
 # through the same redactor that masks events on their way to NATS, and that
 # redactor mutates -- correctly, for a log line. Applied to replayable state it
-# deletes content: 342 of 344 sessions in one week on one deployment resumed
+# deletes content: nearly every session in one week on one deployment resumed
 # with `<redacted>` where a file path or an identifier had been, and every one
 # of those turns was also a total prompt-cache miss.
 #

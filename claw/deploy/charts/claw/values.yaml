@@ -290,6 +290,11 @@ secret:
       user: brain
     reaper:
       user: reaper
+    # No workload mounts this one. It exists for upgrade.sh, which reads it to
+    # set the drain gate; scoping that credential means a mistyped ops command
+    # cannot reach anything else.
+    ops:
+      user: ops
   # Replicas for every JetStream stream and KV bucket the API and Brain create.
   # Blank takes the code default of 3, which is what the bundled clustered NATS
   # serves; set it to 1 only when pointing at a single-node `nats-server -js`,

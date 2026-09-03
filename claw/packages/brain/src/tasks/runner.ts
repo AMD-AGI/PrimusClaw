@@ -1283,19 +1283,10 @@ class TaskRunner {
     state: CheckpointState,
     workspaceInfo?: { has_workspace_sync: boolean; last_sync_turn: number },
     kind: "turn" | "sigterm" | "post_sync" = "turn",
+    /** Set on the one re-write issued to undo a lost ordering race; see below. */
+    isRepair = false,
   ): Promise<boolean> {
     const seq = ++this.checkpointSeq;
-    // A post-workspace-sync rewrite runs in a `.then()` and can land after a
-    // later turn has already written. Dropping the older one keeps the key
-    // moving forward; without this the run silently rewinds a turn.
-    if (seq < this.lastWrittenSeq) {
-      metrics.onCheckpointSeqRegressed();
-      logger.debug(
-        { sessionId: this.sessionId, kind, seq, lastWritten: this.lastWrittenSeq },
-        "checkpoint.seq_regressed",
-      );
-      return true;
-    }
     const envelope: CheckpointEnvelope = {
       session_id: this.sessionId,
       message_id: this.messageId,
@@ -1319,6 +1310,32 @@ class TaskRunner {
     const t0 = Date.now();
     try {
       await this.kvCkpt.put(checkpointKey(this.sessionId, this.messageId), encoded);
+      // Checked here rather than before the put, which is where it was and
+      // where it could never fire: `seq` is freshly incremented, so it is the
+      // largest issued and cannot be below a previously written one. The race
+      // it guards against only becomes visible across the await -- a
+      // post-workspace-sync rewrite runs in a `.then()` and can complete after
+      // a later turn has already landed, putting the older conversation back
+      // under the same key. Serializing and writing an already-superseded
+      // payload is wasted work but harmless; publishing it as the newest is
+      // not, so the ordering is fixed by recording only forward progress and
+      // re-writing the newer state.
+      if (seq < this.lastWrittenSeq) {
+        metrics.onCheckpointSeqRegressed();
+        logger.debug(
+          { sessionId: this.sessionId, kind, seq, lastWritten: this.lastWrittenSeq },
+          "checkpoint.seq_regressed",
+        );
+        // Bounded to one attempt. The repair issues a fresh, higher seq so it
+        // cannot regress against the value it just recorded, but a third
+        // writer landing in between could start the cycle again -- and an
+        // unbounded repair loop on the awaited turn path is a worse failure
+        // than a checkpoint that is one turn stale until the next one lands.
+        if (!isRepair && this.latestCheckpointState) {
+          await this.writeKvCheckpoint(this.latestCheckpointState, workspaceInfo, kind, true);
+        }
+        return true;
+      }
       this.lastWrittenSeq = seq;
       metrics.onCheckpointWrite(
         kind, "success", (Date.now() - t0) / 1000, payloadBytes, serializeSec,
@@ -1368,7 +1385,11 @@ class TaskRunner {
         .get(checkpointKey(this.sessionId, this.messageId)).catch(() => null);
       if (!entry) return miss("absent");
 
-      const decoded = decodeCheckpoint(entry.value, CHECKPOINT_SEAL_KEY);
+      const decoded = decodeCheckpoint(entry.value, CHECKPOINT_SEAL_KEY, {
+        sessionId: this.sessionId,
+        messageId: this.messageId,
+        userId: this.userId,
+      });
       if (!decoded.ok) {
         // Every one of these used to be a bare `return null`, which is why a
         // run restarting from turn zero was indistinguishable from one that
@@ -1383,9 +1404,12 @@ class TaskRunner {
       metrics.onCheckpointVersion("read", decoded.version);
 
       const { envelope, state } = decoded.value;
-      // Checked after the seal, not before: on v4 these fields are only
-      // trustworthy once the AAD and the sealed counters have agreed.
-      if (envelope.message_id !== this.messageId) return miss("envelope_mismatch");
+      // Session, message and user are verified inside decodeCheckpoint against
+      // the identity passed above -- on v4 by the AAD itself, so a payload from
+      // another run does not decrypt at all. Only the TTL is left, and it is
+      // meaningful because checkpointed_at is sealed: outside the seal, anyone
+      // able to write the bucket could move an expired checkpoint back into
+      // its window.
       if (Date.now() - envelope.checkpointed_at > CHECKPOINT_TTL_MS) return miss("absent");
 
       metrics.onCheckpointRead("ok");

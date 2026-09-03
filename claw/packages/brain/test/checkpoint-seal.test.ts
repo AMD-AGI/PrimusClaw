@@ -22,7 +22,8 @@ import { gunzipSync } from "node:zlib";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  encodeCheckpoint, decodeCheckpoint, type CheckpointEnvelope,
+  encodeCheckpoint, decodeCheckpoint,
+  type CheckpointEnvelope, type CheckpointIdentity,
 } from "../src/tasks/checkpoint-codec.js";
 import { redactEgressPayload } from "../src/events/redaction.js";
 import type { CheckpointState } from "../src/agent/index.js";
@@ -69,11 +70,14 @@ function envelope(overrides: Partial<CheckpointEnvelope> = {}): CheckpointEnvelo
 
 const redactV3 = (s: CheckpointState) => redactEgressPayload(s, SECRETS);
 const v4 = { writeVersion: 4 as const, key: KEY, redactV3 };
+/** Who the reader believes it is loading. Never taken from the payload. */
+const AS_A: CheckpointIdentity = { sessionId: "sess-a", messageId: "msg-a", userId: "u1" };
+const AS_B: CheckpointIdentity = { sessionId: "sess-b", messageId: "msg-b", userId: "u1" };
 const v3 = { writeVersion: 3 as const, key: null, redactV3 };
 
 test("v4 replays the conversation exactly as it was sent", () => {
   const s = state();
-  const decoded = decodeCheckpoint(encodeCheckpoint(s, envelope(), v4), KEY);
+  const decoded = decodeCheckpoint(encodeCheckpoint(s, envelope(), v4), KEY, AS_A);
   assert.ok(decoded.ok, `expected a decode, got ${!decoded.ok && decoded.reason}`);
   assert.deepEqual(decoded.value.state, s);
   assert.equal(
@@ -90,11 +94,11 @@ test("v4 is unreadable without the key, and not merely encoded", () => {
   // Asserting `!raw.includes(...)` alone would be satisfied by base64, by gzip,
   // or by renaming a field. Assert the two things that actually matter: the
   // wrong key cannot open it, and the blob is not merely compressed.
-  const wrongKey = decodeCheckpoint(bytes, OTHER_KEY);
+  const wrongKey = decodeCheckpoint(bytes, OTHER_KEY, AS_A);
   assert.equal(wrongKey.ok, false);
   assert.equal(!wrongKey.ok && wrongKey.reason, "seal_open_failed");
 
-  const missingKey = decodeCheckpoint(bytes, null);
+  const missingKey = decodeCheckpoint(bytes, null, AS_A);
   assert.equal(!missingKey.ok && missingKey.reason, "seal_key_missing");
 
   const blob = Buffer.from(JSON.parse(raw).state_enc as string, "base64");
@@ -137,9 +141,47 @@ test("a sealed core cannot be moved onto another run's key", () => {
   ));
   b.state_enc = a.state_enc;
 
-  const spliced = decodeCheckpoint(new TextEncoder().encode(JSON.stringify(b)), KEY);
+  const spliced = decodeCheckpoint(new TextEncoder().encode(JSON.stringify(b)), KEY, AS_B);
   assert.equal(spliced.ok, false);
   assert.equal(!spliced.ok && spliced.reason, "seal_open_failed");
+});
+
+test("a whole checkpoint cannot be moved onto another run's key", () => {
+  // The attack the first version of this file missed. Splicing ciphertext into
+  // a foreign envelope was covered; carrying the envelope along with it was
+  // not, and that was the easier attack. It worked, because the AAD was built
+  // from the payload's own session id -- the seal authenticated whatever
+  // identity travelled beside it, which is self-consistency, not binding.
+  //
+  // Nothing in the object is trusted for identity now: the reader supplies who
+  // it believes it is loading, and the AAD is built from that.
+  const bytes = encodeCheckpoint(
+    state(), envelope({ session_id: "sess-a", message_id: "msg-a" }), v4,
+  );
+  const moved = decodeCheckpoint(bytes, KEY, AS_B);
+  assert.equal(moved.ok, false, "run B must not be able to replay run A's conversation");
+  assert.equal(!moved.ok && moved.reason, "seal_open_failed");
+});
+
+test("a v3 checkpoint from another run is refused too", () => {
+  // Weaker than v4's -- a writer can forge the plaintext fields this compares
+  // -- but leaving v3 with no check at all would make the older format the
+  // way around the newer one's.
+  const bytes = encodeCheckpoint(state(), envelope(), v3);
+  const moved = decodeCheckpoint(bytes, KEY, AS_B);
+  assert.equal(!moved.ok && moved.reason, "envelope_mismatch");
+});
+
+test("an expired checkpoint cannot be made current again", () => {
+  // checkpointed_at drives the reader's TTL. Left outside the seal, anyone able
+  // to write the bucket could push a stale conversation back into its window.
+  const raw = JSON.parse(new TextDecoder().decode(
+    encodeCheckpoint(state(), envelope(), v4),
+  ));
+  raw.checkpointed_at = raw.checkpointed_at + 86_400_000;
+  const tampered = decodeCheckpoint(new TextEncoder().encode(JSON.stringify(raw)), KEY, AS_A);
+  assert.equal(tampered.ok, false);
+  assert.equal(!tampered.ok && tampered.reason, "envelope_mismatch");
 });
 
 test("a rewritten envelope counter is caught, not believed", () => {
@@ -148,7 +190,7 @@ test("a rewritten envelope counter is caught, not believed", () => {
   ));
   raw.turns_completed = 999;
 
-  const tampered = decodeCheckpoint(new TextEncoder().encode(JSON.stringify(raw)), KEY);
+  const tampered = decodeCheckpoint(new TextEncoder().encode(JSON.stringify(raw)), KEY, AS_A);
   assert.equal(tampered.ok, false);
   assert.equal(
     !tampered.ok && tampered.reason,
@@ -160,7 +202,7 @@ test("a rewritten envelope counter is caught, not believed", () => {
 test("a v3 checkpoint written by an older pod still resumes", () => {
   // The rollout depends on this: during a rolling update a run checkpointed by
   // a pod that has not restarted has to be resumable by one that has.
-  const decoded = decodeCheckpoint(encodeCheckpoint(state(), envelope(), v3), KEY);
+  const decoded = decodeCheckpoint(encodeCheckpoint(state(), envelope(), v3), KEY, AS_A);
   assert.ok(decoded.ok);
   assert.equal(decoded.version, 3);
   assert.equal(decoded.value.envelope.turns_completed, 7);

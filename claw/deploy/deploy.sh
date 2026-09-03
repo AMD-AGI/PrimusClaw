@@ -271,6 +271,18 @@ if ! $SKIP_NATS; then
   log "NATS ready."
 else
   log "Step 2/7: NATS skipped (--skip-nats)."
+  # Still load whatever passwords a previous run generated. The chart decides
+  # per workload whether to use its own NATS user by whether a password is
+  # set, so skipping this would quietly hand every component back the shared
+  # all-access credential -- a downgrade with no error and no log line.
+  #
+  # Deliberately does not GENERATE any: without the helm step, nats.conf has
+  # not been rendered, and pointing a workload at a user the server does not
+  # know about fails authentication outright.
+  if [ -f "$NATS_CREDS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$NATS_CREDS_FILE"
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -385,6 +397,8 @@ CLAW_VALUES_FILE="$WORK_DIR/claw-values.json"
 NATS_PASSWORD_EFFECTIVE="${NATS_PASSWORD_PROD:-${NATS_PASSWORD:-__TBD__}}"
 export REGISTRY TAG BRAIN_REPLICAS STORAGE_CLASS DOMAIN INGRESS_PATH AUTH_INTERNAL_TOKEN
 export USER_ENV_ENCRYPTION_KEY BRAIN_CHECKPOINT_KEY NATS_PASSWORD_EFFECTIVE CLAW_DEPLOY_ROOT
+export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_OPS
+export CHECKPOINT_WRITE_VERSION
 export S3_ENDPOINT S3_API_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
 export CLAW_DEPLOY_MODE PG_CLUSTER PG_APP_USER PG_APP_DB PG_USER_SECRET PG_SSL_NO_VERIFY
 export SANDBOX_NAMESPACE SANDBOX_WORKLOAD_NAMESPACE SANDBOX_ROUTER_URL
@@ -449,6 +463,10 @@ values = {
     },
     "brain": {
         "replicas": int(env("BRAIN_REPLICAS", "3")),
+        # Defaults to 3 in the chart and in the code; passed explicitly so an
+        # operator can move the fleet to sealed checkpoints without editing
+        # values by hand. See values.yaml for the three preconditions.
+        "checkpointWriteVersion": int(env("CHECKPOINT_WRITE_VERSION", "3")),
     },
     "api": {
         # Browser origins allowed to call the API with credentials. Empty --
@@ -483,6 +501,12 @@ values = {
         "authInternalToken": env("AUTH_INTERNAL_TOKEN"),
         "userEnvEncryptionKey": env("USER_ENV_ENCRYPTION_KEY"),
         "brainCheckpointKey": env("BRAIN_CHECKPOINT_KEY"),
+        "natsUsers": {
+          "api":    { "user": "api",    "password": env("NATS_PASSWORD_API") },
+          "brain":  { "user": "brain",  "password": env("NATS_PASSWORD_BRAIN") },
+          "reaper": { "user": "reaper", "password": env("NATS_PASSWORD_REAPER") },
+          "ops":    { "user": "ops",    "password": env("NATS_PASSWORD_OPS") },
+        },
         "natsPassword": env("NATS_PASSWORD_EFFECTIVE"),
         "clawDeployMode": env("CLAW_DEPLOY_MODE", "kubernetes"),
         "sandboxRouterUrl": env(

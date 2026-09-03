@@ -14,8 +14,8 @@
  * through the same redactor that masks events on their way to NATS and the
  * event database, and that redactor mutates -- by design, because a log line
  * with a credential in it should not be stored verbatim. Applied to replayable
- * state the same behaviour deletes content: on one live deployment 342 of 344
- * sessions in a week resumed with `<redacted>` standing where a file path, a
+ * state the same behaviour deletes content: on one live deployment nearly every
+ * session in a week resumed with `<redacted>` standing where a file path, a
  * model directory or a word from the middle of an identifier used to be. The
  * agent came back having lost what it was working on, and the turn was a
  * guaranteed total prompt-cache miss because the bytes no longer matched what
@@ -99,8 +99,25 @@ function hasStateShape(v: unknown): v is CheckpointState {
   return !!s && Array.isArray(s.messages) && typeof s.turns_completed === "number";
 }
 
-function aadFor(sessionId: string, messageId: string, version: number): Buffer {
-  return Buffer.from(`${sessionId}|${messageId}|${version}`, "utf8");
+/**
+ * The identity a checkpoint is sealed against.
+ *
+ * Supplied by the caller from what it EXPECTS to be reading, never taken from
+ * the payload. Deriving it from the envelope makes the seal self-consistent
+ * rather than context-binding: the ciphertext would then authenticate whatever
+ * identity travelled next to it, so lifting the whole object -- envelope and
+ * all -- onto another run's key opens cleanly and replays one run's
+ * conversation as another's. Binding to the reader's expectation is what makes
+ * that fail.
+ */
+export interface CheckpointIdentity {
+  sessionId: string;
+  messageId: string;
+  userId: string;
+}
+
+function aadFor(id: CheckpointIdentity, version: number): Buffer {
+  return Buffer.from(`${id.sessionId}|${id.messageId}|${id.userId}|${version}`, "utf8");
 }
 
 /**
@@ -132,14 +149,21 @@ export function encodeCheckpointV4(
     key,
     gzipSync(Buffer.from(JSON.stringify({
       state,
-      // Sealed copies of the counters the envelope also carries in the clear,
-      // so a rewritten envelope can be detected rather than believed.
+      // Sealed copies of everything the envelope also carries in the clear, so
+      // a rewritten envelope is detected rather than believed. checkpointed_at
+      // is in here because the reader enforces a TTL with it: outside the
+      // seal, anyone able to write the bucket could move an expired checkpoint
+      // back inside its window.
       turns_completed: env.turns_completed,
       has_workspace_sync: env.has_workspace_sync,
       last_sync_turn: env.last_sync_turn,
+      checkpointed_at: env.checkpointed_at,
       seq: env.seq,
     }), "utf8"), { level: 1 }),
-    aadFor(env.session_id, env.message_id, 4),
+    aadFor(
+      { sessionId: env.session_id, messageId: env.message_id, userId: env.user_id },
+      4,
+    ),
   );
   return new TextEncoder().encode(JSON.stringify({ version: 4, ...env, state_enc: sealed }));
 }
@@ -169,6 +193,13 @@ export function encodeCheckpoint(
 export function decodeCheckpoint(
   bytes: Uint8Array,
   key: Buffer | null,
+  /**
+   * Who the caller believes this checkpoint belongs to. Both the AAD and the
+   * plaintext envelope are checked against it, so a payload that travelled
+   * from another run fails to open rather than being trusted for saying it
+   * belongs here.
+   */
+  expect: CheckpointIdentity,
 ): DecodeResult {
   let raw: Record<string, unknown>;
   try {
@@ -180,6 +211,15 @@ export function decodeCheckpoint(
 
   if (version === 3) {
     if (!hasStateShape(raw)) return { ok: false, reason: "schema_invalid", version: 3 };
+    // v3 has no seal, so this is the only identity check it can get. It is
+    // weaker than v4's by construction -- a writer can forge the fields it
+    // compares -- which is another reason to move off it.
+    if (
+      String(raw.session_id ?? "") !== expect.sessionId
+      || String(raw.message_id ?? "") !== expect.messageId
+    ) {
+      return { ok: false, reason: "envelope_mismatch", version: 3 };
+    }
     const { version: _v, ...flat } = raw as Record<string, unknown>;
     return {
       ok: true,
@@ -218,12 +258,12 @@ export function decodeCheckpoint(
   }
 
   let inner: {
-    state?: unknown; turns_completed?: number;
-    has_workspace_sync?: boolean; last_sync_turn?: number; seq?: number;
+    state?: unknown; turns_completed?: number; has_workspace_sync?: boolean;
+    last_sync_turn?: number; checkpointed_at?: number; seq?: number;
   };
   try {
     inner = JSON.parse(gunzipSync(
-      openAead(key, raw.state_enc, aadFor(envelope.session_id, envelope.message_id, 4)),
+      openAead(key, raw.state_enc, aadFor(expect, 4)),
     ).toString("utf8"));
   } catch (e) {
     if (e instanceof AeadOpenError) return { ok: false, reason: "seal_open_failed", version: 4 };
@@ -240,7 +280,14 @@ export function decodeCheckpoint(
     inner.turns_completed !== envelope.turns_completed
     || inner.has_workspace_sync !== envelope.has_workspace_sync
     || inner.last_sync_turn !== envelope.last_sync_turn
+    || inner.checkpointed_at !== envelope.checkpointed_at
     || inner.seq !== envelope.seq
+    // The AAD already proves the ciphertext was sealed for this identity; this
+    // catches a plaintext envelope rewritten to disagree with it, which would
+    // otherwise feed the caller a session_id the seal never covered.
+    || envelope.session_id !== expect.sessionId
+    || envelope.message_id !== expect.messageId
+    || envelope.user_id !== expect.userId
   ) {
     return { ok: false, reason: "envelope_mismatch", version: 4 };
   }

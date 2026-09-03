@@ -282,6 +282,17 @@ config:
           # when a bucket is missing, on purpose, and the ability to create one
           # would turn "deployed out of order" into "every workspace looks
           # unlocked and uncheckpointed, so reap all of them".
+          #
+          # One limit worth stating rather than glossing: `kv.keys()` is a
+          # headers-only scan, but the permission that allows it --
+          # CONSUMER.CREATE on the checkpoint stream -- does not say
+          # headers_only. A reaper that wanted to could ask for a consumer that
+          # delivers bodies and read whole conversations. NATS has no subject
+          # that distinguishes the two, so this cannot be closed with an
+          # allow-list; what closes it is v4, after which the bodies are
+          # ciphertext and the seal key is not mounted here. Until the fleet
+          # writes v4, treat this user as able to read checkpoints in principle
+          # and keep its password as tightly held as brain'"'"'s.
           - user: reaper
             password: "__REAPER_NATS_PASSWORD__"
             permissions:

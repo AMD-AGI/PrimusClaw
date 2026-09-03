@@ -41,6 +41,13 @@ spec:
         # the Secret is someone else's, and a change to it still needs a
         # deliberate `kubectl rollout restart`.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # The per-workload NATS credential lives in its own Secret, and the
+        # Brain seal key in another. Rotating either changes nothing the
+        # annotation above can see, so the pods would keep the old value in
+        # their environment -- with a NATS password that is one rotation out
+        # of date, or a seal key that no longer opens what the fleet is
+        # writing. Hash them here so a rotation actually rolls.
+        checksum/nats-user: {{ include (print $.Template.BasePath "/nats-user-secrets.yaml") . | sha256sum }}
     spec:
       securityContext:
         runAsNonRoot: true
