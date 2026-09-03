@@ -66,6 +66,10 @@ extraEnv: []
 # replaces a list wholesale when a later -f sets it, so a wrapper appending its
 # own entry there would silently drop whatever extraEnv the operator's own
 # values file had.
+# Extra pod-template annotations. deploy.sh puts a hash of the credentials
+# Secret here so that rotating it actually rolls the Pods.
+podAnnotations: {}
+
 providerApiKey:
   secretName: ""
   secretKey: api_key
