@@ -3,7 +3,10 @@
 
 export { sleep } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
-export { redactSecrets, safePreview, scanForSecretLeak, type RedactResult, type ScanHit } from "./security/redact-secrets.js";
+export {
+  redactSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
+  type RedactResult, type ScanHit,
+} from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
 export { isRevisionConflict } from "./kv/errors.js";
 export {

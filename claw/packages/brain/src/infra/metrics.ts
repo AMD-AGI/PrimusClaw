@@ -279,11 +279,20 @@ const promptSizeUnknownTotal = new Counter({
 // wrote, we came back with the same prefix, nothing was read -- so it works on
 // any transport regardless of what the usage object chooses to report.
 //
-// gap="over_5m" is consistent with an entry shorter-lived than requested;
-// "under_5m" points at the prefix rather than the lifetime.
+// gap="over_ttl" is consistent with an entry shorter-lived than the TTL this
+// deployment configured; "under_ttl" points at the prefix rather than the
+// lifetime. The threshold follows LLM_CACHE_TTL rather than a fixed five
+// minutes, because on a 5m deployment every ordinary expiry would otherwise be
+// filed as a defect. A gap of exactly the TTL counts as over_ttl.
+//
+// "an earlier write" is no longer bounded by the process: the timestamp the
+// gap is measured from rides in the checkpoint, so a run resumed on another
+// pod after a redelivery still knows an entry existed and still counts the
+// loss. Those are the expensive ones -- a long conversation paying full price
+// for a prefix it had already written.
 const cacheEntryLostTotal = new Counter({
   name: "claw_brain_llm_cache_entry_lost_total",
-  help: "Turns that sent markers and read nothing back despite an earlier write in the same run.",
+  help: "Turns that sent markers and read nothing back despite an earlier write, across resumes.",
   labelNames: ["gap"],
   registers: [registry],
 });

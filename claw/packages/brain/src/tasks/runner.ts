@@ -27,7 +27,7 @@ import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { classifyResumeOutcome } from "./resume-outcome.js";
-import { sleep, redactSecrets, isSensitiveKey } from "@claw/utils";
+import { sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
   WORKSPACE_SYNC_INTERVAL_MS, WORKSPACE_SYNC_GRACE_MS,
@@ -87,7 +87,21 @@ const sc = StringCodec();
  * gets a field masked also gets its value hunted; the two halves cannot drift
  * apart. It errs towards redacting, which is the right direction here: a
  * config value wrongly treated as a secret costs one mangled log line, and the
- * length floor in redactValue keeps a short one from mangling anything at all.
+ * distinctiveness filter in redactValue keeps a short one from mangling
+ * anything at all.
+ *
+ * A name is not the only way in, because a name is not always told the truth.
+ * `BUILD_CONFIG=P@ssw0rd` is a live credential filed under a name that reads
+ * as configuration, and no name rule will ever see it. looksLikeCredentialValue
+ * asks the complementary question of the value itself, and asks it narrowly
+ * enough that the paths and model names this function was rewritten to protect
+ * do not answer yes -- anything with a slash or a space is out before the test
+ * begins.
+ *
+ * Both grounds feed one list, and everything on that list is filtered the same
+ * way by isDistinctiveSecret at the point of use. Collection decides what is
+ * worth looking at; distinctiveness decides what is safe to cut. Neither rule
+ * gets its own exemption from the other.
  */
 function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): string[] {
   return [
@@ -100,11 +114,11 @@ function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): stri
   ].filter((value): value is string => typeof value === "string" && value.length > 0);
 }
 
-/** Values of the env vars whose name reads as a credential. */
+/** Values of the env vars whose name -- or whose own shape -- reads as a credential. */
 function sensitiveEnvValues(env: Record<string, string> | undefined): string[] {
   if (!env) return [];
   return Object.entries(env)
-    .filter(([name]) => isSensitiveKey(name))
+    .filter(([name, value]) => isSensitiveKey(name) || looksLikeCredentialValue(value))
     .map(([, value]) => value);
 }
 

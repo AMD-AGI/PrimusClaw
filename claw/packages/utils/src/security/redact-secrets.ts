@@ -20,20 +20,78 @@ const HEX_TOKEN_32B_RE = /\b[A-Fa-f0-9]{64}\b/g;
 // credential is stored somewhere unremarkable -- `CONFIG=ghp_...`, a token
 // pasted into a comment, a key echoed by a tool. The name-based passes cannot
 // see any of those.
+//
+// Every alternative is anchored on a LEADING \b, and that is not decoration.
+// Without it each prefix matched mid-identifier and took the rest of the word
+// with it: `sk-` inside `task-management-system` redacted to `ta<redacted>`,
+// `hf_` inside `myhf_...` to `my<redacted>`. This pass runs over transcripts
+// that are replayed to the model, so a partial match does not mask a secret,
+// it silently rewrites the conversation -- the exact failure mode the
+// name-based pass was narrowed to stop.
+//
+// `sk-` additionally needs more than a boundary, because its charset includes
+// the hyphen and so a boundary alone still swallows any hyphenated phrase
+// beginning with those two letters. A real OpenAI/Anthropic key ends in one
+// long unbroken run (`sk-ant-api03-<48 chars>`, `sk-proj-<48 chars>`), while a
+// phrase is short segments all the way down, so the run is what distinguishes
+// them: `sk-learn-is-a-typo` has no segment near key length and is left alone.
 const VENDOR_TOKEN_RE = new RegExp([
-  "gh[pousr]_[A-Za-z0-9]{16,}",           // GitHub classic
-  "github_pat_[A-Za-z0-9_]{20,}",         // GitHub fine-grained
-  "xox[baprs]-[A-Za-z0-9-]{10,}",         // Slack
-  "sk-[A-Za-z0-9_-]{16,}",                // OpenAI / Anthropic style
-  "hf_[A-Za-z0-9]{20,}",                  // Hugging Face
-  "AKIA[0-9A-Z]{16}",                     // AWS access key id
-  "glpat-[A-Za-z0-9_-]{16,}",             // GitLab
-  "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", // JWT
+  "\\bgh[pousr]_[A-Za-z0-9]{16,}",                      // GitHub classic
+  "\\bgithub_pat_[A-Za-z0-9_]{20,}",                    // GitHub fine-grained
+  "\\bxox[baprs]-[A-Za-z0-9-]{10,}",                    // Slack
+  "\\bsk-(?:[A-Za-z0-9_]{1,20}-)*[A-Za-z0-9_]{16,}",    // OpenAI / Anthropic style
+  "\\bhf_[A-Za-z0-9]{20,}",                             // Hugging Face
+  "\\bAKIA[0-9A-Z]{16}",                                // AWS access key id
+  "\\bglpat-[A-Za-z0-9_-]{16,}",                        // GitLab
+  "\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", // JWT
 ].join("|"), "g");
 // A URL carrying inline credentials is a password with a hostname attached.
 // Only the credential half is replaced so the endpoint stays legible -- knowing
 // which host a run talked to is usually the point of the log line.
-const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/g;
+//
+// The userinfo half is `user:password`, and BOTH halves are optional in the
+// grammar. `redis://:s3cr3t@host` -- a password with no username -- is the
+// spelling Redis and a few managed brokers hand out by default, and requiring
+// a username meant that one was not redacted at all. The username is `*` now
+// rather than `+`; the colon and the password still have to be there, so a
+// bare `scheme://host` is untouched.
+const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
+
+/**
+ * Whether a discrete configuration VALUE looks like a credential on its own.
+ *
+ * Separate from the passes above, and deliberately not a pass over free text.
+ * The regexes above scan prose, so they can only afford shapes with a literal
+ * vendor prefix. This one is handed a single env-var value -- one whole field,
+ * with a boundary at each end -- and can therefore ask a question prose cannot
+ * be asked: does this entire string look like nothing but a password?
+ *
+ * It exists because the name-based collection in Brain's runtimeSecrets() has
+ * a hole it cannot close by itself. `BUILD_CONFIG=P@ssw0rd` is a live
+ * credential under a name that reads as configuration, so no name rule sees
+ * it, and it carries no vendor prefix, so no shape regex sees it either.
+ *
+ * The conditions are narrow on purpose, and each one is a value the previous
+ * rule destroyed. Rejecting anything containing a slash or whitespace keeps
+ * `/models/qwen3-8b` and `sed -n '140,340p' ...` out. Requiring a character
+ * outside `[A-Za-z0-9._-]` keeps `Qwen3-8B`, every version string and every
+ * dotted hostname out -- those are the shapes ordinary configuration takes.
+ * Requiring all three of lower, upper and digit alongside it is what is left
+ * of "password" once the guessable parts are gone.
+ *
+ * What it deliberately does NOT catch: an all-lowercase value like `hunter2`
+ * under an unremarkable name. Nothing distinguishes that from ordinary config,
+ * and a rule loose enough to catch it is the rule that deleted MODEL_PATH out
+ * of a thousand transcripts. It stays covered by its name (`DB_PASSWORD`) and
+ * by the key-name mask, which is where a value with no shape has to be caught.
+ */
+const STRONG_SYMBOL_RE = /[^A-Za-z0-9._-]/;
+export function looksLikeCredentialValue(value: string): boolean {
+  if (value.length < 8 || value.length > 128) return false;
+  if (/[\s/]/.test(value)) return false;
+  if (!STRONG_SYMBOL_RE.test(value)) return false;
+  return /[a-z]/.test(value) && /[A-Z]/.test(value) && /[0-9]/.test(value);
+}
 
 export interface RedactResult {
   text: string;
@@ -109,7 +167,9 @@ export function safePreview(text: string, max: number): string {
 }
 
 export interface ScanHit {
-  category: "token_literal" | "bearer" | "x_api_key" | "raw_hex_32" | "explicit_secret";
+  category:
+    | "token_literal" | "bearer" | "x_api_key" | "raw_hex_32" | "explicit_secret"
+    | "vendor_token" | "url_credentials";
   excerpt: string;
 }
 
@@ -137,6 +197,14 @@ export function scanForSecretLeak(text: string, knownSecrets: string[] = []): Sc
     [TOKEN_LITERAL_RE, "token_literal"],
     [BEARER_RE, "bearer"],
     [X_API_KEY_RE, "x_api_key"],
+    // The shape catalogue, scanned for the same reason it is redacted: these
+    // are the credentials stored somewhere unremarkable, which is exactly the
+    // kind that reaches an archive tarball. This file's own header promises
+    // the two functions work off one catalogue, and a shape added only to the
+    // redactor quietly breaks that -- the upload would be waved through
+    // carrying a token the redactor two layers up would have masked.
+    [VENDOR_TOKEN_RE, "vendor_token"],
+    [URL_CREDENTIALS_RE, "url_credentials"],
     // raw 32B hex is noisy; only match alongside an explicit token name to
     // avoid false-positives on legitimate hash dumps. Skip in scan.
   ];

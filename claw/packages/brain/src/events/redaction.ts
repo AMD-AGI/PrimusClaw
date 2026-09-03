@@ -28,13 +28,43 @@ import { isSensitiveKey, redactSecrets } from "@claw/utils";
  * field by key name and leave the substring pass out of it. Anything else --
  * mixed case, digits with letters, punctuation, or simply long -- does not
  * appear in a transcript by accident.
+ *
+ * Applied to every candidate, whichever rule nominated it. runtimeSecrets()
+ * collects on two grounds now -- the name reads as a credential, or the value
+ * itself is shaped like one -- and a value that cannot be hunted safely cannot
+ * be hunted safely for either reason. The check lives at the point of use, so
+ * there is one place it can be applied and no way for a new collection rule to
+ * arrive without it.
  */
-const ORDINARY_WORD_RE = /^[a-z]+$/;
+const ORDINARY_WORD_RE = /^[A-Za-z]+$/;
 const ORDINARY_NUMBER_RE = /^[0-9]+([.,][0-9]+)?$/;
 const BOOLEANISH = new Set([
   "true", "false", "yes", "no", "on", "off", "none", "null", "nil",
   "enabled", "disabled", "auto", "default", "debug", "info", "warn", "error",
 ]);
+
+/**
+ * Whether an all-letters value is written the way a word is written.
+ *
+ * `main`, `MAIN` and `Main` are one word in three casings and collide with
+ * prose identically, so exempting only the lowercase spelling exempted the
+ * wrong third of them -- a `BRANCH_TOKEN=Staging` still cut "Staging" out of
+ * every line that mentioned the environment. Case is not evidence of anything
+ * here; a shift key is not entropy.
+ *
+ * Casing still carries one real signal, which is why this is not simply
+ * `toLowerCase()`. A generated alphabetic token switches case mid-word
+ * (`XkjQmzPl`) and no vocabulary does, so an internally-mixed run stays
+ * distinctive while all-lower, all-upper and Capitalized do not.
+ */
+function isWordCased(value: string): boolean {
+  if (!ORDINARY_WORD_RE.test(value)) return false;
+  const lower = value.toLowerCase();
+  const upper = value.toUpperCase();
+  return value === lower
+    || value === upper
+    || value === value[0]!.toUpperCase() + lower.slice(1);
+}
 
 export function isDistinctiveSecret(secret: string): boolean {
   // Below this, a value cannot carry enough entropy to be worth the collision
@@ -43,10 +73,10 @@ export function isDistinctiveSecret(secret: string): boolean {
   const lower = secret.toLowerCase();
   if (BOOLEANISH.has(lower)) return false;
   if (ORDINARY_NUMBER_RE.test(secret)) return false;
-  // A short run of plain lowercase letters is a word ("main", "remote",
-  // "staging"). Past a certain length it stops being one -- a 16-character
-  // lowercase string is a token, not vocabulary.
-  if (secret.length < 16 && ORDINARY_WORD_RE.test(secret)) return false;
+  // A short run of letters written as a word is a word ("main", "Staging",
+  // "REMOTE"). Past a certain length it stops being one -- a 16-character
+  // alphabetic string is a token, not vocabulary.
+  if (secret.length < 16 && isWordCased(secret)) return false;
   return true;
 }
 

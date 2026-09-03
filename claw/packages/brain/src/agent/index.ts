@@ -36,7 +36,13 @@ export interface CheckpointState {
    *  free of a dependency on the loop. */
   todo_state?: Array<{ id: string; content?: string; status?: string }>;
   /**
-   * When this run last read the prompt cache, as an epoch ms.
+   * When this run last USED the prompt cache -- read or write -- as an epoch ms.
+   *
+   * Both, because both prove an entry exists to lose, and a write is the only
+   * proof the first time round: the turn that creates an entry reads nothing.
+   * Recording reads alone would leave a run that wrote once and then missed
+   * looking exactly like a cold start, which is the case the counter is for.
+   * A read refreshes the entry's lifetime, so it moves the timestamp too.
    *
    * Persisted because the cache-loss detector needs to tell "we wrote
    * something and then could not read it" from "there was never an entry", and

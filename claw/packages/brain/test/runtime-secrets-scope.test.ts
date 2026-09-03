@@ -217,3 +217,54 @@ test("a credential-named var holding an ordinary word is collected but never hun
   );
   assert.equal(evt.description, "git switch main", "and the distinctiveness filter declines it");
 });
+
+// ── The second collection ground: shape ─────────────────────────────────────
+
+test("a credential-shaped value under an unremarkable name is collected by shape", () => {
+  // The name check has no chance here -- BUILD_CONFIG is as ordinary as a name
+  // gets -- and no vendor prefix matches, so without a shape ground this walks
+  // out of the run verbatim.
+  const secrets = runtimeSecrets(request({
+    user_env: { BUILD_CONFIG: "P@ssw0rd", DEPLOY_OPTS: "Xk9$mzPl2vQ" },
+  }));
+  assert.ok(secrets.includes("P@ssw0rd"), "a symbol-bearing credential must be hunted");
+  assert.ok(secrets.includes("Xk9$mzPl2vQ"));
+});
+
+test("the shape ground stays narrow enough not to re-open the incident", () => {
+  // Every value below is distinctive by the length-and-entropy test, so a
+  // shape rule written as "anything distinctive" would collect all of them --
+  // and collecting them is precisely what deleted content out of a thousand
+  // transcripts. Paths, versions, URLs and prose are excluded by shape before
+  // distinctiveness is ever consulted.
+  const secrets = runtimeSecrets(request({
+    user_env: {
+      MODEL_PATH: "/models/qwen3-8b",
+      MODEL_NAME: "Qwen3-8B",
+      FORGE_PATH: "/models/qwen3-8b/backends",
+      APP_VERSION: "v1.2.3",
+      ENDPOINT: "https://api.internal/v1",
+      GIT_SUBCOMMAND: "remote",
+      DEPLOY_ENV: "Staging",
+    },
+  }));
+  for (const config of [
+    "/models/qwen3-8b", "Qwen3-8B", "/models/qwen3-8b/backends",
+    "v1.2.3", "https://api.internal/v1", "remote", "Staging",
+  ]) {
+    assert.ok(!secrets.includes(config), `${JSON.stringify(config)} is configuration`);
+  }
+});
+
+test("an ordinary word is never hunted whatever case it is written in", () => {
+  // Same word, three spellings. The exemption is on the word, not on the
+  // shift key, so all three come back byte-identical.
+  const text = "checkout MAIN then Staging then main";
+  const evt = redactPersistedEvent(
+    { type: "toolUsed", argumentsDetail: { bash: { command: text } } },
+    runtimeSecrets(request({
+      user_env: { A_TOKEN: "MAIN", B_TOKEN: "Staging", C_TOKEN: "main" },
+    })),
+  ) as { argumentsDetail: { bash: { command: string } } };
+  assert.equal(evt.argumentsDetail.bash.command, text);
+});

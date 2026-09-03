@@ -21,7 +21,7 @@ test("a short but distinctive credential is still hunted", () => {
   // The regression that motivated this: DB_PASSWORD=hunter2 is named
   // unambiguously and is seven characters, and a 16-character floor sent it
   // to NATS, the event DB, SSE and the checkpoint verbatim.
-  for (const secret of ["hunter2", "P@ssw0rd", "Hunter", "abc-123", "s3cr3t"]) {
+  for (const secret of ["hunter2", "P@ssw0rd", "abc-123", "s3cr3t"]) {
     assert.ok(isDistinctiveSecret(secret), `${JSON.stringify(secret)} must be redacted`);
   }
 });
@@ -44,6 +44,12 @@ test("a value that collides with prose is left alone whatever its name claims", 
   for (const ordinary of ["main", "remote", "staging", "master", "prod"]) {
     assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is vocabulary, not a token`);
   }
+  // Case is not entropy. An env file writes MAIN, Staging and main for the
+  // same word, and hunting the shouted spelling cuts it out of the transcript
+  // exactly as thoroughly as hunting the quiet one would.
+  for (const ordinary of ["MAIN", "Staging", "Prod", "REMOTE", "Master", "Hunter", "TRUE", "Debug"]) {
+    assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is the same word shouted`);
+  }
   for (const ordinary of ["8080", "3", "1.5", "2024"]) {
     assert.ok(!isDistinctiveSecret(ordinary), `${JSON.stringify(ordinary)} is a number`);
   }
@@ -62,9 +68,14 @@ test("the lowercase-word exemption ends exactly where the docstring says", () =>
   // down leaks a generated lowercase token, moving it up excises a word.
   assert.equal(isDistinctiveSecret("a".repeat(15)), false, "15 lowercase letters may be prose");
   assert.equal(isDistinctiveSecret("a".repeat(16)), true, "16 is past what vocabulary reaches");
-  // Only a *plain* lowercase run gets the exemption. Anything the shift key or
-  // the number row touched is distinctive at any length above the floor.
-  for (const short of ["Main", "ma1n", "ma-n", "m.in", "Prod", "s3cr3t"]) {
+  assert.equal(isDistinctiveSecret("A".repeat(15)), false, "shouting does not add entropy");
+  assert.equal(isDistinctiveSecret("A".repeat(16)), true, "the step is the same on both cases");
+  // Only a run of letters in a casing a human types gets the exemption:
+  // all-lower, all-upper, or Capitalized. Anything the number row or the
+  // punctuation keys touched is distinctive at any length above the floor, and
+  // so is a run that changes case mid-word -- no vocabulary does that, but a
+  // generated token does it constantly.
+  for (const short of ["ma1n", "ma-n", "m.in", "s3cr3t", "mAin", "XkjQmzPl", "PrOd"]) {
     assert.ok(isDistinctiveSecret(short), `${JSON.stringify(short)} does not occur in prose`);
   }
 });
