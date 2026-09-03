@@ -68,7 +68,7 @@ func TestIdleReclaimIsVisibleAsAnEvent(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("want exactly one Event for one reclaim, got %d: %v", len(events), events)
 	}
-	if !strings.Contains(events[0], "IdleReclaimed") {
+	if !strings.Contains(events[0], "IdleReclaimRequested") {
 		t.Errorf("the reason is what a watcher filters on; got %q", events[0])
 	}
 	// Normal, not Warning: reclaiming an idle sandbox is this controller doing

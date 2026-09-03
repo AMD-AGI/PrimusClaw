@@ -114,3 +114,56 @@ func TestNothingToWriteIsNotAnError(t *testing.T) {
 		t.Error("patched with an empty body")
 	}
 }
+
+func TestClaimMetadataRetriesBeforeGivingUp(t *testing.T) {
+	// The failures worth surviving are the cheap ones -- a conflict with the
+	// controller that just created the object -- and giving up on the first
+	// throws away a Pod that came out of the warm pool.
+	scheme := claimScheme(t)
+	var calls int
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claimSandbox()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl ctrlclient.WithWatch, o ctrlclient.Object,
+				p ctrlclient.Patch, opts ...ctrlclient.PatchOption) error {
+				calls++
+				if calls == 1 {
+					return errors.New("conflict")
+				}
+				return cl.Patch(ctx, o, p, opts...)
+			},
+		}).Build()
+
+	if err := applyClaimMetadataWithRetry(context.Background(), c, claimSandbox(),
+		nil, map[string]string{"runtime.agent-sandbox.io/idle-timeout": "48h"}); err != nil {
+		t.Fatalf("a transient conflict should not fail the claim: %v", err)
+	}
+	if calls < 2 {
+		t.Errorf("it gave up after %d attempt(s)", calls)
+	}
+}
+
+func TestClaimMetadataStopsRetrying(t *testing.T) {
+	// Bounded, because every attempt is holding a Pod out of the pool.
+	scheme := claimScheme(t)
+	var calls int
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claimSandbox()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object,
+				ctrlclient.Patch, ...ctrlclient.PatchOption) error {
+				calls++
+				return errors.New("still broken")
+			},
+		}).Build()
+
+	if err := applyClaimMetadataWithRetry(context.Background(), c, claimSandbox(),
+		nil, map[string]string{"x": "y"}); err == nil {
+		t.Fatal("a claim that never got its metadata must not report success")
+	}
+	if calls > 5 {
+		t.Errorf("retried %d times while holding a pooled Pod", calls)
+	}
+}

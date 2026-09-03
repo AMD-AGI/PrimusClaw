@@ -407,6 +407,38 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 //  3. The SandboxClaim controller adopts a warm Pod (sets the agents.x-k8s.io/pod-name annotation).
 //  4. SandboxReconciler fires when the Sandbox reaches Ready state → we get ServiceFQDN.
 //
+// applyClaimMetadataWithRetry gives the patch a few goes before giving up on
+// the whole claim.
+//
+// The failures worth surviving here are the cheap ones -- a conflict with the
+// controller that just created the object, an API server having a moment -- and
+// they are gone by the next attempt. Bounded because the alternative to failing
+// is worse than failing: every attempt is holding a Pod that came out of the
+// warm pool.
+func applyClaimMetadataWithRetry(
+	ctx context.Context,
+	c ctrlclient.Client,
+	sandbox *sandboxv1alpha1.Sandbox,
+	labels map[string]string,
+	annotations map[string]string,
+) error {
+	const attempts = 3
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = applyClaimMetadata(ctx, c, sandbox, labels, annotations); err == nil {
+			return nil
+		}
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(i+1) * 200 * time.Millisecond):
+			}
+		}
+	}
+	return err
+}
+
 // applyClaimMetadata writes the labels and annotations a warm-pool claim needs
 // onto the Sandbox the pool handed over.
 //
@@ -550,8 +582,23 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 						patchAnnotations[userNameAnnotationKey] = user.UserName
 					}
 				}
-				if err := applyClaimMetadata(waitCtx, c.client, createdSandbox,
+				// Retried, then rolled back. Returning straight away left the
+				// Claim, the Sandbox and a Pod already taken out of the pool
+				// behind -- the caller only clears its own placeholder -- so a
+				// client retry claimed a second Pod and the first sat there until
+				// its absolute deadline. A patch is a small write against an
+				// object that already exists, so a couple of attempts covers the
+				// conflicts and blips this is actually seeing; past that the claim
+				// did not happen and should not look like it half did.
+				if err := applyClaimMetadataWithRetry(waitCtx, c.client, createdSandbox,
 					patchLabels, patchAnnotations); err != nil {
+					if rbErr := c.DeleteSandboxClaim(ctx, &store.SandboxInfo{
+						Namespace:   namespace,
+						SandboxName: sandboxName,
+					}); rbErr != nil {
+						slog.Error("warm-pool claim rollback failed; pod may be held until its deadline",
+							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
+					}
 					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {

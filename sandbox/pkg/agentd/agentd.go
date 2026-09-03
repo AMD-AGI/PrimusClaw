@@ -438,9 +438,23 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 // Emitted after the delete, unlike the audit event: this one is what an
 // operator reads, and one saying a sandbox was reclaimed while it is still
 // there -- RBAC, a webhook, a flaky API call -- is worse than none at all. The
-// object being gone is not a problem; an Event holds its own reference. Events
-// also expire on their own (an hour, in a default cluster), so this is a
-// debugging aid on top of the audit trail, not a replacement for it.
+// object being gone is not a problem; an Event holds its own reference.
+//
+// "Requested", not "reclaimed", and that is the honest word. A UID precondition
+// makes this the object the reconcile decided about, but a delete that returns
+// nil is not proof this call is what removed it: another actor can mark the
+// object between the read and here, and with a finalizer holding it, a second
+// delete succeeds all the same. Closing that would take a ResourceVersion
+// precondition, which fails the reclaim whenever anything at all writes the
+// object first -- a status update is enough -- and a working collector is worth
+// more than exact attribution on a rare race. So the Event claims what is
+// always true.
+//
+// Events also expire on their own (an hour, in a default cluster), so this is a
+// debugging aid on top of the audit trail, not a replacement for it. The audit
+// event is still written before the delete, which has the same imprecision and
+// predates this; worth fixing, not worth changing an existing contract from
+// here.
 func (r *SandboxReconciler) recordIdleDeletedEvent(
 	sandbox *sandboxv1alpha1.Sandbox,
 	lastActivity time.Time,
@@ -449,8 +463,8 @@ func (r *SandboxReconciler) recordIdleDeletedEvent(
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Eventf(sandbox, corev1.EventTypeNormal, "IdleReclaimed",
-		"Deleted after %s idle (last activity %s)",
+	r.Recorder.Eventf(sandbox, corev1.EventTypeNormal, "IdleReclaimRequested",
+		"Requested deletion after %s idle (last activity %s)",
 		timeout, lastActivity.UTC().Format(time.RFC3339))
 }
 
