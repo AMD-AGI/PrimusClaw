@@ -184,38 +184,43 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
   envInt("AGENT_SANDBOX_WARM_POOL_SIZE", 0),
 );
 
-/**
- * Idle timeout for sandboxes this Brain creates, as a Go duration ("2h", "90m").
- *
- * The platform deletes a Sandbox once `lastActivity + timeout` passes, and
- * `lastActivity` only moves for traffic through the Router -- a request in
- * flight, or the Brain keepalive exec. Work running *inside* the pod does not
- * move it, so a sandbox busy with a long computation looks exactly like an
- * abandoned one. Brain also stops the keepalive the moment a task reaches a
- * terminal state (see stopKeepaliveAfterTask), which is right when the sandbox
- * is only a warm cache for the next message -- and wrong when something the
- * task started is still running in there. That combination reclaims a working
- * sandbox 15 minutes after the agent turn ends.
- *
- * The platform has always taken a per-sandbox override
- * (`runtime.agent-sandbox.io/idle-timeout`, no upper bound, with
- * maxSessionDuration as the real backstop) and the Workload Manager writes it
- * from the CodeInterpreter spec -- Brain simply never set the field, so every
- * sandbox took the controller default of 15m no matter what it was for.
- *
- * Empty means "leave whatever the base template says", which is what every
- * deployment gets until it opts in: a mounted ConfigMap that sets its own
- * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
- * costs held nodes -- every sandbox survives that much longer after everyone has
- * stopped asking it for anything -- so raise it for a deployment whose work
- * needs it, not as a default. Per-workload is not offered: the value would have
- * to reach the create path through the protocol and request normalisation and
- * join the sandbox reuse fingerprint, or a session would reuse a pod built with
- * a different lifetime and the caller's value would silently not apply.
- */
+const GO_DURATION_UNIT_NS: Record<string, bigint> = {
+  ns: 1n,
+  us: 1_000n, "µs": 1_000n, "μs": 1_000n,
+  ms: 1_000_000n,
+  s: 1_000_000_000n,
+  m: 60_000_000_000n,
+  h: 3_600_000_000_000n,
+};
+const INT64_MAX = (1n << 63n) - 1n;
+// Go does this arithmetic in uint64, and every one of its overflow guards
+// compares against 1<<63 rather than int64's maximum -- the headroom that lets
+// `-9223372036854775808ns` parse. Ported as the same bound and not the tighter
+// one, because the fraction accumulator's limit is not only a range check: it
+// decides where `leadingFraction` stops scaling, and so which (value, scale)
+// pair the fractional term is computed from. INT64_MAX there makes a fraction
+// beginning 9223372036854775808 stop one digit earlier than Go stops, and the
+// two terms are then equal only by a float64 coincidence. The final result is
+// still held to INT64_MAX, at the end, exactly where Go holds it.
+const UINT64_HALF = 1n << 63n;
+const UINT64_MASK = (1n << 64n) - 1n;
+
+const isDigit = (c: string): boolean => c >= "0" && c <= "9";
+
 /**
  * A Go duration in whole nanoseconds, or null if `time.ParseDuration` would not
  * give a positive one.
+ *
+ * Ported from `time.ParseDuration` and its `leadingInt`/`leadingFraction`
+ * helpers in the Go standard library (src/time/format.go):
+ *   Copyright 2010 The Go Authors. All rights reserved.
+ *   Use of this source code is governed by a BSD-3-Clause license,
+ *   reproduced at LICENSES/BSD-3-Clause.txt.
+ * The bounds, the overflow guards, the uint64 arithmetic and the order the
+ * checks run in are that algorithm rather than an independent reading of it,
+ * so the attribution covers the shape and not only the idea. `goDurationNs`
+ * and `goDurationSeconds` are the derived part of this file; everything else
+ * here is AMD-authored under the repository's MIT (see REUSE.toml).
  *
  * A port of Go's parser rather than a regex that resembles it, because both
  * directions of "close enough" are failures with no symptom. Too permissive and
@@ -241,29 +246,6 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
  * Zero and negative come back as null. Both parse in Go, and neither is a value
  * worth sending: the Workload Manager applies an override only when positive.
  */
-const GO_DURATION_UNIT_NS: Record<string, bigint> = {
-  ns: 1n,
-  us: 1_000n, "µs": 1_000n, "μs": 1_000n,
-  ms: 1_000_000n,
-  s: 1_000_000_000n,
-  m: 60_000_000_000n,
-  h: 3_600_000_000_000n,
-};
-const INT64_MAX = (1n << 63n) - 1n;
-// Go does this arithmetic in uint64, and every one of its overflow guards
-// compares against 1<<63 rather than int64's maximum -- the headroom that lets
-// `-9223372036854775808ns` parse. Ported as the same bound and not the tighter
-// one, because the fraction accumulator's limit is not only a range check: it
-// decides where `leadingFraction` stops scaling, and so which (value, scale)
-// pair the fractional term is computed from. INT64_MAX there makes a fraction
-// beginning 9223372036854775808 stop one digit earlier than Go stops, and the
-// two terms are then equal only by a float64 coincidence. The final result is
-// still held to INT64_MAX, at the end, exactly where Go holds it.
-const UINT64_HALF = 1n << 63n;
-const UINT64_MASK = (1n << 64n) - 1n;
-
-const isDigit = (c: string): boolean => c >= "0" && c <= "9";
-
 export function goDurationNs(input: string): bigint | null {
   try {
     let s = input;
@@ -365,6 +347,35 @@ export function goDurationSeconds(ns: bigint): number {
   return Math.max(1, Number(ns / 1_000_000_000n));
 }
 
+/**
+ * Idle timeout for sandboxes this Brain creates, as a Go duration ("2h", "90m").
+ *
+ * The platform deletes a Sandbox once `lastActivity + timeout` passes, and
+ * `lastActivity` only moves for traffic through the Router -- a request in
+ * flight, or the Brain keepalive exec. Work running *inside* the pod does not
+ * move it, so a sandbox busy with a long computation looks exactly like an
+ * abandoned one. Brain also stops the keepalive the moment a task reaches a
+ * terminal state (see stopKeepaliveAfterTask), which is right when the sandbox
+ * is only a warm cache for the next message -- and wrong when something the
+ * task started is still running in there. That combination reclaims a working
+ * sandbox 15 minutes after the agent turn ends.
+ *
+ * The platform has always taken a per-sandbox override
+ * (`runtime.agent-sandbox.io/idle-timeout`, no upper bound, with
+ * maxSessionDuration as the real backstop) and the Workload Manager writes it
+ * from the CodeInterpreter spec -- Brain simply never set the field, so every
+ * sandbox took the controller default of 15m no matter what it was for.
+ *
+ * Empty means "leave whatever the base template says", which is what every
+ * deployment gets until it opts in: a mounted ConfigMap that sets its own
+ * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
+ * costs held nodes -- every sandbox survives that much longer after everyone has
+ * stopped asking it for anything -- so raise it for a deployment whose work
+ * needs it, not as a default. Per-workload is not offered: the value would have
+ * to reach the create path through the protocol and request normalisation and
+ * join the sandbox reuse fingerprint, or a session would reuse a pod built with
+ * a different lifetime and the caller's value would silently not apply.
+ */
 function resolveAgentSandboxSessionTimeout(): string {
   const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
   if (!configured) return "";

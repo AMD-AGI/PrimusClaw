@@ -17,6 +17,8 @@ package workloadmanager
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -191,7 +194,10 @@ func TestClaimMetadataStopsRetrying(t *testing.T) {
 	// And no wait after the last attempt, measured from that attempt rather
 	// than from the start, so a stalled scheduler earlier in the run cannot
 	// make a prompt return look like a fourth backoff.
-	if settled := time.Since(lastCall); settled >= firstBackoff {
+	// The ceiling is 2.5x the first backoff rather than 1x: the sleep this rules
+	// out is the third one, 600ms, so there is room for a suspended scheduler
+	// between the last attempt and the return without room for a real backoff.
+	if settled := time.Since(lastCall); settled >= 5*firstBackoff/2 {
 		t.Errorf("returned %v after the final attempt -- it slept on a decision it had made", settled)
 	}
 }
@@ -229,10 +235,10 @@ func TestClaimMetadataStopsWhenTheRequestIsCancelledMidBackoff(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("it kept trying after cancellation: %d attempts", calls)
 	}
-	// Generous against scheduler jitter and still far below the 600ms the full
-	// schedule would take: what this rules out is sleeping through the rest of
-	// it, not any particular millisecond.
-	if elapsed := time.Since(start); elapsed >= 2*firstBackoff {
+	// Generous against scheduler suspension and still below the 600ms the rest
+	// of the schedule would take: what this rules out is sleeping through it,
+	// not any particular millisecond.
+	if elapsed := time.Since(start); elapsed >= 5*firstBackoff/2 {
 		t.Errorf("it kept sleeping after cancellation, took %v of a %v schedule",
 			elapsed, firstBackoff+2*firstBackoff)
 	}
@@ -264,6 +270,13 @@ func adoptedSet() []ctrlclient.Object {
 		}},
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Name: "pool-pod-7", Namespace: "sandboxes",
+			// What extensions/controllers/sandboxclaim_controller.go writes when
+			// it adopts a Pod out of the warm pool, after clearing the pool's
+			// labels and owner references.
+			Labels: map[string]string{
+				"agents.x-k8s.io/sandbox-name-hash": sandboxcontrollers.NameHash("sbx-claimed"),
+				"agents.x-k8s.io/claim-uid":         "claim-uid-1",
+			},
 		}},
 		&extensionsv1alpha1.SandboxClaim{ObjectMeta: metav1.ObjectMeta{
 			Name: "sbx-claimed", Namespace: "sandboxes",
@@ -378,5 +391,103 @@ func TestClaimTeardownRunsOnACancelledRequestContext(t *testing.T) {
 		Namespace: "sandboxes", Name: "pool-pod-7",
 	}, pod); !k8serrors.IsNotFound(err) {
 		t.Fatalf("the pod must actually be gone, got: %v", err)
+	}
+}
+
+// A Delete that returns nil has not deleted anything yet -- the API server has
+// set deletionTimestamp and kubelet has up to terminationGracePeriodSeconds to
+// finish. Teardown proceeds through that window on purpose: waiting it out
+// would put the grace period (30s by default, since these Pods never set one)
+// on every session teardown, and on an unreachable node it would time out and
+// strand the Sandbox and Claim rather than the Pod.
+//
+// What makes that safe is that the removal is already certain. Nothing in this
+// repository attaches a finalizer to a Pod, so once deletionTimestamp is set
+// there is nothing left that can hold it. This test models the Pod surviving
+// its own successful delete, and pins the two things the decision rests on.
+func TestClaimTeardownProceedsWhileThePodIsStillTerminating(t *testing.T) {
+	now := metav1.Now()
+	objs := adoptedSet()
+	pod := objs[1].(*corev1.Pod)
+	pod.DeletionTimestamp = &now
+	pod.Finalizers = []string{"test.agent-sandbox.io/hold"} // the API server requires one
+
+	c := fake.NewClientBuilder().WithScheme(teardownScheme(t)).WithObjects(objs...).Build()
+
+	creator := &K8sSandboxCreator{client: c}
+	if err := creator.DeleteSandboxClaim(context.Background(), &store.SandboxInfo{
+		Namespace: "sandboxes", SandboxName: "sbx-claimed",
+	}); err != nil {
+		t.Fatalf("a pod already on its way out must not fail the teardown: %v", err)
+	}
+
+	key := types.NamespacedName{Namespace: "sandboxes", Name: "sbx-claimed"}
+	if err := c.Get(context.Background(), key, &sandboxv1alpha1.Sandbox{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("sandbox should be gone once the pod is certain to follow, got: %v", err)
+	}
+	if err := c.Get(context.Background(), key, &extensionsv1alpha1.SandboxClaim{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("claim should be gone too, got: %v", err)
+	}
+
+	// First thing the decision rests on: the Pod really is still here, so this
+	// test is exercising the window and not a client that deleted synchronously.
+	surviving := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "sandboxes", Name: "pool-pod-7",
+	}, surviving); err != nil {
+		t.Fatalf("the test must model a pod that outlives its delete, got: %v", err)
+	}
+	if surviving.DeletionTimestamp.IsZero() {
+		t.Error("a pod that survives a successful delete must carry a deletionTimestamp")
+	}
+
+	// Second: even with the Sandbox and its annotation gone, the Pod is still
+	// addressable. sandbox-name-hash is fnv-1a of the sandbox name, so it can be
+	// recomputed from nothing but the name a caller already has. If the claim
+	// controller ever stops setting it, this fails and the comment in
+	// DeleteSandboxClaim stops being true.
+	var found corev1.PodList
+	if err := c.List(context.Background(), &found,
+		ctrlclient.InNamespace("sandboxes"),
+		ctrlclient.MatchingLabels{"agents.x-k8s.io/sandbox-name-hash": sandboxcontrollers.NameHash("sbx-claimed")},
+	); err != nil {
+		t.Fatalf("list by label: %v", err)
+	}
+	if len(found.Items) != 1 || found.Items[0].Name != "pool-pod-7" {
+		t.Errorf("the surviving pod must stay findable without the sandbox, got %d match(es)", len(found.Items))
+	}
+}
+
+// The guarantee the test above leans on, checked against the tree rather than
+// asserted in a comment: no production code here puts a finalizer on a Pod. A
+// Pod finalizer would mean deletionTimestamp no longer implies removal, and the
+// reasoning in DeleteSandboxClaim would need revisiting.
+func TestNoProductionCodeAddsAPodFinalizer(t *testing.T) {
+	root := "../.."
+	var offenders []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err //nolint:wrapcheck // walk error passthrough
+		}
+		if strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		b, readErr := os.ReadFile(path) //nolint:gosec // walking our own tree
+		if readErr != nil {
+			return readErr //nolint:wrapcheck // surfaced by the test
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.Contains(line, "Finalizers") && !strings.HasPrefix(strings.TrimSpace(line), "//") {
+				offenders = append(offenders, path+": "+strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(offenders) != 0 {
+		t.Errorf("a finalizer in production code breaks the deletionTimestamp reasoning in DeleteSandboxClaim:\n%s",
+			strings.Join(offenders, "\n"))
 	}
 }

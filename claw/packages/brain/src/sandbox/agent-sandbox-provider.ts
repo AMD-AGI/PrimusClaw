@@ -142,18 +142,6 @@ function extractHost(entryPoint?: string): string {
 }
 
 /**
- * Everything that must select a different template when it changes.
- *
- * Templates are content-addressed and created idempotently, so anything left
- * out of here is a setting an operator cannot actually change: the render would
- * resolve to the name already built under the old value.
- *
- * Includes the base digest so editing the ConfigMap yields a new name rather
- * than reusing a template with stale steps/volumes, and the userId because
- * templates are private to the Router user unless marked public — one BYOK user
- * must never collide with another's.
- */
-/**
  * The lifetime overrides every sandbox this deployment creates is built with.
  *
  * Sent as Workload Manager create overrides rather than written into the
@@ -178,6 +166,18 @@ export function lifetimeOverrides(): Record<string, string> {
   };
 }
 
+/**
+ * Everything that must select a different template when it changes.
+ *
+ * Templates are content-addressed and created idempotently, so anything left
+ * out of here is a setting an operator cannot actually change: the render would
+ * resolve to the name already built under the old value.
+ *
+ * Includes the base digest so editing the ConfigMap yields a new name rather
+ * than reusing a template with stale steps/volumes, and the userId because
+ * templates are private to the Router user unless marked public — one BYOK user
+ * must never collide with another's.
+ */
 export function templateHashKey(base: BaseTemplate, params: SandboxCreateParams): string {
   const r = params.resources;
   return [

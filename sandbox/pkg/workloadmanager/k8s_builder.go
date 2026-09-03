@@ -1055,14 +1055,31 @@ func (c *K8sSandboxCreator) DeleteSandboxClaim(ctx context.Context, info *store.
 		// Dropping it was the zombie this function's own comment describes: the
 		// Pod has no OwnerReference, so nothing cascades to it, and deleting the
 		// Claim below removes the last record anyone could find it through.
+		// A nil error here does not mean the Pod is gone; it means the API server
+		// accepted the deletion and set deletionTimestamp, after which kubelet
+		// takes up to terminationGracePeriodSeconds (never set on these Pods, so
+		// the API default of 30s) to finish. That asynchrony is fine, and waiting
+		// it out would be worse: it would add the grace period to every teardown,
+		// and on an unreachable node it would time out and leave the Sandbox and
+		// Claim behind instead of the Pod. What matters is that removal is now
+		// certain, and it is -- nothing in this repository attaches a finalizer
+		// to a Pod (the only Pod finalizers in the tree are in tests, and the
+		// RBAC grants /finalizers on this project's own CRDs, not on pods), and
+		// there are no admission webhooks that could add one.
+		//
+		// The case worth stopping for is the other one: an error means the
+		// deletion may never have been accepted at all, so the Pod may have no
+		// deletionTimestamp and no reason to ever go away.
 		podErr := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, pod))
 		if podErr != nil {
-			// The Claim carries no Pod reference; the annotation read above is
-			// the only thing in the cluster that names this Pod. Deleting the
-			// Sandbox now would take that name with it and leave a running Pod
-			// nothing can address -- worse than the Sandbox outliving its Pod,
-			// which a retry can still finish. So the teardown stops here, with
-			// both objects intact and the failure returned to the caller.
+			// The Claim carries no Pod reference, and this annotation is the
+			// only thing that names the Pod *directly*. Deleting the Sandbox now
+			// would take that name with it, for a Pod that may not be going
+			// anywhere. It would still be reachable the long way round -- the
+			// claim controller labels an adopted Pod with sandbox-name-hash,
+			// which is fnv-1a of this same name and so recomputable without any
+			// of these objects -- but a teardown should not have to be recovered
+			// from by search. So it stops here, with both objects intact.
 			return fmt.Errorf("delete warm-pool pod %s/%s (sandbox %s retained so its %s annotation still names it): %w",
 				info.Namespace, podName, info.SandboxName, "agents.x-k8s.io/pod-name", podErr)
 		}
