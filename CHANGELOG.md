@@ -27,7 +27,31 @@ record it.
 
 ## [Unreleased]
 
+### Security
+- Credential redaction no longer treats every `user_env` / `session_env` value
+  as a secret to cut out of transcripts, and no longer misses short or
+  oddly-named ones. Values are selected by whether the variable **name** reads
+  as a credential, hunted only when the value is distinctive enough that
+  replacing it will not also delete ordinary words, and matched by **shape**
+  (GitHub/GitLab/Slack/OpenAI/Hugging Face/AWS tokens, JWTs, URLs with inline
+  credentials) regardless of the field they sit in. A short, ordinary-looking
+  secret echoed into free text still cannot be removed safely after the fact —
+  do not put one in an env var the agent can print.
+- `LLM_DEBUG_RESPONSE_HEADERS` rejects credential-bearing header names and
+  names that are not valid HTTP tokens, at boot rather than per request.
+
 ### Fixed
+- The prompt-cache loss counter no longer misses the turn after a NATS
+  redelivery, no longer reports the anchor breakpoint's fixed distance as a
+  broken marker chain, no longer claims the provider reported cache fields it
+  did not, and compares gaps against the TTL the deployment configured rather
+  than a hardcoded five minutes. Its metric labels are now `over_ttl` /
+  `under_ttl`.
+
+### Changed
+- `secret.yaml` gains `LLM_DEBUG_RESPONSE_HEADERS` (empty by default). It
+  changes the rendered secret's checksum, so the first upgrade carrying it
+  **rolls api and brain once** even though the value does nothing yet.
 - The LiteLLM deploy wrapper no longer passes the master key and database URL to
   Helm when `secrets.existingSecret` is set, so they stay out of the release
   values. Revisions written before this change still hold them; see

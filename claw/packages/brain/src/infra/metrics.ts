@@ -554,7 +554,7 @@ export const metrics = {
    * turn back, at 150k tokens a time. Counting it under a time bucket would be
    * a lie about what was measured; counting it not at all was worse.
    */
-  onCacheEntryLost(gap: "over_5m" | "under_5m"): void {
+  onCacheEntryLost(gap: "over_ttl" | "under_ttl"): void {
     cacheEntryLostTotal.inc({ gap });
   },
   onPromptSizeUnknown(): void {

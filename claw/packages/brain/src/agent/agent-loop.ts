@@ -12,6 +12,7 @@ import {
   TODO_WRITE_ENABLED, EXIT_PLAN_MODE_ENABLED,
   COMPACTION_TRIGGER_INPUT_TOKENS,
   CHECKPOINT_TURN_INTERVAL, CHECKPOINT_MAX_WALL_GAP_MS,
+  LLM_CACHE_TTL,
 } from "../config.js";
 import {
   HandsRebuildFailed,
@@ -368,7 +369,16 @@ const CANCELLED_TOOL_RESULT =
 // 4 was too aggressive and occasionally caused the agent to re-run commands
 // that were already completed.)
 /** Anthropic's default ephemeral lifetime, the line the survival check splits on. */
-const CACHE_TTL_5M_MS = 5 * 60 * 1000;
+/**
+ * How long an entry this deployment asked for is supposed to live.
+ *
+ * Taken from LLM_CACHE_TTL rather than pinned at five minutes. A deployment
+ * configured for 5m has entries that expire at five minutes by design, and
+ * comparing its gaps against a constant reported every one of those normal
+ * expiries as a defect. The label means "longer than we paid for" -- which is
+ * a different claim depending on what was paid for.
+ */
+const CONFIGURED_CACHE_TTL_MS = LLM_CACHE_TTL === "5m" ? 5 * 60 * 1000 : 60 * 60 * 1000;
 
 const COMPACTION_KEEP_RECENT_TURNS = 8;
 // Don't bother compacting tiny conversations.
@@ -1108,7 +1118,7 @@ class AgentLoopRunner {
       && this.lastCacheUseAt !== undefined
     ) {
       const gapMs = turnStart - this.lastCacheUseAt;
-      const gap = gapMs > CACHE_TTL_5M_MS ? "over_5m" : "under_5m";
+      const gap = gapMs > CONFIGURED_CACHE_TTL_MS ? "over_ttl" : "under_ttl";
       metrics.onCacheEntryLost(gap);
       // Everything needed to tell the three causes apart, on the one turn that
       // can still tell them apart -- the next turn re-plans and the evidence is
