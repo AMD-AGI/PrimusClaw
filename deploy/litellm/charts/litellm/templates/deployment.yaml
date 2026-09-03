@@ -52,6 +52,15 @@ spec:
               key: master_key
         - name: SAFE_API_URL
           value: {{ .Values.safeApiUrl | quote }}
+        {{- with .Values.providerApiKey }}
+        {{- if .secretName }}
+        - name: {{ .envName | default "LITELLM_PROVIDER_API_KEY" }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ .secretName }}
+              key: {{ .secretKey | default "api_key" }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

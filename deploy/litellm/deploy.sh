@@ -111,6 +111,9 @@ cleanup_tmp() {
 }
 trap cleanup_tmp EXIT
 GENERATED_MODELS_FILE=""
+PROVIDER_KEY_SECRET=""
+PROVIDER_KEY_SECRET_KEY="api_key"
+PROVIDER_KEY_ENV="LITELLM_PROVIDER_API_KEY"
 
 # Prompt for a provider (anthropic/openai) + base URL + API key, query its
 # /models endpoint, and render the discovered models into a temp Helm values
@@ -165,10 +168,15 @@ configure_models_interactive() {
 
   # Parse an OpenAI/Anthropic-style {"data":[{"id":...}]} payload and emit
   # modelList as JSON (a valid YAML subset, so ids/urls/keys stay safely quoted).
+  # The key itself never reaches this file. `api_key: os.environ/NAME` is
+  # resolved by LiteLLM at request time from the container's environment, and
+  # the environment entry comes from a Secret -- because this file is handed to
+  # Helm with -f, and a literal key in it would sit in the release values, and
+  # in every stored revision, for anyone who can run `helm get values`.
   local count
   count="$(printf '%s' "$resp" | python3 -c '
 import json, sys
-prefix, api_base, api_key, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+prefix, api_base, env_name, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 data = json.load(sys.stdin)
 items = data.get("data") if isinstance(data, dict) else data
 ids = []
@@ -179,13 +187,28 @@ for it in (items or []):
 if not ids:
     sys.stderr.write("no models found in /models response\n"); sys.exit(1)
 model_list = [
-    {"model_name": m, "litellm_params": {"model": f"{prefix}/{m}", "api_base": api_base, "api_key": api_key}}
+    {"model_name": m, "litellm_params": {
+        "model": f"{prefix}/{m}",
+        "api_base": api_base,
+        "api_key": f"os.environ/{env_name}",
+    }}
     for m in ids
 ]
 json.dump({"modelList": model_list}, open(out, "w"), indent=2)
 print(len(ids))
-' "$model_prefix" "$purl" "$pkey" "$GENERATED_MODELS_FILE")" \
+' "$model_prefix" "$purl" "$PROVIDER_KEY_ENV" "$GENERATED_MODELS_FILE")" \
     || fail "could not parse models response from $models_url"
+
+  # Written through stdin rather than --from-literal: an argument is visible in
+  # /proc and to anything auditing process starts, and this is the one moment
+  # the plaintext key exists outside the operator's terminal.
+  PROVIDER_KEY_SECRET="$LITELLM_NAME-provider"
+  printf '%s' "$pkey" \
+    | kubectl -n "$LITELLM_NAMESPACE" create secret generic "$PROVIDER_KEY_SECRET" \
+        --from-file="$PROVIDER_KEY_SECRET_KEY=/dev/stdin" --dry-run=client -o yaml \
+    | kubectl -n "$LITELLM_NAMESPACE" apply -f - >/dev/null \
+    || fail "could not store the provider API key in Secret/$PROVIDER_KEY_SECRET"
+  log "provider API key stored in Secret/$PROVIDER_KEY_SECRET (referenced as os.environ/$PROVIDER_KEY_ENV)"
 
   log "discovered $count model(s) from $ptype provider; configuring modelList"
 }
@@ -351,6 +374,13 @@ else
   helm_args+=(
     --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
     --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
+  )
+fi
+if [ -n "$PROVIDER_KEY_SECRET" ]; then
+  helm_args+=(
+    --set-string "providerApiKey.secretName=$PROVIDER_KEY_SECRET"
+    --set-string "providerApiKey.secretKey=$PROVIDER_KEY_SECRET_KEY"
+    --set-string "providerApiKey.envName=$PROVIDER_KEY_ENV"
   )
 fi
 if [ -n "$GENERATED_MODELS_FILE" ]; then

@@ -57,6 +57,35 @@ rg -q 'drop_params: false' "$existing_render"
 rg -q -- '- prometheus' "$existing_render"
 rg -q 'disable_spend_logs: true' "$existing_render"
 
+# The provider key reaches the container from a Secret, never from values: a
+# literal api_key in modelList would sit in the release and every revision after
+# it. The knob is three scalars rather than an extraEnv entry because Helm
+# replaces a list wholesale, so appending there would drop the operator's own.
+provider_render="$tmp/provider-render.yaml"
+helm template release "$chart" --values "$values" \
+  --set-string providerApiKey.secretName=release-provider-key \
+  >"$provider_render"
+rg -q 'name: LITELLM_PROVIDER_API_KEY' "$provider_render"
+rg -q 'name: release-provider-key' "$provider_render"
+# the operator's own extraEnv entry survives alongside it
+rg -q 'name: RELEASE_TEST_TOKEN' "$provider_render"
+if rg -q 'name: LITELLM_PROVIDER_API_KEY' "$existing_render"; then
+  echo "provider key env rendered with no providerApiKey.secretName set" >&2
+  exit 1
+fi
+
+# The interactive discovery path writes an os.environ reference, not the key.
+if rg -q 'api_key: os.environ/' "$deploy_script"; then
+  :
+else
+  echo "deploy.sh no longer writes modelList api_key as an os.environ reference" >&2
+  exit 1
+fi
+if rg -q -- '--from-literal=.*pkey|"api_key": api_key' "$deploy_script"; then
+  echo "deploy.sh passes the provider key by argument or embeds it in modelList" >&2
+  exit 1
+fi
+
 generated_render="$tmp/generated-render.yaml"
 helm template release "$chart" \
   --set-string secrets.masterKey=release-master \

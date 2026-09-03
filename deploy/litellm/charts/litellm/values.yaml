@@ -56,6 +56,21 @@ tolerations: []
 #         secretKeyRef: {name: my-litellm-secret, key: hyperloom_apim_key}
 extraEnv: []
 
+# The provider API key referenced by a `modelList` entry written as
+# `api_key: os.environ/<envName>`. Naming a Secret here is what keeps the key
+# out of the release: a literal `api_key` in modelList travels through Helm
+# values and is then readable, in every stored revision, by anyone who can run
+# `helm get values` on the namespace.
+#
+# Kept as three scalars rather than folded into `extraEnv` on purpose. Helm
+# replaces a list wholesale when a later -f sets it, so a wrapper appending its
+# own entry there would silently drop whatever extraEnv the operator's own
+# values file had.
+providerApiKey:
+  secretName: ""
+  secretKey: api_key
+  envName: LITELLM_PROVIDER_API_KEY
+
 # Merged over the chart's litellm_settings defaults (drop_params, set_verbose,
 # and the apim_key_hook callback). Set `callbacks` here to replace that list --
 # include the hook entry if you still want it. This is also where

@@ -117,6 +117,12 @@ in `LiteLLM_ProxyModelTable` — the `api_key` and `extra_headers` fields inside
 them. Issue new credentials at each provider, enter them through the proxy, and
 retire the old ones there.
 
+When you re-enter them, keep them out of Helm values the same way the wrapper
+does: put the key in a Secret, reference it from `modelList` as
+`api_key: os.environ/<NAME>`, and point `providerApiKey` at that Secret so the
+container gets `<NAME>` from it. A literal key under `api_key` in a values file
+lands in the release and in every revision after it.
+
 Re-encrypting instead is not offered here because LiteLLM has no supported path
 for it — `encrypt_value_helper()` takes a `new_encryption_key` argument, but
 nothing in the proxy passes one — and it would not be the remedy in any case:
