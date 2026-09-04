@@ -194,6 +194,25 @@ brain:
   # own default, which for the bash ceiling depends on features.backgroundShell
   # -- see the note there before pinning it.
   bashMaxTimeoutSec: ""
+  # Idle timeout and absolute lifetime for the sandboxes Brain creates, as Go
+  # durations ("6h", "48h"). Sent as Workload Manager create overrides, so an
+  # empty value is not sent at all and the template keeps whatever it says --
+  # which is what every deployment gets until it sets one of these.
+  #
+  # The idle clock is pushed back by activity; the lifetime is not. A sandbox
+  # given a longer idle window without a longer lifetime still dies on schedule
+  # with its work running, so raise them together or not at all. A value that is
+  # not a positive Go duration is refused at startup rather than dropped by the
+  # Workload Manager's parse.
+  #
+  # sessionTimeout is an agent-sandbox concept and only reaches a sandbox when
+  # deployMode is kubernetes. SaFE has no idle clock to map it onto, so in the
+  # default safe mode it does nothing at all -- the startup log names it as an
+  # inert setting rather than letting it read back as applied. maxSessionDuration
+  # is honoured in both modes, and on SaFE it is the ceiling a per-request
+  # deadline is clamped to.
+  sessionTimeout: ""
+  maxSessionDuration: ""
   bashDefaultTimeoutSec: ""
   waitMaxSec: ""
   waitDefaultSec: ""

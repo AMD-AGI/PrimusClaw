@@ -91,8 +91,11 @@ type SandboxOverrides struct {
 	// SessionTimeout overrides the idle timeout (no hard cap).
 	// maxSessionDuration (24h) is the final backstop for sandbox lifetime.
 	SessionTimeout string `json:"sessionTimeout,omitempty"`
-	// MaxSessionDuration overrides the max lifetime.
-	// Capped at backend hard limit (24h) — values exceeding the cap are silently reduced.
+	// MaxSessionDuration overrides the max lifetime. No cap: the value is applied
+	// as given, and DefaultMaxSessionDuration (24h) is only the fallback when
+	// neither this nor the template names one. (This used to claim a 24h cap that
+	// silently reduced longer values. There is no such cap in the code, and a
+	// comment promising one is how a caller decides not to ask for what it needs.)
 	MaxSessionDuration string `json:"maxSessionDuration,omitempty"`
 	// RuntimeClassName overrides the Pod runtime class (e.g. "kata-qemu" for VM isolation).
 	// Only effective for non-WarmPool templates (WarmPool pods are pre-created with fixed runtime).

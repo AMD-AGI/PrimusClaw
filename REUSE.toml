@@ -29,3 +29,17 @@ path = "sandbox/**"
 precedence = "override"
 SPDX-FileCopyrightText = ["The Kubernetes Authors", "Advanced Micro Devices, Inc."]
 SPDX-License-Identifier = "Apache-2.0"
+
+# `goDurationNs` in the file below is a close port of `time.ParseDuration` from
+# the Go standard library -- deliberately so, because the Workload Manager it
+# has to agree with is Go, and a parser that only resembles that one disagrees
+# with it in silence. The bounds, the overflow guards, the uint64 arithmetic and
+# the leadingInt/leadingFraction structure are all taken from the original, so
+# the file carries the Go Authors' copyright and BSD-3-Clause alongside the
+# repository's own MIT. The rest of the file is AMD-authored under MIT; the
+# comment above the function marks where the ported part starts and ends.
+[[annotations]]
+path = "claw/packages/brain/src/config.ts"
+precedence = "override"
+SPDX-FileCopyrightText = ["Advanced Micro Devices, Inc.", "The Go Authors"]
+SPDX-License-Identifier = "MIT AND BSD-3-Clause"

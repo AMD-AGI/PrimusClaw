@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-// Warm pool sizing on rendered CodeInterpreter templates.
+// Deployment-level knobs on rendered CodeInterpreter templates: warm pool size
+// and idle timeout.
 //
 // The size used to be a literal inside the inline fallback skeleton, so it was
 // unreachable for any deployment that mounted its own base ConfigMap or let the
@@ -14,10 +15,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  renderTemplate, templateHashKey, type BaseTemplate,
+  renderTemplate, templateHashKey, lifetimeOverrides, type BaseTemplate,
 } from "../src/sandbox/agent-sandbox-provider.js";
 import type { SandboxCreateParams } from "../src/sandbox/provider.js";
-import { AGENT_SANDBOX_WARM_POOL_SIZE } from "../src/config.js";
+import {
+  AGENT_SANDBOX_WARM_POOL_SIZE, AGENT_SANDBOX_SESSION_TIMEOUT,
+} from "../src/config.js";
 
 const params: SandboxCreateParams = {
   image: "example.io/img:1",
@@ -32,6 +35,7 @@ const foreignBase: BaseTemplate = {
   spec: {
     authMode: "none",
     sessionTimeout: "30m",
+    maxSessionDuration: "48h",
     template: { fromImage: "<PLACEHOLDER>", steps: [] },
   },
 };
@@ -81,4 +85,61 @@ test("a differing pool size would select a differing template", () => {
 
   assert.notEqual(key, key.replace(/warm=\d+/, "warm=99"),
     "the key has to actually vary with the size, not merely mention it");
+});
+
+// --- lifetime overrides ---
+//
+// The sandbox is deleted once `lastActivity + sessionTimeout` passes, and only
+// Router traffic moves lastActivity -- computation inside the pod does not. So
+// the timeout decides whether a job that outlives its agent turn survives, and
+// maxSessionDuration is the deadline underneath it that nothing moves at all.
+// Until these existed every sandbox took 15m and 24h no matter what it was for.
+//
+// They travel as Workload Manager create overrides, not in the rendered
+// template, and that is what these pin: the template name is a content hash, so
+// baking a value into the spec would give every distinct timeout its own
+// CodeInterpreter -- and its own warm pool.
+
+// This process has an empty environment, which is the only case it can pin
+// with a literal: config reads these once at module scope, so a *configured*
+// value needs a process that owns its environment, and that is
+// agent-sandbox-lifetime-overrides.test.ts next door. Written out as `{}`
+// rather than rebuilt from the same constants the implementation is built from
+// -- an expectation assembled that way agrees with the implementation by
+// construction, and would go on agreeing with a broken one.
+test("nothing configured sends nothing at all", () => {
+  assert.deepEqual(lifetimeOverrides(), {});
+});
+
+test("an unset knob is absent, not empty", () => {
+  // An override sent empty is still an override: it would replace a base
+  // template's own value with nothing.
+  const got = lifetimeOverrides();
+  for (const [k, v] of Object.entries(got)) {
+    assert.notEqual(v, "", `${k} was sent as an empty string`);
+  }
+  if (!AGENT_SANDBOX_SESSION_TIMEOUT) {
+    assert.ok(!("sessionTimeout" in got), "nothing was configured, so nothing goes");
+  }
+});
+
+test("neither value reaches the template name", () => {
+  // The regression this exists for: putting them in the hash renamed every
+  // template on upgrade even for deployments that set nothing, orphaning the old
+  // CodeInterpreters and -- with a warm pool -- leaving a pool behind each.
+  const a = templateHashKey(foreignBase, params);
+  const b = templateHashKey(foreignBase, { ...params, image: params.image });
+
+  assert.equal(a, b);
+  assert.ok(!a.includes("idle="), "the key must not carry a lifetime at all");
+  assert.ok(!a.includes("life="));
+});
+
+test("the base template's own lifetime survives rendering", () => {
+  const { spec } = renderTemplate(foreignBase, params);
+
+  assert.equal(spec.sessionTimeout, "30m",
+    "a ConfigMap that set its own value meant it; the override path is how a "
+      + "deployment changes its mind, not the renderer");
+  assert.equal(spec.maxSessionDuration, "48h");
 });

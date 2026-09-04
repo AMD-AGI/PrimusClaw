@@ -22,6 +22,8 @@ import {
   AGENT_SANDBOX_NAMESPACE,
   AGENT_SANDBOX_TEMPLATE_FILE,
   AGENT_SANDBOX_WARM_POOL_SIZE,
+  AGENT_SANDBOX_SESSION_TIMEOUT,
+  AGENT_SANDBOX_MAX_SESSION_DURATION,
 } from "../config.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -56,6 +58,12 @@ function buildFallbackSpec(): Record<string, unknown> {
   return {
     authMode: "none",
     runtimePolicy: "agent-default",
+    // The platform's own defaults, restated so the skeleton is self-contained.
+    // Not a ceiling either of them: the Workload Manager takes both per template
+    // and per request and says so ("no hard cap"). A deployment that wants
+    // different numbers sets AGENT_SANDBOX_SESSION_TIMEOUT /
+    // AGENT_SANDBOX_MAX_SESSION_DURATION, which are sent as create overrides and
+    // win over whatever the template carries -- including these.
     sessionTimeout: "15m",
     maxSessionDuration: "24h",
     template: {
@@ -131,6 +139,31 @@ function extractHost(entryPoint?: string): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * The lifetime overrides every sandbox this deployment creates is built with.
+ *
+ * Sent as Workload Manager create overrides rather than written into the
+ * rendered template, which is the difference between a knob and a template
+ * explosion: the template name is a content hash, so a value baked into the
+ * spec would make every distinct timeout its own CodeInterpreter, and its own
+ * warm pool. An empty one is simply not sent, so a base template that set its
+ * own value keeps it.
+ *
+ * Deployment-wide on purpose, for now. A per-request version needs more than a
+ * field on this type: the value has to reach here through the protocol and the
+ * request normalisation, and it has to join the sandbox reuse fingerprint --
+ * without that last part a session would happily reuse a pod built with a
+ * different lifetime and the caller's value would silently not apply. That is
+ * its own change, and it wants the caller that needs it in the same one.
+ */
+export function lifetimeOverrides(): Record<string, string> {
+  return {
+    ...(AGENT_SANDBOX_SESSION_TIMEOUT ? { sessionTimeout: AGENT_SANDBOX_SESSION_TIMEOUT } : {}),
+    ...(AGENT_SANDBOX_MAX_SESSION_DURATION
+      ? { maxSessionDuration: AGENT_SANDBOX_MAX_SESSION_DURATION } : {}),
+  };
 }
 
 /**
@@ -235,6 +268,7 @@ export class AgentSandboxProvider implements SandboxProvider {
         overrides: {
           environment: params.env,
           ...(params.labels ? { labels: params.labels } : {}),
+          ...lifetimeOverrides(),
         },
       }),
       timeoutMs: CREATE_TIMEOUT_MS,

@@ -254,6 +254,10 @@ spec:
         # another is worse than either number on its own.
         - name: BASH_MAX_TIMEOUT_SEC
           value: {{ .Values.brain.bashMaxTimeoutSec | quote }}
+        - name: AGENT_SANDBOX_SESSION_TIMEOUT
+          value: {{ .Values.brain.sessionTimeout | quote }}
+        - name: AGENT_SANDBOX_MAX_SESSION_DURATION
+          value: {{ .Values.brain.maxSessionDuration | quote }}
         - name: BASH_DEFAULT_TIMEOUT_SEC
           value: {{ .Values.brain.bashDefaultTimeoutSec | quote }}
         - name: WAIT_MAX_SEC

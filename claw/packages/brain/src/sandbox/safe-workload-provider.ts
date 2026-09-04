@@ -16,6 +16,7 @@ import pino from "pino";
 import {
   SAFE_API_URL,
   SANDBOX_DEFAULT_TIMEOUT_SECONDS,
+  AGENT_SANDBOX_MAX_SESSION_SECONDS,
   SANDBOX_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
   SANDBOX_ROUTER_URL,
@@ -37,6 +38,54 @@ import type {
 const logger = pino({ name: "safe-workload-provider" });
 const HANDS_MCP_PORT = "9100";
 
+/** The run deadline gets an hour of room to be stopped in; a ceiling does not. */
+const SHUTDOWN_BUFFER_SECONDS = 3600;
+
+/**
+ * How long SaFE lets this workload run, in seconds.
+ *
+ * Not the same clock as agent-sandbox. `maxSessionDuration` there becomes an
+ * absolute ShutdownTime from creation; SaFE measures `timeout` from
+ * `Status.StartTime` and explicitly does not count queue time. So this is a cap
+ * on running, not on existing, and a workload that sat in the queue for an hour
+ * gets that hour on top. Close enough in intent to carry the same setting --
+ * both answer "do not let this run forever" -- and not close enough to describe
+ * as the same guarantee.
+ *
+ * The knob was reaching neither backend on a `safe` deployment, which is where
+ * this started: CLAW_DEPLOY_MODE picks the provider, "kubernetes" gets
+ * agent-sandbox and everything else including unset falls here, and only the
+ * other one was wired. Setting 48h left every Sandbox on the 24h that
+ * SANDBOX_DEFAULT_TIMEOUT_SECONDS put there, with no error and no warning.
+ *
+ * A ceiling caps, it does not merely default. An explicit run deadline is still
+ * honoured, and still gets the shutdown buffer -- that hour is the room the
+ * platform needs to stop a run cleanly at its deadline -- but the result is
+ * clamped: a caller asking for longer than the deployment allows gets the
+ * deployment's answer, which is what a maximum means. Without the clamp the
+ * setting was a default wearing a ceiling's name, and any caller naming a
+ * timeout walked straight past it.
+ *
+ * AGENT_SANDBOX_SESSION_TIMEOUT is deliberately absent, and startup says so
+ * rather than leaving it silently inert. It is an *idle* timeout -- reclaim once
+ * nothing has touched the sandbox for this long -- and SaFE's Workload has no
+ * such concept: `timeout` runs whether or not anyone is using it, and
+ * `ttlSecondsAfterFinished` is cleanup after the workload ends. Mapping it onto
+ * either would make the setting look like it took effect while doing something
+ * else.
+ *
+ * Takes the ceiling as an argument rather than reading the module constant, so
+ * every branch is reachable in one process: the constant is resolved at import.
+ */
+export function workloadTimeoutSeconds(
+  timeoutSec: number | undefined,
+  ceilingSec: number | null,
+): number {
+  if (timeoutSec === undefined) return ceilingSec ?? SANDBOX_DEFAULT_TIMEOUT_SECONDS;
+  const wanted = timeoutSec + SHUTDOWN_BUFFER_SECONDS;
+  return ceilingSec === null ? wanted : Math.min(wanted, ceilingSec);
+}
+
 export class SafeWorkloadProvider implements SandboxProvider {
   readonly kind = "safe-workload" as const;
 
@@ -44,10 +93,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     const ns = params.namespace || SANDBOX_NAMESPACE;
     const apiKey = params.platformKey ?? "";
 
-    const SHUTDOWN_BUFFER_SECONDS = 3600;
-    const timeout = params.timeoutSec !== undefined
-      ? params.timeoutSec + SHUTDOWN_BUFFER_SECONDS
-      : SANDBOX_DEFAULT_TIMEOUT_SECONDS;
+    const timeout = workloadTimeoutSeconds(params.timeoutSec, AGENT_SANDBOX_MAX_SESSION_SECONDS);
 
     const workloadBody: Record<string, unknown> = {
       displayName: sandboxWorkloadName(),
