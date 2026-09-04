@@ -124,6 +124,11 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- `GET /v1/runs` no longer answers 500 when a query parameter is given twice.
+  A repeated key parses to an array, and the handler read every parameter as a
+  string, so `?ids=a&ids=b` — and the same for `state` and `since` — reached a
+  `TypeError` and reported the server as broken rather than the request. Any
+  repeated parameter is now a 400 (`repeated_query_parameter`).
 - The prompt-cache loss counter no longer misses the turn after a NATS
   redelivery, no longer reports the anchor breakpoint's fixed distance as a
   broken marker chain, no longer claims the provider reported cache fields it
@@ -183,6 +188,23 @@ record it.
   numbers — they were wrong.
 
 ### Added
+- `run_id` on the responses that start a run, so a caller can read back the run
+  it just began. `POST /v1/sessions` with a `message` reports it at
+  `data.message.run_id`, and `POST /v1/sessions/{id}/messages` at the top level
+  when the message is dispatched rather than queued. Both previously returned
+  only a session ID and a message ID, neither of which names a run: a session
+  owns many runs, so a caller polling `/v1/runs` had to guess which entry was
+  its own. A message accepted while the session is busy still answers
+  `{"queued": true}` with no `run_id` — its run row is opened later, when the
+  queue drains — and `POST /v1/sessions` without a `message` starts no run and
+  reports none. Additive; no existing field changed.
+- `session_id` on every `/v1/runs` result, and a `?session_ids=` filter for
+  enumerating the runs of one or more sessions. This is a collection filter for
+  discovery and reconciliation, not a second way of naming a run: it returns
+  every run a session owns, so `requested` counts sessions asked about rather
+  than runs to expect back. At most 350 session IDs and 1000 returned runs per
+  call, each refused (`too_many_ids`, `too_many_runs`) rather than trimmed.
+  See [`claw/docs/run-api.md`](claw/docs/run-api.md).
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
   Agent Sandbox control-plane fork (`sandbox/`), the long-term memory plane
   (`memory/`), and the whole-stack installer.

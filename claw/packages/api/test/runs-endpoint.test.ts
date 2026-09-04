@@ -16,11 +16,23 @@
  *   R5 equal timestamps paginate by task id without overlap
  *   R6 malformed cursors and limits fail before querying
  *   R7 the database index follows the cursor's complete ordering
+ *   S1 a run answers to its session id and carries it back
+ *   S2 the task-id form is unchanged by the session-id one
+ *   S3 session ids obey the ownership scope
+ *   S4 too many session ids is refused at the lower cap
+ *   S5 naming runs both ways at once is refused
+ *   S6 the session-id cap keeps a full call inside the transport limit
+ *   S7 an empty parameter is still the caller naming it
+ *   S8 a parameter given twice is refused, not stringified into nonsense
+ *   S9 the cap counts ids after de-duplication
+ *   S10 a session query wider than a page is refused whole
  */
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { maxHeaderSize } from "node:http";
+import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { db } from "../src/infra/db.js";
@@ -31,12 +43,15 @@ let app: FastifyInstance;
 let lastParams: unknown[] = [];
 let lastSql = "";
 let queryCalls = 0;
+/** Who the request is from, for the tests that care. Null is unauthenticated. */
+let caller: { userId: string; roles: string[] } | null = null;
 
 before(async () => {
   app = Fastify();
-  // No auth hook: the app registers one globally in index.ts, and an
-  // unauthenticated request here simply scopes to the empty user -- which is
-  // what the stubbed query ignores.
+  // Stands in for the auth hook index.ts registers globally, so the ownership
+  // scope has a caller to resolve. Null by default, which leaves every test that
+  // does not set one scoped to the empty user -- what they already assumed.
+  app.addHook("onRequest", async (req) => { (req as unknown as { user: unknown }).user = caller; });
   await registerRunRoutes(app);
   await app.ready();
 });
@@ -60,6 +75,32 @@ function serve(rows: unknown[]): void {
     lastSql = text.replace(/\s+/g, " ").trim();
     lastParams = params;
     return { rows, rowCount: rows.length };
+  }) as typeof db.query;
+}
+
+/** The ownership predicate the route is expected to add, and the param holding the user. */
+const SCOPE_CLAUSE
+  = /AND session_id IN \(SELECT session_id FROM claw_sessions WHERE user_id = \$(\d+)\)/;
+
+/**
+ * A stub that applies the ownership predicate instead of ignoring it.
+ *
+ * `serve` hands back its rows whatever the SQL says, which is fine for shape
+ * assertions and worthless for a scope one -- a route that dropped the clause
+ * altogether would still pass. This reads the clause out of the statement and
+ * enforces it against `owners`, so the test fails when the predicate is missing
+ * rather than only when it is misspelt.
+ */
+function serveOwned(rows: Array<Record<string, unknown>>, owners: Record<string, string>): void {
+  db.query = (async (text: string, params: unknown[] = []) => {
+    queryCalls++;
+    lastSql = text.replace(/\s+/g, " ").trim();
+    lastParams = params;
+    const scoped = SCOPE_CLAUSE.exec(lastSql);
+    const visible = scoped
+      ? rows.filter((r) => owners[String(r.session_id)] === params[Number(scoped[1]) - 1])
+      : rows;
+    return { rows: visible, rowCount: visible.length };
   }) as typeof db.query;
 }
 
@@ -267,6 +308,276 @@ test("R23 a short page ends the walk", async () => {
   serve([row("ktsk_a")]);
   const body = (await app.inject({ method: "GET", url: "/v1/runs?state=terminal&limit=2" })).json();
   assert.ok(!body.next_cursor, "nothing left to continue from");
+});
+
+// ── Naming runs by session ───────────────────────────────────────────────────
+//
+// The dispatcher above Claw never holds a `ktsk_...` id. It has the session id
+// `POST /v1/sessions` returned, and against a task-id-only route that produced
+// the worse of the two failures available: `?ids=<session id>` answered 200 with
+// an empty array, which is what "none of these have finished yet" looks like, so
+// a caller polling with the wrong key was told a plausible thing forever.
+
+test("S1 a run answers to its session id and carries it back", async () => {
+  const sessionId = "9e0cab58-c73c-4a3e-9324-9e095aa1582e";
+  serve([row("ktsk_a", { session_id: sessionId })]);
+  const resp = await app.inject({ method: "GET", url: `/v1/runs?session_ids=${sessionId}` });
+
+  assert.equal(resp.statusCode, 200);
+  assert.match(lastSql, /WHERE session_id = ANY\(\$1\)/, "matched on the wrong column");
+  assert.deepEqual(lastParams[0], [sessionId]);
+  const body = resp.json() as { runs: Array<{ run_id: string; session_id: string }>; requested: number };
+  assert.equal(body.requested, 1);
+  assert.deepEqual(body.runs.map((r) => [r.run_id, r.session_id]), [["ktsk_a", sessionId]]);
+});
+
+test("S1b the single-run form carries the session id too", async () => {
+  // Without it a caller that resolved one run by task id still cannot join the
+  // answer back to the session it dispatched under.
+  serve([row("ktsk_a", { session_id: "sess-1" })]);
+  const resp = await app.inject({ method: "GET", url: "/v1/runs/ktsk_a" });
+  assert.equal(resp.statusCode, 200);
+  assert.equal((resp.json() as { session_id: string }).session_id, "sess-1");
+});
+
+test("S1c one session answers with every run it owns", async () => {
+  // A session is the many side: a DAG expands to a root plus a row per node, a
+  // batch to one of those per input, a chat to a row per turn. So `requested`
+  // counts sessions asked about, not runs to expect, and the caller groups on
+  // the `session_id` each run carries.
+  const sessionId = "e2f1a0d4-6b3c-4a71-9f52-0c8d7e6b5a49";
+  serve([
+    row("ktsk_root", { session_id: sessionId }),
+    row("ktsk_n1", { session_id: sessionId }),
+    row("ktsk_n2", { session_id: sessionId }),
+  ]);
+  const body = (await app.inject({
+    method: "GET", url: `/v1/runs?session_ids=${sessionId}`,
+  })).json() as { runs: Array<{ session_id: string }>; requested: number };
+
+  assert.equal(body.requested, 1, "one session was named");
+  assert.equal(body.runs.length, 3, "and it owns three runs");
+  assert.ok(body.runs.every((r) => r.session_id === sessionId), "all grouped under it");
+  // Rows written inside one transaction share NOW(), so created_at ties are the
+  // normal case here and need a tiebreaker or the page order is arbitrary.
+  assert.match(lastSql, /ORDER BY created_at, task_id/);
+});
+
+test("S2 the task-id form is unchanged by the session-id one", async () => {
+  serve([row("ktsk_a")]);
+  const resp = await app.inject({ method: "GET", url: "/v1/runs?ids=ktsk_a,ktsk_b" });
+
+  assert.equal(resp.statusCode, 200);
+  assert.match(lastSql, /WHERE task_id = ANY\(\$1\)/, "the task-id predicate moved");
+  assert.deepEqual(lastParams[0], ["ktsk_a", "ktsk_b"]);
+  const body = resp.json() as { runs: unknown[]; requested: number };
+  assert.equal(body.requested, 2, "still the ids named");
+  assert.equal(body.runs.length, 1, "and a miss is still absent rather than invented");
+});
+
+test("S3 session ids obey the ownership scope", async () => {
+  // The scope is the whole reason this is not an open lookup: a run id plus a
+  // node name is a map of who is running what and where. Another tenant's
+  // session must come back absent -- not 404, which would confirm it exists, and
+  // certainly not rendered.
+  const mine = "11111111-1111-4111-8111-111111111111";
+  const theirs = "22222222-2222-4222-8222-222222222222";
+  caller = { userId: "u-mine", roles: [] };
+  try {
+    serveOwned(
+      [row("ktsk_mine", { session_id: mine }), row("ktsk_theirs", { session_id: theirs })],
+      { [mine]: "u-mine", [theirs]: "u-other" },
+    );
+    const resp = await app.inject({
+      method: "GET", url: `/v1/runs?session_ids=${mine},${theirs}`,
+    });
+
+    assert.equal(resp.statusCode, 200, "a foreign session is absent, not an error");
+    assert.match(lastSql, SCOPE_CLAUSE, "the batch read was not scoped at all");
+    assert.ok(lastParams.includes("u-mine"), "the caller was not bound to the scope");
+    const body = resp.json() as { runs: Array<{ run_id: string }>; requested: number };
+    assert.deepEqual(body.runs.map((r) => r.run_id), ["ktsk_mine"]);
+    assert.equal(body.requested, 2, "both ids were asked about, one was not answerable");
+  } finally {
+    caller = null;
+  }
+});
+
+test("S4 too many session ids is refused at the lower cap", async () => {
+  serve([]);
+  const before = queryCalls;
+  const ids = Array.from({ length: 351 }, () => randomUUID());
+  const resp = await app.inject({ method: "GET", url: `/v1/runs?session_ids=${ids.join(",")}` });
+
+  assert.equal(resp.statusCode, 400);
+  const body = resp.json() as { error: string; max_ids: number };
+  assert.equal(body.error, "too_many_ids");
+  assert.equal(body.max_ids, 350, "the refusal must name the cap that applied");
+  assert.equal(queryCalls, before, "over-long input was trimmed and queried anyway");
+});
+
+test("S5 naming runs both ways at once is refused", async () => {
+  // Not intersected: when the two disagree an intersection is an empty array,
+  // which reads as "nothing finished" to the caller that is already unsure which
+  // key it holds.
+  serve([row("ktsk_a")]);
+  const before = queryCalls;
+  const resp = await app.inject({
+    method: "GET", url: "/v1/runs?ids=ktsk_a&session_ids=11111111-1111-4111-8111-111111111111",
+  });
+
+  assert.equal(resp.statusCode, 400);
+  assert.equal((resp.json() as { error: string }).error, "ids_and_session_ids_are_exclusive");
+  assert.equal(queryCalls, before, "one of the two parameters won silently");
+});
+
+test("S5b an empty session_ids list is refused by name", async () => {
+  serve([]);
+  const resp = await app.inject({ method: "GET", url: "/v1/runs?session_ids=%2C%2C" });
+  assert.equal(resp.statusCode, 400);
+  assert.match((resp.json() as { error: string }).error, /^session_ids /);
+});
+
+test("S6 the session-id cap keeps a full call inside the transport limit", async () => {
+  // Why the session cap sits below the task-id one, asserted rather than left in
+  // a comment. A session id is a UUID against a task id's 31 characters, so the
+  // task-id ceiling applied here overruns Node's request-line-and-headers limit
+  // and the caller gets a bare HTTP 431 naming no size -- the exact failure the
+  // cap exists to turn into a readable 400.
+  //
+  // The cap is read back off the route's own refusal rather than written down
+  // here, so raising the constant fails this instead of quietly outgrowing it.
+  serve([]);
+  const refusal = await app.inject({
+    method: "GET",
+    url: `/v1/runs?session_ids=${Array.from({ length: 1000 }, () => randomUUID()).join(",")}`,
+  });
+  assert.equal(refusal.statusCode, 400);
+  const cap = (refusal.json() as { max_ids: number }).max_ids;
+
+  const requestLine = `GET /v1/runs?session_ids=${
+    Array.from({ length: cap }, () => randomUUID()).join(",")
+  } HTTP/1.1\r\n`.length;
+  // Room for what a real client sends alongside: bearer token, host, user-agent,
+  // accept, tracing headers.
+  const headroom = 2048;
+  assert.ok(
+    requestLine + headroom < maxHeaderSize,
+    `a full ${cap}-session call is ${requestLine}B of request line, which passes the `
+    + `${maxHeaderSize}B limit once ${headroom}B of headers are added -- callers at the `
+    + `documented cap would get HTTP 431, not an answer`,
+  );
+});
+
+// ── What a malformed query answers ───────────────────────────────────────────
+//
+// These three used to be read as "the parameter is absent", which is a
+// different request from the one that was sent. Two of them answered something
+// plausible for the wrong request; the third reached a string method on an
+// array and surfaced a TypeError as a 500, telling the caller the server was
+// broken when it was the query that was.
+
+test("S7 an empty parameter is still the caller naming it", async () => {
+  serve([]);
+  const before = queryCalls;
+
+  // Read as absent, this fell through to the terminal listing and complained
+  // about `state` -- naming neither the parameter the caller sent nor what was
+  // wrong with it.
+  const empty = await app.inject({ method: "GET", url: "/v1/runs?session_ids=" });
+  assert.equal(empty.statusCode, 400);
+  assert.equal((empty.json() as { error: string }).error, "session_ids must not be empty");
+
+  // And read as absent here, only one parameter appeared to be present, so the
+  // exclusivity rule did not fire and the request was answered -- which is the
+  // confused caller the rule exists to refuse.
+  for (const url of [
+    "/v1/runs?ids=&session_ids=s-1",
+    "/v1/runs?session_ids=&ids=ktsk_1",
+  ]) {
+    const both = await app.inject({ method: "GET", url });
+    assert.equal(both.statusCode, 400, url);
+    assert.equal(
+      (both.json() as { error: string }).error, "ids_and_session_ids_are_exclusive", url,
+    );
+  }
+  assert.equal(queryCalls, before, "a malformed query reached the database");
+});
+
+test("S8 a parameter given twice is refused, not stringified into nonsense", async () => {
+  // A repeated key parses to an array, and every reader below is written for a
+  // string: `.split` on the id parameters, `.trim` on `state` and `since`. Each
+  // was a 500. Refused rather than joined or last-one-wins, both of which pick
+  // a value the caller did not ask for.
+  serve([]);
+  const before = queryCalls;
+  for (const [param, url] of [
+    ["ids", "/v1/runs?ids=ktsk_1&ids=ktsk_2"],
+    ["session_ids", "/v1/runs?session_ids=s-1&session_ids=s-2"],
+    ["state", "/v1/runs?state=terminal&state=terminal"],
+    ["since", "/v1/runs?state=terminal&since=2026-09-01T00:00:00Z&since=2026-09-02T00:00:00Z"],
+    ["limit", "/v1/runs?state=terminal&limit=1&limit=2"],
+    ["cursor", "/v1/runs?state=terminal&cursor=e30&cursor=e30"],
+  ] as const) {
+    const res = await app.inject({ method: "GET", url });
+    assert.equal(res.statusCode, 400, url);
+    const body = res.json() as { error: string; detail: string };
+    assert.equal(body.error, "repeated_query_parameter", url);
+    assert.match(body.detail, new RegExp(`^${param} `), "the refusal names the parameter");
+  }
+  assert.equal(queryCalls, before, "a malformed query reached the database");
+});
+
+test("S9 the cap counts ids after de-duplication", async () => {
+  // The cap exists to keep the request line under the transport limit, and a
+  // repeated id costs bytes there -- but it is `parseIds` that decides how many
+  // ids there are, so the two have to agree on which count is checked. A caller
+  // whose list repeats must not be refused for a width it did not ask for.
+  const unique = Array.from({ length: 350 }, () => randomUUID());
+  serve([]);
+  const atCap = await app.inject({
+    method: "GET",
+    url: `/v1/runs?session_ids=${[...unique, ...unique.slice(0, 50)].join(",")}`,
+  });
+  assert.equal(atCap.statusCode, 200, "700 ids naming 350 sessions is within the cap");
+  assert.equal((atCap.json() as { requested: number }).requested, 350);
+  assert.deepEqual(lastParams[0], unique, "and the query asks for each one once");
+
+  const overCap = await app.inject({
+    method: "GET",
+    url: `/v1/runs?session_ids=${[...unique, randomUUID()].join(",")}`,
+  });
+  assert.equal(overCap.statusCode, 400, "one distinct session past the cap is over it");
+  assert.equal((overCap.json() as { error: string }).error, "too_many_ids");
+});
+
+test("S10 a session query wider than a page is refused whole", async () => {
+  // The `?ids=` cap bounds its own answer -- task_id is the primary key, so 500
+  // ids are at most 500 rows. A session owns any number of runs, so the size of
+  // this answer is set by history rather than by the request, and one call
+  // could load and serialise the lot.
+  const oneSession = "9e0cab58-c73c-4a3e-9324-9e095aa1582e";
+  serve(Array.from({ length: 1001 }, (_, i) => row(`ktsk_${i}`, { session_id: oneSession })));
+
+  const res = await app.inject({ method: "GET", url: `/v1/runs?session_ids=${oneSession}` });
+
+  assert.equal(res.statusCode, 400);
+  const body = res.json() as { error: string; max_runs: number };
+  assert.equal(body.error, "too_many_runs");
+  assert.equal(body.max_runs, 1000, "the refusal names the ceiling that applied");
+  assert.match(lastSql, /LIMIT 1001/, "one row past the ceiling, to know there is a next one");
+});
+
+test("S10b a session query exactly at the ceiling is answered", async () => {
+  // The other side of the boundary. Refusing here would make the ceiling a
+  // silent 999, and a caller reconciling a wide session would lose a run.
+  const oneSession = "e2f1a0d4-6b3c-4a71-9f52-0c8d7e6b5a49";
+  serve(Array.from({ length: 1000 }, (_, i) => row(`ktsk_${i}`, { session_id: oneSession })));
+
+  const res = await app.inject({ method: "GET", url: `/v1/runs?session_ids=${oneSession}` });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal((res.json() as { runs: unknown[] }).runs.length, 1000);
 });
 
 test("R24 a malformed terminal row never produces a cursor the API rejects itself", async () => {
