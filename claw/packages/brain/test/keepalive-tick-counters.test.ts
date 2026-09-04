@@ -3,10 +3,10 @@
 
 // A stalled reclaim loop has to look different from a quiet one.
 //
-// Every branch of the background-work decision was logged except the one the
-// fleet got stuck in. `unknown` -> keep emitted nothing, so four hours of zero
-// reclaims -- 8 sandboxes pinned, three of them 16h old, nothing bounding them
-// but the CR's 24h deadline -- produced the same logs as a healthy idle fleet,
+// Every branch of the background-work decision was logged except the one a
+// stalled fleet sits in. `unknown` -> keep emitted nothing, so a run of ticks
+// that reclaimed nothing -- idle sandboxes pinned with nothing bounding them but
+// the CR's absolute deadline -- produced the same logs as a healthy idle fleet,
 // and the cause could only be found by shipping a debug build with tracing in
 // it.
 //

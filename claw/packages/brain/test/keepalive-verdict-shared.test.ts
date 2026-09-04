@@ -5,16 +5,14 @@
 //
 // The background-work answer was kept only in the deciding process's memory,
 // and reaped at the end of any sweep that did not see the identity. On a
-// multi-replica Brain a sweep walks a rotating slice of the handles -- one per
-// tick on the cluster where this was found -- so "not seen this tick" is the
-// ordinary state of a live sandbox, and every answer was discarded about a
-// minute after it was written, tens of minutes before the sweep that would have
-// read it.
+// multi-replica Brain a sweep walks a rotating slice of the handles -- as few as
+// one per tick -- so "not seen this tick" is the ordinary state of a live
+// sandbox, and every answer was discarded within a tick or two of being written,
+// long before the sweep that would have read it.
 //
 // `unknown` was then the permanent answer. `unknown` is the branch that keeps
-// the handle, so idle sandboxes were pinged until the CR's 24h absolute
-// deadline and the control plane never reclaimed one: zero idle reclaims fleet
-// -wide in the four hours after the probe shipped.
+// the handle, so idle sandboxes were pinged until the CR's absolute deadline and
+// the control plane reclaimed none of them.
 //
 // These pin the two halves of the repair: the answer is written where another
 // process can read it, and absence from a sweep is no longer what discards it.
@@ -149,7 +147,7 @@ test("a sweep that does not see the handle does not discard its verdict", async 
     backgroundWorkStateSizesForTest().cache > 0,
     "the handle was not seen, which on a multi-replica Brain is most ticks for "
       + "most handles; discarding the answer on that basis is what made `unknown` "
-      + "permanent and pinned every idle sandbox to its 24h deadline",
+      + "permanent and pinned every idle sandbox to its absolute deadline",
   );
 });
 
@@ -311,10 +309,14 @@ test("a verdict is not stamped onto whatever took the key while the probe was ou
 // streak has to survive, and it is not the one the shared verdict is sized for.
 // A verdict is read by whichever replica sweeps next; a streak is in-process, so
 // only the replica that failed can add to it, and it waits out the rotation
-// multiplied by the replica count. Measured at about thirty-six minutes here
-// against a thirty-minute memory: every failure aged out before the same replica
-// could fail again, the count never left one, and the give-up path existed
-// without ever being able to fire.
+// multiplied by the replica count -- tens of minutes even on a small fleet, and
+// longer on a bigger one. Against a thirty-minute memory that is the bug: every
+// failure aged out before the same replica could fail again, the count never
+// left one, and the give-up path existed without ever being able to fire.
+//
+// The interval below stands for that scale rather than for any one deployment's
+// number. What the test pins is the ordering -- a memory shorter than the
+// revisit interval can never accumulate a streak -- not the value.
 const SAME_REPLICA_REVISIT_MS = 36 * 60_000;
 
 test("a run of failures accumulates across the interval the same replica returns on", async () => {
@@ -1018,15 +1020,117 @@ test("a `running` on the handle is not outranked by a local `idle` with a later 
   );
 });
 
+test("an `idle` answer landing late does not overwrite a `running` one from the same period", async () => {
+  // The read side prefers `running` from either copy, and that only decides
+  // anything while both answers exist to be compared. One verdict is kept per
+  // handle, so the write side is where an answer can be made to stop existing:
+  // whichever probe persists last is what every later sweep reads, and the two
+  // probes are on different replicas with no ordering between them.
+  //
+  // Nothing above catches it. The identity check says the entry still names the
+  // sandbox that was probed, and the period checks say it is still in the idle
+  // period that was probed. Both are true of the loser of this race -- it is the
+  // same sandbox and the same period; it is simply the less authoritative answer
+  // about them, and it arrives second.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // A handle in a fully named idle period with nothing measured in it yet: the
+  // sweep stamps the period, and the verdict it files is then stripped so the
+  // race below starts from no answer at all.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = { ...k.current() };
+  for (const f of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"]) {
+    delete stamped[f];
+  }
+  assert.equal(typeof stamped.idleEpoch, "number", "sanity: the period has to be named");
+  assert.equal(typeof stamped.idleRev, "number", "sanity: on both halves of its name");
+  k.replace(stamped);
+  resetBackgroundWorkStateForTest();
+
+  // This replica's probe answers `idle` and then blocks before it can file the
+  // answer. The run-lease read is that suspension point in the real path, and
+  // it is a KV read, so it is where the delay is injected.
+  let releaseLease: (() => void) | null = null;
+  const leaseInFlight = new Promise<void>((r) => { releaseLease = r; });
+  let leaseAsked = false;
+  const slow = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) {
+      if (key.startsWith("lock.")) {
+        leaseAsked = true;
+        await leaseInFlight;
+        return null;   // no lease, so `held` is false and the `idle` would be filed
+      }
+      return k.kv.get(key);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({ kv: slow, countActiveShells: async () => 0 });
+  await new Promise((r) => setImmediate(r));
+  assert.ok(leaseAsked, "sanity: the answer has to be in flight, not already written");
+  assert.equal(
+    k.current().bgRunning, undefined,
+    "sanity: and nothing may be on the handle while it is",
+  );
+
+  // Another replica probes the same handle in the same period, finds a shell,
+  // and gets its answer onto the entry first. Everything it writes is about the
+  // period the entry is still in, so it is believed by every reader.
+  const publishedAt = Date.now();
+  k.replace({
+    ...stamped,
+    bgRunning: 1,
+    bgCheckedAt: publishedAt,
+    bgEpoch: stamped.idleEpoch,
+    bgIdleSince: stamped.idleSince,
+    bgIdleRev: stamped.idleRev,
+    // The revision that write was conditioned on, which is what names it.
+    bgRev: (stamped.idleRev as number) + 3,
+  });
+
+  // And now the slow answer lands. Same sandbox, same period, so it clears every
+  // guard that was there before this one.
+  releaseLease!();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    k.current().bgRunning, 1,
+    "an `idle` measured before another replica saw a shell must not be the last "
+      + "word about the period they both measured -- one verdict is kept, and "
+      + "overwriting the `running` one erases the only record that work is there",
+  );
+  assert.equal(
+    k.current().bgCheckedAt, publishedAt,
+    "and the `running` verdict has to survive intact rather than be re-stamped, "
+      + "because its stamp is the anchor the reuse window is moved against",
+  );
+
+  // Which is the whole point: a third replica, with no memory of either probe,
+  // reads the entry and decides the pod on it.
+  resetBackgroundWorkStateForTest();
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the handle was reclaimed on an `idle` that lost a race it had no business "
+      + "winning, with a background shell still running in the sandbox",
+  );
+});
+
 // --- an inference has to survive long enough to be read ---
 
 test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
   // The give-up answer is kept in this process only, which is right -- it is a
   // statement about one replica's reach, not a measurement to publish. But that
   // makes the replica that inferred it the only one that can read it, so it has
-  // to survive until THAT replica walks the handle again: the same thirty-six
-  // minute gap the streak above is sized for, not the five minutes a measured
-  // answer is reused for.
+  // to survive until THAT replica walks the handle again: the same
+  // rotation-times-replica-count gap the streak above is sized for, not the five
+  // minutes a measured answer is reused for.
   //
   // Under the short lifetime the inference expired unread every time. The
   // handle was probed again, the probes failed again, the streak gave up again

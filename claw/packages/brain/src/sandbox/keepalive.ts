@@ -126,8 +126,8 @@ interface HandsKvEntry {
    *
    * On the handle rather than only in memory because the sweep that asks and the
    * sweep that reads are not the same process. A Brain replica walks a rotating
-   * slice of the handles -- one per tick on this cluster -- so a given handle
-   * comes back to a given replica on the order of tens of minutes, and any
+   * slice of the handles -- as few as one per tick -- so a given handle comes
+   * back to a given replica on the order of tens of minutes, and any
    * in-process cache has expired by then even when nothing evicts it. Left
    * in-memory the verdict is written by whoever probed and read by nobody: every
    * sweep sees `unknown`, `unknown` is the keep branch, and an idle handle whose
@@ -193,6 +193,22 @@ interface HandsKvEntry {
    * witnessed at all.
    */
   bgIdleRev?: number;
+  /**
+   * The revision the write that published this verdict was conditioned on.
+   *
+   * Names the verdict itself, the way `idleRev` names an idle period and for the
+   * same reason: the bucket accepts one write per revision of a key and hands
+   * out a strictly greater one each time, so no two verdict-publishing writes
+   * can ever carry the same value. `bgCheckedAt` cannot do this on its own --
+   * it is a clock reading taken on whichever replica probed, and two replicas
+   * can read the same millisecond.
+   *
+   * Read by persistVerdict, to tell the verdict a probe went out under from one
+   * a different replica published while that probe was still in the air. Absent
+   * on verdicts written before this field existed, where the stamp beside it is
+   * the only half of the comparison available.
+   */
+  bgRev?: number;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -450,6 +466,7 @@ export function markHandsIdle(
       delete info.bgEpoch;
       delete info.bgIdleSince;
       delete info.bgIdleRev;
+      delete info.bgRev;
       // Same reason, for the clock those verdicts moved: work seen during the
       // last idle period says nothing about this one. `reuseWindowStart` would
       // ignore it anyway -- the stamp above is later than anything from before
@@ -539,15 +556,15 @@ const BG_VERDICT_TTL_MS = 30 * 60_000;
  * Each failure re-stamps the entry, so this only has to outlive the gap between
  * two consecutive probes of the same identity -- not the whole run of five. But
  * that gap is not the one BG_VERDICT_TTL_MS is sized for. A verdict is read by
- * whichever replica sweeps next, so it has to survive until ANY replica returns
- * to the handle -- about six minutes here. A streak is in-process, owned by the
- * replica that failed, so it has to survive until THAT replica returns, which is
- * the same rotation multiplied by the replica count: about thirty-six minutes on
- * this cluster, and more on a bigger one or a larger bucket of handles. Thirty
- * minutes is inside that gap, so every failure aged out before the same replica
- * could fail again and the streak never left one.
+ * whichever replica sweeps next, so it has to survive one rotation of the
+ * handles. A streak is in-process, owned by the replica that failed, so it has
+ * to survive until THAT replica returns, which is that same rotation multiplied
+ * by the replica count -- tens of minutes even on a small fleet, and longer on a
+ * bigger one or a larger bucket of handles. A lifetime shorter than that is what
+ * made the give-up path unreachable: every failure aged out before the same
+ * replica could fail again, so the streak never left one.
  *
- * Four hours is that measured gap with room for a fleet several times the size,
+ * Four hours is that interval with room for a fleet several times the size,
  * because the two directions are not symmetrical. Too short and the give-up path
  * exists but can never fire, which is the bug above. Too long and a run of
  * failures separated by hours is treated as consecutive -- a Hands that failed
@@ -571,9 +588,9 @@ const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
  * replica returns, because it is written to the handle where any of them can
  * read it. An inferred one is readable by the replica that inferred it and by
  * no other, so it has to survive until THAT replica comes back to the handle --
- * the probe rotation multiplied by the replica count, about thirty-six minutes
- * here, and longer on a bigger fleet or a larger bucket. At five minutes it did
- * not: the inference expired before the visit that would have acted on it, the
+ * the probe rotation multiplied by the replica count, which runs to tens of
+ * minutes even on a small fleet and longer on a bigger one or a larger bucket.
+ * At five minutes it did not: the inference expired before the visit that would have acted on it, the
  * handle was probed again, the probes failed again, and the streak gave up
  * again -- six, seven, eight failures deep, on a Hands that has stopped
  * answering, which is precisely the sandbox the give-up path exists to release.
@@ -765,9 +782,8 @@ export function ageBackgroundWorkCacheForTest(ms: number): void {
  * Aggregated rather than logged per handle: the interesting quantity is the
  * shape of a whole sweep, and a line per handle per replica per minute is a
  * volume nobody reads. The specific gap these close is that `unknown` -> keep
- * was silent -- the branch the fleet was stuck in for four hours emitted
- * nothing, so a stalled reclaim loop and a healthy quiet one produced identical
- * logs. `bgUnknown` high with `expired` at zero across consecutive ticks is that
+ * was silent -- the branch a stalled fleet sits in emitted nothing, so a stalled
+ * reclaim loop and a healthy quiet one produced identical logs. `bgUnknown` high with `expired` at zero across consecutive ticks is that
  * stall, visible without a debug build.
  */
 interface TickStats {
@@ -1163,6 +1179,10 @@ function dispatchProbes(
     // same one; this is the revision an idle-opening write was conditioned on,
     // which is unique per key by construction.
     const idleRevAtStart = info.idleRev;
+    // And the verdict the handle was carrying when the question was asked, so an
+    // answer of `idle` can tell a `running` published while it was in the air
+    // from the one it read on the way out. See persistVerdict.
+    const verdictAtStart = verdictWitness(info);
     if (bgProbeInFlight.has(identity)) continue;
 
     // `generation` came from the scan that formed this candidate, not from
@@ -1236,6 +1256,7 @@ function dispatchProbes(
         // and not something to publish to the others.
         await persistVerdict(
           deps, sessionId, identity, running, epoch, idleSinceAtStart, idleRevAtStart,
+          verdictAtStart,
         );
         if (state === "running") {
           logger.info(
@@ -1283,6 +1304,30 @@ function dispatchProbes(
 }
 
 /**
+ * Which verdict an entry is carrying, named by values rather than by a time.
+ *
+ * `rev` is the revision the publishing write was conditioned on and is unique
+ * per key by construction; `at` is the stamp, which is not unique but is all a
+ * verdict written before `rev` existed has. Both are read, because either one
+ * changing means the verdict changed, and the pair is only equal when the entry
+ * is still carrying the same verdict it was.
+ */
+interface VerdictWitness {
+  rev?: number;
+  at?: number;
+}
+
+function verdictWitness(info: HandsKvEntry): VerdictWitness {
+  return { rev: info.bgRev, at: info.bgCheckedAt };
+}
+
+/** Whether the entry still carries the verdict this witness was taken from --
+ *  including "still carries no verdict", which is two absent values. */
+function sameVerdict(witness: VerdictWitness, info: HandsKvEntry): boolean {
+  return witness.rev === info.bgRev && witness.at === info.bgCheckedAt;
+}
+
+/**
  * Record a measured background-work answer onto the handle itself.
  *
  * Re-reads instead of reusing the revision the sweep was holding: the answer
@@ -1312,6 +1357,12 @@ function dispatchProbes(
  * behind. The epoch comes from the scan that formed the candidate, so a
  * reactivation anywhere in the probe's flight is caught here as well as by the
  * generation the promise carries.
+ *
+ * And, for an `idle` answer only, only if no `running` answer about that same
+ * period was published while this one was in the air -- the write-side half of
+ * the rule peekBackgroundWork reads by, where `running` wins on what it says
+ * rather than on whose clock said it. See the guard itself for why the two
+ * directions are not symmetrical.
  */
 async function persistVerdict(
   deps: KeepaliveDeps,
@@ -1321,6 +1372,7 @@ async function persistVerdict(
   epoch: number | undefined,
   idleSinceAtStart: number | undefined,
   idleRevAtStart: number | undefined,
+  verdictAtStart: VerdictWitness,
 ): Promise<void> {
   try {
     const key = `hands.${sessionId}`;
@@ -1362,6 +1414,52 @@ async function persistVerdict(
       );
       return;
     }
+    // And only if no `running` answer about this same period was published while
+    // this one was in the air.
+    //
+    // The checks above establish that the period is still the one this answer
+    // was measured in. They do not establish that it is the most authoritative
+    // answer taken in it, and one verdict is kept per handle, so whichever write
+    // lands last is what every later sweep reads. Two replicas probing the same
+    // idle handle is the ordinary case -- the sweep is fleet-wide and the slices
+    // overlap -- and this promise has its own suspension points before it gets
+    // here, the run-lease read among them. A `running` that completes first and
+    // an `idle` that completes second leaves `idle` on the entry, and the next
+    // replica to sweep deletes a handle with a background shell in it.
+    //
+    // Which of the two was taken later cannot be asked here, for the reason
+    // peekBackgroundWork will not ask it either: the two stamps are two
+    // machines' clocks and their order proves nothing. So the write is decided
+    // the same way the read is, by what the answers say rather than by when they
+    // say they were taken. `running` wins. The two ways of being wrong are not
+    // the same size: dropping a live `idle` costs pings on a sandbox that no
+    // longer needs them, until the `running` verdict ages out and the probe this
+    // sweep starts anyway files the same answer again; letting a stale `idle`
+    // land costs the pod. The opposite direction is unguarded on purpose -- a
+    // `running` overwriting an earlier `idle` in the same period is how a
+    // sandbox that started work after being measured empty gets protected.
+    //
+    // "Published while this one was in the air" is asked as a value comparison,
+    // not as an ordering: the verdict the entry carries now against the one it
+    // carried when the probe went out. `bgRev` is the half that cannot collide
+    // -- one write per revision, so no two published verdicts share it -- and
+    // the stamp beside it is the half that a verdict from a build without
+    // `bgRev` still answers with. Equal on both means nothing has been published
+    // since, so this answer is the newer one and may overwrite. That is what
+    // keeps the ordinary case working: a job that ends is measured `idle`
+    // against the unchanged `running` verdict its own sweep read, and replaces
+    // it on the spot.
+    if (
+      running === 0
+      && usableSharedVerdict(info)?.state === "running"
+      && !sameVerdict(verdictAtStart, info)
+    ) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.background_work_answer_superseded",
+      );
+      return;
+    }
     const next = sc.encode(JSON.stringify({
       ...info,
       bgCheckedAt: Date.now(),
@@ -1369,6 +1467,11 @@ async function persistVerdict(
       bgEpoch: epoch,
       bgIdleSince: idleSinceAtStart,
       bgIdleRev: idleRevAtStart,
+      // The revision this write is conditioned on, which names this verdict and
+      // no other -- read before the write for the same reason `idleRev` is: the
+      // write's own revision is not knowable until it lands, and the value only
+      // has to be unique.
+      bgRev: e.revision,
     }));
     await deps.kv.update(key, next, e.revision);
   } catch {
