@@ -170,6 +170,9 @@ record it.
   What these count changes meaning with the wire protocol, so a fleet that
   speaks both — during a rollout, or after a backend switch — previously summed
   into a number that was true of neither and gave the reader no way to notice.
+  The Brain dashboard's "Prompt Cache Hit Ratio" panel gained a per-provider
+  token series so the split is visible, and its description now names the
+  arithmetic signature of the failure the label exists to catch.
 
 ### Fixed
 - Prompt-cache token accounting on the OpenAI path. An OpenAI-shaped

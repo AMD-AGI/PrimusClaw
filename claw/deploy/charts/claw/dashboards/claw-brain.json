@@ -83,7 +83,7 @@
       "id": 1,
       "type": "stat",
       "title": "Prompt Cache Hit Ratio",
-      "description": "Whether the prompt cache is actually working, measured two ways at once. The token series is cache_read / (input + cache_read + cache_create) from claw_brain_llm_tokens_total — the share of prompt tokens that were billed at the cached rate, i.e. the real saving. The turn series is claw_brain_llm_cache_turns_total{state=\"hit\"} over all turns — how often a request read anything back at all; state is derived from what the response reported, where \"hit\" means cache_read > 0, \"write\" means only a create, \"miss\" means the provider spoke and returned nothing, and \"unreported\"/\"off\" mean it said nothing about caching, so those turns move the turn ratio without being real misses. Both series sum across all brain pods before dividing; never average per-pod ratios. Read the two together: a high token ratio with a healthy turn ratio is a working cache; a mid-range 0.5–0.85 usually means the cached prefix keeps being broken — tool-list changes, a compaction rewriting history, or cache_control breakpoints drifting position — and is worth investigating against the breakpoints_sent distribution. A ratio collapsing toward zero while requests keep flowing is the failure this panel exists to catch: markers are still being sent and nothing is read back, so every turn is paid at full price; pair it with the cache failure detectors and the breakpoint distribution to find where the prefix diverges. Note that the denominator deliberately includes only the three kinds providers actually report — a missing kind means the provider cannot report it, which is not the same as zero.",
+      "description": "Whether the prompt cache is actually working, measured two ways at once. The token series is cache_read / (input + cache_read + cache_create) from claw_brain_llm_tokens_total — the share of prompt tokens that were billed at the cached rate, i.e. the real saving. The turn series is claw_brain_llm_cache_turns_total{state=\"hit\"} over all turns — how often a request read anything back at all; state is derived from what the response reported, where \"hit\" means cache_read > 0, \"write\" means only a create, \"miss\" means the provider spoke and returned nothing, and \"unreported\"/\"off\" mean it said nothing about caching, so those turns move the turn ratio without being real misses. Both series sum across all brain pods before dividing; never average per-pod ratios. Read the two together: a high token ratio with a healthy turn ratio is a working cache; a mid-range 0.5–0.85 usually means the cached prefix keeps being broken — tool-list changes, a compaction rewriting history, or cache_control breakpoints drifting position — and is worth investigating against the breakpoints_sent distribution. A ratio collapsing toward zero while requests keep flowing is the failure this panel exists to catch: markers are still being sent and nothing is read back, so every turn is paid at full price; pair it with the cache failure detectors and the breakpoint distribution to find where the prefix diverges. Note that the denominator deliberately includes only the three kinds providers actually report — a missing kind means the provider cannot report it, which is not the same as zero. The third series splits the token ratio by the wire protocol that reported it, which the aggregate cannot show: the OpenAI shape reports the whole prompt where the Anthropic shape reports only the uncached remainder, so a fleet speaking both — mid-rollout, or after a backend switch — sums into a number true of neither. If the aggregate ever sits near 0.50 while the turn ratio stays healthy, suspect token accounting before you suspect the cache: that is the arithmetic signature of the cached portion landing on both sides of the division, not of a cache missing half the time.",
       "datasource": "${DS_PROMETHEUS}",
       "gridPos": {
         "h": 4,
@@ -136,6 +136,14 @@
           "range": true,
           "editorMode": "code",
           "legendFormat": "hit share of turns"
+        },
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (provider) (rate(claw_brain_llm_tokens_total{kind=\"cache_read\"}[$__rate_interval])) / (sum by (provider) (rate(claw_brain_llm_tokens_total{kind=~\"input|cache_read|cache_create\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "editorMode": "code",
+          "legendFormat": "tokens: {{provider}}"
         }
       ]
     },
