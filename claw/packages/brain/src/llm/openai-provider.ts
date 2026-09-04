@@ -427,6 +427,12 @@ async function streamingTurn(
       reported: [...reported],
       createdEphemeral5m: created5m,
       createdEphemeral1h: created1h,
+      // Same as the Anthropic path. Without this the knob is wired to the
+      // wire and nowhere else on this provider: headers get captured off the
+      // response and then dropped, so a deployment on LLM_API_STYLE=openai
+      // sets LLM_DEBUG_RESPONSE_HEADERS and sees nothing, with no error to
+      // explain why.
+      upstreamHeaders: capture.headers,
     },
   };
 }

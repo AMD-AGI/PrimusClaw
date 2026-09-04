@@ -40,6 +40,7 @@ import {
   DELIVERY_HEARTBEAT_MS, DELIVERY_HEARTBEATS_PER_ACK_WAIT,
   RUN_GATE_KEY, RUN_GATE_KEY_CONFIGURED,
   envSettingProblems,
+  envSettingRefused,
   LLM_CACHE_STYLE,
   openAiBaseUrlFellBack,
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
@@ -473,6 +474,21 @@ function validateStartupConfig(): void {
   const refused = envSettingProblems();
   if (refused.length) {
     logger.error({ refused }, "startup.config_refused");
+  }
+
+  // One of those refusals is not survivable. CHECKPOINT_WRITE_VERSION decides
+  // whether conversations are sealed or merely redacted, and a refused value
+  // falls back to the default (3) -- so an operator who set 4 and typed 5, or
+  // whose value arrived non-numeric, would get a pod quietly writing the
+  // weaker format while their values file says otherwise. Refusing to start is
+  // the only outcome that cannot be mistaken for having been obeyed.
+  if (envSettingRefused("CHECKPOINT_WRITE_VERSION")) {
+    logger.error(
+      { refused: refused.filter((p) => p.startsWith("CHECKPOINT_WRITE_VERSION=")) },
+      "startup.checkpoint_write_version_invalid (must be 3 or 4; refusing to start "
+      + "rather than write a format nobody chose)",
+    );
+    process.exit(1);
   }
 }
 

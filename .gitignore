@@ -48,3 +48,9 @@ coverage.xml
 .claude/
 *.swp
 .DS_Store
+
+# Private per-deployment values: model routing and provider credentials.
+# deploy/litellm/README.md tells operators to keep these out of the repo;
+# this makes that stick.
+deploy/litellm/values.*.yaml
+!deploy/litellm/values.autorouting.example.yaml

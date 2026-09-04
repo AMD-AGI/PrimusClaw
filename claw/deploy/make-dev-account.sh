@@ -43,6 +43,13 @@ NAMESPACE="${NAMESPACE:-primus-claw}"
 NATS_RELEASE="${NATS_RELEASE:-primus-claw-nats}"
 STORAGE_CLASS="${STORAGE_CLASS:-rbd}"
 
+# This script re-renders the WHOLE values file, prod user included, and
+# helm-upgrades the whole release. Adding one developer account would otherwise
+# reinstate the all-access 'prod' user on a cluster that retired it -- silently,
+# by someone onboarding themselves who never made that decision.
+# shellcheck source=./nats-prod-retirement.sh
+source "$SCRIPT_DIR/nats-prod-retirement.sh"
+
 ACCOUNT_KEY="DEV_$(echo "$DEVNAME" | tr '[:lower:]' '[:upper:]' | tr - _)"
 USER_NAME="dev-${DEVNAME}"
 PASS_VAR="NATS_PASSWORD_${ACCOUNT_KEY}"
@@ -84,13 +91,44 @@ while IFS='=' read -r key val; do
   esac
 done < <(grep -E '^NATS_PASSWORD_DEV_' "$CREDS_FILE" || true)
 
+# Retired stays retired. Unknown is not "no": if the marker cannot be read, the
+# render that follows would put the all-access user back, so stop instead.
+_strip_prod=""
+_retire_state=0
+nats_prod_retirement_state || _retire_state=$?
+case "$_retire_state" in
+  2) echo "ERROR: cannot read $NATS_PROD_RETIRED_MARKER in $NAMESPACE, so whether the all-access 'prod' NATS user is retired is unknown. This script re-renders every production user, and rendering on a guess would reinstate it. Fix cluster access and re-run." >&2
+     exit 1 ;;
+  0) echo "NATS: prod is retired on this cluster — leaving it out of the render."
+     _strip_prod="$NATS_PROD_STRIP_EXPR" ;;
+esac
+
 awk -v block="$DEV_BLOCKS" '
   /# \{\{DEV_ACCOUNTS\}\}/ { printf "%s", block; next }
   { print }
 ' "$VALUES_TEMPLATE" \
+  | { [ -n "$_strip_prod" ] && sed -e "$_strip_prod" || cat; } \
   | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
         -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
+        -e "s|__API_NATS_PASSWORD__|${NATS_PASSWORD_API}|g" \
+        -e "s|__BRAIN_NATS_PASSWORD__|${NATS_PASSWORD_BRAIN}|g" \
+        -e "s|__REAPER_NATS_PASSWORD__|${NATS_PASSWORD_REAPER}|g" \
+        -e "s|__OPS_NATS_PASSWORD__|${NATS_PASSWORD_OPS}|g" \
   > "$RENDERED"
+
+# This script helm-upgrades the whole NATS release, so it re-renders the PROD
+# account too -- adding a dev account rewrites every production user. If a
+# password variable is missing from the creds file, the corresponding user
+# would be rendered with the literal placeholder as its password and every
+# component authenticating as that user would start failing. deploy.sh is what
+# creates and backfills those variables, so point the operator there rather
+# than generating one here and diverging from what the cluster expects.
+if grep -q '__[A-Z]*_NATS_PASSWORD__' "$RENDERED"; then
+  echo "ERROR: unsubstituted NATS password placeholder in $RENDERED:" >&2
+  grep -n '__[A-Z]*_NATS_PASSWORD__' "$RENDERED" >&2
+  echo "Run deploy.sh once to backfill $CREDS_FILE, then retry." >&2
+  exit 1
+fi
 
 echo "Running helm upgrade ..."
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/ 2>/dev/null || true

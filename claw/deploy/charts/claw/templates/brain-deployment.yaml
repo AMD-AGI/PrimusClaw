@@ -1,6 +1,44 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
+{{- /*
+v4 checkpoints are sealed, and a seal needs a key. Brain refuses to start on
+CHECKPOINT_WRITE_VERSION=4 with no BRAIN_CHECKPOINT_KEY -- deliberately, since
+the alternative is writing verbatim conversations to a bucket whose threat
+model just changed -- but that refusal lands as a CrashLoopBackOff after the
+rollout has begun. Say it here instead, where `helm template` and `helm lint`
+can see it and no pod has been replaced yet.
+
+Same shape as the reaper.enabled guards in workspace-reaper-cronjob.yaml: a
+setting whose prerequisites the chart can check is one the chart should check.
+*/ -}}
+{{- /*
+Anything outside {3,4} is refused here rather than shipped. Brain's own
+envInt bounds this setting, but bounding it means an out-of-range value falls
+back to the DEFAULT -- so `5` (or `banana`, which `int` renders as 0) starts a
+pod writing v3 while the operator believes they asked for sealed v4, and `2`
+asks for a format that no longer exists and gets v3 without being told. Both
+are a silent answer to a question about how conversations are stored, which is
+the one place a silent answer is worst.
+
+The comparison is on the value AS WRITTEN, not on `int` of it. `int` is a
+truncating cast: a values file carrying the YAML number 3.5 -- a typed float,
+which `--set-string` can never produce and a test using only `--set-string`
+therefore never sees -- passes an `int`-first guard as 3 while line ~166 below
+emits the untouched "3.5" into the pod. The chart would have approved one
+value and shipped another.
+*/ -}}
+{{- $cwvRaw := "" }}
+{{- if not (kindIs "invalid" .Values.brain.checkpointWriteVersion) }}
+{{- $cwvRaw = toString .Values.brain.checkpointWriteVersion }}
+{{- end }}
+{{- if not (has $cwvRaw (list "3" "4")) }}
+{{- fail (printf "brain.checkpointWriteVersion must be 3 or 4, got %q: 3 writes redacted checkpoints, 4 seals them, and there is no other format. A value outside those two would otherwise start Brain on the default (3) while looking like it had been set." $cwvRaw) }}
+{{- end }}
+{{- $cwv := int $cwvRaw }}
+{{- if and (eq $cwv 4) (not .Values.secret.brainCheckpointKey) }}
+{{- fail "brain.checkpointWriteVersion=4 requires secret.brainCheckpointKey: v4 checkpoints are sealed, and Brain refuses to start without the key rather than writing plaintext. Generate one with 'openssl rand -base64 32'." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,6 +74,19 @@ spec:
         # directory, so both believe they hold it and the second one's
         # `rsync --delete` removes the first one's files.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # The per-workload NATS credential lives in its own Secret, and the
+        # Brain seal key in another. Rotating either changes nothing the
+        # annotation above can see, so the pods would keep the old value in
+        # their environment -- with a NATS password that is one rotation out
+        # of date, or a seal key that no longer opens what the fleet is
+        # writing. Hash them here so a rotation actually rolls.
+        #
+        # Scoped to THIS workload's Secret, not to the file that renders all
+        # four: hashing the whole file made rotating any one credential restart
+        # every workload that reads it, so a routine api rotation also bounced
+        # brain and threw away its in-flight turns.
+        checksum/nats-user: {{ include "primus-claw.natsUserSecret" (dict "root" . "component" "brain") | sha256sum }}
+        checksum/checkpoint-key: {{ include (print $.Template.BasePath "/brain-checkpoint-secret.yaml") . | sha256sum }}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -122,6 +173,33 @@ spec:
         - secretRef:
             name: primus-claw-secrets
         env:
+        - name: CHECKPOINT_WRITE_VERSION
+          value: {{ .Values.brain.checkpointWriteVersion | quote }}
+        {{- if .Values.secret.brainCheckpointKey }}
+        - name: BRAIN_CHECKPOINT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-brain-checkpoint
+              key: BRAIN_CHECKPOINT_KEY
+        {{- end }}
+        {{- with (get .Values.secret.natsUsers "brain") }}
+        {{- if .password }}
+        # A container-level env entry overrides the same name coming from envFrom,
+        # so these replace the shared prod credential in primus-claw-secrets
+        # without that Secret having to change. Absent a password, nothing renders
+        # here and the shared credential is used exactly as before.
+        - name: NATS_USER
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-brain
+              key: NATS_USER
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-brain
+              key: NATS_PASSWORD
+        {{- end }}
+        {{- end }}
         - name: POD_NAME
           valueFrom: { fieldRef: { fieldPath: metadata.name } }
         - name: POD_NAMESPACE

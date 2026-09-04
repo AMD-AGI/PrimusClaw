@@ -15,8 +15,11 @@ data:
 {{- else }}
       []
 {{- end }}
-    general_settings: {}
+    general_settings:
+{{- if .Values.generalSettings }}
+{{ toYaml .Values.generalSettings | indent 6 }}
+{{- else }}
+      {}
+{{- end }}
     litellm_settings:
-      drop_params: true
-      set_verbose: false
-      callbacks: litellm.proxy.hooks.apim_key_hook.proxy_handler_instance
+{{ toYaml (mergeOverwrite (dict "drop_params" true "set_verbose" false "callbacks" (list "litellm.proxy.hooks.apim_key_hook.proxy_handler_instance")) .Values.litellmSettings) | indent 6 }}

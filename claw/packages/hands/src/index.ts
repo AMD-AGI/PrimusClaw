@@ -10,11 +10,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { constantTimeEquals } from "@claw/utils";
 import { tools } from "./tools/index.js";
-import { shutdownAllShells, shutdownRunShells } from "./tools/shell/bg-manager.js";
-import { OWNER_HEADER, RUN_HEADER, normalizeOwner, normalizeRun, withCaller } from "./runtime/owner-context.js";
+import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
+import { OWNER_HEADER, RUN_HEADER, UNOWNED, normalizeOwner, normalizeRun, withCaller } from "./runtime/owner-context.js";
 import { INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
-const app = Fastify({ logger: true });
+/**
+ * Exported so route tests can reach the routes with `app.inject()` instead of
+ * binding a port. Importing this module is only safe for that under
+ * `--self-check`, which is what the listen at the bottom is gated on.
+ */
+export const app = Fastify({ logger: true });
 
 /**
  * Every route here can start or kill processes in the sandbox, so each one
@@ -68,6 +73,40 @@ app.all("/mcp", async (req, reply) => {
     { owner: normalizeOwner(req.headers[OWNER_HEADER]), run: normalizeRun(req.headers[RUN_HEADER]) },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
+});
+
+/**
+ * How much background work is still running in this sandbox.
+ *
+ * Brain asks when a task reaches a terminal state, because "the turn ended" and
+ * "this sandbox is free" are not the same thing: a background shell is expected
+ * to outlive the turn that started it, and the sandbox has to stay alive while
+ * one is running or the control plane reclaims it out from under the work.
+ *
+ * Read-only, and internal rather than an MCP tool for the same reason the reap
+ * is: this is Brain's bookkeeping, not something the model should be able to ask
+ * on its own behalf or about another caller.
+ */
+app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, reply) => {
+  const denied = authFailure(req);
+  if (denied) return reply.status(denied.status).send({ error: denied.error });
+
+  // `!owner` would never fire: normalizeOwner substitutes the shared `unowned`
+  // bucket for everything it cannot use -- absent, blank, over-long, control
+  // characters -- and that string is truthy. Answering anyway is the part that
+  // matters: `unowned` holds the shells of every caller that sent no owner
+  // header, so a malformed question would be answered with somebody else's
+  // work, and a pod kept alive for a session that has nothing running in it.
+  //
+  // A caller naming the bucket explicitly is asking a real question and is
+  // answered; a value that only landed there by failing normalization is not.
+  const raw = req.body?.owner;
+  const owner = normalizeOwner(raw);
+  if (owner === UNOWNED && raw !== UNOWNED) {
+    return reply.status(400).send({ error: "owner_required" });
+  }
+
+  return { running: runningShellCount(owner) };
 });
 
 /**

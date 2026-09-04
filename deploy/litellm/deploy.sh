@@ -11,8 +11,20 @@
 #   LITELLM_MASTER_KEY        Generated if unset (or reused from the existing Secret)
 #   LITELLM_INGRESS_HOST      If set, apply ingress for /llm-gateway
 #   LITELLM_VALUES_FILE       Private Helm values file with modelList/secrets
+#
+# glm-5.3: copy values.glm53.example.yaml, set litellm_params.api_base to the
+# cluster OpenAI-compatible /v1 URL, then pass that file as LITELLM_VALUES_FILE.
+# Skip interactive /models discovery; it overwrites modelList from the file.
 
 set -euo pipefail
+
+# Defined here rather than further down because the image-tag check below
+# calls log(). It used to sit at line 90, so any LITELLM_IMAGE whose tag did
+# not start with v[0-9] -- including this script's own default, and every
+# timestamp tag build.sh produces -- hit `log: command not found` and, under
+# `set -e`, exited 127 before doing anything.
+log() { echo "[litellm] $(date +%H:%M:%S) $*"; }
+fail() { echo "[litellm] ERROR: $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "$SCRIPT_DIR/charts/litellm" && pwd)"
@@ -46,6 +58,7 @@ LITELLM_SAFE_API_URL="${LITELLM_SAFE_API_URL:-${SAFE_API_URL:-}}"
 LITELLM_DATABASE_URL="${LITELLM_DATABASE_URL:-}"
 LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
 LITELLM_VALUES_FILE="${LITELLM_VALUES_FILE:-}"
+LITELLM_EXISTING_SECRET="${LITELLM_EXISTING_SECRET:-}"
 LITELLM_INSTALL_INGRESS="${LITELLM_INSTALL_INGRESS:-true}"
 LITELLM_INGRESS_HOST="${LITELLM_INGRESS_HOST:-}"
 LITELLM_INGRESS_CLASS="${LITELLM_INGRESS_CLASS:-higress}"
@@ -78,21 +91,27 @@ Key env:
   LITELLM_NAME=litellm
   LITELLM_IMAGE=docker.io/primussafe/litellm:20260331111348
   LITELLM_VALUES_FILE=/path/private-values.yaml # optional modelList overrides
+  LITELLM_EXISTING_SECRET=litellm-credentials   # Secret with master_key/database_url
   LITELLM_INGRESS_HOST=<host>       # optional; enables ingress when set
   LITELLM_SERVER_ROOT_PATH=/llm-gateway
   LITELLM_SAFE_API_URL=https://safe.example.com
+
+  glm-5.3: copy values.glm53.example.yaml, replace api_base with the cluster
+  OpenAI-compatible /v1 URL, then set LITELLM_VALUES_FILE to that copy. Skip
+  the interactive /models prompt so it does not overwrite the glm-5.3 modelList.
 HELP
       exit 0 ;;
     *) echo "Unknown flag: $1" >&2; exit 2 ;;
   esac
 done
 
-log() { echo "[litellm] $(date +%H:%M:%S) $*"; }
-fail() { echo "[litellm] ERROR: $*" >&2; exit 1; }
-
 # Temp files may hold a provider API key; remove them on any exit.
 MODELS_TMP_FILES=()
-cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; }
+# `return 0` because this runs as the EXIT trap and its status becomes the
+# script's. With no temp files the loop's last command is a false test, so a
+# successful `--dry-run` exited 1 -- the check below could not tell that from a
+# real failure.
+cleanup_tmp() { local f; for f in "${MODELS_TMP_FILES[@]:-}"; do [ -n "${f:-}" ] && rm -f "$f"; done; return 0; }
 trap cleanup_tmp EXIT
 GENERATED_MODELS_FILE=""
 
@@ -224,9 +243,26 @@ discover_pgo_database_url() {
   printf 'postgresql://%s:%s@%s:%s/%s' "$user" "$pass" "$host" "${port:-5432}" "${db:-$user}"
 }
 
+# Whether the chart will render its own Secret, given everything this run will
+# pass it. Asked by rendering rather than by reading LITELLM_EXISTING_SECRET,
+# because secrets.existingSecret can just as well be set in the values file.
+chart_uses_existing_secret() {
+  local rendered
+  local -a args=(
+    template "$LITELLM_RELEASE" "$CHART_DIR"
+    --namespace "$LITELLM_NAMESPACE"
+    --show-only templates/secret.yaml
+    --set-string "secrets.masterKey=probe"
+    --set-string "secrets.databaseUrl=postgresql://probe.invalid/litellm"
+  )
+  [ -n "$LITELLM_VALUES_FILE" ] && args+=(-f "$LITELLM_VALUES_FILE")
+  [ -n "$LITELLM_EXISTING_SECRET" ] && args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+  rendered="$(helm "${args[@]}")" || fail "could not resolve the chart's Secret configuration"
+  ! grep -q '^kind: Secret$' <<<"$rendered"
+}
+
 command -v kubectl >/dev/null || fail "kubectl not found"
 command -v helm >/dev/null || fail "helm not found"
-command -v openssl >/dev/null || fail "openssl not found"
 command -v python3 >/dev/null || fail "python3 not found"
 [[ -f "$CHART_DIR/Chart.yaml" ]] || fail "missing Helm chart: $CHART_DIR"
 
@@ -234,33 +270,41 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl cluster-info >/dev/null 2>&1 || fail "kubectl cannot reach cluster"
 fi
 
-if [ -z "$LITELLM_DATABASE_URL" ]; then
-  if [ "$DRY_RUN" = "true" ]; then
-    LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
-  else
-    # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
-    LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
-    if [ -n "$LITELLM_DATABASE_URL" ]; then
-      log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
-    elif [ -t 0 ]; then
-      read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
-      [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+USE_EXISTING_SECRET=false
+if chart_uses_existing_secret; then
+  USE_EXISTING_SECRET=true
+  log "using an existing Secret for database and master credentials"
+else
+  command -v openssl >/dev/null || fail "openssl not found"
+
+  if [ -z "$LITELLM_DATABASE_URL" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+      LITELLM_DATABASE_URL="postgres://user:pass@example:5432/litellm"
     else
-      fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      # Reuse a PGO PostgresCluster in the namespace if present; otherwise prompt.
+      LITELLM_DATABASE_URL="$(discover_pgo_database_url || true)"
+      if [ -n "$LITELLM_DATABASE_URL" ]; then
+        log "using PGO PostgresCluster database in ns=$LITELLM_NAMESPACE"
+      elif [ -t 0 ]; then
+        read -r -p "[litellm] LITELLM_DATABASE_URL unset and no PGO in ns=$LITELLM_NAMESPACE; enter Postgres URL: " LITELLM_DATABASE_URL
+        [ -n "$LITELLM_DATABASE_URL" ] || fail "LITELLM_DATABASE_URL is required"
+      else
+        fail "LITELLM_DATABASE_URL is required (no PGO PostgresCluster in ns=$LITELLM_NAMESPACE; no TTY to prompt)"
+      fi
     fi
   fi
-fi
 
-if [ -z "$LITELLM_MASTER_KEY" ]; then
-  if [ "$DRY_RUN" != "true" ]; then
-    LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
-      -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-  fi
   if [ -z "$LITELLM_MASTER_KEY" ]; then
-    LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
-    log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
-  else
-    log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    if [ "$DRY_RUN" != "true" ]; then
+      LITELLM_MASTER_KEY="$(kubectl -n "$LITELLM_NAMESPACE" get secret "$LITELLM_NAME" \
+        -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
+    if [ -z "$LITELLM_MASTER_KEY" ]; then
+      LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)"
+      log "generated LITELLM_MASTER_KEY (stored in Secret/$LITELLM_NAME)"
+    else
+      log "reusing existing LITELLM_MASTER_KEY from Secret/$LITELLM_NAME"
+    fi
   fi
 fi
 
@@ -298,9 +342,20 @@ helm_args=(
   --set "image.tag=$image_tag"
   --set "image.pullPolicy=$LITELLM_IMAGE_PULL_POLICY"
   --set "serverRootPath=$LITELLM_SERVER_ROOT_PATH"
-  --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
-  --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
 )
+[ -n "$LITELLM_EXISTING_SECRET" ] && helm_args+=(--set-string "secrets.existingSecret=$LITELLM_EXISTING_SECRET")
+if [ "$USE_EXISTING_SECRET" = "true" ]; then
+  # Explicitly blanked rather than simply not set: a values file may carry stale
+  # inline credentials, and anything passed here is what Helm stores -- in the
+  # release values and in every revision after it -- whether the chart renders a
+  # Secret from it or not.
+  helm_args+=(--set-string "secrets.masterKey=" --set-string "secrets.databaseUrl=")
+else
+  helm_args+=(
+    --set "secrets.masterKey=$(helm_set_escape "$LITELLM_MASTER_KEY")"
+    --set "secrets.databaseUrl=$(helm_set_escape "$LITELLM_DATABASE_URL")"
+  )
+fi
 [ -n "$LITELLM_SAFE_API_URL" ] && helm_args+=(--set "safeApiUrl=$LITELLM_SAFE_API_URL")
 [ -n "$LITELLM_VALUES_FILE" ] && helm_args+=(-f "$LITELLM_VALUES_FILE")
 if [ -n "$GENERATED_MODELS_FILE" ]; then
@@ -356,23 +411,40 @@ fi
 # onto a new image starts cleanly, answers readiness, and never calls the hook
 # -- upgrading this cluster produced exactly that, and nothing in the rollout
 # said so. Asking the running pod is the only answer that survives the move.
-callback="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-  python3 -c 'import yaml;print(yaml.safe_load(open("/app/config.yaml")).get("litellm_settings",{}).get("callbacks",""))' 2>/dev/null || true)"
-case "$callback" in
-  *.*)
-    mod="${callback%.*}"
-    if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
-         python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
-      echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
-      echo "The proxy will serve traffic with the hook silently inactive." >&2
-      echo "Usually a hook mounted at a path this base image does not import from;" >&2
-      echo "the image bakes it in at the right place, so drop the mount." >&2
-      exit 1
-    fi
-    log "callback $callback resolves in the running image"
-    ;;
-  "") : ;;
-  *) log "note: callback '$callback' is not a dotted path; not checked" ;;
-esac
+# `callbacks` is a list as often as it is a string -- anything that adds
+# `prometheus` alongside the hook makes it one. Reading it as a scalar printed
+# the repr of the list, which still matched `*.*`, so the module name became
+# "['prometheus', 'litellm.proxy.hooks.apim_key_hook" and the import failed:
+# a hard error on a perfectly healthy deployment. Normalise to one entry per
+# line and check each dotted one on its own; bare names like `prometheus` are
+# built in and have nothing to import.
+callbacks="$(kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+  python3 -c 'import yaml
+cb = yaml.safe_load(open("/app/config.yaml")).get("litellm_settings", {}).get("callbacks", [])
+if isinstance(cb, str):
+    cb = [cb]
+for c in cb or []:
+    if c:
+        print(c)' 2>/dev/null || true)"
+while IFS= read -r callback; do
+  [ -n "$callback" ] || continue
+  case "$callback" in
+    *.*)
+      mod="${callback%.*}"
+      if ! kubectl -n "$LITELLM_NAMESPACE" exec "deployment/$LITELLM_NAME" -- \
+           python3 -c "import importlib,sys; m=importlib.import_module('$mod'); sys.exit(0 if hasattr(m,'${callback##*.}') else 1)" 2>/dev/null; then
+        echo "ERROR: config names callback '$callback' but the running image cannot resolve it." >&2
+        echo "The proxy will serve traffic with the hook silently inactive." >&2
+        echo "Usually a hook mounted at a path this base image does not import from;" >&2
+        echo "the image bakes it in at the right place, so drop the mount." >&2
+        exit 1
+      fi
+      log "callback $callback resolves in the running image"
+      ;;
+    *) log "note: callback '$callback' is built in; nothing to import" ;;
+  esac
+done <<EOF
+$callbacks
+EOF
 
 log "LiteLLM deploy complete"

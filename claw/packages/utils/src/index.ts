@@ -3,8 +3,15 @@
 
 export { sleep } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
-export { redactSecrets, safePreview, scanForSecretLeak, type RedactResult, type ScanHit } from "./security/redact-secrets.js";
+export {
+  redactSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
+  looksLikeVersionString, isCredentialFreeLocator,
+  type RedactResult, type ScanHit,
+} from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
+export {
+  sealAead, openAead, decodeAeadKey, AeadOpenError, AEAD_KEY_LEN, AEAD_VERSION_V1,
+} from "./crypto/aead.js";
 export { isRevisionConflict } from "./kv/errors.js";
 export {
   readIntSetting,

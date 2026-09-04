@@ -17,6 +17,13 @@ serverRootPath: /llm-gateway
 safeApiUrl: ""
 
 secrets:
+  # Name a Secret you already manage and the chart will not render its own.
+  # It must carry the keys `master_key` and `database_url`. Use this rather
+  # than the two below for anything real: values passed to Helm end up in the
+  # release history in plain text, and master_key is not only the admin
+  # credential -- it is also the encryption key for every model credential
+  # stored in the database.
+  existingSecret: ""
   masterKey: ""
   databaseUrl: ""
 
@@ -36,6 +43,29 @@ ingress:
 
 nodeSelector: {}
 tolerations: []
+
+# Extra environment for the proxy container, appended verbatim -- raw env
+# entries, so `valueFrom` works. The APIM hook this chart bakes into the image
+# reads its credentials from the environment (AMD_HYPERLOOM_APIM_KEY and
+# AMD_HYPERLOOM_APIM_USER), and without a way to pass them the chart ships a
+# hook it cannot feed: every upstream call goes out with an empty subscription
+# header and is refused.
+#
+#   extraEnv:
+#     - name: AMD_HYPERLOOM_APIM_KEY
+#       valueFrom:
+#         secretKeyRef: {name: my-litellm-secret, key: hyperloom_apim_key}
+extraEnv: []
+
+# Merged over the chart's litellm_settings defaults (drop_params, set_verbose,
+# and the apim_key_hook callback). Set `callbacks` here to replace that list --
+# include the hook entry if you still want it. This is also where
+# prometheus_metrics_config goes when `prometheus` is one of the callbacks.
+litellmSettings: {}
+
+# Rendered as general_settings verbatim (it replaces, not merges -- the
+# chart has no defaults there). Empty renders `{}`.
+generalSettings: {}
 
 # Keep model routing out of the public chart defaults. Supply a private values
 # file with modelList entries for your deployment (LITELLM_VALUES_FILE).

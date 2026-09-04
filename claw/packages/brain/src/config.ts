@@ -14,7 +14,7 @@ import {
   TASK_LOCK_NAK_BASE_MS,
   TASK_LOCK_NAK_CEILING_NS,
 } from "@claw/protocol";
-import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readIntSetting, isSensitiveKey, type IntSettingBounds } from "@claw/utils";
 
 // Re-exported so the budget and the poison threshold derived from it stay
 // reachable from one import, the way they were when this file owned both.
@@ -54,6 +54,18 @@ const settingProblems: string[] = [];
 /** Why any configured value was refused, in the operator's terms. */
 export function envSettingProblems(): readonly string[] {
   return settingProblems;
+}
+
+/**
+ * Was this specific setting given a value that had to be refused?
+ *
+ * Most refusals are worth logging and surviving: a bad CLAIM_NEXT_IDLE_MS
+ * costs a poll interval. A few decide how data is written, and running on a
+ * default nobody chose is not a survivable answer for those -- see
+ * `validateStartupConfig()`.
+ */
+export function envSettingRefused(key: string): boolean {
+  return settingProblems.some((p) => p.startsWith(`${key}=`));
 }
 
 function envInt(key: string, fallback: number, bounds?: IntSettingBounds): number {
@@ -684,6 +696,49 @@ export const BRAIN_VERSION = env("BRAIN_VERSION", "");
 // still checks code-side `checkpointed_at` to guard against attaching
 // stale state during edge cases (drift between NATS and brain clocks).
 export const CHECKPOINT_TTL_MS = envInt("CHECKPOINT_TTL_MS", 24 * 60 * 60 * 1000);
+/**
+ * Which checkpoint format to WRITE. Readers always accept both.
+ *
+ * Defaults to 3 so that shipping the v4 reader is not the same event as
+ * starting to write v4. Roll out the reader first and let it reach every pod;
+ * a v4 checkpoint that lands on a pod which cannot read it resumes from turn
+ * zero, and during a rolling update that is exactly what would happen.
+ *
+ * There is no version that writes conversations verbatim in the clear: 3 keeps
+ * the redactor, 4 seals. The gap between them is closed on purpose, because a
+ * soak period spent writing unredacted plaintext to this bucket would be worse
+ * than the bug being fixed.
+ */
+// 3 and 4 are the only two formats there are, so this is an enumeration, not
+// a quantity: `3.5` is not a slightly-off 3 and a blank is not a considered
+// choice of 3. Truncating one or defaulting the other lands the pod on
+// redacted plaintext while the values file reads as though sealing was asked
+// for -- which is the whole failure this setting is checked for. Refuse both,
+// so `envSettingRefused()` sees them and startup stops. See
+// validateStartupConfig() in index.ts.
+export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
+  min: 3,
+  max: 4,
+  wholeNumbersOnly: true,
+  blankIsRefused: true,
+});
+/**
+ * base64 of 32 raw bytes, sealing the v4 conversation core.
+ *
+ * Its own key and its own Secret, not derived from USER_ENV_ENCRYPTION_KEY:
+ * reading a checkpoint for debugging would otherwise require the user-env
+ * vault master key, whose entire point is that not even the API hands back its
+ * plaintext. Mounted only by the Brain -- the reaper deletes directories and
+ * has no business being able to decrypt a conversation.
+ */
+export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
+// Read once, then taken out of the environment. A session owner supplies its
+// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
+// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
+// environment is a key that can be asked for by name and shipped out as an
+// Authorization header. Nothing else reads it from process.env, and dropping it
+// here also keeps it out of every stdio MCP child process we spawn.
+delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
 
@@ -1231,6 +1286,99 @@ function resolvePromptCacheTtl(): PromptCacheTtl {
   return "1h";
 }
 export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
+
+/**
+ * Response headers to carry into the cache-loss log, lowercased, comma-separated.
+ *
+ * `claw_brain_llm_cache_entry_lost_total` can say a read was lost and cannot say
+ * which upstream lost it. Every deployment reaches the model through something
+ * -- a gateway, a proxy, a cloud API front door -- and when a cache entry does
+ * not come back, the first question is whether the turn that wrote it and the
+ * turn that missed it were served by the same backend. Nothing in the request
+ * can answer that; only the response can.
+ *
+ * An allowlist rather than a header name baked in, because the header that
+ * identifies a backend is a property of the deployment, not of Claw: it is
+ * `x-litellm-model-id` behind one proxy, an Azure APIM request id behind
+ * another, a plain `request-id` when talking to the provider directly.
+ *
+ * An allowlist rather than capturing everything, because response headers carry
+ * credentials -- echoed authorization, set-cookie -- and this value is logged.
+ * Naming what you want is the difference between a diagnostic and a leak.
+ *
+ * Empty by default: off, no capture, no allocation, no log field.
+ */
+/**
+ * Header names an operator may ask to have captured off an LLM response.
+ *
+ * Two kinds of entry are rejected outright rather than filtered quietly at
+ * request time, because both are configuration mistakes and both are worse
+ * than they look:
+ *
+ * A name that is not a valid HTTP token makes `Headers.get()` throw. That call
+ * happens inside the fetch wrapper, after the response has already arrived, so
+ * a typo here does not degrade a diagnostic -- it turns every successful LLM
+ * request into a failure.
+ *
+ * A name that carries a credential turns the diagnostic into the leak it was
+ * written to avoid. The captured value is logged, and `authorization` is
+ * usually echoed straight back by a gateway. Naming what you want is the whole
+ * safety property of an allowlist, and it is not a property if the list may
+ * name the Authorization header.
+ *
+ * Failing at boot rather than dropping the bad entry: a silently ignored name
+ * looks exactly like a gateway that does not send that header, so the operator
+ * debugs the gateway instead of their own typo.
+ */
+const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/**
+ * Names that carry a credential but do not read as one word-by-word, so
+ * `isSensitiveKey` cannot see them: `cookie` is in its word list, but
+ * `authorization` as a whole header name and the various `www-authenticate`
+ * spellings are header-specific.
+ *
+ * The word-level predicate does the rest, and doing it that way is the point:
+ * a fixed list only ever rejects the names someone thought of, and
+ * `x-client-secret`, `x-access-token` and `x-goog-api-key` are exactly the
+ * ones that get thought of second. Sharing the predicate with the redactor
+ * also means a credential word added for one is added for both.
+ */
+const CREDENTIAL_HEADERS: ReadonlySet<string> = new Set([
+  "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
+  "x-amz-security-token", "x-csrf-token", "x-xsrf-token",
+]);
+
+export function assertDiagnosableHeaderName(name: string): void {
+  if (!HTTP_TOKEN_RE.test(name)) {
+    throw new Error(
+      `LLM_DEBUG_RESPONSE_HEADERS contains ${JSON.stringify(name)}, which is not a valid `
+      + `HTTP header name. Reading it would throw on every response.`,
+    );
+  }
+  // Header names are case-insensitive on the wire, so the list has to be
+  // compared case-insensitively too. The env parse lowercases before calling
+  // here, which hid it: this predicate is exported and is the thing a caller
+  // reaches for, and `WWW-Authenticate` walked straight past a set that only
+  // holds `www-authenticate`. isSensitiveKey lowercases on its own, which is
+  // why the names it covers were never exposed to this.
+  const lowered = name.toLowerCase();
+  if (CREDENTIAL_HEADERS.has(lowered) || isSensitiveKey(name)) {
+    throw new Error(
+      `LLM_DEBUG_RESPONSE_HEADERS names ${JSON.stringify(name)}, which carries a credential. `
+      + `Captured headers are logged; pick a header that identifies the upstream instead.`,
+    );
+  }
+}
+
+export const LLM_DEBUG_RESPONSE_HEADERS: ReadonlyArray<string> = (() => {
+  const names = env("LLM_DEBUG_RESPONSE_HEADERS")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+  for (const name of names) assertDiagnosableHeaderName(name);
+  return names;
+})();
+
 
 /**
  * Turns off client-side cache breakpoints entirely.

@@ -142,6 +142,38 @@ const checkpointSerializeDurationSeconds = new Histogram({
   registers: [registry],
 });
 
+const checkpointReadResultTotal = new Counter({
+  name: "claw_brain_checkpoint_read_result_total",
+  help: "Checkpoint reads by outcome. Every not-found branch is labelled: a read "
+    + "that returns nothing makes a run restart from turn zero, and without a "
+    + "reason these are indistinguishable from 'there was no checkpoint'.",
+  labelNames: ["reason"],
+  registers: [registry],
+});
+
+const checkpointVersionTotal = new Counter({
+  name: "claw_brain_checkpoint_version_total",
+  help: "Checkpoint reads and writes by format version. Watch this to know when "
+    + "every pod can read v4, which is the precondition for writing it.",
+  labelNames: ["op", "version"],
+  registers: [registry],
+});
+
+const checkpointSealDurationSeconds = new Histogram({
+  name: "claw_brain_checkpoint_seal_duration_seconds",
+  help: "Time spent compressing and sealing a checkpoint. onCheckpoint is awaited "
+    + "on the turn path, so this is latency the run pays.",
+  buckets: [0.001, 0.005, 0.02, 0.1, 0.5, 2],
+  registers: [registry],
+});
+
+const checkpointWriteSeqRegressedTotal = new Counter({
+  name: "claw_brain_checkpoint_write_seq_regressed_total",
+  help: "Writes dropped because a newer checkpoint for the same key had already "
+    + "been written by this process -- a post-sync rewrite that lost a race.",
+  registers: [registry],
+});
+
 const checkpointPayloadBytes = new Histogram({
   name: "claw_brain_checkpoint_payload_bytes",
   help: "Size of serialized NATS KV checkpoint payload at write time.",
@@ -279,11 +311,20 @@ const promptSizeUnknownTotal = new Counter({
 // wrote, we came back with the same prefix, nothing was read -- so it works on
 // any transport regardless of what the usage object chooses to report.
 //
-// gap="over_5m" is consistent with an entry shorter-lived than requested;
-// "under_5m" points at the prefix rather than the lifetime.
+// gap="over_ttl" is consistent with an entry shorter-lived than the TTL this
+// deployment configured; "under_ttl" points at the prefix rather than the
+// lifetime. The threshold follows LLM_CACHE_TTL rather than a fixed five
+// minutes, because on a 5m deployment every ordinary expiry would otherwise be
+// filed as a defect. A gap of exactly the TTL counts as over_ttl.
+//
+// "an earlier write" is no longer bounded by the process: the timestamp the
+// gap is measured from rides in the checkpoint, so a run resumed on another
+// pod after a redelivery still knows an entry existed and still counts the
+// loss. Those are the expensive ones -- a long conversation paying full price
+// for a prefix it had already written.
 const cacheEntryLostTotal = new Counter({
   name: "claw_brain_llm_cache_entry_lost_total",
-  help: "Turns that sent markers and read nothing back despite an earlier write in the same run.",
+  help: "Turns that sent markers and read nothing back despite an earlier write, across resumes.",
   labelNames: ["gap"],
   registers: [registry],
 });
@@ -543,7 +584,19 @@ export const metrics = {
             : "off";
     llmCacheTurnsTotal.inc({ state });
   },
-  onCacheEntryLost(gap: "over_5m" | "under_5m"): void {
+  /**
+   * The gap is always a real measurement now: the timestamp it is taken
+   * from survives a redelivery inside the checkpoint, so a resume no longer
+   * needs a bucket meaning "we could not measure this".
+   * A run redelivered onto another pod builds a fresh AgentLoop, so the
+   * in-process "when did we last use the cache" clock is unset and the
+   * detector's guard drops the turn -- which is how the single most expensive
+   * class of loss stayed invisible: on a long conversation the whole prompt is
+   * rewritten on the first turn back, which is the largest single bill any one
+   * turn can produce. Counting it under a time bucket would be a lie about
+   * what was measured; counting it not at all was worse.
+   */
+  onCacheEntryLost(gap: "over_ttl" | "under_ttl"): void {
     cacheEntryLostTotal.inc({ gap });
   },
   onPromptSizeUnknown(): void {
@@ -606,6 +659,22 @@ export const metrics = {
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────
+  onCheckpointRead(reason: "ok" | import("../tasks/checkpoint-codec.js").DecodeFailure): void {
+    checkpointReadResultTotal.inc({ reason });
+  },
+
+  onCheckpointVersion(op: "read" | "write", version: number): void {
+    checkpointVersionTotal.inc({ op, version: String(version) });
+  },
+
+  onCheckpointSeal(durationSec: number): void {
+    checkpointSealDurationSeconds.observe(durationSec);
+  },
+
+  onCheckpointSeqRegressed(): void {
+    checkpointWriteSeqRegressedTotal.inc();
+  },
+
   onCheckpointWrite(
     kind: "turn" | "sigterm" | "post_sync",
     result: "success" | "failure",

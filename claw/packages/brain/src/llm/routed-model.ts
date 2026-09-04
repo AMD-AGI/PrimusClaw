@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { LLM_DEBUG_RESPONSE_HEADERS } from "../config.js";
+
 /** LiteLLM Auto Router writes the backend it picked here. */
 export const LITELLM_ROUTED_MODEL_HEADER = "x-litellm-model-name";
 
@@ -16,6 +18,15 @@ export const LITELLM_ROUTED_MODEL_HEADER = "x-litellm-model-name";
  */
 export interface RoutedModelSink {
   headerModel?: string;
+  /**
+   * Allowlisted response headers from the same successful attempt.
+   *
+   * Written by the same wrapper and under the same rule as `headerModel`: only
+   * a successful attempt describes the backend that served the turn, so a
+   * 429/5xx retry must not leave its headers standing in front of the 200's.
+   * Absent when nothing was allowlisted, which is the default.
+   */
+  headers?: Record<string, string>;
 }
 
 function trimModel(value: unknown): string | undefined {
@@ -111,19 +122,41 @@ export function headerModelFromStream(stream: unknown): string | undefined {
   return modelFromHeaders(headersFromSdkStream(stream));
 }
 
+/** Pick the allowlisted headers off one response. Empty allowlist -> nothing. */
+function pickHeaders(
+  headers: Headers,
+  want: ReadonlyArray<string>,
+): Record<string, string> | undefined {
+  if (want.length === 0) return undefined;
+  const out: Record<string, string> = {};
+  for (const name of want) {
+    const v = headers.get(name);
+    // Only what came back. A header that was asked for and not sent is absent
+    // from the log rather than present as empty, so "the gateway does not send
+    // this" and "the gateway sent nothing" stay distinguishable.
+    if (v != null && v !== "") out[name] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /**
  * Anthropic/OpenAI `Stream` does not expose the underlying `Response`. Wrap
- * the client's `fetch` so each attempt records `x-litellm-model-name`.
+ * the client's `fetch` so each attempt records `x-litellm-model-name`, and any
+ * headers the deployment named in LLM_DEBUG_RESPONSE_HEADERS.
  */
 export function wrapFetchCaptureRoutedModel(
   sink: RoutedModelSink,
   baseFetch: typeof fetch = globalThis.fetch.bind(globalThis),
+  debugHeaders: ReadonlyArray<string> = LLM_DEBUG_RESPONSE_HEADERS,
 ): typeof fetch {
   return (async (input, init) => {
     const res = await baseFetch(input, init);
     // A 429/5xx retry must not wipe a later 200's header (or keep a stale
     // one from the previous turn). Only a successful attempt is the backend.
-    if (res.ok) sink.headerModel = modelFromHeaders(res.headers);
+    if (res.ok) {
+      sink.headerModel = modelFromHeaders(res.headers);
+      sink.headers = pickHeaders(res.headers, debugHeaders);
+    }
     return res;
   }) as typeof fetch;
 }

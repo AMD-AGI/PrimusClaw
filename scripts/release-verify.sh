@@ -51,6 +51,11 @@ bash "$repo_root/scripts/release-tests/dry-run-no-side-effects.sh"
 bash "$repo_root/scripts/release-tests/deploy-values-persistence.sh"
 
 require_tool helm
+echo "==> deployment security behavior"
+# Upgrade preservation, prod-retirement gating and the chart's render-time
+# guards. After require_tool helm, because the guards are asserted by rendering.
+bash "$repo_root/scripts/release-tests/claw-deploy-security.sh"
+
 echo "==> Helm lint and render"
 helm lint "$repo_root/sandbox/deploy/helm" \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml"

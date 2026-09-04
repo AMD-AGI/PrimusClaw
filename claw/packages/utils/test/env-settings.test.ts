@@ -64,3 +64,41 @@ test("a fraction is truncated, the way every parser this replaces did", () => {
   assert.deepEqual(readIntSetting("1.9"), { value: 1 });
   assert.deepEqual(readIntSetting("-1.9"), { value: -1 });
 });
+
+/**
+ * The two defaults above are wrong for a setting whose values are an
+ * enumeration rather than a quantity. `CHECKPOINT_WRITE_VERSION` is the one in
+ * this repo: 3 and 4 are two different on-disk formats, so `3.5` truncating to
+ * 3 and a blank falling back to 3 both hand back a legal-looking neighbour of
+ * what was asked for -- and 3 is the weaker format, written while the values
+ * file reads as though sealing had been requested. Opt-in, so no existing
+ * caller's meaning changes.
+ */
+test("wholeNumbersOnly refuses a fraction instead of truncating toward a legal value", () => {
+  assert.deepEqual(readIntSetting("3.5", { min: 3, max: 4, wholeNumbersOnly: true }), {
+    problem: "is not a whole number",
+  });
+  assert.deepEqual(readIntSetting("2.9", { min: 3, max: 4, wholeNumbersOnly: true }), {
+    problem: "is not a whole number",
+  });
+  // The shape it is refusing is the fraction, not the number: whole values,
+  // however written, still read as themselves.
+  assert.deepEqual(readIntSetting("4", { min: 3, max: 4, wholeNumbersOnly: true }), { value: 4 });
+  assert.deepEqual(readIntSetting(" 3 ", { min: 3, max: 4, wholeNumbersOnly: true }), { value: 3 });
+  assert.deepEqual(readIntSetting("4.0", { min: 3, max: 4, wholeNumbersOnly: true }), { value: 4 });
+  // And range is still range: it must not be reported as a fraction.
+  assert.deepEqual(readIntSetting("5", { min: 3, max: 4, wholeNumbersOnly: true }), {
+    problem: "is outside the usable range 3..4",
+  });
+});
+
+test("blankIsRefused tells a key that rendered empty from a key nobody set", () => {
+  assert.deepEqual(readIntSetting("", { blankIsRefused: true }), { problem: "is blank" });
+  assert.deepEqual(readIntSetting("   ", { blankIsRefused: true }), { problem: "is blank" });
+  // Unset stays absent under any options. There is no configured value to
+  // refuse, and refusing it would make every unset setting fatal.
+  assert.equal(readIntSetting(undefined, { blankIsRefused: true }), null);
+  assert.equal(readIntSetting(null, { blankIsRefused: true }), null);
+  // Off by default, or every `.env.example` key left empty becomes a refusal.
+  assert.equal(readIntSetting(""), null);
+});

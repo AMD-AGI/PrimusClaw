@@ -196,6 +196,29 @@ if ! $SKIP_NATS; then
     source "$NATS_CREDS_FILE"
   fi
 
+  # Backfill the per-component passwords.
+  #
+  # These arrived after the creds file did, and the branch above only writes a
+  # fresh file -- an existing namespace sources one that predates them and
+  # leaves the new variables unset. The sed below substitutes an unset variable
+  # with the empty string, which renders four users whose password is "" and
+  # authenticates nobody. So append what is missing rather than assuming the
+  # file is current, and do it one variable at a time so a file written by a
+  # future version with more users still works.
+  for _nats_user in API BRAIN REAPER OPS; do
+    _nats_var="NATS_PASSWORD_${_nats_user}"
+    if [ -z "${!_nats_var:-}" ]; then
+      if $DRY_RUN; then
+        printf -v "$_nats_var" 'dry-run-%s-password' "$(echo "$_nats_user" | tr '[:upper:]' '[:lower:]')"
+      else
+        log "  Adding $_nats_var -> $NATS_CREDS_FILE"
+        printf -v "$_nats_var" '%s' "$(openssl rand -hex 16)"
+        echo "${_nats_var}=${!_nats_var}" >> "$NATS_CREDS_FILE"
+      fi
+    fi
+  done
+  unset _nats_user _nats_var
+
   # Render values file: substitute PROD/SYS passwords and inject one
   # account block per NATS_PASSWORD_DEV_<NAME> entry in the creds file.
   RENDERED_NATS_VALUES="$WORK_DIR/nats-values.rendered.yaml"
@@ -212,13 +235,85 @@ if ! $SKIP_NATS; then
     done < <(grep -E '^NATS_PASSWORD_DEV_' "$NATS_CREDS_FILE" || true)
   fi
 
+  # NATS_RETIRE_PROD=true removes the all-access user from the rendered config.
+  # Off by default, and deliberately NOT inferred from "are all four
+  # per-workload passwords set": a cluster can have them set and still have an
+  # out-of-tree client authenticating as prod, and the failure mode of guessing
+  # wrong is that client silently losing its connection. It has to be an
+  # explicit decision, taken after the connection census described in
+  # nats-values.yaml.
+  #
+  # The flag says "retire it now". The marker in the cluster says "it IS
+  # retired", and that is what every later run reads: this step re-renders the
+  # whole values file, so a decision remembered only in one shell's environment
+  # is undone by the next ordinary deploy. See nats-prod-retirement.sh.
+  _strip_prod=""
+  _record_retirement=false
+  _retire_state=0
+  nats_prod_retirement_state || _retire_state=$?
+  if [ "$_retire_state" = "2" ]; then
+    # Neither guess is safe: assuming "not retired" re-adds the all-access user
+    # over a transient API error, and assuming "retired" deletes a credential
+    # workloads may still be holding. Rendering is what has to stop.
+    fail "cannot read $NATS_PROD_RETIRED_MARKER in $NAMESPACE, so whether the all-access 'prod' NATS user is already retired is unknown. Rendering now would either reinstate it or delete it on a guess. Fix cluster access and re-run."
+  fi
+  if [ "$_retire_state" = "0" ]; then
+    log "  NATS: prod stays retired (marker $NATS_PROD_RETIRED_MARKER in $NAMESPACE)"
+    _strip_prod="$NATS_PROD_STRIP_EXPR"
+  elif [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
+    # Retirement is gated on all four built-in identities having actually been
+    # adopted, not on the operator having looked at a connection census and
+    # not on this shell's own inputs. reaper is a CronJob and ops runs only
+    # during an upgrade, so a census taken at any given moment can easily show
+    # neither -- and reading that as "nothing else uses prod" retires it out
+    # from under the workloads that were merely idle. Environment variables are
+    # no better on their own: they say what the next render will contain, so
+    # exporting the four passwords and retiring in one invocation would pass a
+    # check that reads only them while nothing is deployed. The gate asks the
+    # cluster and the NATS server instead. See nats_retirement_blockers in
+    # common.sh.
+    #
+    # Loud rather than skipped: an operator who asked for retirement and got a
+    # silently unretired cluster would believe the all-access user was gone.
+    log "  NATS: verifying every built-in identity is deployed and accepted before retiring prod"
+    if ! _blockers="$(nats_retirement_blockers)"; then
+      echo "ERROR: NATS_RETIRE_PROD=true, but these identities are not in use yet:" >&2
+      printf '%s\n' "$_blockers" | sed 's/^/  - /' >&2
+      echo "" >&2
+      echo "  Removing the all-access 'prod' user would cut off every workload still" >&2
+      echo "  using the shared credential. Add each component to" >&2
+      echo "  NATS_PER_USER_WORKLOADS, deploy so it adopts its own identity, confirm" >&2
+      echo "  the rollout finished, and retire prod after that -- having also run the" >&2
+      echo "  connection census in deploy/nats-values.yaml for clients that are not in" >&2
+      echo "  this repo." >&2
+      exit 1
+    fi
+    log "  NATS: retiring the all-access prod user (NATS_RETIRE_PROD=true)"
+    log "  NATS: all four built-in identities are deployed and authenticate"
+    _strip_prod="$NATS_PROD_STRIP_EXPR"
+    _record_retirement=true
+  fi
   awk -v block="$DEV_BLOCKS" '
     /# \{\{DEV_ACCOUNTS\}\}/ { printf "%s", block; next }
     { print }
   ' "$SCRIPT_DIR/nats-values.yaml" \
+    | { [ -n "$_strip_prod" ] && sed -e "$_strip_prod" || cat; } \
     | sed -e "s|__PROD_NATS_PASSWORD__|${NATS_PASSWORD_PROD}|g" \
           -e "s|__SYS_NATS_PASSWORD__|${NATS_PASSWORD_SYS}|g" \
+          -e "s|__API_NATS_PASSWORD__|${NATS_PASSWORD_API}|g" \
+          -e "s|__BRAIN_NATS_PASSWORD__|${NATS_PASSWORD_BRAIN}|g" \
+          -e "s|__REAPER_NATS_PASSWORD__|${NATS_PASSWORD_REAPER}|g" \
+          -e "s|__OPS_NATS_PASSWORD__|${NATS_PASSWORD_OPS}|g" \
     > "$RENDERED_NATS_VALUES"
+
+  # A placeholder that survived rendering means a password variable was unset,
+  # and the resulting user would silently accept the literal string as its
+  # password. Fail here rather than shipping that to the cluster.
+  if grep -q '__[A-Z]*_NATS_PASSWORD__' "$RENDERED_NATS_VALUES"; then
+    echo "ERROR: unsubstituted NATS password placeholder in $RENDERED_NATS_VALUES:" >&2
+    grep -n '__[A-Z]*_NATS_PASSWORD__' "$RENDERED_NATS_VALUES" >&2
+    exit 1
+  fi
 
   if $DRY_RUN; then
     log "[dry-run] helm upgrade --install $NATS_RELEASE nats/nats -n $NAMESPACE -f $RENDERED_NATS_VALUES"
@@ -232,9 +327,32 @@ if ! $SKIP_NATS; then
       --set config.jetstream.fileStore.pvc.storageClassName="$STORAGE_CLASS" \
       --wait --timeout 300s
   fi
+  # Only now, with the retiring config actually on the server. A marker written
+  # before this would survive a failed upgrade and make every later run strip a
+  # user the server still has.
+  if $_record_retirement; then
+    if $DRY_RUN; then
+      log "[dry-run] would record $NATS_PROD_RETIRED_MARKER in $NAMESPACE"
+    else
+      record_nats_prod_retirement
+      log "  NATS: recorded the retirement -- later runs keep prod out without the flag"
+    fi
+  fi
   log "NATS ready."
 else
   log "Step 2/7: NATS skipped (--skip-nats)."
+  # Still load whatever passwords a previous run generated. The chart decides
+  # per workload whether to use its own NATS user by whether a password is
+  # set, so skipping this would quietly hand every component back the shared
+  # all-access credential -- a downgrade with no error and no log line.
+  #
+  # Deliberately does not GENERATE any: without the helm step, nats.conf has
+  # not been rendered, and pointing a workload at a user the server does not
+  # know about fails authentication outright.
+  if [ -f "$NATS_CREDS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$NATS_CREDS_FILE"
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -348,7 +466,9 @@ log "Step 4/7: Applying Claw Helm chart ..."
 CLAW_VALUES_FILE="$WORK_DIR/claw-values.json"
 NATS_PASSWORD_EFFECTIVE="${NATS_PASSWORD_PROD:-${NATS_PASSWORD:-__TBD__}}"
 export REGISTRY TAG BRAIN_REPLICAS STORAGE_CLASS DOMAIN INGRESS_PATH AUTH_INTERNAL_TOKEN
-export USER_ENV_ENCRYPTION_KEY NATS_PASSWORD_EFFECTIVE CLAW_DEPLOY_ROOT
+export USER_ENV_ENCRYPTION_KEY BRAIN_CHECKPOINT_KEY NATS_PASSWORD_EFFECTIVE CLAW_DEPLOY_ROOT
+export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_OPS
+export CHECKPOINT_WRITE_VERSION
 export S3_ENDPOINT S3_API_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
 export CLAW_DEPLOY_MODE PG_CLUSTER PG_APP_USER PG_APP_DB PG_USER_SECRET PG_SSL_NO_VERIFY
 export SANDBOX_NAMESPACE SANDBOX_WORKLOAD_NAMESPACE SANDBOX_ROUTER_URL
@@ -413,6 +533,10 @@ values = {
     },
     "brain": {
         "replicas": int(env("BRAIN_REPLICAS", "3")),
+        # Defaults to 3 in the chart and in the code; passed explicitly so an
+        # operator can move the fleet to sealed checkpoints without editing
+        # values by hand. See values.yaml for the three preconditions.
+        "checkpointWriteVersion": int(env("CHECKPOINT_WRITE_VERSION", "3")),
     },
     "api": {
         # Browser origins allowed to call the API with credentials. Empty --
@@ -446,6 +570,28 @@ values = {
     "secret": {
         "authInternalToken": env("AUTH_INTERNAL_TOKEN"),
         "userEnvEncryptionKey": env("USER_ENV_ENCRYPTION_KEY"),
+        "brainCheckpointKey": env("BRAIN_CHECKPOINT_KEY"),
+        # A workload switches to its own NATS user only when it is named in
+        # NATS_PER_USER_WORKLOADS. Passing all four at once would move the
+        # whole fleet in one step, and the rollout order exists because the
+        # components fail at very different volumes: reaper exits non-zero, api
+        # is fatal on consumer setup, brain is mostly fail-open and is the one
+        # where a missing subject looks like nothing at all.
+        #
+        # Empty by default, which keeps every component on the shared
+        # credential. The users still get created in nats.conf either way, so
+        # adopting one later is a redeploy and not a NATS change.
+        "natsUsers": {
+            c: {
+                "user": c,
+                "password": (
+                    env("NATS_PASSWORD_" + c.upper())
+                    if c in {w.strip() for w in env("NATS_PER_USER_WORKLOADS").split(",") if w.strip()}
+                    else ""
+                ),
+            }
+            for c in ("api", "brain", "reaper", "ops")
+        },
         "natsPassword": env("NATS_PASSWORD_EFFECTIVE"),
         "clawDeployMode": env("CLAW_DEPLOY_MODE", "kubernetes"),
         "sandboxRouterUrl": env(
@@ -467,6 +613,7 @@ values = {
         "promptCacheEnabled": prompt_cache_enabled,
         "llmCacheTtl": llm_cache_ttl,
         "llmCacheStyle": llm_cache_style,
+        "llmDebugResponseHeaders": env("LLM_DEBUG_RESPONSE_HEADERS"),
         "anthropicBaseUrl": anthropic_base,
         "openaiBaseUrl": openai_base,
         "byokVerifyModelsUrl": env("BYOK_VERIFY_MODELS_URL", models_url(provider_base)),
