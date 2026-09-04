@@ -56,6 +56,18 @@ export function envSettingProblems(): readonly string[] {
   return settingProblems;
 }
 
+/**
+ * Was this specific setting given a value that had to be refused?
+ *
+ * Most refusals are worth logging and surviving: a bad CLAIM_NEXT_IDLE_MS
+ * costs a poll interval. A few decide how data is written, and running on a
+ * default nobody chose is not a survivable answer for those -- see
+ * `validateStartupConfig()`.
+ */
+export function envSettingRefused(key: string): boolean {
+  return settingProblems.some((p) => p.startsWith(`${key}=`));
+}
+
 function envInt(key: string, fallback: number, bounds?: IntSettingBounds): number {
   const setting = readIntSetting(process.env[key], bounds);
   if (setting === null) return fallback;

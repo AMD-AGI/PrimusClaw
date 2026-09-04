@@ -39,11 +39,18 @@ EOF
 chmod +x "$tmp/bin/helm"
 
 # ── A cluster whose contents each case declares ──────────────────────────
-# Absent by default (exit 1), which is what a first-time upgrade looks like.
+# Absent by default, which is what a first-time upgrade looks like. Absent and
+# unreachable are DIFFERENT answers here, as they are from real kubectl: an
+# object that does not exist is a successful empty reply under
+# --ignore-not-found, while a refusal or a timeout is a non-zero exit with no
+# output. MOCK_FAIL_QUERY produces the second for whichever query names it.
 cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
 emit() { printf '%s' "$1" | base64 | tr -d '\n'; exit 0; }
+if [ -n "${MOCK_FAIL_QUERY:-}" ]; then
+  case "$args" in *"$MOCK_FAIL_QUERY"*) exit 7 ;; esac
+fi
 case "$args" in
   *"secret primus-claw-nats-api"*NATS_PASSWORD*)
     [ -n "${MOCK_API_PASSWORD:-}" ] && emit "$MOCK_API_PASSWORD" ;;
@@ -54,6 +61,8 @@ case "$args" in
   *"deployment primus-claw-brain"*)
     [ -n "${MOCK_WRITE_VERSION:-}" ] && { printf '%s' "$MOCK_WRITE_VERSION"; exit 0; } ;;
 esac
+# Nothing was declared for this query, so the object is not there.
+case " $args " in *" --ignore-not-found "*) exit 0 ;; esac
 exit 1
 EOF
 chmod +x "$tmp/bin/kubectl"
@@ -71,6 +80,19 @@ render() {
     render_chart "brain-deployment.yaml" "$tmp/out.yaml"
   ) >/dev/null
   cat "$args_file"
+}
+
+# The same run, reporting whether render_chart itself succeeded rather than
+# what it told helm.
+render_status() {
+  (
+    export PATH="$tmp/bin:$PATH" HELM_ARGS_FILE="$tmp/helm-args-status"
+    export NAMESPACE=primus-claw REGISTRY=example.invalid TAG=test
+    SCRIPT_DIR="$deploy_dir"
+    # shellcheck disable=SC1091
+    source "$deploy_dir/common.sh"
+    render_chart "brain-deployment.yaml" "$tmp/out.yaml" >/dev/null
+  ) 2>&1
 }
 
 echo "==> upgrade preservation"
@@ -120,6 +142,25 @@ grep -q 'secret.brainCheckpointKey=' <<<"$args" || bad "the checkpoint seal key 
 grep -qxF 'brain.checkpointWriteVersion=4' <<<"$args" \
   || bad "a v4 fleet was silently re-rendered as v3"
 ok "the seal key and checkpoint write version survive a re-render"
+
+# 5. A read that FAILS is not a read that came back empty.
+#
+# This path decides what the upgrade carries forward. Treating an RBAC denial
+# or an API timeout as "nothing is deployed" re-renders a v4 fleet as v3 with
+# no seal key and hands every workload back the shared all-access credential --
+# the whole of this PR, undone by one bad minute on the API server, with a
+# successful-looking helm upgrade to show for it.
+for q in "secret primus-claw-brain-checkpoint" "deployment primus-claw-brain" \
+         "secret primus-claw-nats-api"; do
+  if out="$(MOCK_FAIL_QUERY="$q" MOCK_API_PASSWORD=s3cret \
+            MOCK_CHECKPOINT_KEY=k MOCK_WRITE_VERSION=4 render_status)"; then
+    bad "a failed read of '$q' was rendered through as if nothing were deployed:
+$out"
+  fi
+  grep -q 'could not read the deployed security settings' <<<"$out" \
+    || bad "the operator must be told which read failed, got: $out"
+done
+ok "a read that fails stops the upgrade instead of preserving nothing"
 
 echo "==> prod retirement gating"
 
@@ -178,6 +219,19 @@ fld() {
   [ "$v" = "-" ] && exit 0          # the field is simply not there
   printf '%s' "$v"
 }
+# Which Secret and key one container env var reads. Absent means the workload
+# does not set it -- with --ignore-not-found that is a successful empty answer,
+# exactly as kubectl reports a filter that matched nothing.
+envref() {
+  local v
+  v="$(val "envref-$1-$2")" || exit 0
+  [ "$v" = "!" ] && exit 7
+  printf '%s ' "$v"
+  exit 0
+}
+# --ignore-not-found: an object that is not there is empty and SUCCESSFUL. The
+# stub has to model that, or the fail-closed paths cannot be told from it.
+absent_ok() { case " $args " in *" --ignore-not-found "*) exit 0 ;; esac; exit 1; }
 
 case "$args" in
   *"exec"*"nats rtt"*)
@@ -195,7 +249,8 @@ case "$args" in
     b64 "nats://primus-claw-nats.primus-claw.svc.cluster.local:4222"; exit 0 ;;
   *"get secret primus-claw-nats-"*)
     name="${args#*get secret }"; name="${name%% *}"; comp="${name#primus-claw-nats-}"
-    line="$(val "secret-$comp")" || exit 1
+    line="$(val "secret-$comp")" || absent_ok
+    [ "$line" = "!" ] && exit 7
     case "$args" in
       *NATS_USER*) b64 "${line%% *}" ;;
       *NATS_PASSWORD*) b64 "${line##* }" ;;
@@ -205,7 +260,8 @@ case "$args" in
   *"get deployment primus-claw-"*)
     name="${args#*get deployment }"; name="${name%% *}"; comp="${name#primus-claw-}"
     case "$args" in
-      *secretKeyRef.name*) val "refs-$comp" || exit 0 ;;
+      *'@.name=="NATS_USER"'*)     envref "$comp" NATS_USER ;;
+      *'@.name=="NATS_PASSWORD"'*) envref "$comp" NATS_PASSWORD ;;
       # replicas-<comp> is: desired updated ready total generation observed.
       # A field written as `-` is one the API server does not report at all --
       # a zero-valued status counter, or an object that has no such field.
@@ -219,8 +275,18 @@ case "$args" in
     esac
     exit 0 ;;
   *"get cronjob primus-claw-workspace-reaper"*)
-    val "refs-reaper-cronjob" || exit 0
-    exit 0 ;;
+    case "$args" in
+      *'@.name=="NATS_USER"'*)     envref reaper-cronjob NATS_USER ;;
+      *'@.name=="NATS_PASSWORD"'*) envref reaper-cronjob NATS_PASSWORD ;;
+    esac
+    exit 1 ;;
+  # The durable record of the retirement decision.
+  *"get configmap "*)
+    v="$(val prod-retired-marker)" || absent_ok
+    [ "$v" = "!" ] && exit 7
+    echo "configmap/primus-claw-nats-prod-retired"; exit 0 ;;
+  *"create configmap "*)
+    echo recorded >"$CLUSTER_DIR/prod-retired-marker"; exit 0 ;;
 esac
 exit 1
 EOF
@@ -234,12 +300,14 @@ adopted() {
   local c
   for c in api brain reaper ops; do echo "claw-$c pw-$c" >"$cluster/secret-$c"; done
   for c in api brain; do
-    echo "primus-claw-secrets primus-claw-nats-$c" >"$cluster/refs-$c"
+    echo "primus-claw-nats-$c/NATS_USER" >"$cluster/envref-$c-NATS_USER"
+    echo "primus-claw-nats-$c/NATS_PASSWORD" >"$cluster/envref-$c-NATS_PASSWORD"
     # desired 2, both updated, both Ready, two pods in total (no old
     # ReplicaSet left) and the controller has acted on the current spec.
     echo "2 2 2 2 7 7" >"$cluster/replicas-$c"
   done
-  echo "primus-claw-secrets primus-claw-nats-reaper" >"$cluster/refs-reaper-cronjob"
+  echo "primus-claw-nats-reaper/NATS_USER" >"$cluster/envref-reaper-cronjob-NATS_USER"
+  echo "primus-claw-nats-reaper/NATS_PASSWORD" >"$cluster/envref-reaper-cronjob-NATS_PASSWORD"
   printf 'claw-api\nclaw-brain\nclaw-reaper\nclaw-ops\n' >"$cluster/auth-ok"
 }
 
@@ -296,11 +364,38 @@ ok "a deployed password that differs from the configured one blocks retirement"
 # 4. The Secret exists and the workload does not read it. A Secret can be
 #    applied a full deploy before the Deployment that consumes it.
 adopted
-echo "primus-claw-secrets" >"$cluster/refs-api"
+rm -f "$cluster/envref-api-NATS_USER" "$cluster/envref-api-NATS_PASSWORD"
 out="$(blockers)"
-grep -q "^api (the primus-claw-api Deployment does not read primus-claw-nats-api" <<<"$out" \
+grep -q "^api (the primus-claw-api deployment does not set NATS_USER from a Secret" <<<"$out" \
   || bad "a workload that does not read its Secret must block retirement, got: $out"
 ok "a Deployment that does not read its own credential blocks retirement"
+
+# 4a. It reads A Secret -- the shared one. This is what the cutover looks like
+#     when the chart rendered the Deployment before the identity existed: the
+#     env var is there, it resolves, the pod runs, and the value it resolves to
+#     is the all-access credential this retirement is about to delete.
+adopted
+echo "primus-claw-secrets/NATS_PASSWORD" >"$cluster/envref-api-NATS_PASSWORD"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api deployment reads NATS_PASSWORD from primus-claw-secrets/NATS_PASSWORD rather than primus-claw-nats-api/NATS_PASSWORD" <<<"$out" \
+  || bad "a Deployment on the shared credential must block retirement, got: $out"
+ok "a Deployment reading the shared Secret blocks retirement"
+
+# 4b. The right Secret, the wrong key in it. Same name, different value.
+adopted
+echo "primus-claw-nats-api/NATS_PASSWORD_OLD" >"$cluster/envref-api-NATS_PASSWORD"
+out="$(blockers)"
+grep -q "^api (the primus-claw-api deployment reads NATS_PASSWORD from primus-claw-nats-api/NATS_PASSWORD_OLD" <<<"$out" \
+  || bad "the key inside the Secret has to match too, got: $out"
+ok "the right Secret under the wrong key blocks retirement"
+
+# 4c. And a query that fails is not a workload that passed.
+adopted
+echo '!' >"$cluster/envref-brain-NATS_USER"
+out="$(blockers)"
+grep -q "^brain (the primus-claw-brain deployment could not be read" <<<"$out" \
+  || bad "an unreadable Deployment must block retirement, got: $out"
+ok "a Deployment that cannot be read blocks retirement"
 
 # 5. The spec is right and the rollout is not finished. Half the pods are still
 #    the old ReplicaSet, authenticating as prod.
@@ -417,9 +512,9 @@ ok "a scale-down that still owns a pod blocks retirement"
 #    between sweeps there is nothing connected to count, so the spec is the
 #    only evidence there is.
 adopted
-echo "primus-claw-secrets" >"$cluster/refs-reaper-cronjob"
+echo "primus-claw-secrets/NATS_PASSWORD" >"$cluster/envref-reaper-cronjob-NATS_PASSWORD"
 out="$(blockers)"
-grep -q "^reaper (the primus-claw-workspace-reaper CronJob does not read" <<<"$out" \
+grep -q "^reaper (the primus-claw-workspace-reaper cronjob reads NATS_PASSWORD from primus-claw-secrets" <<<"$out" \
   || bad "a CronJob still on the shared credential must block retirement, got: $out"
 ok "a reaper CronJob still on the shared credential blocks retirement"
 
@@ -449,9 +544,121 @@ grep -q 'nats_retirement_blockers' <<<"$retire_block" \
   || bad "deploy.sh retires prod without running the adoption gate"
 grep -q 'exit 1' <<<"$retire_block" \
   || bad "deploy.sh must abort, not warn, when the gate reports blockers"
-[ "$(grep -c '__PROD_USER_BEGIN__' <<<"$retire_block")" -ge 1 ] \
+grep -q 'NATS_PROD_STRIP_EXPR' <<<"$retire_block" \
   || bad "the retirement branch no longer strips the prod user block"
+grep -q '__PROD_USER_BEGIN__' "$deploy_dir/nats-prod-retirement.sh" \
+  || bad "NATS_PROD_STRIP_EXPR no longer removes the prod user block"
 ok "deploy.sh runs the gate before stripping the prod user, and aborts on blockers"
+
+# ── 10. The decision has to outlive the run that took it ─────────────────
+#
+# Every script that touches nats-values.yaml re-renders the WHOLE file and
+# helm-upgrades the WHOLE release. A retirement kept only in NATS_RETIRE_PROD
+# therefore lasts exactly one invocation: the next ordinary deploy, or the next
+# developer running make-dev-account.sh to add themselves, renders the
+# all-access user straight back onto the server. Nothing errors, nothing logs,
+# and the credential this PR exists to remove is serving again.
+#
+# These cases execute the real blocks out of both scripts rather than reading
+# them, so a future edit that reintroduces the env-only decision fails here.
+
+# deploy.sh's retirement decision and the render it feeds, lifted verbatim.
+deploy_render() {
+  (
+    export PATH="$tmp/bin:$PATH" CLUSTER_DIR="$cluster" NAMESPACE=primus-claw
+    export NATS_PER_USER_WORKLOADS="api,brain,reaper,ops"
+    export NATS_PASSWORD_PROD=pw-prod NATS_PASSWORD_SYS=pw-sys
+    export NATS_PASSWORD_API=pw-api NATS_PASSWORD_BRAIN=pw-brain
+    export NATS_PASSWORD_REAPER=pw-reaper NATS_PASSWORD_OPS=pw-ops
+    export HELM_ARGS_FILE="$tmp/helm-args-deploy"
+    SCRIPT_DIR="$deploy_dir"
+    DEV_BLOCKS=""
+    DRY_RUN=false
+    STORAGE_CLASS=standard
+    NATS_RELEASE=primus-claw-nats
+    RENDERED_NATS_VALUES="$tmp/rendered.yaml"
+    # shellcheck disable=SC1091
+    source "$deploy_dir/common.sh"
+    eval "$(sed -n '/^  _strip_prod=""/,/^  log "NATS ready\."/p' "$deploy_dir/deploy.sh")"
+    cat "$RENDERED_NATS_VALUES"
+  )
+}
+
+# A cluster that has retired prod, being deployed again by someone who has
+# never heard of NATS_RETIRE_PROD.
+adopted
+echo recorded >"$cluster/prod-retired-marker"
+out="$(NATS_RETIRE_PROD= deploy_render)"
+grep -q '__PROD_USER_BEGIN__' <<<"$out" \
+  && bad "an ordinary deploy re-added the all-access prod user after retirement"
+grep -q 'SYS:' <<<"$out" || bad "the render lost the sys account along with prod: $out"
+ok "an ordinary deploy with no flag keeps prod retired"
+
+# And the flag is still what performs a retirement that has not happened yet,
+# recording it so the run above has something to read.
+adopted
+out="$(NATS_RETIRE_PROD=true deploy_render)"
+grep -q '__PROD_USER_BEGIN__' <<<"$out" \
+  && bad "NATS_RETIRE_PROD=true did not strip the prod user"
+[ -f "$cluster/prod-retired-marker" ] \
+  || bad "the retirement was performed but never recorded, so the next run re-adds prod"
+ok "retiring records the decision in the cluster"
+
+# The gate still runs on the way there: a cluster that has not adopted the
+# identities must not be able to retire, marker mechanism or not.
+rm -rf "$cluster"; mkdir -p "$cluster"
+if out="$(NATS_RETIRE_PROD=true deploy_render 2>&1)"; then
+  bad "retirement proceeded on a cluster with nothing deployed: $out"
+fi
+grep -q "not in use yet" <<<"$out" || bad "the adoption gate no longer runs before retiring: $out"
+[ -f "$cluster/prod-retired-marker" ] \
+  && bad "a refused retirement must not be recorded as having happened"
+ok "a blocked retirement neither strips nor records"
+
+# Unknown is not "no". If the marker cannot be read, rendering either way is a
+# guess -- one reinstates the all-access user, the other deletes a credential
+# workloads may still hold -- so the render must not happen at all.
+adopted
+echo '!' >"$cluster/prod-retired-marker"
+if out="$(NATS_RETIRE_PROD= deploy_render 2>&1)"; then
+  bad "deploy.sh rendered while the retirement state was unreadable: $out"
+fi
+grep -q "is already retired is unknown" <<<"$out" \
+  || bad "the operator must be told the marker could not be read, got: $out"
+ok "an unreadable retirement marker stops the render instead of guessing"
+
+# make-dev-account.sh is the one that surprises people: it exists to add a
+# developer account and rewrites every production user on its way there.
+dev_render() {
+  (
+    export PATH="$tmp/bin:$PATH" CLUSTER_DIR="$cluster" NAMESPACE=primus-claw
+    export NATS_PASSWORD_PROD=pw-prod NATS_PASSWORD_SYS=pw-sys
+    export NATS_PASSWORD_API=pw-api NATS_PASSWORD_BRAIN=pw-brain
+    export NATS_PASSWORD_REAPER=pw-reaper NATS_PASSWORD_OPS=pw-ops
+    SCRIPT_DIR="$deploy_dir"
+    VALUES_TEMPLATE="$deploy_dir/nats-values.yaml"
+    DEV_BLOCKS=""
+    RENDERED="$tmp/dev-rendered.yaml"
+    # shellcheck disable=SC1091
+    source "$deploy_dir/nats-prod-retirement.sh"
+    eval "$(sed -n '/^_strip_prod=""/,/> "\$RENDERED"/p' "$deploy_dir/make-dev-account.sh")"
+    cat "$RENDERED"
+  )
+}
+
+adopted
+echo recorded >"$cluster/prod-retired-marker"
+out="$(dev_render)"
+grep -q '__PROD_USER_BEGIN__' <<<"$out" \
+  && bad "onboarding a developer re-added the all-access prod user"
+grep -q 'SYS:' <<<"$out" || bad "the dev render lost the sys account: $out"
+ok "make-dev-account.sh keeps prod retired"
+
+rm -rf "$cluster"; mkdir -p "$cluster"
+out="$(dev_render)"
+grep -q '__PROD_USER_BEGIN__' <<<"$out" \
+  || bad "make-dev-account.sh must leave prod alone on a cluster that never retired it"
+ok "make-dev-account.sh leaves prod in place where it was never retired"
 
 echo "==> chart render guards"
 
@@ -490,6 +697,27 @@ key="$(head -c 32 /dev/urandom | base64)"
   || bad "v4 with a seal key must render"
 grep -q 'CHECKPOINT_WRITE_VERSION' "$tmp/v4.yaml" || bad "the v4 render lost CHECKPOINT_WRITE_VERSION"
 grep -q 'BRAIN_CHECKPOINT_KEY' "$tmp/v4.yaml" || bad "the v4 render did not mount the seal key"
+
+# There are two checkpoint formats and no others. A guard that only catches
+# "4 without a key" lets 2, 5 and "banana" through, and the brain reads them
+# with readIntSetting, which does not clamp -- it falls back. So the operator
+# who typed 5 meaning "newest" gets 3: redacted checkpoints, unsealed, from a
+# render that reported success. Refuse the value instead of picking one.
+for v in 2 5 0 -1 banana 3.5 ""; do
+  refuses "checkpointWriteVersion=${v:-<empty>}" \
+    --set-string "brain.checkpointWriteVersion=$v" \
+    --set-string "secret.brainCheckpointKey=$key"
+done
+"${helm_base[@]}" --set-string brain.checkpointWriteVersion=5 >/dev/null 2>"$tmp/err" || true
+grep -q 'must be 3 or 4' "$tmp/err" || bad "the version guard must say what the usable values are"
+grep -q '"5"' "$tmp/err" || bad "the version guard must quote back the value it refused, got: $(cat "$tmp/err")"
+ok "the version guard names the value it refused and the two that exist"
+
+# And 3 -- the default, and the only value most clusters ever set -- still
+# renders without a seal key, or the guard has broken every v3 deployment.
+"${helm_base[@]}" --set brain.checkpointWriteVersion=3 >/dev/null 2>&1 \
+  || bad "checkpointWriteVersion=3 must render on its own"
+ok "checkpointWriteVersion=3 still renders"
 ok "v4 with a seal key renders and mounts it"
 
 # The reaper's guards, in both directions.

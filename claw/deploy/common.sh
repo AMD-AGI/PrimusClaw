@@ -40,6 +40,10 @@ _SCRIPT_LABEL="${_SCRIPT_LABEL:-claw}"
 log()  { echo "[$_SCRIPT_LABEL] $(date +%H:%M:%S) $*"; }
 fail() { echo "[$_SCRIPT_LABEL] ERROR: $*" >&2; exit 1; }
 
+# ── NATS prod-user retirement, as a durable cluster fact ─────────────────
+# shellcheck source=./nats-prod-retirement.sh
+source "$SCRIPT_DIR/nats-prod-retirement.sh"
+
 # ── StorageClass selection ───────────────────────────────────────────────
 # Chooses the StorageClass for the PostgresCluster + NATS PVCs. Honors an
 # explicit STORAGE_CLASS env; otherwise lists `kubectl get sc` and prompts.
@@ -272,15 +276,54 @@ trap cleanup_deploy_temp_files EXIT
 # file, upgrade.sh does not -- and "the operator must remember to pass them" is
 # precisely the failure being fixed. What is deployed is the authority on what
 # should stay deployed.
+#
+# Every read below tells "not deployed yet" apart from "the cluster could not be
+# asked", and refuses to render on the second. `kubectl get` exits non-zero for
+# both a missing object and an API server that timed out, refused the
+# credential, or was mid-outage, so the exit status alone cannot separate them
+# -- which is why the old `|| true` was indistinguishable from "absent".
+# --ignore-not-found separates them: an object that does not exist becomes exit
+# 0 with no output, leaving every non-zero status to mean a real failure.
+#
+# Fail-open here is the specific regression this function exists to prevent,
+# arrived at the other way round. One timed-out kubectl and the upgrade renders
+# with CHECKPOINT_WRITE_VERSION back at 3 and no per-workload NATS credentials
+# -- every component silently returned to the shared all-access user, sealed
+# checkpoints stranded in the bucket, and no error anywhere.
+
+# Read one field into _PRESERVED_VALUE. Returns non-zero only when the query
+# itself failed; an object that is simply absent is empty and successful.
+#
+# Sets a global instead of printing, because the caller must be able to tell a
+# failure from empty output -- inside `v=$(...)` a `return 1` is a subshell's,
+# and the reason for it would be lost with the subshell.
+_preserved_get() {
+  local raw
+  if ! raw="$(kubectl get "$1" "$2" -n "$NAMESPACE" --ignore-not-found \
+              -o jsonpath="$3" 2>/dev/null)"; then
+    echo "[$_SCRIPT_LABEL] ERROR: could not read $1/$2 in $NAMESPACE" >&2
+    return 1
+  fi
+  _PRESERVED_VALUE="$raw"
+}
+
+# The same, base64-decoded, for Secret data.
+_preserved_secret() {
+  _preserved_get secret "$1" "{.data.$2}" || return 1
+  [ -n "$_PRESERVED_VALUE" ] || return 0
+  _PRESERVED_VALUE="$(printf '%s' "$_PRESERVED_VALUE" | base64 -d 2>/dev/null)"
+}
+
 _preserve_security_values() {
   local out=() v
-  v=$(kubectl get secret primus-claw-brain-checkpoint -n "$NAMESPACE" \
-      -o jsonpath='{.data.BRAIN_CHECKPOINT_KEY}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  _preserved_secret primus-claw-brain-checkpoint BRAIN_CHECKPOINT_KEY || return 1
+  v="$_PRESERVED_VALUE"
   [ -n "$v" ] && out+=(--set-string "secret.brainCheckpointKey=$v")
 
-  v=$(kubectl get deployment primus-claw-brain -n "$NAMESPACE" -o \
-      jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CHECKPOINT_WRITE_VERSION")]}{.value}{end}' \
-      2>/dev/null || true)
+  _preserved_get deployment primus-claw-brain \
+    '{range .spec.template.spec.containers[0].env[?(@.name=="CHECKPOINT_WRITE_VERSION")]}{.value}{end}' \
+    || return 1
+  v="$_PRESERVED_VALUE"
   [ -n "$v" ] && out+=(--set-string "brain.checkpointWriteVersion=$v")
 
   # Username and password are read and restored as a PAIR. Restoring the
@@ -292,12 +335,12 @@ _preserve_security_values() {
   # password came back too: half a credential is not one.
   local c u
   for c in api brain reaper ops; do
-    v=$(kubectl get secret "primus-claw-nats-$c" -n "$NAMESPACE" \
-        -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    _preserved_secret "primus-claw-nats-$c" NATS_PASSWORD || return 1
+    v="$_PRESERVED_VALUE"
     [ -n "$v" ] || continue
     out+=(--set-string "secret.natsUsers.$c.password=$v")
-    u=$(kubectl get secret "primus-claw-nats-$c" -n "$NAMESPACE" \
-        -o jsonpath='{.data.NATS_USER}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    _preserved_secret "primus-claw-nats-$c" NATS_USER || return 1
+    u="$_PRESERVED_VALUE"
     [ -n "$u" ] && out+=(--set-string "secret.natsUsers.$c.user=$u")
   done
   # An empty array must produce zero lines, not one empty one. `printf '%s\n'`
@@ -387,9 +430,16 @@ _missing_nats_identities() {
 # one silently changes what runs there.
 _shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
+# Prints the decoded value; returns non-zero only when the query failed.
+# Absent Secret is empty and successful (--ignore-not-found), so a caller can
+# tell "never deployed" from "could not ask" -- which here decide the same
+# thing, but for reasons the operator has to be told apart.
 _nats_secret_value() {
-  kubectl get secret "$1" -n "$NAMESPACE" \
-    -o jsonpath="{.data.$2}" 2>/dev/null | base64 -d 2>/dev/null || true
+  local raw
+  raw="$(kubectl get secret "$1" -n "$NAMESPACE" --ignore-not-found \
+         -o jsonpath="{.data.$2}" 2>/dev/null)" || return 1
+  [ -n "$raw" ] || return 0
+  printf '%s' "$raw" | base64 -d 2>/dev/null
 }
 
 # The two strategies upgrade.sh's nats_kv_put uses, in the same order: the
@@ -437,21 +487,63 @@ _nats_auth_probe() {
   _nats_box_exec "nats rtt --server=$(_shq "$url")" >/dev/null 2>&1
 }
 
+# Which Secret and key does a container env var actually read?
+#
+# The reference NAME alone is not adoption, and that is the hole this closes.
+# A pod spec can mention primus-claw-nats-<c> on some unrelated variable while
+# NATS_USER and NATS_PASSWORD still come from primus-claw-secrets -- the shared
+# prod credential -- and a check that only asks "is this Secret referenced
+# anywhere in the spec" passes that spec unchanged, then reports the workload
+# has adopted its own identity. So ask about the two variables that actually
+# authenticate, and about the key each of them reads: a NATS_PASSWORD wired to
+# the right Secret but the wrong key authenticates as nobody, and one wired to
+# primus-claw-secrets authenticates as prod.
+#
+# Container-level env is the right place to look: it overrides the same name
+# arriving through envFrom, which is how the chart replaces the shared
+# credential without primus-claw-secrets changing.
+#
+# Prints one `<secret>/<key>` per matching container entry, space-separated.
+# Returns non-zero only when the query itself failed.
+_nats_env_ref() {   # <kind> <object> <containers jsonpath> <env var>
+  kubectl get "$1" "$2" -n "$NAMESPACE" --ignore-not-found \
+    -o jsonpath="{range $3[?(@.name==\"$4\")]}{.valueFrom.secretKeyRef.name}/{.valueFrom.secretKeyRef.key}{\" \"}{end}" \
+    2>/dev/null
+}
+
+# Do NATS_USER and NATS_PASSWORD both come from this component's own Secret,
+# in every container that sets them? Prints why not, and returns non-zero.
+_nats_creds_from_own_secret() {   # <kind> <object> <containers jsonpath> <component>
+  local kind="$1" obj="$2" path="$3" c="$4" var refs tok want
+  for var in NATS_USER NATS_PASSWORD; do
+    if ! refs="$(_nats_env_ref "$kind" "$obj" "$path" "$var")"; then
+      echo "the $obj $kind could not be read from $NAMESPACE, so which credential it uses is unknown"
+      return 1
+    fi
+    want="primus-claw-nats-$c/$var"
+    if [ -z "${refs// /}" ]; then
+      echo "the $obj $kind does not set $var from a Secret, so it is still using the shared credential from primus-claw-secrets"
+      return 1
+    fi
+    for tok in $refs; do
+      if [ "$tok" != "$want" ]; then
+        echo "the $obj $kind reads $var from $tok rather than $want, so it is not authenticating as its own identity"
+        return 1
+      fi
+    done
+  done
+  return 0
+}
+
 # Prints why this component's workload has not adopted its identity, and
 # returns non-zero. Silent and 0 when it has.
 _nats_workload_adoption() {
-  local c="$1" refs name
+  local c="$1" name
   case "$c" in
     api|brain)
       name="primus-claw-$c"
-      refs=$(kubectl get deployment "$name" -n "$NAMESPACE" \
-        -o jsonpath='{.spec.template.spec.containers[*].env[*].valueFrom.secretKeyRef.name}' \
-        2>/dev/null || true)
-      case " $refs " in
-        *" primus-claw-nats-$c "*) ;;
-        *) echo "the $name Deployment does not read primus-claw-nats-$c, so it is still on the shared credential"
-           return 1 ;;
-      esac
+      _nats_creds_from_own_secret deployment "$name" \
+        '.spec.template.spec.containers[*].env' "$c" || return 1
       # Rollout completeness, by the same four conditions `kubectl rollout
       # status` waits on. The obvious pair -- every replica updated, at least
       # one ready -- is satisfied in the middle of a rolling update: with
@@ -537,14 +629,8 @@ _nats_workload_adoption() {
       fi
       ;;
     reaper)
-      refs=$(kubectl get cronjob primus-claw-workspace-reaper -n "$NAMESPACE" \
-        -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[*].env[*].valueFrom.secretKeyRef.name}' \
-        2>/dev/null || true)
-      case " $refs " in
-        *" primus-claw-nats-reaper "*) ;;
-        *) echo "the primus-claw-workspace-reaper CronJob does not read primus-claw-nats-reaper, so the next sweep would authenticate as prod"
-           return 1 ;;
-      esac
+      _nats_creds_from_own_secret cronjob primus-claw-workspace-reaper \
+        '.spec.jobTemplate.spec.template.spec.containers[*].env' reaper || return 1
       ;;
     ops) : ;;
   esac
@@ -556,8 +642,11 @@ _unadopted_nats_identities() {
   for c in api brain reaper ops; do
     var="NATS_PASSWORD_$(echo "$c" | tr '[:lower:]' '[:upper:]')"
     configured="${!var:-}"
-    user="$(_nats_secret_value "primus-claw-nats-$c" NATS_USER)"
-    pass="$(_nats_secret_value "primus-claw-nats-$c" NATS_PASSWORD)"
+    if ! user="$(_nats_secret_value "primus-claw-nats-$c" NATS_USER)" \
+       || ! pass="$(_nats_secret_value "primus-claw-nats-$c" NATS_PASSWORD)"; then
+      unadopted+=("$c (the primus-claw-nats-$c Secret could not be read from $NAMESPACE, so whether this identity is deployed is unknown)")
+      continue
+    fi
     if [ -z "$user" ] || [ -z "$pass" ]; then
       unadopted+=("$c (no primus-claw-nats-$c Secret in $NAMESPACE: this identity has never been deployed)")
       continue
@@ -598,10 +687,21 @@ nats_retirement_blockers() {
 
 render_chart() {
   local template="$1" dst="$2"; shift 2
-  local preserved=()
+  local preserved=() preserved_out
   # Explicit values from the caller come after these, so a deliberate --set
   # still wins over what happens to be deployed.
-  mapfile -t preserved < <(_preserve_security_values)
+  #
+  # Captured with `$(...)` rather than read straight from a process
+  # substitution, because `mapfile < <(...)` reports the status of mapfile --
+  # a function that gave up because the cluster was unreachable would look
+  # exactly like one that found nothing to preserve.
+  if ! preserved_out="$(_preserve_security_values)"; then
+    fail "could not read the deployed security settings from $NAMESPACE (see above). Rendering now would reset CHECKPOINT_WRITE_VERSION and drop the per-workload NATS credentials, putting every component back on the shared all-access user. Fix cluster access and re-run."
+  fi
+  # Empty output must produce zero arguments, not one empty one: `mapfile`
+  # on an empty here-string still yields a single empty element, which reaches
+  # helm as an empty positional argument and fails the render.
+  [ -n "$preserved_out" ] && mapfile -t preserved <<<"$preserved_out"
   helm template primus-claw "$CLAW_CHART_DIR" \
     -n "$NAMESPACE" \
     --set secret.create=false \

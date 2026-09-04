@@ -322,6 +322,17 @@ config:
                   - "$JS.API.STREAM.MSG.GET.KV_BRAIN_REGISTRY"
                   # keys() only -- a headers-only scan. The reaper never reads
                   # a checkpoint value, so it gets no DIRECT.GET here.
+                  #
+                  # Accepted scope, stated plainly: headers-only is what the
+                  # reaper's client asks for, not what these lines enforce. A
+                  # consumer created under CONSUMER.CREATE can be created with
+                  # bodies, and MSG.NEXT would then deliver them. It cannot be
+                  # narrowed the way the api entries above are: the reaper's
+                  # consumers are ephemeral, so the server names them and the
+                  # request subject has no name to pin. What actually closes it
+                  # is v4 -- sealed bodies the reaper has no key for -- which is
+                  # the same reason the paragraph above says to hold this
+                  # password as tightly as the brain user's until then.
                   - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS"
                   - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS.>"
                   - "$JS.API.CONSUMER.INFO.KV_BRAIN_CHECKPOINTS.>"

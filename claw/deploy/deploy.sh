@@ -242,8 +242,25 @@ if ! $SKIP_NATS; then
   # wrong is that client silently losing its connection. It has to be an
   # explicit decision, taken after the connection census described in
   # nats-values.yaml.
+  #
+  # The flag says "retire it now". The marker in the cluster says "it IS
+  # retired", and that is what every later run reads: this step re-renders the
+  # whole values file, so a decision remembered only in one shell's environment
+  # is undone by the next ordinary deploy. See nats-prod-retirement.sh.
   _strip_prod=""
-  if [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
+  _record_retirement=false
+  _retire_state=0
+  nats_prod_retirement_state || _retire_state=$?
+  if [ "$_retire_state" = "2" ]; then
+    # Neither guess is safe: assuming "not retired" re-adds the all-access user
+    # over a transient API error, and assuming "retired" deletes a credential
+    # workloads may still be holding. Rendering is what has to stop.
+    fail "cannot read $NATS_PROD_RETIRED_MARKER in $NAMESPACE, so whether the all-access 'prod' NATS user is already retired is unknown. Rendering now would either reinstate it or delete it on a guess. Fix cluster access and re-run."
+  fi
+  if [ "$_retire_state" = "0" ]; then
+    log "  NATS: prod stays retired (marker $NATS_PROD_RETIRED_MARKER in $NAMESPACE)"
+    _strip_prod="$NATS_PROD_STRIP_EXPR"
+  elif [ "${NATS_RETIRE_PROD:-false}" = "true" ]; then
     # Retirement is gated on all four built-in identities having actually been
     # adopted, not on the operator having looked at a connection census and
     # not on this shell's own inputs. reaper is a CronJob and ops runs only
@@ -273,7 +290,8 @@ if ! $SKIP_NATS; then
     fi
     log "  NATS: retiring the all-access prod user (NATS_RETIRE_PROD=true)"
     log "  NATS: all four built-in identities are deployed and authenticate"
-    _strip_prod='/__PROD_USER_BEGIN__/,/__PROD_USER_END__/d'
+    _strip_prod="$NATS_PROD_STRIP_EXPR"
+    _record_retirement=true
   fi
   awk -v block="$DEV_BLOCKS" '
     /# \{\{DEV_ACCOUNTS\}\}/ { printf "%s", block; next }
@@ -308,6 +326,17 @@ if ! $SKIP_NATS; then
       -f "$RENDERED_NATS_VALUES" \
       --set config.jetstream.fileStore.pvc.storageClassName="$STORAGE_CLASS" \
       --wait --timeout 300s
+  fi
+  # Only now, with the retiring config actually on the server. A marker written
+  # before this would survive a failed upgrade and make every later run strip a
+  # user the server still has.
+  if $_record_retirement; then
+    if $DRY_RUN; then
+      log "[dry-run] would record $NATS_PROD_RETIRED_MARKER in $NAMESPACE"
+    else
+      record_nats_prod_retirement
+      log "  NATS: recorded the retirement -- later runs keep prod out without the flag"
+    fi
   fi
   log "NATS ready."
 else
