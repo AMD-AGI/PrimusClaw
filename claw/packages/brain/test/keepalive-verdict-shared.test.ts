@@ -860,3 +860,108 @@ test("a verdict an old binary carried across a task is not read as current when 
     "and the sweep had to ask again, which is what the fresh answer proves",
   );
 });
+
+// --- a clock reading is not a unique name for the period it names ---
+
+test("a verdict is not carried into a second idle period that opened on the same millisecond", async () => {
+  // The ABA the stamp cannot see.
+  //
+  // `idleSince` was made the witness because it is a value rather than an
+  // ordering, and a value cannot be skewed into the wrong answer. But it is a
+  // wall-clock reading, and a wall-clock reading is not unique: two idle periods
+  // fifteen minutes apart can be stamped with the same millisecond, and when
+  // they are they carry the same `idleEpoch` too -- markHandsIdle copies one
+  // from the other. Both halves of the check then match across the boundary they
+  // exist to detect, and the `idle` answer measured during the FIRST period is
+  // read as current for the second, which deletes the handle while the task that
+  // ran in between is still holding the pod with a background shell.
+  //
+  // The entry below is that collision at its plainest: the measurement is
+  // timestamped one millisecond BEFORE the idle period it is being credited to,
+  // which is the proof that the two are different periods, and every field the
+  // reader compares still agrees. It is also the shape a build that predates the
+  // revision witness leaves behind -- no `idleRev` on the handle, none on the
+  // verdict -- so it doubles as the rolling-deployment reading: an entry no
+  // current writer stamped is unwitnessed, which costs one probe and never a
+  // reclaim.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // Sixteen minutes idle, past SANDBOX_IDLE_REUSE_MS, so an `idle` answer is
+  // acted on by this very sweep rather than being academic.
+  const T = Date.now() - 16 * 60_000;
+  k.replace({
+    ...ENTRY,
+    keepalive: false,
+    idleSince: T,
+    idleEpoch: T,
+    // Measured before this period opened -- so it is about the one before it.
+    bgCheckedAt: T - 1,
+    bgRunning: 0,
+    bgEpoch: T,
+    bgIdleSince: T,
+  });
+
+  const carried = k.current();
+  assert.equal(
+    carried.bgIdleSince, carried.idleSince,
+    "premise: the two periods were stamped with the same millisecond, so the "
+      + "witness matches across the boundary it exists to detect",
+  );
+  assert.equal(carried.bgEpoch, carried.idleEpoch, "premise: and so do the epochs");
+  assert.ok(
+    (carried.bgCheckedAt as number) < (carried.idleSince as number),
+    "premise: the answer predates the period it is credited to, which is what "
+      + "makes these two periods and not one",
+  );
+
+  // A replica sweeps with no memory of any of this. Its probe finds the shell
+  // the task left -- if the handle survives long enough to be asked.
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "two idle periods that stamp the same millisecond are indistinguishable by "
+      + "any reading of the clock; treating the earlier one's `idle` as current "
+      + "reclaims the pod out from under a live background shell",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the sweep asked again instead, which is what the fresh answer proves",
+  );
+
+  // The other half of the same defect, and the half that shows the revision
+  // doing positive work rather than merely being absent. The verdict a replica
+  // keeps in its own memory is checked by the same rule, and nothing bumps this
+  // process's generation when the re-idle happens on ANOTHER replica -- so a
+  // colliding millisecond carries the in-process answer across the boundary
+  // exactly as it carries the entry-borne one.
+  resetBackgroundWorkStateForTest();
+  k.replace({ ...ENTRY, keepalive: false, idleSince: T, idleEpoch: T, idleRev: 101 });
+
+  // This replica measures `idle` for the period named (T, 101) and caches it.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  assert.equal(k.current().bgRunning, 0, "sanity: an `idle` answer was cached and filed");
+  assert.equal(k.current().bgIdleRev, 101, "sanity: witnessed by the period's revision");
+
+  // Another replica then runs the session's next message in this pod, leaves a
+  // background shell, and idles the handle again -- landing on the same
+  // millisecond, so its `idleSince` and `idleEpoch` are the ones this replica
+  // already has an answer for. Its markHandsIdle clears the verdict from the
+  // entry, which is why only the in-memory copy can decide this sweep.
+  k.replace({ ...ENTRY, keepalive: false, idleSince: T, idleEpoch: T, idleRev: 102 });
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the cached `idle` names the period (T, 101) and the handle is in (T, 102); "
+      + "the two are one period by every clock reading on the entry and two by "
+      + "the revision, and only the revision is right",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and this sweep asked again too, rather than acting on the previous "
+      + "period's answer",
+  );
+});

@@ -98,6 +98,30 @@ interface HandsKvEntry {
    */
   idleEpoch?: number;
   /**
+   * The KV revision the write that opened this idle period was conditioned on.
+   *
+   * `idleEpoch` cannot identify a period on its own, because it is a copy of
+   * `idleSince` -- markHandsIdle stamps one from the other -- so any two idle
+   * periods whose `idleSince` readings land on the same millisecond carry the
+   * same epoch too. Both halves of the witness below then collapse together, and
+   * a verdict from the earlier period reads as current for the later one: the
+   * ABA the wall clock cannot rule out, because a clock reading is not a
+   * unique name for the moment it was read at.
+   *
+   * A revision is. Every write to a key is conditioned on the revision it read,
+   * the bucket accepts exactly one write per revision, and the revision it
+   * produces is strictly greater -- so the revision an idle-opening write was
+   * conditioned on is a name no later idle-opening write on this key can be
+   * given. Not compared as an ordering, only as a value: see
+   * `measuredUnderThisIdlePeriod`.
+   *
+   * Absent on entries written before it existed, and backfilled in
+   * collectTargets for the same reason `idleEpoch` is -- an unstamped handle can
+   * never hold a witnessed verdict, so leaving it unstamped costs a probe per
+   * sweep forever rather than once.
+   */
+  idleRev?: number;
+  /**
    * The last background-work answer, and when it was taken.
    *
    * On the handle rather than only in memory because the sweep that asks and the
@@ -152,6 +176,23 @@ interface HandsKvEntry {
    * before this field existed, which are read as not witnessed at all.
    */
   bgIdleSince?: number;
+  /**
+   * The `idleRev` the entry carried when this verdict was measured.
+   *
+   * The half of the witness that cannot collide. `bgIdleSince` catches an idle
+   * period an OLD binary opened -- it rewrites `idleSince` and can write neither
+   * of these -- but two distinct periods can share an `idleSince` value, and
+   * when they do they share `idleEpoch` with it, so nothing else on the entry
+   * tells them apart. This one does: no two idle-opening writes to a key are
+   * conditioned on the same revision.
+   *
+   * Both must match for an `idle` verdict to be believed, because neither
+   * subsumes the other: an old binary carries this field across a task
+   * untouched, and a millisecond collision carries the other one across.
+   * Absent on verdicts written before this field existed, which are read as not
+   * witnessed at all.
+   */
+  bgIdleRev?: number;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -396,10 +437,19 @@ export function markHandsIdle(
       // way -- so leaving the fields alone republishes a stale answer to the
       // whole fleet at the exact moment the sweep starts acting on it.
       info.idleEpoch = info.idleSince;
+      // And the half of the period's name that two periods cannot share. The
+      // revision this write is conditioned on: the bucket takes one write per
+      // revision, so no other idle-opening write on this key can ever be given
+      // the same one -- unlike the stamp above, which is a clock reading and can
+      // repeat. Read here rather than after the write because the write's own
+      // revision is not knowable until it lands, and the value only has to be
+      // unique, not to be the write's own number.
+      info.idleRev = entry.revision;
       delete info.bgCheckedAt;
       delete info.bgRunning;
       delete info.bgEpoch;
       delete info.bgIdleSince;
+      delete info.bgIdleRev;
       // Same reason, for the clock those verdicts moved: work seen during the
       // last idle period says nothing about this one. `reuseWindowStart` would
       // ignore it anyway -- the stamp above is later than anything from before
@@ -562,7 +612,7 @@ let pingCursor = 0;
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<
   string,
-  { at: number; state: BackgroundWork; epoch?: number; idleSince?: number }
+  { at: number; state: BackgroundWork; epoch?: number; idleSince?: number; idleRev?: number }
 >();
 const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
@@ -750,6 +800,32 @@ function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): b
  * unavoidably replaces the value the witness names, which is what makes the
  * entry it touched read as suspect.
  *
+ * Equality of THAT value is still not enough, because the value is a clock
+ * reading and a clock reading is not unique. Two idle periods a quarter of an
+ * hour apart can stamp the same millisecond -- and when they do they also share
+ * `idleEpoch`, which markHandsIdle copies from the same stamp -- so a verdict
+ * from the first reads as current for the second and the handle is deleted with
+ * a background shell in it. That is an ABA, and no rule reading only timestamps
+ * can close it: the two periods are described by identical numbers.
+ *
+ * `witnessRev` is the half that can be unique. The bucket accepts exactly one
+ * write per revision of a key and hands out a strictly greater one each time, so
+ * the revision an idle-opening write was conditioned on names that write and no
+ * other, for the life of the key. Compared as a value, like the stamp -- the
+ * ordering it happens to have is not what is being relied on, and an ordering
+ * test here would be the same mistake in a currency that merely cannot be
+ * skewed.
+ *
+ * Both must match, because neither closes what the other does. An old binary
+ * carries `idleRev` across a task untouched, so the revision alone would read
+ * its new idle period as the measured one -- the very case the stamp was added
+ * for. A millisecond collision carries the stamp across, so the stamp alone is
+ * the ABA above. Together they leave exactly one gap: an old binary re-idling
+ * onto the identical millisecond, which leaves an entry byte-identical to the
+ * one it found, and which therefore no rule reading the entry can detect. It
+ * closes when the old binary is gone, and nothing on the entry can close it
+ * sooner.
+ *
  * `running` also accepts the older rule, `at` at or after the stamp. It is a
  * weaker test and it is allowed to be, because the two ways it can be wrong are
  * both safe: believing a stale `running` costs a ping the sandbox did not need,
@@ -763,18 +839,25 @@ function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): b
  *
  * Both readings of a rejection are the same and are safe: the handle reads
  * `unknown`, which keeps and pings it, and one probe replaces the unwitnessed
- * verdict with a witnessed one. A handle with no `idleSince` at all is not one
- * any writer produces, and it is already treated as instantly expired by the
- * window below; no verdict about it is believed.
+ * verdict with a witnessed one. That is also what a handle or a verdict written
+ * before `idleRev` existed reads as -- unwitnessed, one extra probe, witnessed
+ * from then on -- rather than as a match between two absent fields. A handle
+ * with no `idleSince` at all is not one any writer produces, and it is already
+ * treated as instantly expired by the window below; no verdict about it is
+ * believed.
  */
 function measuredUnderThisIdlePeriod(
   at: number | undefined,
   witness: number | undefined,
+  witnessRev: number | undefined,
   info: HandsKvEntry,
   state: BackgroundWork,
 ): boolean {
   if (typeof info.idleSince !== "number") return false;
-  if (typeof witness === "number" && witness === info.idleSince) return true;
+  if (
+    typeof witness === "number" && witness === info.idleSince
+    && typeof witnessRev === "number" && witnessRev === info.idleRev
+  ) return true;
   if (state !== "running") return false;
   return typeof at === "number" && at >= info.idleSince;
 }
@@ -816,7 +899,9 @@ function usableCachedVerdict(
   // this process's generation when the reactivation happens on another replica,
   // so an in-process answer survives an old binary's task-and-idle cycle exactly
   // as an entry-borne one does.
-  if (!measuredUnderThisIdlePeriod(cached.at, cached.idleSince, info, cached.state)) return null;
+  if (!measuredUnderThisIdlePeriod(
+    cached.at, cached.idleSince, cached.idleRev, info, cached.state,
+  )) return null;
   return cached;
 }
 
@@ -827,7 +912,9 @@ function usableSharedVerdict(info: HandsKvEntry): { at: number; state: Backgroun
   if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
   if (!sameIdlePeriod(info.bgEpoch, info)) return null;
   const state: BackgroundWork = info.bgRunning > 0 ? "running" : "idle";
-  if (!measuredUnderThisIdlePeriod(info.bgCheckedAt, info.bgIdleSince, info, state)) return null;
+  if (!measuredUnderThisIdlePeriod(
+    info.bgCheckedAt, info.bgIdleSince, info.bgIdleRev, info, state,
+  )) return null;
   return { at: info.bgCheckedAt, state };
 }
 
@@ -947,6 +1034,11 @@ function dispatchProbes(
     // of a task that another replica ran. A value rather than a time: see
     // measuredUnderThisIdlePeriod for why the comparison cannot be an ordering.
     const idleSinceAtStart = info.idleSince;
+    // And the half of that name a second idle period cannot land on by accident.
+    // The stamp alone is a clock reading, so two periods can be described by the
+    // same one; this is the revision an idle-opening write was conditioned on,
+    // which is unique per key by construction.
+    const idleRevAtStart = info.idleRev;
     if (bgProbeInFlight.has(identity)) continue;
 
     // `generation` came from the scan that formed this candidate, not from
@@ -1008,14 +1100,19 @@ function dispatchProbes(
           return;
         }
         const state: BackgroundWork = running > 0 ? "running" : "idle";
-        bgProbeCache.set(identity, { at: Date.now(), state, epoch, idleSince: idleSinceAtStart });
+        bgProbeCache.set(identity, {
+          at: Date.now(), state, epoch,
+          idleSince: idleSinceAtStart, idleRev: idleRevAtStart,
+        });
         bgUnknownStreak.delete(identity);
         // And onto the handle, so the next sweep to reach it reads the answer
         // whichever replica that turns out to be. Only the measured answer is
         // shared this way -- the give-up below infers `idle` from this replica's
         // own probes failing, which is a statement about one replica's network
         // and not something to publish to the others.
-        await persistVerdict(deps, sessionId, identity, running, epoch, idleSinceAtStart);
+        await persistVerdict(
+          deps, sessionId, identity, running, epoch, idleSinceAtStart, idleRevAtStart,
+        );
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -1037,6 +1134,7 @@ function dispatchProbes(
             state: "idle",
             epoch,
             idleSince: idleSinceAtStart,
+            idleRev: idleRevAtStart,
           });
           logger.warn(
             { sessionId, workloadId: info.workloadId, streak },
@@ -1088,6 +1186,7 @@ async function persistVerdict(
   running: number,
   epoch: number | undefined,
   idleSinceAtStart: number | undefined,
+  idleRevAtStart: number | undefined,
 ): Promise<void> {
   try {
     const key = `hands.${sessionId}`;
@@ -1104,19 +1203,25 @@ async function persistVerdict(
       );
       return;
     }
-    // Two questions, because the epoch only answers one of them. `sameIdlePeriod`
-    // catches a period this build opened while the probe was out; the stamp
-    // catches one an OLD build opened, which leaves the epochs exactly as it
-    // found them and moves only `idleSince`. Asked as "does the entry still hold
-    // the value the probe went out under", not "was it stamped before the probe
+    // Three questions, because no one of them answers the others.
+    // `sameIdlePeriod` catches a period this build opened while the probe was
+    // out; the stamp catches one an OLD build opened, which leaves the epochs
+    // exactly as it found them and moves only `idleSince`; the revision catches
+    // one that opened on the same millisecond as the last, which both of the
+    // others read as no new period at all. Asked as "does the entry still hold
+    // the values the probe went out under", not "was it stamped before the probe
     // started": the two clocks involved belong to different machines and their
-    // order proves nothing, while the value is either the one this answer is
-    // about or it is not.
+    // order proves nothing, while the values are either the ones this answer is
+    // about or they are not.
     //
-    // The stamp the probe went out under is also the one filed with the answer,
+    // The pair the probe went out under is also the pair filed with the answer,
     // so a verdict is only ever published as being about the period it was
     // actually measured in.
-    if (!sameIdlePeriod(epoch, info) || info.idleSince !== idleSinceAtStart) {
+    if (
+      !sameIdlePeriod(epoch, info)
+      || info.idleSince !== idleSinceAtStart
+      || info.idleRev !== idleRevAtStart
+    ) {
       logger.info(
         { sessionId, workloadId: info.workloadId },
         "keepalive.background_work_answer_reactivated",
@@ -1129,6 +1234,7 @@ async function persistVerdict(
       bgRunning: running,
       bgEpoch: epoch,
       bgIdleSince: idleSinceAtStart,
+      bgIdleRev: idleRevAtStart,
     }));
     await deps.kv.update(key, next, e.revision);
   } catch {
@@ -1297,9 +1403,20 @@ async function collectTargets(
         // stamped actually began; a fresh timestamp would name a period that
         // starts in the middle of one. It rides along on whichever write this
         // tick was already going to make, so it costs no extra round trip.
+        //
+        // `idleRev` is backfilled on the same terms and for the same reason --
+        // a handle with no revision half to its name can hold no witnessed
+        // `idle` verdict, so an unstamped one is re-probed every sweep until it
+        // is stamped. The value is the revision this tick's write is
+        // conditioned on, which is exactly what markHandsIdle records and is
+        // unique for the same reason: one write per revision.
         let value = e.value;
-        if (info.keepalive === false && typeof info.idleEpoch !== "number") {
-          info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
+        if (info.keepalive === false
+          && (typeof info.idleEpoch !== "number" || typeof info.idleRev !== "number")) {
+          if (typeof info.idleEpoch !== "number") {
+            info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
+          }
+          if (typeof info.idleRev !== "number") info.idleRev = e.revision;
           value = sc.encode(JSON.stringify(info));
         }
         const peeked = info.keepalive === false
