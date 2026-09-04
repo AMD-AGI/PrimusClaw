@@ -119,6 +119,25 @@ function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
     : `${sessionId}:safe:${entry.workloadId || ""}`;
 }
 
+/**
+ * The sandbox identity a KV entry names.
+ *
+ * The same string the local registry keys on, derived from the fields the entry
+ * carries. One definition, shared by the scan that starts a probe and the write
+ * that files the answer, so the two cannot drift: `hands.<session>` is a key a
+ * sandbox is put behind, not the sandbox, and two reads of it that disagree here
+ * are about two different pods.
+ */
+function entryIdentity(sessionId: string, info: HandsKvEntry): string {
+  return sandboxRegistryKey(sessionId, {
+    provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+    workloadId: info.workloadId,
+    sessionId: info.sessionId,
+    sandboxName: info.sandboxName,
+    namespace: info.namespace,
+  });
+}
+
 /** Drop orphaned READY sandboxes when a retryable attempt was never redelivered. */
 async function shouldSkipExpiredRetry(
   deps: KeepaliveDeps,
@@ -361,6 +380,22 @@ const BG_UNKNOWN_TOLERANCE = 5;
 const BG_VERDICT_TTL_MS = 30 * 60_000;
 
 /**
+ * How long a run of failed probes is remembered.
+ *
+ * The streak has to survive the sweeps that do not see the handle, for the same
+ * reason the verdict does: a replica walks a rotating slice, so an identity is
+ * absent from most ticks while its sandbox is alive, and a streak dropped on
+ * absence is a streak that never reaches the tolerance above -- the give-up path
+ * would exist and never fire, and a Hands that has stopped answering would hold
+ * its handle until the CR's absolute deadline.
+ *
+ * Each failure re-stamps the entry, so this only has to outlive the gap between
+ * two consecutive probes of the same identity -- the same gap BG_VERDICT_TTL_MS
+ * is sized for, hence the same number -- not the whole run of five.
+ */
+const BG_UNKNOWN_STREAK_TTL_MS = BG_VERDICT_TTL_MS;
+
+/**
  * How many probes may be in flight across the whole sweep.
  *
  * Per-session de-duplication is not a bound: on a cold start every idle handle
@@ -415,7 +450,7 @@ let pingCursor = 0;
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
-const bgUnknownStreak = new Map<string, number>();
+const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
 /**
  * Bumped whenever something makes an in-flight answer obsolete.
@@ -464,16 +499,20 @@ export function resetBackgroundWorkStateForTest(): void {
 }
 
 /**
- * Age every cached verdict by `ms`, for tests about the reap.
+ * Age every cached verdict and every unknown streak by `ms`, for tests about the
+ * reap.
  *
  * The reap is by age now, and the age that matters is tens of minutes -- longer
  * than any test can wait and longer than a fake timer would reach without also
- * moving the clock the sweep itself reads. This moves only the cache's own
- * stamps, which is the one input the reap consults.
+ * moving the clock the sweep itself reads. This moves only the two maps' own
+ * stamps, which are the inputs the reap consults.
  */
 export function ageBackgroundWorkCacheForTest(ms: number): void {
   for (const [identity, cached] of bgProbeCache) {
     bgProbeCache.set(identity, { ...cached, at: cached.at - ms });
+  }
+  for (const [identity, streak] of bgUnknownStreak) {
+    bgUnknownStreak.set(identity, { ...streak, at: streak.at - ms });
   }
 }
 
@@ -525,7 +564,7 @@ interface TickStats {
   fromMem: number; fromHandle: number; fromNone: number; fromNoHands: number;
   /** What happened to the handles answered `idle`. */
   expired: number; withinWindow: number; keptLocal: number; keptRunLease: number;
-  /** Probes this tick decided to start. */
+  /** Probes this tick actually started; candidates over the cap are not counted. */
   probes: number;
 }
 
@@ -613,8 +652,8 @@ function dispatchProbes(
   candidates: Array<{
     identity: string; sessionId: string; info: HandsKvEntry; generation: number;
   }>,
-): void {
-  if (candidates.length === 0) return;
+): number {
+  if (candidates.length === 0) return 0;
   const probe = deps.countActiveShells ?? countActiveShells;
   const start = bgProbeCursor % candidates.length;
 
@@ -691,7 +730,7 @@ function dispatchProbes(
         // shared this way -- the give-up below infers `idle` from this replica's
         // own probes failing, which is a statement about one replica's network
         // and not something to publish to the others.
-        await persistVerdict(deps, sessionId, running);
+        await persistVerdict(deps, sessionId, identity, running);
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -701,8 +740,8 @@ function dispatchProbes(
       })
       .catch((err) => {
         if (stale()) return;
-        const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
-        bgUnknownStreak.set(identity, streak);
+        const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
+        bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
         logger.warn(
           { err: (err as Error)?.message ?? err, sessionId, streak },
           "keepalive.background_work_check_failed",
@@ -718,6 +757,7 @@ function dispatchProbes(
       .finally(() => { bgProbeInFlight.delete(identity); });
   }
   bgProbeCursor = start + started;
+  return started;
 }
 
 /**
@@ -733,10 +773,20 @@ function dispatchProbes(
  * read, so a concurrent writer's change to any other field survives unless it
  * landed inside this read-modify-write -- which is what the conditional update
  * catches.
+ *
+ * And only if the entry still names the sandbox that was probed. The revision
+ * check cannot see that: it is taken against the read this function just made,
+ * so an entry another replica replaced while the probe was in the air matches
+ * its own fresh revision and the update succeeds -- stamping one sandbox's shell
+ * count onto a different one. Believed for BG_VERDICT_TTL_MS afterwards, that is
+ * either a pod kept alive on a verdict about a pod that is gone, or a working
+ * one reclaimed early. The key is the session; the identity is the sandbox, and
+ * the identity is what the answer was about.
  */
 async function persistVerdict(
   deps: KeepaliveDeps,
   sessionId: string,
+  identity: string,
   running: number,
 ): Promise<void> {
   try {
@@ -744,6 +794,16 @@ async function persistVerdict(
     const e = await deps.kv.get(key);
     if (!e) return;
     const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(sessionId, info) !== identity) {
+      // Somebody put a different sandbox behind this key. Dropping the write is
+      // the same outcome as losing the revision race, and for the same reason:
+      // the entry that is there now is newer than anything this answer knows.
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.background_work_answer_substituted",
+      );
+      return;
+    }
     const next = sc.encode(JSON.stringify({
       ...info,
       bgCheckedAt: Date.now(),
@@ -868,13 +928,7 @@ async function collectTargets(
         // Read, not asked: the probe runs behind the sweep and leaves its answer
         // for the next one. Under the identity of the sandbox this entry names,
         // so the answer cannot outlive the pod it was about.
-        const identity = sandboxRegistryKey(sessionId, {
-          provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
-          workloadId: info.workloadId,
-          sessionId: info.sessionId,
-          sandboxName: info.sandboxName,
-          namespace: info.namespace,
-        });
+        const identity = entryIdentity(sessionId, info);
         seenIdentities.add(identity);
         const peeked = info.keepalive === false
           ? peekBackgroundWork(identity, info)
@@ -890,7 +944,6 @@ async function collectTargets(
           else if (peeked.source === "no-hands") stats.fromNoHands += 1;
         }
         if (info.keepalive === false && needsProbe(identity, info)) {
-          stats.probes += 1;
           // The generation is read here, not at dispatch. The candidate is a
           // judgement about the handle as this scan found it -- idle, unprobed
           // -- and dispatch happens after the whole walk, so a registerSandbox
@@ -942,9 +995,19 @@ async function collectTargets(
             continue;
           }
           if (expired) {
-            await deps.kv.delete(key, { previousSeq: e.revision }).catch(() => {});
-            stats.expired += 1;
-            logger.info({ sessionId, workloadId: info.workloadId }, "keepalive.idle_handle_expired");
+            // Counted and logged on the delete landing, not on it being
+            // attempted: the conditional delete loses to any writer that touched
+            // the entry first, and a swallowed failure reported as a reclaim is
+            // the counter saying the loop is moving while it is stuck.
+            await deps.kv.delete(key, { previousSeq: e.revision })
+              .then(() => {
+                stats.expired += 1;
+                logger.info(
+                  { sessionId, workloadId: info.workloadId },
+                  "keepalive.idle_handle_expired",
+                );
+              })
+              .catch(() => {});
           } else {
             stats.withinWindow += 1;
             // Refresh the TTL only, no ping -- and conditionally, because an
@@ -991,8 +1054,11 @@ async function collectTargets(
   }
 
   // After the walk, not during it: the cap is global and the cursor rotates, so
-  // who gets a slot has to be decided once the candidates are all known.
-  dispatchProbes(deps, probeCandidates);
+  // who gets a slot has to be decided once the candidates are all known. Counted
+  // from what it started rather than from the candidate list, which the cap can
+  // leave far behind -- `probes: 50` on a tick that opened eight is the reading
+  // that would send someone looking for the wrong problem.
+  stats.probes += dispatchProbes(deps, probeCandidates);
 
   return targets;
 }
@@ -1113,13 +1179,19 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   for (const [identity, cached] of [...bgProbeCache.entries()]) {
     if (cached.at < verdictFloor) forgetBackgroundWork(identity);
   }
-  // A streak with no cached answer and no probe outstanding belongs to nothing:
-  // whatever was failing has either succeeded (which clears the streak) or
-  // stopped being asked about.
-  for (const identity of [...bgUnknownStreak.keys()]) {
-    if (!bgProbeCache.has(identity) && !bgProbeInFlight.has(identity)) {
-      bgUnknownStreak.delete(identity);
-    }
+  // Streaks the same way, and for the same reason. A failed probe deliberately
+  // caches nothing -- only a measured answer is worth reusing -- so reaping a
+  // streak because no cached answer accompanies it discarded it on the first
+  // tick that walked elsewhere, and the count restarted at one every time. Five
+  // consecutive failures were then unreachable under the rotation this module
+  // actually runs under, and the give-up that settles a permanently unreachable
+  // Hands to idle never happened.
+  //
+  // A run of failures that has stopped being added to is what "no longer worth
+  // counting" means, and that is an age.
+  const streakFloor = Date.now() - BG_UNKNOWN_STREAK_TTL_MS;
+  for (const [identity, streak] of [...bgUnknownStreak.entries()]) {
+    if (streak.at < streakFloor) bgUnknownStreak.delete(identity);
   }
   // Generations outlive the two maps above on purpose -- a bumped generation is
   // what discards an in-flight answer, so it has to survive the answer -- but

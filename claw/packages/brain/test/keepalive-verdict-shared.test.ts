@@ -25,7 +25,7 @@ import { StringCodec } from "nats";
 import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
-  backgroundWorkStateSizesForTest,
+  backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -79,6 +79,7 @@ function fakeKv(): {
   kv: KV; deleted: string[];
   current: () => Record<string, unknown>;
   setVisible: (v: boolean) => void;
+  substitute: (patch: Record<string, unknown>) => void;
 } {
   const deleted: string[] = [];
   let value = sc.encode(JSON.stringify(ENTRY));
@@ -105,6 +106,12 @@ function fakeKv(): {
     kv, deleted,
     current: () => JSON.parse(sc.decode(value)) as Record<string, unknown>,
     setVisible: (v: boolean) => { visible = v; },
+    // Another replica put a different sandbox behind the same key, the way a
+    // failed reuse does: same session, same key, new pod, new revision.
+    substitute: (patch: Record<string, unknown>) => {
+      value = sc.encode(JSON.stringify({ ...ENTRY, ...patch }));
+      revision += 1;
+    },
   };
 }
 
@@ -189,5 +196,104 @@ test("a handle carrying running work is kept by a replica that never probed it",
     !k.deleted.includes(KEY),
     "a background shell the user expects to still be running next turn was "
       + "recorded as running; no replica may reclaim the pod out from under it",
+  );
+});
+
+// --- the give-up path, under the same rotation ---
+
+test("a run of failed probes is not restarted by the sweeps that walk elsewhere", async () => {
+  // `unknown` holds the handle, which is right for a blip and wrong forever, so
+  // five consecutive failures settle it to idle locally. A failed probe caches
+  // nothing on purpose -- only a measured answer is worth reusing -- and the
+  // streak used to be reaped whenever no cached answer accompanied it. Under the
+  // rotation this module runs under that is most ticks, so the count restarted
+  // at one every time, the tolerance was never reached, and a Hands that had
+  // stopped answering held its handle to the CR's absolute deadline: the same
+  // failure this file is about, one map over.
+  const k = fakeKv();
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+
+  for (let i = 0; i < 8 && !k.deleted.includes(KEY); i++) {
+    await sweep(deps);
+    // The walk rotates away, and comes back. Nothing about the sandbox changed.
+    k.setVisible(false);
+    await sweep(deps);
+    k.setVisible(true);
+  }
+
+  assert.ok(
+    k.deleted.includes(KEY),
+    "the failures were consecutive; only the ticks that did not look at this "
+      + "handle came between them, and those must not be what resets the count",
+  );
+});
+
+test("a streak nothing adds to is still eventually forgotten", async () => {
+  // The other half: reaping by age has to actually reap, or the map grows one
+  // entry per sandbox this replica has ever failed to reach.
+  const k = fakeKv();
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+
+  await sweep(deps);
+  assert.equal(
+    backgroundWorkStateSizesForTest().streaks, 1,
+    "sanity: the failure has to have been counted before anything can drop it",
+  );
+
+  k.setVisible(false);
+  await sweep(deps);
+  assert.equal(
+    backgroundWorkStateSizesForTest().streaks, 1,
+    "absence from one tick is the ordinary state of a live handle, not evidence",
+  );
+
+  ageBackgroundWorkCacheForTest(24 * 60 * 60_000);
+  await sweep(deps);
+  assert.equal(
+    backgroundWorkStateSizesForTest().streaks, 0,
+    "a run of failures nothing has added to for a day is not a run any more",
+  );
+});
+
+// --- an answer belongs to a sandbox, not to a key ---
+
+test("a verdict is not stamped onto whatever took the key while the probe was out", async () => {
+  // `hands.<session>` is a key a sandbox is put behind, not the sandbox. A
+  // failed reuse builds a new pod and writes it here, and the write that files
+  // the old pod's answer re-reads the key well after the probe started. Its
+  // revision check is taken against that fresh read, so it succeeds -- and the
+  // new sandbox carries a shell count nobody ever measured in it, believed for
+  // the whole verdict TTL: kept alive on a verdict about a pod that is gone, or
+  // reclaimed early while it works.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => {
+      // Mid-probe: same session, same key, different sandbox.
+      k.substitute({ workloadId: "wl-replacement" });
+      return 1;
+    },
+  });
+
+  const after = k.current();
+  assert.equal(after.workloadId, "wl-replacement", "sanity: the substitution stood");
+  assert.equal(
+    after.bgRunning, undefined,
+    "the count was taken inside the pod this handle no longer names; writing it "
+      + "here is a measurement about one sandbox filed against another",
+  );
+  assert.equal(
+    after.bgCheckedAt, undefined,
+    "and stamping it fresh is what makes every reader believe it for the TTL",
   );
 });
