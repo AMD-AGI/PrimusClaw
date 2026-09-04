@@ -241,6 +241,33 @@ interface RunsQuery {
   cursor?: string;
 }
 
+/** Every parameter above, which a request may each give at most once. */
+const SINGLE_VALUE_PARAMS = [
+  "ids", "session_ids", "state", "since", "limit", "cursor",
+] as const;
+
+/**
+ * The name of a parameter given more than once, if any.
+ *
+ * A repeated key parses to an array rather than a string, and everything below
+ * this point treats these as strings -- `.split`, `.trim`, `.toLowerCase`. So a
+ * request that spelt one parameter twice reached a TypeError and answered 500,
+ * which tells the caller the server is broken when it was the request that was.
+ * Checked once here rather than per parameter, because the mistake is a
+ * property of the query string rather than of any one field.
+ *
+ * Refused rather than joined or resolved last-one-wins: both of those pick a
+ * value the caller did not ask for, and a client sending a key twice has a bug
+ * that is cheaper to hear about than to infer from the wrong runs coming back.
+ */
+function repeatedParam(query: Record<string, unknown>): string | null {
+  for (const name of SINGLE_VALUE_PARAMS) {
+    const value = query[name];
+    if (value !== undefined && typeof value !== "string") return name;
+  }
+  return null;
+}
+
 /**
  * Answer for runs the caller named outright, by whichever key it holds.
  *
@@ -248,7 +275,14 @@ interface RunsQuery {
  * take over.
  */
 async function readNamedRuns(q: RunsQuery, s: Scope, reply: FastifyReply): Promise<unknown> {
-  const named = ID_FILTERS.filter((f) => q[f.param]);
+  // Presence, not truthiness. An empty value is still the caller naming a
+  // parameter, and reading it as absent got both cases wrong: `?session_ids=`
+  // fell through to the listing form and complained about `state`, naming
+  // neither what was sent nor what was wrong with it, and
+  // `?ids=&session_ids=x` looked like one parameter and was answered -- which
+  // is exactly the "caller is unsure which key it holds" the exclusivity rule
+  // below exists to refuse.
+  const named = ID_FILTERS.filter((f) => q[f.param] !== undefined);
   // Refused rather than intersected, on the reasoning `too_many_ids` already
   // uses. A caller naming runs both ways does not know which key it is holding,
   // and every answer available here reads as confirmation that it does: an
@@ -285,18 +319,39 @@ async function readNamedRuns(q: RunsQuery, s: Scope, reply: FastifyReply): Promi
     });
   }
   const r = await db.query(
-    // `filter.column` is one of two literals from ID_FILTERS, never caller text.
+    // `filter.column` is one of two literals from ID_FILTERS, never caller text,
+    // and the limit is a constant read one row past the ceiling.
     `SELECT ${SELECT_COLUMNS} FROM claw_tasks
       WHERE ${filter.column} = ANY($1) ${s.clause.replace("$USER", "$2")}
-      ORDER BY created_at, task_id`,
+      ORDER BY created_at, task_id
+      LIMIT ${MAX_BATCH + 1}`,
     [ids, ...s.params],
   );
+  const rows = r.rows as RunRow[];
+  // Refused whole rather than truncated, for the reason `too_many_ids` is.
+  //
+  // The id cap bounds the `?ids=` answer on its own -- `task_id` is the primary
+  // key, so 500 ids are at most 500 rows -- but a session owns any number of
+  // runs, so the size of a `?session_ids=` answer is set by how much history
+  // those sessions have rather than by how much the caller asked for. Left
+  // unbounded, one call loads and serialises the lot. Silently cutting it
+  // instead would be worse than refusing: a short answer is indistinguishable
+  // from those sessions having only that many runs, so a caller reconciling
+  // dispatches would read the ones left out as never having existed.
+  if (rows.length > MAX_BATCH) {
+    return reply.status(400).send({
+      ok: false,
+      error: "too_many_runs",
+      detail: `more than ${MAX_BATCH} runs match; ask about fewer sessions`,
+      max_runs: MAX_BATCH,
+    });
+  }
   // Ids that matched nothing are absent rather than rendered as a run in an
   // unknown state: a caller polling its own dispatches must be able to tell
   // "not ours" from "not finished". `requested` counts the ids named, so for
   // `?session_ids=` it is a count of sessions and `runs` may be longer --
   // each run carries its `session_id` for the caller to group on.
-  return { runs: (r.rows as RunRow[]).map(toRunView), requested: ids.length };
+  return { runs: rows.map(toRunView), requested: ids.length };
 }
 
 /** Walk terminal runs newest-first, one keyset page at a time. */
@@ -395,7 +450,18 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/v1/runs", async (req, reply) => {
-    const q = (req.query ?? {}) as RunsQuery;
+    const rawQuery = (req.query ?? {}) as Record<string, unknown>;
+    // Before anything reads a value, because this is what makes the cast below
+    // true: past here every parameter is a string or absent.
+    const repeated = repeatedParam(rawQuery);
+    if (repeated) {
+      return reply.status(400).send({
+        ok: false,
+        error: "repeated_query_parameter",
+        detail: `${repeated} was given more than once; send it once, comma-separated`,
+      });
+    }
+    const q = rawQuery as RunsQuery;
     const s = scope(req);
     // Two reads behind one path: runs the caller can name, and a walk over the
     // ones it cannot. Naming wins when the request does it, so `state` is only

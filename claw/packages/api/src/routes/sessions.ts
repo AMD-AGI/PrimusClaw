@@ -834,6 +834,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
+              // The run this message opened, which is the handle `/v1/runs`
+              // answers to. Saved with the rest of the response under the
+              // idempotency key, so a replayed create names the same run rather
+              // than sending the caller looking for a second one.
+              run_id: dispatch.runId,
             },
           },
         };
@@ -1164,6 +1169,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           ],
         );
         await client.query("COMMIT");
+        // No `run_id` here, and none invented. What this call accepted is a
+        // queued message; the run row is opened later by the drain, once the
+        // turn in front of it finishes. An id minted now would answer 404 on
+        // `/v1/runs` until then, and would name nothing at all if the replay is
+        // later refused a workspace or its admission. The caller polls the
+        // session until a run appears -- see docs/run-api.md.
         return { ok: true, session_id: sessionId, queued: true };
       }
       // Stash the snapshot for the immediate-dispatch path below — building
@@ -1224,6 +1235,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       session_id: sessionId,
       message_id: dispatch.messageId,
       accepted: true,
+      // Present exactly when this call opened a run row. The queued branch
+      // above returns before this and carries no id on purpose: that message is
+      // in `claw_pending_messages` and no run exists to name yet.
+      run_id: dispatch.runId,
     };
   });
 
