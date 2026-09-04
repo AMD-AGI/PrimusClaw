@@ -6,9 +6,8 @@
 // Every branch of the background-work decision was logged except the one a
 // stalled fleet sits in. `unknown` -> keep emitted nothing, so a run of ticks
 // that reclaimed nothing -- idle sandboxes pinned with nothing bounding them but
-// the CR's absolute deadline -- produced the same logs as a healthy idle fleet,
-// and the cause could only be found by shipping a debug build with tracing in
-// it.
+// the CR's absolute deadline -- produced the same logs as a healthy idle fleet.
+// Nothing in the output distinguished the two.
 //
 // The scan line now carries per-tick counts of each branch and of where each
 // verdict came from. These pin the two properties that make it usable: the

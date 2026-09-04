@@ -626,6 +626,27 @@ const BG_GIVEUP_TTL_MS = BG_UNKNOWN_STREAK_TTL_MS;
 const BG_PROBE_MAX_IN_FLIGHT = 8;
 
 /**
+ * How many times a `running` verdict re-reads and re-writes after losing the
+ * conditional update.
+ *
+ * The write is a read-modify-write with no lock around it, so two replicas
+ * probing the same handle in the same idle period can both read the entry
+ * before either of them writes to it. Neither sees the other's verdict at the
+ * guard, both condition their update on the revision they read, and exactly one
+ * of them lands -- chosen by which write reached the store first, which is the
+ * one thing about these two answers that carries no information. The guard
+ * below settles a race between an answer already on the entry and one arriving
+ * after it; this settles the race the guard cannot see, where the two answers
+ * are decided against the same revision.
+ *
+ * Retrying is only for `running`, and a handful of attempts is enough for what
+ * it has to survive: the number of replicas that can be probing one handle at
+ * one moment, not a busy key with unbounded writers. Exhausting them gives up
+ * the same way every other failure here does.
+ */
+const BG_VERDICT_WRITE_ATTEMPTS = 4;
+
+/**
  * How many sandboxes are pinged at once.
  *
  * The ping fan-out was `Promise.all` over every target, which was survivable
@@ -783,8 +804,9 @@ export function ageBackgroundWorkCacheForTest(ms: number): void {
  * shape of a whole sweep, and a line per handle per replica per minute is a
  * volume nobody reads. The specific gap these close is that `unknown` -> keep
  * was silent -- the branch a stalled fleet sits in emitted nothing, so a stalled
- * reclaim loop and a healthy quiet one produced identical logs. `bgUnknown` high with `expired` at zero across consecutive ticks is that
- * stall, visible without a debug build.
+ * reclaim loop and a healthy quiet one produced identical logs. `bgUnknown` high
+ * with `expired` at zero across consecutive ticks is that stall, and it is now
+ * on the line every sweep already emits.
  */
 interface TickStats {
   /** Idle handles by background-work answer. */
@@ -1363,6 +1385,14 @@ function sameVerdict(witness: VerdictWitness, info: HandsKvEntry): boolean {
  * the rule peekBackgroundWork reads by, where `running` wins on what it says
  * rather than on whose clock said it. See the guard itself for why the two
  * directions are not symmetrical.
+ *
+ * That guard can only compare against an answer already on the entry, which
+ * leaves the case where neither answer is: both replicas read the same revision,
+ * both clear every guard, and the conditional update picks one of them by
+ * arrival order. So the same asymmetry is applied a second time, to the failed
+ * update rather than to the entry -- a `running` answer re-reads and tries
+ * again, an `idle` answer stops. See the loop for why that settles it in the
+ * same direction from either arrival order.
  */
 async function persistVerdict(
   deps: KeepaliveDeps,
@@ -1376,109 +1406,148 @@ async function persistVerdict(
 ): Promise<void> {
   try {
     const key = `hands.${sessionId}`;
-    const e = await deps.kv.get(key);
-    if (!e) return;
-    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-    if (entryIdentity(sessionId, info) !== identity) {
-      // Somebody put a different sandbox behind this key. Dropping the write is
-      // the same outcome as losing the revision race, and for the same reason:
-      // the entry that is there now is newer than anything this answer knows.
-      logger.info(
-        { sessionId, workloadId: info.workloadId },
-        "keepalive.background_work_answer_substituted",
-      );
-      return;
+    // `running` re-reads and tries again after losing the conditional update;
+    // `idle` gets one attempt and no more. Losing the update means the entry
+    // changed between this function's read and its write, so what the guards
+    // below cleared is no longer what is there -- every attempt therefore
+    // re-reads and re-asks all of them rather than resending the same value
+    // against a newer revision.
+    //
+    // The asymmetry is the same one the `running`-wins guard is built on, and
+    // it is why retrying is safe to do here at all. An `idle` write that gives
+    // up costs a ping on a sandbox that no longer needs one, until the probe
+    // the next sweep starts anyway files the answer again; a `running` write
+    // that gives up costs the pod, because the entry is then left carrying an
+    // `idle` verdict about a sandbox with a shell in it and the next replica to
+    // read it reclaims the handle. So the answer that is expensive to lose is
+    // the one allowed to insist, and the answer that is cheap to lose yields --
+    // which also means the two can never retry against each other.
+    //
+    // `verdictAtStart` is not refreshed between attempts, and does not need to
+    // be: it is read only by the `running`-wins guard, and that guard is only
+    // reachable by an `idle` write, which never takes a second attempt.
+    let workloadId: string | undefined;
+    for (let attempt = 1; attempt <= (running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1); attempt++) {
+      const e = await deps.kv.get(key);
+      if (!e) return;
+      const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      workloadId = info.workloadId;
+      if (entryIdentity(sessionId, info) !== identity) {
+        // Somebody put a different sandbox behind this key. Dropping the write is
+        // the same outcome as losing the revision race, and for the same reason:
+        // the entry that is there now is newer than anything this answer knows.
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_substituted",
+        );
+        return;
+      }
+      // Three questions, because no one of them answers the others.
+      // `sameIdlePeriod` catches a period this build opened while the probe was
+      // out; the stamp catches one an OLD build opened, which leaves the epochs
+      // exactly as it found them and moves only `idleSince`; the revision catches
+      // one that opened on the same millisecond as the last, which both of the
+      // others read as no new period at all. Asked as "does the entry still hold
+      // the values the probe went out under", not "was it stamped before the probe
+      // started": the two clocks involved belong to different machines and their
+      // order proves nothing, while the values are either the ones this answer is
+      // about or they are not.
+      //
+      // The pair the probe went out under is also the pair filed with the answer,
+      // so a verdict is only ever published as being about the period it was
+      // actually measured in.
+      if (
+        !sameIdlePeriod(epoch, info)
+        || info.idleSince !== idleSinceAtStart
+        || info.idleRev !== idleRevAtStart
+      ) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_reactivated",
+        );
+        return;
+      }
+      // And only if no `running` answer about this same period was published while
+      // this one was in the air.
+      //
+      // The checks above establish that the period is still the one this answer
+      // was measured in. They do not establish that it is the most authoritative
+      // answer taken in it, and one verdict is kept per handle, so whichever write
+      // lands last is what every later sweep reads. Two replicas probing the same
+      // idle handle is the ordinary case -- the sweep is fleet-wide and the slices
+      // overlap -- and this promise has its own suspension points before it gets
+      // here, the run-lease read among them. A `running` that completes first and
+      // an `idle` that completes second leaves `idle` on the entry, and the next
+      // replica to sweep deletes a handle with a background shell in it.
+      //
+      // Which of the two was taken later cannot be asked here, for the reason
+      // peekBackgroundWork will not ask it either: the two stamps are two
+      // machines' clocks and their order proves nothing. So the write is decided
+      // the same way the read is, by what the answers say rather than by when they
+      // say they were taken. `running` wins. The two ways of being wrong are not
+      // the same size: dropping a live `idle` costs pings on a sandbox that no
+      // longer needs them, until the `running` verdict ages out and the probe this
+      // sweep starts anyway files the same answer again; letting a stale `idle`
+      // land costs the pod. The opposite direction is unguarded on purpose -- a
+      // `running` overwriting an earlier `idle` in the same period is how a
+      // sandbox that started work after being measured empty gets protected.
+      //
+      // "Published while this one was in the air" is asked as a value comparison,
+      // not as an ordering: the verdict the entry carries now against the one it
+      // carried when the probe went out. `bgRev` is the half that cannot collide
+      // -- one write per revision, so no two published verdicts share it -- and
+      // the stamp beside it is the half that a verdict from a build without
+      // `bgRev` still answers with. Equal on both means nothing has been published
+      // since, so this answer is the newer one and may overwrite. That is what
+      // keeps the ordinary case working: a job that ends is measured `idle`
+      // against the unchanged `running` verdict its own sweep read, and replaces
+      // it on the spot.
+      if (
+        running === 0
+        && usableSharedVerdict(info)?.state === "running"
+        && !sameVerdict(verdictAtStart, info)
+      ) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_superseded",
+        );
+        return;
+      }
+      const next = sc.encode(JSON.stringify({
+        ...info,
+        bgCheckedAt: Date.now(),
+        bgRunning: running,
+        bgEpoch: epoch,
+        bgIdleSince: idleSinceAtStart,
+        bgIdleRev: idleRevAtStart,
+        // The revision this write is conditioned on, which names this verdict and
+        // no other -- read before the write for the same reason `idleRev` is: the
+        // write's own revision is not knowable until it lands, and the value only
+        // has to be unique.
+        bgRev: e.revision,
+      }));
+      try {
+        await deps.kv.update(key, next, e.revision);
+        return;
+      } catch {
+        // Somebody else wrote the entry between the read at the top of this
+        // attempt and here. Whether that was the other half of a same-revision
+        // race or an unrelated writer is not knowable from the failure, and
+        // does not have to be: the next attempt reads what is actually there
+        // and re-asks every guard against it, so a `running` answer that lost
+        // to a concurrent `idle` now sees that `idle` and overwrites it, while
+        // one that lost to a reactivation or a substitution sees that instead
+        // and stops.
+        logger.info(
+          { sessionId, workloadId, attempt },
+          "keepalive.background_work_answer_write_contended",
+        );
+      }
     }
-    // Three questions, because no one of them answers the others.
-    // `sameIdlePeriod` catches a period this build opened while the probe was
-    // out; the stamp catches one an OLD build opened, which leaves the epochs
-    // exactly as it found them and moves only `idleSince`; the revision catches
-    // one that opened on the same millisecond as the last, which both of the
-    // others read as no new period at all. Asked as "does the entry still hold
-    // the values the probe went out under", not "was it stamped before the probe
-    // started": the two clocks involved belong to different machines and their
-    // order proves nothing, while the values are either the ones this answer is
-    // about or they are not.
-    //
-    // The pair the probe went out under is also the pair filed with the answer,
-    // so a verdict is only ever published as being about the period it was
-    // actually measured in.
-    if (
-      !sameIdlePeriod(epoch, info)
-      || info.idleSince !== idleSinceAtStart
-      || info.idleRev !== idleRevAtStart
-    ) {
-      logger.info(
-        { sessionId, workloadId: info.workloadId },
-        "keepalive.background_work_answer_reactivated",
-      );
-      return;
-    }
-    // And only if no `running` answer about this same period was published while
-    // this one was in the air.
-    //
-    // The checks above establish that the period is still the one this answer
-    // was measured in. They do not establish that it is the most authoritative
-    // answer taken in it, and one verdict is kept per handle, so whichever write
-    // lands last is what every later sweep reads. Two replicas probing the same
-    // idle handle is the ordinary case -- the sweep is fleet-wide and the slices
-    // overlap -- and this promise has its own suspension points before it gets
-    // here, the run-lease read among them. A `running` that completes first and
-    // an `idle` that completes second leaves `idle` on the entry, and the next
-    // replica to sweep deletes a handle with a background shell in it.
-    //
-    // Which of the two was taken later cannot be asked here, for the reason
-    // peekBackgroundWork will not ask it either: the two stamps are two
-    // machines' clocks and their order proves nothing. So the write is decided
-    // the same way the read is, by what the answers say rather than by when they
-    // say they were taken. `running` wins. The two ways of being wrong are not
-    // the same size: dropping a live `idle` costs pings on a sandbox that no
-    // longer needs them, until the `running` verdict ages out and the probe this
-    // sweep starts anyway files the same answer again; letting a stale `idle`
-    // land costs the pod. The opposite direction is unguarded on purpose -- a
-    // `running` overwriting an earlier `idle` in the same period is how a
-    // sandbox that started work after being measured empty gets protected.
-    //
-    // "Published while this one was in the air" is asked as a value comparison,
-    // not as an ordering: the verdict the entry carries now against the one it
-    // carried when the probe went out. `bgRev` is the half that cannot collide
-    // -- one write per revision, so no two published verdicts share it -- and
-    // the stamp beside it is the half that a verdict from a build without
-    // `bgRev` still answers with. Equal on both means nothing has been published
-    // since, so this answer is the newer one and may overwrite. That is what
-    // keeps the ordinary case working: a job that ends is measured `idle`
-    // against the unchanged `running` verdict its own sweep read, and replaces
-    // it on the spot.
-    if (
-      running === 0
-      && usableSharedVerdict(info)?.state === "running"
-      && !sameVerdict(verdictAtStart, info)
-    ) {
-      logger.info(
-        { sessionId, workloadId: info.workloadId },
-        "keepalive.background_work_answer_superseded",
-      );
-      return;
-    }
-    const next = sc.encode(JSON.stringify({
-      ...info,
-      bgCheckedAt: Date.now(),
-      bgRunning: running,
-      bgEpoch: epoch,
-      bgIdleSince: idleSinceAtStart,
-      bgIdleRev: idleRevAtStart,
-      // The revision this write is conditioned on, which names this verdict and
-      // no other -- read before the write for the same reason `idleRev` is: the
-      // write's own revision is not knowable until it lands, and the value only
-      // has to be unique.
-      bgRev: e.revision,
-    }));
-    await deps.kv.update(key, next, e.revision);
   } catch {
-    // A revision conflict means another writer got there first, and any other
-    // failure leaves the handle with no verdict -- which reads back as
-    // `unknown`, the branch that keeps the sandbox rather than reclaiming one
-    // that may still be working.
+    // Every failure that reaches here leaves the handle with no verdict from
+    // this probe -- which reads back as `unknown`, the branch that keeps the
+    // sandbox rather than reclaiming one that may still be working.
   }
 }
 
@@ -1891,11 +1960,11 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // "Not seen" looks like it means "the pod is gone", and it does not. A sweep
   // walks the handles the KV walk returned this tick, which on a multi-replica
   // Brain is a rotating slice -- so an identity is absent from most sweeps while
-  // its sandbox is perfectly alive, and reaping on absence discarded every
-  // verdict about a minute after it was written, long before the sweep that
-  // would have read it. `unknown` then became the permanent answer, `unknown` is
-  // the branch that keeps the handle, and idle sandboxes were pinged until the
-  // CR's absolute deadline instead of being reclaimed.
+  // its sandbox is perfectly alive. Reaping on absence therefore discarded a
+  // verdict within a tick or two of it being written, long before the sweep that
+  // would have read it: `unknown` became the permanent answer, `unknown` is the
+  // branch that keeps the handle, and idle sandboxes were pinged until the CR's
+  // absolute deadline instead of being reclaimed.
   //
   // Age is the property that actually says an answer is no longer worth
   // believing, and it bounds the maps on its own: an identity nothing probes

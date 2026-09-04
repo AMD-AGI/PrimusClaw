@@ -1122,6 +1122,92 @@ test("an `idle` answer landing late does not overwrite a `running` one from the 
   );
 });
 
+test("a `running` answer is not dropped by an `idle` one decided against the same revision", async () => {
+  // The guard above settles the race it can see: an answer already published on
+  // the entry against one that arrives after it. This is the same race one step
+  // earlier, where there is nothing published for the guard to compare against.
+  //
+  // Two replicas probe the same handle in the same idle period. Both read the
+  // entry before either writes to it, so both read the same revision and both
+  // read no verdict at all -- the `running`-wins guard has nothing to find and
+  // permits either write. Both then condition their update on that one revision
+  // and exactly one of them can land. Which one is decided by arrival order,
+  // which is the single thing about these two answers that says nothing about
+  // the sandbox, and the loser's failure is indistinguishable from every other
+  // best-effort failure in this path.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // A handle in a fully named idle period with no answer measured in it yet, so
+  // the race starts from the state that makes the guard blind: nothing to
+  // compare against.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = { ...k.current() };
+  for (const f of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"]) {
+    delete stamped[f];
+  }
+  assert.equal(typeof stamped.idleEpoch, "number", "sanity: the period has to be named");
+  assert.equal(typeof stamped.idleRev, "number", "sanity: on both halves of its name");
+  k.replace(stamped);
+  resetBackgroundWorkStateForTest();
+
+  // This replica finds a shell. The other replica's `idle` write is landed at
+  // the moment this one's update is issued and against the revision it read,
+  // which is what "both decided against the same revision" means -- it is not a
+  // verdict this replica could have seen at the guard, and it takes the one
+  // update that revision allows.
+  let idleLanded = false;
+  const idleAt = Date.now();
+  const racing = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) { return k.kv.get(key); },
+    async update(key: string, v: Uint8Array, rev: number) {
+      const writing = JSON.parse(sc.decode(v)) as Record<string, unknown>;
+      if (!idleLanded && key === KEY && writing.bgRunning === 1) {
+        idleLanded = true;
+        k.replace({
+          ...stamped,
+          bgRunning: 0,
+          bgCheckedAt: idleAt,
+          bgEpoch: stamped.idleEpoch,
+          bgIdleSince: stamped.idleSince,
+          bgIdleRev: stamped.idleRev,
+          // Conditioned on the same revision this replica read, and so named by
+          // it: the two answers are about one revision, not one after the other.
+          bgRev: rev,
+        });
+      }
+      return k.kv.update(key, v, rev);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({ kv: racing, countActiveShells: async () => 1 });
+  for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(idleLanded, "sanity: the two writes have to actually have raced");
+
+  assert.equal(
+    k.current().bgRunning, 1,
+    "an `idle` answer that wins the conditional update erases the only record "
+      + "that a shell is running, and it wins it by arriving first -- which is "
+      + "the one thing about these two answers that is not about the sandbox",
+  );
+
+  // Which is the whole point: a third replica, with no memory of either probe,
+  // reads the entry and decides the pod on it.
+  resetBackgroundWorkStateForTest();
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the handle was reclaimed on an `idle` that won a coin toss, with a "
+      + "background shell still running in the sandbox",
+  );
+});
+
+
 // --- an inference has to survive long enough to be read ---
 
 test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
