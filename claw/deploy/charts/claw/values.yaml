@@ -279,6 +279,21 @@ secret:
   promptCacheEnabled: "true"
   llmCacheTtl: "1h"
   llmCacheStyle: "off"
+  # Response headers to carry into the cache-loss log, comma-separated.
+  #
+  # claw_brain_llm_cache_entry_lost_total can say a read was lost and cannot say
+  # which upstream lost it, and on a miss that is the first question worth
+  # asking: was the turn that wrote the entry served by the same backend as the
+  # turn that missed it? Only the response can answer that.
+  #
+  # Which header identifies a backend is a property of whatever sits between
+  # Claw and the model, so it is named here rather than baked in:
+  # "x-litellm-model-id" behind that proxy, an Azure APIM request id behind an
+  # API gateway, "request-id" talking to the provider directly.
+  #
+  # Named rather than "capture the response headers", because these are logged
+  # and response headers carry credentials. Empty is off, and off is default.
+  llmDebugResponseHeaders: ""
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""

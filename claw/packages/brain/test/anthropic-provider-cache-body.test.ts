@@ -82,7 +82,30 @@ test("the request body that goes out carries cache breakpoints", async () => {
   assert.ok(sent <= 4, `sent ${sent} markers, over the API cap`);
   assert.equal(res.cacheReport?.breakpointsSent, sent, "the report must match the bytes");
   assert.equal(res.cacheReport?.enabled, true);
-  assert.deepEqual([...(res.cacheReport?.reported ?? [])], ["cache_read", "cache_create"]);
+  // This stream's usage carries input_tokens and nothing else, so there is
+  // nothing to say about either cache number. `reported` used to be hardcoded
+  // to both, which is what made agent-loop's "the response has to have SAID
+  // zero" guard a no-op on this path -- a turn whose cache usage never arrived
+  // was indistinguishable from a genuine miss.
+  assert.deepEqual([...(res.cacheReport?.reported ?? [])], []);
+});
+
+test("reported names the cache numbers the response actually carried", async () => {
+  for (const [usage, expected] of [
+    [{ cache_read_input_tokens: 900, cache_creation_input_tokens: 0 }, ["cache_read", "cache_create"]],
+    [{ cache_read_input_tokens: 0 }, ["cache_read"]],
+    [{ cache_creation_input_tokens: 4 }, ["cache_create"]],
+    [{}, []],
+  ] as Array<[Record<string, unknown>, string[]]>) {
+    const { client } = stubClient({ usage });
+    const res = await buildAnthropicSession(client, "claude-sonnet-5")
+      .streamTurn(convo(), TOOLS, undefined);
+    assert.deepEqual(
+      [...(res.cacheReport?.reported ?? [])],
+      expected,
+      `usage ${JSON.stringify(usage)} should report ${JSON.stringify(expected)}`,
+    );
+  }
 });
 
 test("no system parameter is sent when the conversation has no system message", async () => {

@@ -35,6 +35,28 @@ export interface CheckpointState {
   /** Structural shape of agent-loop's TodoItem, inlined to keep this module
    *  free of a dependency on the loop. */
   todo_state?: Array<{ id: string; content?: string; status?: string }>;
+  /**
+   * When this run last USED the prompt cache -- read or write -- as an epoch ms.
+   *
+   * Both, because both prove an entry exists to lose, and a write is the only
+   * proof the first time round: the turn that creates an entry reads nothing.
+   * Recording reads alone would leave a run that wrote once and then missed
+   * looking exactly like a cold start, which is the case the counter is for.
+   * A read refreshes the entry's lifetime, so it moves the timestamp too.
+   *
+   * Persisted because the cache-loss detector needs to tell "we wrote
+   * something and then could not read it" from "there was never an entry", and
+   * that fact does not survive a redelivery on its own. Inferring it from
+   * `turns_completed > 0` is what this replaces: a resumed run that compacted,
+   * or one whose markers were refused before the interruption, has a high turn
+   * count and no entry, and got counted as a loss.
+   *
+   * Absent on a checkpoint written before this field existed, and absent after
+   * a compaction, which drops the entry deliberately. Both mean the same thing
+   * to the reader -- no evidence an entry exists -- and it under-reports rather
+   * than invents a loss.
+   */
+  last_cache_use_at?: number;
   /** Sandbox rebuilds already spent. Without it the per-task rebuild budget
    *  resets on every resume, so the infinite-rebuild guard stops holding. */
   rebuilds_used?: number;
@@ -137,6 +159,9 @@ export interface ExecuteExtras {
   ) => Promise<HandsClient | RecreateHandsResult>;
   /** Called after each complete turn to persist execution state. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
+  /** Called when a turn uses the prefix cache, so a SIGTERM mid-tool-batch can
+   *  persist a fresher last_cache_use_at than the last turn boundary wrote. */
+  onCacheUse?: (at: number | undefined) => void;
   /** If present, resume from this checkpoint instead of starting fresh. */
   resumeCheckpoint?: CheckpointState;
   /**

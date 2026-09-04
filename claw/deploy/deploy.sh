@@ -467,6 +467,7 @@ values = {
         "promptCacheEnabled": prompt_cache_enabled,
         "llmCacheTtl": llm_cache_ttl,
         "llmCacheStyle": llm_cache_style,
+        "llmDebugResponseHeaders": env("LLM_DEBUG_RESPONSE_HEADERS"),
         "anthropicBaseUrl": anthropic_base,
         "openaiBaseUrl": openai_base,
         "byokVerifyModelsUrl": env("BYOK_VERIFY_MODELS_URL", models_url(provider_base)),

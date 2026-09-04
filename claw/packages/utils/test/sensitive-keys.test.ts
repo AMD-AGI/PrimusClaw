@@ -107,3 +107,71 @@ test("ordinary field names are untouched", () => {
 test("an empty or punctuation-only key is not sensitive", () => {
   assertSensitive(["", "_", "-", "..."], false);
 });
+
+test("vendor spellings of 'password' are sensitive", () => {
+  // The word list only works if it holds the words config files actually use.
+  // Each of these is a password whose name does not contain "password":
+  // Postgres writes it as one unsplittable run, MySQL abbreviates, OpenSSH
+  // calls it a passphrase, and the Unix spelling drops the vowel.
+  assertSensitive([
+    "PGPASSWORD", "pgpassword", "pgPassword", "PGPASS",
+    "MYSQL_PWD", "mysql_pwd", "mysqlPwd", "db_pwd", "pwd_hash", "mysql_pwd_hash",
+    "SSH_PASSPHRASE", "ssh_passphrase", "sshPassphrase", "key_passphrase",
+    "passphrases", "PASSWD", "passwd", "user_passwd",
+  ], true);
+});
+
+test("adding the vendor spellings did not widen anything else", () => {
+  // `pwd` is a word, not a substring, so a name that merely contains those
+  // three letters is untouched -- which is the whole reason this file matches
+  // by word. `password` remains the only thing being spelled differently.
+  assertSensitive([
+    "cwd", "upwd", "pwdless", "passphraseless", "passwdless",
+    "pg_host", "pg_database", "mysql_host", "ssh_host", "ssh_port",
+  ], false);
+});
+
+test("the standalone PWD variable is the working directory, not a password", () => {
+  // PWD is in essentially every container's environment, and its value is a
+  // path. Calling it sensitive collects that path as a secret, and a collected
+  // secret is substring-replaced out of every transcript string the model is
+  // replayed -- so `cd /workspace/project` comes back as `cd <redacted>`.
+  // Losing a password costs a rotation; losing the working directory out of a
+  // transcript costs the agent the ability to read its own history.
+  assertSensitive(["PWD", "pwd", "OLDPWD", "oldpwd", "$PWD"], false);
+  // Qualified by anything at all, it is a password again.
+  assertSensitive([
+    "MYSQL_PWD", "DB_PWD", "mysql_pwd_hash", "pwd_hash", "app.pwd",
+  ], true);
+});
+
+test("a qualified credential name is sensitive in the plural too", () => {
+  // `API_KEYS` and `ACCESS_TOKENS` are as much a credential as their
+  // singulars, and both went straight through -- collection and response
+  // header rejection alike -- because the rule spelled the head out letter for
+  // letter and every plural had to be added by hand.
+  for (const key of [
+    "API_KEYS", "api_keys", "apiKeys", "x-api-keys",
+    "ACCESS_TOKENS", "access_tokens", "accessTokens",
+    "SSH_KEYS", "private_keys", "secret_keys", "signing_keys",
+    "refresh_tokens", "bearer_tokens", "auth_tokens", "session_tokens",
+  ]) {
+    assert.equal(isSensitiveKey(key), true, key);
+  }
+});
+
+test("the usage counters keep their names in the plural", () => {
+  // The reason `tokens` is not simply added to the word list. Every one of
+  // these is a number the UI renders, and masking them blanks what a user
+  // reads about their own run. `keys` is the same argument: most keys are map
+  // keys and sort keys.
+  for (const key of [
+    "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+    "max_tokens", "cached_tokens", "reasoning_tokens", "total_tokens",
+    "x-ratelimit-remaining-tokens",
+    "foreign_keys", "object_keys", "sort_keys", "partition_keys",
+    "tokens", "TOKENS", "keys", "KEYS",
+  ]) {
+    assert.equal(isSensitiveKey(key), false, key);
+  }
+});

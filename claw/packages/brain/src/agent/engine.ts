@@ -359,6 +359,7 @@ export class AgentEngine {
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
           onCheckpoint: extras?.onCheckpoint,
+          onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
         });
       } finally {
