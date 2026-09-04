@@ -240,13 +240,23 @@ case "$args" in
     # nothing -- then answer as this case declared.
     creds="${args#*nats://}"; creds="${creds%%@*}"
     printf '%s\n' "$creds" >>"$CLUSTER_DIR/probes"
+    # And which server it was pointed at. Authenticating against the wrong one
+    # is an answer about a different deployment.
+    target="${args##*@}"; target="${target%%\'*}"
+    printf '%s\n' "$target" >>"$CLUSTER_DIR/probe-hosts"
     user="${creds%%:*}"
     grep -qxF "$user" "$CLUSTER_DIR/auth-ok" 2>/dev/null || exit 1
     echo "round trip time: 1ms"; exit 0 ;;
   *"get pods"*nats-box*)
     echo -n "primus-claw-nats-box-0"; exit 0 ;;
   *"get secret primus-claw-secrets"*NATS_URL*)
-    b64 "nats://primus-claw-nats.primus-claw.svc.cluster.local:4222"; exit 0 ;;
+    # Absent by default -- the caller falls back to the in-cluster service.
+    # `!` is a read that failed; anything else is the endpoint this deployment
+    # actually uses.
+    v="$(val nats-url)" \
+      || { b64 "nats://primus-claw-nats.primus-claw.svc.cluster.local:4222"; exit 0; }
+    [ "$v" = "!" ] && exit 7
+    b64 "$v"; exit 0 ;;
   *"get secret primus-claw-nats-"*)
     name="${args#*get secret }"; name="${name%% *}"; comp="${name#primus-claw-nats-}"
     line="$(val "secret-$comp")" || absent_ok
@@ -536,6 +546,34 @@ out="$(blockers)"
 grep -q "^api (NATS refused" <<<"$out" || bad "an unreachable server must block retirement, got: $out"
 ok "a probe that cannot get an answer blocks retirement"
 
+# 8a. Which server the probe asks is itself read from the cluster, and that
+#     read can fail. Substituting the in-cluster default there asks a DIFFERENT
+#     server whether these credentials work -- and on a deployment pointed at
+#     an external NATS, the default is either nothing or somebody else's
+#     cluster. An "accepted" from the wrong server is the dangerous direction:
+#     it reads as proof of adoption, and the next step deletes the all-access
+#     user every workload may still be holding.
+adopted
+echo '!' >"$cluster/nats-url"
+out="$(blockers)"
+grep -q "^api (the NATS endpoint could not be read from primus-claw-secrets" <<<"$out" \
+  || bad "an unreadable NATS_URL must block retirement, got: $out"
+[ -f "$cluster/probe-hosts" ] \
+  && bad "the probe ran against a default endpoint after the real one could not be read: $(cat "$cluster/probe-hosts")"
+ok "an unreadable NATS endpoint blocks retirement instead of probing the default"
+
+# 8b. And when it CAN be read, it is what gets probed -- otherwise the case
+#     above is satisfied by a probe that ignores the Secret entirely.
+adopted
+echo "nats://external-nats.example.invalid:4222" >"$cluster/nats-url"
+out="$(blockers)"
+[ -z "$out" ] || bad "a readable endpoint must not block retirement, got: $out"
+for h in $(sort -u "$cluster/probe-hosts"); do
+  [ "$h" = "external-nats.example.invalid:4222" ] \
+    || bad "the probe used $h rather than the endpoint the deployment names"
+done
+ok "the probe asks the server the deployed Secret names"
+
 # 9. deploy.sh has to run this gate before it strips the user, not after. The
 #    check is on the call, because the retirement branch is inline in a script
 #    that runs top to bottom and cannot be sourced.
@@ -718,6 +756,39 @@ ok "the version guard names the value it refused and the two that exist"
 "${helm_base[@]}" --set brain.checkpointWriteVersion=3 >/dev/null 2>&1 \
   || bad "checkpointWriteVersion=3 must render on its own"
 ok "checkpointWriteVersion=3 still renders"
+
+# --set-string is not how operators set this. A values file is, and a values
+# file carries TYPED YAML: `checkpointWriteVersion: 3.5` arrives as a float,
+# which --set-string can never produce. A guard that casts with `int` before
+# comparing approves that as 3 and then ships "3.5" into the pod's env, so the
+# render is checked on one value and deployed with another. Every case here is
+# the file, not the flag.
+vals="$tmp/cwv-values.yaml"
+typed_refuses() {
+  local why="$1" body="$2"
+  printf 'brain:\n  checkpointWriteVersion: %s\n' "$body" >"$vals"
+  if "${helm_base[@]}" -f "$vals" --set-string "secret.brainCheckpointKey=$key" \
+       >/dev/null 2>"$tmp/err"; then
+    bad "a values file with checkpointWriteVersion: $why rendered"
+  fi
+  grep -q 'must be 3 or 4' "$tmp/err" \
+    || bad "the refusal of $why must name the two usable values, got: $(cat "$tmp/err")"
+  ok "refused from a values file: checkpointWriteVersion: $why"
+}
+typed_refuses "3.5 (typed YAML float)" 3.5
+typed_refuses "2.9" 2.9
+typed_refuses "<blank>" ""
+typed_refuses "5" 5
+
+# The rendered env must carry exactly what the guard approved, or the two can
+# drift again the moment one of them changes.
+printf 'brain:\n  checkpointWriteVersion: 4\n' >"$vals"
+"${helm_base[@]}" -f "$vals" --set-string "secret.brainCheckpointKey=$key" \
+  --show-only templates/brain-deployment.yaml >"$tmp/typed4.yaml" 2>/dev/null \
+  || bad "a values file asking for 4 with a key must render"
+grep -A1 'name: CHECKPOINT_WRITE_VERSION' "$tmp/typed4.yaml" | grep -q 'value: "4"' \
+  || bad "the pod's CHECKPOINT_WRITE_VERSION is not what the guard checked: $(grep -A1 'name: CHECKPOINT_WRITE_VERSION' "$tmp/typed4.yaml")"
+ok "the value the guard approves is the value the pod receives"
 ok "v4 with a seal key renders and mounts it"
 
 # The reaper's guards, in both directions.

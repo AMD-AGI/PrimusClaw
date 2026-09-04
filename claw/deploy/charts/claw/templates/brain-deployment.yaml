@@ -12,7 +12,6 @@ can see it and no pod has been replaced yet.
 Same shape as the reaper.enabled guards in workspace-reaper-cronjob.yaml: a
 setting whose prerequisites the chart can check is one the chart should check.
 */ -}}
-{{- $cwv := int .Values.brain.checkpointWriteVersion }}
 {{- /*
 Anything outside {3,4} is refused here rather than shipped. Brain's own
 envInt bounds this setting, but bounding it means an out-of-range value falls
@@ -21,10 +20,22 @@ pod writing v3 while the operator believes they asked for sealed v4, and `2`
 asks for a format that no longer exists and gets v3 without being told. Both
 are a silent answer to a question about how conversations are stored, which is
 the one place a silent answer is worst.
+
+The comparison is on the value AS WRITTEN, not on `int` of it. `int` is a
+truncating cast: a values file carrying the YAML number 3.5 -- a typed float,
+which `--set-string` can never produce and a test using only `--set-string`
+therefore never sees -- passes an `int`-first guard as 3 while line ~166 below
+emits the untouched "3.5" into the pod. The chart would have approved one
+value and shipped another.
 */ -}}
-{{- if not (has $cwv (list 3 4)) }}
-{{- fail (printf "brain.checkpointWriteVersion must be 3 or 4, got %q: 3 writes redacted checkpoints, 4 seals them, and there is no other format. An out-of-range value would otherwise start Brain on the default (3) while looking like it had been set." (toString .Values.brain.checkpointWriteVersion)) }}
+{{- $cwvRaw := "" }}
+{{- if not (kindIs "invalid" .Values.brain.checkpointWriteVersion) }}
+{{- $cwvRaw = toString .Values.brain.checkpointWriteVersion }}
 {{- end }}
+{{- if not (has $cwvRaw (list "3" "4")) }}
+{{- fail (printf "brain.checkpointWriteVersion must be 3 or 4, got %q: 3 writes redacted checkpoints, 4 seals them, and there is no other format. A value outside those two would otherwise start Brain on the default (3) while looking like it had been set." $cwvRaw) }}
+{{- end }}
+{{- $cwv := int $cwvRaw }}
 {{- if and (eq $cwv 4) (not .Values.secret.brainCheckpointKey) }}
 {{- fail "brain.checkpointWriteVersion=4 requires secret.brainCheckpointKey: v4 checkpoints are sealed, and Brain refuses to start without the key rather than writing plaintext. Generate one with 'openssl rand -base64 32'." }}
 {{- end }}

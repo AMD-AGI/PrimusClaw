@@ -466,9 +466,17 @@ _nats_box_exec() {
 # host:port with any credentials stripped. The stored URL may already carry
 # user:pass, and nats://user:pass@user:pass@host is the shape the CLI rejects
 # without saying why -- the bug nats_kv_put documents.
+#
+# A read that FAILED is not an absent Secret. Falling back to the default
+# hostport there would probe a server the deployment may not use: on a cluster
+# whose Secret names an external NATS, the default resolves to a different
+# server (or to nothing), and whichever answer that gives is evidence about the
+# wrong endpoint. "Authenticated" against the wrong server is the dangerous
+# direction -- it reads as proof the identity is adopted, and the next step
+# deletes the all-access user every workload may still be using.
 _nats_server_hostport() {
   local url rest
-  url="$(_nats_secret_value primus-claw-secrets NATS_URL)"
+  url="$(_nats_secret_value primus-claw-secrets NATS_URL)" || return 1
   [ -n "$url" ] || url="nats://primus-claw-nats.${NAMESPACE}.svc.cluster.local:4222"
   rest="${url#nats://}"
   printf '%s\n' "${rest##*@}"
@@ -481,9 +489,16 @@ _nats_server_hostport() {
 # publishes or subscribes would confuse "these credentials are refused" with
 # "this user is not allowed on that subject" -- opposite answers, and the
 # second one is what a correctly least-privileged user is supposed to give.
+#
+# Three answers, not two: 0 accepted, 1 refused, 2 could not be asked. The
+# third exists because the endpoint has to be read from the cluster first, and
+# collapsing "could not read it" into either of the others is wrong in both
+# directions -- into 0 it invents an adoption, into 1 it reports NATS as having
+# refused a credential it was never shown.
 _nats_auth_probe() {
-  local user="$1" pass="$2" url
-  url="nats://${user}:${pass}@$(_nats_server_hostport)"
+  local user="$1" pass="$2" hostport url
+  hostport="$(_nats_server_hostport)" || return 2
+  url="nats://${user}:${pass}@${hostport}"
   _nats_box_exec "nats rtt --server=$(_shq "$url")" >/dev/null 2>&1
 }
 
@@ -638,7 +653,7 @@ _nats_workload_adoption() {
 }
 
 _unadopted_nats_identities() {
-  local unadopted=() c var configured user pass why
+  local unadopted=() c var configured user pass why probe
   for c in api brain reaper ops; do
     var="NATS_PASSWORD_$(echo "$c" | tr '[:lower:]' '[:upper:]')"
     configured="${!var:-}"
@@ -659,7 +674,13 @@ _unadopted_nats_identities() {
       unadopted+=("$c ($why)")
       continue
     fi
-    if ! _nats_auth_probe "$user" "$pass"; then
+    probe=0
+    _nats_auth_probe "$user" "$pass" || probe=$?
+    if [ "$probe" = "2" ]; then
+      unadopted+=("$c (the NATS endpoint could not be read from primus-claw-secrets in $NAMESPACE, so '$user' was never checked against the server this deployment actually uses)")
+      continue
+    fi
+    if [ "$probe" != "0" ]; then
       unadopted+=("$c (NATS refused '$user': the user is not in the applied nats-values.yaml, its password differs, or the server could not be reached)")
       continue
     fi

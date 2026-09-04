@@ -383,7 +383,19 @@ export const CHECKPOINT_TTL_MS = envInt("CHECKPOINT_TTL_MS", 24 * 60 * 60 * 1000
  * soak period spent writing unredacted plaintext to this bucket would be worse
  * than the bug being fixed.
  */
-export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, { min: 3, max: 4 });
+// 3 and 4 are the only two formats there are, so this is an enumeration, not
+// a quantity: `3.5` is not a slightly-off 3 and a blank is not a considered
+// choice of 3. Truncating one or defaulting the other lands the pod on
+// redacted plaintext while the values file reads as though sealing was asked
+// for -- which is the whole failure this setting is checked for. Refuse both,
+// so `envSettingRefused()` sees them and startup stops. See
+// validateStartupConfig() in index.ts.
+export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
+  min: 3,
+  max: 4,
+  wholeNumbersOnly: true,
+  blankIsRefused: true,
+});
 /**
  * base64 of 32 raw bytes, sealing the v4 conversation core.
  *
