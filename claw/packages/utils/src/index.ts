@@ -9,6 +9,9 @@ export {
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
+export {
+  sealAead, openAead, decodeAeadKey, AeadOpenError, AEAD_KEY_LEN, AEAD_VERSION_V1,
+} from "./crypto/aead.js";
 export { isRevisionConflict } from "./kv/errors.js";
 export {
   readIntSetting,

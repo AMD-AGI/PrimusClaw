@@ -46,8 +46,320 @@ config:
       PROD:
         jetstream: enabled
         users:
+          # The original all-access user. Kept so that this file can be
+          # applied before anything has been cut over, and deleted last.
+          #
+          # Before deleting it, check whether your deployment has a NATS client
+          # that is not in this repo. The one to look for is a publisher of
+          # `external-resolved.<id>`: api subscribes to it
+          # (tasks/external-resolver.ts) and nothing here publishes it, so if a
+          # site drives external task resolution it does so from outside, and
+          # today that can only be as `prod`. Removing this user would turn
+          # that into a subscription that silently never fires.
+          #
+          # The check is a connection census rather than a guess -- every
+          # client shows up, named or not:
+          #
+          #   for i in 0 1 2; do
+          #     kubectl -n <ns> port-forward pod/<nats>-$i 822$i:8222 &
+          #     curl -s "localhost:822$i/connz?auth=1&subs=1"
+          #   done
+          #
+          # then map each `ip` back to a pod. Anything that is not api or brain
+          # needs a user of its own first. A clean census is one where every
+          # connection maps to an api or brain pod of this release, no task row
+          # has ever had an external_id set, and `external.push_received` has
+          # never been logged -- at which point there is nothing else to
+          # migrate. What that census returns is a per-site fact, not a
+          # property of the chart, so run it rather than assuming this shape.
+          # __PROD_USER_BEGIN__  (deploy.sh strips this block when
+          # NATS_RETIRE_PROD=true, which is how the account stops having an
+          # all-access user at all. Retiring it is a one-way step per cluster:
+          # anything still authenticating as `prod` -- including a publisher
+          # that is not in this repo -- stops working at that moment, which is
+          # the intent, but run the census in the comment above first.)
           - user: prod
             password: "__PROD_NATS_PASSWORD__"
+          # __PROD_USER_END__
+
+          # --- Least-privilege users, one per workload ------------------------
+          #
+          # Two things make a mistake here quiet rather than loud, so both are
+          # worth knowing before editing any list below.
+          #
+          # A denied publish is not an error the client surfaces. nats.js
+          # reports it as an async error, and nothing in this repo consumes
+          # nc.status() or nc.closed(), so it goes nowhere. The observable is
+          # the NATS *server* log: `Permissions Violation for Publication to
+          # "..."`. Alert on it during a cutover; a subject missing from a list
+          # otherwise shows up as a feature that quietly stopped working.
+          #
+          # And subject shape matters more than it looks. `$JS.API.CONSUMER.
+          # CREATE.<stream>` (no trailing token) and `$JS.API.CONSUMER.CREATE.
+          # <stream>.<name>.<filter>` are both real, the filter itself contains
+          # dots, and KV keys are multi-token. That is why several entries below
+          # carry both a bare form and a `.>` form, and why `.*` is almost
+          # always wrong.
+
+          - user: api
+            password: "__API_NATS_PASSWORD__"
+            permissions:
+              publish:
+                allow:
+                  # Core subjects. `tasks.*.cancel` rather than `tasks.>`, so a
+                  # compromised api cannot inject arbitrary subjects into the
+                  # stream brain consumes from.
+                  - "tasks.execute"
+                  - "tasks.*.cancel"
+                  - "events.*"
+                  - "sse.events.*"
+                  - "interrupt.*"
+                  - "cleanup.*"
+                  - "decision.*"
+                  # api is the provisioning authority for streams and buckets.
+                  - "$JS.API.INFO"
+                  - "$JS.API.STREAM.INFO.PRIMUS_CLAW_EVENTS"
+                  - "$JS.API.STREAM.CREATE.PRIMUS_CLAW_EVENTS"
+                  - "$JS.API.STREAM.UPDATE.PRIMUS_CLAW_EVENTS"
+                  - "$JS.API.STREAM.PURGE.PRIMUS_CLAW_EVENTS"
+                  - "$JS.API.STREAM.INFO.PRIMUS_CLAW_TASKS"
+                  - "$JS.API.STREAM.CREATE.PRIMUS_CLAW_TASKS"
+                  - "$JS.API.STREAM.UPDATE.PRIMUS_CLAW_TASKS"
+                  # SSE opens consumers the server names, so the request
+                  # subject has no trailing token at all -- the bare form below
+                  # is what that path needs, and `.*` would not match it.
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_EVENTS"
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_EVENTS.>"
+                  - "$JS.API.CONSUMER.DURABLE.CREATE.PRIMUS_CLAW_EVENTS.api-consumer"
+                  - "$JS.API.CONSUMER.INFO.PRIMUS_CLAW_EVENTS.*"
+                  - "$JS.API.CONSUMER.MSG.NEXT.PRIMUS_CLAW_EVENTS.*"
+                  - "$JS.API.CONSUMER.DELETE.PRIMUS_CLAW_EVENTS.*"
+                  # Named, not wildcarded. api creates exactly one consumer on
+                  # this stream -- the `brain-workers` durable, from
+                  # TASK_CONSUMER_NAME in packages/protocol/src/task-consumer.ts
+                  # -- so `.>` here would have let a compromised api stand up
+                  # arbitrarily named consumers on the stream brain reads its
+                  # work from. Both forms are needed: newer servers address the
+                  # request as <stream>.<name>, and as <stream>.<name>.<filter>
+                  # when a filter subject is set, and the filter contains dots.
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.API.CONSUMER.CREATE.PRIMUS_CLAW_TASKS.brain-workers.>"
+                  - "$JS.API.CONSUMER.DURABLE.CREATE.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.API.CONSUMER.UPDATE.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.API.CONSUMER.INFO.PRIMUS_CLAW_TASKS.brain-workers"
+                  # Acks are scoped to api's own consumer: it must not be able
+                  # to ack or terminate a delivery brain is working on.
+                  - "$JS.ACK.PRIMUS_CLAW_EVENTS.>"
+                  # Flow control. Nothing in this repo mentions $JS.FC -- the
+                  # client library publishes it on ordered consumers when the
+                  # server applies backpressure. Omit it and kv.keys()/watch()
+                  # stops yielding, without throwing, once a bucket is large
+                  # enough for backpressure to kick in.
+                  - "$JS.FC.PRIMUS_CLAW_EVENTS.>"
+                  - "$JS.FC.KV_BRAIN_REGISTRY.>"
+                  # KV writes. A put, update or delete is a publish.
+                  - "$KV.BRAIN_REGISTRY.hands.*"
+                  - "$KV.BRAIN_REGISTRY.lock.>"
+                  - "$KV.BRAIN_REGISTRY.deleted.*"
+                  - "$KV.BRAIN_REGISTRY.dag-handles.>"
+                  - "$KV.BRAIN_REGISTRY.brain.min_version"
+                  - "$KV.BRAIN_TOMBSTONES.deleted.*"
+                  - "$KV.SYSTEM_ENV.current"
+                  # Bucket lifecycle. api creates and reconciles four buckets,
+                  # including BRAIN_CHECKPOINTS -- provisioning only; see the
+                  # note under that bucket's absence from the data lists.
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
+                  - "$JS.API.STREAM.CREATE.KV_BRAIN_REGISTRY"
+                  - "$JS.API.STREAM.UPDATE.KV_BRAIN_REGISTRY"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.STREAM.CREATE.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.STREAM.UPDATE.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.STREAM.CREATE.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.STREAM.UPDATE.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.STREAM.INFO.KV_SYSTEM_ENV"
+                  - "$JS.API.STREAM.CREATE.KV_SYSTEM_ENV"
+                  - "$JS.API.STREAM.UPDATE.KV_SYSTEM_ENV"
+                  # KV reads: direct get, plus the non-direct fallback taken
+                  # when a bucket predates allow_direct.
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_TOMBSTONES"
+                  # kv.keys() and kv.watch() build ordered ephemeral consumers
+                  # and tear them down again; without DELETE each sweep leaks
+                  # one, and every teardown here is a bare .catch(() => {}).
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_REGISTRY"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
+              subscribe:
+                allow:
+                  # Reply inboxes, subscribe only. Nobody gets publish on
+                  # _INBOX: the server sends replies, and granting it would let
+                  # any component forge a PubAck or a KV read result into
+                  # another component's inbox.
+                  - "_INBOX.>"
+                  - "cleanup.>"
+                  - "events.*"
+                  - "external-resolved.>"
+
+          - user: brain
+            password: "__BRAIN_NATS_PASSWORD__"
+            permissions:
+              publish:
+                allow:
+                  - "events.*"
+                  - "$JS.API.INFO"
+                  # Binds the durable api created; never creates it, and never
+                  # publishes tasks.execute -- brain must not be able to
+                  # dispatch work to itself around api's quota and authz.
+                  - "$JS.API.CONSUMER.INFO.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.API.CONSUMER.MSG.NEXT.PRIMUS_CLAW_TASKS.brain-workers"
+                  - "$JS.ACK.PRIMUS_CLAW_TASKS.brain-workers.>"
+                  - "$JS.FC.PRIMUS_CLAW_TASKS.>"
+                  # KV writes. Both checkpoint prefixes are required: dropping
+                  # task-result.* would lose the agent-done outbox, and a
+                  # redelivery then re-runs the task's tools instead of
+                  # replaying its result.
+                  - "$KV.BRAIN_REGISTRY.hands.*"
+                  - "$KV.BRAIN_REGISTRY.lock.>"
+                  - "$KV.BRAIN_REGISTRY.retry-pending.>"
+                  - "$KV.BRAIN_CHECKPOINTS.task-ckpt.>"
+                  - "$KV.BRAIN_CHECKPOINTS.task-result.*"
+                  - "$KV.DAG_HANDLES.dag-handles.*"
+                  # Attach only. api owns bucket lifecycle; brain creating one
+                  # first is how the tombstone bucket once got max_age=0 and
+                  # permanently defeated api's TTL. DAG_HANDLES is the one
+                  # bucket only brain ever creates.
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.STREAM.INFO.KV_SYSTEM_ENV"
+                  - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
+                  - "$JS.API.STREAM.CREATE.KV_DAG_HANDLES"
+                  - "$JS.API.STREAM.UPDATE.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.DIRECT.GET.KV_SYSTEM_ENV"
+                  - "$JS.API.DIRECT.GET.KV_SYSTEM_ENV.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_SYSTEM_ENV"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_DAG_HANDLES"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_REGISTRY"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.INFO.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.CREATE.KV_SYSTEM_ENV"
+                  - "$JS.API.CONSUMER.CREATE.KV_SYSTEM_ENV.>"
+                  - "$JS.API.CONSUMER.INFO.KV_SYSTEM_ENV.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_SYSTEM_ENV.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_SYSTEM_ENV.>"
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES"
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.INFO.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_DAG_HANDLES.>"
+                  - "$JS.FC.KV_BRAIN_REGISTRY.>"
+                  - "$JS.FC.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.FC.KV_SYSTEM_ENV.>"
+                  - "$JS.FC.KV_DAG_HANDLES.>"
+              subscribe:
+                allow:
+                  - "_INBOX.>"
+                  - "interrupt.*"
+                  - "cleanup.*"
+                  # `decision.*` is deliberately absent. Nothing constructs the
+                  # decision dispatcher today, and a permission granted for a
+                  # subscriber that does not exist is scope that no test and no
+                  # reader can justify. Add it back in the change that wires
+                  # the HITL path up, where it can be seen to be needed.
+
+          # Reads two buckets, writes nothing. It is a CronJob that deletes
+          # directories, so the smallest possible grant matters. It is
+          # deliberately NOT given STREAM.CREATE: reaper-entry exits non-zero
+          # when a bucket is missing, on purpose, and the ability to create one
+          # would turn "deployed out of order" into "every workspace looks
+          # unlocked and uncheckpointed, so reap all of them".
+          #
+          # One limit worth stating rather than glossing: `kv.keys()` is a
+          # headers-only scan, but the permission that allows it --
+          # CONSUMER.CREATE on the checkpoint stream -- does not say
+          # headers_only. A reaper that wanted to could ask for a consumer that
+          # delivers bodies and read whole conversations. NATS has no subject
+          # that distinguishes the two, so this cannot be closed with an
+          # allow-list; what closes it is v4, after which the bodies are
+          # ciphertext and the seal key is not mounted here. Until the fleet
+          # writes v4, treat this user as able to read checkpoints in principle
+          # and keep its password as tightly held as brain'"'"'s.
+          - user: reaper
+            password: "__REAPER_NATS_PASSWORD__"
+            permissions:
+              publish:
+                allow:
+                  - "$JS.API.INFO"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_REGISTRY"
+                  # keys() only -- a headers-only scan. The reaper never reads
+                  # a checkpoint value, so it gets no DIRECT.GET here.
+                  #
+                  # Accepted scope, stated plainly: headers-only is what the
+                  # reaper's client asks for, not what these lines enforce. A
+                  # consumer created under CONSUMER.CREATE can be created with
+                  # bodies, and MSG.NEXT would then deliver them. It cannot be
+                  # narrowed the way the api entries above are: the reaper's
+                  # consumers are ephemeral, so the server names them and the
+                  # request subject has no name to pin. What actually closes it
+                  # is v4 -- sealed bodies the reaper has no key for -- which is
+                  # the same reason the paragraph above says to hold this
+                  # password as tightly as the brain user's until then.
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS"
+                  - "$JS.API.CONSUMER.CREATE.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.INFO.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_BRAIN_CHECKPOINTS.>"
+                  - "$JS.FC.KV_BRAIN_CHECKPOINTS.>"
+              subscribe:
+                allow:
+                  - "_INBOX.>"
+
+          # The credential upgrade.sh borrows inside the nats-box pod. It sets
+          # one key -- the drain gate -- and reads it back. Scoping it here
+          # means a mistyped ops command cannot reach anything else.
+          - user: ops
+            password: "__OPS_NATS_PASSWORD__"
+            permissions:
+              publish:
+                allow:
+                  - "$JS.API.INFO"
+                  - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
+                  - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_BRAIN_REGISTRY"
+                  - "$KV.BRAIN_REGISTRY.brain.min_version"
+              subscribe:
+                allow:
+                  - "_INBOX.>"
       # {{DEV_ACCOUNTS}}
       SYS:
         users:

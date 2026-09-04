@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  redactCheckpointState,
+  redactEgressPayload,
   redactPersistedEvent,
   redactToolEvent,
 } from "../src/events/redaction.js";
@@ -58,7 +58,7 @@ test("assistant, result, and checkpoint text redact exact runtime credentials", 
     final_text: `command printed ${secret}`,
     prompt: `do not repeat ${secret}`,
   }, [secret]);
-  const checkpoint = redactCheckpointState({
+  const checkpoint = redactEgressPayload({
     messages: [{ role: "assistant", content: `observed ${secret}` }],
     turns_completed: 1,
   }, [secret]);
@@ -102,7 +102,7 @@ test("camelCase credential keys are redacted in tool arguments and results", () 
 test("usage counters survive redaction in both spellings", () => {
   // tokenUsage is on every ExecuteResult handed to deliverAgentDone; masking it
   // would blank the numbers the UI reports rather than protect anything.
-  const state = redactCheckpointState({
+  const state = redactEgressPayload({
     tokenUsage: { input_tokens: 12, output_tokens: 4, cache_read: 0 },
     token_usage: { prompt_tokens: 7 },
     maxTokens: 4096,

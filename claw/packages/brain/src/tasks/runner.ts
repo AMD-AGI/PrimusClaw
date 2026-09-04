@@ -29,9 +29,11 @@ import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { classifyResumeOutcome } from "./resume-outcome.js";
 import {
   sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
+  decodeAeadKey,
 } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
+  CHECKPOINT_WRITE_VERSION, BRAIN_CHECKPOINT_KEY,
   WORKSPACE_SYNC_INTERVAL_MS, WORKSPACE_SYNC_GRACE_MS,
   WORKSPACE_RESTORE_TIMEOUT_MS, WORKSPACE_PERSIST_BASE, SIGTERM_PENDING_SYNC_WAIT_MS,
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
@@ -64,13 +66,34 @@ import {
 } from "./abort-registry.js";
 import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
-  redactCheckpointState, redactPersistedEvent, type RuntimeSecrets,
+  redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
+import {
+  encodeCheckpoint, decodeCheckpoint, type CheckpointEnvelope,
+} from "./checkpoint-codec.js";
 import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
+
+/**
+ * The v4 seal key, decoded once.
+ *
+ * Validated eagerly so a malformed key is a boot failure rather than a write
+ * failure on the first interesting turn, and null when unset so the v3 path
+ * needs no key at all. encodeCheckpoint throws if a v4 write is asked for
+ * without one -- there is deliberately no "fall back to plaintext" branch.
+ */
+const CHECKPOINT_SEAL_KEY: Buffer | null = BRAIN_CHECKPOINT_KEY
+  ? decodeAeadKey(BRAIN_CHECKPOINT_KEY, "BRAIN_CHECKPOINT_KEY")
+  : null;
+
+if (CHECKPOINT_WRITE_VERSION === 4 && !CHECKPOINT_SEAL_KEY) {
+  throw new Error(
+    "CHECKPOINT_WRITE_VERSION=4 requires BRAIN_CHECKPOINT_KEY (base64 of 32 bytes)",
+  );
+}
 
 /**
  * The exact credential strings this run knows about, for the substring pass in
@@ -551,6 +574,20 @@ function clearCacheUse(state: CheckpointState): CheckpointState {
 }
 
 /**
+ * `state` carrying whatever the run currently knows about the cache entry.
+ *
+ * The two directions are mutually exclusive -- `cleared` says compaction
+ * destroyed the entry, `fresh` says it was read again -- so this is the single
+ * place that decides between them. Identity-preserving in both directions, so
+ * "did anything change" stays a test rather than a comparison.
+ */
+function overlayCacheUse(
+  state: CheckpointState, fresh: number | undefined, cleared: boolean,
+): CheckpointState {
+  return cleared ? clearCacheUse(state) : freshenCacheUse(state, fresh);
+}
+
+/**
  * The state a SIGTERM should persist, or null if it has nothing to say.
  *
  * `attempt` is this attempt's own last checkpoint and `resume` is the one the
@@ -576,7 +613,7 @@ function sigtermCheckpointState(
   cleared: boolean,
 ): CheckpointState | null {
   const overlay = (state: CheckpointState): CheckpointState => (
-    cleared ? clearCacheUse(state) : freshenCacheUse(state, fresh)
+    overlayCacheUse(state, fresh, cleared)
   );
   if (attempt) return overlay(attempt);
   if (!resume) return null;
@@ -592,6 +629,7 @@ export const __test__ = {
   runtimeSecrets,
   freshenCacheUse,
   clearCacheUse,
+  overlayCacheUse,
   sigtermCheckpointState,
 };
 
@@ -743,7 +781,7 @@ async function maybeRunSandboxlessTask(
       result = await fx().runScript(request, { hands: null, signal: abortCtrl.signal }, onEvent);
     } catch (e) {
       const errMsg = (e as Error).message;
-      const safeErrMsg = redactCheckpointState(errMsg, runtimeSecrets(request));
+      const safeErrMsg = redactEgressPayload(errMsg, runtimeSecrets(request));
       logger.error({ sessionId, taskId: request.task_id, err: safeErrMsg }, "task.sandboxless.failed");
       await deliverAgentDone(kvCkpt, request, {
         finalText: "",
@@ -764,7 +802,7 @@ async function maybeRunSandboxlessTask(
     await deliverAgentDone(
       kvCkpt,
       request,
-      redactCheckpointState(result, runtimeSecrets(request)),
+      redactEgressPayload(result, runtimeSecrets(request)),
     );
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info(
@@ -912,6 +950,9 @@ class TaskRunner {
   private lastSyncAt = 0;
   private pendingSync: Promise<unknown> | null = null;
   private lastSyncedTurn = 0; // updated post-sync; gates has_workspace_sync KV bit
+  /** Monotonic write counter; see CheckpointEnvelope.seq. */
+  private checkpointSeq = 0;
+  private lastWrittenSeq = 0;
 
   private platformKey: string;
   private hands: HandsClient | null = null;
@@ -1045,6 +1086,24 @@ class TaskRunner {
     }
   };
 
+  /**
+   * The workspace-sync metadata that belongs with the state this runner holds
+   * right now.
+   *
+   * One expression, called from both the turn write and the repair below,
+   * because the two have to agree. `lastSyncedTurn` only ever advances, so a
+   * value derived from it here is never older than the one a caller captured
+   * earlier -- which is the whole point: a repair re-writes
+   * `latestCheckpointState`, and pairing that with a caller's captured
+   * `workspaceInfo` would put `has_workspace_sync: false` back on a run whose
+   * sync has since completed.
+   */
+  private currentWorkspaceInfo(): { has_workspace_sync: boolean; last_sync_turn: number } | undefined {
+    return this.lastSyncedTurn > 0
+      ? { has_workspace_sync: true, last_sync_turn: this.lastSyncedTurn }
+      : undefined;
+  }
+
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
     if (this.abortCtrl.signal.aborted || this.taskFinished) {
       logger.debug(
@@ -1053,11 +1112,15 @@ class TaskRunner {
       );
       return;
     }
-    const safeState = redactCheckpointState(
-      state,
-      runtimeSecrets(this.request, this.platformKey),
-    );
-    this.latestCheckpointState = safeState;
+    // Held verbatim. This is the conversation a resumed run replays to the
+    // model, and mutating it here is what deleted file paths and identifiers
+    // out of live sessions. There is deliberately no copy taken: the agent
+    // loop already hands this in as `workingMessages.slice()`, and the v3
+    // write path redacts on its way to the bucket (see encodeCheckpointV3)
+    // while v4 seals instead. Anything that takes a string out of this object
+    // and sends it somewhere -- the partial summary below is the one that does
+    // -- has to redact for itself now.
+    this.latestCheckpointState = state;
     // The checkpoint is authoritative about cache use, so this assignment can
     // move the timestamp BACKWARDS -- or clear it -- where `onCacheUse` only
     // ever moves it forward. That asymmetry is the fix: compaction discards
@@ -1069,14 +1132,9 @@ class TaskRunner {
     // false positive the clear exists to prevent, reintroduced downstream of
     // it. Within a turn `onCacheUse` is still the fresher of the two; at a
     // turn boundary the loop's state is the one that knows.
-    this.latestCacheUseAt = safeState.last_cache_use_at;
-    this.cacheUseCleared = safeState.last_cache_use_at === undefined;
-    const written = await this.writeKvCheckpoint(
-      safeState,
-      this.lastSyncedTurn > 0
-        ? { has_workspace_sync: true, last_sync_turn: this.lastSyncedTurn }
-        : undefined,
-    );
+    this.latestCacheUseAt = state.last_cache_use_at;
+    this.cacheUseCleared = state.last_cache_use_at === undefined;
+    const written = await this.writeKvCheckpoint(state, this.currentWorkspaceInfo());
 
     // Trigger an async workspace sync if it's been long enough since the
     // last one AND we are not already syncing AND we have a hex user id
@@ -1094,7 +1152,7 @@ class TaskRunner {
       this.lastSyncAt = now;
       const frozenHands = this.hands;
       const frozenUidHex = this.userIdHex;
-      const turnSnapshot = safeState.turns_completed;
+      const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
         .run(() => fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot))
         .then(async (info) => {
@@ -1104,7 +1162,7 @@ class TaskRunner {
           // Use the cached latestCheckpointState if the agent loop has
           // since advanced; otherwise fall back to the state captured at
           // sync issue time so the flip is never lost.
-          const stateToCommit = this.latestCheckpointState ?? safeState;
+          const stateToCommit = this.latestCheckpointState ?? state;
           await this.writeKvCheckpoint(
             stateToCommit,
             { has_workspace_sync: true, last_sync_turn: turnSnapshot },
@@ -1130,7 +1188,7 @@ class TaskRunner {
     // treating the failed write as a fresh checkpoint.
     if (!written) {
       throw new Error(
-        `checkpoint KV write failed at turn ${safeState.turns_completed}`,
+        `checkpoint KV write failed at turn ${state.turns_completed}`,
       );
     }
   };
@@ -1438,24 +1496,93 @@ class TaskRunner {
     state: CheckpointState,
     workspaceInfo?: { has_workspace_sync: boolean; last_sync_turn: number },
     kind: "turn" | "sigterm" | "post_sync" = "turn",
+    /** Set on the one re-write issued to undo a lost ordering race; see below. */
+    isRepair = false,
   ): Promise<boolean> {
-    const payload: TaskCheckpoint = {
-      ...state,
-      version: 3,
+    const seq = ++this.checkpointSeq;
+    const envelope: CheckpointEnvelope = {
       session_id: this.sessionId,
       message_id: this.messageId,
       user_id: this.userId,
       has_workspace_sync: workspaceInfo?.has_workspace_sync ?? false,
       last_sync_turn: workspaceInfo?.last_sync_turn ?? 0,
       checkpointed_at: Date.now(),
+      turns_completed: state.turns_completed,
+      seq,
     };
     const sSerialize = Date.now();
-    const encoded = sc.encode(JSON.stringify(payload));
+    const encoded = encodeCheckpoint(state, envelope, {
+      writeVersion: CHECKPOINT_WRITE_VERSION === 4 ? 4 : 3,
+      key: CHECKPOINT_SEAL_KEY,
+      redactV3: (s) => redactEgressPayload(s, runtimeSecrets(this.request, this.platformKey)),
+    });
     const serializeSec = (Date.now() - sSerialize) / 1000;
+    if (CHECKPOINT_WRITE_VERSION === 4) metrics.onCheckpointSeal(serializeSec);
+    metrics.onCheckpointVersion("write", CHECKPOINT_WRITE_VERSION);
     const payloadBytes = encoded.length;
     const t0 = Date.now();
     try {
       await this.kvCkpt.put(checkpointKey(this.sessionId, this.messageId), encoded);
+      // Checked here rather than before the put, which is where it was and
+      // where it could never fire: `seq` is freshly incremented, so it is the
+      // largest issued and cannot be below a previously written one. The race
+      // it guards against only becomes visible across the await -- a
+      // post-workspace-sync rewrite runs in a `.then()` and can complete after
+      // a later turn has already landed, putting the older conversation back
+      // under the same key. Serializing and writing an already-superseded
+      // payload is wasted work but harmless; publishing it as the newest is
+      // not, so the ordering is fixed by recording only forward progress and
+      // re-writing the newer state.
+      if (seq < this.lastWrittenSeq) {
+        metrics.onCheckpointSeqRegressed();
+        logger.debug(
+          { sessionId: this.sessionId, kind, seq, lastWritten: this.lastWrittenSeq },
+          "checkpoint.seq_regressed",
+        );
+        // Bounded to one attempt. The repair issues a fresh, higher seq so it
+        // cannot regress against the value it just recorded, but a third
+        // writer landing in between could start the cycle again -- and an
+        // unbounded repair loop on the awaited turn path is a worse failure
+        // than a checkpoint that is one turn stale until the next one lands.
+        // The repair's result is the caller's result. Returning true
+        // regardless would tell the loop a durable checkpoint exists when the
+        // key still holds the older state -- and the loop uses that to decide
+        // whether to keep retrying, so a swallowed failure stops the retries
+        // as well as losing the write.
+        //
+        // The repair carries `currentWorkspaceInfo()` rather than this call's
+        // `workspaceInfo`, because the state it re-writes is not this call's
+        // state. Handing the newest conversation the captured flag of a turn
+        // write issued before a sync completed is how a repair used to clear
+        // `has_workspace_sync` on a run that had in fact synced, which sends
+        // the next attempt to restore from S3 instead of the shared disk.
+        //
+        // The cache-use overlay is re-applied rather than taken from the
+        // snapshot. `latestCheckpointState` is the state the agent loop handed
+        // over at the last turn BOUNDARY, and the SIGTERM path deliberately
+        // writes a state overlaid with what the run learned after it -- the
+        // snapshot it was built from is never written back. A repair landing
+        // after that write would otherwise republish the pre-overlay
+        // timestamp, undoing the correction and reporting the cache entry as
+        // older than the run knows it to be. Same source as the SIGTERM's own
+        // overlay, so the two agree by construction.
+        if (!isRepair && this.latestCheckpointState) {
+          return await this.writeKvCheckpoint(
+            overlayCacheUse(
+              this.latestCheckpointState, this.latestCacheUseAt, this.cacheUseCleared,
+            ),
+            this.currentWorkspaceInfo(), kind, true,
+          );
+        }
+        // Either there was no newer state to restore, or this IS the repair
+        // and it was itself overtaken before its put landed. Both leave the
+        // key holding something other than what this call was asked to
+        // persist, so neither may be reported as a write that landed -- the
+        // loop uses this to decide whether to keep retrying, and a false
+        // success stops the retries as well as losing the write.
+        return false;
+      }
+      this.lastWrittenSeq = seq;
       metrics.onCheckpointWrite(
         kind, "success", (Date.now() - t0) / 1000, payloadBytes, serializeSec,
       );
@@ -1495,21 +1622,55 @@ class TaskRunner {
    *     parseable as JSON but semantically broken (Plan Y v2 §5.2)
    */
   private async readKvCheckpoint(): Promise<TaskCheckpoint | null> {
+    const miss = (reason: Parameters<typeof metrics.onCheckpointRead>[0]) => {
+      metrics.onCheckpointRead(reason);
+      return null;
+    };
     try {
       const entry = await this.kvCkpt
         .get(checkpointKey(this.sessionId, this.messageId)).catch(() => null);
-      if (!entry) return null;
-      const ckpt = JSON.parse(sc.decode(entry.value)) as TaskCheckpoint;
-      if (ckpt.version !== 3) return null;
-      if (ckpt.message_id !== this.messageId) return null;
-      if (Date.now() - ckpt.checkpointed_at > CHECKPOINT_TTL_MS) return null;
-      if (!Array.isArray(ckpt.messages) || typeof ckpt.turns_completed !== "number") {
-        logger.warn({ sessionId: this.sessionId, ckpt_keys: Object.keys(ckpt) }, "ckpt.schema_invalid");
-        return null;
+      if (!entry) return miss("absent");
+
+      const decoded = decodeCheckpoint(entry.value, CHECKPOINT_SEAL_KEY, {
+        sessionId: this.sessionId,
+        messageId: this.messageId,
+        userId: this.userId,
+      });
+      if (!decoded.ok) {
+        // Every one of these used to be a bare `return null`, which is why a
+        // run restarting from turn zero was indistinguishable from one that
+        // never had a checkpoint. During a format rollout that difference is
+        // the whole signal.
+        logger.warn(
+          { sessionId: this.sessionId, reason: decoded.reason, version: decoded.version },
+          "ckpt.read_rejected",
+        );
+        return miss(decoded.reason);
       }
-      return ckpt;
+      metrics.onCheckpointVersion("read", decoded.version);
+
+      const { envelope, state } = decoded.value;
+      // Session, message and user are verified inside decodeCheckpoint against
+      // the identity passed above -- on v4 by the AAD itself, so a payload from
+      // another run does not decrypt at all. Only the TTL is left, and it is
+      // meaningful because checkpointed_at is sealed: outside the seal, anyone
+      // able to write the bucket could move an expired checkpoint back into
+      // its window.
+      if (Date.now() - envelope.checkpointed_at > CHECKPOINT_TTL_MS) return miss("absent");
+
+      metrics.onCheckpointRead("ok");
+      return {
+        ...state,
+        version: 3,
+        session_id: envelope.session_id,
+        message_id: envelope.message_id,
+        user_id: envelope.user_id,
+        has_workspace_sync: envelope.has_workspace_sync,
+        last_sync_turn: envelope.last_sync_turn,
+        checkpointed_at: envelope.checkpointed_at,
+      };
     } catch {
-      return null;
+      return miss("not_json");
     }
   }
 
@@ -2179,7 +2340,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         result,
         runtimeSecrets(this.request, this.platformKey),
       ),
@@ -2501,8 +2662,17 @@ class TaskRunner {
         by_tool: ckptState.tool_calls_by_name,
       }
       : undefined;
+    // Redact BEFORE truncating, and redact at all: latestCheckpointState is
+    // held verbatim now, and this string becomes the interrupted run's
+    // final_text -- it reaches NATS, the event DB, SSE and any downstream node
+    // that templates this task's output. Truncating first would also cut a
+    // credential in half, and an exact-substring pass cannot match a fragment,
+    // so the tail would survive. Same order safePreview() settled on.
     const partialSummary = ckptState?.text_parts?.length
-      ? ckptState.text_parts.join("\n\n").slice(-4000)
+      ? redactEgressPayload(
+        ckptState.text_parts.join("\n\n"),
+        runtimeSecrets(this.request, this.platformKey),
+      ).slice(-4000)
       : "";
     const interruptMarker = `[Interrupted by user${turnsCompleted ? ` after ${turnsCompleted} turns` : " before any turn completed"}]`;
     const finalText = partialSummary
@@ -2565,7 +2735,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         {
           finalText,
           // Absent rather than zeroed when nothing recorded them, which is the
@@ -2791,7 +2961,7 @@ class TaskRunner {
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
-      redactCheckpointState<ExecuteResult>(
+      redactEgressPayload<ExecuteResult>(
         {
           finalText: finalText,
           // The same partial progress the `exec_complete` above reports. These

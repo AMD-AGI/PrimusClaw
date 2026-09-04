@@ -264,10 +264,22 @@ fi
 nats_kv_put() {
   local key="$1" val="$2"
   local nats_user nats_pass nats_host nats_url
-  nats_user=$(kubectl get secret primus-claw-secrets -n "$NAMESPACE" \
-    -o jsonpath='{.data.NATS_USER}' 2>/dev/null | base64 -d 2>/dev/null || echo "prod")
-  nats_pass=$(kubectl get secret primus-claw-secrets -n "$NAMESPACE" \
-    -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+  # Prefer the `ops` identity when one has been provisioned. It can set this
+  # one key and read it back and nothing else, which is the whole point: the
+  # credential a human pastes into a shell during an upgrade should not also
+  # be able to rewrite checkpoints or ack another component's deliveries.
+  # Falls back to whatever primus-claw-secrets holds when the per-user secrets
+  # have not been rolled out yet, so this keeps working mid-migration.
+  nats_user=$(kubectl get secret primus-claw-nats-ops -n "$NAMESPACE" \
+    -o jsonpath='{.data.NATS_USER}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  nats_pass=$(kubectl get secret primus-claw-nats-ops -n "$NAMESPACE" \
+    -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  if [ -z "$nats_user" ] || [ -z "$nats_pass" ]; then
+    nats_user=$(kubectl get secret primus-claw-secrets -n "$NAMESPACE" \
+      -o jsonpath='{.data.NATS_USER}' 2>/dev/null | base64 -d 2>/dev/null || echo "prod")
+    nats_pass=$(kubectl get secret primus-claw-secrets -n "$NAMESPACE" \
+      -o jsonpath='{.data.NATS_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+  fi
   nats_host=$(kubectl get secret primus-claw-secrets -n "$NAMESPACE" \
     -o jsonpath='{.data.NATS_URL}' 2>/dev/null | base64 -d 2>/dev/null \
     || echo "nats://primus-claw-nats.${NAMESPACE}.svc.cluster.local:4222")

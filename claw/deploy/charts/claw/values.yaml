@@ -84,6 +84,33 @@ api:
 brain:
   replicas: 3
   port: 8100
+  # Which checkpoint format to WRITE; readers always accept 3 and 4.
+  #
+  # Ship the reader first and leave this at 3 until every pod is running the
+  # new image -- a v4 checkpoint that lands on a pod which cannot read it makes
+  # that run restart from turn zero, and a rolling update is exactly when a
+  # redelivery gets handed to the other kind of pod. Set to 4, together with
+  # secret.brainCheckpointKey, once the rollout has settled.
+  #
+  # There is no setting that writes conversations verbatim in the clear: 3
+  # redacts, 4 seals.
+  #
+  # Flip to 4 once all three hold:
+  #   1. claw_brain_checkpoint_version_total{op="read"} confirms every pod is
+  #      running an image that reads v4. Until then a redelivery handed to a
+  #      lagging pod restarts its run from turn zero -- and redeliveries
+  #      cluster during exactly the rolling update that creates the gap.
+  #   2. secret.brainCheckpointKey is set everywhere. Brain refuses to start on
+  #      4 without it, deliberately: there is no fall back to plaintext.
+  #   3. claw_brain_checkpoint_seal_duration_seconds has been watched in
+  #      production. onCheckpoint is awaited on the turn path, so this is
+  #      latency runs pay. It should fall -- the redaction deep-copy it
+  #      replaces was not free -- but that is a prediction, not a measurement.
+  #
+  # And know the rollback rule before flipping: you may roll back to an image
+  # that reads v4, never past one. An older build cannot read a v4 checkpoint
+  # and will overwrite it with v3, which destroys it for good.
+  checkpointWriteVersion: 3
   maxConcurrent: "5"
   # Runs a pod may hold at once, executing or waiting. A run that stops for a
   # user approval or a background command gives its execution slot back, so
@@ -232,6 +259,42 @@ secret:
   natsUrl: ""
   natsUser: prod
   natsPassword: "__TBD__"
+  # Per-workload NATS identities, replacing the single all-access `prod` user
+  # above for the components listed here.
+  #
+  # Leave a password empty and that workload keeps using natsUser /
+  # natsPassword, so this can be filled in one component at a time. Do it in
+  # order of how loudly each fails: reaper first (it exits non-zero), then api
+  # (its consumer setup is fatal on error), and brain last -- brain has the
+  # most fail-open paths, so a subject missing from its allow-list in
+  # deploy/nats-values.yaml is the one most likely to look like nothing at all.
+  #
+  # A denied publish does not raise in the client. Watch the NATS server log
+  # for "Permissions Violation" while cutting over; that is the only reliable
+  # signal.
+  # base64 of 32 raw bytes (openssl rand -base64 32), sealing the conversation
+  # inside a v4 checkpoint. Empty means no key is mounted, which is fine while
+  # checkpointWriteVersion is 3; setting that to 4 without this makes Brain
+  # refuse to start rather than write plaintext.
+  brainCheckpointKey: ""
+  natsUsers:
+  #
+  # Each entry gains a `password` when its user is provisioned -- normally by
+  # deploy.sh, which generates one per component and passes it through. The key
+  # is absent rather than empty here on purpose: an empty password in a config
+  # file is indistinguishable from a real one that was blanked by mistake, and
+  # every scanner that looks at this file is right to say so.
+    api:
+      user: api
+    brain:
+      user: brain
+    reaper:
+      user: reaper
+    # No workload mounts this one. It exists for upgrade.sh, which reads it to
+    # set the drain gate; scoping that credential means a mistyped ops command
+    # cannot reach anything else.
+    ops:
+      user: ops
   # Replicas for every JetStream stream and KV bucket the API and Brain create.
   # Blank takes the code default of 3, which is what the bundled clustered NATS
   # serves; set it to 1 only when pointing at a single-node `nats-server -js`,

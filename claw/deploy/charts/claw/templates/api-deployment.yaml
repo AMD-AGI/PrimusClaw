@@ -41,6 +41,18 @@ spec:
         # the Secret is someone else's, and a change to it still needs a
         # deliberate `kubectl rollout restart`.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # The per-workload NATS credential lives in its own Secret, and the
+        # Brain seal key in another. Rotating either changes nothing the
+        # annotation above can see, so the pods would keep the old value in
+        # their environment -- with a NATS password that is one rotation out
+        # of date, or a seal key that no longer opens what the fleet is
+        # writing. Hash them here so a rotation actually rolls.
+        #
+        # Scoped to THIS workload's Secret, not to the file that renders all
+        # four: hashing the whole file made rotating any one credential restart
+        # every workload that reads it, so a routine api rotation also bounced
+        # brain and threw away its in-flight turns.
+        checksum/nats-user: {{ include "primus-claw.natsUserSecret" (dict "root" . "component" "api") | sha256sum }}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -58,6 +70,24 @@ spec:
         - secretRef:
             name: primus-claw-secrets
         env:
+        {{- with (get .Values.secret.natsUsers "api") }}
+        {{- if .password }}
+        # A container-level env entry overrides the same name coming from envFrom,
+        # so these replace the shared prod credential in primus-claw-secrets
+        # without that Secret having to change. Absent a password, nothing renders
+        # here and the shared credential is used exactly as before.
+        - name: NATS_USER
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-api
+              key: NATS_USER
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: primus-claw-nats-api
+              key: NATS_PASSWORD
+        {{- end }}
+        {{- end }}
         - name: NODE_OPTIONS
           value: {{ .Values.api.nodeOptions | quote }}
         - name: BRAIN_TASK_TIMEOUT_SEC
