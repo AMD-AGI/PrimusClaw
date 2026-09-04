@@ -796,3 +796,67 @@ test("a sandbox that has just stopped working gets the whole reuse window", asyn
       + "reuse time at all -- the next message in the session loses the pod",
   );
 });
+
+test("a verdict an old binary carried across a task is not read as current when the clocks disagree", async () => {
+  // The same rolling-deployment window, with the one assumption removed that the
+  // test above quietly relies on: that the replica which measured the verdict
+  // and the replica which later re-idled the handle agree about what time it is.
+  //
+  // They do not have to. These are two machines, and a stamp written by one is
+  // compared against a measurement written by the other; a second of ordinary
+  // skew is enough to reverse them. Here the replica that files the verdict runs
+  // a minute fast, so the answer it measured BEFORE the old binary's task
+  // carries a LARGER number than the `idleSince` that old binary wrote when it
+  // idled the sandbox again afterwards. Every "was this measured after the
+  // period opened" test says yes; the answer is still from before the task, the
+  // task still left a background shell, and believing it still reclaims the pod.
+  //
+  // So the boundary is not read as a time. The verdict records the stamp it was
+  // measured under, and the old binary -- which cannot write that field, but
+  // also cannot avoid replacing the value it names -- leaves an entry whose two
+  // numbers no longer describe the same idle period, whichever clock was ahead.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // The fast replica: it stamps the handle and files `idle` against it, and
+  // every timestamp it writes is its own clock's.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const measured = k.current();
+  assert.equal(measured.bgRunning, 0, "sanity: an `idle` answer was filed");
+
+  const now = Date.now();
+  // Its reading of when it measured, a minute ahead of the replica below.
+  k.replace(afterOldReplicaRanATask(
+    { ...measured, bgCheckedAt: now - 16 * 60_000 },
+    // The old replica's reading of when it handed the sandbox back, which is
+    // physically later and numerically earlier.
+    now - 17 * 60_000,
+  ));
+
+  const carried = k.current();
+  assert.ok(
+    (carried.bgCheckedAt as number) > (carried.idleSince as number),
+    "premise: skew has put the pre-task measurement after the post-task stamp, "
+      + "so every ordering test between them reads the stale answer as current",
+  );
+  assert.equal(
+    carried.bgEpoch, carried.idleEpoch,
+    "premise: and the old build changed neither epoch, as before",
+  );
+
+  // A new replica sweeps with no memory of any of this. Its probe would find the
+  // shell the task left behind -- if the handle survives long enough to be asked.
+  resetBackgroundWorkStateForTest();
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the answer was measured under a stamp this entry no longer carries; "
+      + "reading it as current because one replica's clock ran fast reclaims "
+      + "the pod out from under a background shell",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the sweep had to ask again, which is what the fresh answer proves",
+  );
+});
