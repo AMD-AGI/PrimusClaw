@@ -53,7 +53,16 @@ interface HandsKvEntry {
   /** False on a post-task idle reuse handle: kept for reuse but NOT pinged so
    *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
   keepalive?: boolean;
-  /** Epoch ms when the handle became idle; used to expire it after the window. */
+  /**
+   * Epoch ms when the handle became idle; used to expire it after the window.
+   *
+   * Also the anchor every background-work verdict is checked against, because it
+   * is the one field on this entry that EVERY version of this code stamps when a
+   * handle enters the idle pool -- markHandsIdle and parkHandsHandle both write
+   * it unconditionally, and they have since long before the epochs below
+   * existed. That is what makes it usable across a rolling deployment, where the
+   * epochs are not: see `measuredSinceIdleBegan`.
+   */
   idleSince?: number;
   /**
    * Identifies the idle period `idleSince` opened.
@@ -92,6 +101,11 @@ interface HandsKvEntry {
    * including for a background shell that task started. Absent, like
    * `idleEpoch`, on entries written before either existed; the two are then
    * equal, which is the behaviour those entries already had.
+   *
+   * Necessary and not sufficient, though: a replica running the previous build
+   * opens a new idle period without touching either number, so a match it
+   * carried forward proves nothing. `measuredSinceIdleBegan` is the half of the
+   * question that survives a rolling deployment.
    */
   bgEpoch?: number;
   /** True on a handle parked by a session delete rather than by a finished task.
@@ -641,6 +655,45 @@ function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): b
   return typeof verdictEpoch === "number" && verdictEpoch === info.idleEpoch;
 }
 
+/**
+ * Whether a measurement taken at `at` can have been taken during the idle period
+ * the handle is in now.
+ *
+ * The epoch check above is necessary and not sufficient, because it asks a
+ * question only this build knows how to answer. During a rolling deployment the
+ * other replicas are still running the binary these fields were added in, and
+ * that binary carries them without understanding them: its activation path
+ * deletes `keepalive` and `idleSince` and re-serializes everything else, and its
+ * markHandsIdle sets `keepalive:false` and a fresh `idleSince` and
+ * re-serializes everything else. So a handle stamped by a new replica, taken by
+ * a task on an old one and idled again by it, comes back with `idleEpoch`,
+ * `bgEpoch` and the verdict all preserved and all still agreeing -- an answer
+ * measured before that task, reading as current for the idle period after it.
+ * That is the reclaim this whole file exists to prevent, arriving through the
+ * very mechanism added to prevent it: an old binary cannot open a new epoch, so
+ * an epoch match it carried forward is not evidence that it did.
+ *
+ * `idleSince` is evidence, and it is the only field here that is. Every writer
+ * that puts a handle into the idle pool stamps it fresh -- this build's
+ * markHandsIdle, the previous build's, and parkHandsHandle -- so a new idle
+ * period always moves it forward, whichever binary opened the period. A verdict
+ * older than it was therefore measured before this idle period began, and is
+ * ignored: the handle reads `unknown`, which keeps and probes it, and the answer
+ * that comes back is newer than the stamp. One probe repairs it, so unlike an
+ * unstamped epoch this is not a state a handle can be stuck in.
+ *
+ * `>=` rather than `>`: refreshIdleSince moves the stamp up to the timestamp of
+ * the verdict that justified moving it, so equality is the steady state for a
+ * handle whose sandbox is working, not an edge case. A handle with no `idleSince`
+ * at all is not one any writer produces, and it is already treated as instantly
+ * expired by the window below; no verdict about it is believed.
+ */
+function measuredSinceIdleBegan(at: number | undefined, info: HandsKvEntry): boolean {
+  return typeof at === "number"
+    && typeof info.idleSince === "number"
+    && at >= info.idleSince;
+}
+
 /** This replica's own last answer, if it is fresh enough to reuse and still
  *  about the idle period the handle is in. */
 function usableCachedVerdict(
@@ -651,6 +704,11 @@ function usableCachedVerdict(
   if (!cached) return null;
   if (Date.now() - cached.at >= BG_PROBE_TTL_MS) return null;
   if (!sameIdlePeriod(cached.epoch, info)) return null;
+  // The same rule as the shared copy, and for the same reason: nothing bumps
+  // this process's generation when the reactivation happens on another replica,
+  // so an in-process answer survives an old binary's task-and-idle cycle exactly
+  // as an entry-borne one does.
+  if (!measuredSinceIdleBegan(cached.at, info)) return null;
   return cached;
 }
 
@@ -660,6 +718,7 @@ function usableSharedVerdict(info: HandsKvEntry): { at: number; state: Backgroun
   if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
   if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
   if (!sameIdlePeriod(info.bgEpoch, info)) return null;
+  if (!measuredSinceIdleBegan(info.bgCheckedAt, info)) return null;
   return { at: info.bgCheckedAt, state: info.bgRunning > 0 ? "running" : "idle" };
 }
 
@@ -688,7 +747,7 @@ function usableSharedVerdict(info: HandsKvEntry): { at: number; state: Backgroun
 function peekBackgroundWork(
   identity: string,
   info: HandsKvEntry,
-): { state: BackgroundWork; source: VerdictSource } {
+): { state: BackgroundWork; source: VerdictSource; at?: number } {
   if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
   const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
@@ -700,9 +759,9 @@ function peekBackgroundWork(
   // entry. Preferring the local one there reclaims a handle that a more recent
   // measurement says is busy, which is the failure the sharing exists to stop.
   if (cached && (!shared || cached.at >= shared.at)) {
-    return { state: cached.state, source: "mem" };
+    return { state: cached.state, source: "mem", at: cached.at };
   }
-  if (shared) return { state: shared.state, source: "handle" };
+  if (shared) return { state: shared.state, source: "handle", at: shared.at };
   return { state: "unknown", source: "none" };
 }
 
@@ -772,6 +831,12 @@ function dispatchProbes(
     // saw. The answer is only about that period, and both places it is recorded
     // carry it so a later period cannot inherit it.
     const epoch = info.idleEpoch;
+    // When this probe began asking. The answer describes the sandbox as it was
+    // from here on, so the idle period it belongs to is the one that was open at
+    // this moment -- which is what persistVerdict checks the entry against when
+    // the answer lands, minutes later and possibly on the far side of a task
+    // that another replica ran.
+    const startedAt = Date.now();
     if (bgProbeInFlight.has(identity)) continue;
 
     // `generation` came from the scan that formed this candidate, not from
@@ -840,7 +905,7 @@ function dispatchProbes(
         // shared this way -- the give-up below infers `idle` from this replica's
         // own probes failing, which is a statement about one replica's network
         // and not something to publish to the others.
-        await persistVerdict(deps, sessionId, identity, running, epoch);
+        await persistVerdict(deps, sessionId, identity, running, epoch, startedAt);
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -907,6 +972,7 @@ async function persistVerdict(
   identity: string,
   running: number,
   epoch: number | undefined,
+  startedAt: number,
 ): Promise<void> {
   try {
     const key = `hands.${sessionId}`;
@@ -923,7 +989,16 @@ async function persistVerdict(
       );
       return;
     }
-    if (!sameIdlePeriod(epoch, info)) {
+    // Two questions, because the epoch only answers one of them. `sameIdlePeriod`
+    // catches a period this build opened while the probe was out; the stamp check
+    // catches one an OLD build opened, which leaves the epochs exactly as it
+    // found them and moves only `idleSince`. Asking whether the period began
+    // before this probe did -- rather than whether `idleSince` still holds the
+    // value the scan read -- is what tells the two movements apart: a re-idle
+    // stamps the moment it happened, which is after the probe started, while
+    // refreshIdleSince below only ever moves the stamp up to an already-measured
+    // verdict, which is before it.
+    if (!sameIdlePeriod(epoch, info) || !measuredSinceIdleBegan(startedAt, info)) {
       logger.info(
         { sessionId, workloadId: info.workloadId },
         "keepalive.background_work_answer_reactivated",
@@ -965,9 +1040,32 @@ async function refreshIdleSince(
   key: string,
   revision: number,
   info: HandsKvEntry,
+  seenAt: number,
 ): Promise<void> {
   try {
-    const next = sc.encode(JSON.stringify({ ...info, idleSince: Date.now() }));
+    // `seenAt`, not `Date.now()`: the last moment work was actually *seen*, which
+    // is when the verdict driving this branch was measured. Two reasons, and the
+    // first is only the honest reading of the sentence above -- a sweep that
+    // reuses a four-minute-old `running` has not seen work now, it has read that
+    // work was there four minutes ago.
+    //
+    // The second is that `idleSince` is what every verdict is anchored against
+    // (see measuredSinceIdleBegan), so a stamp of `Date.now()` here would land
+    // ahead of the very answer that produced it and invalidate it on the next
+    // sweep -- a working sandbox would fall back to `unknown` every other tick
+    // and be re-probed for as long as its job ran. Anchored to the measurement
+    // instead, re-reading the same verdict re-writes the same stamp, and the
+    // clock advances exactly when a newer measurement says work is still there.
+    //
+    // `Math.max` so the stamp is monotonic by construction rather than by the
+    // caller's promise: a verdict older than the stamp is already refused before
+    // this is reached, and nothing here should be the thing that moves an idle
+    // window backwards if that ever stops being true.
+    const idleSince = Math.max(
+      typeof info.idleSince === "number" ? info.idleSince : 0,
+      seenAt,
+    );
+    const next = sc.encode(JSON.stringify({ ...info, idleSince }));
     await deps.kv.update(key, next, revision);
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
@@ -1076,7 +1174,7 @@ async function collectTargets(
         }
         const peeked = info.keepalive === false
           ? peekBackgroundWork(identity, info)
-          : { state: "idle" as BackgroundWork, source: null };
+          : { state: "idle" as BackgroundWork, source: null, at: undefined };
         const bgWork = peeked.state;
         if (info.keepalive === false) {
           if (bgWork === "running") stats.bgRunning += 1;
@@ -1099,7 +1197,7 @@ async function collectTargets(
           });
         }
         if (info.keepalive === false && bgWork === "running") {
-          await refreshIdleSince(deps, key, e.revision, info);
+          await refreshIdleSince(deps, key, e.revision, info, peeked.at ?? Date.now());
         } else if (info.keepalive === false && bgWork === "unknown") {
           await deps.kv.update(key, value, e.revision).catch(() => {});
         }

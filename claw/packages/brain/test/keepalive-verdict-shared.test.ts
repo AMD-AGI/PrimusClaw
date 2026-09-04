@@ -80,6 +80,7 @@ function fakeKv(): {
   current: () => Record<string, unknown>;
   setVisible: (v: boolean) => void;
   substitute: (patch: Record<string, unknown>) => void;
+  replace: (value: Record<string, unknown>) => void;
 } {
   const deleted: string[] = [];
   let value = sc.encode(JSON.stringify(ENTRY));
@@ -110,6 +111,13 @@ function fakeKv(): {
     // failed reuse does: same session, same key, new pod, new revision.
     substitute: (patch: Record<string, unknown>) => {
       value = sc.encode(JSON.stringify({ ...ENTRY, ...patch }));
+      revision += 1;
+    },
+    // The whole entry, exactly as given. `substitute` starts from ENTRY, which
+    // is the wrong base for modelling a writer whose defining property is that
+    // it carries forward fields it does not understand.
+    replace: (v: Record<string, unknown>) => {
+      value = sc.encode(JSON.stringify(v));
       revision += 1;
     },
   };
@@ -567,4 +575,126 @@ test("a handle with no verdict at all is still just unprobed", async () => {
 
   assert.equal(asked, 1, "a handle with no answer on it is a handle to ask about");
   assert.ok(!k.deleted.includes(KEY), "and it is kept until the answer arrives");
+});
+
+// --- an old binary cannot open a new idle period, and must not look like it did ---
+
+/**
+ * The entry a replica running the PREVIOUS build leaves behind after it takes an
+ * idle handle for a task and idles it again.
+ *
+ * Both of that build's writers are re-serializations of whatever they read.
+ * ensureHands' clearIdleMarkers deletes `keepalive` and `idleSince` on the way
+ * in and writes the rest back; its markHandsIdle sets `keepalive:false` and a
+ * fresh `idleSince` on the way out and writes the rest back. Neither has any
+ * concept of `idleEpoch`, `bgEpoch` or the verdict -- those fields do not exist
+ * in that binary -- so all three ride through the task untouched, and the epochs
+ * still agree with each other on the far side of it.
+ *
+ * That is the shape this file's epoch check cannot see: it asks whether the
+ * verdict names the period the handle is in, and an old replica answers "yes" by
+ * simply not touching either number.
+ */
+function afterOldReplicaRanATask(
+  entry: Record<string, unknown>,
+  idledAt: number,
+): Record<string, unknown> {
+  const activated = { ...entry };
+  delete activated.keepalive;   // ensureHands.clearIdleMarkers, on the way in
+  delete activated.idleSince;
+  // The old markHandsIdle, on the way out: two fields, everything else as found.
+  return { ...activated, keepalive: false, idleSince: idledAt };
+}
+
+test("a verdict an old binary carried across a task is not read as current", async () => {
+  // The rolling-deployment window, which the epochs opened rather than closed.
+  //
+  // A new replica stamps an old idle handle and files an answer against the
+  // stamp. A replica still on the previous build then runs the session's next
+  // message in that same pod and idles it again -- preserving stamp, scope and
+  // answer, because it cannot see them -- and the task leaves a background shell
+  // behind, which is the thing the whole probe exists to protect. The next new
+  // replica to sweep finds `idleEpoch === bgEpoch` and an `idle` count, and gives
+  // the pod back while the probe that would have found the shell is still in the
+  // air.
+  //
+  // Nothing about the epochs can catch this: an old binary opens a new idle
+  // period without touching them, so their agreement is not evidence that the
+  // period they name is the current one. `idleSince` is, because every build's
+  // markHandsIdle stamps it -- including the one that ran here.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // A new replica: stamps the unstamped handle and records `idle` against it.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const measured = k.current();
+  assert.equal(typeof measured.idleEpoch, "number", "sanity: the handle was stamped");
+  assert.equal(measured.bgRunning, 0, "sanity: an `idle` answer was filed");
+  assert.equal(measured.bgEpoch, measured.idleEpoch, "sanity: scoped to that period");
+
+  // Twenty minutes pass on the old replica: the next message arrives, its task
+  // runs in this pod and starts a background shell, and the task ends. The
+  // measurement above is untouched and still inside BG_VERDICT_TTL_MS, so every
+  // replica still believes it; only the clock has moved past it. The handle has
+  // then sat idle for sixteen minutes, past SANDBOX_IDLE_REUSE_MS -- which is
+  // what makes an `idle` answer actionable rather than academic.
+  const now = Date.now();
+  k.replace(afterOldReplicaRanATask(
+    { ...measured, bgCheckedAt: now - 20 * 60_000 },
+    now - 16 * 60_000,
+  ));
+
+  const carried = k.current();
+  assert.equal(
+    carried.bgEpoch, carried.idleEpoch,
+    "premise: the old build changed neither epoch, so comparing them still matches",
+  );
+  assert.equal(carried.bgRunning, 0, "premise: and the answer rode through with them");
+
+  // A new replica sweeps, with no memory of any of this, and its probe would
+  // find the shell the task left -- if it is given the chance to land.
+  resetBackgroundWorkStateForTest();
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the `idle` was measured before a task this record has a boundary for only "
+      + "in `idleSince`; acting on it reclaims the pod out from under a "
+      + "background shell the user expects to still be running",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the sweep had to ask again, which is what the fresh answer proves",
+  );
+});
+
+test("a working sandbox is not re-probed every tick by the stamp that protects it", async () => {
+  // The cost side of anchoring the verdict to `idleSince`. The `running` branch
+  // also moves that stamp -- so if it moved it to `Date.now()` it would land
+  // ahead of the answer that justified moving it, and invalidate it on the very
+  // next sweep: a pod with a long-running job would fall back to `unknown` every
+  // other tick and be re-probed for as long as the job ran. Anchoring the stamp
+  // to the measurement instead makes re-reading the same verdict idempotent.
+  const k = fakeKv();
+  stubPingableProvider();
+  let probes = 0;
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { probes += 1; return 2; },
+  };
+
+  await sweep(deps);
+  assert.equal(probes, 1, "sanity: the first sweep had nothing to read and asked");
+
+  // The next several sweeps have a `running` answer to read, on the handle and
+  // in memory, and neither the stamp they write nor the one they read may
+  // dislodge the other.
+  for (let i = 0; i < 4; i++) await sweep(deps);
+
+  assert.equal(
+    probes, 1,
+    "the answer stayed usable across the sweeps that acted on it; a stamp "
+      + "written ahead of it would have expired it once per tick",
+  );
+  assert.ok(!k.deleted.includes(KEY), "and the working pod was kept throughout");
 });
