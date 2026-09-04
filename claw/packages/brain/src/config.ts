@@ -195,6 +195,332 @@ export const AGENT_SANDBOX_WARM_POOL_SIZE = Math.max(
   0,
   envInt("AGENT_SANDBOX_WARM_POOL_SIZE", 0),
 );
+
+const GO_DURATION_UNIT_NS: Record<string, bigint> = {
+  ns: 1n,
+  us: 1_000n, "µs": 1_000n, "μs": 1_000n,
+  ms: 1_000_000n,
+  s: 1_000_000_000n,
+  m: 60_000_000_000n,
+  h: 3_600_000_000_000n,
+};
+const INT64_MAX = (1n << 63n) - 1n;
+// Go does this arithmetic in uint64, and every one of its overflow guards
+// compares against 1<<63 rather than int64's maximum -- the headroom that lets
+// `-9223372036854775808ns` parse. Ported as the same bound and not the tighter
+// one, because the fraction accumulator's limit is not only a range check: it
+// decides where `leadingFraction` stops scaling, and so which (value, scale)
+// pair the fractional term is computed from. INT64_MAX there makes a fraction
+// beginning 9223372036854775808 stop one digit earlier than Go stops, and the
+// two terms are then equal only by a float64 coincidence. The final result is
+// still held to INT64_MAX, at the end, exactly where Go holds it.
+const UINT64_HALF = 1n << 63n;
+const UINT64_MASK = (1n << 64n) - 1n;
+
+const isDigit = (c: string): boolean => c >= "0" && c <= "9";
+
+/**
+ * A Go duration in whole nanoseconds, or null if `time.ParseDuration` would not
+ * give a positive one.
+ *
+ * Ported from `time.ParseDuration` and its `leadingInt`/`leadingFraction`
+ * helpers in the Go standard library (src/time/format.go):
+ *   Copyright 2010 The Go Authors. All rights reserved.
+ *   Use of this source code is governed by a BSD-3-Clause license,
+ *   reproduced at LICENSES/BSD-3-Clause.txt.
+ * The bounds, the overflow guards, the uint64 arithmetic and the order the
+ * checks run in are that algorithm rather than an independent reading of it,
+ * so the attribution covers the shape and not only the idea. `goDurationNs`
+ * and `goDurationSeconds` are the derived part of this file; everything else
+ * here is AMD-authored under the repository's MIT (see REUSE.toml).
+ *
+ * A port of Go's parser rather than a regex that resembles it, because both
+ * directions of "close enough" are failures with no symptom. Too permissive and
+ * the Workload Manager drops the value in silence while the operator reads it
+ * back from the Deployment and believes it took. Too strict and a legal setting
+ * is refused -- Go accepts `+1s`, `.5s`, `1.s`, and `us`/`µs`/`μs` alike, and a
+ * hand-rolled check rejected all four.
+ *
+ * And it must not throw. It runs at module load, so an exception here is a Brain
+ * that will not start over an environment variable: an earlier version reached
+ * `BigInt(NaN)` on a fraction long enough to make `scale` infinite -- 309 digits
+ * did it -- and a RangeError at import is a crash loop, not a config error.
+ *
+ * Faithful in the parts that decide the answer: `leadingFraction` stops
+ * accumulating when it would overflow but stops scaling too, which is why Go
+ * reads 309 nines as 1s rather than as anything smaller; the fractional term is
+ * computed in float64 and truncated per segment, which is why `0.6ns` is zero
+ * and `0.6ns0.6ns` is zero twice; every multiply is overflow-checked before it
+ * happens; and the running total is a uint64 that wraps rather than a number
+ * that grows. Every case in test/go-duration.test.ts is an answer captured from
+ * `time.ParseDuration` itself.
+ *
+ * Zero and negative come back as null. Both parse in Go, and neither is a value
+ * worth sending: the Workload Manager applies an override only when positive.
+ */
+export function goDurationNs(input: string): bigint | null {
+  try {
+    let s = input;
+    if (s === "") return null;
+    if (s[0] === "+" || s[0] === "-") {
+      // Signed is legal; negative is not a lifetime, and "-0s" is still zero.
+      if (s[0] === "-") return null;
+      s = s.slice(1);
+    }
+    if (s === "" || s === "0") return null;
+
+    let total = 0n;
+    while (s !== "") {
+      if (!(s[0] === "." || isDigit(s[0]))) return null;
+
+      // leadingInt: bails at 1<<63, not at INT64_MAX.
+      const beforeInt = s.length;
+      let v = 0n;
+      while (s !== "" && isDigit(s[0])) {
+        if (v > UINT64_HALF / 10n) return null;
+        v = v * 10n + BigInt(s.charCodeAt(0) - 48);
+        if (v > UINT64_HALF) return null;
+        s = s.slice(1);
+      }
+      const sawInt = beforeInt !== s.length;
+
+      // leadingFraction: stops accumulating AND stops scaling on overflow, which
+      // is the behaviour that keeps a very long fraction finite. The outer guard
+      // is INT64_MAX/10 and the inner one is 1<<63 -- they are different bounds
+      // in Go too, and the inner one is what decides the final digit.
+      let frac = 0n;
+      let scale = 1;
+      let sawFrac = false;
+      if (s !== "" && s[0] === ".") {
+        s = s.slice(1);
+        const beforeFrac = s.length;
+        let overflowed = false;
+        while (s !== "" && isDigit(s[0])) {
+          const digit = BigInt(s.charCodeAt(0) - 48);
+          s = s.slice(1);
+          if (overflowed) continue;
+          if (frac > INT64_MAX / 10n) { overflowed = true; continue; }
+          const next = frac * 10n + digit;
+          if (next > UINT64_HALF) { overflowed = true; continue; }
+          frac = next;
+          scale *= 10;
+        }
+        sawFrac = beforeFrac !== s.length;
+      }
+      if (!sawInt && !sawFrac) return null;
+
+      // The unit is everything up to the next digit or dot.
+      let i = 0;
+      while (i < s.length && !(s[i] === "." || isDigit(s[i]))) i++;
+      if (i === 0) return null;
+      const unitNs = GO_DURATION_UNIT_NS[s.slice(0, i)];
+      s = s.slice(i);
+      if (unitNs === undefined) return null;
+
+      if (v > UINT64_HALF / unitNs) return null;
+      v *= unitNs;
+      if (frac > 0n) {
+        const term = Math.trunc(Number(frac) * (Number(unitNs) / scale));
+        if (!Number.isFinite(term)) return null;
+        v += BigInt(term);
+        if (v > UINT64_HALF) return null;
+      }
+
+      // Go adds into a uint64 and only then asks whether it went too far, so a
+      // sum that goes far enough wraps past the question: two terms of exactly
+      // 1<<63 land on 0, not on an error, and `...ns...ns1ns` is 1ns to Go.
+      // Rejecting it here would be the safer answer to a string nobody means,
+      // but "safer than Go" is the drift this parser exists to not have -- the
+      // Workload Manager is the one that decides, and it decides in uint64.
+      total = (total + v) & UINT64_MASK;
+      if (total > UINT64_HALF) return null;
+    }
+    // Go's own last word: everything above runs to 1<<63, and a positive result
+    // is then held to what an int64 can carry. Without this the relaxed bounds
+    // above would let 1<<63 itself through as a duration Go refuses.
+    if (total > INT64_MAX) return null;
+    return total > 0n ? total : null;
+  } catch {
+    // Belt and braces. Nothing above should throw, and a config value is not
+    // worth a crash loop if something does.
+    return null;
+  }
+}
+
+/**
+ * A Go duration in whole seconds, for a backend that counts in seconds.
+ *
+ * Truncated, with a floor of one second. Truncation is right above the floor --
+ * 1.5s of lifetime is 1s, not 2 -- and the floor is there because truncating a
+ * sub-second value to zero would be read by SaFE as "no timeout at all", the
+ * exact opposite of the shortest possible one.
+ */
+export function goDurationSeconds(ns: bigint): number {
+  return Math.max(1, Number(ns / 1_000_000_000n));
+}
+
+/**
+ * Idle timeout for sandboxes this Brain creates, as a Go duration ("2h", "90m").
+ *
+ * The platform deletes a Sandbox once `lastActivity + timeout` passes, and
+ * `lastActivity` only moves for traffic through the Router -- a request in
+ * flight, or the Brain keepalive exec. Work running *inside* the pod does not
+ * move it, so a sandbox busy with a long computation looks exactly like an
+ * abandoned one. Brain also stops the keepalive the moment a task reaches a
+ * terminal state (see stopKeepaliveAfterTask), which is right when the sandbox
+ * is only a warm cache for the next message -- and wrong when something the
+ * task started is still running in there. That combination reclaims a working
+ * sandbox 15 minutes after the agent turn ends.
+ *
+ * The platform has always taken a per-sandbox override
+ * (`runtime.agent-sandbox.io/idle-timeout`, no upper bound, with
+ * maxSessionDuration as the real backstop) and the Workload Manager writes it
+ * from the CodeInterpreter spec -- Brain simply never set the field, so every
+ * sandbox took the controller default of 15m no matter what it was for.
+ *
+ * Empty means "leave whatever the base template says", which is what every
+ * deployment gets until it opts in: a mounted ConfigMap that sets its own
+ * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
+ * costs held nodes -- every sandbox survives that much longer after everyone has
+ * stopped asking it for anything -- so raise it for a deployment whose work
+ * needs it, not as a default. Per-workload is not offered: the value would have
+ * to reach the create path through the protocol and request normalisation and
+ * join the sandbox reuse fingerprint, or a session would reuse a pod built with
+ * a different lifetime and the caller's value would silently not apply.
+ */
+/**
+ * Floor for AGENT_SANDBOX_SESSION_TIMEOUT, in nanoseconds.
+ *
+ * The idle timeout is a deadline something else has to keep pushing back, and
+ * what pushes it back arrives on a fixed cadence -- the Router refreshes
+ * LastActivity every 5 minutes for as long as a proxy connection is open, and
+ * that constant carries the invariant in its own comment: it has to sit "well
+ * below the default idle timeout (15min) to guarantee the sandbox is never
+ * mistakenly considered idle". This setting is the first thing that can move
+ * the other side of that comparison, and so the first thing that can invert it.
+ * Set below the cadence, the sandbox is reclaimed while it is being used,
+ * because the signal saying so was not due yet -- and nothing reports that as a
+ * misconfiguration, it looks like a sandbox that died.
+ *
+ * The floor is two refresh intervals plus slack: one missed tick must not be
+ * fatal, and at exactly two intervals it still is. Miss the tick at 5m and the
+ * next write is due at 10m -- but the write is not instant, the Router gives it
+ * its own 2s timeout, so at a 10m timeout the deadline can fall while the write
+ * that would have moved it is still in flight. Nothing on the other side is
+ * obliged to wait that out. agentd asks to be re-queued a second past expiry
+ * (`time.Until(expiresAt) + time.Second`), and that is a request for when to
+ * look again, not a grace period: it is one reconcile's own schedule, and any
+ * unrelated event on the Sandbox can bring a pass forward. So a second is the
+ * most that can be assumed, and not even that reliably.
+ *
+ * So 2 x 5m + 1m. A minute rather than the ~3s the write and the requeue
+ * account for, because 3s of headroom is a knife-edge held up by nothing --
+ * ticker drift, a scheduler that is late, a store write slower than usual, an
+ * early reconcile, all of which land inside a margin that thin. It stays looser
+ * than the 3x implied by the shipped 15m default, because this rejects a
+ * setting outright rather than quietly clamping it, and what it has to
+ * establish is only the floor of what can work at all.
+ */
+const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 660_000_000_000n; // 2 x 5m + 1m
+
+function resolveAgentSandboxSessionTimeout(): string {
+  const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
+  if (!configured) return "";
+  const ns = goDurationNs(configured);
+  if (ns === null) {
+    settingProblems.push(
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a positive Go duration `
+        + `(e.g. "90m", "2h30m"); leaving the template's own value`,
+    );
+    return "";
+  }
+  if (ns < AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS) {
+    settingProblems.push(
+      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is below the 11m floor: the `
+        + `liveness signal that holds a sandbox open only arrives every 5m, and `
+        + `the floor is two of those plus a minute for the write to land, so a `
+        + `sandbox still in use would be reclaimed before the signal saying so is `
+        + `due; leaving the template's own value`,
+    );
+    return "";
+  }
+  return configured;
+}
+export const AGENT_SANDBOX_SESSION_TIMEOUT = resolveAgentSandboxSessionTimeout();
+
+/**
+ * Absolute lifetime for sandboxes this Brain creates, as a Go duration.
+ *
+ * The other end of the same clamp as AGENT_SANDBOX_SESSION_TIMEOUT, and the one
+ * nothing can talk its way out of: the idle timeout is a deadline the sandbox
+ * pushes back every time something touches it, while this one is written onto
+ * the CR as an absolute ShutdownTime and enforced by a controller that reads no
+ * store and takes no heartbeat. Keeping a sandbox alive past it is not possible
+ * from Brain's side at all -- not by pinging, not by holding work open.
+ *
+ * The platform puts no ceiling on it ("no hard cap -- longer values pass through
+ * as-is") and takes it per template or per request, so the 24h every sandbox
+ * gets here is not a platform limit. It is a literal in this file's inline
+ * fallback skeleton, which is to say it was unreachable for a deployment that
+ * mounted its own base ConfigMap and unreachable per request for anyone --
+ * exactly the gap AGENT_SANDBOX_SESSION_TIMEOUT closed for the idle side, left
+ * open on the line below it.
+ *
+ * Empty leaves whatever the base template says, so nothing changes until a
+ * deployment opts in. Raise it only for work that genuinely runs that long: it
+ * is a ceiling on leaked sandboxes too, and the thing that bounds what a lost
+ * activity record can cost.
+ */
+function resolveAgentSandboxMaxSessionDuration(): string {
+  const configured = env("AGENT_SANDBOX_MAX_SESSION_DURATION");
+  if (!configured) return "";
+  if (goDurationNs(configured) === null) {
+    settingProblems.push(
+      `AGENT_SANDBOX_MAX_SESSION_DURATION=${configured} is not a positive Go `
+        + `duration (e.g. "48h", "36h30m"); leaving the template's own value`,
+    );
+    return "";
+  }
+  return configured;
+}
+export const AGENT_SANDBOX_MAX_SESSION_DURATION = resolveAgentSandboxMaxSessionDuration();
+
+/**
+ * The same ceiling in whole seconds, for the backend that wants it that way.
+ *
+ * safe-workload's `timeout` is seconds, and it answers the same question
+ * `maxSessionDuration` does -- do not let this run forever -- so the value has
+ * to reach both providers, and converting it here rather than in each one is
+ * what keeps them from drifting into two nearly-identical parsers.
+ *
+ * Near-equivalent, not identical: `maxSessionDuration` becomes an absolute
+ * ShutdownTime from creation, while SaFE counts `timeout` from
+ * `Status.StartTime` and explicitly excludes queue time, so a workload that
+ * waited an hour to be dispatched gets that hour on top. Close enough to carry
+ * one setting; not close enough to describe as one guarantee.
+ *
+ * Null when unset or refused, which leaves each provider on its own default.
+ */
+export const AGENT_SANDBOX_MAX_SESSION_SECONDS: number | null = (() => {
+  const ns = AGENT_SANDBOX_MAX_SESSION_DURATION
+    ? goDurationNs(AGENT_SANDBOX_MAX_SESSION_DURATION)
+    : null;
+  return ns === null ? null : goDurationSeconds(ns);
+})();
+
+// A setting that quietly does nothing is worse than one that is refused, and
+// this one does nothing on the default deployment mode: SaFE's Workload has no
+// idle timeout to map it onto -- `timeout` runs whether or not anyone is using
+// the sandbox, and `ttlSecondsAfterFinished` is cleanup after it ends. Said at
+// startup so it is read once by the person who set it, rather than discovered
+// from a sandbox that was reclaimed on a schedule they thought they had changed.
+if (AGENT_SANDBOX_SESSION_TIMEOUT && CLAW_DEPLOY_MODE !== "kubernetes") {
+  settingProblems.push(
+    `AGENT_SANDBOX_SESSION_TIMEOUT=${AGENT_SANDBOX_SESSION_TIMEOUT} has no effect `
+      + `with CLAW_DEPLOY_MODE=${CLAW_DEPLOY_MODE}: safe-workload has no idle `
+      + `timeout. AGENT_SANDBOX_MAX_SESSION_DURATION does apply there`,
+  );
+}
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,
@@ -666,13 +992,10 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // unreadable backstop above (which only fires when SaFE stops answering). Set to
 // 0 to queue forever. Stored in ms; configured in seconds like the sibling above.
 //
-// NOTE (task/DAG mode only): the API-side sweeper independently fails a
-// claw_tasks row as `brain_timeout` after BRAIN_TASK_TIMEOUT_SEC (code fallback
-// 1h, but the Helm chart deploys 21600s = 6h) measured from started_at, with no
-// liveness signal. If this ceiling can exceed that, raise BRAIN_TASK_TIMEOUT_SEC
-// to match — otherwise a task's DB row goes terminal first while Brain keeps
-// waiting, leaving a window where the workload still holds resources. Chat
-// sessions live in claw_sessions (not claw_tasks) and are never swept.
+// Task and DAG runs carry a renewable API-side lease, so this Pending ceiling
+// does not have to fit under BRAIN_TASK_TIMEOUT_SEC. That timeout now covers
+// only a row that never receives its first lease renewal; once Brain is alive,
+// the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
 
 // Hands /health readiness poll AFTER the sandbox reaches Running and the

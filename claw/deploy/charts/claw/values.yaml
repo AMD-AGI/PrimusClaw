@@ -55,9 +55,14 @@ api:
   # run_budget_exhausted with the turn count. Without one the row is requeued
   # from outside and the user is told nothing about why.
   #
-  # runBudgetDagNodeSec only bites below api.brainTaskTimeoutSec: above it a
-  # graph node is closed as brain_timeout first, because a DAG row carries no
-  # lease for the budget arm to outrun.
+  # A task or DAG worker renews a short lease independently of this budget.
+  # Healthy multi-day nodes therefore reach runBudgetDagNodeSec; a row that
+  # never receives its first renewal still closes at api.brainTaskTimeoutSec
+  # instead of claiming to run until a far-away deadline.
+  #
+  # brainTaskTimeoutSec also bounds a DAG root once one of its children has
+  # failed (sweeper.reapStuckDagRoots), so a failed graph does not survive on
+  # this setting alone.
   runBudgetChatSec: ""
   runBudgetDagNodeSec: ""
   # How many times a message queued behind a running turn may be refused a
@@ -194,6 +199,25 @@ brain:
   # own default, which for the bash ceiling depends on features.backgroundShell
   # -- see the note there before pinning it.
   bashMaxTimeoutSec: ""
+  # Idle timeout and absolute lifetime for the sandboxes Brain creates, as Go
+  # durations ("6h", "48h"). Sent as Workload Manager create overrides, so an
+  # empty value is not sent at all and the template keeps whatever it says --
+  # which is what every deployment gets until it sets one of these.
+  #
+  # The idle clock is pushed back by activity; the lifetime is not. A sandbox
+  # given a longer idle window without a longer lifetime still dies on schedule
+  # with its work running, so raise them together or not at all. A value that is
+  # not a positive Go duration is refused at startup rather than dropped by the
+  # Workload Manager's parse.
+  #
+  # sessionTimeout is an agent-sandbox concept and only reaches a sandbox when
+  # deployMode is kubernetes. SaFE has no idle clock to map it onto, so in the
+  # default safe mode it does nothing at all -- the startup log names it as an
+  # inert setting rather than letting it read back as applied. maxSessionDuration
+  # is honoured in both modes, and on SaFE it is the ceiling a per-request
+  # deadline is clamped to.
+  sessionTimeout: ""
+  maxSessionDuration: ""
   bashDefaultTimeoutSec: ""
   waitMaxSec: ""
   waitDefaultSec: ""
@@ -373,7 +397,10 @@ secret:
   # defaults in packages/{api,brain}/src/config.ts (kept minimal on purpose).
   fetchHeadersTimeoutMs: "60000"
   fetchBodyIdleTimeoutMs: "120000"
-  sandboxKeepaliveFailLimit: "5"
+  # Automatic stop on failed keepalive probes is opt-in. A shared Router or
+  # control-plane fault can affect every sandbox at once, so the safe default is
+  # to log and let the platform's own idle/TTL GC reclaim confirmed orphans.
+  sandboxKeepaliveFailLimit: "0"
 
 sandboxTemplate:
   enabled: true

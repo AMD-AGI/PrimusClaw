@@ -54,3 +54,10 @@ coverage.xml
 # this makes that stick.
 deploy/litellm/values.*.yaml
 !deploy/litellm/values.autorouting.example.yaml
+
+# Private CA anchors for an internal gateway, fetched at build time via the
+# Dockerfile's EXTRA_CA_CERT_URLS. Kept on disk for local builds and out of the
+# tree on purpose: an open-source image must not ship one organisation's trust
+# root. Ignored rather than merely remembered, because `git add -A` does not
+# remember.
+claw/ca-anchors/

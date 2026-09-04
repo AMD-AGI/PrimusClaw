@@ -20,6 +20,7 @@ wins.
 | [`brain-graceful-upgrade.md`](brain-graceful-upgrade.md) | Draining and restarting Brain without losing in-flight runs |
 | [`litellm-auto-routing-design.md`](litellm-auto-routing-design.md) | Complexity-based model routing through the LiteLLM gateway |
 | [`plugins.md`](plugins.md) | The plugin format and the marketplace import path |
+| [`run-api.md`](run-api.md) | Platform run status, terminal classification, batch reads, and cursor pagination |
 | `architecture.drawio` | Editable source for the architecture diagram |
 
 ## Documents referenced from the code but not published here

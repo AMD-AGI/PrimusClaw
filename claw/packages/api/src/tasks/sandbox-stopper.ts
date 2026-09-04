@@ -19,6 +19,7 @@
 import { DagHandleMap } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import pino from "pino";
+import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
 import { kv as natsKv } from "../infra/nats.js";
 import { db } from "../infra/db.js";
@@ -92,14 +93,9 @@ async function safeStopWorkload(workloadId: string, platformKey: string): Promis
 }
 
 async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
-  // `claw_sessions` does not have a dedicated platform_key column in the
-  // canonical schema; some deployments stash it under config.platform_key.
   const r = await db.query(`SELECT config FROM claw_sessions WHERE session_id = $1`, [sessionId]);
   if (r.rowCount === 0) return "";
-  const cfg = (r.rows[0].config ?? {}) as Record<string, unknown>;
-  return cfg._server_managed_credentials === true && typeof cfg.platform_key === "string"
-    ? cfg.platform_key
-    : "";
+  return readTrustedSessionCredentials(r.rows[0].config).platformKey;
 }
 
 export async function stopSandboxByHandle(

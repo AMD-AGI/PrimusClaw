@@ -19,6 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { db } from "../infra/db.js";
+import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import { interruptSubject } from "@claw/protocol";
@@ -144,11 +145,16 @@ export async function reapStaleTasks(): Promise<number> {
          (deadline_at IS NOT NULL
             AND deadline_at < NOW() - ($3::int * INTERVAL '1 second'))
          OR
+         -- The never-claimed arm. A healthy task or DAG node renews its lease
+         -- immediately, so a NULL lease after this long means no worker ever
+         -- accepted the run (or one too old to speak the lease protocol did).
+         -- Its execution budget is independent: a deadline hours away must not
+         -- turn a missing worker into a run that claims to be alive for hours.
          (lease_expires_at IS NULL
             AND started_at IS NOT NULL
             AND started_at < NOW() - ($1::int * INTERVAL '1 second'))
        )
-     RETURNING task_id, session_id, dag_root_task_id, deadline_at`,
+     RETURNING task_id, session_id, dag_root_task_id, deadline_at, sandbox_workload_id`,
     [
       BRAIN_TASK_TIMEOUT_SEC,
       `no agent_done after ${BRAIN_TASK_TIMEOUT_SEC}s`,
@@ -163,6 +169,7 @@ export async function reapStaleTasks(): Promise<number> {
     session_id: string;
     dag_root_task_id: string | null;
     deadline_at: string | null;
+    sandbox_workload_id: string | null;
   }>;
   logger.warn(
     {
@@ -174,6 +181,14 @@ export async function reapStaleTasks(): Promise<number> {
     "sweeper.reaped_stale_tasks",
   );
   await interruptReapedRuns(rows);
+  // These are the runs that stopped reporting. Some of them stopped because the
+  // node under them was reclaimed, and this is the last moment their pods can
+  // still say so. Best-effort and after the interrupt: the close has already
+  // happened and must stand regardless.
+  await backfillPlatformFacts(rows).catch((err) => {
+    logger.warn({ err }, "sweeper.platform_backfill_failed");
+    return 0;
+  });
   return r.rowCount;
 }
 
@@ -308,15 +323,11 @@ export async function reapStuckDagRoots(): Promise<number> {
  * would risk aborting whatever the user is running now over a run that ended
  * long ago. Closing the row is the entire job.
  *
- * Only rows that ever had a lease are eligible, so runs dispatched before this
- * existed, or by a worker too old to renew, keep the old behaviour rather than
- * being reaped for not speaking a protocol they do not know. Graph nodes are in
- * that set by construction and not by age: the lease is handed out with the
- * chat dispatch, and the DAG path builds its ExecuteRequest without one, so
- * `postRunLease` finds nothing to renew and `lease_expires_at` stays NULL for
- * the life of the row. Liveness for those is still the deadline backstop above,
- * which for a graph node means the run budget's grace rather than a minute --
- * widening the lease to cover them is a dispatch change, not a predicate one.
+ * Only rows that ever had a lease are eligible. Current chat, task, and DAG
+ * dispatches all issue one; rows dispatched before that protocol, workers too
+ * old to renew, and messages nobody claimed keep a NULL lease and reach the
+ * never-claimed timeout above instead.
+ *
  * The one exception is deliberate and follows the reap rather than widening
  * it: a chat row that
  * shares its message id with a row reaped here was opened by the same dispatch
@@ -600,25 +611,40 @@ export async function reapLostLeases(): Promise<number> {
           AND status IN ('preparing','running')
         )
       RETURNING task_id, session_id, origin, lease_owner,
-                metadata->>'message_id' AS message_id`,
+                metadata->>'message_id' AS message_id,
+                sandbox_workload_id`,
     [LEASE_LOST_GRACE_SEC],
   );
   if (!r.rowCount) return 0;
+  const rows = r.rows as Array<{
+    task_id: string;
+    session_id: string;
+    origin: string;
+    lease_owner: string | null;
+    message_id: string | null;
+    sandbox_workload_id: string | null;
+  }>;
   logger.warn(
     {
       reaped: r.rowCount,
       graceSec: LEASE_LOST_GRACE_SEC,
-      rows: r.rows,
+      rows,
     },
     "sweeper.reaped_lost_leases",
   );
-  const chatRows = r.rows.filter(
-    (row) => (row as { origin: string }).origin === "chat",
-  ) as Array<{ session_id: string; message_id: string | null }>;
+  const chatRows = rows.filter((row) => row.origin === "chat");
   // Ahead of the gate release, not after it: the spare row is non-terminal, and
   // the release refuses to act on a session with anything non-terminal left.
   await closeUnclaimedDispatchSiblings(chatRows);
   await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
+  // A worker and its sandbox commonly disappear together on node loss. The
+  // expired lease closes the row; this read records the platform's reason while
+  // the workload detail still exists. Best-effort because liveness cleanup must
+  // not depend on the platform API being available.
+  await backfillPlatformFacts(rows).catch((err) => {
+    logger.warn({ err }, "sweeper.lost_lease_platform_backfill_failed");
+    return 0;
+  });
   return r.rowCount;
 }
 
@@ -974,6 +1000,11 @@ export async function sweeperTick(): Promise<void> {
   await runContained("sweeper.expired_doorbell_failed", reapExpiredDoorbellRuns);
   await runContained("sweeper.wait_external_failed", reapWaitExternal);
   await runContained("sweeper.stuck_sessions_failed", reapStuckSessions);
+  // Retry platform reads deferred by a per-sweep cap or a transient failure,
+  // even when this tick found no newly stale rows. Before this lived after
+  // reapStaleTasks' early return, so a quiet next tick left the backlog forever.
+  // Run before orphan cleanup can destroy the last workload detail available.
+  await runContained("sweeper.platform_backfill_drain_failed", drainPendingPlatformFacts);
   // The one scan here whose action is not idempotent: it reads a handle,
   // decides the DAG behind it is over, and destroys a sandbox. Two replicas
   // reaching that conclusion together destroy it twice, and the second one is

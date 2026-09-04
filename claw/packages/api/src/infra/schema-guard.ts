@@ -72,7 +72,14 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // applied migration here means every chat dispatch fails on insert --
       // which is the failure this guard exists to move to startup.
       "origin", "workspace_id", "lease_owner", "lease_expires_at", "heartbeat_at", "event_seq",
-      "claim_count",
+      "claim_count", "sandbox_workload_id",
+      // Named on every task insert, so a database that lost it takes down the
+      // creation of every run rather than just the ones that set it. The ALTER
+      // that adds it discards its own error like the rest of setup, which is
+      // exactly why the column has to be claimed here instead.
+      "workspace_throwaway",
+      "platform_message", "platform_node", "platform_exit_code", "platform_container_reason",
+      "platform_facts_resolved_at", "platform_facts_next_retry_at", "platform_facts_attempts",
       "created_at", "queued_at", "started_at", "completed_at",
     ],
   },

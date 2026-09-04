@@ -17,13 +17,16 @@ import { interruptSubject } from "@claw/protocol";
 import pino from "pino";
 import { getUser } from "../auth/middleware.js";
 import {
+  canAccessSession,
   canAccessSessionAsOperator,
   canWriteSessionAsOperator,
 } from "../auth/models.js";
-import { db } from "../infra/db.js";
+import { db, MarketplaceDb } from "../infra/db.js";
 import { nc, sc } from "../infra/nats.js";
 import { canExecuteTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
+import type { UserInfo } from "../auth/models.js";
+import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { createSingleTask, expandDag } from "../tasks/dag-expander.js";
 import { getTask, listTasksByDag } from "../tasks/db.js";
 import { cancelTask, retryTask } from "../tasks/lifecycle.js";
@@ -33,13 +36,73 @@ import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
 
+/**
+ * The sandbox a plugin-less single task should get.
+ *
+ * This used to be the literal `"none"`, which `resolveSandboxAction` maps to
+ * `{kind:"none"}` and `ensureHands` then throws on -- while the agent is still
+ * handed the full tool schema. So a prompt-only task advertised every sandbox
+ * tool and died on the first one that was called, and the sandboxless fast
+ * path that would have excused it is gated on `mode === "script"`. The visible
+ * symptom was a run ending in two turns having called nothing, and a
+ * `sandbox_workload_id` that was NULL for every row ever written -- which in
+ * turn left the platform-facts backfill filtering out every row it was given.
+ *
+ * The chat path never had this: it resolves an image through
+ * request -> plugin -> marketplace default and ships it as the legacy
+ * top-level field. Same precedence here, minus the per-request override a task
+ * body has no field for. `"none"` survives only for the case it describes --
+ * no plugin and no default image, where a sandbox genuinely cannot be built.
+ */
+export async function singleTaskSandboxSpec(
+  plugin: { image?: string; resource?: unknown } | null | undefined,
+): Promise<{ handle: string; image: string; resources?: unknown } | "none"> {
+  if (plugin?.image) {
+    return { handle: "main", image: plugin.image, resources: plugin.resource };
+  }
+  const row = await MarketplaceDb.resourceFirstByType("default").catch(() => null);
+  const image = String((row as Record<string, unknown> | null)?.image ?? "").trim();
+  if (!image) return "none";
+  return { handle: "main", image, resources: (row as Record<string, unknown>).resource };
+}
+
 const logger = pino({ name: "tasks-routes" });
+
+/**
+ * Record the caller's credentials on the session, or refuse the submission.
+ *
+ * 403 rather than 500: a caller with no platform key is a request this service
+ * cannot honour, not a fault in it. And rather than the shared identity the
+ * dispatcher used to fall back to -- a submission that runs as somebody else is
+ * worse than one that does not run, because the submitter cannot stop it.
+ */
+async function stampCredentialsOr403(
+  reply: FastifyReply,
+  sessionId: string,
+  user: UserInfo,
+): Promise<boolean> {
+  try {
+    await stampSessionCredentials(sessionId, user);
+    return true;
+  } catch (error) {
+    if (!(error instanceof MissingPlatformKeyError)) throw error;
+    logger.warn({ sessionId, userId: user.userId }, "task.submit_without_platform_key");
+    await reply.status(403).send({ ok: false, error: "missing_platform_key" });
+    return false;
+  }
+}
 
 interface CreateTaskBody {
   dag_id?: string;
   plugin_id?: number;
   input?: Record<string, unknown>;
   prompt?: string;
+  /**
+   * Skip the post-run /workspace upload: this task has already delivered its
+   * output somewhere of its own. Only honoured on the single-task path -- a DAG
+   * declares it on the template, per node or for all of them.
+   */
+  workspace_throwaway?: boolean;
 }
 
 async function requireSessionAccess(
@@ -47,6 +110,7 @@ async function requireSessionAccess(
   reply: FastifyReply,
   sessionId: string,
   write: boolean,
+  ownerOnly = false,
 ): Promise<boolean> {
   const session = (await db.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -57,9 +121,11 @@ async function requireSessionAccess(
     return false;
   }
   const user = getUser(req);
-  const allowed = write
-    ? canWriteSessionAsOperator(session.user_id, user)
-    : canAccessSessionAsOperator(session.user_id, user);
+  const allowed = ownerOnly
+    ? canAccessSession(session.user_id, user?.userId)
+    : write
+      ? canWriteSessionAsOperator(session.user_id, user)
+      : canAccessSessionAsOperator(session.user_id, user);
   if (!allowed) {
     reply.status(403).send({ ok: false, error: "access_denied" });
     return false;
@@ -72,13 +138,14 @@ async function requireTaskAccess(
   reply: FastifyReply,
   taskId: string,
   write: boolean,
+  ownerOnly = false,
 ): Promise<ClawTaskRow | null> {
   const task = await getTask(taskId);
   if (!task) {
     reply.status(404).send({ ok: false, error: "not_found" });
     return null;
   }
-  if (!await requireSessionAccess(req, reply, task.session_id, write)) return null;
+  if (!await requireSessionAccess(req, reply, task.session_id, write, ownerOnly)) return null;
   return task;
 }
 
@@ -113,7 +180,10 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       const sessionId = req.params.sessionId;
       const body = req.body ?? {};
 
-      if (!await requireSessionAccess(req, reply, sessionId, true)) return reply;
+      // Submission stamps the caller's credentials onto the session. Operators
+      // may inspect and stop tenant work, but submitting here would replace the
+      // owner's credentials while their queued tasks still read from this row.
+      if (!await requireSessionAccess(req, reply, sessionId, true, true)) return reply;
 
       let dag = body.dag_id ? await getTaskDag(body.dag_id) : null;
       let plugin = body.plugin_id ? await loadPluginRow(body.plugin_id) : null;
@@ -129,18 +199,25 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (!dag) {
+        if (!(await stampCredentialsOr403(reply, sessionId, user))) return reply;
         const single = await createSingleTask({
           session_id: sessionId,
           plugin_id: body.plugin_id ?? null,
           input: body.input ?? {},
           prompt: body.prompt,
           mode: "llm",
-          sandbox_spec: plugin
-            ? { handle: "main", image: plugin.image, resources: plugin.resource }
-            : "none",
+          workspace_throwaway: body.workspace_throwaway === true,
+          sandbox_spec: await singleTaskSandboxSpec(plugin),
         });
         return { ok: true, task_id: single.task_id };
       }
+
+      // Record the caller's own credentials on the session before anything is
+      // queued. A task is dispatched long after this request has gone, and the
+      // session row is the only thing that carries the submitter that far --
+      // which is why the path that skipped this ran every workload under the
+      // cluster's shared identity.
+      if (!(await stampCredentialsOr403(reply, sessionId, user))) return reply;
 
       const result = await expandDag({
         session_id: sessionId,
@@ -174,7 +251,7 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       if (!Array.isArray(body.inputs) || body.inputs.length === 0) {
         return reply.status(400).send({ ok: false, error: "inputs[] required" });
       }
-      if (!await requireSessionAccess(req, reply, body.session_id, true)) return reply;
+      if (!await requireSessionAccess(req, reply, body.session_id, true, true)) return reply;
 
       const dag = await getTaskDag(body.dag_id);
       if (!dag || !canExecuteTaskDag(dag, user)) {
@@ -187,6 +264,10 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       const roots: string[] = [];
       try {
         await client.query("BEGIN");
+        // Inside the transaction that creates the batch: a batch whose rows exist
+        // without the credential stamped would dispatch under the wrong identity,
+        // and the two facts belong to the same decision.
+        await stampSessionCredentials(body.session_id, user, client);
         await client.query(
           `INSERT INTO claw_batches (batch_id, session_id, user_id, dag_id, size, status)
            VALUES ($1,$2,$3,$4,$5,'running')`,
@@ -208,6 +289,19 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK").catch(() => {});
+        // The same refusal its sibling endpoint gives, in the same words. It
+        // cannot go through stampCredentialsOr403 because the stamp belongs
+        // inside this transaction, and without the branch a submission with no
+        // platform key came back as an unhandled 500 -- indistinguishable from
+        // Claw being broken, when it is the caller's request that cannot be
+        // honoured.
+        if (error instanceof MissingPlatformKeyError) {
+          logger.warn(
+            { sessionId: body.session_id, userId: user.userId },
+            "batch.submit_without_platform_key",
+          );
+          return reply.status(403).send({ ok: false, error: "missing_platform_key" });
+        }
         throw error;
       } finally {
         client.release();
@@ -265,7 +359,11 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { taskId: string } }>(
     "/v1/tasks/:taskId/retry",
     async (req, reply) => {
-      if (!await requireTaskAccess(req, reply, req.params.taskId, true)) return reply;
+      const task = await requireTaskAccess(req, reply, req.params.taskId, true, true);
+      if (!task) return reply;
+      const user = getUser(req);
+      if (!user) return reply.status(401).send({ ok: false, error: "unauthorized" });
+      if (!(await stampCredentialsOr403(reply, task.session_id, user))) return reply;
       const r = await retryTask(req.params.taskId);
       if (!r.ok) return reply.status(409).send({ ok: false, error: "not_retryable" });
       return { ok: true, new_task_id: r.new_task_id };

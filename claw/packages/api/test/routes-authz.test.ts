@@ -40,6 +40,7 @@ function user(userId: string, roles: string[] = ["default"]): UserInfo {
 const OWNER = user("u-owner");
 const OTHER_TENANT = user("u-other");
 const READONLY_ADMIN = user("u-ops", ["system-admin-readonly"]);
+const FULL_ADMIN = user("u-admin", ["system-admin"]);
 
 interface SeenQuery { text: string; params: unknown[] }
 
@@ -65,6 +66,7 @@ function stubDb(): SeenQuery[] {
         ? { rows: [{ task_id: TASK_ID, session_id: SESSION_ID, status: "completed" }], rowCount: 1 }
         : { rows: [], rowCount: 0 };
     }
+    if (/FROM claw_task_dags/.test(sql)) return { rows: [], rowCount: 0 };
     throw new Error(`stubDb: unexpected query ${sql.slice(0, 80)}`);
   }) as typeof db.query;
   return seen;
@@ -175,6 +177,39 @@ test("task read is scoped to the owner of the task's session", async () => {
     assert.equal(missing.statusCode, 404);
   } finally {
     await Promise.all([owner.close(), foreign.close()]);
+  }
+});
+
+test("an operator cannot submit work under a tenant's mutable session credentials", async () => {
+  stubDb();
+  const url = `/v1/sessions/${SESSION_ID}/tasks`;
+  const request = {
+    method: "POST" as const,
+    url,
+    payload: { dag_id: "missing" },
+  };
+  const owner = await appAs(OWNER, registerTaskRoutes);
+  const admin = await appAs(FULL_ADMIN, registerTaskRoutes);
+  try {
+    const allowedThroughOwnership = await owner.inject(request);
+    assert.equal(
+      allowedThroughOwnership.statusCode,
+      404,
+      "the owner should reach DAG lookup after the ownership gate",
+    );
+    assert.equal(JSON.parse(allowedThroughOwnership.body).error, "dag_not_found");
+
+    const denied = await admin.inject(request);
+    assert.equal(denied.statusCode, 403);
+    assert.equal(JSON.parse(denied.body).error, "access_denied");
+
+    const retry = await admin.inject({
+      method: "POST",
+      url: `/v1/tasks/${TASK_ID}/retry`,
+    });
+    assert.equal(retry.statusCode, 403, "retry bypassed owner-only submission");
+  } finally {
+    await Promise.all([owner.close(), admin.close()]);
   }
 });
 

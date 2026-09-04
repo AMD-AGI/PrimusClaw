@@ -17,7 +17,9 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -74,6 +76,16 @@ type SandboxReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
 	SessionTimeout time.Duration
+	// Recorder publishes the reclaim as a Kubernetes Event on the Sandbox.
+	//
+	// The audit store already records it, but only somewhere a person has to
+	// know to look: `kubectl describe sandbox` and every dashboard built on
+	// Events show nothing, so a sandbox that was deleted while its work was
+	// still running is indistinguishable from one that was never created --
+	// leaving the reclaim to be reconstructed from control-plane logs, if they
+	// still reach back far enough. Nil disables it; the audit event is written
+	// either way.
+	Recorder record.EventRecorder
 	// Store is the Redis-backed session store (optional).
 	//
 	// When non-nil it carries the most recent activity time, written by the
@@ -122,6 +134,13 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Already on its way out, by somebody else's decision. Reconciling it would
+	// at best re-issue a delete that changes nothing and at worst attribute
+	// another controller's teardown -- or a user's -- to the idle collector.
+	if !sandbox.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	lastActivity, err := r.resolveLastActivity(ctx, sandbox)
@@ -189,8 +208,35 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Emit audit event BEFORE deletion so callers can observe the cause.
 		// Fire-and-forget: never block the GC on audit failures.
 		r.emitIdleDeletedEvent(ctx, sandbox, lastActivity, timeout)
-		if err := r.Delete(ctx, sandbox); err != nil && client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, err
+		// Bound to the object this reconcile decided about. Without it, a sandbox
+		// deleted and recreated under the same name between the read and here --
+		// the same session coming straight back -- would have its replacement
+		// deleted instead, and the replacement is by definition not idle.
+		//
+		// UID and not ResourceVersion, deliberately. A ResourceVersion
+		// precondition would also close the narrower race where another actor
+		// marks the object for deletion after the read, but it makes the reclaim
+		// fail whenever anything at all writes the object first -- a status
+		// update is enough -- and trading a working collector for exact
+		// attribution on a rare race is the wrong way round. What that leaves is
+		// documented on the Event: a delete this call did not cause can still be
+		// reported as one, if it lands inside that window.
+		deleteErr := r.Delete(ctx, sandbox,
+			client.Preconditions{UID: &sandbox.UID})
+		if deleteErr != nil && client.IgnoreNotFound(deleteErr) != nil {
+			return ctrl.Result{}, deleteErr
+		}
+		// Only when this call is the one that removed it, and only after it did.
+		//
+		// Before the delete, an Event would claim a reclaim that RBAC, a webhook
+		// or a flaky API call then refused -- and the Event is the thing an
+		// operator trusts, so it would send them looking for a pod still sitting
+		// there. On a NotFound it would claim someone else's teardown: a user
+		// deleting their own sandbox, or another controller, filed under
+		// IdleReclaimRequested and counted against an idle timeout that had
+		// nothing to do with it.
+		if deleteErr == nil {
+			r.recordIdleDeletedEvent(sandbox, lastActivity, timeout)
 		}
 		// Reached whether this call removed the Sandbox or found it already gone --
 		// something else deleting it first still leaves the mapping stale, and the
@@ -374,6 +420,52 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 			"session_id", sessionID,
 			"error", err)
 	}
+}
+
+// recordIdleDeletedEvent publishes the reclaim where a person will find it.
+//
+// Same facts the audit event carries -- when the sandbox was last active, and
+// the timeout it outran -- because those two are what turn "the pod vanished"
+// into "the pod was reclaimed for being idle, and here is the window it missed
+// by". Without them the Event only restates the disappearance.
+//
+// Normal rather than Warning: reclaiming an idle sandbox is this controller
+// working, and a Warning would put every routine reclaim in front of whatever
+// watches for Warnings. That it is sometimes wrong -- the pod was busy in a way
+// nothing outside it could see -- is an argument for saying so, not for
+// alarming on every one.
+//
+// Emitted after the delete, unlike the audit event: this one is what an
+// operator reads, and one saying a sandbox was reclaimed while it is still
+// there -- RBAC, a webhook, a flaky API call -- is worse than none at all. The
+// object being gone is not a problem; an Event holds its own reference.
+//
+// "Requested", not "reclaimed", and that is the honest word. A UID precondition
+// makes this the object the reconcile decided about, but a delete that returns
+// nil is not proof this call is what removed it: another actor can mark the
+// object between the read and here, and with a finalizer holding it, a second
+// delete succeeds all the same. Closing that would take a ResourceVersion
+// precondition, which fails the reclaim whenever anything at all writes the
+// object first -- a status update is enough -- and a working collector is worth
+// more than exact attribution on a rare race. So the Event claims what is
+// always true.
+//
+// Events also expire on their own (an hour, in a default cluster), so this is a
+// debugging aid on top of the audit trail, not a replacement for it. The audit
+// event is still written before the delete, which has the same imprecision and
+// predates this; worth fixing, not worth changing an existing contract from
+// here.
+func (r *SandboxReconciler) recordIdleDeletedEvent(
+	sandbox *sandboxv1alpha1.Sandbox,
+	lastActivity time.Time,
+	timeout time.Duration,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(sandbox, corev1.EventTypeNormal, "IdleReclaimRequested",
+		"Requested deletion after %s idle (last activity %s)",
+		timeout, lastActivity.UTC().Format(time.RFC3339))
 }
 
 // SetupWithManager registers the controller.

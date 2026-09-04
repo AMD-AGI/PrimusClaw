@@ -23,16 +23,20 @@
  *   B8 a refused publish fails the row; one that only went quiet leaves it open
  *   B9 a payload that will not serialise is a publish that certainly failed
  *   B10 a queued chat doorbell is put back without moving a claimed lease
+ *   B11 dispatched task and DAG runs carry their scoped lease credential
+ *   B12 kubernetes/BYOK dispatch needs an LLM key, not a SaFE platform key
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-
-import { db } from "../src/infra/db.js";
+import { createHash } from "node:crypto";
 
 // The stage timeout has to be reachable without waiting the shipped fifteen
 // seconds for one, and the dispatcher reads it once at import. Long enough that
 // the stages which answer immediately below are never caught by it.
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
+process.env.CLAW_DEPLOY_MODE = "kubernetes";
+process.env.LLM_KEY_SOURCE = "virtualKey";
+const { db } = await import("../src/infra/db.js");
 const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
 
 interface SeenQuery { sql: string; params: unknown[] }
@@ -89,6 +93,7 @@ function stubDb(
   workspace: DbAnswer = WORKSPACE_UNREACHABLE,
   input: Record<string, unknown> = {},
   rowPatch: Record<string, unknown> = {},
+  sessionConfig: Record<string, unknown> = SERVER_MANAGED_CONFIG,
 ): SeenQuery[] {
   const seen: SeenQuery[] = [];
   const row = () => ({ ...taskRow(startedAt, input), ...rowPatch });
@@ -99,12 +104,24 @@ function stubDb(
     if (/^UPDATE claw_tasks SET/.test(sql)) return { rows: [row()], rowCount: 1 };
     if (/FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [row()], rowCount: 1 };
     if (/SELECT user_id, config FROM claw_sessions/.test(sql)) {
-      return { rows: [{ user_id: "u-1", config: {} }], rowCount: 1 };
+      // A session carrying its submitter's key, which is what every entry point
+      // now stamps before queueing a task. An empty config here used to dispatch
+      // anyway, under the cluster's shared identity.
+      return { rows: [{ user_id: "u-1", config: sessionConfig }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   return seen;
 }
+
+/**
+ * A session config as the entry points write it: the submitter's platform key,
+ * marked server-managed so the dispatcher will trust it.
+ */
+const SERVER_MANAGED_CONFIG = {
+  platform_key: "pk-user-1",
+  _server_managed_credentials: true,
+};
 
 /** The status transitions attempted, in order, read as `from -> to`. */
 function transitions(seen: SeenQuery[]): string[] {
@@ -238,6 +255,56 @@ test("B7 the run that took it does not claim the write side at dispatch time", a
     !seen.some((q) => /SET writer_run_id = \$2/.test(q.sql)),
     "a measurement of dispatch batches is not a measurement of concurrent writes",
   );
+});
+
+test("B11 a dispatched task carries the lease credential Brain renews", async () => {
+  const callbackUrl = "http://api.test/v1/internal/tasks/ktsk_1";
+  const seen = stubDb(
+    new Date().toISOString(),
+    WORKSPACE_BOUND,
+    {},
+    { callback_url: callbackUrl },
+  );
+  let request: Record<string, unknown> = {};
+  taskPublisher.publish = async (payload) => {
+    request = JSON.parse(payload) as Record<string, unknown>;
+  };
+
+  assert.equal((await dispatchTask("ktsk_1")).ok, true);
+
+  const token = String(request.backend_internal_token ?? "");
+  assert.match(token, /^[a-f0-9]{64}$/);
+  assert.deepEqual(request.run_lease, {
+    url: `${callbackUrl}/lease`,
+    token,
+  });
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  assert.ok(
+    seen.some((query) => query.params.includes(tokenHash)),
+    "the database must hold only the token hash used by internalTaskAuth",
+  );
+  assert.ok(
+    !seen.some((query) => query.params.includes(token)),
+    "the bearer token must exist only in the request sent to Brain",
+  );
+});
+
+test("B12 kubernetes dispatch accepts a trusted LLM key without a platform key", async () => {
+  stubDb(
+    new Date().toISOString(),
+    WORKSPACE_BOUND,
+    {},
+    {},
+    { llm_api_key: "vk-user-1", _server_managed_credentials: true },
+  );
+  let request: Record<string, unknown> = {};
+  taskPublisher.publish = async (payload) => {
+    request = JSON.parse(payload) as Record<string, unknown>;
+  };
+
+  assert.equal((await dispatchTask("ktsk_1")).ok, true);
+  assert.equal(request.platform_key, "");
+  assert.equal(request.llm_api_key, "vk-user-1");
 });
 
 test("B8 a publish the server refused fails the row; one that only went quiet does not", async () => {

@@ -198,6 +198,8 @@ export async function expandDag(opts: ExpandOpts, transactionClient?: PoolClient
       executor: "brain",
       mode: node.mode,
       model: node.model ?? null,
+      // Node overrides DAG; neither set means the workspace is published as usual.
+      workspace_throwaway: node.workspace_throwaway ?? dag.workspace_throwaway ?? false,
       tools_allowlist: inherited.tools_allowlist,
       skills: inherited.skills,
       rules_text: inherited.rules_text,
@@ -236,6 +238,7 @@ export async function createSingleTask(opts: {
   prompt?: string;
   mode?: "llm" | "script";
   sandbox_spec?: unknown;
+  workspace_throwaway?: boolean;
 }): Promise<{ task_id: string }> {
   const tid = newTaskId();
   await insertTask({
@@ -249,6 +252,7 @@ export async function createSingleTask(opts: {
     depends_on: [],
     executor: "brain",
     mode: opts.mode ?? "llm",
+    workspace_throwaway: opts.workspace_throwaway ?? false,
     sandbox_spec: opts.sandbox_spec,
     callback_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}`,
     backend_mcp_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}/backend-mcp`,

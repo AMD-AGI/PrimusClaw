@@ -86,83 +86,28 @@ export const RUN_BUDGET_OFF = 0;
  * then watches it for hours -- arrive as chat turns too, and they are the runs
  * a budget actually decides the fate of.
  *
- * The chat scope defaults to 48 hours; `dag_node` keeps the day it already
- * had, because the measurement below is about chat turns and nothing here
- * learned anything new about graph nodes -- and raising `dag_node` buys
- * nothing anyway, since the 24h it already has sits above
- * `BRAIN_TASK_TIMEOUT_SEC`, which closes a graph node first (see below), so
- * moving it would have been noise dressed as symmetry. The chat number is not
- * in that position and the whole change depends on its not being: a chat row
- * carries a lease and `reapStaleTasks` skips it by default, so nothing caps a
- * live chat turn at the global timeout and all 48 hours are reachable.
+ * The chat scope defaults to 48 hours. A chat row carries a lease and
+ * `reapStaleTasks` skips it by default, so nothing caps a live chat turn at the
+ * global timeout and all 48 hours are reachable.
  *
- * What was wrong was two hours, not the existence of a ceiling: once liveness moved onto the lease, what a
- * budget still decides is policy rather than safety, and a two-hour policy
- * killed one of those inference-optimization turns outright with the whole run
- * lost.
+ * `dag_node` defaults to 72 hours so multi-day jobs are expressible without
+ * disabling the safety ceiling. Both defaults are deployment policy and can be
+ * set to zero when an operator deliberately wants no deadline.
  *
- * The number comes from measurement rather than instinct, because instinct got
- * it wrong twice. Over 30 days of this fleet, 287 chat turns ran to completion
- * with p50 = 7.9h, p90 = 21.5h, p99 = 24.0h and a maximum of 25.0h; three
- * quarters of them ran longer than three hours. A day -- the first answer here
- * -- sits *inside* that distribution: it would have killed the top percentile
- * after twenty-four hours of GPU time already spent, which is the most
- * expensive moment there is to kill anything. 48h clears the observed maximum
- * by roughly a factor of two, and the margin is deliberate: 43% of turns are
- * ended by a user interrupt, and that path reports no elapsed time, so the
- * measured distribution describes only the half that finished on its own.
+ * Liveness is independent of these numbers. Current chat, standalone task, and
+ * DAG dispatches all issue a short renewable lease. A healthy long run keeps
+ * renewing it; a dead worker is closed by the lost-lease reaper. A row that
+ * never receives its first renewal still reaches `BRAIN_TASK_TIMEOUT_SEC`, even
+ * when its execution deadline is much later, because an unclaimed run has not
+ * started spending that budget.
  *
- * Turning the ceiling off entirely was considered and rejected, because a
- * deadline is also what buys a run a graceful ending: see the note below on
- * `armDeadline`. Zero remains available as {@link RUN_BUDGET_OFF} for a
- * deployment that means it.
- *
- * They stay two settings because the two scopes are tuned against different
- * things, and each is asymmetric in its own way. Both are worth knowing before
- * configuring either.
- *
- * `RUN_BUDGET_DAG_NODE_SEC` only works downwards. A graph node is dispatched by
- * a path that issues no `run_lease`, so `startLeaseHeartbeat` returns without
- * arming and `lease_expires_at` stays NULL for the row's whole life. That makes
- * `reapStaleTasks`' never-claimed arm -- `lease_expires_at IS NULL AND
- * started_at < NOW() - BRAIN_TASK_TIMEOUT_SEC` -- reachable and, above that
- * timeout, decisive: raising this setting for a ten-hour training node buys
- * nothing, because the node is closed as `brain_timeout` at six hours first.
- * The setting to raise is `BRAIN_TASK_TIMEOUT_SEC`.
- *
- * Lowering it does work, and the reason is worth stating because it is the
- * opposite of the chat case: a DAG row's `origin` is not `chat`, so it clears
- * `reapStaleTasks`' `($N OR origin IS DISTINCT FROM 'chat')` gate whatever
- * `RUN_ROWS_SWEEPABLE` says, and the budget arm matches on its own. A 30-minute
- * DAG budget closes the node at 30 minutes as `run_budget_exhausted`. Below
- * `BRAIN_TASK_TIMEOUT_SEC` this is a working ceiling; above it, dead letter.
- * `tasks/dispatcher.ts` puts `deadline_at` on the request too, so a DAG budget under
- * the global timeout also gets the in-process abort described next.
- *
- * The CHAT budget's main effect is the in-process one, and it reaches every
- * deployment rather than only those that opted into a sweeper flag.
- * `run-claim.ts` carries a doorbell row's `deadline_at` onto the ExecuteRequest;
- * Brain's `armDeadline` reads it and arms a timer that, on expiry, aborts with
- * `DEADLINE_EXCEEDED_ABORT_REASON` -- which flushes the transcript and reports
- * `run_budget_exhausted` with the turn count. No flag gates it. Set the budget
- * to zero and `armDeadline` returns on its first line: a runaway turn then ends
- * by being requeued from outside, with nothing said about why. That asymmetry
- * is why the default is a large number rather than none.
- *
- * `reapStaleTasks`' budget arm is NOT that effect, which is worth stating
- * because it is the easy assumption: that arm is behind `RUN_ROWS_SWEEPABLE`,
- * off by default, so most deployments never reach it either way. And the fat
- * chat path never puts `deadline_at` on the request at all, so its
- * `armDeadline` is never armed -- the budget's reach over the two chat paths
- * has always been uneven, and only the doorbell one is governed by it.
- *
- * A dead worker is caught in 45 seconds by the lease whatever this says. What
- * the budget adds is a graceful ending for a live-but-wedged run, not the
- * detection of a dead one.
+ * `deadline_at` is also carried on the ExecuteRequest so Brain can stop a live
+ * run gracefully and report `run_budget_exhausted` before the sweeper's grace
+ * period expires.
  */
 export const RUN_BUDGET_DEFAULT_SEC: Record<RunScope, number> = {
   chat: envBudgetSec("RUN_BUDGET_CHAT_SEC", 48 * 60 * 60),
-  dag_node: envBudgetSec("RUN_BUDGET_DAG_NODE_SEC", 24 * 60 * 60),
+  dag_node: envBudgetSec("RUN_BUDGET_DAG_NODE_SEC", 72 * 60 * 60),
 };
 
 /**

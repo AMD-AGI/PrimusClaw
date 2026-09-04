@@ -59,6 +59,8 @@ export interface SandboxStatus {
   running: boolean;
   healthy: boolean;
   podIp?: string;
+  /** Whether the provider could distinguish absence from a control-plane error. */
+  state?: "running" | "terminal" | "absent" | "unknown";
 }
 
 export interface SandboxExecResult {

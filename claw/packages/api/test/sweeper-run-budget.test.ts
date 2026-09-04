@@ -260,3 +260,35 @@ test("a run reaped for never being claimed is not called a budget failure", asyn
     "a row nobody ever picked up would be reported as having burned a budget it never started",
   );
 });
+
+test("a future budget does not hide a run that never received its first lease", () => {
+  // Healthy task and DAG workers renew immediately, so a NULL lease after the
+  // legacy timeout means no worker claimed the run. The execution deadline is a
+  // separate policy clock and may be days away without making that row alive.
+  const seen = stubDb([]);
+  stubBus();
+  return reapStaleTasks().then(() => {
+    const sql = seen[0]?.sql ?? "";
+    assert.match(
+      sql,
+      /lease_expires_at IS NULL AND started_at IS NOT NULL/,
+      "the never-claimed arm must remain independent of deadline_at",
+    );
+    assert.doesNotMatch(
+      sql,
+      /deadline_at IS NULL AND lease_expires_at IS NULL/,
+      "a future execution budget must not conceal a missing worker",
+    );
+    // The budget arm is untouched: a row past its own deadline is still reaped.
+    assert.match(sql, /deadline_at IS NOT NULL AND deadline_at < NOW\(\)/);
+  });
+});
+
+test("a run with no budget still gets the legacy backstop", async () => {
+  // The case the never-claimed arm was written for: nothing holds a lease, nothing
+  // stamped a deadline, and without it the row would sit at `running` forever.
+  const seen = stubDb([{ task_id: "t-old", session_id: "s-3", dag_root_task_id: null, deadline_at: null }]);
+  stubBus();
+  assert.equal(await reapStaleTasks(), 1);
+  assert.match(seen[0].sql, /started_at < NOW\(\) - \(\$1::int/);
+});

@@ -50,6 +50,8 @@ import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
 import { probeSandboxContainer } from "../sandbox/container-probe.js";
+import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
+import type { PlatformFacts } from "@claw/protocol";
 import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/container-probe.js";
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
@@ -335,6 +337,7 @@ export interface TaskRunnerSideEffects {
   destroyHands: typeof destroyHands;
   reapPendingHands: typeof reapPendingHands;
   probeSandboxContainer: typeof probeSandboxContainer;
+  fetchPlatformFacts: typeof fetchPlatformFacts;
   restartHandsInSandbox: typeof restartHandsInSandbox;
   unregisterSandbox: typeof unregisterSandbox;
   markHandsIdle: typeof markHandsIdle;
@@ -361,6 +364,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   destroyHands,
   reapPendingHands,
   probeSandboxContainer,
+  fetchPlatformFacts,
   restartHandsInSandbox,
   unregisterSandbox,
   markHandsIdle,
@@ -974,6 +978,15 @@ class TaskRunner {
    * workload to name.
    */
   private handsIdentity: HandsProbeEntry | null = null;
+  /**
+   * What the platform said about this run's sandbox dying, read at the moment we
+   * found out and kept until the callback carries it.
+   *
+   * Read once and never overwritten with nothing: a later read of a workload
+   * whose pods have been collected returns null, and letting that replace a real
+   * reason would lose the one fact nothing else can supply.
+   */
+  private platformFacts: PlatformFacts | null = null;
   // Workload id from this run's identity, never the DAG-shared session key.
   private handsWorkloadId = "";
   private multiNodeContext: MultiNodeContext | null = null;
@@ -1221,6 +1234,39 @@ class TaskRunner {
    * behaviour and it had no repair in it at all, so a container that stayed up
    * with a dead Hands produced an unbounded run of identical failures.
    */
+  /**
+   * Ask the platform why this run's sandbox is gone, and keep the answer.
+   *
+   * Called wherever we first establish that it IS gone, which is the only window
+   * in which the answer exists: SaFE serves a pod's account of its own ending
+   * from the pod, and a reclaimed node's pods are collected within minutes. By
+   * the time a dispatcher above Claw asks, there is nothing left to read -- which
+   * is why the fact is stored on the row rather than resolved on request.
+   *
+   * Never overwrites a fact already held, and never records an absence.
+   */
+  private async capturePlatformFacts(): Promise<void> {
+    if (this.platformFacts) return;
+    const facts = await fx().fetchPlatformFacts(
+      this.handsIdentity?.workloadId,
+      this.handsIdentity?.platformKey ?? this.platformKey,
+    ).catch(() => null);
+    if (facts) this.platformFacts = facts;
+  }
+
+  /**
+   * The result as delivered, carrying whatever the platform said.
+   *
+   * Attached here rather than at each construction site so a new terminal path
+   * cannot forget it, and attached to the result rather than to the POST because
+   * `deliverAgentDone` checkpoints the result before sending: a Brain that dies
+   * between the two replays the facts instead of losing them.
+   */
+  private withPlatformFacts(result: ExecuteResult): ExecuteResult {
+    if (!this.platformFacts) return result;
+    return { ...result, platformFacts: this.platformFacts };
+  }
+
   private readonly recreateHands = async (
     allowance: HandsRecoveryAllowance = { rebuild: true, nondestructive: true },
   ): Promise<RecreateHandsResult> => {
@@ -1234,6 +1280,10 @@ class TaskRunner {
       if (!allowance.nondestructive) throw new HandsRecoveryBudgetExhausted("recovery");
       return this.recoverWithoutDestroy(probe.verdict, probe.reason);
     }
+    // The container is gone and we are about to destroy what is left of the
+    // workload. Ask the platform why first: after the destroy there is nothing
+    // to ask, and a preemption is only ever visible here.
+    await this.capturePlatformFacts();
     // A node running on a sandbox it inherited must not destroy it, whatever
     // the probe says: `use` names one sandbox and the destroy path addresses
     // the session, which every node of the DAG shares. See
@@ -1284,7 +1334,7 @@ class TaskRunner {
     // wedged; ignore failures).
     const oldHands = this.hands;
     oldHands?.close().catch(() => {});
-    // Pass multiNodeContext so the rebuilt sandbox keeps Hyperloom external-mode
+    // Pass multiNodeContext so the rebuilt sandbox keeps the dispatcher external-mode
     // env and the Infera SSH key for the cluster already provisioned above.
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
@@ -1312,6 +1362,23 @@ class TaskRunner {
     this.handsIdentity = newIdentity ?? null;
     this.handsWorkloadId = newIdentity?.workloadId ?? "";
     this.hands = newHands;
+    // The facts explained a sandbox that no longer has anything to do with how
+    // this run ends. They were read to account for an ending, and the rebuild
+    // is the proof there was no ending: the task keeps going on a live sandbox,
+    // and whatever it does next is its own. Left set, a run preempted at turn
+    // three and finished normally at turn forty delivered that preemption's
+    // message, node, and exit code on a successful completion -- the platform
+    // read is attached to every terminal path by design, and the success path
+    // is one of them -- so the row said "the cluster took this run away" about
+    // a run that returned an answer.
+    //
+    // Cleared here rather than at the top of the recovery, so that everything
+    // between the capture and a working sandbox still carries them: a destroy
+    // that succeeded and a provision that then did not is exactly the ending
+    // the facts were read for. And cleared rather than merely ignored, so a
+    // second sandbox death later in the same run captures its own account
+    // instead of finding the first one already held.
+    this.platformFacts = null;
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
@@ -2056,6 +2123,13 @@ class TaskRunner {
     const CHECKPOINT_INTERVAL_MS = 30 * 60 * 1000;
     return setInterval(() => {
       if (this.inflightCkptInProgress || this.abortCtrl.signal.aborted) return;
+      // A throwaway workspace has nothing for this to protect. The checkpoint
+      // exists so a failed terminal sync does not lose the run's artifacts, and
+      // this run publishes none -- so the only thing it would do is repeat the
+      // upload the flag was set to avoid, every half hour, for runs measured in
+      // days. Skipped rather than gated at the terminal, so nothing is written
+      // and there is correspondingly nothing for the recovery copy to find.
+      if (this.request.workspace_throwaway === true) return;
       // Capture the current hands client; recreateHands may swap `hands`
       // mid-run after a sandbox rebuild, but for this checkpoint we want
       // the live reference that exists at fire time.
@@ -2254,6 +2328,16 @@ class TaskRunner {
         { sessionId: this.sessionId, messageId: this.messageId },
         "s3.sync_skipped_no_sandbox",
       );
+    } else if (this.request.workspace_throwaway === true) {
+      // The task declared its workspace throwaway -- it has already delivered
+      // its output somewhere of its own -- so this run publishes nothing. The
+      // prune is skipped with the upload, on purpose: pruning against a tree we
+      // never uploaded would delete the last durable copy of whatever an
+      // earlier, non-throwaway run of this session left in S3.
+      logger.info(
+        { sessionId: this.sessionId, messageId: this.messageId },
+        "s3.sync_skipped_workspace_throwaway",
+      );
     } else {
       logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
       try {
@@ -2341,7 +2425,7 @@ class TaskRunner {
       this.kvCkpt,
       this.request,
       redactEgressPayload<ExecuteResult>(
-        result,
+        this.withPlatformFacts(result),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
@@ -2537,6 +2621,13 @@ class TaskRunner {
             "task.sigterm.workspace_sync_failed");
         }
       }
+      // Deliberately NOT gated on workspace_throwaway, unlike the terminal sync
+      // above. The two calls share code and share nothing else: the terminal one
+      // publishes a finished run's output, which a throwaway task has already
+      // delivered elsewhere, so it is pure duplication. This one is the only
+      // thing that lets a preempted run pick up where it stopped -- skipping it
+      // would not save a copy of anything, it would discard work in flight.
+      //
       // Fall back to S3 whenever the shared-filesystem sync did not happen.
       // This guard used to be the only one, so with WORKSPACE_PERSIST_BASE
       // unset — the default, in code and in the Helm values alike — a SIGTERM
@@ -2736,7 +2827,7 @@ class TaskRunner {
       this.kvCkpt,
       this.request,
       redactEgressPayload<ExecuteResult>(
-        {
+        this.withPlatformFacts({
           finalText,
           // Absent rather than zeroed when nothing recorded them, which is the
           // same statement the event above makes and for a sharper reason:
@@ -2756,7 +2847,7 @@ class TaskRunner {
           elapsedMs,
           abortReason: "cancelled",
           failureReason: "cancelled by user",
-        },
+        }),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
@@ -2956,13 +3047,18 @@ class TaskRunner {
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
     });
+    // Every failed run asks the platform, not only one that reached the rebuild
+    // path: a sandbox can vanish in ways that surface as an ordinary tool error,
+    // and a run that fails for its own reasons simply gets nothing back. No-op
+    // when the facts were already read at the probe.
+    await this.capturePlatformFacts();
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.
     await deliverAgentDone(
       this.kvCkpt,
       this.request,
       redactEgressPayload<ExecuteResult>(
-        {
+        this.withPlatformFacts({
           finalText: finalText,
           // The same partial progress the `exec_complete` above reports. These
           // were hard-coded to zero, and `applyAgentDone` writes them straight
@@ -2980,7 +3076,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
-        },
+        }),
         runtimeSecrets(this.request, this.platformKey),
       ),
     );

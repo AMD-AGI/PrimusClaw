@@ -165,6 +165,17 @@ record it.
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
   Agent Sandbox control-plane fork (`sandbox/`), the long-term memory plane
   (`memory/`), and the whole-stack installer.
+- Deployment-level sandbox lifetime settings: `brain.sessionTimeout` and
+  `brain.maxSessionDuration` in the Claw chart, set at install time with
+  `AGENT_SANDBOX_SESSION_TIMEOUT` / `AGENT_SANDBOX_MAX_SESSION_DURATION`.
+  Both take Go durations (`6h`, `48h`). Both are persisted to
+  `deploy/values.<namespace>.env`, so an upgrade re-renders with the value the
+  install chose. Leaving them unset changes nothing: the sandbox template's own
+  values, and then the built-in fallbacks (`15m` idle, `24h` lifetime), still
+  apply.
+- An `IdleReclaimRequested` Kubernetes Event on the Sandbox, recording the idle
+  timeout a reclaim was measured against and the last activity it saw, so an
+  operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.
   What these count changes meaning with the wire protocol, so a fleet that

@@ -83,3 +83,35 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
   }
   return "sandbox_workload_terminal";
 }
+
+/**
+ * The sandbox this call targeted does not exist any more.
+ *
+ * Distinct from a transport failure on purpose. Keepalive tolerates several
+ * consecutive errors before declaring a sandbox lost, which is right for a
+ * dropped packet and wrong for a definite answer: an absent workload does not
+ * come back, and spending five ticks to confirm it costs about five minutes
+ * during which the run reads healthy.
+ */
+export class SandboxGoneError extends Error {
+  readonly sandboxGone = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxGoneError";
+  }
+}
+
+/**
+ * The workload still exists, but the Router could not execute inside it.
+ *
+ * Keepalive must not turn this data-plane failure into evidence that the
+ * workload itself is dead. In particular, a wrong Router path can return 404
+ * for every healthy sandbox at once.
+ */
+export class SandboxExecRouteUnavailableError extends Error {
+  readonly sandboxConfirmedRunning = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxExecRouteUnavailableError";
+  }
+}
