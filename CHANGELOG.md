@@ -165,6 +165,33 @@ record it.
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
   Agent Sandbox control-plane fork (`sandbox/`), the long-term memory plane
   (`memory/`), and the whole-stack installer.
+- A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
+  `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.
+  What these count changes meaning with the wire protocol, so a fleet that
+  speaks both — during a rollout, or after a backend switch — previously summed
+  into a number that was true of neither and gave the reader no way to notice.
+
+### Fixed
+- Prompt-cache token accounting on the OpenAI path. An OpenAI-shaped
+  `prompt_tokens` already contains the cached portion, where Anthropic's
+  `input_tokens` is only the uncached remainder; the OpenAI provider passed the
+  inclusive number through as `input_tokens` while also reporting the cached
+  portion separately, so every consumer that adds the cache fields back on
+  counted those tokens twice. A cache hit ratio computed as
+  `cache_read / (input + cache_read + cache_create)` therefore asymptoted to
+  0.5 as caching improved — observed at ~0.49 on a fleet whose cache was in
+  fact working at ~96%. `input_tokens` is now normalized to the uncached
+  remainder on both paths.
+
+### Changed
+- **Affects existing dashboards and alerts.** Two changes above alter series
+  already being scraped, and both take effect the moment a Brain pod restarts:
+  the `provider` label splits every existing series in three of the cache
+  metrics, and the accounting fix steps `kind="input"` down to the uncached
+  remainder. Queries that `sum()` before dividing keep working and simply
+  become correct; anything matching an exact label set, or comparing across the
+  upgrade boundary, needs revisiting. There is no setting that restores the old
+  numbers — they were wrong.
 
 <!--
 Template for the next release. Drop the sections that do not apply.
