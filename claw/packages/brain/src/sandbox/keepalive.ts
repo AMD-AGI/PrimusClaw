@@ -62,8 +62,29 @@ interface HandsKvEntry {
    * it unconditionally, and they have since long before the epochs below
    * existed. That is what makes it usable across a rolling deployment, where the
    * epochs are not: see `measuredSinceIdleBegan`.
+   *
+   * Where the reuse window starts counting is `reuseWindowStart`, not this on
+   * its own -- see `workSeenAt` for why the two are no longer the same number.
    */
   idleSince?: number;
+  /**
+   * Epoch ms when a sweep last SAW background work running in this sandbox.
+   *
+   * `idleSince` cannot be the verdict anchor and the reuse clock at the same
+   * time. As the anchor it must never move ahead of the verdict that justified
+   * moving it, or the verdict invalidates itself on the next sweep, so
+   * refreshIdleSince may only carry it up to the measurement -- which is as much
+   * as BG_VERDICT_TTL_MS old. As the reuse clock it has to say "now", or a
+   * sandbox whose long job has just finished starts its window already most of
+   * the way through it, and one whose last measurement is older than the window
+   * is deleted by the very next sweep with no reuse time at all.
+   *
+   * So the two readings get two fields. This one is stamped `Date.now()` by the
+   * sweep that acts on a `running` verdict, and the window runs from whichever
+   * of the two is later. Absent on entries written before it existed, and on
+   * handles no sweep has ever found working.
+   */
+  workSeenAt?: number;
   /**
    * Identifies the idle period `idleSince` opened.
    *
@@ -355,6 +376,11 @@ export function markHandsIdle(
       delete info.bgCheckedAt;
       delete info.bgRunning;
       delete info.bgEpoch;
+      // Same reason, for the clock those verdicts moved: work seen during the
+      // last idle period says nothing about this one. `reuseWindowStart` would
+      // ignore it anyway -- the stamp above is later than anything from before
+      // it -- but leaving it published invites the next reader to disagree.
+      delete info.workSeenAt;
       // Conditioned on the revision just read, because a session teardown can
       // delete this entry between the read and the write. An unconditional put
       // would resurrect the handle of a deleted session, and collectTargets
@@ -682,16 +708,55 @@ function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): b
  * that comes back is newer than the stamp. One probe repairs it, so unlike an
  * unstamped epoch this is not a state a handle can be stuck in.
  *
- * `>=` rather than `>`: refreshIdleSince moves the stamp up to the timestamp of
- * the verdict that justified moving it, so equality is the steady state for a
- * handle whose sandbox is working, not an edge case. A handle with no `idleSince`
- * at all is not one any writer produces, and it is already treated as instantly
- * expired by the window below; no verdict about it is believed.
+ * Strictly after, unless the answer is `running`. Equality is ambiguous: it is
+ * either a verdict measured in the millisecond the period opened, or an old
+ * binary's re-idle landing on the same millisecond as a verdict from before the
+ * task it ran -- and nothing on the entry tells those apart. Which reading is
+ * safe therefore depends on what the verdict says. Believing an `idle` one that
+ * is really from before the task deletes a handle whose sandbox may still be
+ * working, which is the reclaim this function exists to prevent; believing a
+ * `running` one costs a ping the sandbox did not need. So `idle` has to clear
+ * the stamp strictly, and `running` is allowed to equal it -- which it commonly
+ * does, because refreshIdleSince moves the stamp up to the timestamp of the
+ * verdict that justified moving it, making equality the steady state for a
+ * working sandbox rather than an edge case.
+ *
+ * Both readings of a rejection are the same and are safe: the handle reads
+ * `unknown`, which keeps and pings it, and one probe replaces the ambiguous
+ * stamp with an unambiguous one. A handle with no `idleSince` at all is not one
+ * any writer produces, and it is already treated as instantly expired by the
+ * window below; no verdict about it is believed.
  */
-function measuredSinceIdleBegan(at: number | undefined, info: HandsKvEntry): boolean {
-  return typeof at === "number"
-    && typeof info.idleSince === "number"
-    && at >= info.idleSince;
+function measuredSinceIdleBegan(
+  at: number | undefined,
+  info: HandsKvEntry,
+  state: BackgroundWork,
+): boolean {
+  if (typeof at !== "number" || typeof info.idleSince !== "number") return false;
+  return state === "running" ? at >= info.idleSince : at > info.idleSince;
+}
+
+/**
+ * When this handle's reuse window starts counting.
+ *
+ * The later of the two stamps, because they answer different halves of the
+ * question and either one can be the current answer. `idleSince` is when the
+ * idle period began and is the only one a replica running the previous build
+ * writes, so after a task that ran on an old replica it is the fresh value and
+ * `workSeenAt` is a leftover from before. `workSeenAt` is when work was last
+ * seen running, and while a long background job is going it is the fresh one --
+ * `idleSince` sits back at the measurement that justified it, by as much as the
+ * verdict TTL.
+ *
+ * A leftover can never win. Every writer that opens an idle period stamps
+ * `idleSince` with the moment it did so, and that is later than any `workSeenAt`
+ * the period before it can have left behind.
+ */
+function reuseWindowStart(info: HandsKvEntry): number {
+  return Math.max(
+    typeof info.idleSince === "number" ? info.idleSince : 0,
+    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
+  );
 }
 
 /** This replica's own last answer, if it is fresh enough to reuse and still
@@ -708,7 +773,7 @@ function usableCachedVerdict(
   // this process's generation when the reactivation happens on another replica,
   // so an in-process answer survives an old binary's task-and-idle cycle exactly
   // as an entry-borne one does.
-  if (!measuredSinceIdleBegan(cached.at, info)) return null;
+  if (!measuredSinceIdleBegan(cached.at, info, cached.state)) return null;
   return cached;
 }
 
@@ -718,8 +783,9 @@ function usableSharedVerdict(info: HandsKvEntry): { at: number; state: Backgroun
   if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
   if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
   if (!sameIdlePeriod(info.bgEpoch, info)) return null;
-  if (!measuredSinceIdleBegan(info.bgCheckedAt, info)) return null;
-  return { at: info.bgCheckedAt, state: info.bgRunning > 0 ? "running" : "idle" };
+  const state: BackgroundWork = info.bgRunning > 0 ? "running" : "idle";
+  if (!measuredSinceIdleBegan(info.bgCheckedAt, info, state)) return null;
+  return { at: info.bgCheckedAt, state };
 }
 
 /**
@@ -998,7 +1064,13 @@ async function persistVerdict(
     // stamps the moment it happened, which is after the probe started, while
     // refreshIdleSince below only ever moves the stamp up to an already-measured
     // verdict, which is before it.
-    if (!sameIdlePeriod(epoch, info) || !measuredSinceIdleBegan(startedAt, info)) {
+    //
+    // Asked about the answer being filed, because the boundary between the two
+    // movements is only safe to read one way for an `idle` answer: that is the
+    // one that gets a working sandbox reclaimed if it is really from before the
+    // task, so it has to have started strictly after the period did.
+    const answer: BackgroundWork = running > 0 ? "running" : "idle";
+    if (!sameIdlePeriod(epoch, info) || !measuredSinceIdleBegan(startedAt, info, answer)) {
       logger.info(
         { sessionId, workloadId: info.workloadId },
         "keepalive.background_work_answer_reactivated",
@@ -1027,9 +1099,9 @@ async function persistVerdict(
  * measured from it. Left alone, a background job that outlasts the window means
  * the handle is already expired the moment the job finishes: the next sweep
  * deletes it, the next message in the session cannot reuse the pod, and whatever
- * the job wrote that has not been synced goes with it. Keeping the stamp at the
- * last moment work was seen gives the session the full window it would have had
- * if the job had never run.
+ * the job wrote that has not been synced goes with it. Moving the clock while
+ * the work is visible gives the session the full window it would have had if the
+ * job had never run.
  *
  * Conditional and best-effort, like every other write in this sweep: losing the
  * race means somebody else just wrote the entry, and their value is the newer
@@ -1065,7 +1137,12 @@ async function refreshIdleSince(
       typeof info.idleSince === "number" ? info.idleSince : 0,
       seenAt,
     );
-    const next = sc.encode(JSON.stringify({ ...info, idleSince }));
+    // And the reuse clock, which is the other half of what this write used to
+    // do with one number. `Date.now()` is right for it and wrong for the anchor:
+    // this sweep is seeing the sandbox at work now, whatever the age of the
+    // measurement telling it so, and the window it gets when the work stops has
+    // to start from now rather than from a reading that may be half an hour old.
+    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: Date.now() }));
     await deps.kv.update(key, next, revision);
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
@@ -1202,8 +1279,7 @@ async function collectTargets(
           await deps.kv.update(key, value, e.revision).catch(() => {});
         }
         if (info.keepalive === false && bgWork === "idle") {
-          const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-          const expired = Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
+          const expired = Date.now() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
           // A session this replica is actively running is not idle, whatever
           // the entry says. The `local wins` short-circuit that used to guard
           // the whole KV branch was removed so DAG siblings could each be

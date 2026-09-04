@@ -698,3 +698,101 @@ test("a working sandbox is not re-probed every tick by the stamp that protects i
   );
   assert.ok(!k.deleted.includes(KEY), "and the working pod was kept throughout");
 });
+
+test("a stale `idle` verdict is not admitted by landing on the stamp exactly", async () => {
+  // The boundary of the rule above. `idleSince` is compared against, not
+  // matched, so the case where an old binary's re-idle lands on the same
+  // millisecond as the verdict it carried through the task is the one reading
+  // where the two are indistinguishable by time -- and the reading the test
+  // above turns on is the wrong one for an `idle` answer. Same millisecond is
+  // not contrived: the stamp and the measurement are written by different
+  // replicas off clocks that agree only to within their skew.
+  //
+  // A `running` answer still gets to equal the stamp, because refreshIdleSince
+  // manufactures exactly that equality on every sweep of a working sandbox --
+  // the test after this one is what that costs if it is taken away.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const measured = k.current();
+  assert.equal(measured.bgRunning, 0, "sanity: an `idle` answer was filed");
+
+  // The old replica ran the session's next message here, left a background
+  // shell, and idled the handle again -- at the millisecond the answer from
+  // before the task happens to carry. Sixteen minutes ago, so the answer is
+  // still inside BG_VERDICT_TTL_MS and the handle is already past
+  // SANDBOX_IDLE_REUSE_MS: believing it reclaims the pod on this sweep.
+  const collision = Date.now() - 16 * 60_000;
+  k.replace(afterOldReplicaRanATask({ ...measured, bgCheckedAt: collision }, collision));
+
+  const carried = k.current();
+  assert.equal(
+    carried.bgCheckedAt, carried.idleSince,
+    "premise: the re-idle stamp and the carried measurement are the same instant",
+  );
+  assert.equal(carried.bgEpoch, carried.idleEpoch, "premise: and the epochs still agree");
+
+  resetBackgroundWorkStateForTest();
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "an `idle` answer that only just reaches the stamp cannot be told from one "
+      + "carried across a task that re-idled on the same millisecond; reading it "
+      + "as current reclaims the pod out from under a background shell",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the sweep asked again instead, which is what the fresh answer proves",
+  );
+});
+
+test("a sandbox that has just stopped working gets the whole reuse window", async () => {
+  // What the anchor may not be allowed to cost. A verdict is believed for
+  // BG_VERDICT_TTL_MS, twice the reuse window, so the `running` one a sweep acts
+  // on can be far older than the window -- and anchoring means the stamp it
+  // moves cannot be moved past it. Measuring the reuse window from that same
+  // stamp therefore hands a sandbox whose job has just finished a window that
+  // expired before it started: the fresh `idle` answer arrives and the very next
+  // sweep deletes the handle, which is the case this whole branch exists to
+  // prevent, arriving through the mechanism added to prevent it.
+  //
+  // So the window is measured from when work was last SEEN, which is now,
+  // while the anchor stays at the measurement that said so.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = k.current();
+
+  // Another replica measured the job running sixteen minutes ago and nothing has
+  // swept the handle since: inside the verdict TTL, so it is still believed, and
+  // past the reuse window, so what the window counts from decides the pod.
+  const measuredAt = Date.now() - 16 * 60_000;
+  k.replace({
+    ...stamped, bgRunning: 1, bgCheckedAt: measuredAt, idleSince: measuredAt,
+  });
+  resetBackgroundWorkStateForTest();
+
+  // This replica reads that answer -- keeping the handle and moving the clocks --
+  // and its own probe comes back `idle`, because the job has just finished.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const answered = k.current();
+  assert.equal(answered.bgRunning, 0, "sanity: the fresh probe answered `idle`");
+  assert.equal(
+    answered.idleSince, measuredAt,
+    "premise: the anchor stayed at the measurement, as the test above requires",
+  );
+
+  // The sweep that acts on that answer is the first one to treat the handle as
+  // spare, and the window it gets has to start here.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the sandbox was seen working seconds ago and its window ran from a "
+      + "sixteen-minute-old measurement instead, so it was reclaimed with no "
+      + "reuse time at all -- the next message in the session loses the pod",
+  );
+});
