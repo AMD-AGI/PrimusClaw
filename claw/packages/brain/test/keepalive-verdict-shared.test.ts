@@ -965,3 +965,233 @@ test("a verdict is not carried into a second idle period that opened on the same
       + "period's answer",
   );
 });
+
+// --- and which of them, when the two clocks disagree ---
+
+test("a `running` on the handle is not outranked by a local `idle` with a later stamp", async () => {
+  // The choice between the two answers was made by comparing their timestamps,
+  // and the timestamps come from two different machines. `bgCheckedAt` is
+  // stamped by whichever replica probed the handle; the in-process `at` is
+  // stamped by this one. Ordinary skew is enough to make the older measurement
+  // carry the larger number -- which is the same thing
+  // `measuredUnderThisIdlePeriod` refuses to do with `idleSince`, reintroduced
+  // one comparison further along.
+  //
+  // The direction matters. A stale `running` costs one ping. A stale `idle`
+  // deletes the handle, and here it deletes it while another replica's
+  // measurement says a shell is running in the pod.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const measured = k.current();
+  assert.equal(measured.bgRunning, 0, "sanity: this replica measured and filed `idle`");
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: and kept its own copy of that answer to prefer",
+  );
+
+  // Another replica probed after we did and found work running. Same idle
+  // period on both sides -- same epoch, same witnesses -- so the answer is
+  // usable; only its clock is behind ours, by a second.
+  k.replace({
+    ...measured,
+    bgRunning: 1,
+    // Derived from the answer this replica just filed rather than from the
+    // clock, so the skew under test is exactly one second no matter how long
+    // the sweep above took to run.
+    bgCheckedAt: (measured.bgCheckedAt as number) - 1_000,
+  });
+
+  await sweep({
+    kv: k.kv,
+    // Nothing new is measured on this sweep, so the decision is made entirely
+    // from the two answers that already exist.
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "a live measurement saying a shell is running cannot be overruled by an "
+      + "`idle` that merely carries a larger number off a different clock; "
+      + "believing the clock reclaims the pod out from under the shell",
+  );
+});
+
+// --- an inference has to survive long enough to be read ---
+
+test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
+  // The give-up answer is kept in this process only, which is right -- it is a
+  // statement about one replica's reach, not a measurement to publish. But that
+  // makes the replica that inferred it the only one that can read it, so it has
+  // to survive until THAT replica walks the handle again: the same thirty-six
+  // minute gap the streak above is sized for, not the five minutes a measured
+  // answer is reused for.
+  //
+  // Under the short lifetime the inference expired unread every time. The
+  // handle was probed again, the probes failed again, the streak gave up again
+  // -- six, seven, eight failures deep -- and the pod was never released, which
+  // is the one thing the give-up path exists to do.
+  const k = fakeKv();
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+
+  for (let visit = 0; visit < 10 && !k.deleted.includes(KEY); visit++) {
+    await sweep(deps);
+    // One whole revisit interval before this replica sees the handle again --
+    // the cadence the give-up answer actually has to live through, rather than
+    // a second sweep arriving while it is still warm.
+    ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
+  }
+
+  assert.ok(
+    k.deleted.includes(KEY),
+    "the give-up settled to `idle` and then expired before the sweep that would "
+      + "have acted on it; a Hands that has stopped answering holds its pod to "
+      + "the CR's absolute deadline and the tolerance means nothing",
+  );
+});
+
+test("a give-up is revised by the Hands that comes back before the window ends", async () => {
+  // What the longer life may not cost. The lifetime of a cached answer was also
+  // how long this replica stopped asking -- `needsProbe` reads the same rule --
+  // so an inference believed for hours would be an inference nothing could
+  // revise: a handle inside its reuse window is not deleted and opens no new
+  // idle period, so no probe means no correction. A Hands that blipped for six
+  // probes and came straight back would then have its pod reclaimed at the end
+  // of the window with a background shell still running in it, which is the
+  // reclaim this whole file exists to prevent.
+  const k = fakeKv();
+  stubPingableProvider();
+  // Freshly idled, so the give-up does not immediately delete the handle and
+  // there is a window left for the recovery to matter in.
+  k.replace({ ...ENTRY, idleSince: Date.now() });
+
+  let reachable = false;
+  let probes = 0;
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      probes += 1;
+      if (!reachable) throw new Error("hands unreachable");
+      return 1;
+    },
+  };
+
+  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
+    await sweep(deps);
+  }
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: the streak gave up and inferred `idle` while the window is still open",
+  );
+  const gaveUpAfter = probes;
+
+  // Hands comes back, with a background shell running in the pod, and the
+  // inference is older than the interval a probe is skipped for.
+  reachable = true;
+  ageBackgroundWorkCacheForTest(6 * 60_000);
+  await sweep(deps);
+
+  assert.ok(
+    probes > gaveUpAfter,
+    "believing an inference for longer is not a reason to stop asking; a "
+      + "replica that never asks again can never find out it was wrong",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the measurement that came back replaces the guess, so the shell keeps "
+      + "its pod",
+  );
+  assert.ok(!k.deleted.includes(KEY), "sanity: nothing was reclaimed here");
+});
+
+test("a give-up inference is not reaped before the visit it exists for", async () => {
+  // The reap is the other place a lifetime is decided, and it had one floor for
+  // every entry. Left at the measured floor it discards the inference at thirty
+  // minutes -- inside the gap the longer life was given for -- so the give-up
+  // expires unread after all and the loop it was meant to break resumes one
+  // level down.
+  const k = fakeKv();
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+
+  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
+    await sweep(deps);
+  }
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: there is an inference to reap",
+  );
+
+  // Walked elsewhere, so nothing can re-probe and quietly rewrite what the reap
+  // removes -- the assertion is about the reap and only about the reap.
+  k.setVisible(false);
+  ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
+  await sweep(deps);
+
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "the answer this replica is still meant to be reading cannot be reaped out "
+      + "from under it by a floor sized for a different kind of answer",
+  );
+});
+
+test("a give-up does not delete the handle in the same sweep it re-asks", async () => {
+  // The give-up answer decides the one irreversible thing in this file, and the
+  // sweep decides it during the walk -- before the probes it dispatches at the
+  // end of the same tick. So an inference old enough that this very tick has
+  // judged it worth re-asking was still good enough to delete on: the handle
+  // was gone by the time the answer came back, and `persistVerdict` dropped a
+  // measurement of live background work onto a key that no longer existed.
+  //
+  // A guess this replica is in the act of doubting may not reclaim a pod. It
+  // has to be refused twice, one visit apart, with the handle kept and pinged
+  // in between -- which costs a ping and buys the answer that makes the delete
+  // correct.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  let reachable = false;
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      if (!reachable) throw new Error("hands unreachable");
+      return 3;
+    },
+  };
+
+  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
+    await sweep(deps);
+  }
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: the streak gave up and inferred `idle` for a handle already past "
+      + "its reuse window",
+  );
+  assert.ok(!k.deleted.includes(KEY), "sanity: the first give-up does not reclaim on its own");
+
+  // Hands is back, with three background shells in it, and the inference is old
+  // enough that this sweep re-arms a probe for it.
+  reachable = true;
+  ageBackgroundWorkCacheForTest(6 * 60_000);
+  await sweep(deps);
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the sweep that re-asks cannot also act on the answer it is replacing; "
+      + "deleting first means the measurement lands on a deleted key and three "
+      + "live shells go down with the pod",
+  );
+  assert.equal(
+    k.current().bgRunning, 3,
+    "and the probe that tick dispatched is filed against a handle that is still "
+      + "there to carry it",
+  );
+});

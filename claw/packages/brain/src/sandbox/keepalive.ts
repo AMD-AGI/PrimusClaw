@@ -557,6 +557,45 @@ const BG_VERDICT_TTL_MS = 30 * 60_000;
 const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
 
 /**
+ * How long the give-up answer is believed.
+ *
+ * The give-up path infers `idle` after BG_UNKNOWN_TOLERANCE consecutive failed
+ * probes, and deliberately keeps that inference in this process only -- it is a
+ * statement about one replica's reach, not a measurement to publish to the
+ * others. Which leaves it with only the in-process TTL to live under, and
+ * BG_PROBE_TTL_MS is five minutes: shorter than the gap until the same replica
+ * walks this handle again.
+ *
+ * That gap is the one BG_UNKNOWN_STREAK_TTL_MS is sized for and not the one
+ * BG_PROBE_TTL_MS is. A measured answer only has to survive until *some*
+ * replica returns, because it is written to the handle where any of them can
+ * read it. An inferred one is readable by the replica that inferred it and by
+ * no other, so it has to survive until THAT replica comes back to the handle --
+ * the probe rotation multiplied by the replica count, about thirty-six minutes
+ * here, and longer on a bigger fleet or a larger bucket. At five minutes it did
+ * not: the inference expired before the visit that would have acted on it, the
+ * handle was probed again, the probes failed again, and the streak gave up
+ * again -- six, seven, eight failures deep, on a Hands that has stopped
+ * answering, which is precisely the sandbox the give-up path exists to release.
+ *
+ * So it is sized against the same interval the streak is, and shares the
+ * constant so the two cannot drift apart: they are two halves of one mechanism,
+ * and a give-up that outlives its own streak or dies before it is a mechanism
+ * with a hole in it.
+ *
+ * The length is how long the answer is BELIEVED, and deliberately not how long
+ * this replica stops asking -- see needsProbe, which keeps probing on the
+ * ordinary BG_PROBE_TTL_MS. That is what keeps the cost bounded: a Hands that
+ * comes back is measured within one probe and the inference is replaced, while
+ * one that stays away is asked once more and, when that fails too, read as
+ * `idle` and its handle reclaimed on the next sweep past the reuse window --
+ * see `retested` on the cache entry for why the reclaim waits for that second
+ * refusal. An inference is also discarded, exactly as a measured answer is, by
+ * anything that opens a new idle period on the handle.
+ */
+const BG_GIVEUP_TTL_MS = BG_UNKNOWN_STREAK_TTL_MS;
+
+/**
  * How many probes may be in flight across the whole sweep.
  *
  * Per-session de-duplication is not a bound: on a cold start every idle handle
@@ -612,8 +651,35 @@ let pingCursor = 0;
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<
   string,
-  { at: number; state: BackgroundWork; epoch?: number; idleSince?: number; idleRev?: number }
+  {
+    at: number; state: BackgroundWork; epoch?: number; idleSince?: number; idleRev?: number;
+    /** Not measured: the give-up path inferred it. See BG_GIVEUP_TTL_MS. */
+    inferred?: boolean;
+    /**
+     * A probe attempted after this inference was first formed has also failed.
+     *
+     * Which is what lets an aged inference delete a handle. Without it the
+     * sweep decides the one irreversible thing in this file from a guess it
+     * has, in the same tick, just judged stale enough to re-ask: the delete
+     * happens during the walk and the probe goes out after it, so a Hands that
+     * came back is measured seconds too late and the answer lands on a key that
+     * is gone. Waiting for the re-ask costs one visit, during which the handle
+     * is kept and pinged, which is the direction a wrong guess is free in.
+     *
+     * And it is what stops that wait from becoming permanent: the failed
+     * re-ask rewrites the inference, so without a mark saying the question has
+     * already been put again, every visit would find a stale answer, re-ask,
+     * and defer -- the give-up path suspending a handle forever instead of
+     * releasing it.
+     */
+    retested?: boolean;
+  }
 >();
+
+/** How long this particular cached answer may be reused. */
+function cachedVerdictTtlMs(cached: { inferred?: boolean }): number {
+  return cached.inferred ? BG_GIVEUP_TTL_MS : BG_PROBE_TTL_MS;
+}
 const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
 /**
@@ -890,10 +956,10 @@ function reuseWindowStart(info: HandsKvEntry): number {
 function usableCachedVerdict(
   identity: string,
   info: HandsKvEntry,
-): { at: number; state: BackgroundWork } | null {
+): { at: number; state: BackgroundWork; inferred?: boolean; retested?: boolean } | null {
   const cached = bgProbeCache.get(identity);
   if (!cached) return null;
-  if (Date.now() - cached.at >= BG_PROBE_TTL_MS) return null;
+  if (Date.now() - cached.at >= cachedVerdictTtlMs(cached)) return null;
   if (!sameIdlePeriod(cached.epoch, info)) return null;
   // The same rule as the shared copy, and for the same reason: nothing bumps
   // this process's generation when the reactivation happens on another replica,
@@ -945,18 +1011,59 @@ function peekBackgroundWork(
   info: HandsKvEntry,
 ): { state: BackgroundWork; source: VerdictSource; at?: number } {
   if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
-  const cached = usableCachedVerdict(identity, info);
+  // An inference this tick has judged stale enough to re-ask is not an answer
+  // to act on until the re-ask reports: the delete happens here, during the
+  // walk, and the probe goes out after it. While that is outstanding the handle
+  // reads `unknown`, which keeps and pings it. A fresh inference re-arms
+  // nothing and stands on its own, and one a later probe has already refused
+  // (`retested`) stands however old it is -- otherwise the re-ask would renew
+  // its own doubt every visit and the give-up could never reclaim anything.
+  const local = usableCachedVerdict(identity, info);
+  const beingReasked = !!local?.inferred && !local.retested
+    && Date.now() - local.at >= BG_PROBE_TTL_MS;
+  const cached = beingReasked ? null : local;
   const shared = usableSharedVerdict(info);
-  // Whichever measurement is actually the newer one. The in-process copy is the
-  // newer one most of the time -- it is written by the probe that also wrote the
-  // handle -- but not always: another replica probes the same handle on its own
-  // rotation, so a local answer from four minutes ago is still inside its TTL
-  // while a `running` recorded elsewhere two minutes ago sits unread on the
-  // entry. Preferring the local one there reclaims a handle that a more recent
-  // measurement says is busy, which is the failure the sharing exists to stop.
-  if (cached && (!shared || cached.at >= shared.at)) {
-    return { state: cached.state, source: "mem", at: cached.at };
+  // Which of the two answers to act on, when both are about this idle period
+  // and they disagree.
+  //
+  // The obvious rule is the newer one, and it cannot be asked here. The two
+  // stamps are two replicas' readings of two different clocks -- the same
+  // reason `measuredUnderThisIdlePeriod` refuses to compare `bgCheckedAt`
+  // against `idleSince` -- so "larger number" is not "later measurement", and
+  // ordinary skew of a second is enough to invert it. A pure ordering test
+  // here is that mistake in a third currency: another replica measures
+  // `running` after this one measured `idle`, its clock reads slightly behind,
+  // and the local `idle` wins the comparison and deletes the handle with a
+  // background shell in it.
+  //
+  // So the choice is made by what the two answers are, not by when they say
+  // they were taken, because the two ways of being wrong are not the same
+  // size. Acting on a stale `running` costs one ping of a sandbox that did not
+  // need it. Acting on a stale `idle` reclaims a pod that is still working --
+  // the failure this whole branch exists to prevent. `running` therefore wins
+  // outright, from whichever copy holds it, and an `idle` decides nothing while
+  // any live measurement disagrees with it.
+  //
+  // That is also the rule that makes the sharing do its job, and it subsumes
+  // the ordering the sharing was added for: a `running` recorded on the entry
+  // by another replica is read here even though this replica has its own older
+  // `idle`, with no clock comparison to get wrong.
+  //
+  // The stamps are still read when both answers agree on `running`, but only to
+  // pick the later one, and only because `at` is the anchor refreshIdleSince
+  // moves. Skew cannot do harm there: that write takes the max of the anchor it
+  // finds and the one it is given, so a reading off a slow clock leaves the
+  // stamp where it was, and the reuse clock beside it is stamped locally.
+  if (cached?.state === "running" && shared?.state === "running") {
+    return cached.at >= shared.at
+      ? { state: "running", source: "mem", at: cached.at }
+      : { state: "running", source: "handle", at: shared.at };
   }
+  if (cached?.state === "running") return { state: "running", source: "mem", at: cached.at };
+  if (shared?.state === "running") return { state: "running", source: "handle", at: shared.at };
+  // Neither says `running`, so any answer left is `idle` and they agree. Which
+  // one is reported is a stats question only.
+  if (cached) return { state: cached.state, source: "mem", at: cached.at };
   if (shared) return { state: shared.state, source: "handle", at: shared.at };
   return { state: "unknown", source: "none" };
 }
@@ -989,7 +1096,24 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
   // The same rule peekBackgroundWork reads by, so an answer the peek will not
   // use is not an answer that suppresses asking again -- a handle whose idle
   // period has turned over needs a fresh probe, not the previous period's.
-  if (usableCachedVerdict(identity, info)) return false;
+  const cached = usableCachedVerdict(identity, info);
+  // But only for as long as a probe would be redundant, which is not the same
+  // as for as long as the answer is worth reading. They were one number while
+  // every cached answer was a measurement; the give-up inference is not one,
+  // and it lives eight times longer -- so reusing that lifetime here would make
+  // it the one answer this replica can never revise. Nothing else revises it
+  // either: a handle sitting inside its reuse window is not deleted and opens no
+  // new idle period, so no probe means no correction, and a Hands that blipped
+  // for six probes and came straight back would have its pod reclaimed at the
+  // end of the window with a background shell still in it.
+  //
+  // So belief and silence are decoupled: the inference is read for
+  // BG_GIVEUP_TTL_MS and stops suppressing probes after the ordinary
+  // BG_PROBE_TTL_MS, which is what makes it a floor for the sweeps that have to
+  // act before an answer arrives rather than a decision not to ask again. A
+  // measured answer is unaffected -- for it the two lifetimes are the same
+  // number, as they were.
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
   return !bgProbeInFlight.has(identity);
 }
 
@@ -1135,6 +1259,16 @@ function dispatchProbes(
             epoch,
             idleSince: idleSinceAtStart,
             idleRev: idleRevAtStart,
+            // Inferred, not measured, which is what buys it the longer life
+            // above: nothing shares it, so nothing else can carry it to the
+            // sweep that needs to read it.
+            inferred: true,
+            // And whether this failure is the one that re-tested an inference
+            // already on the books. The first give-up is a guess about a Hands
+            // that has gone quiet; this is that guess asked again, after the
+            // handle was kept and pinged for a visit, and refused again. Only
+            // then is it allowed to reclaim anything.
+            retested: bgProbeCache.get(identity)?.inferred === true,
           });
           logger.warn(
             { sessionId, workloadId: info.workloadId, streak },
@@ -1663,9 +1797,16 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // Age is the property that actually says an answer is no longer worth
   // believing, and it bounds the maps on its own: an identity nothing probes
   // again stops being refreshed and falls out one TTL later.
-  const verdictFloor = Date.now() - BG_VERDICT_TTL_MS;
+  //
+  // The floor is per entry, because the entries do not all have the same
+  // lifetime. Reaping a give-up inference at BG_VERDICT_TTL_MS would expire it
+  // before the replica that made it returns to the handle, which is the whole
+  // failure BG_GIVEUP_TTL_MS exists to fix -- the reap would simply reintroduce
+  // it behind the TTL check.
+  const now = Date.now();
   for (const [identity, cached] of [...bgProbeCache.entries()]) {
-    if (cached.at < verdictFloor) forgetBackgroundWork(identity);
+    const floor = now - Math.max(BG_VERDICT_TTL_MS, cachedVerdictTtlMs(cached));
+    if (cached.at < floor) forgetBackgroundWork(identity);
   }
   // Streaks the same way, and for the same reason. A failed probe deliberately
   // caches nothing -- only a measured answer is worth reusing -- so reaping a
