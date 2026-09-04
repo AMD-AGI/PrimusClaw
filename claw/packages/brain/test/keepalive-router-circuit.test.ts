@@ -56,3 +56,38 @@ test("simultaneous gone responses open the circuit instead of stopping every san
     restore();
   }
 });
+
+test("a single gone response reaches the verdict and jumps the counter", async () => {
+  // The circuit only suppresses eviction when more than one target reports gone
+  // in the same sweep; with one, the failure has to reach the verdict and act.
+  //
+  // This exists because the sweep and the verdict now live in different places
+  // -- the ping loop collects, handleKeepaliveFailures decides -- so "collected
+  // but never adjudicated" is a real way to end up with a sweep that notices
+  // everything and does nothing. Deleting the handleKeepaliveFailures call
+  // leaves every other keepalive test green.
+  //
+  // Asserted on the verdict rather than on destroyHands: eviction needs the real
+  // KV bucket, so a unit test cannot watch it -- which is also why the circuit
+  // test above would pass even if nothing were ever adjudicated.
+  const { lastVerdictForTest } = await import("../src/sandbox/keepalive.js") as any;
+  let execs = 0;
+  const provider = {
+    kind: "safe-workload",
+    async exec() { execs++; throw new SandboxGoneError("workload absent (HTTP 404)"); },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  registerSandbox("s-solo", { provider: "safe-workload", workloadId: "wl-solo", platformKey: "pk" });
+  try {
+    await runKeepaliveTickForTest({ kv: emptyKv() });
+    assert.ok(execs > 0, `precondition: the sandbox was pinged (execs=${execs})`);
+    const v = lastVerdictForTest("s-solo");
+    assert.ok(v, "the failure must reach the verdict at all");
+    assert.equal(v.gone, true, "a lone gone is not suppressed");
+    assert.equal(v.fails, 1, "and jumps straight to the limit");
+  } finally {
+    unregisterSandbox("s-solo");
+    restore();
+  }
+});
