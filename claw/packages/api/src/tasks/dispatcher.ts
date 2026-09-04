@@ -18,6 +18,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
 import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
+import {
+  MissingPlatformKeyError,
+  readTrustedSessionCredentials,
+} from "../auth/session-credentials.js";
+import { CLAW_DEPLOY_MODE } from "../config.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
@@ -133,7 +138,7 @@ async function publishExecuteRequest(payload: string): Promise<void> {
   }
 }
 
-async function loadSessionPlatformKey(sessionId: string): Promise<{
+async function loadSessionCredentials(sessionId: string): Promise<{
   user_id: string;
   platform_key: string;
   workspace_id: string;
@@ -144,11 +149,17 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   // deployments. We SELECT user_id + config and read platform_key /
   // workspace_id from the config JSONB.
   //
-  // Dev harness fallback: when the session row has no platform_key, fall
-  // back to the cluster-wide `SAFE_PLATFORM_KEY` env so DAG-driven
-  // sandbox.create can talk to SaFE without a real SaFE-issued user
-  // session. Same fallback applies to workspace_id via
-  // `SANDBOX_NAMESPACE`.
+  // There is deliberately no fallback to the cluster-wide `SAFE_PLATFORM_KEY`.
+  // There used to be, and it applied silently: every DAG-driven workload ran
+  // under a shared identity, because the only entry point that recorded the
+  // caller's key was the workbench one. SaFE takes the workload's `user.id`
+  // label from the bearer's subject and grants update/delete/resume to the
+  // owner, so the submitter of a run could not stop or delete it -- and nothing
+  // anywhere said why.
+  //
+  // Failing here in SaFE mode is the point. Every entry point stamps the
+  // caller's credentials before queueing; Kubernetes mode legitimately has no
+  // platform key and uses the stamped LLM key instead.
   const r = await db.query(
     `SELECT user_id, config FROM claw_sessions WHERE session_id = $1`,
     [sessionId],
@@ -156,17 +167,21 @@ async function loadSessionPlatformKey(sessionId: string): Promise<{
   if (r.rowCount === 0) throw new Error(`session ${sessionId} not found`);
   const row = r.rows[0] as { user_id: string; config: Record<string, unknown> | null };
   const cfg = (row.config ?? {}) as Record<string, unknown>;
-  const trustedCredentials = cfg._server_managed_credentials === true;
-  const sessionPlatformKey = trustedCredentials && typeof cfg.platform_key === "string" ? cfg.platform_key : "";
+  const credentials = readTrustedSessionCredentials(cfg);
   const sessionWorkspaceId = typeof cfg.workspace_id === "string" ? cfg.workspace_id : "";
-  const sessionLlmApiKey = trustedCredentials && typeof cfg.llm_api_key === "string"
-    ? cfg.llm_api_key
-    : (trustedCredentials && typeof cfg.virtual_key === "string" ? cfg.virtual_key : "");
+  // Only SaFE creates a workload with this credential. Kubernetes/BYOK uses the
+  // caller's LLM key and the agent-sandbox provider, so requiring platformKey
+  // here made every task-system dispatch fail on the shipped default mode.
+  if (CLAW_DEPLOY_MODE !== "kubernetes" && !credentials.platformKey) {
+    throw new MissingPlatformKeyError(`session ${sessionId}`);
+  }
   return {
     user_id: row.user_id ?? "",
-    platform_key: sessionPlatformKey || process.env.SAFE_PLATFORM_KEY || "",
+    platform_key: credentials.platformKey,
+    // The namespace is not a credential: it names where the work runs, not who
+    // it runs as, and a deployment-wide default for it grants nothing.
     workspace_id: sessionWorkspaceId || process.env.SANDBOX_NAMESPACE || "",
-    llm_api_key: sessionLlmApiKey,
+    llm_api_key: credentials.llmApiKey,
   };
 }
 
@@ -333,7 +348,7 @@ async function bindRunFiles(
 function buildExecuteRequest(opts: {
   updated: ClawTaskRow;
   rendered: RenderedTask;
-  session: Awaited<ReturnType<typeof loadSessionPlatformKey>>;
+  session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
 }): ExecuteRequest {
@@ -362,7 +377,15 @@ function buildExecuteRequest(opts: {
     callback_url: updated.callback_url ?? undefined,
     backend_mcp_url: updated.backend_mcp_url ?? undefined,
     backend_internal_token: internalToken,
+    // The same per-task token authenticates callbacks, backend MCP calls, and
+    // this task's lease endpoint. Brain renews immediately and then
+    // periodically, so a long budget controls policy while the lease answers
+    // the independent question of whether a worker is still alive.
+    run_lease: updated.callback_url
+      ? { url: `${updated.callback_url}/lease`, token: internalToken }
+      : undefined,
     mode: (updated.mode as "llm" | "script") ?? "llm",
+    workspace_throwaway: updated.workspace_throwaway === true ? true : undefined,
     sandbox_spec: sandboxSpecForBrain,
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
@@ -401,6 +424,7 @@ async function resolveDispatchFailure(
   const msg = e instanceof Error ? e.message : String(e);
   logger.error({ taskId, err: msg }, "task.dispatch_failed");
   const bindFailure = isWorkspaceBindingError(e);
+  const credentialFailure = e instanceof MissingPlatformKeyError;
   // The one failure here that is worth another attempt on its own. Everything
   // else is either the task's own fault (an unrenderable template, a session
   // that does not exist) or already covered: a NATS publish that failed leaves
@@ -429,8 +453,16 @@ async function resolveDispatchFailure(
   // NATS / DB errors will be picked up by sweeper). The binding gets its own
   // reason rather than sharing `agent_error`: no agent ran, nothing was
   // dispatched, and the two need different alerts.
+  // A missing credential gets its own reason for the same reason the binding
+  // failure does: no agent ran, nothing was dispatched, and the fix is a
+  // configuration one. Filed under `agent_error` it would be counted among the
+  // failures that are the workload's own.
   await transitionStatus(taskId, ["preparing"], "failed", {
-    failure_reason: bindFailure ? "workspace_bind_failed" : "agent_error",
+    failure_reason: credentialFailure
+      ? "missing_platform_key"
+      : bindFailure
+        ? "workspace_bind_failed"
+        : "agent_error",
     error_message: msg,
   });
   return { ok: false, reason: msg };
@@ -513,7 +545,7 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
 
     // 4. Build the ExecuteRequest, over the files this run is bound to.
     const session = await withTimeout(
-      "loadSessionPlatformKey", loadSessionPlatformKey(updated.session_id),
+      "loadSessionCredentials", loadSessionCredentials(updated.session_id),
     );
     logger.info(
       {

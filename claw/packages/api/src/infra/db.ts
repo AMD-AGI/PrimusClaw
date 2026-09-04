@@ -175,6 +175,19 @@ const SCHEMA_MIGRATION_LOCK_ID = 8_264_179_233_001;
 // lost when a pod is killed mid-sequence, since each statement commits on its
 // own and the re-run skips what already exists, but a single statement that
 // outlives the probe's window will be started again and killed again.
+/**
+ * Ceiling for one CREATE INDEX CONCURRENTLY.
+ *
+ * Deliberately far above the migration timeout: a concurrent build scans the
+ * table twice and waits out every transaction older than itself, so its runtime
+ * is a property of the data and the traffic, not of the DDL. The migration
+ * timeout is the wrong instrument for it -- and unlike every other statement
+ * here, an interrupted concurrent build is not skipped on the next boot, it is
+ * discarded and restarted from nothing.
+ */
+const CONCURRENT_INDEX_TIMEOUT_MS =
+  Number(process.env.PG_CONCURRENT_INDEX_TIMEOUT_MS) || 30 * 60 * 1000;
+
 const MIGRATION_STATEMENT_TIMEOUT_MS =
   envInt("PG_MIGRATION_STATEMENT_TIMEOUT_MS", 300_000);
 
@@ -200,6 +213,68 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
   if (problems.length > 0) {
     logger.error({ problems }, "db.schema_incomplete");
     throw new Error(`database schema is incomplete after migration: ${problems.join("; ")}`);
+  }
+}
+
+async function ensureConcurrentIndex(
+  client: pg.PoolClient,
+  name: string,
+  createSql: string,
+): Promise<void> {
+  if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
+    throw new Error(`unsafe index name: ${name}`);
+  }
+  const readValidity = () => client.query<{ indisvalid: boolean }>(
+    `SELECT i.indisvalid
+       FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1
+        AND n.nspname = CURRENT_SCHEMA()`,
+    [name],
+  );
+  let existing = await readValidity();
+  if (existing.rowCount && existing.rows[0].indisvalid) return;
+  if (existing.rowCount) {
+    // Interrupted concurrent builds leave an INVALID index that IF NOT EXISTS
+    // would skip forever. Remove only that unusable object before rebuilding.
+    //
+    // Worth naming what this cannot do: an interrupted concurrent build is the
+    // one statement in this file that a re-run does not resume. Postgres has no
+    // way to continue it, so the drop-and-rebuild below starts from nothing --
+    // which is why the timeout above is sized for a whole build rather than for
+    // ordinary DDL. If a table ever grows past that window, the fix is to build
+    // the index out-of-band, not to raise the ceiling until a boot blocks on it.
+    logger.warn({ index: name }, "db.concurrent_index_rebuilding_from_invalid");
+    await client.query(`DROP INDEX CONCURRENTLY "${name}"`).catch((err) => {
+      logger.warn({ index: name, err }, "db.concurrent_index_drop_failed");
+    });
+  }
+  // A concurrent build is the one statement here the migration timeout is wrong
+  // for: it is sized for ordinary DDL, and a CIC over a large table legitimately
+  // runs longer. Exceeding it does not fail cleanly -- it leaves an INVALID
+  // index that the next boot drops and rebuilds from zero, so a table too big
+  // to finish in one window never finishes in any of them. Lifted for this
+  // statement only, and restored afterwards whatever happens.
+  await client.query(`SET statement_timeout = ${CONCURRENT_INDEX_TIMEOUT_MS}`);
+  try {
+    await client.query(createSql);
+  } finally {
+    await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`)
+      .catch(() => { /* the caller's next statement will fail loudly enough */ });
+  }
+  existing = await readValidity();
+  if (!existing.rowCount || !existing.rows[0].indisvalid) {
+    // Reported, not thrown. Every other index in this migration is created with
+    // `.catch(() => {})` because an index is a performance property, not a
+    // schema one -- and this is the only DDL whose failure would abort the rest
+    // of the migration and skip assertSchema, the check that exists to catch
+    // exactly the incomplete state a throw here produces. A missing index makes
+    // one sweep slower; a half-run migration makes the deployment wrong.
+    logger.warn(
+      { index: name },
+      "db.concurrent_index_not_valid",
+    );
   }
 }
 
@@ -1005,6 +1080,34 @@ export async function initDb(): Promise<void> {
     // Monotonic per-run event counter, so a reconnecting reader can say what
     // it has already seen instead of receiving the stream from the top.
     await addTaskCol("event_seq", "BIGINT NOT NULL DEFAULT 0");
+    // What the platform did to this run, captured when it ended.
+    //
+    // Recorded rather than fetched on read. A dispatcher above Claw polls a couple
+    // of hundred live runs every thirty seconds; resolving each one against SaFE at
+    // that point would be two hundred calls per sweep, and it would be asking for
+    // facts that stopped changing when the run did. Written once at the terminal,
+    // the batch read is one query.
+    await addTaskCol("platform_exit_code", "INT");
+    await addTaskCol("platform_node", "TEXT");
+    // The pod's own account is kept verbatim so kill-reason vocabulary can
+    // evolve without rewriting stored history.
+    await addTaskCol("platform_message", "TEXT");
+    // The container's own termination reason. Separate from the message above
+    // because the pod-level one describes the kills decided above the container
+    // and is empty for an OOM -- which is the ending exit code 137 alone cannot
+    // tell from an eviction or a deliberate stop.
+    await addTaskCol("platform_container_reason", "TEXT");
+    // Content cannot say whether a read happened: an empty pod message is a
+    // valid answer. These fields separate a conclusive read from a transient
+    // failure and keep multiple API replicas from fetching the same workload.
+    await addTaskCol("platform_facts_resolved_at", "TIMESTAMPTZ");
+    await addTaskCol("platform_facts_next_retry_at", "TIMESTAMPTZ");
+    await addTaskCol("platform_facts_attempts", "INT NOT NULL DEFAULT 0");
+    // Declared by a task whose workspace is throwaway -- it has already delivered
+    // its output somewhere else, so uploading the tree afterwards copies it a
+    // second time to a prefix nobody reads. Default false: with the shared-disk
+    // sync off by default, S3 is the only durable copy of a workspace.
+    await addTaskCol("workspace_throwaway", "BOOLEAN NOT NULL DEFAULT FALSE");
     // How many times a doorbell run has been claimed. The poison delivery
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.
@@ -1027,6 +1130,20 @@ export async function initDb(): Promise<void> {
        WHERE lease_expires_at IS NOT NULL
          AND status IN ('preparing','running','cancelling')`,
     ).catch(() => {});
+    await ensureConcurrentIndex(
+      client,
+      "idx_tasks_platform_facts_pending",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
+         ON claw_tasks(
+           platform_facts_next_retry_at ASC NULLS FIRST,
+           completed_at ASC,
+           task_id ASC
+         )
+       WHERE status = 'failed'
+         AND failure_reason IN ('brain_timeout','worker_lost')
+         AND sandbox_workload_id IS NOT NULL
+         AND platform_facts_resolved_at IS NULL`,
+    );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
     ).catch(() => {});
@@ -1055,6 +1172,20 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON claw_tasks(batch_id) WHERE batch_id IS NOT NULL",
     ).catch(() => {});
+    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
+    // statuses and ordered by the exact keyset cursor. The task id is the stable
+    // tiebreaker when one statement completes many rows at the same timestamp.
+    await ensureConcurrentIndex(
+      client,
+      "idx_tasks_terminal_completed_task_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
+         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
+       WHERE status IN ('completed','failed','cancelled')`,
+    );
+    // Older variants are intentionally retained during this rolling upgrade.
+    // Dropping them after a swallowed concurrent-create failure could leave the
+    // route with no ordered index; a later maintenance migration can remove
+    // them after every deployment reports the replacement present.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
@@ -1183,7 +1314,7 @@ export async function initDb(): Promise<void> {
          ON claw_workspace_refs(ref_kind, ref_id)`,
     ).catch(() => {});
 
-    // Legacy Kernel Arena tables (`claw_kernel_*`) are no longer created or
+    // Legacy long-running-job tables (`claw_kernel_*`) are no longer created or
     // referenced by the Claw API. Existing deployments keep those historical
     // rows untouched; a destructive DROP belongs in a separate data-migration PR.
 

@@ -32,6 +32,7 @@ import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
+import { registerRunRoutes } from "./runs/routes.js";
 import { registerWorkbenchRoutes } from "./workbenches/routes.js";
 import { startScheduler } from "./tasks/scheduler.js";
 import { startSweeper } from "./tasks/sweeper.js";
@@ -45,6 +46,15 @@ import { registry as metricsRegistry } from "./infra/metrics.js";
 import pino from "pino";
 
 const logger = pino({ name: "api" });
+
+/**
+ * Largest request body the API accepts.
+ *
+ * Four megabytes: comfortably above the one-megabyte total Brain caps a run's
+ * captures at, so the truncation there is what a caller sees rather than a
+ * refused callback, and low enough that it is still a limit.
+ */
+const BODY_LIMIT_BYTES = 4 * 1024 * 1024;
 
 /**
  * Warn at startup when credentials needed later are missing.
@@ -74,6 +84,35 @@ function validateStartupConfig(): void {
 }
 
 /**
+ * Refuse to serve when the dev auth bypass is combined with a real cluster key.
+ *
+ * Either alone is a deliberate configuration. Together they are not: the bypass
+ * treats every anonymous caller as a system-admin, and `SAFE_PLATFORM_KEY` is a
+ * credential that acts on the cluster as a shared identity. A deployment with
+ * both hands anyone who can reach the port the ability to create workloads under
+ * an identity nobody owns.
+ *
+ * Fatal rather than warned about, because the combination produces no error at
+ * runtime -- it produces work that runs, attributed to nobody, which is exactly
+ * the failure that went unnoticed on the DAG path for as long as it did.
+ */
+function assertNoSharedIdentityBypass(): void {
+  const bypass = (process.env.CLAW_INSECURE_DEV_AUTH ?? "").trim() === "1";
+  const sharedKey = (process.env.SAFE_PLATFORM_KEY ?? "").trim() !== "";
+  if (!bypass || !sharedKey) return;
+  logger.error(
+    {},
+    "startup.insecure_dev_auth_with_shared_platform_key",
+  );
+  throw new Error(
+    "CLAW_INSECURE_DEV_AUTH=1 and SAFE_PLATFORM_KEY are both set. The bypass makes " +
+      "every caller a system-admin and the key lets them act as the cluster's shared " +
+      "identity; together they let anyone who can reach this port create workloads " +
+      "owned by nobody. Unset one.",
+  );
+}
+
+/**
  * Refuse to serve when the timings that decide a run is dead disagree.
  *
  * Fatal rather than a warning, for the same reason an incomplete schema is: the
@@ -96,6 +135,7 @@ function assertRunLeaseTiming(): void {
 
 async function main() {
   validateStartupConfig();
+  assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
@@ -105,6 +145,17 @@ async function main() {
   await initNats();
 
   const app = Fastify({
+    // Stated rather than left to Fastify's 1 MiB default.
+    //
+    // The body that decides this is `agent_done`: it carries a run's captures, and
+    // a run that captured a large result did not lose the capture -- it lost the
+    // callback. A 413 there records a run that finished its work as never having
+    // reported, and takes everything else it captured with it.
+    //
+    // Brain now truncates each capture and caps their total, so this is the
+    // backstop rather than the limit that bites: a body over it means something
+    // other than captures grew, and 413 is then the right answer.
+    bodyLimit: BODY_LIMIT_BYTES,
     logger: {
       redact: {
         paths: [
@@ -209,6 +260,7 @@ async function main() {
   await registerInternalWorkspaceRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
+  await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
 
   // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env

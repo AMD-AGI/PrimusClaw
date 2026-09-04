@@ -37,6 +37,8 @@ export interface ClawTaskRow {
   executor: string;
   mode: string;
   model: string | null;
+  /** Skip the post-run /workspace upload; this task publishes its own output. */
+  workspace_throwaway?: boolean;
   tools_allowlist: unknown[];
   skills: unknown[];
   rules_text: string | null;

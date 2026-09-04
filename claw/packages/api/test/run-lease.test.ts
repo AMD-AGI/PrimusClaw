@@ -65,6 +65,11 @@ test("an expired lease closes the run, and says which one it was", async () => {
   assert.equal(await reapLostLeases(), 1);
   assert.match(seen[0]!.sql, /ELSE 'worker_lost' END/,
     "a worker that vanished is a different failure from a run that overran");
+  assert.match(
+    seen[0]!.sql,
+    /RETURNING[\s\S]*sandbox_workload_id/,
+    "the reaper must retain the handle needed to ask why the worker disappeared",
+  );
 });
 
 test("a reclaimed run does not shout at the session it used to be in", async () => {

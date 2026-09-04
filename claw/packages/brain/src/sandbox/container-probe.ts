@@ -285,7 +285,17 @@ export function readHandsProbeEntry(sessionId: string): Promise<HandsProbeEntry 
  * mapping changes: a 404 for an unreachable backend would turn this function
  * into a rubber stamp for the destroy the module exists to prevent.
  */
-function execFailureMeansGone(err: unknown): boolean {
+function execFailureMeansGone(err: unknown, provider: SandboxInstance["provider"]): boolean {
+  if ((err as { sandboxConfirmedRunning?: boolean })?.sandboxConfirmedRunning === true) {
+    return false;
+  }
+  if ((err as { sandboxGone?: boolean })?.sandboxGone === true) return true;
+  // SafeWorkloadProvider independently confirms Router 404/410 responses and
+  // tags only conclusive absence. Its untagged 404 text means confirmation was
+  // unavailable and must stay unknown. The agent-sandbox provider has no
+  // independent control plane, so its established status string remains the
+  // fallback contract.
+  if (provider === "safe-workload") return false;
   return /exec failed: (?:HTTP )?(?:404|410)\b/i.test(String((err as Error)?.message ?? err));
 }
 
@@ -387,7 +397,7 @@ async function classify(
     const msg = String((err as Error)?.message ?? err);
     if (msg === PROBE_ABORTED_ERROR) return { verdict: "unknown", reason: "aborted" };
     if (msg === PROBE_DEADLINE_ERROR) return { verdict: "unknown", reason: "exec_deadline" };
-    if (execFailureMeansGone(err)) {
+    if (execFailureMeansGone(err, inst.provider)) {
       return { verdict: "dead", reason: "exec_sandbox_gone" };
     }
     return { verdict: "unknown", reason: "exec_unreachable" };

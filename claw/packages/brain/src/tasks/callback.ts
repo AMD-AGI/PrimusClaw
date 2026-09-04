@@ -34,6 +34,16 @@ interface AgentDoneBody {
   abort_reason?: string;
   failure_reason?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * What the platform did, when it was the platform that ended the run. Only
+   * sent when a read produced something: `applyAgentDone` writes each field it
+   * receives, so sending empties would stamp over a reason a previous attempt
+   * managed to read.
+   */
+  platform_message?: string;
+  platform_node?: string;
+  platform_exit_code?: number;
+  platform_container_reason?: string;
 }
 
 /**
@@ -220,6 +230,141 @@ export async function postRunLease(
  * failures are thrown and the JetStream execution message remains unacked.
  * Backend transitions are CAS/idempotent, making callback retries safe.
  */
+/**
+ * Ceiling on the run's own text in the callback body.
+ *
+ * Captures are bounded where they are produced, because that is where the step
+ * that produced one can be named. `final_text` is not: on the script path it is
+ * the last step's whole stdout, which Hands will hand over up to 10 MiB of --
+ * comfortably past the 4 MiB the API accepts. An oversized body fails the
+ * callback, and a failed callback records a run that finished its work as never
+ * having reported at all, losing everything else in the body with it.
+ */
+const MAX_FINAL_TEXT_BYTES = 256 * 1024;
+
+/**
+ * Cap for a downgraded body's failure_reason.
+ *
+ * Far smaller than the final-text cap on purpose: the downgrade exists because
+ * the full body was already refused, so what survives it has to be small
+ * enough that the second attempt cannot fail the same way.
+ */
+const MAX_DOWNGRADED_REASON_BYTES = 8 * 1024;
+
+/**
+ * Cap for every other string a downgraded body keeps.
+ *
+ * The fields below are a node name, a termination reason, an abort reason, a
+ * task id and an external id -- all of which are tens of bytes when the system
+ * producing them is behaving. The cap is not sized for those; it is sized so
+ * that one that is *not* behaving, such as a SaFE payload carrying a megabyte
+ * in `message`, cannot be the reason the shed body is refused as well.
+ */
+const MAX_DOWNGRADED_FIELD_BYTES = 1024;
+
+function truncateField(text: string, label: string): string {
+  return truncate(text, MAX_DOWNGRADED_FIELD_BYTES, label);
+}
+
+function truncate(text: string, maxBytes: number, label: string): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const head = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+  return `${head}\n[${label} truncated at ${maxBytes} bytes]`;
+}
+
+function truncateFinalText(text: string): string {
+  return truncate(text, MAX_FINAL_TEXT_BYTES, "final text");
+}
+
+/**
+ * The body with everything optional taken out of it.
+ *
+ * Used once, after a 413, and only because the alternative is worse: the
+ * previous behaviour retried the identical body three times, threw, left the
+ * JetStream message unacked, and failed the same way on every redelivery --
+ * forever, for a run that had done its work. A row that lands carrying the
+ * outcome and none of the output is a far smaller loss than a row that never
+ * lands.
+ */
+function withoutPayload(body: AgentDoneBody): AgentDoneBody {
+  // Built field by field rather than by spreading `body` and overwriting the
+  // large ones. A spread keeps whatever it was not told about, so the size of
+  // the result depended on fields nobody had thought of: `token_usage`,
+  // `metadata`, and the `platform_*` strings all passed through at their
+  // original size. Any one of them being the reason for the 413 meant the shed
+  // body was refused too, all attempts failed, the JetStream message never
+  // acked, and every redelivery repeated it -- the exact loop this function
+  // exists to break. Listing what survives makes the bound a property of the
+  // function instead of a property of the input.
+  const downgraded: AgentDoneBody = {
+    task_id: body.task_id ? truncateField(body.task_id, "task id") : body.task_id,
+    final_text: "[dropped: the callback body exceeded the size the API accepts]",
+    captures: {},
+    artifacts: [],
+    // Dropped, not truncated: it is accounting rather than outcome, it has no
+    // declared shape here to trim to, and a row that lands without its usage
+    // numbers is a far smaller loss than one that never lands.
+    token_usage: undefined,
+    turns: body.turns,
+    tool_stats: undefined,
+    error_count: body.error_count,
+    abort_reason: body.abort_reason
+      ? truncateField(body.abort_reason, "abort reason")
+      : body.abort_reason,
+    // failure_reason survived the downgrade, and on the script path it carries
+    // a failing step's entire tool output -- uncapped. A multi-MiB stderr made
+    // it the dominant field, so the shed body was still over the limit, all
+    // three attempts 413'd, the JetStream message never acked, and every
+    // redelivery failed identically. A downgrade that can still be too large
+    // is not a downgrade.
+    failure_reason: body.failure_reason
+      ? truncate(body.failure_reason, MAX_DOWNGRADED_REASON_BYTES, "failure reason")
+      : body.failure_reason,
+  };
+
+  // The one part of `metadata` that is load-bearing rather than informational:
+  // a run ending in `waiting_external` is found again by this id alone, so
+  // shedding it would strand the row where no resolver tick can reach it.
+  // Carried as its own object so nothing else under `metadata` rides along.
+  const externalId = body.metadata?.external_id;
+  if (typeof externalId === "string" && externalId) {
+    downgraded.metadata = { external_id: truncateField(externalId, "external id") };
+  }
+
+  // Kept because they are the platform's account of how the run ended, which is
+  // what a shed body is for -- and bounded because they are the half of the
+  // body this process did not author.
+  if (body.platform_message) {
+    downgraded.platform_message = truncateField(body.platform_message, "platform message");
+  }
+  if (body.platform_node) {
+    downgraded.platform_node = truncateField(body.platform_node, "platform node");
+  }
+  if (body.platform_container_reason) {
+    downgraded.platform_container_reason = truncateField(
+      body.platform_container_reason,
+      "platform container reason",
+    );
+  }
+  if (typeof body.platform_exit_code === "number") {
+    downgraded.platform_exit_code = body.platform_exit_code;
+  }
+
+  return downgraded;
+}
+
+/** The platform half of the body, present only when there is something to say. */
+function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
+  const f = result.platformFacts;
+  if (!f) return {};
+  return {
+    ...(f.message ? { platform_message: f.message } : {}),
+    ...(f.node ? { platform_node: f.node } : {}),
+    ...(f.containerReason ? { platform_container_reason: f.containerReason } : {}),
+    ...(typeof f.exitCode === "number" ? { platform_exit_code: f.exitCode } : {}),
+  };
+}
+
 export async function postAgentDone(
   request: ExecuteRequest,
   result: ExecuteResult,
@@ -228,7 +373,7 @@ export async function postAgentDone(
   const url = `${request.callback_url}/agent_done`;
   const body: AgentDoneBody = {
     task_id: request.task_id,
-    final_text: result.finalText,
+    final_text: truncateFinalText(result.finalText ?? ""),
     captures: result.captures,
     artifacts: (result.artifacts ?? []) as unknown as Array<Record<string, unknown>>,
     token_usage: result.tokenUsage as unknown as Record<string, unknown>,
@@ -238,6 +383,7 @@ export async function postAgentDone(
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
+    ...platformFields(result),
   };
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -246,17 +392,32 @@ export async function postAgentDone(
     headers["Authorization"] = `Bearer ${request.backend_internal_token}`;
   }
   let lastError: Error | undefined;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  let payload = body;
+  let shed = false;
+  let maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
     try {
       const resp = await fetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
       if (resp.ok) return;
+      // 413 is the one status a retry cannot help with: the body is too large
+      // and will be exactly as large next time. Shed it once and retry that,
+      // rather than spending the remaining attempts proving the point.
+      if (resp.status === 413 && !shed) {
+        shed = true;
+        payload = withoutPayload(body);
+        // Ordinary failures get three attempts. If the first size answer only
+        // arrives on the third, grant the newly-built lean payload one distinct
+        // send rather than constructing it and immediately leaving the loop.
+        if (attempt === maxAttempts) maxAttempts++;
+        logger.warn({ taskId: request.task_id }, "agent_done.body_shed_after_413");
+      }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -267,7 +428,7 @@ export async function postAgentDone(
       { taskId: request.task_id, attempt, err: lastError.message },
       "agent_done.retry",
     );
-    if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
   }
   throw new AgentDoneDeliveryError(lastError?.message ?? "agent_done callback failed");
 }

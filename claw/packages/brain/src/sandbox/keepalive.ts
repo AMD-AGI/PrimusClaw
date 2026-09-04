@@ -855,6 +855,79 @@ export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void
   return tick(deps);
 }
 
+interface KeepaliveFailure {
+  targetKey: string;
+  sessionId: string;
+  entry: SandboxEntry;
+  error: unknown;
+  gone: boolean;
+}
+
+async function handleKeepaliveFailures(
+  failures: KeepaliveFailure[],
+  targetCount: number,
+): Promise<void> {
+  // More than one independently "gone" result in one tick is more likely to be
+  // a shared routing/control-plane fault than simultaneous sandbox loss. Delay
+  // immediate eviction and let the ordinary opt-in failure threshold decide.
+  const goneCount = failures.filter((failure) => failure.gone).length;
+  const suppressImmediateGone = goneCount > 1;
+  if (suppressImmediateGone) {
+    logger.error(
+      { gone: goneCount, total: targetCount },
+      "keepalive.multiple_sandboxes_reported_gone",
+    );
+  }
+
+  for (const failure of failures) {
+    const { targetKey, sessionId, entry, error } = failure;
+    const goneCircuitOpen = suppressImmediateGone && failure.gone;
+    const gone = failure.gone && !goneCircuitOpen;
+    const fails = gone
+      ? Math.max(SANDBOX_KEEPALIVE_FAIL_LIMIT, (failCounts.get(targetKey) || 0) + 1)
+      : (failCounts.get(targetKey) || 0) + 1;
+    failCounts.set(targetKey, fails);
+    lastVerdict.set(targetKey, { fails, gone });
+    logger.warn(
+      {
+        err: (error as { message?: string })?.message || String(error),
+        sessionId,
+        workloadId: entry.workloadId,
+        fails,
+        gone,
+        goneCircuitOpen,
+      },
+      "keepalive.ping_failed",
+    );
+    // Automatic eviction is opt-in; the default leaves recovery to platform
+    // idle/TTL GC rather than acting on an unavailable control plane.
+    if (
+      SANDBOX_KEEPALIVE_FAIL_LIMIT > 0
+      && fails >= SANDBOX_KEEPALIVE_FAIL_LIMIT
+      // A multi-target spike gets one additional full-threshold confirmation;
+      // otherwise a genuine node-wide loss would be suppressed forever.
+      && (!goneCircuitOpen || fails > SANDBOX_KEEPALIVE_FAIL_LIMIT)
+    ) {
+      await destroyHands(sessionId, entry).catch((err2) =>
+        logger.warn({ err: err2, sessionId }, "keepalive.destroy_failed"),
+      );
+      failCounts.delete(targetKey);
+      localRegistry.delete(targetKey);
+      logger.error(
+        { sessionId, workloadId: entry.workloadId, fails },
+        "keepalive.sandbox_evicted",
+      );
+    }
+  }
+}
+
+/** The verdict the last sweep reached for a target, for tests. */
+const lastVerdict = new Map<string, { fails: number; gone: boolean }>();
+export function lastVerdictForTest(sessionId: string): { fails: number; gone: boolean } | null {
+  for (const [key, v] of lastVerdict) if (key.includes(sessionId)) return v;
+  return null;
+}
+
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
   const targets = await collectTargets(deps, seenIdentities);
@@ -908,6 +981,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   const pingDeadline = Date.now() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
   let pinged = 0;
   let deferred = 0;
+  const failures: KeepaliveFailure[] = [];
 
   await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
     // Checked as each target is picked up, so this bounds when a ping may
@@ -961,39 +1035,22 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       }
       logger.info({ sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId }, "keepalive.ping");
     } catch (err: any) {
-      const fails = (failCounts.get(targetKey) || 0) + 1;
-      failCounts.set(targetKey, fails);
-      logger.warn(
-        { err: err?.message || String(err), sessionId, workloadId: entry.workloadId, fails },
-        "keepalive.ping_failed",
-      );
-      // Auto-eviction is opt-in: only when FAIL_LIMIT > 0. When disabled (<=0)
-      // we keep the sandbox registered and keep pinging it forever — never
-      // abort the task, never destroy the sandbox on keepalive failures, so a
-      // transient control-plane outage cannot tear down a healthy long-running
-      // sandbox. Dead sandboxes are still reclaimed by the control-plane idle-GC.
-      //
-      // In-flight rebuild and ensureHands reuse now probe exec before destroy.
-      // This ticker does not: FAIL_LIMIT is the operator opting in to "enough
-      // missed pings means the pod is gone". Leave it at 0 unless that is the
-      // policy you want.
-      if (SANDBOX_KEEPALIVE_FAIL_LIMIT > 0 && fails >= SANDBOX_KEEPALIVE_FAIL_LIMIT) {
-        // Session-level abort would cancel healthy DAG siblings, so eviction
-        // stops this exact sandbox instead. Note what that does not do: a loop
-        // already parked in an MCP call unblocks only if stopping the workload
-        // breaks its connection, and the case that brought us here -- a pod
-        // that stopped answering pings -- is the one where it may not. Nothing
-        // has replaced the abort for that path yet.
-        await destroyHands(sessionId, entry).catch((err2) =>
-          logger.warn({ err: err2, sessionId }, "keepalive.destroy_failed"),
-        );
+      if (err?.sandboxConfirmedRunning === true) {
         failCounts.delete(targetKey);
-        localRegistry.delete(targetKey);
         logger.error(
-          { sessionId, workloadId: entry.workloadId, fails },
-          "keepalive.sandbox_evicted",
+          { err: err?.message || String(err), sessionId, workloadId: entry.workloadId },
+          "keepalive.router_failed_for_running_sandbox",
         );
+        return;
       }
+      // Collected, not decided here: whether a `gone` may evict depends on how
+      // many OTHER targets reported gone in the same sweep -- more than one is
+      // more likely a shared control-plane fault than simultaneous loss -- and
+      // that is only knowable once the sweep has finished.
+      failures.push({
+        targetKey, sessionId, entry, error: err,
+        gone: err?.sandboxGone === true,
+      } satisfies KeepaliveFailure);
     }
   });
 
@@ -1001,6 +1058,8 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // sweep. Reported rather than silent: a sweep that cannot cover the fleet
   // inside half a TTL is a capacity signal, and the failure it precedes -- a
   // handle expiring un-pinged -- looks like nothing at all from the outside.
+  await handleKeepaliveFailures(failures, targets.size);
+
   pingCursor = (pingStart + pinged) % ordered.length;
   if (deferred > 0) {
     logger.warn(

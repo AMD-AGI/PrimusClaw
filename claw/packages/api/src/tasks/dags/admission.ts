@@ -38,10 +38,20 @@ import type {
   TaskDagDef,
 } from "./types.js";
 
-/** Hands-side builtin tools always available; not in the `tools` table. */
+/**
+ * Hands-side builtin tools always available; not in the `tools` table.
+ *
+ * `wait` and `log_s3_upload_manifest` were missing, and `wait` is the tool the
+ * repeat/until step exists to drive -- so the very pattern this admission code
+ * validates the bounds of was rejected one check earlier as an unknown tool.
+ * The list is duplicated from brain's HANDS_TOOLS by necessity (the API cannot
+ * import from brain), which is exactly how it fell behind; anything added
+ * there has to be added here.
+ */
 const HANDS_BUILTIN_TOOLS = new Set([
   "read", "write", "edit", "multi_edit", "bash", "glob", "grep", "ls",
   "notebook_edit", "upload_to_s3", "download_from_s3", "bash_output", "kill_shell",
+  "wait", "log_s3_upload_manifest",
 ]);
 
 export interface ToolMeta {
@@ -262,6 +272,9 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
 
   // 1. Structural.
   const idSet = new Set<string>();
+  if (dag.workspace_throwaway !== undefined && typeof dag.workspace_throwaway !== "boolean") {
+    throw new BadRequestError("workspace_throwaway must be a boolean");
+  }
   for (const n of dag.nodes) {
     if (!n || typeof n !== "object") throw new BadRequestError("each node must be an object");
     if (!n.id || typeof n.id !== "string") throw new BadRequestError("each node must have a string id");
@@ -270,6 +283,9 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
     if (n.executor !== "brain") throw new BadRequestError(`node ${n.id}: executor must be 'brain'`);
     if (n.mode !== "llm" && n.mode !== "script") {
       throw new BadRequestError(`node ${n.id}: mode must be 'llm' or 'script'`);
+    }
+    if (n.workspace_throwaway !== undefined && typeof n.workspace_throwaway !== "boolean") {
+      throw new BadRequestError(`node ${n.id}: workspace_throwaway must be a boolean`);
     }
   }
   for (const n of dag.nodes) {
@@ -322,6 +338,7 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
             `node ${n.id}: tool '${step.name}' has scope='${meta.scope}' but sandbox='none'`,
           );
         }
+        assertRepeatIsBounded(n.id, step);
       }
     }
   }
@@ -392,4 +409,78 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
       schema_digest: schemaDigest,
     },
   };
+}
+
+
+/**
+ * Largest repetition a step may declare.
+ *
+ * Not a policy about how long work may take -- the run's own budget decides that,
+ * and a graph node can be given days. These bound the shape of the loop, so a
+ * typo cannot ask for a million attempts, and they are refused at upload rather
+ * than clamped at runtime: a script that quietly ran a tenth of what it asked for
+ * is worse than one that would not save.
+ */
+const REPEAT_MAX_ATTEMPTS = 10_000;
+const REPEAT_MAX_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Refuse a repetition that is not bounded in both dimensions.
+ *
+ * Both, because they bound different failures: a step that returns instantly
+ * burns its attempts in seconds, and one that blocks for its full timeout every
+ * time needs a wall-clock ceiling rather than an attempt count nobody can convert
+ * into one. An unbounded loop inside a script is the hang the per-call ceiling
+ * exists to prevent, and a script has no judgement to fall back on.
+ */
+function assertRepeatIsBounded(nodeId: string, step: ScriptStepDef): void {
+  const repeat = step.repeat;
+  if (!repeat) return;
+  const where = `node ${nodeId}: step '${step.name}' repeat`;
+
+  const attempts = repeat.max_attempts;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > REPEAT_MAX_ATTEMPTS) {
+    throw new BadRequestError(
+      `${where}.max_attempts must be a whole number between 1 and ${REPEAT_MAX_ATTEMPTS}`,
+    );
+  }
+  const seconds = repeat.max_seconds;
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > REPEAT_MAX_SECONDS) {
+    throw new BadRequestError(
+      `${where}.max_seconds must be between 1 and ${REPEAT_MAX_SECONDS}`,
+    );
+  }
+  if (repeat.interval_sec !== undefined) {
+    const interval = repeat.interval_sec;
+    if (!Number.isFinite(interval) || interval < 0 || interval > seconds) {
+      throw new BadRequestError(`${where}.interval_sec must be between 0 and max_seconds`);
+    }
+  }
+  const path = repeat.until?.path;
+  if (typeof path !== "string" || path.trim() === "") {
+    throw new BadRequestError(
+      `${where}.until.path must name the structured field that says the work is done`,
+    );
+  }
+  // Narrowed to what the comparison can actually match. `repeatSatisfied`
+  // decides the loop with `===` against the value the tool reported, so an
+  // object or an array here compares by identity and is unequal to every
+  // structured result the step could ever return -- and the loop it can never
+  // leave is not refused, it is run: the step repeats until max_attempts,
+  // max_seconds, or the 72h ceiling stops it. NaN is the same shape of bug
+  // without the excuse of a type error, since it is not even equal to itself.
+  // The declared type is `string | number | boolean`; a JSON request body is
+  // not bound by it, so it is enforced here rather than assumed.
+  const equals: unknown = repeat.until.equals;
+  const kind = typeof equals;
+  if (kind !== "string" && kind !== "boolean" && kind !== "number") {
+    throw new BadRequestError(
+      `${where}.until.equals must be a string, number, or boolean -- the value that means done`,
+    );
+  }
+  if (kind === "number" && !Number.isFinite(equals)) {
+    throw new BadRequestError(
+      `${where}.until.equals must be a finite number: NaN and Infinity match nothing`,
+    );
+  }
 }

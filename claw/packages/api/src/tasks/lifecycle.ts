@@ -32,6 +32,24 @@ export interface AgentDonePayload {
   failure_reason?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
+  /**
+   * What the platform did, when the run ended because the platform ended it.
+   *
+   * Recorded here rather than resolved when somebody asks. A dispatcher above
+   * Claw sweeps a couple of hundred live runs every thirty seconds; resolving
+   * each against SaFE at read time would be two hundred calls per sweep, for
+   * facts that stopped changing when the run did.
+   *
+   * The raw pod and container fields are retained so the API can derive the
+   * platform reason under its current vocabulary without freezing that reading
+   * into the row.
+   */
+  /** The container's own termination reason, the only source for an OOM. */
+  platform_container_reason?: string;
+  platform_exit_code?: number;
+  platform_node?: string;
+  /** The pod's own account, kept verbatim so a wrong reading can be re-derived. */
+  platform_message?: string;
 }
 
 function resolveTerminalStatus(p: AgentDonePayload): TaskStatus {
@@ -65,6 +83,18 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     failure_reason: payload.failure_reason ?? null,
     error_message: payload.failure_reason ?? null,
   };
+
+  // Only written when the callback carried them. A run that ended for its own
+  // reasons has no platform facts, and stamping empty strings over a row that a
+  // previous path filled would erase the platform's recorded account.
+  if (payload.platform_message) patch.platform_message = payload.platform_message;
+  if (payload.platform_container_reason) {
+    patch.platform_container_reason = payload.platform_container_reason;
+  }
+  if (payload.platform_node) patch.platform_node = payload.platform_node;
+  if (typeof payload.platform_exit_code === "number") {
+    patch.platform_exit_code = payload.platform_exit_code;
+  }
 
   if (next === "waiting_external") {
     // Stash external_id under metadata.derived so the ExternalResolver
@@ -249,7 +279,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
         input, prompt, script, depends_on, priority,
         executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
         sandbox_spec, callback_url, backend_mcp_url,
-        status, metadata)
+        status, metadata, workspace_throwaway)
      SELECT $1, session_id, task_id, batch_id,
             dag_id, dag_node_id, dag_root_task_id, plugin_id, name,
             input, prompt, script, depends_on, priority,
@@ -261,7 +291,10 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             replace(callback_url,    task_id, $1),
             replace(backend_mcp_url, task_id, $1),
             CASE WHEN coalesce(array_length(depends_on,1),0) = 0 THEN 'queued' ELSE 'waiting_deps' END,
-            metadata
+            metadata,
+            -- carried, not defaulted: a retry of a task that declared its
+            -- workspace throwaway must not start uploading it.
+            workspace_throwaway
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );

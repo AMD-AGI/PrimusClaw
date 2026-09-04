@@ -992,13 +992,10 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // unreadable backstop above (which only fires when SaFE stops answering). Set to
 // 0 to queue forever. Stored in ms; configured in seconds like the sibling above.
 //
-// NOTE (task/DAG mode only): the API-side sweeper independently fails a
-// claw_tasks row as `brain_timeout` after BRAIN_TASK_TIMEOUT_SEC (code fallback
-// 1h, but the Helm chart deploys 21600s = 6h) measured from started_at, with no
-// liveness signal. If this ceiling can exceed that, raise BRAIN_TASK_TIMEOUT_SEC
-// to match — otherwise a task's DB row goes terminal first while Brain keeps
-// waiting, leaving a window where the workload still holds resources. Chat
-// sessions live in claw_sessions (not claw_tasks) and are never swept.
+// Task and DAG runs carry a renewable API-side lease, so this Pending ceiling
+// does not have to fit under BRAIN_TASK_TIMEOUT_SEC. That timeout now covers
+// only a row that never receives its first lease renewal; once Brain is alive,
+// the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
 
 // Hands /health readiness poll AFTER the sandbox reaches Running and the

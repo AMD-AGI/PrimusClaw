@@ -68,10 +68,21 @@ async function execError(
 }
 
 /** That same error, put through the real classifier. */
-async function verdictFor(err: Error): Promise<unknown> {
+async function verdictFor(
+  err: Error,
+  provider: SandboxInstance["provider"] = "safe-workload",
+): Promise<unknown> {
   const cp = await import("../src/sandbox/container-probe.js");
   const restore = cp.bindContainerProbeEffects({
-    readHandsEntry: async () => ENTRY,
+    readHandsEntry: async () => provider === "agent-sandbox"
+      ? {
+          provider: "agent-sandbox",
+          sessionId: "sess-1",
+          sandboxName: "box",
+          namespace: "ns",
+          userId: "u",
+        }
+      : ENTRY,
     exec: async () => { throw err; },
   });
   try {
@@ -95,7 +106,7 @@ test("a real provider's 404 and 410 are what the classifier reads as a gone cont
     for (const status of [404, 410]) {
       const err = await execError(provider, inst, status);
       assert.deepEqual(
-        await verdictFor(err),
+        await verdictFor(err, inst.provider),
         { verdict: "dead", reason: "exec_sandbox_gone" },
         `${name} HTTP ${status} must license the rebuild; the provider said `
         + `"${err.message}", which the classifier did not recognise`,
@@ -111,9 +122,27 @@ test("a real provider's 502 stays unknown, so nothing licenses a destroy", async
   for (const [name, provider, inst] of await providers()) {
     const err = await execError(provider, inst, 502);
     assert.deepEqual(
-      await verdictFor(err),
+      await verdictFor(err, inst.provider),
       { verdict: "unknown", reason: "exec_unreachable" },
       `${name} HTTP 502 must never license a destroy; the provider said "${err.message}"`,
     );
   }
+});
+
+test("a Router 404 cannot override independent proof that the workload is running", async () => {
+  const { SandboxExecRouteUnavailableError } = await import("../src/sandbox/errors.js");
+  const err = new SandboxExecRouteUnavailableError(
+    "sandboxExec failed: HTTP 404 route not found",
+  );
+  assert.deepEqual(
+    await verdictFor(err),
+    { verdict: "unknown", reason: "exec_unreachable" },
+  );
+});
+
+test("an unconfirmed Safe Router 404 remains unknown", async () => {
+  assert.deepEqual(
+    await verdictFor(new Error("sandboxExec failed: HTTP 404 route not found")),
+    { verdict: "unknown", reason: "exec_unreachable" },
+  );
 });

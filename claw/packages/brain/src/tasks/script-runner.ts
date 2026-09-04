@@ -68,14 +68,110 @@ function renderString(
   s: string,
   state: { captures: Record<string, string>; prev?: { captures: Record<string, string>; structured?: unknown } },
 ): string {
-  return s.replace(/\$\{([^}]+)\}/g, (_, raw: string) => {
+  return s.replace(/\$\{([^}]+)\}/g, (whole, raw: string) => {
     const path = raw.trim();
+    // A name with no dot is a shell variable, not a template path -- and it never
+    // could have been one: resolvePath returns undefined for anything shorter than
+    // `root.rest`. Throwing on it took the whole task down for writing `${HOME}`
+    // or `${PATH}` in an inline command, which is the ordinary way to write shell.
+    //
+    // Left literal, which is what the backend renderer already does with the same
+    // input (template-renderer.ts). The two run over the same strings in sequence,
+    // so disagreeing about what counts as a template meant a step could survive one
+    // stage and be destroyed by the next.
+    if (!path.includes(".")) return whole;
     const val = resolvePath(path, state);
     if (val === undefined) {
       throw new Error(`script runtime template '${path}' did not resolve; Backend dispatcher should have rendered it`);
     }
     return typeof val === "string" ? val : JSON.stringify(val);
   });
+}
+
+/**
+ * Largest a single capture may be.
+ *
+ * Captures travel to Backend inside the `agent_done` body, and that body has a
+ * size limit. Unbounded, one step that captured a large `result.json` did not
+ * lose the capture -- it failed the entire completion callback, so a run that had
+ * finished its work was recorded as never having reported at all, and everything
+ * else it captured went with it.
+ *
+ * Truncated here rather than at the boundary because this is where the step that
+ * produced it can be named.
+ */
+const MAX_CAPTURE_BYTES = 256 * 1024;
+
+/** Total across all captures, so many medium ones cannot do what one large one cannot. */
+const MAX_CAPTURES_TOTAL_BYTES = 1024 * 1024;
+
+/**
+ * A capture cut to size, with the cut stated in the value.
+ *
+ * The marker matters: a consumer parsing a capture as JSON has to be able to tell
+ * a truncated document from a malformed one, and silently handing over the first
+ * 256 KiB of a JSON file is how a caller concludes the producer is broken.
+ */
+export function truncateCapture(name: string, value: string): string {
+  if (Buffer.byteLength(value, "utf8") <= MAX_CAPTURE_BYTES) return value;
+  const head = Buffer.from(value, "utf8").subarray(0, MAX_CAPTURE_BYTES).toString("utf8");
+  return `${head}\n[capture '${name}' truncated at ${MAX_CAPTURE_BYTES} bytes]`;
+}
+
+/**
+ * Captures cut to a total, dropping whole entries from the largest down.
+ *
+ * Whole entries rather than a second per-entry trim: a caller reading
+ * `captures.result` wants a document or an absence, and half of one is the answer
+ * that looks valid and is not.
+ */
+export function capCapturesTotal(captures: Record<string, string>): Record<string, string> {
+  const sizes = Object.entries(captures)
+    .map(([k, v]) => [k, Buffer.byteLength(v, "utf8")] as const)
+    .sort((a, b) => b[1] - a[1]);
+  let total = sizes.reduce((n, [, size]) => n + size, 0);
+  const out = { ...captures };
+  for (const [name, size] of sizes) {
+    if (total <= MAX_CAPTURES_TOTAL_BYTES) break;
+    out[name] = `[capture '${name}' dropped: ${size} bytes, over the ${MAX_CAPTURES_TOTAL_BYTES}-byte total]`;
+    total -= size - Buffer.byteLength(out[name], "utf8");
+  }
+  return out;
+}
+
+/** Pause until the interval elapses or the run is cancelled. */
+function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Whether a repetition's condition holds over the step's structured result.
+ *
+ * A miss is not satisfaction: a tool that returned no structured result, or one
+ * without the named field, keeps the loop going until a bound stops it. The other
+ * reading -- absent means done -- turns a tool that stopped answering into a job
+ * the graph believes finished.
+ */
+export function repeatSatisfied(
+  repeat: { until: { path: string; equals: string | number | boolean } },
+  structured: unknown,
+): boolean {
+  if (structured === undefined || structured === null) return false;
+  const value = getDeep(structured, repeat.until.path.split("."));
+  return value === repeat.until.equals;
 }
 
 function resolvePath(
@@ -151,21 +247,10 @@ export async function runScript(
 
   for (let i = 0; i < script.length; i++) {
     if (ctx.signal?.aborted) {
-      return {
-        finalText: "",
-        tokenUsage: zeroTokens(),
-        turns: 0,
-        pendingMemories: [],
-        pendingSkills: [],
-        skillsUsed: {},
-        errorCount: toolStats.error_calls,
-        toolStats,
-        elapsedMs: nowMs() - startedAt,
-        captures,
-        artifacts,
-        abortReason: "cancelled",
-        failureReason: "script aborted by signal",
-      };
+      return failResult(
+        "script aborted by signal", "cancelled",
+        captures, artifacts, toolStats, startedAt,
+      );
     }
     const step = script[i];
     let args: Record<string, unknown>;
@@ -199,53 +284,145 @@ export async function runScript(
 
     await onEvent({ type: "scriptStep", name: step.name, step: i, status: "started", scope });
 
-    try {
-      if (scope === "backend") {
-        if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
-        if (!request.backend_internal_token) throw new Error("backend_internal_token not provided for scope=backend tool");
-        const out = await callBackendMcpTool(
-          request.backend_mcp_url,
-          request.backend_internal_token,
-          step.name,
-          args,
-          { timeoutMs: stepDeadlineSec * 1000, signal: ctx.signal },
+    // One attempt of this step, or several when it declares a repetition. The
+    // loop wraps exactly one step's call: nothing nests, so the executor stays
+    // the flat pass over one array that every other stage assumes it is.
+    const repeat = step.repeat;
+    const repeatDeadline = repeat ? nowMs() + repeat.max_seconds * 1000 : 0;
+    let attempt = 0;
+    let repeatStopped = "";
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (ctx.signal?.aborted) {
+        return failResult(
+          "script aborted by signal", "cancelled",
+          captures, artifacts, toolStats, startedAt,
         );
-        if (out.wait_external) {
-          waitExternal = true;
-          stepError = out.error;
-          const md = out.metadata as Record<string, unknown> | undefined;
-          if (md && typeof md.external_id === "string") waitExternalId = md.external_id;
-        } else if (out.isError) {
-          stepError = out.error || out.text || "backend tool returned isError";
+      }
+      const remainingMs = repeat ? repeatDeadline - nowMs() : stepDeadlineSec * 1000;
+      if (repeat && remainingMs <= 0) {
+        repeatStopped = "max_seconds";
+        break;
+      }
+
+      attempt++;
+      resultText = "";
+      structured = undefined;
+      stepError = undefined;
+      const attemptTimeoutMs = Math.max(
+        1,
+        Math.floor(repeat ? Math.min(stepDeadlineSec * 1000, remainingMs) : stepDeadlineSec * 1000),
+      );
+      const budgetSignal = repeat ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
+      const attemptSignal = budgetSignal && ctx.signal
+        ? AbortSignal.any([ctx.signal, budgetSignal])
+        : (budgetSignal ?? ctx.signal);
+      try {
+        if (scope === "backend") {
+          if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
+          if (!request.backend_internal_token) throw new Error("backend_internal_token not provided for scope=backend tool");
+          const out = await callBackendMcpTool(
+            request.backend_mcp_url,
+            request.backend_internal_token,
+            step.name,
+            args,
+            { timeoutMs: attemptTimeoutMs, signal: attemptSignal },
+          );
+          if (out.wait_external) {
+            waitExternal = true;
+            stepError = out.error;
+            const md = out.metadata as Record<string, unknown> | undefined;
+            if (md && typeof md.external_id === "string") waitExternalId = md.external_id;
+          } else if (out.isError) {
+            stepError = out.error || out.text || "backend tool returned isError";
+          }
+          resultText = out.text;
+          structured = out.structured;
+        } else {
+          if (!ctx.hands) throw new Error("Hands client not provided for scope=hands tool");
+          let handsArgs = args;
+          const timeoutField = step.name === "wait"
+            ? "timeout_sec"
+            : (step.name === "bash" ? "timeout" : null);
+          if (timeoutField && (repeat || step.timeout_sec !== undefined)) {
+            const requested = Number(args[timeoutField]);
+            const timeoutSec = Math.min(
+              Number.isFinite(requested) && requested > 0 ? requested : stepDeadlineSec,
+              Math.max(1, Math.ceil(attemptTimeoutMs / 1000)),
+            );
+            handsArgs = { ...args, [timeoutField]: timeoutSec };
+          }
+          const out = await ctx.hands.callToolFull(step.name, handsArgs, attemptSignal);
+          resultText = out.text;
+          structured = out.structured;
+          if (out.isError) stepError = out.text || "hands tool returned isError";
+          if (
+            stepError &&
+            step.on_fail === "wait_external" &&
+            resultText.includes(WAIT_EXTERNAL_SENTINEL)
+          ) {
+            waitExternal = true;
+            stepError = undefined;
+            waitExternalId = `timer:${request.task_id}:${i}`;
+          }
         }
-        resultText = out.text;
-        structured = out.structured;
-      } else {
-        if (!ctx.hands) throw new Error("Hands client not provided for scope=hands tool");
-        const handsArgs = step.timeout_sec === undefined || Object.prototype.hasOwnProperty.call(args, "timeout")
-          ? args
-          : { ...args, timeout: stepDeadlineSec };
-        const out = await ctx.hands.callToolFull(step.name, handsArgs, ctx.signal);
-        resultText = out.text;
-        structured = out.structured;
-        if (out.isError) stepError = out.text || "hands tool returned isError";
-        if (
-          stepError &&
-          step.on_fail === "wait_external" &&
-          resultText.includes(WAIT_EXTERNAL_SENTINEL)
-        ) {
-          waitExternal = true;
-          stepError = undefined;
-          waitExternalId = `timer:${request.task_id}:${i}`;
+      } catch (callErr) {
+        stepError = callErr instanceof Error ? callErr.message : String(callErr);
+      }
+
+      toolStats.total_calls++;
+      toolStats.by_tool[step.name] = (toolStats.by_tool[step.name] ?? 0) + 1;
+
+      // Cancellation and the wall-clock bound outrank a late tool answer. A
+      // completed-looking result after either event must not advance the DAG.
+      if (ctx.signal?.aborted) {
+        return failResult(
+          "script aborted by signal", "cancelled",
+          captures, artifacts, toolStats, startedAt,
+        );
+      }
+      if (repeat && nowMs() >= repeatDeadline) {
+        waitExternal = false;
+        waitExternalId = undefined;
+        stepError = undefined;
+        repeatStopped = "max_seconds";
+        break;
+      }
+      if (stepError && !waitExternal) toolStats.error_calls++;
+
+      if (!repeat) break;
+      // An error ends the repetition and is handled by on_fail below, exactly as it
+      // would be for a single attempt.
+      if (stepError || waitExternal) { repeatStopped = "error"; break; }
+      if (repeatSatisfied(repeat, structured)) { repeatStopped = "done"; break; }
+      if (attempt >= repeat.max_attempts) { repeatStopped = "max_attempts"; break; }
+      await onEvent({
+        type: "scriptStep", name: step.name, step: i, status: "repeating", attempt, scope,
+      });
+      if (repeat.interval_sec) {
+        const completedSleep = await sleep(
+          Math.min(repeat.interval_sec * 1000, Math.max(0, repeatDeadline - nowMs())),
+          ctx.signal,
+        );
+        if (!completedSleep) {
+          return failResult(
+            "script aborted by signal", "cancelled",
+            captures, artifacts, toolStats, startedAt,
+          );
         }
       }
-    } catch (callErr) {
-      stepError = callErr instanceof Error ? callErr.message : String(callErr);
     }
 
-    toolStats.total_calls++;
-    toolStats.by_tool[step.name] = (toolStats.by_tool[step.name] ?? 0) + 1;
-    if (stepError && !waitExternal) toolStats.error_calls++;
+    // A repetition that ran out of bound without its condition holding is a
+    // failure of the step, not a quiet success: the work it was waiting for is
+    // still going, and reporting completion would have the graph move on from a
+    // job that is still running.
+    if (repeat && (repeatStopped === "max_attempts" || repeatStopped === "max_seconds")) {
+      stepError = stepError
+        ?? `repeat gave up after ${attempt} attempt(s) without ${repeat.until.path} = ${String(repeat.until.equals)} (${repeatStopped})`;
+      toolStats.error_calls++;
+    }
 
     await ctx.fireHook?.("PostToolUse", { tool_name: step.name, tool_response: stepError ? { error: stepError } : { text: resultText, structured } });
 
@@ -292,7 +469,7 @@ export async function runScript(
       const value = structured !== undefined && structured !== null
         ? JSON.stringify(structured)
         : resultText;
-      captures[step.captures] = value ?? "";
+      captures[step.captures] = truncateCapture(step.captures, value ?? "");
     }
     lastResultText = resultText ?? lastResultText;
     lastStructured = structured;
@@ -311,7 +488,7 @@ export async function runScript(
     errorCount: toolStats.error_calls,
     toolStats,
     elapsedMs: nowMs() - startedAt,
-    captures,
+    captures: capCapturesTotal(captures),
     artifacts,
     abortReason: "completed",
   };
@@ -335,7 +512,7 @@ function failResult(
     errorCount: toolStats.error_calls,
     toolStats,
     elapsedMs: nowMs() - startedAt,
-    captures,
+    captures: capCapturesTotal(captures),
     artifacts,
     abortReason,
     failureReason: reason,
