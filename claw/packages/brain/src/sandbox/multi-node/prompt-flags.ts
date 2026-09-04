@@ -88,13 +88,36 @@ export interface MultiNodePromptSpec {
 }
 
 /**
+ * Strip the markup a prompt wraps a flag in from its value.
+ *
+ * A prompt is prose as much as it is a command line, and a flag listed as a
+ * markdown bullet -- `` `--nodes 2` `` -- ends its value with the closing
+ * backtick, which `\S+` captures. The value is then `2\`` rather than `2` and
+ * `infera\`` rather than `infera`: the first falls back to one node, the second
+ * fails the backend enum, and both make the task read as single-node with no
+ * flag misspelt anywhere.
+ *
+ * Only the outermost characters go, and only ones that cannot begin or end a
+ * path, an image reference or a `K=V` pair, so a value that legitimately
+ * contains them -- `rdma0,rdma1` -- keeps them.
+ */
+function stripFlagDecoration(raw: string): string {
+  return raw.replace(/^[`"'([]+/, "").replace(/[`"')\],;]+$/, "");
+}
+
+/**
  * Read `--flag value` / `--flag=value` from a prompt. Only the first
  * occurrence counts, so a later mention inside e.g. `--server-args "..."`
  * cannot override the real flag.
+ *
+ * A value that is nothing but decoration reads as absent, so the caller takes
+ * its default instead of an empty string.
  */
 function readFlag(prompt: string, flag: string): string | undefined {
   const re = new RegExp(`--${flag}[\\s=]+(\\S+)`, "i");
-  return re.exec(prompt)?.[1];
+  const raw = re.exec(prompt)?.[1];
+  if (raw === undefined) return undefined;
+  return stripFlagDecoration(raw) || undefined;
 }
 
 function readIntFlag(prompt: string, flag: string, fallback: number): number {
@@ -120,7 +143,8 @@ function readRepeatedFlag(prompt: string, flag: string): string[] {
   const re = new RegExp(`--${flag}[\\s=]+(\\S+)`, "gi");
   const out: string[] = [];
   for (const m of prompt.matchAll(re)) {
-    if (m[1]) out.push(m[1]);
+    const value = m[1] ? stripFlagDecoration(m[1]) : "";
+    if (value) out.push(value);
   }
   return out;
 }
