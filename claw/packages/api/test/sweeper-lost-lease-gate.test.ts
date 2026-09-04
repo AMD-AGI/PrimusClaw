@@ -25,8 +25,26 @@ import { reapLostLeases, sweeperPorts } from "../src/tasks/sweeper.js";
 
 interface SeenQuery { sql: string; params: unknown[] }
 
+/**
+ * Statements and publishes in the order they actually happened.
+ *
+ * Two of the properties this file checks are orderings across the two -- the
+ * announce has to precede the gate release -- and a per-side list cannot say
+ * which came first. Recorded by both stubs into one array instead.
+ */
+type Step =
+  | { kind: "query"; sql: string }
+  | { kind: "event"; type: string };
+
 const originalQuery = db.query;
-after(() => { db.query = originalQuery; });
+const originalPublish = sweeperPorts.publishSessionEvent;
+after(() => {
+  db.query = originalQuery;
+  sweeperPorts.publishSessionEvent = originalPublish;
+});
+
+let timeline: Step[] = [];
+let published: Array<Record<string, unknown>> = [];
 
 /**
  * Answer the reap with `reaped`, the sibling close with `closed`, and anything
@@ -35,16 +53,33 @@ after(() => { db.query = originalQuery; });
  * `closed` defaults to empty, which is the common case and also the one that
  * never reaches the statement's own reporting branch -- so the tests that care
  * about that branch pass rows here rather than trusting it unexecuted.
+ *
+ * `failOn` makes the matching statement throw, which is how the durability
+ * tests reproduce a database that fails after the row has already been closed.
+ *
+ * Publishing is stubbed here rather than per-test because every fixture below
+ * now carries the `failure_reason` the reap returns, so the announce runs in
+ * tests that were written before it existed; left unstubbed they would reach
+ * the real JetStream client.
  */
 function stubDb(
   reaped: Array<Record<string, unknown>>,
   closed: Array<Record<string, unknown>> = [],
   released: Array<Record<string, unknown>> = [],
+  failOn?: RegExp,
 ): SeenQuery[] {
   const seen: SeenQuery[] = [];
+  timeline = [];
+  published = [];
+  sweeperPorts.publishSessionEvent = async (_sessionId, event) => {
+    published.push(event);
+    timeline.push({ kind: "event", type: String(event.type) });
+  };
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push({ sql, params });
+    timeline.push({ kind: "query", sql });
+    if (failOn?.test(sql)) throw new Error("db is down");
     // The reap itself is the statement without an alias; the sibling close is
     // `UPDATE claw_tasks t` and reports its own rows.
     if (sql.startsWith("UPDATE claw_tasks SET")) {
@@ -61,13 +96,18 @@ function stubDb(
   return seen;
 }
 
+/** Every column the reap's RETURNING hands the code below, as a real row has them. */
 const CHAT_RUN = {
   task_id: "t-1", session_id: "s-1", origin: "chat",
   lease_owner: "brain-a", message_id: "claw-pending-7",
+  sandbox_workload_id: null, failure_reason: "worker_lost",
+  prompt: "optimise the kernel", user_id: "u-1",
 };
 const DAG_RUN = {
   task_id: "t-2", session_id: "s-2", origin: "dag_node",
   lease_owner: "brain-a", message_id: null,
+  sandbox_workload_id: null, failure_reason: "worker_lost",
+  prompt: null, user_id: null,
 };
 
 function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
@@ -134,10 +174,12 @@ test("a run the user stopped is archived as cancelled, not as a worker we lost",
 });
 
 test("the messages that piled up behind the gate are counted, not silently left", async () => {
-  // Releasing the gate does not answer them: draining is handleComplete's job
-  // and the event that would have reached it died with the worker. They wait
-  // for the user's next message and then arrive out of order behind it, so the
-  // one thing this path can do is say how many are waiting.
+  // Releasing the gate does not itself answer them: draining is
+  // handleComplete's job, and this statement publishes nothing. The announce a
+  // few lines earlier does reach handleComplete for a worker_lost row, but only
+  // once the gate is open for it, and the rows deliberately left unannounced --
+  // a cancelled reap -- still have nobody to drain them. So the one thing this
+  // path can do for certain is say how many are waiting.
   const seen = stubDb([CHAT_RUN], [], [{ session_id: "s-1" }]);
   await reapLostLeases();
 
@@ -267,13 +309,9 @@ test("closing spare rows is not counted as a run given up on", async () => {
 // recordCompletionTurns (the sole writer of claw_conversation_turns) runs only
 // on exec_complete; reapLostLeases published none, so a later message rebuilt
 // history from an empty table and the session forgot the reaped work.
-const originalPublish = sweeperPorts.publishSessionEvent;
-after(() => { sweeperPorts.publishSessionEvent = originalPublish; });
-
+/** The events `stubDb` has captured since it was installed. */
 function captureEvents(): Array<Record<string, unknown>> {
-  const events: Array<Record<string, unknown>> = [];
-  sweeperPorts.publishSessionEvent = async (_sessionId, event) => { events.push(event); };
-  return events;
+  return published;
 }
 
 test("a reaped worker_lost chat run announces the terminal trio, carrying prompt and user_id", async () => {
@@ -318,4 +356,66 @@ test("a non-chat reaped run announces nothing", async () => {
 
   assert.equal(await reapLostLeases(), 1);
   assert.deepEqual(events, []);
+});
+
+// --- Durability: the announce must not be contingent on the statements after it.
+// The reap's own UPDATE has already put the row in a terminal status, and the
+// reap only ever selects preparing/running/cancelling -- so a throw between the
+// close and the publish loses the exec_complete for good, and no later sweep
+// can make it up. The two statements that used to run in front of it are
+// ordinary database calls, so this is not a hypothetical ordering.
+
+test("the terminal trio survives a gate release that throws", async () => {
+  const seen = stubDb([CHAT_RUN], [], [], /UPDATE claw_sessions/);
+  const events = captureEvents();
+
+  await assert.rejects(reapLostLeases(), /db is down/,
+    "the failure is still a failure; what must not happen is losing the turn with it");
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"],
+    "the row is already closed and unreachable to every later sweep, so the announce "
+      + "cannot be left downstream of a statement that can throw");
+  assert.equal(events[2].failure_reason, "worker_lost");
+  assert.equal(events[2].prompt, "optimise the kernel");
+  assert.ok(seen.some((q) => q.sql.includes("UPDATE claw_sessions")),
+    "the release was reached -- otherwise this proves nothing about the order");
+});
+
+test("the terminal trio survives a sibling close that throws", async () => {
+  // The other statement in front of it, and the earlier of the two: a throw
+  // here skips the gate release as well, so before the reorder it suppressed
+  // the announce for both reasons at once.
+  stubDb([CHAT_RUN], [], [], /UPDATE claw_tasks t SET/);
+  const events = captureEvents();
+
+  await assert.rejects(reapLostLeases(), /db is down/);
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
+});
+
+test("the gate is not opened before the turn has been announced", async () => {
+  // agent_status = 'idle' is what admits the next message, and the next message
+  // rebuilds its history from claw_conversation_turns -- which stays empty
+  // until recordCompletionTurns runs, and recordCompletionTurns runs on this
+  // exec_complete. Releasing first is a race with the reply being composed.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const doneAt = timeline.findIndex((s) => s.kind === "event" && s.type === "exec_complete");
+  const releaseAt = timeline.findIndex((s) => s.kind === "query" && s.sql.includes("UPDATE claw_sessions"));
+  assert.ok(doneAt >= 0, "the worker_lost row has to be announced at all");
+  assert.ok(releaseAt >= 0, "and the gate still has to be released");
+  assert.ok(doneAt < releaseAt, "the session was reopened for new messages before its turn was published");
+});
+
+test("the whole announce lands before either statement that follows it", async () => {
+  // Not just the exec_complete: the two events before it are the turn's own
+  // text, and a stream that gets the result without them shows an empty reply.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const lastEvent = timeline.map((s) => s.kind).lastIndexOf("event");
+  const siblingAt = timeline.findIndex(
+    (s) => s.kind === "query" && s.sql.startsWith("UPDATE claw_tasks t SET"));
+  assert.ok(siblingAt >= 0, "the sibling close still runs");
+  assert.ok(lastEvent < siblingAt,
+    "nothing that can throw belongs between the row being closed and its turn being published");
 });

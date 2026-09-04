@@ -648,10 +648,6 @@ export async function reapLostLeases(): Promise<number> {
     "sweeper.reaped_lost_leases",
   );
   const chatRows = rows.filter((row) => row.origin === "chat");
-  // Ahead of the gate release, not after it: the spare row is non-terminal, and
-  // the release refuses to act on a session with anything non-terminal left.
-  await closeUnclaimedDispatchSiblings(chatRows);
-  await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
   // A reaped chat run must still record its turn. recordCompletionTurns -- the
   // sole writer of claw_conversation_turns -- runs only on exec_complete, and
   // this reaper published none, so a later message rebuilt history from an empty
@@ -659,6 +655,23 @@ export async function reapLostLeases(): Promise<number> {
   // announce the terminal trio. worker_lost only: announceRunFailure emits
   // failed:true with no interrupted flag, so announcing the cancelled branch
   // would mislabel a user-cancelled turn as a failure.
+  //
+  // First, ahead of the two statements below, and that order is the whole
+  // durability argument rather than tidiness. The UPDATE above has already put
+  // the row in a terminal status, and this reaper's WHERE clause only ever
+  // selects `preparing`/`running`/`cancelling` -- so no later sweep can select
+  // the row a second time. Anything that throws between closing the row and
+  // publishing loses the exec_complete permanently, and with it the turn: the
+  // exact loss this announce exists to prevent. Both statements below are
+  // database calls that can throw and neither is a precondition of the
+  // announce, so neither may stand in front of it.
+  //
+  // The same order also keeps the conversation shut until its history is on its
+  // way. releaseSessionsOfLostRuns is what makes the session able to accept
+  // another message, and a message admitted before this exec_complete is
+  // published reaches buildMessages while claw_conversation_turns is still
+  // empty -- the reap would announce the turn into a reply that had already
+  // been composed without it.
   for (const row of chatRows) {
     if (row.failure_reason !== "worker_lost") continue;
     await announceRunFailure(
@@ -669,6 +682,10 @@ export async function reapLostLeases(): Promise<number> {
         + "session before resending.",
     );
   }
+  // Ahead of the gate release, not after it: the spare row is non-terminal, and
+  // the release refuses to act on a session with anything non-terminal left.
+  await closeUnclaimedDispatchSiblings(chatRows);
+  await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
   // the workload detail still exists. Best-effort because liveness cleanup must
@@ -823,14 +840,23 @@ async function countPendingBySession(
  * into a conversation that is mid-reply. Anything still non-terminal keeps the
  * gate shut and leaves the session to the reaper that judges it directly.
  *
- * What this does not do is answer the messages that piled up while the gate was
- * shut. Draining them is `handleComplete`'s job -- it takes the oldest one per
- * completion event, and the event that would have carried them died with the
- * worker -- so they wait for the user's next message, dispatch behind it, and
- * arrive out of order. Releasing the gate is still the larger half: without it
- * the next message joins them rather than getting a reply. They are counted in
- * the log below so the wait is visible while that path is still unreachable
- * from here.
+ * What this does not itself do is answer the messages that piled up while the
+ * gate was shut. Draining them is `handleComplete`'s job -- it takes the oldest
+ * one per completion event -- and this function publishes nothing. For the
+ * caller that matters most it is no longer true that no such event exists:
+ * `reapLostLeases` now announces the terminal trio for a `worker_lost` chat row
+ * just before calling this, so that turn does reach `handleComplete`, which
+ * records it and drains a message behind it. What the announce does not
+ * guarantee is when: it is published a moment earlier, while the spare row this
+ * reap is about to close may still be non-terminal, and `handleComplete` only
+ * drains once the gate opens for it. The release below is what makes that
+ * possible either way.
+ *
+ * The rows with no announce keep the old shape whole -- a `cancelled` reap,
+ * which is deliberately not announced as a failure, and any row whose publish
+ * threw and was swallowed. Their pending messages still wait for the user's
+ * next message, dispatch behind it, and arrive out of order. They are counted
+ * in the log below so that wait stays visible.
  */
 async function releaseSessionsOfLostRuns(sessionIds: string[]): Promise<void> {
   if (!sessionIds.length) return;
