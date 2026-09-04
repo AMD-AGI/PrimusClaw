@@ -21,7 +21,7 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
 import { db } from "../src/infra/db.js";
-import { reapLostLeases } from "../src/tasks/sweeper.js";
+import { reapLostLeases, sweeperPorts } from "../src/tasks/sweeper.js";
 
 interface SeenQuery { sql: string; params: unknown[] }
 
@@ -261,4 +261,61 @@ test("closing spare rows is not counted as a run given up on", async () => {
   assert.ok(siblingClose(seen), "the close still has to be attempted");
   assert.equal(sessionUpdates(seen).length, 1,
     "and the gate release still follows it -- one statement, all sessions at once");
+});
+
+// --- Defect fix: a reaped worker_lost chat run must still record its turn. ---
+// recordCompletionTurns (the sole writer of claw_conversation_turns) runs only
+// on exec_complete; reapLostLeases published none, so a later message rebuilt
+// history from an empty table and the session forgot the reaped work.
+const originalPublish = sweeperPorts.publishSessionEvent;
+after(() => { sweeperPorts.publishSessionEvent = originalPublish; });
+
+function captureEvents(): Array<Record<string, unknown>> {
+  const events: Array<Record<string, unknown>> = [];
+  sweeperPorts.publishSessionEvent = async (_sessionId, event) => { events.push(event); };
+  return events;
+}
+
+test("a reaped worker_lost chat run announces the terminal trio, carrying prompt and user_id", async () => {
+  stubDb([{
+    task_id: "t-1", session_id: "s-1", origin: "chat",
+    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
+    failure_reason: "worker_lost", prompt: "optimise the kernel", user_id: "u-1",
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
+  const done = events[2];
+  assert.equal(done.failed, true);
+  assert.equal(done.failure_reason, "worker_lost");
+  assert.equal(done.message_id, "claw-1");
+  assert.equal(done.user_id, "u-1");
+  assert.equal(done.prompt, "optimise the kernel");
+});
+
+test("a cancelled reap does not announce a failed turn", async () => {
+  // announceRunFailure emits failed:true with no interrupted flag, so a
+  // user-cancelled row must be left out or it reads as a failure.
+  stubDb([{
+    task_id: "t-1", session_id: "s-1", origin: "chat",
+    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
+    failure_reason: "cancelled", prompt: "stop", user_id: "u-1",
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events, []);
+});
+
+test("a non-chat reaped run announces nothing", async () => {
+  stubDb([{
+    task_id: "t-2", session_id: "s-2", origin: "dag_node",
+    lease_owner: "brain-a", message_id: null, sandbox_workload_id: null,
+    failure_reason: "worker_lost", prompt: null, user_id: null,
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events, []);
 });

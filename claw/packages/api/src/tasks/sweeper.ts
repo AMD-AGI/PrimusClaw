@@ -468,8 +468,15 @@ async function announceQueueTimeout(row: ExpiredQueuedRow): Promise<void> {
 }
 
 /** The terminal three events, for a reaper that closed a row out from under a turn. */
+// The subset announceRunFailure actually reads. Narrowed from ExpiredQueuedRow
+// so reapLostLeases' rows (which have no claim_count) satisfy it too.
+type AnnounceableRow = Pick<
+  ExpiredQueuedRow,
+  "task_id" | "session_id" | "message_id" | "user_id" | "prompt"
+>;
+
 async function announceRunFailure(
-  row: ExpiredQueuedRow,
+  row: AnnounceableRow,
   failureReason: string,
   finalText: string,
 ): Promise<void> {
@@ -612,7 +619,10 @@ export async function reapLostLeases(): Promise<number> {
         )
       RETURNING task_id, session_id, origin, lease_owner,
                 metadata->>'message_id' AS message_id,
-                sandbox_workload_id`,
+                sandbox_workload_id,
+                failure_reason,
+                prompt,
+                COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
     [LEASE_LOST_GRACE_SEC],
   );
   if (!r.rowCount) return 0;
@@ -623,12 +633,17 @@ export async function reapLostLeases(): Promise<number> {
     lease_owner: string | null;
     message_id: string | null;
     sandbox_workload_id: string | null;
+    failure_reason: string;
+    prompt: string | null;
+    user_id: string | null;
   }>;
   logger.warn(
     {
       reaped: r.rowCount,
       graceSec: LEASE_LOST_GRACE_SEC,
-      rows,
+      // prompt is intentionally dropped: it is user input, and RETURNING now
+      // carries it for the announce below. Everything else is diagnostic.
+      rows: rows.map(({ prompt: _prompt, ...rest }) => rest),
     },
     "sweeper.reaped_lost_leases",
   );
@@ -637,6 +652,23 @@ export async function reapLostLeases(): Promise<number> {
   // the release refuses to act on a session with anything non-terminal left.
   await closeUnclaimedDispatchSiblings(chatRows);
   await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
+  // A reaped chat run must still record its turn. recordCompletionTurns -- the
+  // sole writer of claw_conversation_turns -- runs only on exec_complete, and
+  // this reaper published none, so a later message rebuilt history from an empty
+  // table and the session forgot the work. Mirror reapExpiredDoorbellRuns and
+  // announce the terminal trio. worker_lost only: announceRunFailure emits
+  // failed:true with no interrupted flag, so announcing the cancelled branch
+  // would mislabel a user-cancelled turn as a failure.
+  for (const row of chatRows) {
+    if (row.failure_reason !== "worker_lost") continue;
+    await announceRunFailure(
+      row,
+      "worker_lost",
+      "This run lost its worker and no replacement renewed its lease before the "
+        + "sweeper closed it. Its sandbox may still be finishing work; check the "
+        + "session before resending.",
+    );
+  }
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
   // the workload detail still exists. Best-effort because liveness cleanup must
