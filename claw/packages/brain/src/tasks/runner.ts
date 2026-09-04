@@ -574,6 +574,20 @@ function clearCacheUse(state: CheckpointState): CheckpointState {
 }
 
 /**
+ * `state` carrying whatever the run currently knows about the cache entry.
+ *
+ * The two directions are mutually exclusive -- `cleared` says compaction
+ * destroyed the entry, `fresh` says it was read again -- so this is the single
+ * place that decides between them. Identity-preserving in both directions, so
+ * "did anything change" stays a test rather than a comparison.
+ */
+function overlayCacheUse(
+  state: CheckpointState, fresh: number | undefined, cleared: boolean,
+): CheckpointState {
+  return cleared ? clearCacheUse(state) : freshenCacheUse(state, fresh);
+}
+
+/**
  * The state a SIGTERM should persist, or null if it has nothing to say.
  *
  * `attempt` is this attempt's own last checkpoint and `resume` is the one the
@@ -599,7 +613,7 @@ function sigtermCheckpointState(
   cleared: boolean,
 ): CheckpointState | null {
   const overlay = (state: CheckpointState): CheckpointState => (
-    cleared ? clearCacheUse(state) : freshenCacheUse(state, fresh)
+    overlayCacheUse(state, fresh, cleared)
   );
   if (attempt) return overlay(attempt);
   if (!resume) return null;
@@ -615,6 +629,7 @@ export const __test__ = {
   runtimeSecrets,
   freshenCacheUse,
   clearCacheUse,
+  overlayCacheUse,
   sigtermCheckpointState,
 };
 
@@ -1541,9 +1556,22 @@ class TaskRunner {
         // write issued before a sync completed is how a repair used to clear
         // `has_workspace_sync` on a run that had in fact synced, which sends
         // the next attempt to restore from S3 instead of the shared disk.
+        //
+        // The cache-use overlay is re-applied rather than taken from the
+        // snapshot. `latestCheckpointState` is the state the agent loop handed
+        // over at the last turn BOUNDARY, and the SIGTERM path deliberately
+        // writes a state overlaid with what the run learned after it -- the
+        // snapshot it was built from is never written back. A repair landing
+        // after that write would otherwise republish the pre-overlay
+        // timestamp, undoing the correction and reporting the cache entry as
+        // older than the run knows it to be. Same source as the SIGTERM's own
+        // overlay, so the two agree by construction.
         if (!isRepair && this.latestCheckpointState) {
           return await this.writeKvCheckpoint(
-            this.latestCheckpointState, this.currentWorkspaceInfo(), kind, true,
+            overlayCacheUse(
+              this.latestCheckpointState, this.latestCacheUseAt, this.cacheUseCleared,
+            ),
+            this.currentWorkspaceInfo(), kind, true,
           );
         }
         // Either there was no newer state to restore, or this IS the repair

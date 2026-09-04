@@ -406,6 +406,13 @@ export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
  * has no business being able to decrypt a conversation.
  */
 export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
+// Read once, then taken out of the environment. A session owner supplies its
+// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
+// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
+// environment is a key that can be asked for by name and shipped out as an
+// Authorization header. Nothing else reads it from process.env, and dropping it
+// here also keeps it out of every stdio MCP child process we spawn.
+delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
 
