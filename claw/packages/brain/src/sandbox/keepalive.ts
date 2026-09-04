@@ -499,10 +499,56 @@ export function ageBackgroundWorkCacheForTest(ms: number): void {
  * A handle with no URL or token predates this and cannot be asked; it answers
  * idle, which is what the sweep did before the question existed.
  */
-function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWork {
-  if (!info.handsUrl || !info.token) return "idle";
+/**
+ * Where a verdict came from, for the tick counters.
+ *
+ * Worth reporting because the three sources fail differently and the failures
+ * look identical from outside: `none` dominating means answers are not reaching
+ * the sweeps that read them, which is the shape of the bug this sharing was
+ * added to fix, while `handle` dominating is that same sharing working.
+ */
+/**
+ * Per-tick counters for the scan line.
+ *
+ * Aggregated rather than logged per handle: the interesting quantity is the
+ * shape of a whole sweep, and a line per handle per replica per minute is a
+ * volume nobody reads. The specific gap these close is that `unknown` -> keep
+ * was silent -- the branch the fleet was stuck in for four hours emitted
+ * nothing, so a stalled reclaim loop and a healthy quiet one produced identical
+ * logs. `bgUnknown` high with `expired` at zero across consecutive ticks is that
+ * stall, visible without a debug build.
+ */
+interface TickStats {
+  /** Idle handles by background-work answer. */
+  bgRunning: number; bgUnknown: number; bgIdle: number;
+  /** Where those answers came from; see VerdictSource. */
+  fromMem: number; fromHandle: number; fromNone: number; fromNoHands: number;
+  /** What happened to the handles answered `idle`. */
+  expired: number; withinWindow: number; keptLocal: number; keptRunLease: number;
+  /** Probes this tick decided to start. */
+  probes: number;
+}
+
+function newTickStats(): TickStats {
+  return {
+    bgRunning: 0, bgUnknown: 0, bgIdle: 0,
+    fromMem: 0, fromHandle: 0, fromNone: 0, fromNoHands: 0,
+    expired: 0, withinWindow: 0, keptLocal: 0, keptRunLease: 0,
+    probes: 0,
+  };
+}
+
+type VerdictSource = "mem" | "handle" | "none" | "no-hands";
+
+function peekBackgroundWork(
+  identity: string,
+  info: HandsKvEntry,
+): { state: BackgroundWork; source: VerdictSource } {
+  if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
   const cached = bgProbeCache.get(identity);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
+  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) {
+    return { state: cached.state, source: "mem" };
+  }
   // The handle's own copy, which any replica can read. Checked second because
   // the in-process one is newer when it exists at all -- this is the answer for
   // the far more common case of a handle whose last probe ran on some other
@@ -512,9 +558,9 @@ function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWor
     && Date.now() - info.bgCheckedAt < BG_VERDICT_TTL_MS
     && typeof info.bgRunning === "number"
   ) {
-    return info.bgRunning > 0 ? "running" : "idle";
+    return { state: info.bgRunning > 0 ? "running" : "idle", source: "handle" };
   }
-  return "unknown";
+  return { state: "unknown", source: "none" };
 }
 
 /**
@@ -772,6 +818,7 @@ async function forEachWithLimit<T>(
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
+  stats: TickStats,
 ): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
   const probeCandidates: Array<{
@@ -829,10 +876,21 @@ async function collectTargets(
           namespace: info.namespace,
         });
         seenIdentities.add(identity);
-        const bgWork = info.keepalive === false
+        const peeked = info.keepalive === false
           ? peekBackgroundWork(identity, info)
-          : "idle";
+          : { state: "idle" as BackgroundWork, source: null };
+        const bgWork = peeked.state;
+        if (info.keepalive === false) {
+          if (bgWork === "running") stats.bgRunning += 1;
+          else if (bgWork === "unknown") stats.bgUnknown += 1;
+          else stats.bgIdle += 1;
+          if (peeked.source === "mem") stats.fromMem += 1;
+          else if (peeked.source === "handle") stats.fromHandle += 1;
+          else if (peeked.source === "none") stats.fromNone += 1;
+          else if (peeked.source === "no-hands") stats.fromNoHands += 1;
+        }
         if (info.keepalive === false && needsProbe(identity, info)) {
+          stats.probes += 1;
           // The generation is read here, not at dispatch. The candidate is a
           // judgement about the handle as this scan found it -- idle, unprobed
           // -- and dispatch happens after the whole walk, so a registerSandbox
@@ -867,6 +925,7 @@ async function collectTargets(
               { sessionId, workloadId: info.workloadId },
               "keepalive.idle_handle_kept_locally_active",
             );
+            stats.keptLocal += 1;
             continue;
           }
           if (expired && await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
@@ -879,12 +938,15 @@ async function collectTargets(
               { sessionId, workloadId: info.workloadId },
               "keepalive.idle_handle_kept_run_in_flight",
             );
+            stats.keptRunLease += 1;
             continue;
           }
           if (expired) {
             await deps.kv.delete(key, { previousSeq: e.revision }).catch(() => {});
+            stats.expired += 1;
             logger.info({ sessionId, workloadId: info.workloadId }, "keepalive.idle_handle_expired");
           } else {
+            stats.withinWindow += 1;
             // Refresh the TTL only, no ping -- and conditionally, because an
             // unconditional put bumps the revision that ensureHands is holding
             // while it reactivates this very handle. Losing the race is the
@@ -1025,7 +1087,8 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
-  const targets = await collectTargets(deps, seenIdentities);
+  const stats = newTickStats();
+  const targets = await collectTargets(deps, seenIdentities, stats);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
@@ -1074,15 +1137,22 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     }
   }
 
-  if (!targets.size) return;
-
+  // Ahead of the early return, because a sweep with no ping targets is not a
+  // sweep with nothing to say: a fleet that is entirely idle reclaims its pods
+  // through exactly that path, and logging only when something is left to ping
+  // makes the successful case the invisible one.
   const localCount = localRegistry.size;
   const kvOnlyCount = targets.size - localCount;
-  logger.info(
-    { total: targets.size, local: localCount, kvOnly: kvOnlyCount,
-      sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
-    "keepalive.tick_scan",
-  );
+  if (targets.size || seenIdentities.size) {
+    logger.info(
+      { total: targets.size, local: localCount, kvOnly: kvOnlyCount,
+        seen: seenIdentities.size, ...stats,
+        sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
+      "keepalive.tick_scan",
+    );
+  }
+
+  if (!targets.size) return;
 
   // Rotated, so a sweep that cannot finish does not always give up on the same
   // tail. Ordering is otherwise insertion order, which is stable across sweeps.
