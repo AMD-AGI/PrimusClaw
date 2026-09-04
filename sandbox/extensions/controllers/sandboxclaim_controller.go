@@ -25,13 +25,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // TODO: These constants should be imported from the main controller package.

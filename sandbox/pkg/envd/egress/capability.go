@@ -7,8 +7,9 @@ package egress
 
 import (
 	"fmt"
-	"log/slog"
 	"syscall"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // Linux capability constants.
@@ -35,7 +36,7 @@ func DropNetCapabilities() error {
 		if err := prctlCapBsetDrop(cap.id); err != nil {
 			return fmt.Errorf("drop %s: %w", cap.name, err)
 		}
-		slog.Info("egress: dropped capability", "cap", cap.name)
+		log.Info("egress: dropped capability", "cap", cap.name)
 	}
 	return nil
 }

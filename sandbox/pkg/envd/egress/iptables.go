@@ -5,10 +5,11 @@ package egress
 
 import (
 	"fmt"
-	"log/slog"
 	"syscall"
 
 	"github.com/coreos/go-iptables/iptables"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -40,7 +41,7 @@ func AddEnvDProxyGroup() error {
 	if err := syscall.Setgroups(groups); err != nil {
 		return fmt.Errorf("setgroups: %w", err)
 	}
-	slog.Info("egress: added envd-proxy supplementary group", "gid", EnvDProxyGID)
+	log.Info("egress: added envd-proxy supplementary group", "gid", EnvDProxyGID)
 	return nil
 }
 
@@ -57,7 +58,7 @@ func SetupIPTables() error {
 	gid := fmt.Sprintf("%d", EnvDProxyGID)
 
 	major, minor, patch := ipt.GetIptablesVersion()
-	slog.Info("egress: setting up iptables",
+	log.Info("egress: setting up iptables",
 		"gid", gid, "proxyPort", proxyPort,
 		"iptablesVersion", fmt.Sprintf("%d.%d.%d", major, minor, patch))
 
@@ -92,11 +93,11 @@ func SetupIPTables() error {
 		return fmt.Errorf("output chain jump: %w", err)
 	}
 
-	slog.Info("egress: iptables v4 rules configured")
+	log.Info("egress: iptables v4 rules configured")
 
 	// Block all non-loopback IPv6 outbound TCP from non-EnvD processes.
 	if err := setupIPv6Drop(gid); err != nil {
-		slog.Warn("egress: ip6tables setup failed (non-fatal, IPv6 may not be available)", "error", err)
+		log.Warn("egress: ip6tables setup failed (non-fatal, IPv6 may not be available)", "error", err)
 	}
 
 	return nil
@@ -125,7 +126,7 @@ func setupIPv6Drop(gid string) error {
 		return fmt.Errorf("ipv6 output jump: %w", err)
 	}
 
-	slog.Info("egress: ip6tables DROP rules configured")
+	log.Info("egress: ip6tables DROP rules configured")
 	return nil
 }
 
@@ -139,7 +140,7 @@ func CleanupIPTables() {
 		_ = ipt6.Delete(filterTable, outputChain, "-p", "tcp", "-j", egressChain)
 		_ = ipt6.ClearAndDeleteChain(filterTable, egressChain)
 	}
-	slog.Info("egress: iptables rules cleaned up")
+	log.Info("egress: iptables rules cleaned up")
 }
 
 func ensureChain(ipt *iptables.IPTables, table, chain string) error {

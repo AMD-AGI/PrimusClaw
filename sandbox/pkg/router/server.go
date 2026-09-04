@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -70,17 +70,17 @@ func New(
 	// Initialize SaFE API Key client (when auth is enabled)
 	if cfg.EnableAuth {
 		if cfg.SafeAPIURL == "" {
-			slog.Error("--enable-auth requires --safe-api-url to be set")
+			log.Error("--enable-auth requires --safe-api-url to be set")
 		} else {
 			s.safeClient = safe.NewClient(cfg.SafeAPIURL)
-			slog.Info("SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
+			log.Info("SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
 		}
 	}
 
 	// Initialize SessionManager
 	sm, err := NewSessionManager(st, cfg.WorkloadManagerURL)
 	if err != nil {
-		slog.Warn("SessionManager init failed (WORKLOAD_MANAGER_URL not set?)", "error", err)
+		log.Warn("SessionManager init failed (WORKLOAD_MANAGER_URL not set?)", "error", err)
 	} else {
 		s.sessionManager = sm
 	}
@@ -96,7 +96,7 @@ func New(
 			IdentityNamespace, IdentitySecretName, err)
 	}
 	s.jwt = mgr
-	slog.Info("JWT: RSA key pair ready")
+	log.Info("JWT: RSA key pair ready")
 
 	s.setupRoutes()
 	return s, nil
@@ -129,7 +129,7 @@ func (s *Server) setupRoutes() {
 		// the legacy upstream-provided identity headers.
 		v1.Use(stripUntrustedIdentityHeaders())
 		v1.Use(s.safeAuthMiddleware())
-		slog.Info("SaFE API Key auth middleware enabled on /v1/ routes")
+		log.Info("SaFE API Key auth middleware enabled on /v1/ routes")
 	}
 
 	// ── Data plane: invocation routes (handled locally) ──────────────────
@@ -177,7 +177,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("router listening", "port", s.cfg.Port)
+		log.Info("router listening", "port", s.cfg.Port)
 		errCh <- srv.ListenAndServe()
 	}()
 	select {
@@ -270,7 +270,7 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 	)
 	info, err := s.sessionManager.GetSandboxBySession(requestContext, sessionID, namespace, name, kind)
 	if err != nil {
-		slog.Error("GetSandboxBySession failed",
+		log.Error("GetSandboxBySession failed",
 			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
 		errMsg := err.Error()
 
@@ -395,7 +395,7 @@ func logRouterExecute(c *gin.Context, sessionID, namespace, workloadID, invokePa
 	if json.Unmarshal(body, &payload) != nil {
 		return
 	}
-	slog.Info("router.execute",
+	log.Info("router.execute",
 		"sessionId", sessionID,
 		"namespace", namespace,
 		"workloadId", workloadID,
@@ -426,7 +426,7 @@ func (s *Server) refreshActivityWhileAlive(ctx context.Context, sessionID string
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Warn("router: session activity refresh did not land",
+			log.Warn("router: session activity refresh did not land",
 				"sessionId", sessionID, "error", err)
 		}
 	}
