@@ -19,6 +19,7 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 import { closeChatRun } from "../src/tasks/chat-run.js";
 import { db } from "../src/infra/db.js";
@@ -525,4 +526,91 @@ test("a consumer arriving after the reap finds the spare row already accounted f
 
   assert.equal(spare.failure_reason, "dispatch_retried",
     "a terminal row is outside closeChatRun's open-status predicate, whenever the event lands");
+});
+
+/**
+ * Read back what the sweeper's own logger actually emitted while `run` ran.
+ *
+ * The logger is a module-private pino instance writing to fd 1, so there is no
+ * object to swap and nothing arrives at `process.stdout.write`. What can be
+ * held is the sink underneath it: pino hands the serialized line to `fs.write`,
+ * so borrowing that for the duration of the call leaves the real `logger.warn`
+ * -- real serializers, real JSON -- on the path and reads the exact bytes the
+ * process was about to emit. Swallowed rather than forwarded, so the captured
+ * lines do not also land in the test output.
+ *
+ * `waitFor` is the `msg` the caller is after. The sink batches: if a write from
+ * an earlier test is still in flight when this one is logged, the line is
+ * buffered and handed over a tick or two later, so returning as soon as `run`
+ * resolves reads an empty list about as often as not.
+ */
+async function captureLogLines(
+  run: () => Promise<unknown>,
+  waitFor: string,
+): Promise<string[]> {
+  const lines: string[] = [];
+  const realWrite = fs.write as unknown as (...args: unknown[]) => unknown;
+  const realWriteSync = fs.writeSync as unknown as (...args: unknown[]) => unknown;
+  const take = (chunk: unknown) => {
+    for (const line of String(chunk).split("\n")) if (line) lines.push(line);
+  };
+  fs.write = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWrite(fd, chunk, ...rest);
+    take(chunk);
+    // Reporting the full length matters: a short count reads as a partial
+    // write and the sink reissues the rest, forever.
+    const done = rest[rest.length - 1];
+    if (typeof done === "function") done(null, Buffer.byteLength(String(chunk)), chunk);
+    return undefined;
+  }) as unknown as typeof fs.write;
+  fs.writeSync = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWriteSync(fd, chunk, ...rest);
+    take(chunk);
+    return Buffer.byteLength(String(chunk));
+  }) as unknown as typeof fs.writeSync;
+  try {
+    await run();
+    const wanted = `"msg":${JSON.stringify(waitFor)}`;
+    for (let i = 0; i < 500 && !lines.some((line) => line.includes(wanted)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  } finally {
+    fs.write = realWrite as unknown as typeof fs.write;
+    fs.writeSync = realWriteSync as unknown as typeof fs.writeSync;
+  }
+  return lines;
+}
+
+test("the reap log records the run without carrying its prompt", async () => {
+  // Distinctive enough that a leak anywhere in the emitted line is unambiguous,
+  // and long enough not to collide with a substring of anything else logged.
+  const CANARY = "PROMPT-CANARY-6f2b91c4-a07d-4e33-9c5a-1d8ef0b73a52-never-log-me";
+  stubDb([{ ...CHAT_RUN, prompt: CANARY }]);
+
+  const lines = await captureLogLines(() => reapLostLeases(), "sweeper.reaped_lost_leases");
+  const record = lines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((entry) => entry.msg === "sweeper.reaped_lost_leases");
+  assert.ok(record, "the reap logs one line per sweep; without it there is nothing to check");
+
+  const logged = (record.rows as Array<Record<string, unknown>>)[0];
+  // Absent, not blanked: an empty string is still a field a future change can
+  // start filling in, and a redacted one still says how long the prompt was.
+  assert.equal(Object.prototype.hasOwnProperty.call(logged, "prompt"), false,
+    "the prompt is user input and has no business in an operational log line");
+  assert.ok(!lines.some((line) => line.includes(CANARY)),
+    "nor anywhere else in what the sweep emitted");
+
+  // The drop is narrow: everything else the RETURNING produces is diagnostic
+  // and is what makes the line worth having.
+  assert.deepEqual(logged, {
+    task_id: "t-1",
+    session_id: "s-1",
+    origin: "chat",
+    lease_owner: "brain-a",
+    message_id: "claw-pending-7",
+    sandbox_workload_id: null,
+    failure_reason: "worker_lost",
+    user_id: "u-1",
+  });
 });
