@@ -204,6 +204,50 @@ test("parseMultiNodePromptFlags accepts both `--flag value` and `--flag=value`",
   assert.equal(spaced?.gpusPerNode, 4);
 });
 
+/** The same flags as a markdown bullet list, which is how a task JSON writes them. */
+const BULLET_PROMPT = `Required optimize CLI flags (forward every one verbatim):
+- \`--gpu-type mi355x\`
+- \`--model /models/GLM-5.3\`
+- \`--mn-backend infera\`
+- \`--nodes 2\`
+- \`--gpus-per-node 8\`
+- \`--cpus-per-node 64\`
+- \`--mn-image registry.example.com/primus-claw/infera:glm53\`
+- \`--pd-mode disaggregated\`
+- \`--pd-prefill-nodes 1\`
+- \`--pd-decode-nodes 1\`
+- \`--pd-transfer-backend mooncake\`
+- \`--extra-env MC_GID_INDEX=3\`
+- \`--extra-env SGLANG_USE_AITER=1\`
+`;
+
+test("parseMultiNodePromptFlags reads flags wrapped in markdown backticks", () => {
+  const spec = parseMultiNodePromptFlags(BULLET_PROMPT)!;
+  assert.ok(spec, "a bulleted prompt is still a multi-node request");
+  assert.equal(spec.nodes, 2);
+  assert.equal(spec.backend, "infera");
+  assert.equal(spec.model, "/models/GLM-5.3");
+  assert.equal(spec.image, "registry.example.com/primus-claw/infera:glm53");
+  assert.equal(spec.cpusPerNode, 64);
+  assert.equal(spec.pdMode, "disaggregated");
+  assert.equal(spec.kvTransferBackend, "mooncake");
+  assert.deepStrictEqual(spec.extraEnv, { MC_GID_INDEX: "3", SGLANG_USE_AITER: "1" });
+  assert.equal(isMultiNodeRequest({ prompt: BULLET_PROMPT }), true);
+});
+
+test("parseMultiNodePromptFlags keeps separators inside a value", () => {
+  // Only the outermost decoration goes, so a comma-separated list survives it.
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend infera --extra-env `NCCL_IB_HCA=rdma0,rdma1`",
+  )!;
+  assert.deepStrictEqual(spec.extraEnv, { NCCL_IB_HCA: "rdma0,rdma1" });
+});
+
+test("parseMultiNodePromptFlags treats a value that is only decoration as absent", () => {
+  const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera --cpus-per-node `")!;
+  assert.equal(spec.cpusPerNode, 96, "falls back to the parser.py default");
+});
+
 test("isMultiNodeRequest follows the prompt flags, not the request body", () => {
   assert.equal(isMultiNodeRequest({ prompt: REAL_PROMPT }), true);
   // Single node, or no --mn-backend: the task stays sandbox-only.
