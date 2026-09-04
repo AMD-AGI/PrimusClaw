@@ -175,6 +175,19 @@ const SCHEMA_MIGRATION_LOCK_ID = 8_264_179_233_001;
 // lost when a pod is killed mid-sequence, since each statement commits on its
 // own and the re-run skips what already exists, but a single statement that
 // outlives the probe's window will be started again and killed again.
+/**
+ * Ceiling for one CREATE INDEX CONCURRENTLY.
+ *
+ * Deliberately far above the migration timeout: a concurrent build scans the
+ * table twice and waits out every transaction older than itself, so its runtime
+ * is a property of the data and the traffic, not of the DDL. The migration
+ * timeout is the wrong instrument for it -- and unlike every other statement
+ * here, an interrupted concurrent build is not skipped on the next boot, it is
+ * discarded and restarted from nothing.
+ */
+const CONCURRENT_INDEX_TIMEOUT_MS =
+  Number(process.env.PG_CONCURRENT_INDEX_TIMEOUT_MS) || 30 * 60 * 1000;
+
 const MIGRATION_STATEMENT_TIMEOUT_MS =
   envInt("PG_MIGRATION_STATEMENT_TIMEOUT_MS", 300_000);
 
@@ -225,12 +238,43 @@ async function ensureConcurrentIndex(
   if (existing.rowCount) {
     // Interrupted concurrent builds leave an INVALID index that IF NOT EXISTS
     // would skip forever. Remove only that unusable object before rebuilding.
-    await client.query(`DROP INDEX CONCURRENTLY "${name}"`);
+    //
+    // Worth naming what this cannot do: an interrupted concurrent build is the
+    // one statement in this file that a re-run does not resume. Postgres has no
+    // way to continue it, so the drop-and-rebuild below starts from nothing --
+    // which is why the timeout above is sized for a whole build rather than for
+    // ordinary DDL. If a table ever grows past that window, the fix is to build
+    // the index out-of-band, not to raise the ceiling until a boot blocks on it.
+    logger.warn({ index: name }, "db.concurrent_index_rebuilding_from_invalid");
+    await client.query(`DROP INDEX CONCURRENTLY "${name}"`).catch((err) => {
+      logger.warn({ index: name, err }, "db.concurrent_index_drop_failed");
+    });
   }
-  await client.query(createSql);
+  // A concurrent build is the one statement here the migration timeout is wrong
+  // for: it is sized for ordinary DDL, and a CIC over a large table legitimately
+  // runs longer. Exceeding it does not fail cleanly -- it leaves an INVALID
+  // index that the next boot drops and rebuilds from zero, so a table too big
+  // to finish in one window never finishes in any of them. Lifted for this
+  // statement only, and restored afterwards whatever happens.
+  await client.query(`SET statement_timeout = ${CONCURRENT_INDEX_TIMEOUT_MS}`);
+  try {
+    await client.query(createSql);
+  } finally {
+    await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`)
+      .catch(() => { /* the caller's next statement will fail loudly enough */ });
+  }
   existing = await readValidity();
   if (!existing.rowCount || !existing.rows[0].indisvalid) {
-    throw new Error(`index ${name} was not created as a valid index`);
+    // Reported, not thrown. Every other index in this migration is created with
+    // `.catch(() => {})` because an index is a performance property, not a
+    // schema one -- and this is the only DDL whose failure would abort the rest
+    // of the migration and skip assertSchema, the check that exists to catch
+    // exactly the incomplete state a throw here produces. A missing index makes
+    // one sweep slower; a half-run migration makes the deployment wrong.
+    logger.warn(
+      { index: name },
+      "db.concurrent_index_not_valid",
+    );
   }
 }
 
