@@ -254,16 +254,40 @@ const resumeNoticeFilteredTotal = new Counter({
 // back. `breakpoints_sent > 0 && rate(cache_read) == 0` is the fingerprint
 // of this incident and of any future prefix invalidation, and neither half
 // says it alone.
+//
+// `provider` is on these three because what a wire protocol can OBSERVE
+// differs, so summing across protocols blends measurements with blind spots.
+//
+// Note what this reason is NOT: the two shapes no longer disagree about
+// whether `input_tokens` contains the cached portion -- the OpenAI path
+// normalizes that away at the read site, in the same change that added this
+// label. The coverage gap is what survives:
+//
+//   - cache_create exists only where the backend reports a write, and the
+//     self-hosted OpenAI-shaped backend reports none. Summing puts "wrote
+//     nothing" and "cannot see writes" into one number, and quietly drops a
+//     denominator term from the hit ratio on that path alone.
+//   - the TTL split is Anthropic-shaped. An OpenAI-shaped stream commonly
+//     sends no breakdown, which lands in ttl="unreported" rather than in 5m
+//     or 1h, so a mixed sum reads like a fleet that lost half its lifetimes.
+//   - `state` is derived from what the response reported, so the
+//     miss/unreported/off mix is a property of the wire before it is a
+//     property of the cache.
+//
+// A fleet that speaks one protocol today and the other tomorrow -- or both at
+// once during a rollout -- cannot be read without this label, and the reader
+// cannot tell that it is unreadable. The behavioural detectors below stay
+// unlabelled: they count events, not what a provider chose to report.
 const llmTokensTotal = new Counter({
   name: "claw_brain_llm_tokens_total",
-  help: "Prompt tokens by how they were billed. Absent kinds mean the provider cannot report them, not zero.",
-  labelNames: ["kind"],
+  help: "Prompt tokens by how they were billed, and the wire protocol that reported them. Absent kinds mean the provider cannot report them, not zero.",
+  labelNames: ["kind", "provider"],
   registers: [registry],
 });
 const llmCacheTurnsTotal = new Counter({
   name: "claw_brain_llm_cache_turns_total",
-  help: "LLM turns by prompt-cache outcome.",
-  labelNames: ["state"],
+  help: "LLM turns by prompt-cache outcome and the wire protocol that reported it.",
+  labelNames: ["state", "provider"],
   registers: [registry],
 });
 const llmCacheBreakpointsSent = new Histogram({
@@ -282,8 +306,8 @@ const llmCacheBreakpointsSent = new Histogram({
 // same as a zero and must not be read as one.
 const llmCacheWriteTokensTotal = new Counter({
   name: "claw_brain_llm_cache_write_tokens_total",
-  help: "Cache-write tokens by the lifetime the gateway actually granted.",
-  labelNames: ["ttl"],
+  help: "Cache-write tokens by the lifetime the gateway actually granted, and the wire protocol that reported it.",
+  labelNames: ["ttl", "provider"],
   registers: [registry],
 });
 const llmCacheDisabledTotal = new Counter({
@@ -531,6 +555,10 @@ export const metrics = {
    * failure this whole metric exists to catch.
    */
   onLlmTurnCache(input: {
+    /** Wire protocol that produced these numbers. Not decoration: the two
+     *  shapes differ in what they report at all -- cache writes, and the TTL
+     *  split -- so these counters mean different things on each. */
+    provider: "anthropic" | "openai";
     inputTokens: number;
     outputTokens: number;
     cacheRead: number;
@@ -541,21 +569,22 @@ export const metrics = {
     createdEphemeral5m?: number;
     createdEphemeral1h?: number;
   }): void {
-    llmTokensTotal.inc({ kind: "input" }, input.inputTokens);
-    llmTokensTotal.inc({ kind: "output" }, input.outputTokens);
+    const provider = input.provider;
+    llmTokensTotal.inc({ kind: "input", provider }, input.inputTokens);
+    llmTokensTotal.inc({ kind: "output", provider }, input.outputTokens);
     if (input.reported.includes("cache_read")) {
-      llmTokensTotal.inc({ kind: "cache_read" }, input.cacheRead);
+      llmTokensTotal.inc({ kind: "cache_read", provider }, input.cacheRead);
     }
     if (input.reported.includes("cache_create")) {
-      llmTokensTotal.inc({ kind: "cache_create" }, input.cacheCreate);
+      llmTokensTotal.inc({ kind: "cache_create", provider }, input.cacheCreate);
     }
     // Split the write by lifetime when the gateway said; otherwise record it
     // as unreported rather than inventing a bucket for it.
     if (input.createdEphemeral5m !== undefined || input.createdEphemeral1h !== undefined) {
-      if (input.createdEphemeral5m) llmCacheWriteTokensTotal.inc({ ttl: "5m" }, input.createdEphemeral5m);
-      if (input.createdEphemeral1h) llmCacheWriteTokensTotal.inc({ ttl: "1h" }, input.createdEphemeral1h);
+      if (input.createdEphemeral5m) llmCacheWriteTokensTotal.inc({ ttl: "5m", provider }, input.createdEphemeral5m);
+      if (input.createdEphemeral1h) llmCacheWriteTokensTotal.inc({ ttl: "1h", provider }, input.createdEphemeral1h);
     } else if (input.cacheCreate > 0 && input.reported.includes("cache_create")) {
-      llmCacheWriteTokensTotal.inc({ ttl: "unreported" }, input.cacheCreate);
+      llmCacheWriteTokensTotal.inc({ ttl: "unreported", provider }, input.cacheCreate);
     }
     llmCacheBreakpointsSent.observe(input.breakpointsSent);
     // Observed behaviour first, our configuration second. A backend that
@@ -582,7 +611,7 @@ export const metrics = {
           : input.enabled
             ? "unreported"
             : "off";
-    llmCacheTurnsTotal.inc({ state });
+    llmCacheTurnsTotal.inc({ state, provider });
   },
   /**
    * The gap is always a real measurement now: the timestamp it is taken

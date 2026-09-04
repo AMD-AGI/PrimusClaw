@@ -589,6 +589,9 @@ class AgentLoopRunner {
   private readonly depth: number;
   private readonly rawMessageCount: number;
   private readonly session: LlmSession;
+  /** Wire protocol this run's usage numbers were reported in — see the
+   *  assignment in the constructor for why the metric needs it. */
+  private readonly wireProtocol: "anthropic" | "openai";
 
   // --- Resume: pre-populated from checkpoint in the constructor ---
   private workingMessages: Message[];
@@ -760,6 +763,15 @@ class AgentLoopRunner {
     // only thing standing between this file and being testable at all.
     this.session = opts.llmSession
       ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId });
+    // Captured alongside the session because the cache metrics have to say
+    // which wire produced each number: the two protocols differ in what they
+    // report at all -- cache writes, and the TTL split -- so the same counter
+    // means different things on each. They no longer differ on whether
+    // `input_tokens` includes the cached portion; the provider normalizes that
+    // now. Deployment-wide, so reading it once here is faithful -- the one
+    // seam is opts.llmSession (tests only), which does not change the
+    // configured protocol and therefore cannot mislabel a real deployment.
+    this.wireProtocol = getProvider().name;
   }
 
   async run(): Promise<LoopResult> {
@@ -1250,6 +1262,7 @@ class AgentLoopRunner {
     }
 
     metrics.onLlmTurnCache({
+      provider: this.wireProtocol,
       inputTokens: turnUsage.input_tokens,
       outputTokens: turnUsage.output_tokens,
       cacheRead: turnUsage.cache_read,

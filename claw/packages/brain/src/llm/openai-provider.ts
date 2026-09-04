@@ -280,7 +280,7 @@ async function streamingTurn(
       if (chunk.usage) {
         sawUsage = true;
         const u = chunk.usage as Record<string, any>;
-        usage.input_tokens = chunk.usage.prompt_tokens ?? 0;
+        const promptTotal = chunk.usage.prompt_tokens ?? 0;
         usage.output_tokens = chunk.usage.completion_tokens ?? 0;
         const details = u.prompt_tokens_details ?? {};
 
@@ -307,6 +307,24 @@ async function streamingTurn(
           usage.cache_create = Number(createRaw) || 0;
           reported.add("cache_create");
         }
+        // Normalize to the Anthropic split: on both paths `input_tokens` is
+        // the UNCACHED remainder, never the whole prompt.
+        //
+        // OpenAI-shaped `prompt_tokens` counts the cached portion too;
+        // Anthropic's `input_tokens` counts only what had to be read fresh.
+        // Passing the inclusive number straight through made every consumer
+        // that adds the cache fields back on count those tokens twice. That is
+        // what pinned the dashboard's
+        // cache_read/(input+cache_read+cache_create) near 0.5 on a fleet whose
+        // cache was in fact working at ~96%: the better the cache did, the
+        // lower the ratio went, which is the opposite of what a hit ratio can
+        // be allowed to do.
+        //
+        // Subtract only what the response reported -- an absent field left its
+        // counterpart at 0, so this is a no-op there rather than a silent
+        // inflation. max(0) because the arithmetic is the gateway's and a
+        // malformed usage object must not yield a negative token count.
+        usage.input_tokens = Math.max(0, promptTotal - usage.cache_read - usage.cache_create);
         const split = details.cache_creation_token_details;
         if (split && typeof split === "object") {
           created5m = split.ephemeral_5m_input_tokens ?? undefined;
@@ -402,17 +420,21 @@ async function streamingTurn(
       bodyModel,
       headerModel: capture.headerModel ?? headerModelFromStream(stream),
     }),
-    // OpenAI's prompt_tokens already counts cached tokens, unlike Anthropic's
-    // input_tokens, which reports only the uncached remainder. Adding the
-    // cache fields on top here would double-count and halve the effective
-    // compaction threshold on this path.
+    // The whole prompt, which is what compaction measures itself against --
+    // and now literally the same expression the Anthropic provider uses,
+    // because `usage.input_tokens` is normalized to the uncached remainder on
+    // both paths at the read site above. Before that normalization this field
+    // had to bypass the sum to avoid double-counting the cached portion; the
+    // sum is now the only correct way to recover the total.
     //
     // `undefined` rather than 0 when no usage arrived at all, for the reason
     // spelled out in the Anthropic provider: a gateway that omits usage would
     // otherwise pin the compaction trigger at zero for the whole run.
     // stream_options.include_usage is requested, but not every
     // OpenAI-compatible gateway honours it.
-    promptTokens: sawUsage ? usage.input_tokens : undefined,
+    promptTokens: sawUsage
+      ? usage.input_tokens + usage.cache_read + usage.cache_create
+      : undefined,
     cacheReport: {
       breakpointsSent,
       // Recomputed here, not the pre-request `useMarkers`: the latch is thrown

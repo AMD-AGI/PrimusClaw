@@ -252,3 +252,41 @@ test("a turn whose usage never arrived is unreported, not a miss", async () => {
   assert.equal(await counter("claw_brain_llm_cache_turns_total", { state: "unreported" }), before.unreported + 1);
   assert.equal(await counter("claw_brain_llm_cache_turns_total", { state: "miss" }), before.miss);
 });
+
+test("every cache series carries the wire protocol that produced it", async () => {
+  // Without this label the two shapes are summed into one number that is true
+  // of neither: OpenAI's input_tokens already contains the cached portion and
+  // Anthropic's does not, so cache_read/(input+cache_read+cache_create) means
+  // something different depending on a mix the reader cannot see. A fleet
+  // mid-rollout speaks both at once. The label is what makes the sum legible,
+  // so an unlabelled series is a bug, not a cosmetic gap.
+  const { getProvider } = await import("../src/llm/index.js");
+  const wire = getProvider().name;
+
+  const before = await counter("claw_brain_llm_tokens_total", { kind: "cache_read", provider: wire });
+  await run({
+    usage: { input_tokens: 7, output_tokens: 3, cache_read: 4_242, cache_create: 11 },
+    cacheReport: { breakpointsSent: 1, enabled: true, reported: ["cache_read", "cache_create"] },
+  });
+  assert.equal(
+    await counter("claw_brain_llm_tokens_total", { kind: "cache_read", provider: wire }),
+    before + 4_242,
+    "tokens must be attributed to a wire protocol",
+  );
+
+  // No row of any of the three may be missing it -- an unlabelled row would
+  // silently rejoin the blended total the label exists to split.
+  const { registry } = await import("../src/infra/metrics.js");
+  for (const name of [
+    "claw_brain_llm_tokens_total",
+    "claw_brain_llm_cache_turns_total",
+    "claw_brain_llm_cache_write_tokens_total",
+  ]) {
+    const m = registry.getSingleMetric(name);
+    assert.ok(m, `${name} must be registered`);
+    const v = await m!.get();
+    for (const row of v.values as Array<{ labels?: Record<string, unknown> }>) {
+      assert.ok(row.labels?.provider, `${name} has a row with no provider label`);
+    }
+  }
+});
