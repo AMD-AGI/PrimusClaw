@@ -763,13 +763,14 @@ class AgentLoopRunner {
     // only thing standing between this file and being testable at all.
     this.session = opts.llmSession
       ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId });
-    // Captured alongside the session because it is what makes this run's token
-    // numbers interpretable downstream: the two wire protocols disagree on
-    // whether `input_tokens` already contains the cached portion, so the metric
-    // has to say which one it is looking at. Deployment-wide, so reading it
-    // once here is faithful -- the one seam is opts.llmSession (tests only),
-    // which does not change the configured protocol and therefore cannot
-    // mislabel anything in a real deployment.
+    // Captured alongside the session because the cache metrics have to say
+    // which wire produced each number: the two protocols differ in what they
+    // report at all -- cache writes, and the TTL split -- so the same counter
+    // means different things on each. They no longer differ on whether
+    // `input_tokens` includes the cached portion; the provider normalizes that
+    // now. Deployment-wide, so reading it once here is faithful -- the one
+    // seam is opts.llmSession (tests only), which does not change the
+    // configured protocol and therefore cannot mislabel a real deployment.
     this.wireProtocol = getProvider().name;
   }
 

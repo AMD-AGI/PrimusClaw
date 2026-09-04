@@ -64,15 +64,27 @@ export interface LlmTurnResult {
    * How big this turn's prompt actually was, in the provider's own accounting.
    *
    * `usage.input_tokens` cannot be compared against a context budget once
-   * caching works. Anthropic reports it as the UNCACHED REMAINDER -- measured
-   * on the live gateway, the same prompt reads 10,960 without a cache marker
-   * and 6 with one -- so a guard written against it silently stops firing the
-   * moment the fix lands. OpenAI's `prompt_tokens` already includes cached
-   * tokens, so the two need opposite arithmetic and only the provider knows
-   * which it is.
+   * caching works: it is the UNCACHED REMAINDER on both wires -- measured on
+   * the live gateway, the same prompt reads 10,960 without a cache marker and
+   * 6 with one -- so a guard written against it silently stops firing the
+   * moment caching starts working. This field is the whole prompt, which is
+   * the number a context budget is actually about.
+   *
+   * Both providers now compute it the same way, `input + cache_read +
+   * cache_create`, because the OpenAI path normalizes the gateway's inclusive
+   * `prompt_tokens` down to the remainder at the read site. That was not
+   * always true: the OpenAI path used to report the inclusive number as
+   * `input_tokens` and had to bypass the sum here to avoid double-counting the
+   * cached portion, which is why this doc once said the two needed opposite
+   * arithmetic. One meaning now holds on both, and the sum is the only correct
+   * way to recover the total.
    *
    * Absent from a session double, in which case callers fall back to
-   * `usage.input_tokens` and behave as they did before.
+   * `usage.input_tokens` -- the remainder, which UNDER-reports the prompt.
+   * That is a test-only path (see `cacheReport` above for why these are
+   * optional); a provider that reaches production without setting this would
+   * leave compaction comparing against a number that shrinks as the cache
+   * improves.
    */
   promptTokens?: number;
 }

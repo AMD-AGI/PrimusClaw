@@ -152,6 +152,17 @@ record it.
   and dropped the per-workload NATS credentials — on a fleet already writing
   sealed checkpoints, that is data loss rather than a rollback.
 
+- Prompt-cache token accounting on the OpenAI path. An OpenAI-shaped
+  `prompt_tokens` already contains the cached portion, where Anthropic's
+  `input_tokens` is only the uncached remainder; the OpenAI provider passed the
+  inclusive number through as `input_tokens` while also reporting the cached
+  portion separately, so every consumer that adds the cache fields back on
+  counted those tokens twice. A cache hit ratio computed as
+  `cache_read / (input + cache_read + cache_create)` therefore asymptoted to
+  0.5 as caching improved — observed at ~0.49 on a fleet whose cache was in
+  fact working at ~96%. `input_tokens` is now normalized to the uncached
+  remainder on both paths.
+
 ### Changed
 - `secret.yaml` gains `LLM_DEBUG_RESPONSE_HEADERS` (empty by default). It
   changes the rendered secret's checksum, so the first upgrade carrying it
@@ -160,6 +171,16 @@ record it.
   Helm when `secrets.existingSecret` is set, so they stay out of the release
   values. Revisions written before this change still hold them; see
   "Credentials already in the release history" in `deploy/litellm/README.md`.
+
+- **Affects existing dashboards and alerts.** The `provider` label and the
+  OpenAI-path token-accounting fix in this release both alter series already
+  being scraped, and both take effect the moment a Brain pod restarts: the
+  label splits every existing series in three of the cache metrics, and the
+  accounting fix steps `kind="input"` down to the uncached remainder. Queries
+  that `sum()` before dividing keep working and simply become correct;
+  anything matching an exact label set, or comparing across the upgrade
+  boundary, needs revisiting. There is no setting that restores the old
+  numbers — they were wrong.
 
 ### Added
 - Initial public release of PrimusClaw: the Claw agent harness (`claw/`), the
@@ -178,34 +199,14 @@ record it.
   operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.
-  What these count changes meaning with the wire protocol, so a fleet that
-  speaks both — during a rollout, or after a backend switch — previously summed
-  into a number that was true of neither and gave the reader no way to notice.
+  What a wire protocol can observe differs — the self-hosted OpenAI-shaped
+  backend reports no cache writes at all, and no TTL breakdown — so a fleet
+  that speaks both, during a rollout or after a backend switch, previously
+  summed measurements together with blind spots and gave the reader no way to
+  notice.
   The Brain dashboard's "Prompt Cache Hit Ratio" panel gained a per-provider
   token series so the split is visible, and its description now names the
   arithmetic signature of the failure the label exists to catch.
-
-### Fixed
-- Prompt-cache token accounting on the OpenAI path. An OpenAI-shaped
-  `prompt_tokens` already contains the cached portion, where Anthropic's
-  `input_tokens` is only the uncached remainder; the OpenAI provider passed the
-  inclusive number through as `input_tokens` while also reporting the cached
-  portion separately, so every consumer that adds the cache fields back on
-  counted those tokens twice. A cache hit ratio computed as
-  `cache_read / (input + cache_read + cache_create)` therefore asymptoted to
-  0.5 as caching improved — observed at ~0.49 on a fleet whose cache was in
-  fact working at ~96%. `input_tokens` is now normalized to the uncached
-  remainder on both paths.
-
-### Changed
-- **Affects existing dashboards and alerts.** Two changes above alter series
-  already being scraped, and both take effect the moment a Brain pod restarts:
-  the `provider` label splits every existing series in three of the cache
-  metrics, and the accounting fix steps `kind="input"` down to the uncached
-  remainder. Queries that `sum()` before dividing keep working and simply
-  become correct; anything matching an exact label set, or comparing across the
-  upgrade boundary, needs revisiting. There is no setting that restores the old
-  numbers — they were wrong.
 
 <!--
 Template for the next release. Drop the sections that do not apply.

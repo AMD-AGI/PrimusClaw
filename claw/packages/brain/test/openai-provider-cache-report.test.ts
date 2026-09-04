@@ -93,6 +93,14 @@ test("a write is subtracted too, and never yields a negative remainder", async (
   });
   const res2 = await buildOpenAiSession(bad, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
   assert.equal(res2.usage.input_tokens, 0, "clamped, not negative");
+  // 0 + 4_000 + 0, which is ABOVE the 1_000 the gateway claimed. That
+  // direction is the point, not an accident: promptTokens is what compaction
+  // compares against, so on a usage object that does not add up we would
+  // rather trigger early than never. Returning `promptTotal` here instead --
+  // the obvious "just report what the gateway said" simplification -- reads
+  // 1_000, which is the shape that leaves a run growing past the context
+  // window until it takes a 400 that streamTurnWithRetry does not retry.
+  assert.equal(res2.promptTokens, 4_000, "over-reports rather than under-reports");
 });
 
 test("this path declares that it cannot observe cache writes", async () => {
