@@ -29,6 +29,9 @@
  *   N3 a message dispatched immediately names the run it opened
  *   N4 a message queued behind a running turn names no run
  *   N5 an idempotent replay names the same run, not a second one
+ *   N6 a replay of an entry cached before `run_id` existed still names the run
+ *   N7 a legacy entry whose run row is gone names no run rather than a wrong one
+ *   N8 a legacy entry replayed off the busy-poll path is backfilled too
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -260,6 +263,170 @@ test("N5 an idempotent replay names the same run, not a second one", async () =>
     assert.equal(
       replay.data.message.run_id, first.data.message.run_id,
       "a retry must resolve to the run the first call started",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+/**
+ * A cache entry in the shape the handler wrote before `run_id` was part of the
+ * response: a successful create whose message block carries only the message id
+ * and `dispatched`.
+ */
+const LEGACY_MESSAGE = "claw-1700000000000";
+const LEGACY_RUN = "ktsk_cached";
+const legacyCachedCreate = {
+  ok: true,
+  data: {
+    session_id: SID, name: "s", user_id: CALLER.userId, mode: "claw",
+    agent_status: "running", parent_session_id: null, team_role: "",
+    message: { message_id: LEGACY_MESSAGE, dispatched: true },
+  },
+};
+
+/**
+ * A lock pool holding one pre-planted idempotency entry, and a `claw_tasks`
+ * that answers `rows` for the run lookup a replay of it makes.
+ *
+ * The entry is planted rather than written by a first call on purpose: the case
+ * is a request whose response was cached by the *previous* deploy, which no
+ * amount of exercising this build can produce.
+ */
+function lockPoolWithLegacyEntry(rows: Array<{ task_id: string }>): { lookups: unknown[][] } {
+  const lookups: unknown[][] = [];
+  db.lockPool.connect = (async () => ({
+    query: async (text: string, params: unknown[] = []) => {
+      const sql = text.replace(/\s+/g, " ").trim();
+      if (/FROM claw_idempotency_keys/.test(sql)) {
+        return { rows: [{ status_code: 200, response: legacyCachedCreate }], rowCount: 1 };
+      }
+      if (/FROM claw_tasks/.test(sql)) {
+        lookups.push(params);
+        return { rows, rowCount: rows.length };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => {},
+  })) as unknown as typeof db.lockPool.connect;
+  return { lookups };
+}
+
+test("N6 a replay of an entry cached before run_id existed still names the run", async () => {
+  // The cache holds a verbatim response for 24h, so for a day after this ships
+  // a replay can be served from an entry written when the field did not exist.
+  // Handing that back unchanged answers with a shape the endpoint no longer
+  // promises, and reads to the caller exactly like a create that started no run
+  // -- the one thing this response is now supposed to settle. So the id is
+  // resolved from the run the cached message actually opened.
+  dispatchOpensRun();
+  const stub = stubFor("idle");
+  const { lookups } = lockPoolWithLegacyEntry([{ task_id: LEGACY_RUN }]);
+
+  const server = await app();
+  try {
+    const res = await server.inject({
+      method: "POST",
+      url: "/v1/sessions",
+      headers: { "idempotency-key": "cached-before-the-field" },
+      payload: { name: "s", message: { content: "summarise the logs" } },
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      data: { session_id: string; message: { message_id: string; dispatched: boolean; run_id: string } };
+    };
+    assert.equal(
+      body.data.message.run_id, LEGACY_RUN,
+      "the replay names the run the cached create started",
+    );
+    assert.notEqual(
+      body.data.message.run_id, OPENED_RUN,
+      "and that id came from the lookup, not from a second dispatch",
+    );
+    assert.equal(body.data.message.message_id, LEGACY_MESSAGE, "the rest of the entry is untouched");
+    assert.equal(body.data.session_id, SID);
+    assert.ok(
+      !stub.ran(/INSERT INTO claw_sessions/),
+      "this was a replay: no second session was created",
+    );
+    assert.deepEqual(
+      lookups[0], [SID, LEGACY_MESSAGE],
+      "the run is looked up by the session and message the entry names",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("N7 a legacy entry whose run row is gone names no run rather than a wrong one", async () => {
+  // Deleting the session does not take the run row with it -- teardown cancels
+  // it in place -- so this is the entry old enough to predate chat runs having
+  // rows at all, and it is the case that decides what the backfill does when it
+  // cannot resolve. The queued path already establishes what a missing `run_id`
+  // means here, so reporting it is honest. An id minted to fill the field would
+  // be a handle to a run nobody started, which is worse than the omission.
+  dispatchOpensRun();
+  stubFor("idle");
+  lockPoolWithLegacyEntry([]);
+
+  const server = await app();
+  try {
+    const res = await server.inject({
+      method: "POST",
+      url: "/v1/sessions",
+      headers: { "idempotency-key": "cached-and-since-deleted" },
+      payload: { name: "s", message: { content: "summarise the logs" } },
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { data: { message: Record<string, unknown> } };
+    assert.ok(!("run_id" in body.data.message), "nothing was invented to fill the field");
+    assert.equal(body.data.message.dispatched, true, "the cached entry is otherwise replayed as-is");
+  } finally {
+    await server.close();
+  }
+});
+
+test("N8 a legacy entry replayed off the busy-poll path is backfilled too", async () => {
+  // The other replay site: the advisory lock timed out, so this request holds
+  // no lock connection and polls the cache through the main pool instead. It is
+  // reached exactly when the system is degraded, which is no reason to answer a
+  // shape the endpoint stopped promising.
+  dispatchOpensRun();
+  stubFor("idle", (sql) => {
+    if (/FROM claw_idempotency_keys/.test(sql)) {
+      return [{ status_code: 200, response: legacyCachedCreate }];
+    }
+    if (/FROM claw_tasks/.test(sql)) return [{ task_id: LEGACY_RUN }];
+    return [];
+  });
+  // A lock acquire that times out: 55P03 is what lock_timeout raises, and it is
+  // what sends the create down the poll-and-replay path.
+  db.lockPool.connect = (async () => ({
+    query: async (text: string) => {
+      if (/pg_advisory_lock/.test(text)) {
+        throw Object.assign(new Error("lock_not_available"), { code: "55P03" });
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => {},
+  })) as unknown as typeof db.lockPool.connect;
+
+  const server = await app();
+  try {
+    const res = await server.inject({
+      method: "POST",
+      url: "/v1/sessions",
+      headers: { "idempotency-key": "cached-and-contended" },
+      payload: { name: "s", message: { content: "summarise the logs" } },
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { data: { message: { run_id: string } } };
+    assert.equal(
+      body.data.message.run_id, LEGACY_RUN,
+      "the contended replay names the run the cached create started",
     );
   } finally {
     await server.close();

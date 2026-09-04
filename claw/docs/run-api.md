@@ -127,6 +127,15 @@ API's `task_id`, and it stays the public name for a run through the planned rena
 the underlying table; callers should store `run_id` and not depend on the two being
 spelled the same.
 
+A response cached under an `Idempotency-Key` by a release that predates `run_id` is
+still replayed, and the replay resolves the field rather than handing back the older
+shape: a stored `POST /v1/sessions` body whose `data.message` carries only a
+`message_id` is answered with the id of the run that message opened, so a retry landing
+on a day-old entry reads as it would have had the first call been made against this
+release. Nothing is minted to fill the field. On the rare entry whose run cannot be
+resolved the reply is returned as it was stored, without a `run_id`, which is to be read
+the same way as the queued path below -- find the run by filtering on the session.
+
 One gap remains, and it is the queued-message path described under "Run identity": a
 message accepted while the session is busy has no run to name yet. A later release
 creates that run when the input is accepted, at which point every response that accepts
