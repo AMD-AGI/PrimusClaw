@@ -25,7 +25,7 @@ import { StringCodec } from "nats";
 import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
-  backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest,
+  backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest, markHandsIdle,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -203,7 +203,8 @@ test("a handle carrying running work is kept by a replica that never probed it",
 
 test("a run of failed probes is not restarted by the sweeps that walk elsewhere", async () => {
   // `unknown` holds the handle, which is right for a blip and wrong forever, so
-  // five consecutive failures settle it to idle locally. A failed probe caches
+  // a run longer than the tolerance of five -- the sixth consecutive failure --
+  // settles it to idle locally. A failed probe caches
   // nothing on purpose -- only a measured answer is worth reusing -- and the
   // streak used to be reaped whenever no cached answer accompanied it. Under the
   // rotation this module runs under that is most ticks, so the count restarted
@@ -295,5 +296,217 @@ test("a verdict is not stamped onto whatever took the key while the probe was ou
   assert.equal(
     after.bgCheckedAt, undefined,
     "and stamping it fresh is what makes every reader believe it for the TTL",
+  );
+});
+
+// The interval between two probes of the same identity is the interval the
+// streak has to survive, and it is not the one the shared verdict is sized for.
+// A verdict is read by whichever replica sweeps next; a streak is in-process, so
+// only the replica that failed can add to it, and it waits out the rotation
+// multiplied by the replica count. Measured at about thirty-six minutes here
+// against a thirty-minute memory: every failure aged out before the same replica
+// could fail again, the count never left one, and the give-up path existed
+// without ever being able to fire.
+const SAME_REPLICA_REVISIT_MS = 36 * 60_000;
+
+test("a run of failures accumulates across the interval the same replica returns on", async () => {
+  const k = fakeKv();
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+
+  // Each pass is one visit by this replica; the clock moves by a whole revisit
+  // interval before the next one, which is the gap the real cadence has.
+  for (let i = 0; i < 12; i++) {
+    await sweep(deps);
+    // Stop the clock once the give-up has settled: the answer it caches is
+    // believed for the short in-process TTL, and another revisit interval on top
+    // of it would age out the very thing the next sweep has to read.
+    if (backgroundWorkStateSizesForTest().cache > 0) break;
+    ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
+  }
+
+  assert.ok(
+    backgroundWorkStateSizesForTest().cache > 0,
+    "six failures spaced by the interval this replica actually returns on are "
+      + "still six consecutive failures; a memory shorter than that gap forgets "
+      + "each one before the next arrives and the tolerance is never reached",
+  );
+
+  // And the give-up has to be readable by the sweep that follows it, which is
+  // the point of settling to idle at all.
+  await sweep(deps);
+  assert.ok(
+    k.deleted.includes(KEY),
+    "a Hands that has stopped answering entirely must eventually give its pod "
+      + "back rather than hold it to the CR's absolute deadline",
+  );
+});
+
+test("a streak is not dropped by an unrelated verdict aging out", async () => {
+  // The two are remembered on different clocks and for different reasons, and a
+  // failed probe caches no verdict at all -- so a verdict crossing its own TTL
+  // says nothing about a run of failures recorded minutes ago. Clearing both
+  // from one place meant an answer about work that finished half an hour ago
+  // erased the evidence that Hands has been unreachable since.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // A measured answer first, so there is something with its own TTL to expire.
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: the verdict has to be cached before it can age out",
+  );
+
+  // Old enough to be re-probed, not old enough to be reaped.
+  ageBackgroundWorkCacheForTest(25 * 60_000);
+
+  const failing = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("hands unreachable"); },
+  };
+  for (let i = 0; i < 4; i++) await sweep(failing);
+  assert.equal(
+    backgroundWorkStateSizesForTest().streaks, 1,
+    "sanity: four recent failures are on the books",
+  );
+
+  // The old verdict crosses its TTL. The failures are minutes old.
+  ageBackgroundWorkCacheForTest(6 * 60_000);
+  // Walked elsewhere, so nothing can quietly recreate what the reap removes.
+  k.setVisible(false);
+  await sweep(failing);
+
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 0,
+    "sanity: the verdict did age out, which is what the reap is being asked to do",
+  );
+  assert.equal(
+    backgroundWorkStateSizesForTest().streaks, 1,
+    "the run of failures is fresh and unrelated to the answer that expired; "
+      + "reaping it here restarts the count and the give-up never arrives",
+  );
+});
+
+// --- two answers, and which of them is the newer one ---
+
+test("a newer answer on the handle outranks this replica's older one", async () => {
+  // The in-process copy is usually the newer one, and the code took that for a
+  // rule. It is not: another replica probes the same handle on its own
+  // rotation, so a local answer from four minutes ago is still inside its TTL
+  // while a `running` measured elsewhere two minutes ago sits unread on the
+  // entry. Preferring the local one reclaims a pod that the more recent
+  // measurement says is busy.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  assert.equal(
+    backgroundWorkStateSizesForTest().cache, 1,
+    "sanity: this replica has its own `idle` answer to prefer",
+  );
+
+  // Time passes, and another replica asks after we did and finds work running.
+  ageBackgroundWorkCacheForTest(2 * 60_000);
+  k.substitute({ bgCheckedAt: Date.now(), bgRunning: 3 });
+
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the freshest measurement of the sandbox says three shells are running in "
+      + "it; an older local answer is not a reason to take the pod away",
+  );
+});
+
+// --- an answer belongs to an idle period, not just to a sandbox ---
+
+test("a new idle period does not inherit the last one's verdict", async () => {
+  // Identity does not change when the same pod is handed back to a task and
+  // idled again -- same session, same workload, same key -- so the identity
+  // guard cannot see this. The verdict is re-serialized onto the entry by the
+  // very write that opens the next idle period, which republishes an answer
+  // about the period before it to the whole fleet at the moment the sweep
+  // starts acting on it.
+  const k = fakeKv();
+  stubPingableProvider();
+  k.substitute({ idleEpoch: 1_000 });
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  assert.equal(k.current().bgRunning, 0, "sanity: the idle answer was recorded");
+  assert.equal(k.current().bgEpoch, 1_000, "and against the period it measured");
+
+  // The next message arrives, the task runs, and it ends: markHandsIdle puts the
+  // same handle back into the idle pool. Whatever that task started, nothing
+  // measured before it ran knows about.
+  markHandsIdle(k.kv, SESSION, "wl-v");
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    k.current().bgCheckedAt, undefined,
+    "the answer was taken about the idle period before the task; carrying it "
+      + "over suppresses pinging a pod whose new task may have left a shell running",
+  );
+  assert.equal(k.current().bgRunning, undefined, "and the count with it");
+  assert.notEqual(
+    k.current().idleEpoch, 1_000,
+    "the new idle period has to be distinguishable from the old one at all",
+  );
+});
+
+test("a replica does not trust a verdict from before the handle was reactivated", async () => {
+  // The clearing above is one writer's cooperation. The read has to be able to
+  // reject the answer on its own too: an entry written by a Brain from before
+  // this existed, or a probe from the previous period that landed after the
+  // reactivation, both leave a fresh-looking verdict scoped to a period that has
+  // ended.
+  const k = fakeKv();
+  stubPingableProvider();
+  k.substitute({
+    idleSince: 0, idleEpoch: 2_000,
+    bgCheckedAt: Date.now(), bgRunning: 0, bgEpoch: 1_000,
+  });
+
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "an `idle` measured before the task ran is not evidence about the sandbox "
+      + "after it; the sweep has to ask again rather than reclaim on it",
+  );
+});
+
+test("an answer is not filed against the idle period that started while it was out", async () => {
+  // The mirror of the substitution guard, for the case where the sandbox is the
+  // same one: the probe is in the air, the pod is handed to a task and idled
+  // again, and the answer lands on an entry whose period it never looked at.
+  const k = fakeKv();
+  stubPingableProvider();
+  k.substitute({ idleEpoch: 1_000 });
+
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => {
+      // Reactivated and idled again while the probe was outstanding.
+      k.substitute({ idleEpoch: 2_000 });
+      return 0;
+    },
+  });
+
+  assert.equal(k.current().idleEpoch, 2_000, "sanity: the new period stood");
+  assert.equal(
+    k.current().bgCheckedAt, undefined,
+    "the shell count was taken during the previous idle period; stamping it "
+      + "fresh here makes every replica believe it for the whole verdict TTL",
   );
 });

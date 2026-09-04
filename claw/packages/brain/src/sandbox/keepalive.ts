@@ -56,6 +56,18 @@ interface HandsKvEntry {
   /** Epoch ms when the handle became idle; used to expire it after the window. */
   idleSince?: number;
   /**
+   * Identifies the idle period `idleSince` opened.
+   *
+   * Separate from `idleSince` because that one moves: refreshIdleSince slides it
+   * forward every tick under a sandbox that is still working, so it says when
+   * the handle was last seen busy rather than which idle period this is. This
+   * one is stamped once, by markHandsIdle, and a handle taken back by a task and
+   * idled again gets a new value -- which is what tells a background-work
+   * verdict measured during the previous idle period apart from one measured
+   * during this one. Absent on entries written before it existed.
+   */
+  idleEpoch?: number;
+  /**
    * The last background-work answer, and when it was taken.
    *
    * On the handle rather than only in memory because the sweep that asks and the
@@ -70,6 +82,18 @@ interface HandsKvEntry {
   bgCheckedAt?: number;
   /** Shell count from that answer. 0 means the sandbox had nothing running. */
   bgRunning?: number;
+  /**
+   * The `idleEpoch` the verdict above was measured under, so it is only believed
+   * while it is still about the idle period it measured.
+   *
+   * Sandbox identity does not close this: the same pod is handed back to a task
+   * and idled again under the same identity, so an `idle` answer taken before
+   * the task ran would otherwise still be answering for the sandbox after it --
+   * including for a background shell that task started. Absent, like
+   * `idleEpoch`, on entries written before either existed; the two are then
+   * equal, which is the behaviour those entries already had.
+   */
+  bgEpoch?: number;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -308,6 +332,15 @@ export function markHandsIdle(
 
       info.keepalive = false;
       info.idleSince = Date.now();
+      // A new idle period, so the verdict from the last one is not about it.
+      // forgetBackgroundWork above drops this replica's copy; the handle is
+      // where every OTHER replica reads it, and it is re-serialized here either
+      // way -- so leaving the fields alone republishes a stale answer to the
+      // whole fleet at the exact moment the sweep starts acting on it.
+      info.idleEpoch = info.idleSince;
+      delete info.bgCheckedAt;
+      delete info.bgRunning;
+      delete info.bgEpoch;
       // Conditioned on the revision just read, because a session teardown can
       // delete this entry between the read and the write. An unconditional put
       // would resurrect the handle of a deleted session, and collectTargets
@@ -390,10 +423,24 @@ const BG_VERDICT_TTL_MS = 30 * 60_000;
  * its handle until the CR's absolute deadline.
  *
  * Each failure re-stamps the entry, so this only has to outlive the gap between
- * two consecutive probes of the same identity -- the same gap BG_VERDICT_TTL_MS
- * is sized for, hence the same number -- not the whole run of five.
+ * two consecutive probes of the same identity -- not the whole run of five. But
+ * that gap is not the one BG_VERDICT_TTL_MS is sized for. A verdict is read by
+ * whichever replica sweeps next, so it has to survive until ANY replica returns
+ * to the handle -- about six minutes here. A streak is in-process, owned by the
+ * replica that failed, so it has to survive until THAT replica returns, which is
+ * the same rotation multiplied by the replica count: about thirty-six minutes on
+ * this cluster, and more on a bigger one or a larger bucket of handles. Thirty
+ * minutes is inside that gap, so every failure aged out before the same replica
+ * could fail again and the streak never left one.
+ *
+ * Four hours is that measured gap with room for a fleet several times the size,
+ * because the two directions are not symmetrical. Too short and the give-up path
+ * exists but can never fire, which is the bug above. Too long and a run of
+ * failures separated by hours is treated as consecutive -- a Hands that failed
+ * five times over an afternoon is not one anybody wants pinned either, and the
+ * only thing it costs is one integer per identity until the reap below.
  */
-const BG_UNKNOWN_STREAK_TTL_MS = BG_VERDICT_TTL_MS;
+const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
 
 /**
  * How many probes may be in flight across the whole sweep.
@@ -449,7 +496,10 @@ let pingCursor = 0;
 
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
-const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
+const bgProbeCache = new Map<
+  string,
+  { at: number; state: BackgroundWork; epoch?: number }
+>();
 const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
 /**
@@ -465,11 +515,24 @@ const bgGeneration = new Map<string, number>();
 /** Where the last sweep stopped handing out probe slots. */
 let bgProbeCursor = 0;
 
-/** Drop the cached verdict for one sandbox identity, and invalidate any
- *  answer still in the air about it. */
+/**
+ * Drop the cached verdict for one sandbox identity, and invalidate any answer
+ * still in the air about it.
+ *
+ * Deliberately not the unknown streak. The two are reaped on different clocks
+ * -- see BG_UNKNOWN_STREAK_TTL_MS -- and this function is called from the
+ * verdict reap, so clearing both here meant one identity's answer crossing its
+ * thirty-minute TTL wiped a run of failures recorded minutes ago. Nothing links
+ * the two: a failed probe caches no verdict at all, so the streak is about
+ * probes that produced nothing to reap.
+ *
+ * What clears a streak is a probe that succeeds, which is what "consecutive"
+ * means, or the streak's own age. Reuse leaves it: the URL and the Hands behind
+ * it are the same process across a reuse, so failures to reach it are still the
+ * most recent thing known about reaching it.
+ */
 function forgetBackgroundWork(identity: string): void {
   bgProbeCache.delete(identity);
-  bgUnknownStreak.delete(identity);
   bgGeneration.set(identity, (bgGeneration.get(identity) ?? 0) + 1);
 }
 
@@ -517,36 +580,6 @@ export function ageBackgroundWorkCacheForTest(ms: number): void {
 }
 
 /**
- * Whether an idle handle's sandbox still has background work running in it.
- *
- * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
- * idle handle is never pinged, so the control-plane GC reclaims the pod about
- * fifteen minutes later. That is right when the sandbox is only a warm cache for
- * the next message. It is wrong when the turn left something running: Claw's own
- * rule is that a `run_in_background` shell outlives the turn that started it --
- * "the user is still there, and a shell started this turn is expected to still
- * be running when they ask about it in the next one, which is the reason
- * background shells exist at all" -- and reclaiming the pod kills it anyway. The
- * two policies contradicted each other; this is the side that reads the fact.
- *
- * Asked with the session as the owner, which is the key Hands files shells under
- * for everything except a DAG node (there it is the DAG root, and a DAG node's
- * shells are reaped when it finishes, so there is nothing left to protect). Not
- * `runScope`: that is the run *lease* key, a workspace id under
- * RUN_GATE_KEY=workspace, and it would match no owner at all.
- *
- * A handle with no URL or token predates this and cannot be asked; it answers
- * idle, which is what the sweep did before the question existed.
- */
-/**
- * Where a verdict came from, for the tick counters.
- *
- * Worth reporting because the three sources fail differently and the failures
- * look identical from outside: `none` dominating means answers are not reaching
- * the sweeps that read them, which is the shape of the bug this sharing was
- * added to fix, while `handle` dominating is that same sharing working.
- */
-/**
  * Per-tick counters for the scan line.
  *
  * Aggregated rather than logged per handle: the interesting quantity is the
@@ -577,28 +610,88 @@ function newTickStats(): TickStats {
   };
 }
 
+/**
+ * Where a verdict came from, for the tick counters.
+ *
+ * Worth reporting because the three sources fail differently and the failures
+ * look identical from outside: `none` dominating means answers are not reaching
+ * the sweeps that read them, which is the shape of the bug this sharing was
+ * added to fix, while `handle` dominating is that same sharing working.
+ */
 type VerdictSource = "mem" | "handle" | "none" | "no-hands";
 
+/**
+ * Whether a verdict is still about the idle period the handle is in now.
+ *
+ * Both fields absent is an entry from before either existed, and those compare
+ * equal -- the verdict is believed exactly as it was before this check.
+ */
+function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): boolean {
+  return (verdictEpoch ?? null) === (info.idleEpoch ?? null);
+}
+
+/** This replica's own last answer, if it is fresh enough to reuse and still
+ *  about the idle period the handle is in. */
+function usableCachedVerdict(
+  identity: string,
+  info: HandsKvEntry,
+): { at: number; state: BackgroundWork } | null {
+  const cached = bgProbeCache.get(identity);
+  if (!cached) return null;
+  if (Date.now() - cached.at >= BG_PROBE_TTL_MS) return null;
+  if (!sameIdlePeriod(cached.epoch, info)) return null;
+  return cached;
+}
+
+/** The handle's own copy, which any replica can read, under the same two rules
+ *  and its own longer TTL. */
+function usableSharedVerdict(info: HandsKvEntry): { at: number; state: BackgroundWork } | null {
+  if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
+  if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
+  if (!sameIdlePeriod(info.bgEpoch, info)) return null;
+  return { at: info.bgCheckedAt, state: info.bgRunning > 0 ? "running" : "idle" };
+}
+
+/**
+ * Whether an idle handle's sandbox still has background work running in it.
+ *
+ * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
+ * idle handle is never pinged, so the control-plane GC reclaims the pod about
+ * fifteen minutes later. That is right when the sandbox is only a warm cache for
+ * the next message. It is wrong when the turn left something running: Claw's own
+ * rule is that a `run_in_background` shell outlives the turn that started it --
+ * "the user is still there, and a shell started this turn is expected to still
+ * be running when they ask about it in the next one, which is the reason
+ * background shells exist at all" -- and reclaiming the pod kills it anyway. The
+ * two policies contradicted each other; this is the side that reads the fact.
+ *
+ * Asked with the session as the owner, which is the key Hands files shells under
+ * for everything except a DAG node (there it is the DAG root, and a DAG node's
+ * shells are reaped when it finishes, so there is nothing left to protect). Not
+ * `runScope`: that is the run *lease* key, a workspace id under
+ * RUN_GATE_KEY=workspace, and it would match no owner at all.
+ *
+ * A handle with no URL or token predates this and cannot be asked; it answers
+ * idle, which is what the sweep did before the question existed.
+ */
 function peekBackgroundWork(
   identity: string,
   info: HandsKvEntry,
 ): { state: BackgroundWork; source: VerdictSource } {
   if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
-  const cached = bgProbeCache.get(identity);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) {
+  const cached = usableCachedVerdict(identity, info);
+  const shared = usableSharedVerdict(info);
+  // Whichever measurement is actually the newer one. The in-process copy is the
+  // newer one most of the time -- it is written by the probe that also wrote the
+  // handle -- but not always: another replica probes the same handle on its own
+  // rotation, so a local answer from four minutes ago is still inside its TTL
+  // while a `running` recorded elsewhere two minutes ago sits unread on the
+  // entry. Preferring the local one there reclaims a handle that a more recent
+  // measurement says is busy, which is the failure the sharing exists to stop.
+  if (cached && (!shared || cached.at >= shared.at)) {
     return { state: cached.state, source: "mem" };
   }
-  // The handle's own copy, which any replica can read. Checked second because
-  // the in-process one is newer when it exists at all -- this is the answer for
-  // the far more common case of a handle whose last probe ran on some other
-  // replica, or on this one long enough ago that the map has moved on.
-  if (
-    typeof info.bgCheckedAt === "number"
-    && Date.now() - info.bgCheckedAt < BG_VERDICT_TTL_MS
-    && typeof info.bgRunning === "number"
-  ) {
-    return { state: info.bgRunning > 0 ? "running" : "idle", source: "handle" };
-  }
+  if (shared) return { state: shared.state, source: "handle" };
   return { state: "unknown", source: "none" };
 }
 
@@ -627,8 +720,10 @@ function peekBackgroundWork(
  */
 function needsProbe(identity: string, info: HandsKvEntry): boolean {
   if (!info.handsUrl || !info.token) return false;
-  const cached = bgProbeCache.get(identity);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
+  // The same rule peekBackgroundWork reads by, so an answer the peek will not
+  // use is not an answer that suppresses asking again -- a handle whose idle
+  // period has turned over needs a fresh probe, not the previous period's.
+  if (usableCachedVerdict(identity, info)) return false;
   return !bgProbeInFlight.has(identity);
 }
 
@@ -662,6 +757,10 @@ function dispatchProbes(
     if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) break;
     const { identity, sessionId, info, generation } =
       candidates[(start + n) % candidates.length];
+    // The idle period this probe is asking about, read from the entry the scan
+    // saw. The answer is only about that period, and both places it is recorded
+    // carry it so a later period cannot inherit it.
+    const epoch = info.idleEpoch;
     if (bgProbeInFlight.has(identity)) continue;
 
     // `generation` came from the scan that formed this candidate, not from
@@ -723,14 +822,14 @@ function dispatchProbes(
           return;
         }
         const state: BackgroundWork = running > 0 ? "running" : "idle";
-        bgProbeCache.set(identity, { at: Date.now(), state });
+        bgProbeCache.set(identity, { at: Date.now(), state, epoch });
         bgUnknownStreak.delete(identity);
         // And onto the handle, so the next sweep to reach it reads the answer
         // whichever replica that turns out to be. Only the measured answer is
         // shared this way -- the give-up below infers `idle` from this replica's
         // own probes failing, which is a statement about one replica's network
         // and not something to publish to the others.
-        await persistVerdict(deps, sessionId, identity, running);
+        await persistVerdict(deps, sessionId, identity, running, epoch);
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -747,7 +846,7 @@ function dispatchProbes(
           "keepalive.background_work_check_failed",
         );
         if (streak > BG_UNKNOWN_TOLERANCE) {
-          bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
+          bgProbeCache.set(identity, { at: Date.now(), state: "idle", epoch });
           logger.warn(
             { sessionId, workloadId: info.workloadId, streak },
             "keepalive.background_work_unknown_giving_up",
@@ -782,12 +881,21 @@ function dispatchProbes(
  * either a pod kept alive on a verdict about a pod that is gone, or a working
  * one reclaimed early. The key is the session; the identity is the sandbox, and
  * the identity is what the answer was about.
+ *
+ * And only if the handle is still in the idle period that was probed. Identity
+ * does not move when the same pod is handed back to a task and idled again, so
+ * without this the answer measured before the task lands on the entry after it
+ * -- reporting an empty sandbox for a task that may have left a background shell
+ * behind. The epoch comes from the scan that formed the candidate, so a
+ * reactivation anywhere in the probe's flight is caught here as well as by the
+ * generation the promise carries.
  */
 async function persistVerdict(
   deps: KeepaliveDeps,
   sessionId: string,
   identity: string,
   running: number,
+  epoch: number | undefined,
 ): Promise<void> {
   try {
     const key = `hands.${sessionId}`;
@@ -804,10 +912,18 @@ async function persistVerdict(
       );
       return;
     }
+    if (!sameIdlePeriod(epoch, info)) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.background_work_answer_reactivated",
+      );
+      return;
+    }
     const next = sc.encode(JSON.stringify({
       ...info,
       bgCheckedAt: Date.now(),
       bgRunning: running,
+      bgEpoch: epoch,
     }));
     await deps.kv.update(key, next, e.revision);
   } catch {
