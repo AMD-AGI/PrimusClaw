@@ -22,6 +22,7 @@ import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
   registerSandbox, markHandsIdle, backgroundWorkStateSizesForTest,
+  ageBackgroundWorkCacheForTest,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -654,6 +655,13 @@ test("generation bookkeeping does not grow without bound", async () => {
   };
   await runKeepaliveTickForTest(empty);
   await new Promise((r) => setImmediate(r));
+  await runKeepaliveTickForTest(empty);
+
+  // Absence alone deliberately does not collect a verdict: a sweep walks a
+  // rotating slice of the handles, so "not in this tick" is the normal state of
+  // a live sandbox and reaping on it discarded answers before the sweep that
+  // would read them. Age is the bound, so the test spends the age.
+  ageBackgroundWorkCacheForTest(60 * 60_000);
   await runKeepaliveTickForTest(empty);
   // Every map the helper exposes, not just the generations: "nothing is left
   // behind" is the claim, and each of these is a separate per-identity entry

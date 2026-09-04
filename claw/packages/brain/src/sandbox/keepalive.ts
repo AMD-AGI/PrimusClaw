@@ -55,6 +55,21 @@ interface HandsKvEntry {
   keepalive?: boolean;
   /** Epoch ms when the handle became idle; used to expire it after the window. */
   idleSince?: number;
+  /**
+   * The last background-work answer, and when it was taken.
+   *
+   * On the handle rather than only in memory because the sweep that asks and the
+   * sweep that reads are not the same process. A Brain replica walks a rotating
+   * slice of the handles -- one per tick on this cluster -- so a given handle
+   * comes back to a given replica on the order of tens of minutes, and any
+   * in-process cache has expired by then even when nothing evicts it. Left
+   * in-memory the verdict is written by whoever probed and read by nobody: every
+   * sweep sees `unknown`, `unknown` is the keep branch, and an idle handle whose
+   * work has ended is pinged until the CR's absolute deadline.
+   */
+  bgCheckedAt?: number;
+  /** Shell count from that answer. 0 means the sandbox had nothing running. */
+  bgRunning?: number;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -333,6 +348,17 @@ const BG_PROBE_TTL_MS = 5 * 60_000;
  * decides anything and short enough that a dead sandbox is not held for hours.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
+/**
+ * How long the verdict recorded on the handle is believed.
+ *
+ * Longer than BG_PROBE_TTL_MS on purpose: that one bounds how stale an answer a
+ * single replica will reuse before asking again, while this one has to outlive
+ * the gap between two sweeps that see the same handle. That gap is a function of
+ * how many handles the fleet is walking, not of anything this module controls,
+ * so the number is generous and the freshness that matters is still enforced by
+ * the probe the sweep starts anyway.
+ */
+const BG_VERDICT_TTL_MS = 30 * 60_000;
 
 /**
  * How many probes may be in flight across the whole sweep.
@@ -438,6 +464,20 @@ export function resetBackgroundWorkStateForTest(): void {
 }
 
 /**
+ * Age every cached verdict by `ms`, for tests about the reap.
+ *
+ * The reap is by age now, and the age that matters is tens of minutes -- longer
+ * than any test can wait and longer than a fake timer would reach without also
+ * moving the clock the sweep itself reads. This moves only the cache's own
+ * stamps, which is the one input the reap consults.
+ */
+export function ageBackgroundWorkCacheForTest(ms: number): void {
+  for (const [identity, cached] of bgProbeCache) {
+    bgProbeCache.set(identity, { ...cached, at: cached.at - ms });
+  }
+}
+
+/**
  * Whether an idle handle's sandbox still has background work running in it.
  *
  * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
@@ -463,6 +503,17 @@ function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWor
   if (!info.handsUrl || !info.token) return "idle";
   const cached = bgProbeCache.get(identity);
   if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
+  // The handle's own copy, which any replica can read. Checked second because
+  // the in-process one is newer when it exists at all -- this is the answer for
+  // the far more common case of a handle whose last probe ran on some other
+  // replica, or on this one long enough ago that the map has moved on.
+  if (
+    typeof info.bgCheckedAt === "number"
+    && Date.now() - info.bgCheckedAt < BG_VERDICT_TTL_MS
+    && typeof info.bgRunning === "number"
+  ) {
+    return info.bgRunning > 0 ? "running" : "idle";
+  }
   return "unknown";
 }
 
@@ -589,6 +640,12 @@ function dispatchProbes(
         const state: BackgroundWork = running > 0 ? "running" : "idle";
         bgProbeCache.set(identity, { at: Date.now(), state });
         bgUnknownStreak.delete(identity);
+        // And onto the handle, so the next sweep to reach it reads the answer
+        // whichever replica that turns out to be. Only the measured answer is
+        // shared this way -- the give-up below infers `idle` from this replica's
+        // own probes failing, which is a statement about one replica's network
+        // and not something to publish to the others.
+        await persistVerdict(deps, sessionId, running);
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -615,6 +672,44 @@ function dispatchProbes(
       .finally(() => { bgProbeInFlight.delete(identity); });
   }
   bgProbeCursor = start + started;
+}
+
+/**
+ * Record a measured background-work answer onto the handle itself.
+ *
+ * Re-reads instead of reusing the revision the sweep was holding: the answer
+ * lands well after the walk that asked for it, and the entry has normally been
+ * rewritten since -- by this same sweep's TTL refresh, if by nothing else.
+ * Writing against the stale revision would fail every time, and that failure is
+ * indistinguishable from success from here, because the write is best-effort.
+ *
+ * Only the two fields are set; the rest is carried over from the entry as just
+ * read, so a concurrent writer's change to any other field survives unless it
+ * landed inside this read-modify-write -- which is what the conditional update
+ * catches.
+ */
+async function persistVerdict(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  running: number,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    const e = await deps.kv.get(key);
+    if (!e) return;
+    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    const next = sc.encode(JSON.stringify({
+      ...info,
+      bgCheckedAt: Date.now(),
+      bgRunning: running,
+    }));
+    await deps.kv.update(key, next, e.revision);
+  } catch {
+    // A revision conflict means another writer got there first, and any other
+    // failure leaves the handle with no verdict -- which reads back as
+    // `unknown`, the branch that keeps the sandbox rather than reclaiming one
+    // that may still be working.
+  }
 }
 
 /**
@@ -936,16 +1031,32 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
   }
-  // Same for the background-work bookkeeping, which is keyed by sandbox identity
-  // rather than by target: an identity the sweep no longer sees is one nothing
-  // will ask about again, and its cached answer would otherwise outlive the pod
-  // it was about.
-  // Keyed on what the sweep saw, not on what it decided to ping: an `idle`
-  // answer is exactly the case where the handle does not become a target, so
-  // reaping on targets threw away the answer at the end of every tick and asked
-  // again on the next one -- which is the load the cache exists to remove.
-  for (const identity of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
-    if (!seenIdentities.has(identity)) forgetBackgroundWork(identity);
+  // The background-work bookkeeping is reaped by age, not by whether this sweep
+  // happened to see the identity.
+  //
+  // "Not seen" looks like it means "the pod is gone", and it does not. A sweep
+  // walks the handles the KV walk returned this tick, which on a multi-replica
+  // Brain is a rotating slice -- so an identity is absent from most sweeps while
+  // its sandbox is perfectly alive, and reaping on absence discarded every
+  // verdict about a minute after it was written, long before the sweep that
+  // would have read it. `unknown` then became the permanent answer, `unknown` is
+  // the branch that keeps the handle, and idle sandboxes were pinged until the
+  // CR's absolute deadline instead of being reclaimed.
+  //
+  // Age is the property that actually says an answer is no longer worth
+  // believing, and it bounds the maps on its own: an identity nothing probes
+  // again stops being refreshed and falls out one TTL later.
+  const verdictFloor = Date.now() - BG_VERDICT_TTL_MS;
+  for (const [identity, cached] of [...bgProbeCache.entries()]) {
+    if (cached.at < verdictFloor) forgetBackgroundWork(identity);
+  }
+  // A streak with no cached answer and no probe outstanding belongs to nothing:
+  // whatever was failing has either succeeded (which clears the streak) or
+  // stopped being asked about.
+  for (const identity of [...bgUnknownStreak.keys()]) {
+    if (!bgProbeCache.has(identity) && !bgProbeInFlight.has(identity)) {
+      bgUnknownStreak.delete(identity);
+    }
   }
   // Generations outlive the two maps above on purpose -- a bumped generation is
   // what discards an in-flight answer, so it has to survive the answer -- but
