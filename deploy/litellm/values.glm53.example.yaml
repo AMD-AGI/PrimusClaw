@@ -1,23 +1,15 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# Example private Helm values for routing glm-5.3 to an OpenAI-compatible /v1
-# service. Copy this file, replace api_base, then deploy with
-# LITELLM_VALUES_FILE=/path/to/values.yaml. Skip interactive /models
-# discovery; it overwrites modelList from the file.
+# Example private Helm values for glm-5-3. Copy this file, replace api_base,
+# then deploy with LITELLM_VALUES_FILE. Skip interactive /models discovery.
 #
-# This file only registers the model on LiteLLM. It does not change Claw Brain
-# or add streaming patches. Point Brain at glm-5.3 separately (LLM_API_STYLE=openai,
-# DEFAULT_MODEL=glm-5.3 matching model_name below).
-#
-# glm-5.3 has no dedicated upstream key. api_key: dummy is only for an
-# unauthenticated local backend. LiteLLM still requires a non-empty api_key
-# on openai/* routes; the placeholder is not read by the backend.
+# api_key: dummy is a placeholder required by openai/* routes.
 
 modelList:
-  - model_name: glm-5.3
+  - model_name: glm-5-3
     litellm_params:
-      model: openai/glm-5.3
+      model: openai/glm-5-3
       api_base: https://example.invalid/v1
       api_key: dummy
     model_info:

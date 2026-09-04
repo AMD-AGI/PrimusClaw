@@ -524,3 +524,51 @@ export async function withHandsTimeout<T>(
     if (signal && abortListener) signal.removeEventListener("abort", abortListener);
   }
 }
+
+/**
+ * How many background shells are still running for `owner`.
+ *
+ * A free function rather than a method because the caller that needs it most is
+ * the keepalive sweep, which walks KV entries and has a URL and a token but no
+ * client: building one there would mean constructing an MCP client to make one
+ * plain HTTP call.
+ *
+ * Throws on transport or status failure rather than reporting zero. Zero and
+ * "could not tell" lead to opposite decisions -- the first says a sandbox is
+ * free, the second says nothing at all -- and a caller that cannot see the
+ * difference will eventually reclaim a sandbox because Hands was briefly
+ * unreachable.
+ *
+ * That applies to every way the answer can fail to arrive, not just the ones
+ * with a status code. A 200 whose body is missing `running`, or carries
+ * something that is not a count, is a Hands that did not answer the question --
+ * an older build without the route behind a proxy that rewrites 404s, a
+ * truncated body, a JSON error object. Defaulting those to zero reports a
+ * confirmed absence of work, which is the one thing this must never invent.
+ *
+ * An empty owner is refused for the same reason and in the same direction: it
+ * names no bucket, so no count about it can be true. Reporting zero would say
+ * the sandbox is free on the strength of a question nobody asked.
+ */
+export async function countActiveShells(
+  url: string,
+  token: string,
+  owner: string,
+  timeoutMs = 5_000,
+): Promise<number> {
+  if (!owner) throw new Error("hands_active_shells_failed: empty owner");
+  const resp = await undiciFetch(handsEndpoint(url, "/internal/shells/active"), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ owner }),
+    signal: AbortSignal.timeout(timeoutMs),
+    dispatcher: HANDS_DISPATCHER,
+  } as Parameters<typeof undiciFetch>[1]);
+  if (!resp.ok) throw new Error(`hands_active_shells_failed: status=${resp.status}`);
+  const body = await resp.json().catch(() => null) as { running?: unknown } | null;
+  const running = body?.running;
+  if (typeof running !== "number" || !Number.isFinite(running) || running < 0) {
+    throw new Error(`hands_active_shells_failed: malformed body running=${String(running)}`);
+  }
+  return running;
+}
