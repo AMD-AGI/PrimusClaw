@@ -20,6 +20,7 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
+import { closeChatRun } from "../src/tasks/chat-run.js";
 import { db } from "../src/infra/db.js";
 import { reapLostLeases, sweeperPorts } from "../src/tasks/sweeper.js";
 
@@ -381,14 +382,20 @@ test("the terminal trio survives a gate release that throws", async () => {
 });
 
 test("the terminal trio survives a sibling close that throws", async () => {
-  // The other statement in front of it, and the earlier of the two: a throw
-  // here skips the gate release as well, so before the reorder it suppressed
-  // the announce for both reasons at once.
-  stubDb([CHAT_RUN], [], [], /UPDATE claw_tasks t SET/);
+  // This one does run in front of the announce, because the consumer must not
+  // find the spare row open (see the race test below). It is therefore the one
+  // statement that could still suppress the announce by throwing -- so it is
+  // caught rather than raised, and a spare row left open is accepted as the
+  // smaller failure. reapStuckSessions is still the backstop for it.
+  const seen = stubDb([CHAT_RUN], [], [], /UPDATE claw_tasks t SET/);
   const events = captureEvents();
 
-  await assert.rejects(reapLostLeases(), /db is down/);
+  assert.equal(await reapLostLeases(), 1, "a spare row that would not close is not a failed tick");
   assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
+  assert.ok(seen.some((q) => q.sql.startsWith("UPDATE claw_tasks t SET")),
+    "the close was attempted -- otherwise this proves nothing");
+  assert.ok(seen.some((q) => q.sql.includes("UPDATE claw_sessions")),
+    "and the pass carried on to the gate release");
 });
 
 test("the gate is not opened before the turn has been announced", async () => {
@@ -399,23 +406,123 @@ test("the gate is not opened before the turn has been announced", async () => {
   stubDb([CHAT_RUN]);
   await reapLostLeases();
 
-  const doneAt = timeline.findIndex((s) => s.kind === "event" && s.type === "exec_complete");
-  const releaseAt = timeline.findIndex((s) => s.kind === "query" && s.sql.includes("UPDATE claw_sessions"));
+  const doneAt = timeline.findIndex((step) => step.kind === "event" && step.type === "exec_complete");
+  const releaseAt = timeline.findIndex(
+    (step) => step.kind === "query" && step.sql.includes("UPDATE claw_sessions"));
   assert.ok(doneAt >= 0, "the worker_lost row has to be announced at all");
   assert.ok(releaseAt >= 0, "and the gate still has to be released");
   assert.ok(doneAt < releaseAt, "the session was reopened for new messages before its turn was published");
 });
 
-test("the whole announce lands before either statement that follows it", async () => {
-  // Not just the exec_complete: the two events before it are the turn's own
-  // text, and a stream that gets the result without them shows an empty reply.
+test("the whole announce lands before the gate release, not just the exec_complete", async () => {
+  // The two events before it are the turn's own text, and a stream that gets
+  // the result without them shows an empty reply.
   stubDb([CHAT_RUN]);
   await reapLostLeases();
 
-  const lastEvent = timeline.map((s) => s.kind).lastIndexOf("event");
+  const lastEvent = timeline.map((step) => step.kind).lastIndexOf("event");
+  const releaseAt = timeline.findIndex(
+    (step) => step.kind === "query" && step.sql.includes("UPDATE claw_sessions"));
+  assert.ok(releaseAt >= 0, "the gate release still runs");
+  assert.ok(lastEvent < releaseAt,
+    "the release can throw, and nothing that can throw belongs in front of the announce");
+});
+
+test("the spare row is closed before the turn is announced", async () => {
+  // The other half of the same ordering, and it points the other way: the
+  // announce is a publish, and what reads it closes rows by message id. See
+  // the race below for what that costs when the publish goes first.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const firstEvent = timeline.findIndex((step) => step.kind === "event");
   const siblingAt = timeline.findIndex(
-    (s) => s.kind === "query" && s.sql.startsWith("UPDATE claw_tasks t SET"));
-  assert.ok(siblingAt >= 0, "the sibling close still runs");
-  assert.ok(lastEvent < siblingAt,
-    "nothing that can throw belongs between the row being closed and its turn being published");
+    (step) => step.kind === "query" && step.sql.startsWith("UPDATE claw_tasks t SET"));
+  assert.ok(siblingAt >= 0 && firstEvent >= 0);
+  assert.ok(siblingAt < firstEvent,
+    "the consumer must have nothing left to match by the time it sees the event");
+});
+
+// --- The other side of the same ordering: what reads the announce.
+// `closeChatRun` is the consumer's first step on an exec_complete, and it
+// closes every open chat row carrying the event's message id -- the spare row
+// included, stamped with the event's own worker_lost. Publishing before the
+// spare row is closed therefore races the consumer for it, and the row that
+// loses is archived as a worker that was lost on the one row in the pair no
+// worker ever held.
+
+/** The pair of rows one replayed dispatch leaves: the leased one, and the spare. */
+interface FakeRow { task_id: string; status: string; failure_reason: string | null }
+
+/**
+ * A database that answers the reap, and lets a consumer run against the same
+ * rows in the middle of it.
+ *
+ * `onExecComplete` is called from the publish, which is where a JetStream
+ * consumer that is quick enough would be: it is the reviewer's forced ordering
+ * rather than a likelihood, and forcing it is the point -- the ordering has to
+ * hold when the consumer wins the race, not merely when it usually loses.
+ */
+function stubDbWithSpare(spare: FakeRow, onExecComplete: () => Promise<void>): void {
+  sweeperPorts.publishSessionEvent = async (_sessionId, event) => {
+    published.push(event);
+    timeline.push({ kind: "event", type: String(event.type) });
+    if (event.type === "exec_complete") await onExecComplete();
+  };
+  const open = (): boolean =>
+    ["queued", "preparing", "running", "cancelling"].includes(spare.status);
+  db.query = (async (text: string, params: unknown[] = []) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    timeline.push({ kind: "query", sql });
+    if (sql.startsWith("UPDATE claw_tasks SET status = CASE")) {
+      return { rows: [CHAT_RUN], rowCount: 1 };
+    }
+    // The sibling close: the statement that knows this row was never claimed.
+    if (sql.startsWith("UPDATE claw_tasks t SET")) {
+      if (!open()) return { rows: [], rowCount: 0 };
+      spare.status = "failed";
+      spare.failure_reason = "dispatch_retried";
+      return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
+    }
+    // closeChatRun: a blanket update over every open row with this message id.
+    if (sql.startsWith("UPDATE claw_tasks SET status = $3")) {
+      if (!open() || params[5] !== CHAT_RUN.message_id) return { rows: [], rowCount: 0 };
+      spare.status = String(params[2]);
+      spare.failure_reason = params[3] === null ? null : String(params[3]);
+      return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+}
+
+test("a consumer that reads the announce first cannot brand the spare row worker_lost", async () => {
+  const spare: FakeRow = { task_id: "t-spare", status: "queued", failure_reason: null };
+  timeline = [];
+  published = [];
+  stubDbWithSpare(spare, () => closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost"));
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.notEqual(spare.failure_reason, "worker_lost",
+    "no worker ever held the spare row; the reason has to say what it was");
+  assert.deepEqual(
+    { status: spare.status, failure_reason: spare.failure_reason },
+    { status: "failed", failure_reason: "dispatch_retried" },
+  );
+  assert.ok(published.some((e) => e.type === "exec_complete"),
+    "and the turn was still announced -- the close is ordered in front of it, not instead of it");
+});
+
+test("a consumer arriving after the reap finds the spare row already accounted for", async () => {
+  // The same event, delivered late, which is the ordinary case. It must be a
+  // no-op on the spare row rather than a second verdict on it.
+  const spare: FakeRow = { task_id: "t-spare", status: "queued", failure_reason: null };
+  timeline = [];
+  published = [];
+  stubDbWithSpare(spare, async () => {});
+
+  await reapLostLeases();
+  await closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost");
+
+  assert.equal(spare.failure_reason, "dispatch_retried",
+    "a terminal row is outside closeChatRun's open-status predicate, whenever the event lands");
 });

@@ -648,6 +648,29 @@ export async function reapLostLeases(): Promise<number> {
     "sweeper.reaped_lost_leases",
   );
   const chatRows = rows.filter((row) => row.origin === "chat");
+  // Before the announce, because the announce is a publish and the consumer at
+  // the other end of it closes rows by message id. `closeChatRun` updates every
+  // open chat row carrying the reaped row's `metadata->>'message_id'`, which is
+  // exactly the set this statement exists to close -- and it stamps them with
+  // the event's own `worker_lost`. Publishing first is therefore a race the
+  // spare row can lose: it is archived as a worker that was lost, on the one
+  // row in the pair no worker ever held, and the statement below then finds
+  // nothing left to correct. Closing first leaves the consumer nothing to
+  // match, whichever of the two gets there first.
+  //
+  // Caught rather than awaited into the caller, because the ordering must not
+  // buy back the failure it was reordered away from. The row above is already
+  // terminal and this reaper's WHERE clause only ever selects
+  // `preparing`/`running`/`cancelling`, so no later sweep can select it again:
+  // anything that throws between closing the row and publishing loses that
+  // turn's exec_complete permanently. A spare row left open is a smaller
+  // failure than a turn the session forgets, and `reapStuckSessions` is still
+  // the backstop for it, so this one is logged and stepped over.
+  try {
+    await closeUnclaimedDispatchSiblings(chatRows);
+  } catch (err) {
+    logger.error({ err, ids: idsOf(chatRows) }, "sweeper.close_dispatch_siblings_failed");
+  }
   // A reaped chat run must still record its turn. recordCompletionTurns -- the
   // sole writer of claw_conversation_turns -- runs only on exec_complete, and
   // this reaper published none, so a later message rebuilt history from an empty
@@ -656,22 +679,22 @@ export async function reapLostLeases(): Promise<number> {
   // failed:true with no interrupted flag, so announcing the cancelled branch
   // would mislabel a user-cancelled turn as a failure.
   //
-  // First, ahead of the two statements below, and that order is the whole
-  // durability argument rather than tidiness. The UPDATE above has already put
-  // the row in a terminal status, and this reaper's WHERE clause only ever
-  // selects `preparing`/`running`/`cancelling` -- so no later sweep can select
-  // the row a second time. Anything that throws between closing the row and
-  // publishing loses the exec_complete permanently, and with it the turn: the
-  // exact loss this announce exists to prevent. Both statements below are
-  // database calls that can throw and neither is a precondition of the
-  // announce, so neither may stand in front of it.
+  // Ahead of the gate release below, and that order is a durability argument
+  // rather than tidiness for the same reason the try/catch above is: the gate
+  // release is a database call that can throw, it is not a precondition of the
+  // announce, and a throw in it must not be able to take the turn with it.
   //
-  // The same order also keeps the conversation shut until its history is on its
-  // way. releaseSessionsOfLostRuns is what makes the session able to accept
-  // another message, and a message admitted before this exec_complete is
-  // published reaches buildMessages while claw_conversation_turns is still
-  // empty -- the reap would announce the turn into a reply that had already
-  // been composed without it.
+  // It also keeps the conversation shut until the turn is at least on its way.
+  // releaseSessionsOfLostRuns is what makes the session able to accept another
+  // message, and a message admitted before this exec_complete is even published
+  // reaches buildMessages with nothing coming. What that order cannot promise
+  // is that the turn has been *recorded* by then: publishSessionEvent waits for
+  // JetStream to ack the message, not for the consumer to run
+  // recordCompletionTurns, so the gate can still open ahead of the write. That
+  // window is the same one reapExpiredDoorbellRuns and reapExpiredQueuedRuns
+  // have -- both announce and then release in one pass, with no primitive here
+  // that can wait on the consumer -- and closing it is a cross-service change
+  // rather than an ordering one.
   for (const row of chatRows) {
     if (row.failure_reason !== "worker_lost") continue;
     await announceRunFailure(
@@ -682,9 +705,8 @@ export async function reapLostLeases(): Promise<number> {
         + "session before resending.",
     );
   }
-  // Ahead of the gate release, not after it: the spare row is non-terminal, and
-  // the release refuses to act on a session with anything non-terminal left.
-  await closeUnclaimedDispatchSiblings(chatRows);
+  // After the sibling close, whose rows are non-terminal until it runs and each
+  // of which is enough on its own to make this release match nothing.
   await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
@@ -847,10 +869,11 @@ async function countPendingBySession(
  * `reapLostLeases` now announces the terminal trio for a `worker_lost` chat row
  * just before calling this, so that turn does reach `handleComplete`, which
  * records it and drains a message behind it. What the announce does not
- * guarantee is when: it is published a moment earlier, while the spare row this
- * reap is about to close may still be non-terminal, and `handleComplete` only
- * drains once the gate opens for it. The release below is what makes that
- * possible either way.
+ * guarantee is when. A publish is acked by JetStream, not by the consumer, so
+ * the drain -- and the `recordCompletionTurns` write in front of it -- happens
+ * on the consumer's own clock, which may well be after this release has opened
+ * the gate. Whichever order they land in, the release is what lets a message
+ * move at all.
  *
  * The rows with no announce keep the old shape whole -- a `cancelled` reap,
  * which is deliberately not announced as a failure, and any row whose publish
