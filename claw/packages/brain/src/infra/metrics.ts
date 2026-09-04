@@ -142,6 +142,38 @@ const checkpointSerializeDurationSeconds = new Histogram({
   registers: [registry],
 });
 
+const checkpointReadResultTotal = new Counter({
+  name: "claw_brain_checkpoint_read_result_total",
+  help: "Checkpoint reads by outcome. Every not-found branch is labelled: a read "
+    + "that returns nothing makes a run restart from turn zero, and without a "
+    + "reason these are indistinguishable from 'there was no checkpoint'.",
+  labelNames: ["reason"],
+  registers: [registry],
+});
+
+const checkpointVersionTotal = new Counter({
+  name: "claw_brain_checkpoint_version_total",
+  help: "Checkpoint reads and writes by format version. Watch this to know when "
+    + "every pod can read v4, which is the precondition for writing it.",
+  labelNames: ["op", "version"],
+  registers: [registry],
+});
+
+const checkpointSealDurationSeconds = new Histogram({
+  name: "claw_brain_checkpoint_seal_duration_seconds",
+  help: "Time spent compressing and sealing a checkpoint. onCheckpoint is awaited "
+    + "on the turn path, so this is latency the run pays.",
+  buckets: [0.001, 0.005, 0.02, 0.1, 0.5, 2],
+  registers: [registry],
+});
+
+const checkpointWriteSeqRegressedTotal = new Counter({
+  name: "claw_brain_checkpoint_write_seq_regressed_total",
+  help: "Writes dropped because a newer checkpoint for the same key had already "
+    + "been written by this process -- a post-sync rewrite that lost a race.",
+  registers: [registry],
+});
+
 const checkpointPayloadBytes = new Histogram({
   name: "claw_brain_checkpoint_payload_bytes",
   help: "Size of serialized NATS KV checkpoint payload at write time.",
@@ -627,6 +659,22 @@ export const metrics = {
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────
+  onCheckpointRead(reason: "ok" | import("../tasks/checkpoint-codec.js").DecodeFailure): void {
+    checkpointReadResultTotal.inc({ reason });
+  },
+
+  onCheckpointVersion(op: "read" | "write", version: number): void {
+    checkpointVersionTotal.inc({ op, version: String(version) });
+  },
+
+  onCheckpointSeal(durationSec: number): void {
+    checkpointSealDurationSeconds.observe(durationSec);
+  },
+
+  onCheckpointSeqRegressed(): void {
+    checkpointWriteSeqRegressedTotal.inc();
+  },
+
   onCheckpointWrite(
     kind: "turn" | "sigterm" | "post_sync",
     result: "success" | "failure",

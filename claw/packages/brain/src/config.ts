@@ -56,6 +56,18 @@ export function envSettingProblems(): readonly string[] {
   return settingProblems;
 }
 
+/**
+ * Was this specific setting given a value that had to be refused?
+ *
+ * Most refusals are worth logging and surviving: a bad CLAIM_NEXT_IDLE_MS
+ * costs a poll interval. A few decide how data is written, and running on a
+ * default nobody chose is not a survivable answer for those -- see
+ * `validateStartupConfig()`.
+ */
+export function envSettingRefused(key: string): boolean {
+  return settingProblems.some((p) => p.startsWith(`${key}=`));
+}
+
 function envInt(key: string, fallback: number, bounds?: IntSettingBounds): number {
   const setting = readIntSetting(process.env[key], bounds);
   if (setting === null) return fallback;
@@ -358,6 +370,49 @@ export const BRAIN_VERSION = env("BRAIN_VERSION", "");
 // still checks code-side `checkpointed_at` to guard against attaching
 // stale state during edge cases (drift between NATS and brain clocks).
 export const CHECKPOINT_TTL_MS = envInt("CHECKPOINT_TTL_MS", 24 * 60 * 60 * 1000);
+/**
+ * Which checkpoint format to WRITE. Readers always accept both.
+ *
+ * Defaults to 3 so that shipping the v4 reader is not the same event as
+ * starting to write v4. Roll out the reader first and let it reach every pod;
+ * a v4 checkpoint that lands on a pod which cannot read it resumes from turn
+ * zero, and during a rolling update that is exactly what would happen.
+ *
+ * There is no version that writes conversations verbatim in the clear: 3 keeps
+ * the redactor, 4 seals. The gap between them is closed on purpose, because a
+ * soak period spent writing unredacted plaintext to this bucket would be worse
+ * than the bug being fixed.
+ */
+// 3 and 4 are the only two formats there are, so this is an enumeration, not
+// a quantity: `3.5` is not a slightly-off 3 and a blank is not a considered
+// choice of 3. Truncating one or defaulting the other lands the pod on
+// redacted plaintext while the values file reads as though sealing was asked
+// for -- which is the whole failure this setting is checked for. Refuse both,
+// so `envSettingRefused()` sees them and startup stops. See
+// validateStartupConfig() in index.ts.
+export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
+  min: 3,
+  max: 4,
+  wholeNumbersOnly: true,
+  blankIsRefused: true,
+});
+/**
+ * base64 of 32 raw bytes, sealing the v4 conversation core.
+ *
+ * Its own key and its own Secret, not derived from USER_ENV_ENCRYPTION_KEY:
+ * reading a checkpoint for debugging would otherwise require the user-env
+ * vault master key, whose entire point is that not even the API hands back its
+ * plaintext. Mounted only by the Brain -- the reaper deletes directories and
+ * has no business being able to decrypt a conversation.
+ */
+export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
+// Read once, then taken out of the environment. A session owner supplies its
+// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
+// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
+// environment is a key that can be asked for by name and shipped out as an
+// Authorization header. Nothing else reads it from process.env, and dropping it
+// here also keeps it out of every stdio MCP child process we spawn.
+delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
 

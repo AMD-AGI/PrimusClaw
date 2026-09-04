@@ -106,6 +106,23 @@ record it.
 - `LLM_DEBUG_RESPONSE_HEADERS` rejects credential-bearing header names and
   names that are not valid HTTP tokens, at boot rather than per request.
 
+- Each workload can authenticate to NATS as its own least-privilege user
+  instead of the single all-access `prod` account. Off until
+  `NATS_PER_USER_WORKLOADS` names a component, so the fleet moves one at a
+  time; `NATS_RETIRE_PROD=true` removes the all-access user once nothing is
+  left on it, and refuses unless every built-in identity is deployed, adopted
+  by its workload and accepted by the NATS server -- retirement is one-way, and
+  a connection census cannot see a CronJob between sweeps. See
+  `deploy/nats-values.yaml` for the allow-lists and for the census that decides
+  about clients this repo does not deploy.
+- Brain checkpoints can be sealed with AES-256-GCM
+  (`brain.checkpointWriteVersion: 4` plus `secret.brainCheckpointKey`) instead
+  of being rewritten by the observability redactor. Off by default, and readers
+  accept both formats, so ship the reader to every pod first — `values.yaml`
+  carries the preconditions and the rollback rule. Each sealed checkpoint is
+  bound to the run that wrote it, which also closes a path where anyone able to
+  write the KV bucket could have one run replay another's conversation.
+
 ### Fixed
 - The prompt-cache loss counter no longer misses the turn after a NATS
   redelivery, no longer reports the anchor breakpoint's fixed distance as a
@@ -125,6 +142,15 @@ record it.
   **first** tool batch still writes no checkpoint at all — that case resumes
   with no timestamp, which reads as "no evidence", the detector's
   under-reporting default.
+- Checkpoints are no longer written through the redactor that masks events, so
+  a resumed run replays what was actually sent. History already in
+  `claw_conversation_turns` keeps its `<redacted>` markers; that path is
+  unchanged here.
+- `upgrade.sh` no longer strips security settings it did not know about.
+  `render_chart` rendered with chart defaults for anything a caller did not
+  pass, so an upgrade removed the checkpoint key, reset the checkpoint format
+  and dropped the per-workload NATS credentials — on a fleet already writing
+  sealed checkpoints, that is data loss rather than a rollback.
 
 ### Changed
 - `secret.yaml` gains `LLM_DEBUG_RESPONSE_HEADERS` (empty by default). It
