@@ -623,11 +623,22 @@ type VerdictSource = "mem" | "handle" | "none" | "no-hands";
 /**
  * Whether a verdict is still about the idle period the handle is in now.
  *
- * Both fields absent is an entry from before either existed, and those compare
- * equal -- the verdict is believed exactly as it was before this check.
+ * An unstamped verdict is not one, and treating two absent fields as a match is
+ * the same mistake in a quieter form: `undefined === undefined` reads as "the
+ * same period" when what it means is "no period was ever recorded". An entry the
+ * new markHandsIdle has not run on yet is exactly that -- and it does not become
+ * stamped by being probed, so the window is not the rollout, it is forever for
+ * every handle that idles without passing through this build. The verdict on one
+ * is then believed across any number of task-and-idle cycles, which is the bug
+ * the epoch exists to close.
+ *
+ * So the epoch has to be a number, and it has to match. An unstamped verdict is
+ * ignored the way a wrong-epoch one is: the handle reads `unknown`, which keeps
+ * and probes it, and the answer that comes back is stamped. The population it
+ * applies to also shrinks on its own -- see the backfill in collectTargets.
  */
 function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): boolean {
-  return (verdictEpoch ?? null) === (info.idleEpoch ?? null);
+  return typeof verdictEpoch === "number" && verdictEpoch === info.idleEpoch;
 }
 
 /** This replica's own last answer, if it is fresh enough to reuse and still
@@ -1046,6 +1057,23 @@ async function collectTargets(
         // so the answer cannot outlive the pod it was about.
         const identity = entryIdentity(sessionId, info);
         seenIdentities.add(identity);
+        // Give an unstamped idle handle its epoch here, not only in
+        // markHandsIdle. Handles that idled before this shipped never pass
+        // through that function again until their session gets another message,
+        // and until they are stamped no verdict about them can be trusted (see
+        // sameIdlePeriod) -- so without this they would be re-probed on every
+        // sweep for as long as they exist, which is the cost of the strictness
+        // above paid forever rather than once.
+        //
+        // `idleSince` is the value, because that is when the period being
+        // stamped actually began; a fresh timestamp would name a period that
+        // starts in the middle of one. It rides along on whichever write this
+        // tick was already going to make, so it costs no extra round trip.
+        let value = e.value;
+        if (info.keepalive === false && typeof info.idleEpoch !== "number") {
+          info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
+          value = sc.encode(JSON.stringify(info));
+        }
         const peeked = info.keepalive === false
           ? peekBackgroundWork(identity, info)
           : { state: "idle" as BackgroundWork, source: null };
@@ -1073,7 +1101,7 @@ async function collectTargets(
         if (info.keepalive === false && bgWork === "running") {
           await refreshIdleSince(deps, key, e.revision, info);
         } else if (info.keepalive === false && bgWork === "unknown") {
-          await deps.kv.update(key, e.value, e.revision).catch(() => {});
+          await deps.kv.update(key, value, e.revision).catch(() => {});
         }
         if (info.keepalive === false && bgWork === "idle") {
           const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
@@ -1131,7 +1159,7 @@ async function collectTargets(
             // while it reactivates this very handle. Losing the race is the
             // correct outcome: whoever won either refreshed the same TTL or
             // took the handle out of idle, and neither wants this write.
-            await deps.kv.update(key, e.value, e.revision).catch(() => {});
+            await deps.kv.update(key, value, e.revision).catch(() => {});
           }
           continue;
         }

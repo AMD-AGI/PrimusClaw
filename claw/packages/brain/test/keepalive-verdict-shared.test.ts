@@ -410,8 +410,11 @@ test("a newer answer on the handle outranks this replica's older one", async () 
   );
 
   // Time passes, and another replica asks after we did and finds work running.
+  // Same idle period on both sides -- an answer scoped to a different one, or to
+  // none, is rejected before any of this, and the question here is which of two
+  // usable answers is the newer.
   ageBackgroundWorkCacheForTest(2 * 60_000);
-  k.substitute({ bgCheckedAt: Date.now(), bgRunning: 3 });
+  k.substitute({ idleEpoch: 0, bgEpoch: 0, bgCheckedAt: Date.now(), bgRunning: 3 });
 
   await sweep({
     kv: k.kv,
@@ -509,4 +512,59 @@ test("an answer is not filed against the idle period that started while it was o
     "the shell count was taken during the previous idle period; stamping it "
       + "fresh here makes every replica believe it for the whole verdict TTL",
   );
+});
+
+test("an unstamped verdict is not read as one about the period the handle is in", async () => {
+  // The epoch check let two absent fields match, and an entry that has not been
+  // through the new markHandsIdle has exactly that shape -- no idleEpoch, and a
+  // verdict persisted onto it inherits no bgEpoch either, because there is none
+  // to record. So the check passed without ever establishing which idle period
+  // the answer came from, and nothing about being probed fixed that: the entry
+  // stayed unstamped until its session got another message, which for a handle
+  // sitting in the idle pool may be never. For those the original bug was not a
+  // rollout window, it was permanent.
+  const k = fakeKv();
+  stubPingableProvider();
+  // A handle from before any of this: past the reuse window, carrying an `idle`
+  // answer from before that -- and a task ran in between that the record has no
+  // boundary for, leaving a background shell behind.
+  k.substitute({
+    idleSince: Date.now() - 16 * 60_000,
+    bgCheckedAt: Date.now() - 17 * 60_000,
+    bgRunning: 0,
+  });
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "an answer with no period attached is not evidence about this one; acting "
+      + "on it reclaims the pod before the probe that finds the shell can land",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "and the sweep had to ask, which is what the fresh answer proves",
+  );
+  assert.equal(
+    typeof k.current().idleEpoch, "number",
+    "the entry is stamped on the way through, so it is only unusable once",
+  );
+  assert.equal(
+    k.current().bgEpoch, k.current().idleEpoch,
+    "and the answer it just took is scoped to the period it measured",
+  );
+});
+
+test("a handle with no verdict at all is still just unprobed", async () => {
+  // The strictness above is about not trusting an unscoped answer, not about
+  // treating a handle nobody has asked about yet as anything new: that one has
+  // always read `unknown`, which keeps it and probes it.
+  const k = fakeKv();
+  stubPingableProvider();
+  let asked = 0;
+
+  await sweep({ kv: k.kv, countActiveShells: async () => { asked += 1; return 0; } });
+
+  assert.equal(asked, 1, "a handle with no answer on it is a handle to ask about");
+  assert.ok(!k.deleted.includes(KEY), "and it is kept until the answer arrives");
 });

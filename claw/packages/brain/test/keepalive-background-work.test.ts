@@ -355,6 +355,7 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   // still in flight when the swap happens writes under the key it started with,
   // which nothing reads any more, instead of overwriting the new pod's state.
   let workloadId = "wl-1";
+  const idleSince = Date.now();
   const kv = {
     async keys(filter = ">") {
       const key = `hands.${SESSION}`;
@@ -363,7 +364,11 @@ test("an answer about a replaced sandbox does not land on its successor", async 
     },
     async get(key: string) {
       if (key !== `hands.${SESSION}`) return null;
-      const v = { ...ENTRY, workloadId, idleSince: Date.now() };
+      // `idleSince` is fixed rather than re-stamped per read: a KV whose stored
+      // entry changes every time it is looked at is not one, and here it would
+      // move the idle period under the sweep between the two ticks this test is
+      // about. Inside the reuse window, which is all it has to be.
+      const v = { ...ENTRY, workloadId, idleSince };
       return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
     },
     async delete() {}, async put() { return 1; },
