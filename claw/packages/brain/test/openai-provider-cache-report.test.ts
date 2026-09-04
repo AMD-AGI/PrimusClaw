@@ -37,19 +37,62 @@ function stubClient(usage: Record<string, unknown>) {
 
 const MSGS: Message[] = [{ role: "user", content: "hello" }];
 
-test("prompt size is reported as prompt_tokens, which already includes cached tokens", async () => {
-  // Anthropic reports input_tokens as the UNCACHED REMAINDER and the whole
-  // prompt is input + read + create. OpenAI's prompt_tokens is already the
-  // whole thing, so adding the cache fields on top would double-count and
-  // halve the effective compaction threshold on this path.
+test("usage is normalized to the Anthropic split: input_tokens is the uncached remainder", async () => {
+  // The two wires disagree: Anthropic's input_tokens is the UNCACHED
+  // REMAINDER, OpenAI's prompt_tokens is the WHOLE prompt. This path used to
+  // hand the inclusive number through as input_tokens, which made every
+  // consumer that adds the cache fields back on count the cached portion
+  // twice. It is normalized at the read site now, so one meaning holds on
+  // both paths and `input + read + create` is the whole prompt either way.
   const { client } = stubClient({
     prompt_tokens: 9_000, completion_tokens: 5,
     prompt_tokens_details: { cached_tokens: 8_000 },
   });
   const res = await buildOpenAiSession(client, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
-  assert.equal(res.usage.input_tokens, 9_000);
+  assert.equal(res.usage.input_tokens, 1_000, "the uncached remainder, not the whole prompt");
   assert.equal(res.usage.cache_read, 8_000);
-  assert.equal(res.promptTokens, 9_000, "must not be input + read + create");
+  // Compaction measures the whole prompt, and still gets it -- now by the same
+  // sum the Anthropic provider uses rather than by bypassing the sum.
+  assert.equal(res.promptTokens, 9_000, "the whole prompt: input + read + create");
+});
+
+test("a fully cached turn does not read as a half-cached one", async () => {
+  // The regression this normalization exists for. With the inclusive number
+  // recorded as input_tokens, the dashboard's
+  //   cache_read / (input + cache_read + cache_create)
+  // counts the cached tokens twice and asymptotes to 0.5 as the uncached
+  // remainder goes to zero -- a cache working perfectly reported ~50%, and
+  // improving it pushed the number DOWN. Pin the panel's own arithmetic.
+  const { client } = stubClient({
+    prompt_tokens: 100_000, completion_tokens: 5,
+    prompt_tokens_details: { cached_tokens: 100_000 },
+  });
+  const res = await buildOpenAiSession(client, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  const { input_tokens, cache_read, cache_create } = res.usage;
+  assert.equal(input_tokens, 0, "nothing was read fresh");
+  const ratio = cache_read / (input_tokens + cache_read + cache_create);
+  assert.equal(ratio, 1, "a fully cached turn is 100%, not 50%");
+});
+
+test("a write is subtracted too, and never yields a negative remainder", async () => {
+  // The LiteLLM gateway reports the write on the OpenAI wire as well, and it
+  // is inside prompt_tokens alongside the read. Subtract both. max(0) guards
+  // the arithmetic being the gateway's rather than ours: a usage object whose
+  // parts exceed its total must not produce a negative token count.
+  const { client } = stubClient({
+    prompt_tokens: 5_000, completion_tokens: 5,
+    prompt_tokens_details: { cached_tokens: 4_000, cache_creation_tokens: 900 },
+  });
+  const res = await buildOpenAiSession(client, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  assert.equal(res.usage.input_tokens, 100);
+  assert.equal(res.promptTokens, 5_000);
+
+  const { client: bad } = stubClient({
+    prompt_tokens: 1_000, completion_tokens: 5,
+    prompt_tokens_details: { cached_tokens: 4_000 },
+  });
+  const res2 = await buildOpenAiSession(bad, "gpt-4o").streamTurn(MSGS, [] as ToolSchema[], undefined);
+  assert.equal(res2.usage.input_tokens, 0, "clamped, not negative");
 });
 
 test("this path declares that it cannot observe cache writes", async () => {
