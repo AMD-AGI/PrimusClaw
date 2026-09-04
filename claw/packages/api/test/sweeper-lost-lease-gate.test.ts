@@ -19,14 +19,34 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
+import { closeChatRun } from "../src/tasks/chat-run.js";
 import { db } from "../src/infra/db.js";
-import { reapLostLeases } from "../src/tasks/sweeper.js";
+import { reapLostLeases, sweeperPorts } from "../src/tasks/sweeper.js";
 
 interface SeenQuery { sql: string; params: unknown[] }
 
+/**
+ * Statements and publishes in the order they actually happened.
+ *
+ * Two of the properties this file checks are orderings across the two -- the
+ * announce has to precede the gate release -- and a per-side list cannot say
+ * which came first. Recorded by both stubs into one array instead.
+ */
+type Step =
+  | { kind: "query"; sql: string }
+  | { kind: "event"; type: string };
+
 const originalQuery = db.query;
-after(() => { db.query = originalQuery; });
+const originalPublish = sweeperPorts.publishSessionEvent;
+after(() => {
+  db.query = originalQuery;
+  sweeperPorts.publishSessionEvent = originalPublish;
+});
+
+let timeline: Step[] = [];
+let published: Array<Record<string, unknown>> = [];
 
 /**
  * Answer the reap with `reaped`, the sibling close with `closed`, and anything
@@ -35,16 +55,33 @@ after(() => { db.query = originalQuery; });
  * `closed` defaults to empty, which is the common case and also the one that
  * never reaches the statement's own reporting branch -- so the tests that care
  * about that branch pass rows here rather than trusting it unexecuted.
+ *
+ * `failOn` makes the matching statement throw, which is how the durability
+ * tests reproduce a database that fails after the row has already been closed.
+ *
+ * Publishing is stubbed here rather than per-test because every fixture below
+ * now carries the `failure_reason` the reap returns, so the announce runs in
+ * tests that were written before it existed; left unstubbed they would reach
+ * the real JetStream client.
  */
 function stubDb(
   reaped: Array<Record<string, unknown>>,
   closed: Array<Record<string, unknown>> = [],
   released: Array<Record<string, unknown>> = [],
+  failOn?: RegExp,
 ): SeenQuery[] {
   const seen: SeenQuery[] = [];
+  timeline = [];
+  published = [];
+  sweeperPorts.publishSessionEvent = async (_sessionId, event) => {
+    published.push(event);
+    timeline.push({ kind: "event", type: String(event.type) });
+  };
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push({ sql, params });
+    timeline.push({ kind: "query", sql });
+    if (failOn?.test(sql)) throw new Error("db is down");
     // The reap itself is the statement without an alias; the sibling close is
     // `UPDATE claw_tasks t` and reports its own rows.
     if (sql.startsWith("UPDATE claw_tasks SET")) {
@@ -61,13 +98,18 @@ function stubDb(
   return seen;
 }
 
+/** Every column the reap's RETURNING hands the code below, as a real row has them. */
 const CHAT_RUN = {
   task_id: "t-1", session_id: "s-1", origin: "chat",
   lease_owner: "brain-a", message_id: "claw-pending-7",
+  sandbox_workload_id: null, failure_reason: "worker_lost",
+  prompt: "optimise the kernel", user_id: "u-1",
 };
 const DAG_RUN = {
   task_id: "t-2", session_id: "s-2", origin: "dag_node",
   lease_owner: "brain-a", message_id: null,
+  sandbox_workload_id: null, failure_reason: "worker_lost",
+  prompt: null, user_id: null,
 };
 
 function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
@@ -134,10 +176,12 @@ test("a run the user stopped is archived as cancelled, not as a worker we lost",
 });
 
 test("the messages that piled up behind the gate are counted, not silently left", async () => {
-  // Releasing the gate does not answer them: draining is handleComplete's job
-  // and the event that would have reached it died with the worker. They wait
-  // for the user's next message and then arrive out of order behind it, so the
-  // one thing this path can do is say how many are waiting.
+  // Releasing the gate does not itself answer them: draining is
+  // handleComplete's job, and this statement publishes nothing. The announce a
+  // few lines earlier does reach handleComplete for a worker_lost row, but only
+  // once the gate is open for it, and the rows deliberately left unannounced --
+  // a cancelled reap -- still have nobody to drain them. So the one thing this
+  // path can do for certain is say how many are waiting.
   const seen = stubDb([CHAT_RUN], [], [{ session_id: "s-1" }]);
   await reapLostLeases();
 
@@ -261,4 +305,312 @@ test("closing spare rows is not counted as a run given up on", async () => {
   assert.ok(siblingClose(seen), "the close still has to be attempted");
   assert.equal(sessionUpdates(seen).length, 1,
     "and the gate release still follows it -- one statement, all sessions at once");
+});
+
+// --- Defect fix: a reaped worker_lost chat run must still record its turn. ---
+// recordCompletionTurns (the sole writer of claw_conversation_turns) runs only
+// on exec_complete; reapLostLeases published none, so a later message rebuilt
+// history from an empty table and the session forgot the reaped work.
+/** The events `stubDb` has captured since it was installed. */
+function captureEvents(): Array<Record<string, unknown>> {
+  return published;
+}
+
+test("a reaped worker_lost chat run announces the terminal trio, carrying prompt and user_id", async () => {
+  stubDb([{
+    task_id: "t-1", session_id: "s-1", origin: "chat",
+    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
+    failure_reason: "worker_lost", prompt: "optimise the kernel", user_id: "u-1",
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
+  const done = events[2];
+  assert.equal(done.failed, true);
+  assert.equal(done.failure_reason, "worker_lost");
+  assert.equal(done.message_id, "claw-1");
+  assert.equal(done.user_id, "u-1");
+  assert.equal(done.prompt, "optimise the kernel");
+});
+
+test("a cancelled reap does not announce a failed turn", async () => {
+  // announceRunFailure emits failed:true with no interrupted flag, so a
+  // user-cancelled row must be left out or it reads as a failure.
+  stubDb([{
+    task_id: "t-1", session_id: "s-1", origin: "chat",
+    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
+    failure_reason: "cancelled", prompt: "stop", user_id: "u-1",
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events, []);
+});
+
+test("a non-chat reaped run announces nothing", async () => {
+  stubDb([{
+    task_id: "t-2", session_id: "s-2", origin: "dag_node",
+    lease_owner: "brain-a", message_id: null, sandbox_workload_id: null,
+    failure_reason: "worker_lost", prompt: null, user_id: null,
+  }]);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.deepEqual(events, []);
+});
+
+// --- Durability: the announce must not be contingent on the statements after it.
+// The reap's own UPDATE has already put the row in a terminal status, and the
+// reap only ever selects preparing/running/cancelling -- so a throw between the
+// close and the publish loses the exec_complete for good, and no later sweep
+// can make it up. The two statements that used to run in front of it are
+// ordinary database calls, so this is not a hypothetical ordering.
+
+test("the terminal trio survives a gate release that throws", async () => {
+  const seen = stubDb([CHAT_RUN], [], [], /UPDATE claw_sessions/);
+  const events = captureEvents();
+
+  await assert.rejects(reapLostLeases(), /db is down/,
+    "the failure is still a failure; what must not happen is losing the turn with it");
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"],
+    "the row is already closed and unreachable to every later sweep, so the announce "
+      + "cannot be left downstream of a statement that can throw");
+  assert.equal(events[2].failure_reason, "worker_lost");
+  assert.equal(events[2].prompt, "optimise the kernel");
+  assert.ok(seen.some((q) => q.sql.includes("UPDATE claw_sessions")),
+    "the release was reached -- otherwise this proves nothing about the order");
+});
+
+test("the terminal trio survives a sibling close that throws", async () => {
+  // This one does run in front of the announce, because the consumer must not
+  // find the spare row open (see the race test below). It is therefore the one
+  // statement that could still suppress the announce by throwing -- so it is
+  // caught rather than raised, and a spare row left open is accepted as the
+  // smaller failure. reapStuckSessions is still the backstop for it.
+  const seen = stubDb([CHAT_RUN], [], [], /UPDATE claw_tasks t SET/);
+  const events = captureEvents();
+
+  assert.equal(await reapLostLeases(), 1, "a spare row that would not close is not a failed tick");
+  assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
+  assert.ok(seen.some((q) => q.sql.startsWith("UPDATE claw_tasks t SET")),
+    "the close was attempted -- otherwise this proves nothing");
+  assert.ok(seen.some((q) => q.sql.includes("UPDATE claw_sessions")),
+    "and the pass carried on to the gate release");
+});
+
+test("the gate is not opened before the turn has been announced", async () => {
+  // agent_status = 'idle' is what admits the next message, and the next message
+  // rebuilds its history from claw_conversation_turns -- which stays empty
+  // until recordCompletionTurns runs, and recordCompletionTurns runs on this
+  // exec_complete. Releasing first is a race with the reply being composed.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const doneAt = timeline.findIndex((step) => step.kind === "event" && step.type === "exec_complete");
+  const releaseAt = timeline.findIndex(
+    (step) => step.kind === "query" && step.sql.includes("UPDATE claw_sessions"));
+  assert.ok(doneAt >= 0, "the worker_lost row has to be announced at all");
+  assert.ok(releaseAt >= 0, "and the gate still has to be released");
+  assert.ok(doneAt < releaseAt, "the session was reopened for new messages before its turn was published");
+});
+
+test("the whole announce lands before the gate release, not just the exec_complete", async () => {
+  // The two events before it are the turn's own text, and a stream that gets
+  // the result without them shows an empty reply.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const lastEvent = timeline.map((step) => step.kind).lastIndexOf("event");
+  const releaseAt = timeline.findIndex(
+    (step) => step.kind === "query" && step.sql.includes("UPDATE claw_sessions"));
+  assert.ok(releaseAt >= 0, "the gate release still runs");
+  assert.ok(lastEvent < releaseAt,
+    "the release can throw, and nothing that can throw belongs in front of the announce");
+});
+
+test("the spare row is closed before the turn is announced", async () => {
+  // The other half of the same ordering, and it points the other way: the
+  // announce is a publish, and what reads it closes rows by message id. See
+  // the race below for what that costs when the publish goes first.
+  stubDb([CHAT_RUN]);
+  await reapLostLeases();
+
+  const firstEvent = timeline.findIndex((step) => step.kind === "event");
+  const siblingAt = timeline.findIndex(
+    (step) => step.kind === "query" && step.sql.startsWith("UPDATE claw_tasks t SET"));
+  assert.ok(siblingAt >= 0 && firstEvent >= 0);
+  assert.ok(siblingAt < firstEvent,
+    "the consumer must have nothing left to match by the time it sees the event");
+});
+
+// --- The other side of the same ordering: what reads the announce.
+// `closeChatRun` is the consumer's first step on an exec_complete, and it
+// closes every open chat row carrying the event's message id -- the spare row
+// included, stamped with the event's own worker_lost. Publishing before the
+// spare row is closed therefore races the consumer for it, and the row that
+// loses is archived as a worker that was lost on the one row in the pair no
+// worker ever held.
+
+/** The pair of rows one replayed dispatch leaves: the leased one, and the spare. */
+interface FakeRow { task_id: string; status: string; failure_reason: string | null }
+
+/**
+ * A database that answers the reap, and lets a consumer run against the same
+ * rows in the middle of it.
+ *
+ * `onExecComplete` is called from the publish, which is where a JetStream
+ * consumer that is quick enough would be: it is the reviewer's forced ordering
+ * rather than a likelihood, and forcing it is the point -- the ordering has to
+ * hold when the consumer wins the race, not merely when it usually loses.
+ */
+function stubDbWithSpare(spare: FakeRow, onExecComplete: () => Promise<void>): void {
+  sweeperPorts.publishSessionEvent = async (_sessionId, event) => {
+    published.push(event);
+    timeline.push({ kind: "event", type: String(event.type) });
+    if (event.type === "exec_complete") await onExecComplete();
+  };
+  const open = (): boolean =>
+    ["queued", "preparing", "running", "cancelling"].includes(spare.status);
+  db.query = (async (text: string, params: unknown[] = []) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    timeline.push({ kind: "query", sql });
+    if (sql.startsWith("UPDATE claw_tasks SET status = CASE")) {
+      return { rows: [CHAT_RUN], rowCount: 1 };
+    }
+    // The sibling close: the statement that knows this row was never claimed.
+    if (sql.startsWith("UPDATE claw_tasks t SET")) {
+      if (!open()) return { rows: [], rowCount: 0 };
+      spare.status = "failed";
+      spare.failure_reason = "dispatch_retried";
+      return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
+    }
+    // closeChatRun: a blanket update over every open row with this message id.
+    if (sql.startsWith("UPDATE claw_tasks SET status = $3")) {
+      if (!open() || params[5] !== CHAT_RUN.message_id) return { rows: [], rowCount: 0 };
+      spare.status = String(params[2]);
+      spare.failure_reason = params[3] === null ? null : String(params[3]);
+      return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+}
+
+test("a consumer that reads the announce first cannot brand the spare row worker_lost", async () => {
+  const spare: FakeRow = { task_id: "t-spare", status: "queued", failure_reason: null };
+  timeline = [];
+  published = [];
+  stubDbWithSpare(spare, () => closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost"));
+
+  assert.equal(await reapLostLeases(), 1);
+  assert.notEqual(spare.failure_reason, "worker_lost",
+    "no worker ever held the spare row; the reason has to say what it was");
+  assert.deepEqual(
+    { status: spare.status, failure_reason: spare.failure_reason },
+    { status: "failed", failure_reason: "dispatch_retried" },
+  );
+  assert.ok(published.some((e) => e.type === "exec_complete"),
+    "and the turn was still announced -- the close is ordered in front of it, not instead of it");
+});
+
+test("a consumer arriving after the reap finds the spare row already accounted for", async () => {
+  // The same event, delivered late, which is the ordinary case. It must be a
+  // no-op on the spare row rather than a second verdict on it.
+  const spare: FakeRow = { task_id: "t-spare", status: "queued", failure_reason: null };
+  timeline = [];
+  published = [];
+  stubDbWithSpare(spare, async () => {});
+
+  await reapLostLeases();
+  await closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost");
+
+  assert.equal(spare.failure_reason, "dispatch_retried",
+    "a terminal row is outside closeChatRun's open-status predicate, whenever the event lands");
+});
+
+/**
+ * Read back what the sweeper's own logger actually emitted while `run` ran.
+ *
+ * The logger is a module-private pino instance writing to fd 1, so there is no
+ * object to swap and nothing arrives at `process.stdout.write`. What can be
+ * held is the sink underneath it: pino hands the serialized line to `fs.write`,
+ * so borrowing that for the duration of the call leaves the real `logger.warn`
+ * -- real serializers, real JSON -- on the path and reads the exact bytes the
+ * process was about to emit. Swallowed rather than forwarded, so the captured
+ * lines do not also land in the test output.
+ *
+ * `waitFor` is the `msg` the caller is after. The sink batches: if a write from
+ * an earlier test is still in flight when this one is logged, the line is
+ * buffered and handed over a tick or two later, so returning as soon as `run`
+ * resolves reads an empty list about as often as not.
+ */
+async function captureLogLines(
+  run: () => Promise<unknown>,
+  waitFor: string,
+): Promise<string[]> {
+  const lines: string[] = [];
+  const realWrite = fs.write as unknown as (...args: unknown[]) => unknown;
+  const realWriteSync = fs.writeSync as unknown as (...args: unknown[]) => unknown;
+  const take = (chunk: unknown) => {
+    for (const line of String(chunk).split("\n")) if (line) lines.push(line);
+  };
+  fs.write = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWrite(fd, chunk, ...rest);
+    take(chunk);
+    // Reporting the full length matters: a short count reads as a partial
+    // write and the sink reissues the rest, forever.
+    const done = rest[rest.length - 1];
+    if (typeof done === "function") done(null, Buffer.byteLength(String(chunk)), chunk);
+    return undefined;
+  }) as unknown as typeof fs.write;
+  fs.writeSync = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWriteSync(fd, chunk, ...rest);
+    take(chunk);
+    return Buffer.byteLength(String(chunk));
+  }) as unknown as typeof fs.writeSync;
+  try {
+    await run();
+    const wanted = `"msg":${JSON.stringify(waitFor)}`;
+    for (let i = 0; i < 500 && !lines.some((line) => line.includes(wanted)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  } finally {
+    fs.write = realWrite as unknown as typeof fs.write;
+    fs.writeSync = realWriteSync as unknown as typeof fs.writeSync;
+  }
+  return lines;
+}
+
+test("the reap log records the run without carrying its prompt", async () => {
+  // Distinctive enough that a leak anywhere in the emitted line is unambiguous,
+  // and long enough not to collide with a substring of anything else logged.
+  const CANARY = "PROMPT-CANARY-6f2b91c4-a07d-4e33-9c5a-1d8ef0b73a52-never-log-me";
+  stubDb([{ ...CHAT_RUN, prompt: CANARY }]);
+
+  const lines = await captureLogLines(() => reapLostLeases(), "sweeper.reaped_lost_leases");
+  const record = lines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((entry) => entry.msg === "sweeper.reaped_lost_leases");
+  assert.ok(record, "the reap logs one line per sweep; without it there is nothing to check");
+
+  const logged = (record.rows as Array<Record<string, unknown>>)[0];
+  // Absent, not blanked: an empty string is still a field a future change can
+  // start filling in, and a redacted one still says how long the prompt was.
+  assert.equal(Object.prototype.hasOwnProperty.call(logged, "prompt"), false,
+    "the prompt is user input and has no business in an operational log line");
+  assert.ok(!lines.some((line) => line.includes(CANARY)),
+    "nor anywhere else in what the sweep emitted");
+
+  // The drop is narrow: everything else the RETURNING produces is diagnostic
+  // and is what makes the line worth having.
+  assert.deepEqual(logged, {
+    task_id: "t-1",
+    session_id: "s-1",
+    origin: "chat",
+    lease_owner: "brain-a",
+    message_id: "claw-pending-7",
+    sandbox_workload_id: null,
+    failure_reason: "worker_lost",
+    user_id: "u-1",
+  });
 });

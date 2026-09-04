@@ -468,8 +468,15 @@ async function announceQueueTimeout(row: ExpiredQueuedRow): Promise<void> {
 }
 
 /** The terminal three events, for a reaper that closed a row out from under a turn. */
+// The subset announceRunFailure actually reads. Narrowed from ExpiredQueuedRow
+// so reapLostLeases' rows (which have no claim_count) satisfy it too.
+type AnnounceableRow = Pick<
+  ExpiredQueuedRow,
+  "task_id" | "session_id" | "message_id" | "user_id" | "prompt"
+>;
+
 async function announceRunFailure(
-  row: ExpiredQueuedRow,
+  row: AnnounceableRow,
   failureReason: string,
   finalText: string,
 ): Promise<void> {
@@ -612,7 +619,10 @@ export async function reapLostLeases(): Promise<number> {
         )
       RETURNING task_id, session_id, origin, lease_owner,
                 metadata->>'message_id' AS message_id,
-                sandbox_workload_id`,
+                sandbox_workload_id,
+                failure_reason,
+                prompt,
+                COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
     [LEASE_LOST_GRACE_SEC],
   );
   if (!r.rowCount) return 0;
@@ -623,19 +633,80 @@ export async function reapLostLeases(): Promise<number> {
     lease_owner: string | null;
     message_id: string | null;
     sandbox_workload_id: string | null;
+    failure_reason: string;
+    prompt: string | null;
+    user_id: string | null;
   }>;
   logger.warn(
     {
       reaped: r.rowCount,
       graceSec: LEASE_LOST_GRACE_SEC,
-      rows,
+      // prompt is intentionally dropped: it is user input, and RETURNING now
+      // carries it for the announce below. Everything else is diagnostic.
+      rows: rows.map(({ prompt: _prompt, ...rest }) => rest),
     },
     "sweeper.reaped_lost_leases",
   );
   const chatRows = rows.filter((row) => row.origin === "chat");
-  // Ahead of the gate release, not after it: the spare row is non-terminal, and
-  // the release refuses to act on a session with anything non-terminal left.
-  await closeUnclaimedDispatchSiblings(chatRows);
+  // Before the announce, because the announce is a publish and the consumer at
+  // the other end of it closes rows by message id. `closeChatRun` updates every
+  // open chat row carrying the reaped row's `metadata->>'message_id'`, which is
+  // exactly the set this statement exists to close -- and it stamps them with
+  // the event's own `worker_lost`. Publishing first is therefore a race the
+  // spare row can lose: it is archived as a worker that was lost, on the one
+  // row in the pair no worker ever held, and the statement below then finds
+  // nothing left to correct. Closing first leaves the consumer nothing to
+  // match, whichever of the two gets there first.
+  //
+  // Caught rather than awaited into the caller, because the ordering must not
+  // buy back the failure it was reordered away from. The row above is already
+  // terminal and this reaper's WHERE clause only ever selects
+  // `preparing`/`running`/`cancelling`, so no later sweep can select it again:
+  // anything that throws between closing the row and publishing loses that
+  // turn's exec_complete permanently. A spare row left open is a smaller
+  // failure than a turn the session forgets, and `reapStuckSessions` is still
+  // the backstop for it, so this one is logged and stepped over.
+  try {
+    await closeUnclaimedDispatchSiblings(chatRows);
+  } catch (err) {
+    logger.error({ err, ids: idsOf(chatRows) }, "sweeper.close_dispatch_siblings_failed");
+  }
+  // A reaped chat run must still record its turn. recordCompletionTurns -- the
+  // sole writer of claw_conversation_turns -- runs only on exec_complete, and
+  // this reaper published none, so a later message rebuilt history from an empty
+  // table and the session forgot the work. Mirror reapExpiredDoorbellRuns and
+  // announce the terminal trio. worker_lost only: announceRunFailure emits
+  // failed:true with no interrupted flag, so announcing the cancelled branch
+  // would mislabel a user-cancelled turn as a failure.
+  //
+  // Ahead of the gate release below, and that order is a durability argument
+  // rather than tidiness for the same reason the try/catch above is: the gate
+  // release is a database call that can throw, it is not a precondition of the
+  // announce, and a throw in it must not be able to take the turn with it.
+  //
+  // It also keeps the conversation shut until the turn is at least on its way.
+  // releaseSessionsOfLostRuns is what makes the session able to accept another
+  // message, and a message admitted before this exec_complete is even published
+  // reaches buildMessages with nothing coming. What that order cannot promise
+  // is that the turn has been *recorded* by then: publishSessionEvent waits for
+  // JetStream to ack the message, not for the consumer to run
+  // recordCompletionTurns, so the gate can still open ahead of the write. That
+  // window is the same one reapExpiredDoorbellRuns and reapExpiredQueuedRuns
+  // have -- both announce and then release in one pass, with no primitive here
+  // that can wait on the consumer -- and closing it is a cross-service change
+  // rather than an ordering one.
+  for (const row of chatRows) {
+    if (row.failure_reason !== "worker_lost") continue;
+    await announceRunFailure(
+      row,
+      "worker_lost",
+      "This run lost its worker and no replacement renewed its lease before the "
+        + "sweeper closed it. Its sandbox may still be finishing work; check the "
+        + "session before resending.",
+    );
+  }
+  // After the sibling close, whose rows are non-terminal until it runs and each
+  // of which is enough on its own to make this release match nothing.
   await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
@@ -791,14 +862,24 @@ async function countPendingBySession(
  * into a conversation that is mid-reply. Anything still non-terminal keeps the
  * gate shut and leaves the session to the reaper that judges it directly.
  *
- * What this does not do is answer the messages that piled up while the gate was
- * shut. Draining them is `handleComplete`'s job -- it takes the oldest one per
- * completion event, and the event that would have carried them died with the
- * worker -- so they wait for the user's next message, dispatch behind it, and
- * arrive out of order. Releasing the gate is still the larger half: without it
- * the next message joins them rather than getting a reply. They are counted in
- * the log below so the wait is visible while that path is still unreachable
- * from here.
+ * What this does not itself do is answer the messages that piled up while the
+ * gate was shut. Draining them is `handleComplete`'s job -- it takes the oldest
+ * one per completion event -- and this function publishes nothing. For the
+ * caller that matters most it is no longer true that no such event exists:
+ * `reapLostLeases` now announces the terminal trio for a `worker_lost` chat row
+ * just before calling this, so that turn does reach `handleComplete`, which
+ * records it and drains a message behind it. What the announce does not
+ * guarantee is when. A publish is acked by JetStream, not by the consumer, so
+ * the drain -- and the `recordCompletionTurns` write in front of it -- happens
+ * on the consumer's own clock, which may well be after this release has opened
+ * the gate. Whichever order they land in, the release is what lets a message
+ * move at all.
+ *
+ * The rows with no announce keep the old shape whole -- a `cancelled` reap,
+ * which is deliberately not announced as a failure, and any row whose publish
+ * threw and was swallowed. Their pending messages still wait for the user's
+ * next message, dispatch behind it, and arrive out of order. They are counted
+ * in the log below so that wait stays visible.
  */
 async function releaseSessionsOfLostRuns(sessionIds: string[]): Promise<void> {
   if (!sessionIds.length) return;
