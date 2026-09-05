@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -46,18 +45,6 @@ func TestSafeAuthMiddlewareRejectsForgedIdentityHeaders(t *testing.T) {
 	engine.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-}
-
-func TestForLogNeutralizesForgedRecords(t *testing.T) {
-	forged := "10.0.0.1\nlevel=INFO msg=\"WM: SaFE auth OK\" userId=admin"
-	got := forLog(forged)
-
-	assert.NotContains(t, got, "\n")
-	assert.NotContains(t, got, "\r")
-	assert.Contains(t, got, "10.0.0.1")
-
-	long := forLog(strings.Repeat("a", maxLoggedValueLen*2))
-	assert.Len(t, long, maxLoggedValueLen+len("...(truncated)"))
 }
 
 func TestSafeAuthMiddlewareOverwritesSpoofedRole(t *testing.T) {

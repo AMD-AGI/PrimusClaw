@@ -9,13 +9,14 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"os"
 	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -68,19 +69,19 @@ func InitPublicKeyCache(ctx context.Context, clientset kubernetes.Interface) {
 		backoff := 200 * time.Millisecond
 		for {
 			if err := loadPublicKeyFromSecret(clientset); err == nil {
-				slog.Info("loaded Router public key from secret",
+				log.Info("loaded Router public key from secret",
 					"namespace", routerIdentityNamespace,
 					"secret", RouterIdentitySecretName)
 				return
 			} else {
-				slog.Debug("waiting for Router public key",
+				log.Debug("waiting for Router public key",
 					"secret", RouterIdentitySecretName,
 					"retry_in", backoff,
 					"error", err)
 			}
 			select {
 			case <-ctx.Done():
-				slog.Warn("public key cache init cancelled", "error", ctx.Err())
+				log.Warn("public key cache init cancelled", "error", ctx.Err())
 				return
 			case <-time.After(backoff):
 			}

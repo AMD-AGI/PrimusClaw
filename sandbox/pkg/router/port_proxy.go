@@ -6,7 +6,6 @@ package router
 import (
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -47,12 +47,12 @@ var wsUpgrader = websocket.Upgrader{
 		}
 		u, err := url.Parse(origin)
 		if err != nil {
-			slog.Warn("tunnel: rejected invalid Origin header",
+			log.Warn("tunnel: rejected invalid Origin header",
 				"origin", origin, "host", r.Host)
 			return false
 		}
 		if u.Host != r.Host {
-			slog.Warn("tunnel: Origin/Host mismatch",
+			log.Warn("tunnel: Origin/Host mismatch",
 				"origin", origin, "host", r.Host)
 			return false
 		}
@@ -140,7 +140,7 @@ func (s *Server) handlePortProxy(c *gin.Context, info *store.SandboxInfo, port i
 		Transport:     portProxyTransport,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			slog.Error("port proxy: upstream error",
+			log.Error("port proxy: upstream error",
 				"podIP", info.PodIP, "port", port, "error", err)
 			if gw, ok := w.(gin.ResponseWriter); ok && gw.Written() {
 				return
@@ -150,7 +150,7 @@ func (s *Server) handlePortProxy(c *gin.Context, info *store.SandboxInfo, port i
 		},
 	}
 
-	slog.Debug("port proxy", "sessionId", info.SessionID,
+	log.Debug("port proxy", "sessionId", info.SessionID,
 		"podIP", info.PodIP, "port", port, "subPath", subPath)
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
@@ -160,7 +160,7 @@ func (s *Server) handlePortProxy(c *gin.Context, info *store.SandboxInfo, port i
 func (s *Server) handleTunnel(c *gin.Context, info *store.SandboxInfo, port int) {
 	wsConn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		slog.Error("tunnel: websocket upgrade failed", "error", err)
+		log.Error("tunnel: websocket upgrade failed", "error", err)
 		return
 	}
 	defer wsConn.Close()
@@ -168,7 +168,7 @@ func (s *Server) handleTunnel(c *gin.Context, info *store.SandboxInfo, port int)
 	addr := net.JoinHostPort(info.PodIP, strconv.Itoa(port))
 	tcpConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		slog.Error("tunnel: tcp dial failed", "addr", addr, "error", err)
+		log.Error("tunnel: tcp dial failed", "addr", addr, "error", err)
 		wsConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseInternalServerErr,
 				fmt.Sprintf("cannot connect to port %d", port)))
@@ -176,7 +176,7 @@ func (s *Server) handleTunnel(c *gin.Context, info *store.SandboxInfo, port int)
 	}
 	defer tcpConn.Close()
 
-	slog.Debug("tunnel established", "sessionId", info.SessionID,
+	log.Debug("tunnel established", "sessionId", info.SessionID,
 		"podIP", info.PodIP, "port", port)
 
 	var wg sync.WaitGroup
@@ -232,7 +232,7 @@ func (s *Server) handleTunnel(c *gin.Context, info *store.SandboxInfo, port int)
 			}
 			if err != nil {
 				if err != io.EOF {
-					slog.Debug("tunnel: tcp read error", "error", err)
+					log.Debug("tunnel: tcp read error", "error", err)
 				}
 				return
 			}

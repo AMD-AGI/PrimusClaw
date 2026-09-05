@@ -10,13 +10,13 @@
 package router
 
 import (
-	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"sigs.k8s.io/agent-sandbox/pkg/api"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 )
 
@@ -90,7 +90,7 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 			userType, _ := c.Cookie("userType")
 			user, verifyErr := s.safeClient.VerifyCookie(c.Request.Context(), tokenCookie, userType)
 			if verifyErr != nil {
-				slog.Warn("SaFE cookie verification failed",
+				log.Warn("SaFE cookie verification failed",
 					"error", verifyErr, "remote_addr", c.ClientIP())
 				recordCallerAuthRejection(c, http.StatusUnauthorized)
 				c.JSON(http.StatusUnauthorized, gin.H{
@@ -101,7 +101,7 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 				return
 			}
 			setUserContext(c, user)
-			slog.Debug("auth OK (cookie)", "userId", user.UserID,
+			log.Debug("auth OK (cookie)", "userId", user.UserID,
 				"role", resolveRoleFromSaFERoles(user.Roles), "path", c.Request.URL.Path)
 			c.Next()
 			return
@@ -115,7 +115,7 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 				apiKey := parts[1]
 				user, err := s.safeClient.VerifyAPIKey(c.Request.Context(), apiKey)
 				if err != nil {
-					slog.Warn("SaFE API Key verification failed",
+					log.Warn("SaFE API Key verification failed",
 						"error", err, "remote_addr", c.ClientIP())
 					recordCallerAuthRejection(c, http.StatusUnauthorized)
 					c.JSON(http.StatusUnauthorized, gin.H{
@@ -129,7 +129,7 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 				// Forward the original API Key for unified inference gateway (§4.2).
 				// WM stores this in Redis; EnvD pulls it and injects as OPENAI_API_KEY.
 				c.Request.Header.Set(api.SandboxApiKeyHeader, apiKey)
-				slog.Debug("auth OK (API Key)", "userId", user.UserID,
+				log.Debug("auth OK (API Key)", "userId", user.UserID,
 					"role", resolveRoleFromSaFERoles(user.Roles), "path", c.Request.URL.Path)
 				c.Next()
 				return

@@ -9,11 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 )
 
@@ -84,7 +84,7 @@ func (s *PolicySyncer) syncOnce(ctx context.Context) {
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		slog.Warn("policy_sync: build request failed", "error", err)
+		log.Warn("policy_sync: build request failed", "error", err)
 		return
 	}
 	if s.jwtToken != "" {
@@ -93,20 +93,20 @@ func (s *PolicySyncer) syncOnce(ctx context.Context) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		slog.Warn("policy_sync: request failed, using last known policy", "error", err)
+		log.Warn("policy_sync: request failed, using last known policy", "error", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		slog.Warn("policy_sync: non-200 response", "status", resp.StatusCode, "body", string(body))
+		log.Warn("policy_sync: non-200 response", "status", resp.StatusCode, "body", string(body))
 		return
 	}
 
 	var pr egressPolicyResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		slog.Warn("policy_sync: decode failed", "error", err)
+		log.Warn("policy_sync: decode failed", "error", err)
 		return
 	}
 
@@ -127,7 +127,7 @@ func (s *PolicySyncer) syncOnce(ctx context.Context) {
 
 	if s.allowedInternalUpdater != nil {
 		if err := s.allowedInternalUpdater.SetAllowedInternal(pr.AllowedInternalHosts); err != nil {
-			slog.Warn("policy_sync: failed to apply allowedInternalHosts", "error", err)
+			log.Warn("policy_sync: failed to apply allowedInternalHosts", "error", err)
 			return
 		}
 	}
@@ -136,7 +136,7 @@ func (s *PolicySyncer) syncOnce(ctx context.Context) {
 	s.lastVersion = pr.PolicyVersion
 	s.lastSuccessful = cfg
 
-	slog.Info("policy_sync: updated policy",
+	log.Info("policy_sync: updated policy",
 		"version", pr.PolicyVersion,
 		"runtimePolicy", pr.RuntimePolicy,
 		"mode", pr.PolicyMode,

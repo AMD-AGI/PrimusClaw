@@ -18,7 +18,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
 	"go.opentelemetry.io/otel/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -131,6 +132,6 @@ func SetupOTel(ctx context.Context, serviceName string) (Instrumenter, func(), e
 	return &otelInstrumenter{
 		tracer:     tp.Tracer("agent-sandbox-controller"),
 		propagator: otel.GetTextMapPropagator(),
-		logger:     log.FromContext(ctx).WithName("tracing"),
+		logger:     log.FromContext(ctx).WithName("tracing").Logr(),
 	}, func() { _ = tp.Shutdown(context.Background()) }, nil
 }
