@@ -1207,6 +1207,107 @@ test("a `running` answer is not dropped by an `idle` one decided against the sam
   );
 });
 
+test("a `running` answer is not given up on because the contention outlasted its retries", async () => {
+  // The retry above settles the same-revision race by re-reading and insisting.
+  // The retries are counted, though, and the count was the whole guarantee: an
+  // `idle` that keeps arriving for as long as the `running` keeps trying wins by
+  // outlasting it, and giving up is the one outcome a `running` answer may not
+  // have. Losing the update is cheap for `idle` -- another sweep files it again
+  // -- and terminal for `running`, because what it leaves behind is not "no
+  // answer" but the contending `idle`, and the next replica to read that
+  // reclaims a sandbox with a shell in it. So the retries have to outlast the
+  // contention rather than the other way round.
+  //
+  // Sustained, and against a live period the whole time: every contending write
+  // here leaves the period's name exactly as it found it, so nothing this
+  // replica re-asks on the way round ever tells it to stop for a legitimate
+  // reason. The only thing standing between it and the write is the counter.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // Same starting state as the single-race test: a fully named idle period
+  // carrying no answer yet.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = { ...k.current() };
+  for (const f of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"]) {
+    delete stamped[f];
+  }
+  assert.equal(typeof stamped.idleEpoch, "number", "sanity: the period has to be named");
+  assert.equal(typeof stamped.idleRev, "number", "sanity: on both halves of its name");
+  k.replace(stamped);
+  resetBackgroundWorkStateForTest();
+
+  // One distinct contending `idle` per attempt, each landed against the very
+  // revision that attempt read, so every conditional update this replica issues
+  // is beaten by a different writer rather than by one writer over and over.
+  // Four of them, which is what the old counter allowed; the contention then
+  // stops, so a replica whose retries outlast it lands on the next attempt and
+  // one whose retries do not has already given up.
+  const CONTENDERS = 4;
+  const idleAt = Date.now();
+  let contended = 0;
+  let runningLanded = 0;
+  const racing = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) { return k.kv.get(key); },
+    async update(key: string, v: Uint8Array, rev: number) {
+      const writing = JSON.parse(sc.decode(v)) as Record<string, unknown>;
+      if (key === KEY && writing.bgRunning === 1) {
+        if (contended < CONTENDERS) {
+          contended += 1;
+          k.replace({
+            ...stamped,
+            bgRunning: 0,
+            // Distinct per contender, on both halves of what names a verdict, so
+            // these are four separate answers and not one replayed.
+            bgCheckedAt: idleAt + contended,
+            bgEpoch: stamped.idleEpoch,
+            bgIdleSince: stamped.idleSince,
+            bgIdleRev: stamped.idleRev,
+            bgRev: rev,
+          });
+        } else {
+          runningLanded += 1;
+        }
+      }
+      return k.kv.update(key, v, rev);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({ kv: racing, countActiveShells: async () => 1 });
+  for (let i = 0; i < 80; i++) await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    contended, CONTENDERS,
+    "sanity: every one of the contending writes has to have actually raced a "
+      + "conditional update, or the exhaustion being tested never happened",
+  );
+  assert.equal(
+    runningLanded, 1,
+    "the `running` answer stopped trying while a contending `idle` was still "
+      + "winning, which is the one way this write is not allowed to end",
+  );
+  assert.equal(
+    k.current().bgRunning, 1,
+    "a shell is running and the handle says it is idle, because the `idle` "
+      + "answers outnumbered the retries rather than outranked them",
+  );
+
+  // And the same consequence the coin-toss race has: whatever is left on the
+  // entry is what a replica that never probed decides the pod on.
+  resetBackgroundWorkStateForTest();
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the handle was reclaimed on an `idle` that outlasted the retries, with a "
+      + "background shell still running in the sandbox",
+  );
+});
+
 
 // --- an inference has to survive long enough to be read ---
 

@@ -639,12 +639,29 @@ const BG_PROBE_MAX_IN_FLIGHT = 8;
  * after it; this settles the race the guard cannot see, where the two answers
  * are decided against the same revision.
  *
- * Retrying is only for `running`, and a handful of attempts is enough for what
- * it has to survive: the number of replicas that can be probing one handle at
- * one moment, not a busy key with unbounded writers. Exhausting them gives up
- * the same way every other failure here does.
+ * Retrying is only for `running`, and the count is a liveness backstop rather
+ * than the thing that makes the write safe. It used to be a handful, sized to
+ * the number of replicas that can be probing one handle at one moment. That is
+ * a fair estimate of the contention and the wrong thing to bound by, because
+ * running out is not a neutral outcome here. What a `running` answer leaves
+ * behind when it stops is not "no answer" but the `idle` that just beat it, and
+ * the next replica to read that reclaims a sandbox with a shell in it -- so an
+ * `idle` that keeps arriving for as long as the `running` keeps trying wins by
+ * outlasting it. Level with the contention is exactly the budget that loses
+ * that way.
+ *
+ * So it is set far above what it has to survive instead: a fleet's worth of
+ * replicas all publishing about one handle inside one idle period, several
+ * times over. The attempts are only spent while writes are actually being lost,
+ * and each one costs a round trip on a path that is already off the sweep's
+ * critical path, so the ceiling is paid for only in the case it exists for.
+ *
+ * It stays a ceiling rather than becoming an unbounded loop because a store
+ * that refuses every conditional update is a different fault from a contended
+ * key, and spinning on it forever would hide that one instead of reporting it.
+ * Reaching it is logged as the unsafe outcome it is.
  */
-const BG_VERDICT_WRITE_ATTEMPTS = 4;
+const BG_VERDICT_WRITE_ATTEMPTS = 64;
 
 /**
  * How many sandboxes are pinged at once.
@@ -1427,7 +1444,8 @@ async function persistVerdict(
     // be: it is read only by the `running`-wins guard, and that guard is only
     // reachable by an `idle` write, which never takes a second attempt.
     let workloadId: string | undefined;
-    for (let attempt = 1; attempt <= (running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1); attempt++) {
+    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       const e = await deps.kv.get(key);
       if (!e) return;
       const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
@@ -1543,6 +1561,28 @@ async function persistVerdict(
           "keepalive.background_work_answer_write_contended",
         );
       }
+    }
+    // Falling out of the loop rather than returning from inside it means every
+    // attempt was lost to a concurrent write and no guard ever found a reason to
+    // stop. For an `idle` answer that is the ordinary yield -- one attempt, and
+    // the sweep that comes anyway files it again -- and not worth a word.
+    //
+    // For a `running` answer it is the outcome the budget above is sized to make
+    // unreachable, so reaching it is worth saying out loud: the entry is left
+    // carrying whatever beat the last attempt, which may be an `idle` about a
+    // sandbox this replica has just measured a shell in.
+    //
+    // Nothing else can be done about it from here that is not worse than the
+    // problem. The only write that cannot be beaten is one with no revision
+    // precondition, and that overwrites the whole entry from a snapshot read
+    // before the last attempt -- reverting a reactivation or a substitution that
+    // landed in between, which loses the pod in the same direction this path
+    // exists to protect it from. So it is reported rather than forced.
+    if (running > 0) {
+      logger.warn(
+        { sessionId, workloadId, attempts },
+        "keepalive.background_work_answer_write_abandoned",
+      );
     }
   } catch {
     // Every failure that reaches here leaves the handle with no verdict from
