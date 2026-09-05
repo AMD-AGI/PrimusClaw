@@ -209,6 +209,34 @@ interface HandsKvEntry {
    * the only half of the comparison available.
    */
   bgRev?: number;
+  /**
+   * Probes outstanding somewhere in the fleet, as token -> deadline in epoch ms.
+   *
+   * The in-process set that stops one replica asking the same question twice is
+   * invisible to every other replica, and the reclaim is decided by whichever
+   * replica sweeps next. So a handle could be deleted while a probe about it was
+   * still in the air: the answer then lands on a key that no longer exists and
+   * is dropped rather than read, and when that answer is `running` the pod is
+   * reclaimed with a background shell in it. Publishing the question, and not
+   * only the answer, is what closes that -- for the same reason the verdict
+   * itself is published, that the sweep which asks and the sweep which acts are
+   * not the same process.
+   *
+   * A map rather than one deadline because two replicas probing the same handle
+   * in the same idle period is the ordinary case here -- it is the race every
+   * rule around the verdict exists for -- and a single field cannot be released
+   * by one of them without silently dropping the other's protection. Each probe
+   * holds its own token and removes that one only.
+   *
+   * The deadline is the backstop for a replica that stops existing mid-probe,
+   * read against the reader's clock the way `bgCheckedAt` already is: skew moves
+   * the grace by its own size in either direction, which buys a handle kept
+   * slightly longer or a grace slightly shorter, and neither of those is the
+   * failure this exists to prevent. Expired tokens are dropped by every writer
+   * that touches the map, so a replica that never comes back leaves nothing
+   * behind on the entry.
+   */
+  bgProbes?: Record<string, number>;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -626,6 +654,26 @@ const BG_GIVEUP_TTL_MS = BG_UNKNOWN_STREAK_TTL_MS;
 const BG_PROBE_MAX_IN_FLIGHT = 8;
 
 /**
+ * How long a published probe reservation holds a reclaim off, at most.
+ *
+ * It has to outlive the whole question rather than just the request. The probe
+ * is bounded by its own transport timeout, but the answer is filed through a
+ * read-modify-write that re-reads and re-tries while other replicas write to the
+ * same key, and it is that tail -- not the call -- the reclaim was racing.
+ *
+ * And it has to be well short of BG_PROBE_TTL_MS, which is the cadence a handle
+ * is re-asked about. A grace as long as the gap between two probes is a grace
+ * that never lapses, and a handle whose reclaim is deferred forever is exactly
+ * what the reuse window exists to rule out. A minute sits comfortably above the
+ * first quantity and comfortably below the second.
+ *
+ * It is a ceiling and not a wait: the reservation is released as soon as the
+ * answer is filed, so the ordinary reclaim is delayed by one probe's round trip
+ * and this number is only reached when a replica stops answering for its own.
+ */
+const BG_PROBE_RESERVE_MS = 60_000;
+
+/**
  * How many times a `running` verdict re-reads and re-writes after losing the
  * conditional update.
  *
@@ -832,6 +880,8 @@ interface TickStats {
   fromMem: number; fromHandle: number; fromNone: number; fromNoHands: number;
   /** What happened to the handles answered `idle`. */
   expired: number; withinWindow: number; keptLocal: number; keptRunLease: number;
+  /** Reclaims deferred because a probe about the handle was still outstanding. */
+  keptProbe: number;
   /** Probes this tick actually started; candidates over the cap are not counted. */
   probes: number;
 }
@@ -840,7 +890,7 @@ function newTickStats(): TickStats {
   return {
     bgRunning: 0, bgUnknown: 0, bgIdle: 0,
     fromMem: 0, fromHandle: 0, fromNone: 0, fromNoHands: 0,
-    expired: 0, withinWindow: 0, keptLocal: 0, keptRunLease: 0,
+    expired: 0, withinWindow: 0, keptLocal: 0, keptRunLease: 0, keptProbe: 0,
     probes: 0,
   };
 }
@@ -1173,6 +1223,95 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
 }
 
 /**
+ * A name for one probe, unique across the fleet for as long as it is held.
+ *
+ * Only has to distinguish the probes whose reservations sit on one entry at one
+ * moment, which is a handful; the prefix is what keeps two replicas from
+ * choosing the same name for two different questions.
+ */
+const bgProbeTokenPrefix = Math.random().toString(36).slice(2, 10);
+let bgProbeTokenSeq = 0;
+function nextProbeToken(): string {
+  bgProbeTokenSeq += 1;
+  return `${bgProbeTokenPrefix}${bgProbeTokenSeq.toString(36)}`;
+}
+
+/**
+ * The reservations on an entry that have not timed out, pruned on the way past.
+ *
+ * Every writer that touches the map prunes it, so a token whose replica stopped
+ * answering is removed by the next probe of the same handle rather than needing
+ * a sweep of its own.
+ */
+function liveProbeReservations(info: HandsKvEntry, now: number): Record<string, number> {
+  const live: Record<string, number> = {};
+  for (const [token, until] of Object.entries(info.bgProbes ?? {})) {
+    if (typeof until === "number" && until > now) live[token] = until;
+  }
+  return live;
+}
+
+/** Whether any replica is still waiting on an answer about this handle. */
+function probeOutstanding(info: HandsKvEntry): boolean {
+  return Object.keys(liveProbeReservations(info, Date.now())).length > 0;
+}
+
+/**
+ * Publish "a probe about this handle is outstanding" before asking.
+ *
+ * Before, because the reservation is only worth writing while it can still
+ * change a decision, and the decision it has to reach is a reclaim taken by
+ * another replica at any point between here and the answer being filed.
+ *
+ * Conditional and best-effort like every other write in this sweep. Losing it
+ * costs the protection and nothing else: the probe still goes out and the answer
+ * is still filed, which is the behaviour this had before the reservation
+ * existed. Under the identity that was probed, so a reservation is never written
+ * onto a sandbox the question was not about.
+ */
+async function reserveProbe(
+  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    const e = await deps.kv.get(key);
+    if (!e) return;
+    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(sessionId, info) !== identity) return;
+    const now = Date.now();
+    const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
+    await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
+  } catch { /* best effort: the deadline is the backstop */ }
+}
+
+/**
+ * Take the reservation back once the question has closed.
+ *
+ * Not left to the deadline, because the deadline is sized for a replica that
+ * stopped answering and a handle that answered promptly should not be held for
+ * it -- the reclaim would then be deferred by a fixed minute per probe rather
+ * than by the probe. Only this probe's own token, so a second replica still
+ * waiting on its own answer keeps its protection.
+ */
+async function releaseProbe(
+  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    const e = await deps.kv.get(key);
+    if (!e) return;
+    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(sessionId, info) !== identity) return;
+    if (!info.bgProbes || !(token in info.bgProbes)) return;
+    const bgProbes = liveProbeReservations(info, Date.now());
+    delete bgProbes[token];
+    const next: HandsKvEntry = { ...info, bgProbes };
+    if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+  } catch { /* best effort: the deadline is the backstop */ }
+}
+
+/**
  * Start up to BG_PROBE_MAX_IN_FLIGHT probes, resuming where the last sweep left
  * off.
  *
@@ -1232,13 +1371,17 @@ function dispatchProbes(
     // matters is the one at the landing.
     bgProbeInFlight.add(identity);
     started += 1;
+    // And the fleet-wide half of the same statement, which is what a replica
+    // deciding a reclaim can actually read. See reserveProbe.
+    const token = nextProbeToken();
 
     // True once anything has invalidated this identity since the candidate was
     // formed. Called again after every suspension point below, not once at the
     // top: each await is a window the generation can move in.
     const stale = () => (bgGeneration.get(identity) ?? 0) !== generation;
 
-    void probe(info.handsUrl!, info.token!, sessionId)
+    void reserveProbe(deps, sessionId, identity, token)
+      .then(() => probe(info.handsUrl!, info.token!, sessionId))
       .then(async (running) => {
         if (stale()) {
           logger.info(
@@ -1336,7 +1479,10 @@ function dispatchProbes(
           );
         }
       })
-      .finally(() => { bgProbeInFlight.delete(identity); });
+      .finally(async () => {
+        bgProbeInFlight.delete(identity);
+        await releaseProbe(deps, sessionId, identity, token);
+      });
   }
   bgProbeCursor = start + started;
   return started;
@@ -1826,6 +1972,41 @@ async function collectTargets(
               "keepalive.idle_handle_kept_run_in_flight",
             );
             stats.keptRunLease += 1;
+            continue;
+          }
+          if (expired && probeOutstanding(info)) {
+            // A handle with a question still outstanding about it is not a
+            // handle whose answer is known, whatever the entry currently says.
+            //
+            // The verdict this reclaim would act on can be one half of a race
+            // that has not finished being decided. Two replicas probing the same
+            // idle period both publish; `running` wins over `idle` by re-reading
+            // and insisting, and the write that insists is a read-modify-write
+            // with suspension points in it. Deleting between the `idle` landing
+            // and the `running` overtaking it does not merely pick the loser --
+            // it removes the key both answers are about, so the `running` has
+            // nowhere to land and is dropped rather than reconsidered, however
+            // much budget it had left. The pod is then reclaimed on the one
+            // verdict that was still being contested, which is the failure the
+            // contest exists to prevent.
+            //
+            // In-process the same question is already answered, by the set that
+            // stops a replica probing what it is already probing. This is that
+            // statement made where the other replicas can read it -- the sweep
+            // that asks and the sweep that reclaims are not the same process,
+            // which is the premise the shared verdict is built on too.
+            //
+            // Deferred rather than refused: the reservation is released when the
+            // answer is filed and times out if it never is, so the handle is
+            // reclaimed by the next sweep past either. The TTL is refreshed on
+            // the way past, because a handle kept without one is a handle the
+            // bucket drops instead -- the same loss by a slower route.
+            logger.info(
+              { sessionId, workloadId: info.workloadId },
+              "keepalive.idle_handle_kept_probe_outstanding",
+            );
+            stats.keptProbe += 1;
+            await deps.kv.update(key, value, e.revision).catch(() => {});
             continue;
           }
           if (expired) {

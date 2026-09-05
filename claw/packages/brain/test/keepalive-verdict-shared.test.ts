@@ -1309,6 +1309,111 @@ test("a `running` answer is not given up on because the contention outlasted its
 });
 
 
+test("a `running` answer is not lost to a reclaim decided on the `idle` it is contesting", async () => {
+  // The retry settles the same-revision race by insisting: the `idle` that won
+  // the conditional update is re-read and overwritten. That works only for as
+  // long as there is an entry to overwrite.
+  //
+  // Which is not something the retry controls. The `idle` it lost to is a
+  // published verdict the moment it lands, and any replica that reads it sees a
+  // spare handle past its reuse window with no registration and no run lease
+  // behind it -- so it reclaims. The reclaim does not merely beat the `running`
+  // answer to the entry; it removes the entry both answers are about, and the
+  // retry then finds no key, has nothing to insist against, and drops a
+  // measurement of live background work on the floor. The budget it had left is
+  // beside the point, which is why more of it is not the repair.
+  //
+  // Nothing tied the reclaim to the question still being asked. A verdict is
+  // published where every replica can read it; the probe that is still deciding
+  // it was not.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  // Same starting state as the two races above: a fully named idle period
+  // carrying no answer yet, and no question outstanding about it either -- so
+  // what defers the reclaim below is the probe this test starts, not one left
+  // over from the setup.
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = { ...k.current() };
+  for (const f of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"]) {
+    delete stamped[f];
+  }
+  delete stamped.bgProbes;
+  assert.equal(typeof stamped.idleEpoch, "number", "sanity: the period has to be named");
+  assert.equal(typeof stamped.idleRev, "number", "sanity: on both halves of its name");
+  k.replace(stamped);
+  resetBackgroundWorkStateForTest();
+
+  // This replica finds a shell. The other replica's `idle` lands against the
+  // very revision this one read, taking the one update that revision allows --
+  // and is published the way persistVerdict publishes one, onto the entry it
+  // read, carrying forward every field it does not itself set.
+  //
+  // The retry is then held at its next read, which is where the reclaim gets in.
+  let idleLanded = false;
+  let holdRetry = false;
+  let releaseRetry: () => void = () => {};
+  const retryHeld = new Promise<void>((r) => { releaseRetry = r; });
+  const idleAt = Date.now();
+  const racing = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) {
+      if (holdRetry) { holdRetry = false; await retryHeld; }
+      return k.kv.get(key);
+    },
+    async update(key: string, v: Uint8Array, rev: number) {
+      const writing = JSON.parse(sc.decode(v)) as Record<string, unknown>;
+      if (!idleLanded && key === KEY && writing.bgRunning === 1) {
+        idleLanded = true;
+        holdRetry = true;
+        k.replace({
+          ...k.current(),
+          bgRunning: 0,
+          bgCheckedAt: idleAt,
+          bgEpoch: stamped.idleEpoch,
+          bgIdleSince: stamped.idleSince,
+          bgIdleRev: stamped.idleRev,
+          bgRev: rev,
+        });
+      }
+      return k.kv.update(key, v, rev);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({ kv: racing, countActiveShells: async () => 1 });
+  for (let i = 0; i < 40 && !idleLanded; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(idleLanded, "sanity: the two answers have to actually have raced");
+
+  // A third replica, with no memory of either probe, sweeps while the `running`
+  // answer is still on its way round. All it can see is the `idle` that just
+  // won, on a handle long past its reuse window that nothing here is running.
+  resetBackgroundWorkStateForTest();
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the handle was reclaimed on a verdict that was still being contested, and "
+      + "the `running` answer contesting it now has no entry to land on",
+  );
+
+  // And the retry, released, still has somewhere to file what it measured.
+  releaseRetry();
+  for (let i = 0; i < 80; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(
+    k.current().bgRunning, 1,
+    "a shell is running and the measurement that says so was dropped, because "
+      + "the key it was about went out from under it mid-retry",
+  );
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "sanity: nothing reclaimed the handle after the answer landed either",
+  );
+});
+
+
 // --- an inference has to survive long enough to be read ---
 
 test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
