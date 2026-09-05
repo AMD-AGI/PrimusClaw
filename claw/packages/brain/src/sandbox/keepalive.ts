@@ -674,6 +674,27 @@ const BG_PROBE_MAX_IN_FLIGHT = 8;
 const BG_PROBE_RESERVE_MS = 60_000;
 
 /**
+ * How many times a probe reservation re-reads and re-writes before the probe is
+ * given up on for this sweep.
+ *
+ * The reservation is a read-modify-write on the same key every other replica is
+ * writing to, so losing the conditional update is ordinary rather than
+ * exceptional -- a second replica reserving the same handle, a verdict being
+ * published, a reservation being released all move the revision underneath it.
+ * One attempt therefore does not mean "reserved"; it means "reserved unless
+ * anything else touched the entry", which is not a protection anything can be
+ * dispatched behind.
+ *
+ * A smaller budget than a `running` verdict's, because running out here is the
+ * neutral outcome that one does not have. What a probe that cannot reserve
+ * leaves behind is no answer at all, which reads back as `unknown` -- the branch
+ * that keeps the sandbox and pings it -- and the next sweep asks again a tick
+ * later. So this only has to outlast the contention of a moment, not outlast a
+ * competing answer.
+ */
+const BG_PROBE_RESERVE_ATTEMPTS = 8;
+
+/**
  * How many times a `running` verdict re-reads and re-writes after losing the
  * conditional update.
  *
@@ -1257,31 +1278,55 @@ function probeOutstanding(info: HandsKvEntry): boolean {
 }
 
 /**
- * Publish "a probe about this handle is outstanding" before asking.
+ * Publish "a probe about this handle is outstanding" before asking, and report
+ * whether the publication actually landed.
  *
  * Before, because the reservation is only worth writing while it can still
  * change a decision, and the decision it has to reach is a reclaim taken by
  * another replica at any point between here and the answer being filed.
  *
- * Conditional and best-effort like every other write in this sweep. Losing it
- * costs the protection and nothing else: the probe still goes out and the answer
- * is still filed, which is the behaviour this had before the reservation
- * existed. Under the identity that was probed, so a reservation is never written
- * onto a sandbox the question was not about.
+ * Conditional like every other write in this sweep, but not best-effort like
+ * them, and the difference is what the caller does with the answer. A verdict
+ * that loses its update leaves the entry carrying somebody else's, which is
+ * still an answer; a reservation that loses its update leaves the entry carrying
+ * nothing, and a probe dispatched behind it is unprotected -- no token on the
+ * entry, so the next replica to read it sees no question outstanding and
+ * reclaims the handle while this answer is in the air. That is the failure the
+ * reservation exists to rule out, reached by the reservation itself being lost.
+ *
+ * So it re-reads and re-writes rather than swallowing the loss: losing the
+ * revision means somebody wrote the entry, and the next attempt writes this
+ * token onto whatever they left. It returns true only when the token is
+ * genuinely on the entry -- the caller does not ask Hands otherwise -- and false
+ * for a handle that has gone or been replaced, where the reservation has nothing
+ * to protect and the answer would be dropped on arrival anyway.
+ *
+ * Under the identity that was probed, so a reservation is never written onto a
+ * sandbox the question was not about.
  */
 async function reserveProbe(
   deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
-): Promise<void> {
-  try {
-    const key = `hands.${sessionId}`;
-    const e = await deps.kv.get(key);
-    if (!e) return;
-    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-    if (entryIdentity(sessionId, info) !== identity) return;
-    const now = Date.now();
-    const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
-    await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
-  } catch { /* best effort: the deadline is the backstop */ }
+): Promise<boolean> {
+  const key = `hands.${sessionId}`;
+  for (let attempt = 1; attempt <= BG_PROBE_RESERVE_ATTEMPTS; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e) return false;
+      const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(sessionId, info) !== identity) return false;
+      const now = Date.now();
+      const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
+      await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
+      return true;
+    } catch {
+      // Either the update lost its revision or the round trip failed; neither is
+      // distinguishable from here and neither has to be. What both mean is that
+      // the token is not on the entry, so the next attempt reads what is there
+      // now and writes the token onto that instead of resending this value
+      // against a revision that has moved.
+    }
+  }
+  return false;
 }
 
 /**
@@ -1372,7 +1417,8 @@ function dispatchProbes(
     bgProbeInFlight.add(identity);
     started += 1;
     // And the fleet-wide half of the same statement, which is what a replica
-    // deciding a reclaim can actually read. See reserveProbe.
+    // deciding a reclaim can actually read. The probe below is dispatched only
+    // if this one is published; see reserveProbe.
     const token = nextProbeToken();
 
     // True once anything has invalidated this identity since the candidate was
@@ -1381,8 +1427,23 @@ function dispatchProbes(
     const stale = () => (bgGeneration.get(identity) ?? 0) !== generation;
 
     void reserveProbe(deps, sessionId, identity, token)
-      .then(() => probe(info.handsUrl!, info.token!, sessionId))
+      // Gated, not chained. The point of the reservation is that no answer is
+      // ever in the air without one on the entry, and a probe sent regardless of
+      // whether the write landed is exactly that -- so a reservation that could
+      // not be published means the question is not asked this sweep. Deferring
+      // it is cheap: the handle stays `unknown`, which is kept and pinged, and
+      // the next tick asks again.
+      .then((reserved) => (
+        reserved ? probe(info.handsUrl!, info.token!, sessionId) : undefined
+      ))
       .then(async (running) => {
+        if (running === undefined) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_probe_unreserved",
+          );
+          return;
+        }
         if (stale()) {
           logger.info(
             { sessionId, workloadId: info.workloadId },

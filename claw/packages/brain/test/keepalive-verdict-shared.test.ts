@@ -1414,6 +1414,175 @@ test("a `running` answer is not lost to a reclaim decided on the `idle` it is co
 });
 
 
+/**
+ * A named idle period carrying no verdict and no outstanding question.
+ *
+ * The reservation tests are about the write that publishes a question, so the
+ * entry they start from has to have nothing on it that would defer a reclaim by
+ * itself -- otherwise a handle kept for the wrong reason reads as a handle kept.
+ */
+function idlePeriodWithNothingOutstanding(k: ReturnType<typeof fakeKv>): Record<string, unknown> {
+  const stamped = { ...k.current() };
+  for (const f of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"]) {
+    delete stamped[f];
+  }
+  delete stamped.bgProbes;
+  assert.equal(typeof stamped.idleEpoch, "number", "sanity: the period has to be named");
+  assert.equal(typeof stamped.idleRev, "number", "sanity: on both halves of its name");
+  k.replace(stamped);
+  resetBackgroundWorkStateForTest();
+  return stamped;
+}
+
+test("a reservation that loses a revision is republished before Hands is asked", async () => {
+  // The reservation was written the way every other value in this sweep is:
+  // one read, one conditional update, and silence if it did not land. That is
+  // the right shape for a verdict, where losing means somebody else's answer is
+  // on the entry, and the wrong shape for this, where losing means NO question
+  // is on the entry -- and the probe went out anyway.
+  //
+  // Which is the original loss reached by a different route. An unprotected
+  // answer in the air is exactly what the third replica below cannot see, so it
+  // reads a spare handle past its reuse window and reclaims it, and the
+  // measurement of live work arrives to find no key to be about.
+  //
+  // Losing the revision is not the exceptional case either. Every replica that
+  // publishes a verdict, reserves its own probe, or releases one moves the
+  // revision on this key, so a single-attempt reservation is only reliable on a
+  // handle nothing else is interested in.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = idlePeriodWithNothingOutstanding(k);
+
+  // Another replica's verdict lands against the very revision this replica's
+  // reservation read, taking the one update that revision allows. Once, so the
+  // question is whether the reservation comes back rather than whether it can
+  // be starved.
+  let bumped = false;
+  let reservedWhenAsked: Record<string, unknown> | undefined;
+  let asked = false;
+  // The answer is held while the third replica below sweeps, which is the
+  // window the whole mechanism is about: the probe has been sent, nothing has
+  // come back, and the only thing that can tell another replica a question is
+  // open is what is on the entry.
+  let releaseAnswer: () => void = () => {};
+  const answerHeld = new Promise<void>((r) => { releaseAnswer = r; });
+  const racing = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) { return k.kv.get(key); },
+    async update(key: string, v: Uint8Array, rev: number) {
+      const writing = JSON.parse(sc.decode(v)) as Record<string, unknown>;
+      if (!bumped && key === KEY && writing.bgProbes) {
+        bumped = true;
+        k.replace({
+          ...k.current(),
+          bgRunning: 0,
+          bgCheckedAt: Date.now(),
+          bgEpoch: stamped.idleEpoch,
+          bgIdleSince: stamped.idleSince,
+          bgIdleRev: stamped.idleRev,
+          bgRev: rev,
+        });
+      }
+      return k.kv.update(key, v, rev);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({
+    kv: racing,
+    countActiveShells: async () => {
+      asked = true;
+      reservedWhenAsked = k.current().bgProbes as Record<string, unknown> | undefined;
+      await answerHeld;
+      return 1;
+    },
+  });
+  for (let i = 0; i < 40 && !asked; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(bumped, "sanity: the reservation has to have actually lost a revision");
+  assert.ok(
+    reservedWhenAsked && Object.keys(reservedWhenAsked).length > 0,
+    "Hands was asked about this handle with no reservation on the entry, so the "
+      + "answer is in the air with nothing anywhere saying a question is open",
+  );
+
+  // A third replica, with no memory of the question, sweeps while the answer is
+  // still on its way. All it can read is the `idle` verdict that won above, on a
+  // handle long past its reuse window that nothing here is running.
+  resetBackgroundWorkStateForTest();
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    !k.deleted.includes(KEY),
+    "the handle was reclaimed while a probe about it was outstanding, because "
+      + "the reservation that would have said so lost its revision and was dropped",
+  );
+
+  // And the measurement, let through, has somewhere to land.
+  releaseAnswer();
+  for (let i = 0; i < 80; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(
+    k.current().bgRunning, 1,
+    "a shell is running and the measurement that says so never reached the entry",
+  );
+});
+
+test("a probe nothing can reserve is not asked at all", async () => {
+  // The other half of the same rule. Retrying makes the reservation reliable
+  // against contention, not against a store that refuses every conditional
+  // update, and the budget is finite by design -- so there is still a path where
+  // the token cannot be published.
+  //
+  // What that path may not do is ask anyway. An unreserved probe is the
+  // unprotected probe above with no revision race needed to produce it, so the
+  // question is skipped instead: the handle stays `unknown`, which is kept and
+  // pinged, and the next sweep asks again.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  idlePeriodWithNothingOutstanding(k);
+
+  // Every reservation write loses, because the entry moves between each
+  // attempt's read and its update.
+  let reservations = 0;
+  let asked = false;
+  const contended = {
+    ...k.kv,
+    async keys(filter = ">") { return k.kv.keys(filter); },
+    async get(key: string) { return k.kv.get(key); },
+    async update(key: string, v: Uint8Array, rev: number) {
+      const writing = JSON.parse(sc.decode(v)) as Record<string, unknown>;
+      if (key === KEY && writing.bgProbes) {
+        reservations += 1;
+        k.replace({ ...k.current() });
+      }
+      return k.kv.update(key, v, rev);
+    },
+  } as unknown as KV;
+
+  await runKeepaliveTickForTest({
+    kv: contended,
+    countActiveShells: async () => { asked = true; return 1; },
+  });
+  for (let i = 0; i < 80; i++) await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    asked, false,
+    "Hands was asked without a reservation ever reaching the entry, which is the "
+      + "unprotected answer the reservation exists to prevent",
+  );
+  assert.ok(reservations > 1, "sanity: the reservation has to have been retried");
+  assert.equal(
+    k.current().bgProbes, undefined,
+    "sanity: no reservation is left behind by a question that was never asked",
+  );
+});
+
 // --- an inference has to survive long enough to be read ---
 
 test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
