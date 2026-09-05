@@ -24,7 +24,9 @@ import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
   backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest, markHandsIdle,
+  BG_PROBE_RESERVE_MS,
 } from "../src/sandbox/keepalive.js";
+import { SANDBOX_IDLE_REUSE_MS } from "../src/config.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
@@ -1759,4 +1761,313 @@ test("a give-up does not delete the handle in the same sweep it re-asks", async 
     "and the probe that tick dispatched is filed against a handle that is still "
       + "there to carry it",
   );
+});
+
+// --- and the protection has to be readable by a replica that predates it ---
+
+/**
+ * The expiry arithmetic as a replica running the previous build does it.
+ *
+ * That replica carries the reservation forward -- it does not drop fields it
+ * does not understand -- but it cannot read one, so `bgProbes` says nothing to
+ * it and the deferral built on `bgProbes` is not a deferral it takes. During a
+ * rolling deploy that replica is sweeping the same bucket as this one, so a
+ * question this build has open is a question that build can reclaim the handle
+ * out from under.
+ *
+ * On the stamp alone, which is the strictest form of the check: the window
+ * starts no earlier than the stamp, so a handle this says is unexpired is
+ * unexpired to any reading that also considers a later mark.
+ */
+function legacyExpired(info: Record<string, unknown>): boolean {
+  const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
+  return Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
+}
+
+/**
+ * Drive one sweep and stop inside the probe, with the reservation on the entry.
+ *
+ * The interval between the question going out and the answer coming back is
+ * where every one of these tests lives, and it is not otherwise observable: the
+ * probe is fire-and-forget, so a sweep that is allowed to run to completion has
+ * already released what it took. Returns the release, which drains the answer.
+ */
+async function probeHeldOpen(
+  kv: KV, shells: number,
+): Promise<() => Promise<void>> {
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => { release = r; });
+  let asked = false;
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => { asked = true; await held; return shells; },
+  });
+  for (let i = 0; i < 40 && !asked; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(asked, "sanity: the probe has to have gone out before it can be held open");
+  return async () => {
+    release();
+    for (let i = 0; i < 80; i++) await new Promise((r) => setImmediate(r));
+  };
+}
+
+test("a reservation keeps a handle off the previous build's reclaim too", async () => {
+  // The reservation was published where every CURRENT replica can read it, which
+  // during a rolling deploy is not every replica. The old binary reaches the
+  // delete on the same handle by the same route -- past its window, nothing
+  // registered locally, no run lease -- and the one guard that would stop it is
+  // the one guard it has never heard of. The probe's answer then arrives to find
+  // no key, and a sandbox with live background work in it is gone.
+  //
+  // So the statement is made twice in the one write: in the field that says it
+  // exactly, and in the arithmetic the old binary already performs.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = idlePeriodWithNothingOutstanding(k);
+  assert.ok(
+    legacyExpired(stamped),
+    "sanity: absent any carry this handle is one the previous build reclaims on sight",
+  );
+
+  const release = await probeHeldOpen(k.kv, 1);
+  const held = k.current();
+  assert.ok(
+    Object.keys(held.bgProbes as Record<string, unknown>).length > 0,
+    "sanity: the question has to be open for its protection to be the thing under test",
+  );
+  assert.equal(
+    legacyExpired(held), false,
+    "a replica running the previous build reads this handle as expired while a "
+      + "probe about it is outstanding, and reclaims the key the answer is about",
+  );
+  // And for the whole reservation, not merely for the instant it was taken --
+  // the deadline is what the deferral is sized to and the old binary sweeps on
+  // its own cadence in between.
+  assert.ok(
+    Date.now() + BG_PROBE_RESERVE_MS - (held.idleSince as number) <= SANDBOX_IDLE_REUSE_MS,
+    "the carry runs out before the reservation does, so the previous build "
+      + "reclaims the handle partway through the question",
+  );
+
+  await release();
+});
+
+test("a handle carried through a probe is reclaimable again once the answer is idle", async () => {
+  // The carry is a loan against the window, and an unrepaid loan is the reclaim
+  // this whole change is in service of quietly not happening: a handle probed
+  // once per window is a handle whose window restarts once per window.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = idlePeriodWithNothingOutstanding(k);
+
+  const release = await probeHeldOpen(k.kv, 0);
+  assert.notEqual(
+    k.current().idleSince, stamped.idleSince,
+    "sanity: there has to be a carry in force for its repayment to be the thing under test",
+  );
+  await release();
+
+  const after = k.current();
+  assert.equal(
+    after.idleSince, stamped.idleSince,
+    "the stamp came back to a later reading than the one the carry was taken "
+      + "from, so the handle bought itself life by being asked about",
+  );
+  assert.equal(
+    after.probeIdleHold, undefined,
+    "a spent carry is left on the entry, where a later release reads it as one "
+      + "still in force and walks the stamp back past whatever moved it since",
+  );
+  assert.equal(after.idleEpoch, stamped.idleEpoch, "and the period is still the same period");
+  assert.equal(after.idleRev, stamped.idleRev, "on both halves of its name");
+  assert.equal(after.bgRunning, 0, "sanity: the answer that came back was `idle`");
+  assert.ok(legacyExpired(after), "sanity: and the handle reads as expired once more");
+
+  // Which is what the repayment is for: the next sweep past an idle answer
+  // reclaims, on the schedule the handle was already on.
+  await sweep({
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+  });
+  assert.ok(
+    k.deleted.includes(KEY),
+    "an idle handle past its window was not reclaimed after the probe that said "
+      + "so, because the carry taken to ask the question was never given back",
+  );
+});
+
+test("a `running` answer moves the stamp itself, and the carry does not move it twice", async () => {
+  // The other way the two paths can cancel: the running refresh sets the stamp
+  // to when the work was seen, and a carry record left over from the question
+  // that produced the answer names an earlier reading to put it back to. Whoever
+  // runs second wins, and if that is the release then a sandbox with live work in
+  // it reads as expired to exactly the sweep the carry was addressed to.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = idlePeriodWithNothingOutstanding(k);
+
+  const askedAt = Date.now();
+  const release = await probeHeldOpen(k.kv, 1);
+  await release();
+  assert.equal(k.current().bgRunning, 1, "sanity: the answer that came back was `running`");
+
+  // The sweep that acts on it. The refresh is the ordinary, non-temporary reason
+  // to hold the stamp up, and it is entitled to set it outright.
+  await sweep({ kv: k.kv, countActiveShells: async () => 1 });
+
+  const after = k.current();
+  assert.ok(
+    (after.idleSince as number) >= askedAt,
+    "the running refresh did not reach the stamp, so a sandbox with background "
+      + "work in it is still counting down the window it was idle under",
+  );
+  assert.equal(
+    after.probeIdleHold, undefined,
+    "the refresh left the carry record behind it, so the next release undoes the "
+      + "refresh and the handle expires with live work in it",
+  );
+  assert.equal(
+    after.idleSince, after.bgCheckedAt,
+    "the stamp is not where the work was seen -- either short of it, which is a "
+      + "carry that was put back over the refresh, or past it, which is the "
+      + "refresh and the carry both counted",
+  );
+  assert.equal(legacyExpired(after), false, "and the previous build reads it as live too");
+  assert.ok(!k.deleted.includes(KEY), "with nothing reclaiming the handle along the way");
+});
+
+test("the stamp is carried only when the question would outlast the window", async () => {
+  // Carrying it every time is the same unrepaid loan by a shorter route, and it
+  // is not needed: a handle with room left in its window is a handle the previous
+  // build already declines to reclaim. So the condition is exactly the shortfall
+  // -- the question outlasting what the handle has left -- and the amount is
+  // exactly enough to cover it.
+  const k = fakeKv();
+  stubPingableProvider();
+
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  const stamped = idlePeriodWithNothingOutstanding(k);
+
+  // Comfortably longer: the window outlives the reservation several times over.
+  const roomy = Date.now() - SANDBOX_IDLE_REUSE_MS + 4 * BG_PROBE_RESERVE_MS;
+  k.replace({ ...stamped, idleSince: roomy });
+  resetBackgroundWorkStateForTest();
+  const releaseRoomy = await probeHeldOpen(k.kv, 1);
+  assert.equal(
+    k.current().idleSince, roomy,
+    "the stamp was carried for a handle that had room for the whole question, "
+      + "which is life added to every handle that is ever asked about",
+  );
+  assert.equal(k.current().probeIdleHold, undefined, "and a record of a carry that is not in force");
+  await releaseRoomy();
+
+  // And the shortfall: less left than the question can take.
+  const tight = Date.now() - SANDBOX_IDLE_REUSE_MS + BG_PROBE_RESERVE_MS / 2;
+  k.replace({ ...stamped, idleSince: tight });
+  resetBackgroundWorkStateForTest();
+  const releaseTight = await probeHeldOpen(k.kv, 1);
+
+  const held = k.current();
+  assert.ok(
+    (held.idleSince as number) > tight,
+    "the handle runs out of window partway through the question and the stamp "
+      + "was left where it was, so the previous build reclaims it mid-probe",
+  );
+  assert.deepEqual(
+    held.probeIdleHold, { base: tight, to: held.idleSince },
+    "the carry has to say both readings: what it moved the stamp to, so a "
+      + "writer who moved it since is not clobbered, and what to put back",
+  );
+  // Exactly the shortfall, which here is half the reservation. Anything more is
+  // window the handle did not have; anything less and the question outlives it.
+  const carried = (held.idleSince as number) - tight;
+  assert.ok(
+    Math.abs(carried - BG_PROBE_RESERVE_MS / 2) < 5_000,
+    `the carry is ${carried}ms against a shortfall of ${BG_PROBE_RESERVE_MS / 2}ms`,
+  );
+  await releaseTight();
+  assert.equal(k.current().idleSince, tight, "and it is given back in full");
+});
+
+/** A bucket with more than one handle in it, which is the ordinary case. */
+function manyHandleKv(entries: Record<string, Record<string, unknown>>): {
+  kv: KV; deleted: string[]; current: (key: string) => Record<string, unknown>;
+} {
+  const state = new Map<string, { value: Uint8Array; revision: number }>();
+  const deleted: string[] = [];
+  let revision = 5;
+  for (const [key, value] of Object.entries(entries)) {
+    state.set(key, { value: sc.encode(JSON.stringify(value)), revision: ++revision });
+  }
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...state.keys()]
+        .filter((key) => filterToRegExp(filter).test(key) && !deleted.includes(key));
+      return (async function* () { yield* matched; })();
+    },
+    async get(key: string) {
+      const cur = state.get(key);
+      if (!cur || deleted.includes(key)) return null;
+      return { key, value: cur.value, revision: cur.revision };
+    },
+    async delete(key: string) { deleted.push(key); },
+    async put() { return ++revision; },
+    async update(key: string, value: Uint8Array, rev: number) {
+      const cur = state.get(key);
+      if (!cur || cur.revision !== rev) throw new Error("revision conflict");
+      state.set(key, { value, revision: ++revision });
+      return revision;
+    },
+  } as unknown as KV;
+  return {
+    kv, deleted,
+    current: (key: string) => JSON.parse(sc.decode(state.get(key)!.value)) as Record<string, unknown>,
+  };
+}
+
+test("a carry taken for one handle is taken on that handle only", async () => {
+  // The carry is arithmetic on one entry, and the sweep walks many in a tick.
+  // A shortfall read from one handle and covered on another is life granted to a
+  // sandbox nobody asked about -- and, on the handle that needed it, none.
+  const askedSession = "sess-verdict-asked";
+  const otherSession = "sess-verdict-other";
+  const askedKey = `hands.${askedSession}`;
+  const otherKey = `hands.${otherSession}`;
+  stubPingableProvider();
+
+  // Deep past its window, so a question about it needs a carry to survive.
+  const asked = { ...ENTRY, workloadId: "wl-a", handsUrl: "http://a:9100/mcp", idleSince: 0, idleEpoch: 0, idleRev: 3 };
+  // And one with room to spare, so a carry appearing on it came from elsewhere.
+  const roomy = Date.now() - SANDBOX_IDLE_REUSE_MS + 8 * BG_PROBE_RESERVE_MS;
+  const other = {
+    ...ENTRY, workloadId: "wl-b", handsUrl: "http://b:9100/mcp",
+    idleSince: roomy, idleEpoch: roomy, idleRev: 4,
+  };
+  const k = manyHandleKv({ [askedKey]: asked, [otherKey]: other });
+
+  const release = await probeHeldOpen(k.kv, 1);
+  assert.notEqual(
+    k.current(askedKey).idleSince, 0,
+    "sanity: the handle that is short of window has to have been carried",
+  );
+  assert.equal(
+    k.current(otherKey).idleSince, roomy,
+    "a carry taken for one handle moved another handle's stamp, which is window "
+      + "granted to a sandbox on the strength of a question about a different one",
+  );
+  assert.equal(
+    k.current(otherKey).probeIdleHold, undefined,
+    "and left a record on it saying to put back a reading it never left",
+  );
+
+  await release();
+  assert.equal(k.current(askedKey).idleSince, 0, "and the carry is given back where it was taken");
+  assert.equal(k.current(otherKey).idleSince, roomy, "with the other handle still untouched");
+  unregisterSandbox(askedSession);
+  unregisterSandbox(otherSession);
 });
