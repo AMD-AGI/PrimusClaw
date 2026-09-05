@@ -237,42 +237,6 @@ interface HandsKvEntry {
    * behind on the entry.
    */
   bgProbes?: Record<string, number>;
-  /**
-   * The idle stamp's own reading, set aside while a reservation is carrying that
-   * stamp forward, and the reading it is being carried to.
-   *
-   * `bgProbes` above is the reservation every CURRENT replica reads. A replica
-   * running the previous build reads none of it: before reclaiming a spare
-   * handle its sweep asks one question -- has this been idle longer than the
-   * reuse window -- and answers it from `idleSince`, the only field of this
-   * mechanism that predates the mechanism. So a probe reserved here and still
-   * outstanding is invisible to that sweep, and a handle it finds a millisecond
-   * past the window is deleted with the question still open. The answer lands on
-   * a key that is gone, and when the answer was `running` the pod is reclaimed
-   * with a background shell in it -- the exact failure `bgProbes` exists to
-   * prevent, reached by a replica that cannot see `bgProbes`.
-   *
-   * What every replica does read is the stamp. So the reservation is stated
-   * there too: `idleSince` is carried forward just far enough that the handle
-   * does not read as expired to the old arithmetic before this reservation
-   * lapses, and `base` is what it read before that.
-   *
-   * Deliberately not a blanket refresh. Sliding the stamp on every reservation
-   * would restart the whole reuse window on every probe, and the window is what
-   * decides when a spare pod goes back -- a handle re-probed every few minutes
-   * would never reach the end of one. The carry is applied only when the handle
-   * would otherwise read as expired DURING the reservation, and only as far as
-   * that reservation's own deadline: see probeIdleHoldTarget.
-   *
-   * Two fields rather than one because the carry has to be undone exactly, and
-   * "how far it was carried" is not recoverable from the entry afterwards. `to`
-   * is also what tells a carry still in force from one another writer has
-   * already superseded -- a re-idle, or the running refresh, moves `idleSince`
-   * off this value, and a record whose `to` no longer matches the stamp is a
-   * record about a reading that is gone. Nothing is restored from one of those,
-   * and nothing reads through one: see idlePeriodStamp.
-   */
-  probeIdleHold?: { base: number; to: number };
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -531,10 +495,6 @@ export function markHandsIdle(
       delete info.bgIdleSince;
       delete info.bgIdleRev;
       delete info.bgRev;
-      // And any carry a reservation from the last period left on the stamp. The
-      // stamp above is this period's own, so there is nothing left to put back
-      // and a record saying otherwise names a reading that is gone.
-      delete info.probeIdleHold;
       // Same reason, for the clock those verdicts moved: work seen during the
       // last idle period says nothing about this one. `reuseWindowStart` would
       // ignore it anyway -- the stamp above is later than anything from before
@@ -711,7 +671,7 @@ const BG_PROBE_MAX_IN_FLIGHT = 8;
  * answer is filed, so the ordinary reclaim is delayed by one probe's round trip
  * and this number is only reached when a replica stops answering for its own.
  */
-export const BG_PROBE_RESERVE_MS = 60_000;
+const BG_PROBE_RESERVE_MS = 60_000;
 
 /**
  * How many times a probe reservation re-reads and re-writes before the probe is
@@ -988,35 +948,6 @@ function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): b
 }
 
 /**
- * The stamp that names this handle's idle period, with any probe carry read
- * back out of it.
- *
- * `idleSince` is doing two jobs, and a reservation moves it for exactly one of
- * them. As the reuse clock it is arithmetic -- how long has this been spare --
- * and that is the reading a reservation has to reach, because it is the only one
- * a replica running the previous build consults. As the verdict anchor it is a
- * name -- which idle period is this -- compared by equality and never by
- * ordering, and a name that moves because a probe was reserved is a name that
- * makes every answer about the period look like an answer about a different one.
- *
- * So the carry is applied to the field and read back out of it here, and every
- * reader that wants the name goes through this while the expiry arithmetic reads
- * the field directly. A verdict is then measured, filed and believed under one
- * unchanging value for the whole period, whether or not a probe was outstanding
- * when it was taken -- and the restore in releaseProbe has nothing to put back
- * but the number itself.
- *
- * A record whose `to` does not match the stamp is not describing the stamp that
- * is there, so it is not read through: some other writer set that value, and it
- * is the value itself that names the period now.
- */
-function idlePeriodStamp(info: HandsKvEntry): number | undefined {
-  const hold = info.probeIdleHold;
-  if (hold && hold.to === info.idleSince) return hold.base;
-  return info.idleSince;
-}
-
-/**
  * Whether a verdict measured at `at`, under the stamp `witness`, can be about
  * the idle period the handle is in now.
  *
@@ -1114,17 +1045,13 @@ function measuredUnderThisIdlePeriod(
   info: HandsKvEntry,
   state: BackgroundWork,
 ): boolean {
-  // The stamp with any probe carry read out of it: a reservation moves the field
-  // to keep an old sweep from reclaiming the handle, and that is arithmetic
-  // rather than a rename. See idlePeriodStamp.
-  const stamp = idlePeriodStamp(info);
-  if (typeof stamp !== "number") return false;
+  if (typeof info.idleSince !== "number") return false;
   if (
-    typeof witness === "number" && witness === stamp
+    typeof witness === "number" && witness === info.idleSince
     && typeof witnessRev === "number" && witnessRev === info.idleRev
   ) return true;
   if (state !== "running") return false;
-  return typeof at === "number" && at >= stamp;
+  return typeof at === "number" && at >= info.idleSince;
 }
 
 /**
@@ -1345,36 +1272,6 @@ function liveProbeReservations(info: HandsKvEntry, now: number): Record<string, 
   return live;
 }
 
-/**
- * How far the idle stamp has to be carried for a reservation lasting until
- * `until` to be visible to a sweep that reads nothing but that stamp -- or null
- * when it already is.
- *
- * The old arithmetic is `now - idleSince > SANDBOX_IDLE_REUSE_MS`, so the handle
- * stops reading as expired at `idleSince + SANDBOX_IDLE_REUSE_MS`, and the
- * reservation needs it to still read that way at `until`. Nothing to do while
- * the first is at or beyond the second: the boundary is inclusive because the
- * comparison it has to survive is strict, and a handle whose window ends exactly
- * as the reservation does is not expired at that instant.
- *
- * Otherwise the carry is the smallest one that reaches -- the reading whose
- * window ends exactly at the reservation's deadline. Not `now`, which would hand
- * the handle a whole fresh window for the sake of one probe, and not the
- * reservation's length added to whatever is there, which would compound across
- * successive probes into the unbounded deferral the reuse window exists to rule
- * out.
- *
- * `idleSince` and not `reuseWindowStart`, because the sweep this is addressed to
- * predates `workSeenAt` and cannot read it. A handle whose `workSeenAt` is fresh
- * is unexpired to a current replica and expired to that one, and it is that one
- * the carry is for.
- */
-function probeIdleHoldTarget(idleSince: number | undefined, until: number): number | null {
-  if (typeof idleSince !== "number") return null;
-  if (idleSince + SANDBOX_IDLE_REUSE_MS >= until) return null;
-  return until - SANDBOX_IDLE_REUSE_MS;
-}
-
 /** Whether any replica is still waiting on an answer about this handle. */
 function probeOutstanding(info: HandsKvEntry): boolean {
   return Object.keys(liveProbeReservations(info, Date.now())).length > 0;
@@ -1406,17 +1303,6 @@ function probeOutstanding(info: HandsKvEntry): boolean {
  *
  * Under the identity that was probed, so a reservation is never written onto a
  * sandbox the question was not about.
- *
- * And in the same write, the half of the statement a replica running the
- * previous build can read: the token says "a question is open" to anything that
- * knows the field exists, and the stamp carried forward by
- * `probeIdleHoldTarget` says "not expired yet" to everything else. One write,
- * because the two are one statement and a handle protected against half the
- * fleet is not protected.
- *
- * The carry is arithmetic only. What the period is CALLED does not move with it
- * -- `idlePeriodStamp` reads it back out -- so the probe still goes out under,
- * and files its answer against, the one value the period has had all along.
  */
 async function reserveProbe(
   deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
@@ -1429,21 +1315,8 @@ async function reserveProbe(
       const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
       if (entryIdentity(sessionId, info) !== identity) return false;
       const now = Date.now();
-      const until = now + BG_PROBE_RESERVE_MS;
-      const bgProbes = { ...liveProbeReservations(info, now), [token]: until };
-      const next: HandsKvEntry = { ...info, bgProbes };
-      const target = probeIdleHoldTarget(info.idleSince, until);
-      if (target !== null) {
-        // The reading to go back to is the period's own stamp, which is what a
-        // carry already in force is holding aside and what the field itself says
-        // when none is. Reusing a superseded record's `base` instead is how a
-        // restore would walk the window backwards past somebody's legitimate
-        // advance; `idlePeriodStamp` is what refuses to read one.
-        const base = idlePeriodStamp(info) as number;
-        next.probeIdleHold = { base, to: target };
-        next.idleSince = target;
-      }
-      await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+      const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
+      await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
       return true;
     } catch {
       // Either the update lost its revision or the round trip failed; neither is
@@ -1464,25 +1337,6 @@ async function reserveProbe(
  * it -- the reclaim would then be deferred by a fixed minute per probe rather
  * than by the probe. Only this probe's own token, so a second replica still
  * waiting on its own answer keeps its protection.
- *
- * And the same for the stamp the reservation carried forward, on the same terms
- * and for the same reason. The carry states that a question is open, so it lasts
- * exactly as long as one is: once the last token is off the entry the stamp goes
- * back to the reading it was taken from and the handle expires on the schedule it
- * was already on. Anything else and a handle probed often enough is a handle
- * never reclaimed -- the reuse window defeated by the mechanism protecting it.
- *
- * Undone exactly, not approximately. `base` is the period's own stamp, so
- * restoring it can neither add life the handle did not have nor take away life it
- * did, and nothing else on the entry has to move with it -- every verdict was
- * measured and filed under that same value while the carry was in force. And only
- * while `to` still matches, which is what keeps this from clobbering a writer who
- * moved the stamp for a reason of their own: a task that re-idled the handle, or
- * the running refresh, both of which supersede the carry rather than race it.
- *
- * The last token, not this one's: a carry left behind by a replica that stopped
- * answering is released here rather than waiting for some later probe to touch
- * the entry, which is the rule the reservation map itself is pruned by.
  */
 async function releaseProbe(
   deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
@@ -1493,19 +1347,11 @@ async function releaseProbe(
     if (!e) return;
     const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
     if (entryIdentity(sessionId, info) !== identity) return;
-    const mine = !!info.bgProbes && token in info.bgProbes;
+    if (!info.bgProbes || !(token in info.bgProbes)) return;
     const bgProbes = liveProbeReservations(info, Date.now());
     delete bgProbes[token];
-    const outstanding = Object.keys(bgProbes).length > 0;
-    const hold = info.probeIdleHold;
-    const restorable = !outstanding && !!hold && hold.to === info.idleSince;
-    if (!mine && !restorable) return;
     const next: HandsKvEntry = { ...info, bgProbes };
-    if (!outstanding) delete next.bgProbes;
-    if (restorable && hold) {
-      next.idleSince = hold.base;
-      delete next.probeIdleHold;
-    }
+    if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
     await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
   } catch { /* best effort: the deadline is the backstop */ }
 }
@@ -1550,10 +1396,7 @@ function dispatchProbes(
     // against when the answer lands, minutes later and possibly on the far side
     // of a task that another replica ran. A value rather than a time: see
     // measuredUnderThisIdlePeriod for why the comparison cannot be an ordering.
-    // Read through `idlePeriodStamp`, so a reservation that carried the field
-    // forward to keep an old sweep off the handle does not also rename the
-    // period underneath its own answer.
-    const idleSinceAtStart = idlePeriodStamp(info);
+    const idleSinceAtStart = info.idleSince;
     // And the half of that name a second idle period cannot land on by accident.
     // The stamp alone is a clock reading, so two periods can be described by the
     // same one; this is the revision an idle-opening write was conditioned on,
@@ -1840,7 +1683,7 @@ async function persistVerdict(
       // actually measured in.
       if (
         !sameIdlePeriod(epoch, info)
-        || idlePeriodStamp(info) !== idleSinceAtStart
+        || info.idleSince !== idleSinceAtStart
         || info.idleRev !== idleRevAtStart
       ) {
         logger.info(
@@ -1996,28 +1839,16 @@ async function refreshIdleSince(
     // caller's promise: a verdict older than the stamp is already refused before
     // this is reached, and nothing here should be the thing that moves an idle
     // window backwards if that ever stops being true.
-    //
-    // Through `idlePeriodStamp`, for the same reason every other reader of this
-    // value does: a probe reservation may have carried the field forward, and
-    // carrying it further from there would compound a temporary hold into a
-    // permanent one. The stamp is the period's own reading, which is what this
-    // is entitled to move.
-    const idleSince = Math.max(idlePeriodStamp(info) ?? 0, seenAt);
+    const idleSince = Math.max(
+      typeof info.idleSince === "number" ? info.idleSince : 0,
+      seenAt,
+    );
     // And the reuse clock, which is the other half of what this write used to
     // do with one number. `Date.now()` is right for it and wrong for the anchor:
     // this sweep is seeing the sandbox at work now, whatever the age of the
     // measurement telling it so, and the window it gets when the work stops has
     // to start from now rather than from a reading that may be half an hour old.
-    const entry: HandsKvEntry = { ...info, idleSince, workSeenAt: Date.now() };
-    // And any probe carry is spent. This write is the running answer being acted
-    // on -- the ordinary, non-temporary reason to hold the stamp up -- and it
-    // sets the stamp itself, so a record saying where to put the stamp back is
-    // now about a decision that has been superseded. Left behind, releaseProbe
-    // would read it as a carry still in force and undo it, taking this refresh
-    // with it: the two paths cancelling each other out and a working sandbox
-    // reading as expired to exactly the sweep the carry was addressed to.
-    delete entry.probeIdleHold;
-    const next = sc.encode(JSON.stringify(entry));
+    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: Date.now() }));
     await deps.kv.update(key, next, revision);
     // The scan's copy of the entry outlives this write -- a probe dispatched at
     // the end of the same tick reads its `idleSince` to say which period it is
@@ -2025,7 +1856,6 @@ async function refreshIdleSince(
     // no longer carries, and the answer would be dropped on arrival as if the
     // handle had been reactivated.
     info.idleSince = idleSince;
-    delete info.probeIdleHold;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
@@ -2137,11 +1967,7 @@ async function collectTargets(
         if (info.keepalive === false
           && (typeof info.idleEpoch !== "number" || typeof info.idleRev !== "number")) {
           if (typeof info.idleEpoch !== "number") {
-            // The period's own stamp, not the field: an outstanding reservation
-            // may have carried the field forward, and naming the period after a
-            // reading that is about to be put back names a period that will not
-            // exist a moment later.
-            info.idleEpoch = idlePeriodStamp(info) ?? Date.now();
+            info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
           }
           if (typeof info.idleRev !== "number") info.idleRev = e.revision;
           value = sc.encode(JSON.stringify(info));
