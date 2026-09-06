@@ -23,8 +23,10 @@ import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-bac
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import { interruptSubject } from "@claw/protocol";
-import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../config.js";
-import { nc } from "../infra/nats.js";
+import {
+  envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
+} from "../config.js";
+import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
@@ -33,6 +35,10 @@ import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
 } from "../workspace/store.js";
+import {
+  ACTIONABLE_RECEIPT_SQL, failChatRunDispatch, noDeliveryInFlightSql,
+  parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
+} from "./chat-run.js";
 
 const logger = pino({ name: "task-sweeper" });
 
@@ -825,6 +831,271 @@ async function releaseSessionsOfLostRuns(sessionIds: string[]): Promise<void> {
   );
 }
 
+/**
+ * What this tick can prove about deliveries still on the durable.
+ *
+ * Read once per tick rather than once per row, and fails closed: an unreadable
+ * consumer or stream answers "not settled", which keeps a session gate shut
+ * rather than handing it back under a delivery that may still execute.
+ */
+async function deliveryObservations(): Promise<{ wholeStream: boolean }> {
+  const settlement = await taskDeliverySettlement();
+  // A row whose receipt says a publish was attempted but carries no sequence is
+  // covered only by the whole-stream form: any message for it was published
+  // before this read, so a floor past `last_seq` is past that message too.
+  return { wholeStream: settlement !== null && settlement.ackFloor >= settlement.lastSeq };
+}
+
+/**
+ * Close fat and legacy-fat chat rows no Brain ever took a durable lease on.
+ *
+ * Inert while no evidence arm of the shared guard holds, by construction: the
+ * guard is a term of the candidate scan, so the pass finds nothing rather than
+ * being switched off somewhere else. `cancelling` is in the status list for the
+ * debris of a Stop taken before cancellation became holder-aware, and `running`
+ * because `markChatRunRunning` is session-scoped -- a later turn can move an
+ * older holderless row out of `preparing`. Status is not holder evidence.
+ *
+ * An unsupported receipt is excluded from the scan rather than fetched and
+ * declined: a limit's worth of undeclinable rows would otherwise starve every
+ * actionable orphan behind them.
+ */
+export async function reapOrphanedFatRuns(limit = 200): Promise<number> {
+  const settled = await deliveryObservations();
+  const r = await db.query(
+    `SELECT task_id, session_id, metadata
+       FROM claw_tasks
+      WHERE origin = 'chat'
+        AND executor = 'brain'
+        AND status IN ('preparing','running','cancelling')
+        AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND started_at IS NOT NULL
+        AND started_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND NOT (${UNSUPPORTED_RECEIPT_SQL})
+        AND (${noDeliveryInFlightSql("$2", "$3")})
+      ORDER BY started_at, task_id
+      LIMIT $4`,
+    [BRAIN_TASK_TIMEOUT_SEC, RUN_FAT_PREPARING_RECONCILE, settled.wholeStream, limit],
+  );
+  if (!r.rowCount) return 0;
+  let closed = 0;
+  for (const row of r.rows as Array<{
+    task_id: string; session_id: string; metadata: Record<string, unknown> | null;
+  }>) {
+    // The same CAS the request path uses, not a second UPDATE with subtly
+    // different holder rules: a row accepted between the SELECT and the write
+    // classifies as held, and one another replica already closed as closed.
+    const verdict = await failChatRunDispatch(
+      row.task_id,
+      `no Brain established the first durable lease within ${BRAIN_TASK_TIMEOUT_SEC}s`,
+      "dispatch_unconfirmed",
+      {
+        statuses: SWEEPABLE_RUN_STATUSES,
+        observedReceipt: row.metadata?.dispatch_compensation,
+        fleetAsserted: RUN_FAT_PREPARING_RECONCILE,
+        deliverySettled: settled.wholeStream,
+      },
+    );
+    if (verdict === "closed") closed += 1;
+  }
+  if (closed) logger.warn({ closed }, "sweeper.reaped_orphaned_fat_runs");
+  return closed;
+}
+
+/**
+ * Finish the cleanup a terminal fat row is still owed.
+ *
+ * Existing terminal writers do not all know about the receipt -- a sibling
+ * close can fail an armed duplicate, a session deletion can cancel one -- so
+ * this pass owns adoption of a terminal never-held armed record, cleanup of one
+ * already marked terminal, and the resources of a never-held terminal fat row
+ * whose terminalizer left no receipt at all. Every fetched row is one this
+ * deployment can act on, so each acted row leaves the set and a bounded batch
+ * progresses by construction.
+ */
+export async function finalizeDispatchCompensations(limit = 200): Promise<number> {
+  const r = await db.query(
+    `SELECT task_id, session_id, failure_reason, error_message, metadata,
+            metadata->>'message_id' AS message_id
+       FROM claw_tasks
+      WHERE status IN ('completed','failed','cancelled')
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND (
+             (${ACTIONABLE_RECEIPT_SQL}
+              AND metadata->'dispatch_compensation'->>'state' IN ('armed','terminal'))
+             OR (
+                  metadata->'dispatch_compensation' IS NULL
+                  AND origin = 'chat'
+                  AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+                  AND ${OWED_RESOURCE_SQL}
+             )
+        )
+      ORDER BY completed_at NULLS FIRST, task_id
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  let completed = 0;
+  for (const row of r.rows as FinalizableRow[]) {
+    try {
+      if (await finalizeOneCompensation(row)) completed += 1;
+    } catch (err) {
+      // One row's failure leaves it in the arm it was in for the next tick and
+      // must not stop the rest of the batch.
+      logger.warn({ err, taskId: row.task_id }, "sweeper.finalize_compensation_failed");
+    }
+  }
+  if (completed) logger.info({ completed }, "sweeper.finalized_dispatch_compensations");
+  return completed;
+}
+
+interface FinalizableRow {
+  task_id: string;
+  session_id: string;
+  failure_reason: string | null;
+  error_message: string | null;
+  message_id: string | null;
+  metadata: Record<string, unknown> | null;
+}
+
+/** A terminal row still naming a workspace it has not let go of. */
+const OWED_RESOURCE_SQL = `(
+  EXISTS (
+    SELECT 1 FROM claw_workspace_refs wr
+     WHERE wr.ref_kind = 'run' AND wr.ref_id = claw_tasks.task_id AND wr.released_at IS NULL
+  )
+  OR EXISTS (
+    SELECT 1 FROM claw_workspaces w WHERE w.writer_run_id = claw_tasks.task_id
+  )
+)`;
+
+/**
+ * Adopt, release, verify, offer the gate, then mark complete -- in that order,
+ * each step idempotent, so a failure anywhere leaves the row eligible next tick
+ * rather than half-finished.
+ */
+async function finalizeOneCompensation(row: FinalizableRow): Promise<boolean> {
+  const parsed = parseDispatchCompensationRecord(row.metadata);
+  if (parsed.kind === "unsupported" || parsed.kind === "invalid") {
+    logger.warn(
+      { taskId: row.task_id, kind: parsed.kind },
+      "sweeper.invalid_dispatch_compensation",
+    );
+    return false;
+  }
+  const adopting = parsed.kind === "absent" || parsed.record.state === "armed";
+  if (adopting && !await adoptTerminalReceipt(row, parsed)) return false;
+  // A completed run's result is evidence that work changed the workspace; a
+  // never-held failed or cancelled row changed nothing.
+  await releaseRunUse(row.task_id, false);
+  if (await stillOwesResources(row.task_id)) {
+    logger.warn({ taskId: row.task_id }, "sweeper.compensation_cleanup_incomplete");
+    return false;
+  }
+  await releaseSessionsOfLostRuns([row.session_id]);
+  return await markReceiptComplete(row.task_id);
+}
+
+async function adoptTerminalReceipt(
+  row: FinalizableRow,
+  parsed: ReturnType<typeof parseDispatchCompensationRecord>,
+): Promise<boolean> {
+  if ((row.failure_reason === null) !== (row.error_message === null)) {
+    logger.warn({ taskId: row.task_id }, "sweeper.terminal_row_missing_reason");
+  }
+  const observed = parsed.kind === "absent"
+    ? null
+    : JSON.stringify((row.metadata ?? {}).dispatch_compensation);
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              metadata, '{dispatch_compensation}',
+              jsonb_build_object(
+                'version', 1, 'state', 'terminal',
+                'failure_reason', to_jsonb($2::text), 'error_message', to_jsonb($3::text)
+              )
+            )
+      WHERE task_id = $1
+        AND status IN ('completed','failed','cancelled')
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND metadata->'dispatch_compensation' IS NOT DISTINCT FROM $4::jsonb
+      RETURNING task_id`,
+    [row.task_id, row.failure_reason, row.error_message, observed],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+async function stillOwesResources(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `SELECT 1
+       WHERE EXISTS (
+         SELECT 1 FROM claw_workspace_refs
+          WHERE ref_kind = 'run' AND ref_id = $1 AND released_at IS NULL
+       ) OR EXISTS (
+         SELECT 1 FROM claw_workspaces WHERE writer_run_id = $1
+       )`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+async function markReceiptComplete(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              metadata, '{dispatch_compensation,state}', '"complete"'::jsonb
+            )
+      WHERE task_id = $1
+        AND metadata->'dispatch_compensation'->>'version' = '1'
+        AND metadata->'dispatch_compensation'->>'state' = 'terminal'
+      RETURNING task_id`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Report every receipt no pass in this deployment will act on.
+ *
+ * Write-free and bounded separately from the writing passes, so a refusal can
+ * never delay a receipt this deployment can finish. This is how an operator
+ * sees a rollout-order violation.
+ */
+export async function auditRefusedCompensations(limit = 20): Promise<number> {
+  const r = await db.query(
+    `SELECT task_id, status,
+            metadata->'dispatch_compensation'->>'version' AS version,
+            metadata->'dispatch_compensation'->>'state' AS state
+       FROM claw_tasks
+      WHERE (
+             (status IN ('completed','failed','cancelled')
+              AND metadata->'dispatch_compensation' IS NOT NULL
+              AND metadata->'dispatch_compensation'->>'state' IS DISTINCT FROM 'complete'
+              AND NOT (${ACTIONABLE_RECEIPT_SQL}))
+             OR (status IN ('preparing','running','cancelling')
+                 AND origin = 'chat'
+                 AND (${UNSUPPORTED_RECEIPT_SQL}))
+      )
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  for (const row of r.rows as Array<{ task_id: string; version: string | null; state: string | null }>) {
+    const event = row.version !== null && row.version !== "1"
+      ? "sweeper.unsupported_dispatch_compensation"
+      : "sweeper.invalid_dispatch_compensation";
+    logger.warn({ taskId: row.task_id, version: row.version, state: row.state }, event);
+  }
+  return r.rowCount;
+}
+
 /** Fail `waiting_external` rows past their per-node timeout. */
 export async function reapWaitExternal(): Promise<number> {
   const r = await db.query(
@@ -994,6 +1265,13 @@ export async function sweeperTick(): Promise<void> {
   // with the reason that explains it rather than the one that noticed second.
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
+  // After reapLostLeases, so an accepted row whose worker died is closed as
+  // worker_lost by its own reaper rather than reclassified as one that never
+  // executed. Each contained independently: a throw from one must not cost the
+  // later passes or the tick's final idempotency-key prune.
+  await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);
+  await runContained("sweeper.finalize_compensations_failed", finalizeDispatchCompensations);
+  await runContained("sweeper.audit_compensations_failed", auditRefusedCompensations);
   await runContained("sweeper.expired_queue_failed", reapExpiredQueuedRuns);
   // After the requeue pass: a row inside its deadline belongs to that pass,
   // and only what it declines is this one's.

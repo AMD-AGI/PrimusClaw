@@ -994,7 +994,7 @@ test("N an open row the settle could not match establishes nothing", async () =>
   const real = db.query;
   db.query = (async (t: string, p?: unknown[]) => {
     // The settle finds nothing; the row it names is still open and unheld.
-    if (/SET status = 'failed'/.test(t)) return { rows: [], rowCount: 0 };
+    if (/SET status = CASE WHEN status = 'cancelling'/.test(t)) return { rows: [], rowCount: 0 };
     return (real as never as (a: string, b?: unknown[]) => Promise<unknown>)(t, p);
   }) as typeof db.query;
   let verdict;

@@ -312,12 +312,32 @@ test("a publish failure closes the row describing the run that never ran", async
   const seen = stubDb();
   await failChatRunDispatch("ktsk_x", "nats unreachable");
 
-  assert.match(seen[0].sql, /UPDATE claw_tasks SET status = 'failed'/);
-  assert.deepEqual(seen[0].params, ["ktsk_x", "dispatch_failed", "nats unreachable"]);
+  assert.match(seen[0].sql, /UPDATE claw_tasks SET status = CASE WHEN status = 'cancelling'/);
+  assert.deepEqual(
+    seen[0].params.slice(0, 4),
+    ["ktsk_x", "dispatch_failed", "nats unreachable", ["queued", "preparing", "running"]],
+    "the caller's own state list, so one predicate can serve every caller",
+  );
+  // Any durable trace of a holder declines the close, not just a live lease: an
+  // expired or released holder belongs to the lease and retry lifecycle rather
+  // than to a pass that says the run never executed.
+  for (const guard of [
+    /AND lease_owner IS NULL/,
+    /AND lease_expires_at IS NULL/,
+    /AND COALESCE\(claim_count, 0\) = 0/,
+    /status = ANY\(\$4::text\[\]\)/,
+  ]) {
+    assert.match(seen[0].sql, guard);
+  }
   assert.match(
     seen[0].sql,
-    /status IN \('queued','preparing','running'\)/,
-    "a CAS, so a run that has since been swept or cancelled is left alone",
+    /metadata->'dispatch_compensation' IS NOT DISTINCT FROM \$5::jsonb/,
+    "a receipt rewritten between the read and the write matches nothing and is retried",
+  );
+  assert.match(
+    seen[0].sql,
+    /'state', 'terminal'/,
+    "the close writes its own durable receipt, so the cleanup it owes survives this process",
   );
   assert.ok(seen.some((q) => /claw_workspace_refs|workspace/i.test(q.sql)),
     "and an unclaimed row's workspace reference is handed back");

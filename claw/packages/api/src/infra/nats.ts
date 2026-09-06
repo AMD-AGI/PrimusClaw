@@ -188,6 +188,36 @@ export function tombstoneTtlMs(
  * unknown rather than guessed, because the two guesses are not symmetric: one
  * leaves a spare row behind, the other loses the message.
  */
+/**
+ * How far the task durable has settled, read once per sweeper tick.
+ *
+ * `ack_floor.stream_seq` covers both ways a delivery can still be live: never
+ * delivered is still pending, and held unacked behind a pod's execution gate is
+ * still outstanding. `lastSeq` supports the whole-stream form, for a row that
+ * attempted a publish but could not record which sequence it got.
+ *
+ * @returns null on any error or unreadable consumer or stream, which every
+ *   caller must read as "not settled" -- handing a session back on the strength
+ *   of an unreadable durable is the failure this exists to prevent.
+ */
+export async function taskDeliverySettlement(): Promise<
+  { ackFloor: number; lastSeq: number } | null
+> {
+  try {
+    const [consumer, stream] = await Promise.all([
+      jsm.consumers.info(TASK_STREAM, TASK_CONSUMER_NAME),
+      jsm.streams.info(TASK_STREAM),
+    ]);
+    const ackFloor = Number(consumer.ack_floor?.stream_seq);
+    const lastSeq = Number(stream.state?.last_seq);
+    if (!Number.isFinite(ackFloor) || !Number.isFinite(lastSeq)) return null;
+    return { ackFloor, lastSeq };
+  } catch (err) {
+    logger.warn({ err }, "nats.task_delivery_settlement_unreadable");
+    return null;
+  }
+}
+
 export function publishCertainlyFailed(err: unknown): boolean {
   const e = err as { code?: string; api_error?: unknown } | null;
   return e?.code === "503" || e?.api_error !== undefined;

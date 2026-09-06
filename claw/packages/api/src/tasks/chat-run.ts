@@ -458,13 +458,16 @@ export async function markChatRunRunning(sessionId: string): Promise<void> {
  *
  * `error_message` is bounded here rather than trusted: it comes from a failure
  * path, and failure paths are where oversized strings come from.
+ *
+ * @returns the ids of the rows it closed, so a caller releasing resources acts
+ *   only on rows this statement actually settled.
  */
 export async function closeChatRun(
   sessionId: string,
   messageId: string | undefined,
   outcome: ChatRunOutcome,
   failureReason?: string,
-): Promise<void> {
+): Promise<string[]> {
   // Two lists, because this statement asks two different questions.
   //
   // `queued` belongs in what a *named* turn may close: a lease judged lost puts
@@ -534,16 +537,19 @@ export async function closeChatRun(
         { sessionId, messageId, outcome, failureReason },
         "chat_run.close_matched_nothing",
       );
-      return;
+      return [];
     }
     // The run is over, so it is no longer a reason to keep the files and no
     // longer the workspace's writer. A run that failed still counts as having
     // changed it: it may have written half of what it meant to.
-    for (const row of r.rows as Array<{ task_id: string }>) {
-      await releaseRunUse(row.task_id);
+    const closed = (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
+    for (const taskId of closed) {
+      await releaseRunUse(taskId);
     }
+    return closed;
   } catch (err) {
     logger.warn({ err, sessionId, messageId, outcome }, "chat_run.close_failed");
+    return [];
   }
 }
 
@@ -594,21 +600,46 @@ export async function closeChatRun(
  * A terminal row is `closed`: nothing will execute it, which is exactly what
  * the caller needs to know and exactly what a first successful close means.
  */
-async function verdictForUnmatchedRow(taskId: string): Promise<FailDispatchVerdict> {
+async function verdictForUnmatchedRow(
+  taskId: string,
+  statuses: readonly TaskStatus[],
+): Promise<FailDispatchVerdict> {
   const r = await db.query(
-    `SELECT status, lease_owner FROM claw_tasks WHERE task_id = $1`,
+    `SELECT status, lease_owner, lease_expires_at, claim_count, metadata
+       FROM claw_tasks WHERE task_id = $1`,
     [taskId],
   );
-  const row = r.rows[0] as { status?: string; lease_owner?: string | null } | undefined;
+  const row = r.rows[0] as {
+    status?: string;
+    lease_owner?: string | null;
+    lease_expires_at?: unknown;
+    claim_count?: unknown;
+    metadata?: Record<string, unknown> | null;
+  } | undefined;
   // Gone entirely: whatever closed it, nothing is going to run it.
   if (!row) return "closed";
-  if (!OPEN_RUN_STATUS_SET.has(String(row.status))) {
+  const held = hasHolderEvidence(row);
+  // Cancellation leaves the holder's lease on the row it moves to
+  // `cancelling`, so that combination is a live turn rather than debris.
+  if (row.status === "cancelling" && held) {
+    logger.info({ taskId }, "chat_run.fail_dispatch_skipped_held");
+    return "held";
+  }
+  if (!statuses.includes(String(row.status) as TaskStatus)) {
     logger.info({ taskId, status: row.status }, "chat_run.fail_dispatch_already_terminal");
     return "closed";
   }
-  if (row.lease_owner) {
+  if (held) {
     logger.info({ taskId }, "chat_run.fail_dispatch_skipped_held");
     return "held";
+  }
+  const parsed = parseDispatchCompensationRecord(row.metadata);
+  if (parsed.kind === "unsupported") {
+    logger.warn(
+      { taskId, version: parsed.version },
+      "sweeper.unsupported_dispatch_compensation",
+    );
+    return "unknown";
   }
   // Open, unheld, and yet the UPDATE matched nothing: something changed under
   // the statement. Nothing was established, so say so.
@@ -617,82 +648,150 @@ async function verdictForUnmatchedRow(taskId: string): Promise<FailDispatchVerdi
 }
 
 /**
- * The states the settle below is willing to close from, as one list.
+ * Whether any durable trace of a holder exists.
+ *
+ * Deliberately broader than "is a lease live": an expired or released holder
+ * belongs to the lease and retry lifecycle, not to a pass that reclassifies a
+ * run as one that never executed.
+ */
+function hasHolderEvidence(row: {
+  lease_owner?: string | null;
+  lease_expires_at?: unknown;
+  claim_count?: unknown;
+}): boolean {
+  return Boolean(row.lease_owner)
+    || row.lease_expires_at != null
+    || Number(row.claim_count ?? 0) > 0;
+}
+
+/**
+ * The states a settle is willing to close from.
  *
  * Shared with the statement rather than restated beside it: the two had
  * already drifted once -- the SQL closed from three states and the check that
  * reads the outcome recognised four -- which quietly turned a `cancelling` row
  * into "a worker is running this".
  */
-const OPEN_RUN_STATUSES = ["queued", "preparing", "running"] as const;
-const OPEN_RUN_STATUS_SET = new Set<string>(OPEN_RUN_STATUSES);
-const OPEN_RUN_STATUS_SQL = OPEN_RUN_STATUSES.map((s) => `'${s}'`).join(",");
+export const OPEN_RUN_STATUSES = ["queued", "preparing", "running"] as const;
+
+/**
+ * What a pass acting on durable evidence may close from.
+ *
+ * `cancelling` is here and absent from {@link OPEN_RUN_STATUSES} because
+ * certain non-delivery has to reach a row a Stop moved there a moment earlier:
+ * that row is never held, its message is known not to exist, and nothing else
+ * would reclaim it.
+ */
+export const SWEEPABLE_RUN_STATUSES = [...OPEN_RUN_STATUSES, "cancelling"] as const;
 
 /** What a compensation established about the row it was asked to close. */
 export type FailDispatchVerdict = "closed" | "held" | "unknown";
 
+export interface FailDispatchOptions {
+  /** Which open states this caller may close from. Defaults to the request path's. */
+  statuses?: readonly TaskStatus[];
+  /**
+   * The exact receipt value the caller read, letting a malformed one be
+   * replaced without blindly overwriting a value that changed since the read.
+   */
+  observedReceipt?: unknown;
+  /** Whether the deployment asserts every Brain takes a holder before its gate. */
+  fleetAsserted?: boolean;
+  /** Whether this row's delivery has been observed settled on the durable. */
+  deliverySettled?: boolean;
+}
+
+/**
+ * The one terminalizing CAS, taking the states it may close from as a parameter
+ * so that one predicate serves every caller.
+ *
+ * Status, owner, lease, claim count and receipt form one atomic decision: no
+ * preliminary SELECT may authorize the write, because a row accepted between
+ * the two would be closed underneath its holder. The guard is bound rather than
+ * read from configuration here, because one caller is exempt by evidence -- a
+ * publish that certainly failed knows no message exists.
+ */
 export async function failChatRunDispatch(
   taskId: string | null,
   reason: string,
   failureReason = "dispatch_failed",
+  opts: FailDispatchOptions = {},
 ): Promise<FailDispatchVerdict> {
-  if (!taskId) return "unknown";
+  // No row exists, so nothing can be holding anything and the caller may roll
+  // its session back without guessing.
+  if (!taskId) {
+    logger.info({ reason, failureReason }, "chat_run.fail_dispatch_no_row");
+    return "closed";
+  }
+  const statuses = opts.statuses ?? OPEN_RUN_STATUSES;
+  const message = reason.slice(0, 2000);
+  const observed = opts.observedReceipt === undefined ? null : JSON.stringify(opts.observedReceipt);
   try {
-    // Only while nobody holds it. This used to be an unguarded transition on
-    // the grounds that a dispatch which failed had never executed -- true when
-    // the row's only route to a worker was the message this function is
-    // compensating for. The doorbell path added a second route that does not
-    // wait for it: `peekNextQueued` matches the row the instant `insertTask`
-    // commits, which is before the post-insert recheck and before the wakeup
-    // is published, so claim-next can be running the turn by the time any of
-    // those steps fails. Failing it then closes a live run and, worse, hands
-    // its workspace back underneath it.
-    //
-    // A holder settles its own row: it has the lease, the generation and the
-    // terminal event. Leaving it alone is the whole fix.
+    // Only while no durable holder evidence exists. This used to be an
+    // unguarded transition on the grounds that a dispatch which failed had
+    // never executed -- true when the row's only route to a worker was the
+    // message this function is compensating for. The doorbell path added a
+    // second route that does not wait for it: `peekNextQueued` matches the row
+    // the instant `insertTask` commits, so claim-next can be running the turn
+    // by the time any later step fails. A holder settles its own row.
     const r = await db.query(
       `UPDATE claw_tasks
-          SET status = 'failed',
-              failure_reason = $2,
+          SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
+              failure_reason = ${SETTLED_REASON_SQL},
               error_message = $3,
-              completed_at = NOW()
+              completed_at = NOW(),
+              metadata = jsonb_set(
+                metadata, '{dispatch_compensation}',
+                jsonb_build_object(
+                  'version', 1,
+                  'state', 'terminal',
+                  'failure_reason', ${SETTLED_REASON_SQL},
+                  'error_message', $3::text
+                )
+              )
         WHERE task_id = $1
-          AND status IN (${OPEN_RUN_STATUS_SQL})
+          AND origin = 'chat'
+          AND status = ANY($4::text[])
           AND lease_owner IS NULL
-        RETURNING task_id`,
-      [taskId, failureReason, reason.slice(0, 2000)],
+          AND lease_expires_at IS NULL
+          AND COALESCE(claim_count, 0) = 0
+          AND (
+               metadata->'dispatch_compensation'->>'version' = '1'
+               OR metadata->'dispatch_compensation' IS NULL
+               OR metadata->'dispatch_compensation' IS NOT DISTINCT FROM $5::jsonb
+          )
+          AND (${noDeliveryInFlightSql("$6", "$7")})
+        RETURNING task_id, session_id, status`,
+      [
+        taskId, failureReason, message, statuses, observed,
+        opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
+      ],
     );
-    if (!r.rowCount) return await verdictForUnmatchedRow(taskId);
-    // Reached only when the row was still unclaimed, so nothing ever executed
-    // and the workspace is exactly as the run found it.
+    // Every statement after a non-match must be a SELECT: attaching a receipt,
+    // releasing a workspace or altering a session here would act on a row this
+    // call did not establish anything about.
+    if (!r.rowCount) return await verdictForUnmatchedRow(taskId, statuses);
+    // Reached only when the row was still unheld, so nothing ever executed and
+    // the workspace is exactly as the run found it.
     await releaseRunUse(taskId, false);
     return "closed";
   } catch (err) {
-    // TODO(admission): an `unknown` on the fat path leaves the row at
-    // `preparing` with a null lease, and no reaper can see that state --
-    // `reapLostLeases` wants a non-null `lease_expires_at` and `insertTask`
-    // never writes one, `reapStaleTasks` skips chat unless RUN_ROWS_SWEEPABLE,
-    // and every other chat reaper is scoped to doorbell rows. The row then
-    // counts against the fleet-wide `OCCUPYING` total in `loadUsage`, which
-    // has no per-user or per-session dimension, so it holds an admission slot
-    // for the life of the deployment.
-    //
-    // Left as it is on purpose: with no ADMIT_* ceiling configured -- the
-    // default, and what this deployment runs -- `decideAdmission` returns
-    // `admit` before it counts anything, so the row costs nothing. Reaching
-    // this line at all needs the publish and this statement to fail inside the
-    // same narrow window, having just seen a successful insert.
-    //
-    // Fix it before turning any ADMIT_* ceiling on. The cheap-looking options
-    // are both worse than the problem today: RUN_ROWS_SWEEPABLE lets
-    // `reapStaleTasks` cover chat, but that reaper interrupts by session and
-    // would cut a different live run on the same one; stamping
-    // `lease_expires_at` at insert changes every chat row's semantics on the
-    // hot path.
+    // No catch-only metadata write is attempted: it would have the same
+    // unavailable dependency as the statement that just failed. The INSERT-time
+    // armed receipt is what the sweeper retries from.
     logger.warn({ err, taskId }, "chat_run.fail_dispatch_failed");
     return "unknown";
   }
 }
+
+/**
+ * The reason a settle records, which is not the caller's for a stopped turn.
+ *
+ * A user who pressed Stop is owed that answer rather than a dispatch failure,
+ * and the row columns and the receipt must carry the same value.
+ */
+const SETTLED_REASON_SQL =
+  "CASE WHEN status = 'cancelling' THEN 'cancelled_before_dispatch_confirmed' ELSE $2 END";
 
 /**
  * Cancel doorbell rows that Stop can never reach over NATS.
