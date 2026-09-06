@@ -65,7 +65,37 @@ export interface NewSessionRow {
   role: string;
 }
 
-async function insertSessionRow(q: StatementRunner, row: NewSessionRow): Promise<void> {
+/**
+ * Proof that the caller may attach a child to a parent, issued by the read
+ * that checked it.
+ *
+ * A value rather than a boolean, and carrying the parent it was issued for, so
+ * a witness cannot be reused for a different parent than the one authorised.
+ */
+export interface ParentAuthorisation {
+  readonly parentSid: string;
+}
+
+/**
+ * Write the session row, refusing to record a parent nobody authorised.
+ *
+ * The guard is here rather than only at the call sites because "did we check?"
+ * must not be a property of which branch ran. Both creation paths derive that
+ * answer from the same request field they are about to persist, so a third path
+ * -- or a reordering of an existing one -- could write a parent link having
+ * evaluated no authorisation at all, and nothing downstream would notice: a
+ * child row is what grants visibility of a parent's tree. Requiring the witness
+ * at the write makes the check structural, and its absence a crash rather than
+ * a silent cross-tenant attachment.
+ */
+export async function insertSessionRow(
+  q: StatementRunner,
+  row: NewSessionRow,
+  parentAuth?: ParentAuthorisation,
+): Promise<void> {
+  if (row.parentSid && parentAuth?.parentSid !== row.parentSid) {
+    throw new Error("session.create.parent_not_authorised");
+  }
   await q.query(
     `INSERT INTO claw_sessions
      (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
@@ -77,11 +107,22 @@ async function insertSessionRow(q: StatementRunner, row: NewSessionRow): Promise
   );
 }
 
-async function readParentAuthorisation(
+/**
+ * Whether this caller may attach a child to `parentSid`.
+ *
+ * Every arm fails closed: an anonymous caller, a parent that does not exist,
+ * one whose owner column is null, and one owned by somebody else are all
+ * refusals. Returns the witness {@link insertSessionRow} demands, so a caller
+ * cannot persist the link without having come through here.
+ */
+export async function readParentAuthorisation(
   q: StatementRunner,
   parentSid: string,
   user: ReturnType<typeof getUser>,
-): Promise<SessionCreateRefusal | null> {
+): Promise<SessionCreateRefusal | ParentAuthorisation> {
+  if (!user) {
+    return { statusCode: 401, response: { ok: false, error: "authentication required" } };
+  }
   const parent = (await q.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
     [parentSid],
@@ -90,7 +131,14 @@ async function readParentAuthorisation(
   if (!canWriteSessionAsOperator(parent.user_id, user)) {
     return { statusCode: 403, response: { ok: false, error: "parent_session_access_denied" } };
   }
-  return null;
+  return { parentSid };
+}
+
+/** Whether a parent read answered with a refusal rather than a witness. */
+function isRefusal(
+  result: SessionCreateRefusal | ParentAuthorisation,
+): result is SessionCreateRefusal {
+  return "statusCode" in result;
 }
 
 /**
@@ -115,10 +163,10 @@ export async function admitParentedSessionCreate(
     await client.query("BEGIN");
     try {
       await acquireAdmissionLock(client);
-      const denied = await readParentAuthorisation(client, parentSid, user);
-      if (denied) {
+      const parentAuth = await readParentAuthorisation(client, parentSid, user);
+      if (isRefusal(parentAuth)) {
         await client.query("ROLLBACK");
-        return denied;
+        return parentAuth;
       }
       const shape = await sessionTreeShape(parentSid, client);
       const decision = await decideAdmission({
@@ -137,7 +185,7 @@ export async function admitParentedSessionCreate(
           response: { ok: false, error: "admission_rejected", reason: decision.reason },
         };
       }
-      await insertSessionRow(client, row);
+      await insertSessionRow(client, row, parentAuth);
       await client.query("COMMIT");
       return null;
     } catch (err) {
@@ -842,11 +890,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             return { statusCode: refused.statusCode, response: refused.response };
           }
         } else {
+          let parentAuth: ParentAuthorisation | undefined;
           if (parentSid) {
-            const denied = await readParentAuthorisation(db, parentSid, user);
-            if (denied) return { statusCode: denied.statusCode, response: denied.response };
+            const result = await readParentAuthorisation(db, parentSid, user);
+            if (isRefusal(result)) {
+              return { statusCode: result.statusCode, response: result.response };
+            }
+            parentAuth = result;
           }
-          await insertSessionRow(db, newRow);
+          await insertSessionRow(db, newRow, parentAuth);
         }
 
         const dispMode = mode.replace(/-harness$/, "");

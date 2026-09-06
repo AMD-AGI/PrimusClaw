@@ -58,6 +58,16 @@ CREATE TABLE claw_sessions (
   agent_status   TEXT DEFAULT 'idle',
   agent_gate_message_id TEXT,
   status         TEXT DEFAULT 'active',
+  -- The create route's INSERT names every one of these, so a scenario that
+  -- drives it against a narrower table fails on the column rather than on the
+  -- behaviour under test.
+  name           TEXT DEFAULT '',
+  mode           TEXT DEFAULT 'claw',
+  agent_id       TEXT DEFAULT '',
+  system_prompt  TEXT DEFAULT '',
+  config         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  parent_session_id TEXT,
+  team_role      TEXT DEFAULT '',
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
   deleted_at     TIMESTAMPTZ
