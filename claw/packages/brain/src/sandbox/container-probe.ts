@@ -21,18 +21,15 @@
  * 1 call for three different responses, and until now three of the four paths
  * were silent.
  */
-import { StringCodec } from "nats";
 import { isTombstone } from "../tasks/lock.js";
 import pino from "pino";
 import { AGENT_SANDBOX_NAMESPACE, SANDBOX_NAMESPACE } from "../config.js";
 import { metrics } from "../infra/metrics.js";
-import { getHandsKv } from "./registry.js";
+import { getHandsKv, readHandsEntry } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import type { SandboxExecResult, SandboxInstance } from "./provider.js";
-import { handsSessionKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-container-probe" });
-const sc = StringCodec();
 
 /** Short enough not to delay a genuine rebuild; long enough for a healthy exec. */
 const PROBE_COMMAND = "true";
@@ -113,15 +110,15 @@ export interface ContainerProbeEffects {
  * sandbox the same way an unreachable KV did.
  */
 async function defaultReadHandsEntry(sessionId: string): Promise<HandsProbeEntry | null> {
-  const entry = await getHandsKv().get(handsSessionKey(sessionId));
+  const entry = await readHandsEntry(getHandsKv(), sessionId);
   // A delete leaves a readable entry with an empty value. Letting it reach the
   // parser turns "the entry is gone" into `entry_corrupt`, and the two answers
   // point opposite ways: corrupt means unknown, which tells the caller to leave
   // the container alone, so a sandbox whose entry was deleted is never rebuilt
   // and every attempt spends another recovery. Absent is the answer that fits
   // the fact, and it is the one the comment below is written about.
-  if (!entry || isTombstone(entry)) return null;
-  return parseHandsProbeValue(sc.decode(entry.value));
+  if (!entry || isTombstone(entry.entry)) return null;
+  return parseHandsProbeValue(entry.value);
 }
 
 /**

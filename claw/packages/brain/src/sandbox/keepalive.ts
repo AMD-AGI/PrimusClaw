@@ -11,7 +11,7 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
+import { readHandsEntry, reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { listAllDagHandles } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
@@ -295,13 +295,13 @@ export function markHandsIdle(
   sessionId: string,
   known: SandboxEntry | string,
 ): void {
-  const kvKey = handsSessionKey(sessionId);
-  kv.get(kvKey)
+  readHandsEntry(kv, sessionId)
     .then(async (entry) => {
       if (!entry) return; // no handle to keep; a fresh task will recreate one.
+      const kvKey = entry.key;
       let info: HandsKvEntry;
       try {
-        info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+        info = JSON.parse(entry.value) as HandsKvEntry;
       } catch (err) {
         // Unreadable ownership data is not evidence that no live sandbox is
         // referenced. Preserve it for operator repair and natural TTL expiry.
@@ -1308,14 +1308,16 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
         }, "date -Iseconds > /tmp/keepalive_ts", "15s");
       }
       failCounts.delete(targetKey);
-      // Refresh KV TTL so the entry survives across Brain restarts.
-      const kvKey = handsSessionKey(sessionId);
-      const existing = await deps.kv.get(kvKey).catch(() => null);
+      // Refresh KV TTL so the entry survives across Brain restarts. Read-through
+      // and write back to the key it was found under: a binding an old replica
+      // still holds under the legacy name would otherwise never be refreshed,
+      // and the live sandbox's record would expire underneath it.
+      const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
       if (existing) {
         try {
-          const recorded = JSON.parse(sc.decode(existing.value)) as HandsKvEntry;
+          const recorded = JSON.parse(existing.value) as HandsKvEntry;
           if (sameRegisteredSandbox(entry, recorded)) {
-            await deps.kv.update(kvKey, existing.value, existing.revision);
+            await deps.kv.update(existing.key, existing.entry.value, existing.revision);
           }
         } catch (err) {
           logger.warn({ err, sessionId }, "keepalive.kv_refresh_failed");

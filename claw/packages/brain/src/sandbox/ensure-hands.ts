@@ -53,7 +53,7 @@ import {
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
-import { readHandsEntry } from "./registry.js";
+import { readHandsEntry, type HandsBinding } from "./registry.js";
 import { admitSandbox, type AdmissionHold } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
 
@@ -354,7 +354,7 @@ async function recoverUnhealthyReuse(
   sessionId: string,
   info: any,
   identity: SandboxEntry,
-  revision: number,
+  binding: HandsBinding,
   signal?: AbortSignal,
 ): Promise<EnsureHandsResult | null> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
@@ -400,20 +400,22 @@ async function recoverUnhealthyReuse(
     { sessionId, handsUrl: info.handsUrl, detail: restarted.detail },
     "ensureHands.mcp_restarted_in_place",
   );
-  return acceptExistingSandbox(kv, sessionId, info, identity, revision);
+  return acceptExistingSandbox(kv, sessionId, info, identity, binding);
 }
 
 async function readReusableEntry(
   kv: ReuseAttempt["kv"],
   sessionId: string,
-): Promise<{ entry: NonNullable<Awaited<ReturnType<typeof kv.get>>>; info: any } | null> {
+): Promise<{ binding: HandsBinding; info: any } | null> {
   let entry: Awaited<ReturnType<typeof kv.get>>;
+  let key = handsSessionKey(sessionId);
   try {
     // Read-through, because an old replica in a rolling upgrade writes and
     // reads only the legacy key: looking at the canonical one alone would read
     // a live session as having no sandbox and provision a second.
     const found = await readHandsEntry(kv, sessionId);
-    entry = found ? { value: sc.encode(found.value), revision: found.revision } as typeof entry : null;
+    if (found) key = found.key;
+    entry = found?.entry ?? null;
   } catch (cause) {
     throw new Error("hands KV is unavailable; refusing unsafe sandbox replacement", { cause });
   }
@@ -425,7 +427,10 @@ async function readReusableEntry(
   // as the tombstone lived, where the code this replaced recovered.
   if (!entry || isTombstone(entry)) return null;
   try {
-    return { entry, info: parseHandsProbeValue(sc.decode(entry.value)) };
+    return {
+      binding: { key, revision: entry.revision },
+      info: parseHandsProbeValue(sc.decode(entry.value)),
+    };
   } catch (cause) {
     logger.warn({ sessionId }, "ensureHands.kv_entry_unreadable");
     throw new Error("hands KV entry is corrupt; refusing unsafe sandbox replacement", { cause });
@@ -445,7 +450,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   logger.info({ sessionId }, "ensureHands.kv_lookup");
   const recorded = await readReusableEntry(kv, sessionId);
   if (!recorded) return null;
-  const { entry, info } = recorded;
+  const { binding, info } = recorded;
 
   logger.info(
     { sessionId, status: info.status, workloadId: info.workloadId, handsUrl: info.handsUrl },
@@ -504,7 +509,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       { sessionId, handsUrl: info.handsUrl, specMatch: verdict.reason },
       "ensureHands.reusing_existing",
     );
-    return acceptExistingSandbox(kv, sessionId, info, identity, entry.revision);
+    return acceptExistingSandbox(kv, sessionId, info, identity, binding);
   }
   // Both ways of failing the gate, named apart: a sandbox that did not answer
   // is a different operational story from one that answered and has no token to
@@ -527,7 +532,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       sessionId,
       info,
       identity,
-      entry.revision,
+      binding,
       signal,
     );
     if (recovered) return recovered;
@@ -562,7 +567,7 @@ async function clearIdleMarkers(
   sessionId: string,
   info: any,
   identity: SandboxEntry,
-  revision: number,
+  binding: HandsBinding,
 ): Promise<void> {
   if (info.keepalive === undefined && info.idleSince == null) return;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
@@ -576,10 +581,10 @@ async function clearIdleMarkers(
   }
   delete info.keepalive;
   delete info.idleSince;
-  const key = handsSessionKey(sessionId);
+  const { key } = binding;
   const payload = sc.encode(JSON.stringify(info));
   try {
-    await kv.update(key, payload, revision);
+    await kv.update(key, payload, binding.revision);
     return;
   } catch (err) {
     // Only a lost race falls through to the re-read. A bucket that is actually
@@ -634,14 +639,14 @@ async function acceptExistingSandbox(
   sessionId: string,
   info: any,
   identity: SandboxEntry,
-  revision: number,
+  binding: HandsBinding,
 ): Promise<EnsureHandsResult> {
   // Reactivate a post-task idle reuse handle: clear the keepalive:false marker
   // so the ticker resumes owning it as an active session and
   // stopKeepaliveAfterTask re-marks it idle when this task ends. A handle with
   // no markers needs no write at all -- the entry that passed the gate is
   // already the entry we want.
-  await clearIdleMarkers(kv, sessionId, info, identity, revision);
+  await clearIdleMarkers(kv, sessionId, info, identity, binding);
   reuseEffects.registerSandbox(sessionId, identity);
   return { handsUrl: info.handsUrl, created: false, token: info.token, identity };
 }

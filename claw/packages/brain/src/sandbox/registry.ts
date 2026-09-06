@@ -12,7 +12,7 @@
  *     auth check.
  */
 import { LRUCache } from "lru-cache";
-import type { KV } from "nats";
+import type { KV, KvEntry } from "nats";
 import { isTombstone } from "../tasks/lock.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
@@ -103,6 +103,18 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
  * is refused with the keys named.
  */
 /**
+ * The key a session's binding was found under, and the revision read from it.
+ *
+ * The two travel together: a conditional write derived from the canonical key
+ * while the revision came from the legacy one is a guaranteed conflict, and the
+ * write is then silently dropped.
+ */
+export interface HandsBinding {
+  key: string;
+  revision: number;
+}
+
+/**
  * Read a session's binding, whichever key currently holds it.
  *
  * The canonical key first, then the key an unmigrated -- or an
@@ -113,14 +125,14 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
  */
 export async function readHandsEntry(
   kv: KV, sessionId: string,
-): Promise<{ key: string; value: string; revision: number } | null> {
+): Promise<(HandsBinding & { value: string; entry: KvEntry }) | null> {
   // Errors are not caught: an unavailable store is not a session with no
   // sandbox, and reading it as one is how a live workload gets replaced.
   const canonical = handsSessionKey(sessionId);
   const legacy = legacyHandsKey(sessionId);
   for (const key of canonical === legacy ? [canonical] : [canonical, legacy]) {
     const entry = await kv.get(key);
-    if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision };
+    if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision, entry };
   }
   return null;
 }

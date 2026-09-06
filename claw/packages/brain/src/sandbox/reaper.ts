@@ -55,7 +55,7 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { handsSessionKey, legacyHandsKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 import { readHandsEntry as readSessionBinding } from "./registry.js";
 
 const logger = pino({ name: "sandbox-reaper" });
@@ -84,6 +84,8 @@ interface RecordedHandsEntry {
   state: "valid" | "missing" | "unknown";
   identity?: HandsProbeEntry;
   revision?: number;
+  /** The key the binding was read from; a delete conditioned on `revision` must target it. */
+  key?: string;
 }
 
 /**
@@ -93,8 +95,8 @@ interface RecordedHandsEntry {
  */
 async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
   try {
-    const entry = await getHandsKv().get(handsSessionKey(sessionId))
-      ?? await getHandsKv().get(legacyHandsKey(sessionId));
+    const found = await readSessionBinding(getHandsKv(), sessionId);
+    const entry = found?.entry;
     // A deleted key reads back as an entry with an empty value, and letting it
     // reach the parser turns "gone" into "unreadable". The two are not
     // interchangeable here: `missing` lets teardown finish, while `unknown`
@@ -102,10 +104,10 @@ async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
     // unavailable after confirmed sandbox stop" -- so a second teardown, or a
     // sweeper, deleting this key first would fail a user request over a
     // workload that is already stopped.
-    if (!entry || isTombstone(entry)) return { state: "missing" };
-    const identity = parseHandsProbeValue(sc.decode(entry.value));
+    if (!found || !entry || isTombstone(entry)) return { state: "missing" };
+    const identity = parseHandsProbeValue(found.value);
     if (!instanceFromEntry(sessionId, identity)) return { state: "unknown" };
-    return { state: "valid", identity, revision: entry.revision };
+    return { state: "valid", identity, revision: entry.revision, key: found.key };
   } catch (err) {
     logger.warn({ err: String(err), sessionId }, "hands.entry_unreadable");
     return { state: "unknown" };
@@ -239,8 +241,8 @@ export async function destroyHands(
   knownToken?: string,
 ): Promise<void> {
   const kv = getHandsKv();
-  const key = handsSessionKey(sessionId);
   const recorded = await readHandsEntry(sessionId);
+  const key = recorded.key ?? handsSessionKey(sessionId);
   const target = known ?? recorded.identity;
   const ownsRecorded = recorded.state === "valid"
     && !!recorded.identity
@@ -306,7 +308,7 @@ export async function destroyHands(
     && latest.revision !== undefined
     && sameHandsSandbox(target, latest.identity)
   ) {
-    if (await deleteHandsEntryIfRevision(kv, key, latest.revision)) return;
+    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) return;
     // Losing twice means the key is being written faster than we can clear
     // it -- but the workload is already stopped, which is the part callers
     // build a replacement on top of. Throwing here fails a user request over
