@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { z } from "zod";
-import { currentOwner } from "../../runtime/owner-context.js";
+import { currentOwner, currentRun } from "../../runtime/owner-context.js";
 import { waitForShellExit, pollOutput, BG_SHELL_DISABLED_MESSAGE } from "./bg-manager.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
@@ -58,7 +58,8 @@ export const wait = {
     const timeoutSec = Math.min(requested, WAIT_MAX_SEC);
 
     const owner = currentOwner();
-    const pending = waitForShellExit(owner, args.shell_id, timeoutSec * 1000);
+    const run = currentRun();
+    const pending = waitForShellExit(owner, run, args.shell_id, timeoutSec * 1000);
     if (!(pending instanceof Promise)) {
       return { content: [{ type: "text" as const, text: `Error: ${pending.error}` }], isError: true };
     }
@@ -70,7 +71,7 @@ export const wait = {
     // The output is read through the ordinary poll so that a wait and a
     // bash_output leave the read offset in the same place: whichever the model
     // used, it has seen the same bytes and the next call continues after them.
-    const output = pollOutput(owner, args.shell_id, undefined);
+    const output = pollOutput(owner, run, args.shell_id, undefined);
 
     const header = shell
       ? `Shell ${args.shell_id} finished after ~${waitedSec}s (status=${shell.status}, exit_code=${shell.exitCode ?? "?"})`

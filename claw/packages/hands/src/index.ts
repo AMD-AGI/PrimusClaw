@@ -11,7 +11,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { constantTimeEquals } from "@claw/utils";
 import { tools } from "./tools/index.js";
 import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
-import { OWNER_HEADER, RUN_HEADER, UNOWNED, normalizeOwner, normalizeRun, withCaller } from "./runtime/owner-context.js";
+import {
+  DEADLINE_HEADER, INTENT_HEADER, OWNER_HEADER, RUN_HEADER, UNOWNED,
+  normalizeDeadline, normalizeIntent, normalizeOwner, normalizeRun, withCaller,
+} from "./runtime/owner-context.js";
+import { mintEpoch, processStartToken, stateRoot } from "./runtime/shell-records.js";
 import { INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
 /**
@@ -70,7 +74,12 @@ app.all("/mcp", async (req, reply) => {
   // handed it. An absent or malformed owner collapses to the shared `unowned`
   // bucket, and an absent run means no run will reap what this call starts.
   await withCaller(
-    { owner: normalizeOwner(req.headers[OWNER_HEADER]), run: normalizeRun(req.headers[RUN_HEADER]) },
+    {
+      owner: normalizeOwner(req.headers[OWNER_HEADER]),
+      run: normalizeRun(req.headers[RUN_HEADER]),
+      intentKey: normalizeIntent(req.headers[INTENT_HEADER]),
+      deadlineAt: normalizeDeadline(req.headers[DEADLINE_HEADER]),
+    },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
 });
@@ -154,6 +163,19 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 if (process.argv.includes("--self-check")) {
   process.stdout.write(`hands self-check ok (${tools.length} tools)\n`);
 } else {
+  // Minted before anything can be started, and fatal when it cannot be: the
+  // marker is what says this process files durable records, and a Hands
+  // serving shells it files no record of would leave every later destroy gate
+  // reading an empty count as an empty sandbox.
+  try {
+    mintEpoch({ pid: process.pid, startToken: processStartToken(process.pid) });
+  } catch (e) {
+    app.log.fatal(
+      { err: (e as Error).message, stateRoot: stateRoot() },
+      "hands.epoch_mint_failed",
+    );
+    process.exit(1);
+  }
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
   app.listen({ host: "0.0.0.0", port: MCP_PORT }, (err) => {

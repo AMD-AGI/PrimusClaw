@@ -52,6 +52,7 @@ import {
 } from "./container-probe.js";
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
+import { handsSessionKey } from "./hands-key.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -405,7 +406,7 @@ async function readReusableEntry(
 ): Promise<{ entry: NonNullable<Awaited<ReturnType<typeof kv.get>>>; info: any } | null> {
   let entry: Awaited<ReturnType<typeof kv.get>>;
   try {
-    entry = await kv.get(`hands.${sessionId}`);
+    entry = await kv.get(handsSessionKey(sessionId));
   } catch (cause) {
     throw new Error("hands KV is unavailable; refusing unsafe sandbox replacement", { cause });
   }
@@ -568,7 +569,7 @@ async function clearIdleMarkers(
   }
   delete info.keepalive;
   delete info.idleSince;
-  const key = `hands.${sessionId}`;
+  const key = handsSessionKey(sessionId);
   const payload = sc.encode(JSON.stringify(info));
   try {
     await kv.update(key, payload, revision);
@@ -901,7 +902,7 @@ async function provisionHands(
     }));
     let ok = false;
     for (let attempt = 1; attempt <= 3; attempt++) {
-      try { await kv.put(`hands.${sessionId}`, pendingPayload); ok = true; break; }
+      try { await kv.put(handsSessionKey(sessionId), pendingPayload); ok = true; break; }
       catch (kvErr) {
         logger.warn({ err: (kvErr as Error)?.message || String(kvErr), sessionId, workloadId, attempt }, "hands.kv.pending_put_retry");
         if (attempt < 3) await sleep(200);
@@ -992,7 +993,7 @@ async function provisionHands(
   // no admin fallback any more, so this field is mandatory — without it the
   // next SaFE call will fail. The bucket is cluster-internal and the entry
   // rotates with the 5-minute KV TTL.
-  const kvKey = `hands.${sessionId}`;
+  const kvKey = handsSessionKey(sessionId);
   const readyPayload = sc.encode(JSON.stringify({
     status: "ready",
     // The key the run lease is actually under. Not the session: the gate is
@@ -1249,7 +1250,7 @@ async function ensureHandsAgentSandbox(
     // Single-phase KV: create already blocked until pod healthy (no pending window).
     // If this write fails, roll back below; without KV, destroyHands cannot stop
     // the agent-sandbox session later.
-    await kv.put(`hands.${sessionId}`, sc.encode(JSON.stringify({
+    await kv.put(handsSessionKey(sessionId), sc.encode(JSON.stringify({
       status: "ready",
       // The key the run lease is actually under -- see the note on the other
       // create path: workspace-gated by default, session only as a fallback.

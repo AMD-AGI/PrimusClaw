@@ -55,6 +55,7 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
+import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-reaper" });
 const sc = StringCodec();
@@ -69,7 +70,7 @@ const sc = StringCodec();
  */
 export async function readSessionPlatformKey(sessionId: string): Promise<string> {
   try {
-    const entry = await getHandsKv().get(`hands.${sessionId}`);
+    const entry = await getHandsKv().get(handsSessionKey(sessionId));
     if (!entry) return "";
     return String(JSON.parse(sc.decode(entry.value)).platformKey ?? "");
   } catch {
@@ -90,7 +91,7 @@ interface RecordedHandsEntry {
  */
 async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
   try {
-    const entry = await getHandsKv().get(`hands.${sessionId}`);
+    const entry = await getHandsKv().get(handsSessionKey(sessionId));
     // A deleted key reads back as an entry with an empty value, and letting it
     // reach the parser turns "gone" into "unreadable". The two are not
     // interchangeable here: `missing` lets teardown finish, while `unknown`
@@ -235,7 +236,7 @@ export async function destroyHands(
   knownToken?: string,
 ): Promise<void> {
   const kv = getHandsKv();
-  const key = `hands.${sessionId}`;
+  const key = handsSessionKey(sessionId);
   const recorded = await readHandsEntry(sessionId);
   const target = known ?? recorded.identity;
   const ownsRecorded = recorded.state === "valid"
@@ -335,7 +336,7 @@ export async function destroyHands(
 export async function reapPendingHands(sessionId: string): Promise<void> {
   try {
     const kv = getHandsKv();
-    const entry = await kv.get(`hands.${sessionId}`);
+    const entry = await kv.get(handsSessionKey(sessionId));
     if (!entry) return;
     const info = JSON.parse(sc.decode(entry.value));
     if (info.status !== "pending") return;
@@ -370,7 +371,7 @@ async function sweepStaleHands(): Promise<void> {
     const now = new Date().toISOString();
     for await (const key of iter) {
       scanned += 1;
-      const sessionId = key.slice("hands.".length);
+      const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       try {
         const entry = await kv.get(key);
@@ -472,7 +473,7 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
   try {
     const iter = await kv.keys("hands.*");
     for await (const key of iter) {
-      const sessionId = key.slice("hands.".length);
+      const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       try {
         const entry = await kv.get(key);

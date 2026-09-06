@@ -58,7 +58,7 @@ test("a real owner is answered with its own running count", async () => {
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
-    killShell(SESSION, "srv");
+    killShell(SESSION, "ktsk_1", "srv");
   }
 });
 
@@ -88,7 +88,7 @@ test("an owner that did not survive normalization is refused, not answered from 
     assert.equal(absent.statusCode, 400);
     assert.deepEqual(absent.json(), { error: "owner_required" });
   } finally {
-    killShell(UNOWNED, "stray");
+    killShell(UNOWNED, "ktsk_1", "stray");
   }
 });
 
@@ -101,7 +101,7 @@ test("naming the unowned bucket explicitly is a real question and is answered", 
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
-    killShell(UNOWNED, "explicit");
+    killShell(UNOWNED, "ktsk_1", "explicit");
   }
 });
 

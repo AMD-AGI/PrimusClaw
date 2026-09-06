@@ -15,6 +15,7 @@ import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { countActiveShells } from "../clients/hands.js";
 import pino from "pino";
+import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -135,7 +136,7 @@ async function shouldSkipExpiredRetry(
   }
 
   unregisterSandbox(sessionId, entry);
-  await deps.kv.delete(`hands.${sessionId}`).catch(() => {});
+  await deps.kv.delete(handsSessionKey(sessionId)).catch(() => {});
   await clearRetryPending(deps.kv, sessionId, pending.lockKey);
   logger.warn(
     {
@@ -234,7 +235,7 @@ export function markHandsIdle(
   sessionId: string,
   known: SandboxEntry | string,
 ): void {
-  const kvKey = `hands.${sessionId}`;
+  const kvKey = handsSessionKey(sessionId);
   kv.get(kvKey)
     .then(async (entry) => {
       if (!entry) return; // no handle to keep; a fresh task will recreate one.
@@ -701,7 +702,7 @@ async function collectTargets(
     // the most frequent of the three walks over these keys.
     const keys = await deps.kv.keys("hands.*");
     for await (const key of keys) {
-      const sessionId = key.slice("hands.".length);
+      const sessionId = sessionIdFromHandsKey(key);
       const e = await deps.kv.get(key).catch(() => null);
       if (!e) continue;
       try {
@@ -1021,7 +1022,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       }
       failCounts.delete(targetKey);
       // Refresh KV TTL so the entry survives across Brain restarts.
-      const kvKey = `hands.${sessionId}`;
+      const kvKey = handsSessionKey(sessionId);
       const existing = await deps.kv.get(kvKey).catch(() => null);
       if (existing) {
         try {

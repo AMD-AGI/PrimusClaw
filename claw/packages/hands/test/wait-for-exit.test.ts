@@ -37,7 +37,7 @@ const promised = (v: ReturnType<typeof waitForShellExit>) => {
 test("the wait ends when the shell does, not when the timeout does", async () => {
   spawnBackground("owner-a", "run-a", "sleep 0.3; exit 7", "quick");
   const startedAt = Date.now();
-  const shell = await promised(waitForShellExit("owner-a", "quick", 30_000));
+  const shell = await promised(waitForShellExit("owner-a", "run-a", "quick", 30_000));
   const elapsed = Date.now() - startedAt;
 
   assert.equal(shell?.exitCode, 7, "the exit code is readable by the time the wait resolves");
@@ -47,17 +47,17 @@ test("the wait ends when the shell does, not when the timeout does", async () =>
 
 test("a wait that runs out reports the shell is still going, and does not kill it", async () => {
   spawnBackground("owner-b", "run-b", "sleep 20", "slow");
-  const result = await promised(waitForShellExit("owner-b", "slow", 150));
+  const result = await promised(waitForShellExit("owner-b", "run-b", "slow", 150));
 
   assert.equal(result, null, "null is how the caller learns to say 'still running'");
 });
 
 test("waiting on a shell that already finished returns at once", async () => {
   spawnBackground("owner-c", "run-c", "exit 0", "done");
-  await promised(waitForShellExit("owner-c", "done", 30_000));
+  await promised(waitForShellExit("owner-c", "run-c", "done", 30_000));
 
   const startedAt = Date.now();
-  const again = await promised(waitForShellExit("owner-c", "done", 30_000));
+  const again = await promised(waitForShellExit("owner-c", "run-c", "done", 30_000));
   assert.equal(again?.status, "exited");
   assert.ok(Date.now() - startedAt < 100, "no second wait for an exit that already happened");
 });
@@ -69,11 +69,11 @@ test("waiting in slices does not pile up listeners on the shell", async () => {
   // own left them all attached: Node warns at eleven with a
   // MaxListenersExceededWarning, which reads as a leak and is the last thing
   // anybody wants to be diagnosing mid-training-run.
-  const shell = spawnBackground("owner-g", "run-g", "sleep 20", "sliced");
+  const shell = spawnBackground("owner-g", "run-g", "sleep 20", "sliced").shell!;
   const before = shell.process.listenerCount("exit");
 
   for (let i = 0; i < 12; i++) {
-    assert.equal(await promised(waitForShellExit("owner-g", "sliced", 5)), null);
+    assert.equal(await promised(waitForShellExit("owner-g", "run-g", "sliced", 5)), null);
   }
 
   assert.equal(
@@ -88,14 +88,14 @@ test("a wait cannot reach another owner's shell", async () => {
   // run, and the next occupant must not be able to block on -- or learn the
   // existence of -- the previous one's processes.
   spawnBackground("owner-d", "run-d", "sleep 20", "private");
-  const refused = waitForShellExit("owner-e", "private", 100);
+  const refused = waitForShellExit("owner-e", "run-e", "private", 100);
 
   assert.ok(!(refused instanceof Promise));
   assert.match((refused as { error: string }).error, /not found/);
 });
 
 test("an unknown shell is refused rather than waited on", async () => {
-  const refused = waitForShellExit("owner-f", "never-existed", 100);
+  const refused = waitForShellExit("owner-f", "run-f", "never-existed", 100);
   assert.ok(!(refused instanceof Promise));
   assert.match((refused as { error: string }).error, /not found/);
 });

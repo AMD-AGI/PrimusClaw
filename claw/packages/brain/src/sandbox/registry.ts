@@ -16,14 +16,51 @@ import type { KV } from "nats";
 import { isTombstone } from "../tasks/lock.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
+import { migrateReservedSessionKeys, sessionIdFromHandsKey } from "./hands-key.js";
+import pino from "pino";
 
 const sc = StringCodec();
+const logger = pino({ name: "sandbox-registry" });
 
 let _kv: KV | null = null;
 
 /** Bind the BRAIN_REGISTRY KV bucket. Called once from index.ts main() boot. */
 export function bindHandsKv(kv: KV): void {
   _kv = kv;
+}
+
+/**
+ * Move any session binding already sitting in the reserved retention namespace
+ * out of it, at boot and before anything can mint a retention.
+ *
+ * Refusing to mint new colliding keys protects a fresh deployment and nothing
+ * else: a session whose id already begins with the reserved marker is
+ * indistinguishable from a retention by key shape, so the first retention under
+ * a matching generation would write over a live session's binding.
+ */
+export async function migrateReservedKeys(kv: KV): Promise<void> {
+  const result = await migrateReservedSessionKeys({
+    keys: async (filter) => {
+      const out: string[] = [];
+      for await (const key of await kv.keys(filter)) out.push(key);
+      return out;
+    },
+    get: async (key) => {
+      const entry = await kv.get(key);
+      return entry ? sc.decode(entry.value) : null;
+    },
+    put: async (key, value) => { await kv.put(key, sc.encode(value)); },
+    delete: async (key) => { await kv.delete(key); },
+  }).catch((err) => {
+    // A scan that cannot run is not a scan that found nothing: reported rather
+    // than swallowed, since a retention minted afterwards could take a live
+    // session's key.
+    logger.error({ err: (err as Error)?.message }, "hands.reserved_key_scan_failed");
+    return null;
+  });
+  if (result && (result.migrated.length || result.conflicted.length)) {
+    logger.warn(result, "hands.reserved_key_migration");
+  }
 }
 
 /** Read back the bound KV bucket. Throws if bindHandsKv() was never called. */
@@ -173,7 +210,7 @@ export async function isValidHandsToken(token: string): Promise<boolean> {
           // Memoize against the owning session, not just the token: a token
           // learned here must still be revocable by teardown, which only has
           // the session id to go on. The key carries it.
-          handsTokens.set(token, key.slice("hands.".length));
+          handsTokens.set(token, sessionIdFromHandsKey(key));
           return true;
         }
       } catch { /* malformed — skip */ }

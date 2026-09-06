@@ -29,6 +29,7 @@ import { metrics } from "../infra/metrics.js";
 import { getHandsKv } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import type { SandboxExecResult, SandboxInstance } from "./provider.js";
+import { handsSessionKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-container-probe" });
 const sc = StringCodec();
@@ -112,7 +113,7 @@ export interface ContainerProbeEffects {
  * sandbox the same way an unreachable KV did.
  */
 async function defaultReadHandsEntry(sessionId: string): Promise<HandsProbeEntry | null> {
-  const entry = await getHandsKv().get(`hands.${sessionId}`);
+  const entry = await getHandsKv().get(handsSessionKey(sessionId));
   // A delete leaves a readable entry with an empty value. Letting it reach the
   // parser turns "the entry is gone" into `entry_corrupt`, and the two answers
   // point opposite ways: corrupt means unknown, which tells the caller to leave

@@ -20,8 +20,14 @@
  * in the three tools, because here is the only way to reach a process.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { BG_SHELL_ENABLED } from "../../config.js";
+import { NO_RUN } from "../../runtime/owner-context.js";
+import { assertShellId } from "../../runtime/record-path.js";
+import {
+  attachRecord, claimRecord, currentEpoch, processStartToken, readRecord,
+  recordOutcome, releaseOutput, resolveIntent, type ProcessIdentity,
+} from "../../runtime/shell-records.js";
 import {
   type ManagedShell,
   type ManagedShellKind,
@@ -47,6 +53,25 @@ export const BG_SHELL_DISABLED_MESSAGE =
   "background shells are disabled in this deployment (BG_SHELL_ENABLED). "
   + "Run the command in the foreground with a suitable bash timeout instead.";
 
+/** Brain-stamped evidence about a start, carried on headers and never in the
+ *  tool schema, so the model can neither read it nor forge it. */
+export interface BgStartIntent {
+  /** Replay-stable evidence of which start this is. Optional: a caller without
+   *  one behaves as before, minting or accepting an id. */
+  intentKey?: string;
+  /** The owning run's stamped execution deadline, which fixes how long a
+   *  terminal outcome stays surfaced. Absent where the request carried none. */
+  deadlineAt?: string;
+}
+
+/** What a start answers with: the shell, and whether this call is the one that
+ *  produced it. A machine-readable field rather than an inference from wording. */
+export interface BgStart {
+  shell?: BgShell;
+  shellId?: string;
+  resolution: "first_call" | "deduplicated";
+}
+
 interface BgEntry {
   owner: string;
   /**
@@ -62,18 +87,38 @@ interface BgEntry {
 }
 
 /**
- * Keyed by owner and id together. The separator is a NUL, which
- * `normalizeOwner` refuses in an owner and which no shell id can contain
- * either, so one entry can never be addressed as another.
+ * Keyed by owner scope, run identity and id together. The separator is a NUL,
+ * which `normalizeOwner` and `normalizeRun` refuse in either scope and which no
+ * shell id can contain either, so one entry can never be addressed as another.
+ *
+ * The run is part of the address rather than only a reaping key: two runs under
+ * one owner scope -- a later message in a conversation, a sibling node under one
+ * graph root -- are as separate as two owner scopes, and neither may read, wait
+ * on, or terminate the other's shells. A start that presented no run identity
+ * sits in its own bucket that no run identity can name.
  */
 const shells = new Map<string, BgEntry>();
 
-function regKey(owner: string, id: string): string {
-  return `${owner}\u0000${id}`;
+function regKey(owner: string, run: string, id: string): string {
+  return `${owner}\u0000${run}\u0000${id}`;
 }
 
-function lookup(owner: string, id: string): BgShell | undefined {
-  return shells.get(regKey(owner, id))?.shell;
+function lookup(owner: string, run: string, id: string): BgShell | undefined {
+  return shells.get(regKey(owner, run, id))?.shell;
+}
+
+/** The run identity as the record subtree files it: absent, not empty. */
+const recordRun = (run: string): string | null => (run === NO_RUN ? null : run);
+
+/**
+ * Whether this process files durable records at all.
+ *
+ * A process either does or it does not, and the epoch marker is the positive
+ * discriminator: one that mints none is pre-scheme, its shells registry-only,
+ * and no class is overlaid on them.
+ */
+function filesRecords(): boolean {
+  return currentEpoch() !== null;
 }
 
 /** Spawn a background shell process owned by `owner` and started by `run`. */
@@ -83,15 +128,25 @@ export function spawnBackground(
   command: string,
   shellId?: string,
   kind: BgShellKind = "background",
-): BgShell {
+  intent?: BgStartIntent,
+): BgStart {
   if (!BG_SHELL_ENABLED) throw new Error(BG_SHELL_DISABLED_MESSAGE);
   if (shells.size >= BG_SHELL_MAX_CONCURRENT) {
     throw new Error(`Background shell limit reached (max ${BG_SHELL_MAX_CONCURRENT})`);
   }
+  if (shellId) assertShellId(shellId);
+
+  const deduplicated = resolveExistingIntent(owner, run, intent);
+  if (deduplicated) return deduplicated;
 
   const id = shellId || `bg-${randomUUID().slice(0, 8)}`;
-  const key = regKey(owner, id);
+  const key = regKey(owner, run, id);
   if (shells.has(key)) throw new Error(`Shell ${id} already exists`);
+  // The claim is durable before anything is spawned, and its exclusive create
+  // is the arbiter: a start that lost it never reaches a process.
+  if (!claimShell(owner, run, id, command, kind, intent)) {
+    throw new Error(`Shell ${id} already exists`);
+  }
 
   const shell = spawnManagedShell(command, {
     id,
@@ -100,25 +155,109 @@ export function spawnBackground(
     unref: true,
   });
   shells.set(key, { owner, run, shell });
+  attachSpawned(owner, run, shell);
 
   // Auto-reap finished shells so the concurrency cap cannot be saturated by
   // long-lived monitor/background entries that already exited. The delay keeps
   // the final output pollable for one grace window after exit.
   shell.process.once("exit", () => {
+    persistOutcome(owner, run, shell);
     const t = setTimeout(() => {
       const current = shells.get(key);
-      if (current && current.shell.status !== "running") shells.delete(key);
+      if (current && current.shell.status !== "running") {
+        shells.delete(key);
+        if (filesRecords()) releaseOutput(owner, recordRun(run), shell.id);
+      }
     }, BG_SHELL_REAP_DELAY_MS);
     t.unref?.();
   });
 
-  return shell;
+  return { shell, resolution: "first_call" };
 }
 
-/** Read new output from one of `owner`'s shells since its last poll. */
-export function pollOutput(owner: string, id: string, filter?: string): string {
+/** The prior start this intent already produced, where one exists. */
+function resolveExistingIntent(
+  owner: string, run: string, intent?: BgStartIntent,
+): BgStart | undefined {
+  if (!filesRecords() || !intent?.intentKey) return undefined;
+  const priorId = resolveIntent(owner, recordRun(run), intent.intentKey);
+  if (!priorId) return undefined;
+  const record = readRecord(owner, recordRun(run), priorId);
+  if (!record) return undefined;
+  // Redoing the work requires a start under a different intent, which is a
+  // deliberate act with a visible cause. No branch here respawns.
+  return {
+    shell: lookup(owner, run, priorId),
+    shellId: priorId,
+    resolution: "deduplicated",
+  };
+}
+
+function claimShell(
+  owner: string, run: string, id: string, command: string,
+  kind: BgShellKind, intent?: BgStartIntent,
+): boolean {
+  if (!filesRecords()) return true;
+  return claimRecord({
+    owner_scope: owner,
+    run_identity: recordRun(run),
+    shell_id: id,
+    ...(intent?.intentKey ? { intent_key: intent.intentKey } : {}),
+    command_digest: commandDigest(owner, run, command),
+    kind,
+    claimed_at: new Date().toISOString(),
+    hands_epoch: currentEpoch()!.epoch,
+    ...(intent?.deadlineAt ? { deadline_at: intent.deadlineAt } : {}),
+  });
+}
+
+/**
+ * A canonical, non-reversible digest of the command, scoped to the pair that
+ * issued it.
+ *
+ * The raw text is never stored: a command routinely carries credential and
+ * launch-specification material in its arguments. Both scopes are inputs rather
+ * than a salt alone, because one sandbox serves several owners over its life
+ * and a shared salt would digest one command identically for all of them.
+ */
+function commandDigest(owner: string, run: string, command: string): string {
+  return createHash("sha256")
+    .update(commandSalt()).update("\u0000")
+    .update(owner).update("\u0000")
+    .update(run).update("\u0000")
+    .update(command)
+    .digest("hex");
+}
+
+let salt: string | null = null;
+function commandSalt(): string {
+  if (!salt) salt = process.env.HANDS_RECORD_SALT || randomUUID();
+  return salt;
+}
+
+function attachSpawned(owner: string, run: string, shell: BgShell): void {
+  if (!filesRecords() || !shell.pid) return;
+  const identity: ProcessIdentity = { pid: shell.pid, startToken: processStartToken(shell.pid) };
+  try {
+    attachRecord(owner, recordRun(run), shell.id, identity);
+  } catch { /* the record is gone with its sandbox; the spawn still stands */ }
+}
+
+function persistOutcome(owner: string, run: string, shell: BgShell): void {
+  if (!filesRecords()) return;
+  try {
+    recordOutcome(owner, recordRun(run), shell.id, {
+      status: shell.status === "killed" ? "killed" : shell.status === "exited" ? "exited" : "failed",
+      exitCode: shell.exitCode ?? null,
+      signal: shell.signal ?? null,
+    });
+  } catch { /* the record is gone with its sandbox */ }
+}
+
+/** Read new output from one of this run's shells since its last poll. */
+export function pollOutput(owner: string, run: string, id: string, filter?: string): string {
   if (!BG_SHELL_ENABLED) return `Error: ${BG_SHELL_DISABLED_MESSAGE}`;
-  const shell = lookup(owner, id);
+  const shell = lookup(owner, run, id);
   // Another owner's shell reads as absent. Saying "not yours" would confirm it
   // exists, and there is nothing the caller could do with that either way.
   if (!shell) return `Error: shell ${id} not found (possibly lost after sandbox rebuild)`;
@@ -139,10 +278,10 @@ export function pollOutput(owner: string, id: string, filter?: string): string {
   return parts.join("\n");
 }
 
-/** Kill one of `owner`'s background shells. SIGTERM first, SIGKILL after 5s. */
-export function killShell(owner: string, id: string): string {
+/** Kill one of this run's background shells. SIGTERM first, SIGKILL after 5s. */
+export function killShell(owner: string, run: string, id: string): string {
   if (!BG_SHELL_ENABLED) return `Error: ${BG_SHELL_DISABLED_MESSAGE}`;
-  const shell = lookup(owner, id);
+  const shell = lookup(owner, run, id);
   if (!shell) return `Error: shell ${id} not found`;
   if (shell.status !== "running") {
     return `Shell ${id} already ${shell.status} (exit_code=${shell.exitCode})`;
@@ -162,7 +301,7 @@ export function killShell(owner: string, id: string): string {
 }
 
 /**
- * Block until one of `owner`'s shells exits, or until `timeoutMs` elapses.
+ * Block until one of this run's shells exits, or until `timeoutMs` elapses.
  *
  * Returns the shell so the caller can report how it ended, or `null` when the
  * wait timed out with it still running. Resolves immediately for a shell that
@@ -174,11 +313,12 @@ export function killShell(owner: string, id: string): string {
  */
 export function waitForShellExit(
   owner: string,
+  run: string,
   id: string,
   timeoutMs: number,
 ): Promise<BgShell | null> | { error: string } {
   if (!BG_SHELL_ENABLED) return { error: BG_SHELL_DISABLED_MESSAGE };
-  const shell = lookup(owner, id);
+  const shell = lookup(owner, run, id);
   if (!shell) return { error: `shell ${id} not found (possibly lost after sandbox rebuild)` };
   if (shell.status !== "running") return Promise.resolve(shell);
 

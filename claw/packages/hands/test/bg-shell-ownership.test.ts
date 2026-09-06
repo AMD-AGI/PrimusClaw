@@ -28,7 +28,7 @@ process.env.BG_SHELL_REAP_DELAY_MS = "10";
 // the feature flag are read at module load, so the module has to come in after.
 const {
   spawnBackground, pollOutput, killShell, listRunningShells, shutdownAllShells, shutdownRunShells,
-  runningShellCount,
+  runningShellCount, waitForShellExit,
 } = await import("../src/tools/shell/bg-manager.js");
 
 const ALICE = "run-alice";
@@ -54,73 +54,73 @@ afterEach(async () => {
 });
 
 test("one owner cannot read another owner's output", async () => {
-  const shell = spawnBackground(ALICE, RUN_1, "echo secret; sleep 30");
-  assert.ok(await until(() => pollOutput(ALICE, shell.id).includes("secret")));
+  const shell = spawnBackground(ALICE, RUN_1, "echo secret; sleep 30").shell!;
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("secret")));
 
-  const seenByBob = pollOutput(BOB, shell.id);
+  const seenByBob = pollOutput(BOB, RUN_1, shell.id);
   assert.match(seenByBob, /not found/,
     "a sandbox handed to the next run must not come with the last run's output");
   assert.doesNotMatch(seenByBob, /secret/);
 
-  killShell(ALICE, shell.id);
+  killShell(ALICE, RUN_1, shell.id);
 });
 
 test("one owner cannot kill another owner's shell", async () => {
-  const shell = spawnBackground(ALICE, RUN_1, "sleep 30");
+  const shell = spawnBackground(ALICE, RUN_1, "sleep 30").shell!;
 
-  assert.match(killShell(BOB, shell.id), /not found/);
+  assert.match(killShell(BOB, RUN_1, shell.id), /not found/);
   assert.deepEqual(listRunningShells(ALICE), [shell.id],
     "the shell survives a kill it was never addressed by");
 
-  killShell(ALICE, shell.id);
+  killShell(ALICE, RUN_1, shell.id);
   assert.ok(await until(() => shell.status !== "running"), "its own owner can stop it");
 });
 
 test("the same shell name under two owners is two shells", async () => {
-  const mine = spawnBackground(ALICE, RUN_1, "sleep 30", "server");
-  const theirs = spawnBackground(BOB, RUN_1, "sleep 30", "server");
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 30", "server").shell!;
+  const theirs = spawnBackground(BOB, RUN_1, "sleep 30", "server").shell!;
 
   assert.notEqual(mine.pid, theirs.pid,
     "'server' is the obvious name, so two runs will both pick it");
   assert.deepEqual(listRunningShells(ALICE), ["server"]);
   assert.deepEqual(listRunningShells(BOB), ["server"]);
 
-  killShell(ALICE, "server");
+  killShell(ALICE, RUN_1, "server");
   assert.ok(await until(() => mine.status !== "running"));
   assert.equal(theirs.status, "running", "killing one must not reach the other");
 
-  killShell(BOB, "server");
+  killShell(BOB, RUN_1, "server");
 });
 
 test("the same owner reusing a live shell name is still an error", () => {
-  const shell = spawnBackground(ALICE, RUN_1, "sleep 30", "dup");
+  const shell = spawnBackground(ALICE, RUN_1, "sleep 30", "dup").shell!;
   assert.throws(() => spawnBackground(ALICE, RUN_1, "sleep 30", "dup"), /already exists/,
     "silently attaching to an unrelated process would be worse than refusing");
-  killShell(ALICE, shell.id);
+  killShell(ALICE, RUN_1, shell.id);
 });
 
 test("a shell started in one turn is still readable in the next", async () => {
   // Owner is the conversation (or the DAG), not one run in it: a server started
   // to be polled later would be useless if it vanished with that run.
-  const shell = spawnBackground(ALICE, RUN_1, "echo up; sleep 30", "long-lived");
-  assert.ok(await until(() => pollOutput(ALICE, shell.id).includes("up")));
+  const shell = spawnBackground(ALICE, RUN_1, "echo up; sleep 30", "long-lived").shell!;
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("up")));
 
-  assert.match(pollOutput(ALICE, "long-lived"), /Status: running/);
-  killShell(ALICE, "long-lived");
+  assert.match(pollOutput(ALICE, RUN_1, "long-lived"), /Status: running/);
+  killShell(ALICE, RUN_1, "long-lived");
 });
 
 test("polling returns only what is new since the last poll", async () => {
-  const shell = spawnBackground(ALICE, RUN_1, "echo first; sleep 30");
-  assert.ok(await until(() => pollOutput(ALICE, shell.id).includes("first")));
+  const shell = spawnBackground(ALICE, RUN_1, "echo first; sleep 30").shell!;
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("first")));
 
-  assert.match(pollOutput(ALICE, shell.id), /no new output/,
+  assert.match(pollOutput(ALICE, RUN_1, shell.id), /no new output/,
     "re-reading the same bytes would make the model believe the work repeated");
-  killShell(ALICE, shell.id);
+  killShell(ALICE, RUN_1, shell.id);
 });
 
 test("shutdown stops every owner's shells, not just the last one's", async () => {
-  const a = spawnBackground(ALICE, RUN_1, "sleep 60");
-  const b = spawnBackground(BOB, RUN_1, "sleep 60");
+  const a = spawnBackground(ALICE, RUN_1, "sleep 60").shell!;
+  const b = spawnBackground(BOB, RUN_1, "sleep 60").shell!;
 
   const stopped = await shutdownAllShells(200);
   assert.equal(stopped, 2);
@@ -136,15 +136,15 @@ test("a finished run takes its own shells and leaves its neighbour's", async () 
   // A batch node ending is the whole point: its dev server has no one left to
   // read it, and it is holding CPU in a sandbox the workspace shares. The other
   // run under the same owner has not ended, so its shells are not its business.
-  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine");
-  const sibling = spawnBackground(ALICE, RUN_2, "sleep 60", "sibling");
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine").shell!;
+  const sibling = spawnBackground(ALICE, RUN_2, "sleep 60", "sibling").shell!;
 
   assert.equal(await shutdownRunShells(RUN_1, 200), 1);
   assert.ok(await until(() => mine.status !== "running"));
   assert.equal(sibling.status, "running",
     "shells are reaped by run, so an unrelated run under the same owner survives");
 
-  killShell(ALICE, "sibling");
+  killShell(ALICE, RUN_2, "sibling");
 });
 
 test("reaping a run that started nothing is not an error", async () => {
@@ -157,12 +157,12 @@ test("an unclaimed shell is not reaped by every run that ends", async () => {
   // An older Brain sends no run header, so its shells are filed under no run.
   // Matching them against the empty run would let the next run that ends kill
   // processes it never started.
-  const orphan = spawnBackground(ALICE, "", "sleep 60", "orphan");
+  const orphan = spawnBackground(ALICE, "", "sleep 60", "orphan").shell!;
 
   assert.equal(await shutdownRunShells("", 10), 0);
   assert.equal(orphan.status, "running", "only shutdown may take an unclaimed shell");
 
-  killShell(ALICE, "orphan");
+  killShell(ALICE, "", "orphan");
 });
 
 /**
@@ -177,12 +177,12 @@ test("an unclaimed shell is not reaped by every run that ends", async () => {
 test("a still-running shell is what keeps its owner's sandbox from being reclaimed", async () => {
   assert.equal(runningShellCount(ALICE), 0, "nothing started yet");
 
-  const shell = spawnBackground(ALICE, RUN_1, "sleep 60", "server");
+  const shell = spawnBackground(ALICE, RUN_1, "sleep 60", "server").shell!;
   assert.equal(runningShellCount(ALICE), 1,
     "the sweep reads this to decide the sandbox is still working; zero here is "
       + "the pod being reclaimed out from under the shell");
 
-  killShell(ALICE, "server");
+  killShell(ALICE, RUN_1, "server");
   assert.ok(await until(() => shell.status !== "running"));
   assert.ok(await until(() => runningShellCount(ALICE) === 0),
     "once the work is done the handle is free again and the existing expiry applies");
@@ -194,13 +194,13 @@ test("the count is scoped to the owner asked for, so a DAG node's work does not 
   // (`hands.<session>`). A sibling DAG node's shells are filed under the root,
   // are reaped when that node reports, and must not read as the session still
   // being busy -- ALICE and BOB stand in for the two scopes.
-  const theirs = spawnBackground(BOB, RUN_1, "sleep 60", "dag-server");
+  const theirs = spawnBackground(BOB, RUN_1, "sleep 60", "dag-server").shell!;
 
   assert.equal(runningShellCount(ALICE), 0,
     "another scope's shell must not keep this session's sandbox alive");
   assert.equal(runningShellCount(BOB), 1, "it is running -- just not under ALICE");
 
-  killShell(BOB, "dag-server");
+  killShell(BOB, RUN_1, "dag-server");
   assert.ok(await until(() => theirs.status !== "running"));
 });
 
@@ -211,16 +211,16 @@ test("an owner nothing was started under, or none at all, answers zero rather th
   // normalization. This pins the predicate itself -- reached directly, and by
   // anything that files a shell without going through that normalization -- so
   // that "" matches nothing rather than every shell stored without an owner.
-  const unclaimed = spawnBackground("", RUN_1, "sleep 60", "unclaimed");
-  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine");
+  const unclaimed = spawnBackground("", RUN_1, "sleep 60", "unclaimed").shell!;
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine").shell!;
 
   assert.equal(runningShellCount(""), 0,
     "the empty owner must answer zero, not sweep up every shell filed without one");
   assert.equal(runningShellCount("session-never-seen"), 0);
   assert.equal(runningShellCount(ALICE), 1, "sanity: a real owner still counts its own");
 
-  killShell("", "unclaimed");
-  killShell(ALICE, "mine");
+  killShell("", RUN_1, "unclaimed");
+  killShell(ALICE, RUN_1, "mine");
   assert.ok(await until(() => unclaimed.status !== "running" && mine.status !== "running"));
 });
 
@@ -228,7 +228,7 @@ test("a reaped run stops counting, which is how a finished DAG node releases the
   // The two halves together: the reap ends a finished run's shells, and the
   // count is what the sweep then reads. A sibling run under the same owner has
   // not ended, so the pod is still working and must still be pinged.
-  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "reaped");
+  const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "reaped").shell!;
   spawnBackground(ALICE, RUN_2, "sleep 60", "survivor");
   assert.equal(runningShellCount(ALICE), 2);
 
@@ -237,7 +237,7 @@ test("a reaped run stops counting, which is how a finished DAG node releases the
   assert.ok(await until(() => runningShellCount(ALICE) === 1),
     "the reaped run leaves the count, the sibling keeps the sandbox alive");
 
-  killShell(ALICE, "survivor");
+  killShell(ALICE, RUN_2, "survivor");
 });
 
 test("with background shells on, the foreground ceiling is the tight one and points at them", async () => {
@@ -261,4 +261,54 @@ test("the registry advertises the same four names with the feature on", async ()
   for (const name of ["bash", "bash_output", "kill_shell", "wait"]) {
     assert.ok(names.includes(name), `${name} must stay registered`);
   }
+});
+
+test("a sibling run under one owner cannot read, wait on, or kill the other's shell", async () => {
+  // The requirement's second negative case, and the one owner-only addressing
+  // could not enforce: a later message in a conversation and a sibling node
+  // under one graph root each arrive as their own run identity, and neither is
+  // entitled to the other's work. The refusal discloses nothing about the other
+  // party -- it is the same answer a never-issued id gets.
+  const mine = spawnBackground(ALICE, RUN_1, "echo secret; sleep 30", "shared-name").shell!;
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, "shared-name").includes("secret")));
+
+  const seenBySibling = pollOutput(ALICE, RUN_2, "shared-name");
+  assert.match(seenBySibling, /not found/);
+  assert.doesNotMatch(seenBySibling, /secret/);
+  assert.doesNotMatch(seenBySibling, new RegExp(RUN_1), "and names no other party");
+
+  assert.match(killShell(ALICE, RUN_2, "shared-name"), /not found/);
+  assert.equal(mine.status, "running", "the shell survives a kill it was never addressed by");
+
+  const refusedWait = waitForShellExit(ALICE, RUN_2, "shared-name", 50);
+  assert.ok(!(refusedWait instanceof Promise), "a wait is refused the same way");
+
+  killShell(ALICE, RUN_1, "shared-name");
+  assert.ok(await until(() => mine.status !== "running"), "its own run can stop it");
+});
+
+test("the same shell name under two runs of one owner is two shells", async () => {
+  const first = spawnBackground(ALICE, RUN_1, "sleep 30", "server").shell!;
+  const second = spawnBackground(ALICE, RUN_2, "sleep 30", "server").shell!;
+
+  assert.notEqual(first.pid, second.pid,
+    "'server' is the obvious name and both runs will pick it; within one run it "
+      + "is still refused");
+  killShell(ALICE, RUN_1, "server");
+  assert.ok(await until(() => first.status !== "running"));
+  assert.equal(second.status, "running");
+  killShell(ALICE, RUN_2, "server");
+});
+
+test("a shell filed under no run identity is addressable by no run identity", async () => {
+  // An older Brain sends no run header, so its shells sit in a bucket of their
+  // own. Promoting that absence to a run identity would let every such caller
+  // share one, which is the collision the run half exists to prevent.
+  const orphan = spawnBackground(ALICE, "", "sleep 30", "no-run").shell!;
+
+  assert.match(pollOutput(ALICE, RUN_1, "no-run"), /not found/);
+  assert.match(pollOutput(ALICE, "", "no-run"), /Status: running/);
+
+  killShell(ALICE, "", "no-run");
+  assert.ok(await until(() => orphan.status !== "running"));
 });

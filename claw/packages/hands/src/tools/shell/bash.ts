@@ -3,7 +3,7 @@
 
 import { z } from "zod";
 import { spawnBackground } from "./bg-manager.js";
-import { currentOwner, currentRun } from "../../runtime/owner-context.js";
+import { currentOwner, currentRun, currentStartIntent } from "../../runtime/owner-context.js";
 import { runForegroundShell } from "./process-runner.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
@@ -72,10 +72,21 @@ export const bash = {
   }) => {
     if (args.run_in_background) {
       try {
-        const shell = spawnBackground(
-          currentOwner(), currentRun(), args.command, args.shell_id, args.background_kind ?? "background",
+        const start = spawnBackground(
+          currentOwner(), currentRun(), args.command, args.shell_id,
+          args.background_kind ?? "background", currentStartIntent(),
         );
-        return { content: [{ type: "text" as const, text: `Started background shell ${shell.id}. Poll output with bash_output, terminate with kill_shell.` }] };
+        const id = start.shell?.id ?? start.shellId!;
+        const already = start.resolution === "deduplicated"
+          ? " This start was already committed to, so nothing was run a second time."
+          : "";
+        return {
+          content: [{ type: "text" as const, text: `Started background shell ${id}. Poll output with bash_output, terminate with kill_shell.${already}` }],
+          // The same answer as a field: a caller that has to match prose to
+          // tell a first call from a replay is one reword away from running
+          // the command twice.
+          structuredContent: { shell_id: id, resolution: start.resolution },
+        };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
