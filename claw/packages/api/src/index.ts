@@ -9,7 +9,7 @@ import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
   CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED,
-  runLeaseTiming, envSettingProblems,
+  runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
 import { initDb } from "./infra/db.js";
@@ -138,6 +138,7 @@ async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
+  assertAdmissionSettings(logger);
   assertRolloutConfigAtStartup();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
