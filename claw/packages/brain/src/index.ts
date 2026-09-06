@@ -13,6 +13,8 @@ import {
   workspaceSigtermSyncSemaphore,
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
+import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
+import { rosterDeps } from "./sandbox/roster-store.js";
 import { initA2ARegistry } from "./clients/a2a.js";
 import { initSystemEnvCache } from "./infra/system-env.js";
 import {
@@ -44,6 +46,8 @@ import {
   LLM_CACHE_STYLE,
   openAiBaseUrlFellBack,
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
+  BG_SHELL_ENABLED, SANDBOX_KEEPALIVE_INTERVAL_SEC,
+  SANDBOX_KEEPALIVE_TARGET_CEILING, SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
 } from "./config.js";
 import { existsSync, createReadStream } from "fs";
 import { initDagHandles } from "./sandbox/handles.js";
@@ -859,7 +863,18 @@ async function main() {
   // Sandbox keepalive: periodically `exec date > /tmp/keepalive_ts` inside
   // every active Hands sandbox so SaFE doesn't reclaim the workload while
   // the parent agent is mid-LLM-call. See sandbox-keepalive.ts for details.
-  startSandboxKeepalive({ kv });
+  // Refused here rather than degraded at run time: with background shells on
+  // and no sweep, nothing refreshes a sandbox hosting live background work, and
+  // there is no partial mode in which an active shell still holds off idle
+  // reclaim. The capacity settings are proven before the sweep starts, so an
+  // undeclared one cannot be replaced by a default nobody proved it at.
+  const capacity = validateKeepaliveCapacity({
+    bgShellEnabled: BG_SHELL_ENABLED,
+    keepaliveIntervalSec: SANDBOX_KEEPALIVE_INTERVAL_SEC,
+    targetCeiling: SANDBOX_KEEPALIVE_TARGET_CEILING,
+    reconcileReserve: SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
+  });
+  startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
 
   // Background sweeper: evict stale Hands KV entries whose workloads died
   // outside an active task (covers sessions idle longer than the KV TTL

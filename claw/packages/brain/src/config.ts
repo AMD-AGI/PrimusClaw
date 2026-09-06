@@ -1098,6 +1098,25 @@ export const SANDBOX_KEEPALIVE_INTERVAL_SEC = envInt("SANDBOX_KEEPALIVE_INTERVAL
 // failures, so a transient control-plane outage cannot tear down a healthy
 // long-running sandbox. Default 0 (disabled).
 export const SANDBOX_KEEPALIVE_FAIL_LIMIT = envInt("SANDBOX_KEEPALIVE_FAIL_LIMIT", 0);
+/**
+ * N_max: the largest number of distinct ping targets one sweeper may face.
+ *
+ * The deferral count a sweep accumulates is a function of this, and the gap
+ * between two refreshes of one handle is a function of that count -- so a fleet
+ * larger than the value this was proven at means a live background shell can
+ * miss the idle reclaim it exists to hold off. It has no default: absent,
+ * non-integer or non-positive refuses startup rather than being replaced by a
+ * number nobody proved the relation at.
+ */
+export const SANDBOX_KEEPALIVE_TARGET_CEILING = env("SANDBOX_KEEPALIVE_TARGET_CEILING");
+/**
+ * Slots held back from ordinary admission so reconciliation always has some.
+ *
+ * A target another replica created, or one recovered after a restart, must be
+ * taken on before the sweep serves it, and refusing that on the ceiling would
+ * leave it unpinged. Counted inside the ceiling, so the relation is unaffected.
+ */
+export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONCILE_RESERVE");
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can

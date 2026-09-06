@@ -14,6 +14,7 @@ import { destroyHands } from "./reaper.js";
 import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { countActiveShells } from "../clients/hands.js";
+import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
 import pino from "pino";
 import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 
@@ -79,6 +80,16 @@ interface KeepaliveDeps {
    * it. Never set in production.
    */
   pingBudgetMs?: number;
+  /**
+   * The fleet-wide admission roster, where one is bound.
+   *
+   * Every distinct target a sweep may face holds a slot, including one reached
+   * only through a handle record another replica wrote or one recovered after a
+   * restart. An un-admitted target is reconciled in before this sweep serves
+   * it, because the alternative is serving it from whatever capacity the
+   * admitted ones leave -- which starves exactly the target holding live work.
+   */
+  roster?: { store: RosterStore; config: RosterConfig };
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -922,6 +933,42 @@ async function handleKeepaliveFailures(
   }
 }
 
+/**
+ * Take every target of this sweep onto the roster, and renew what this replica
+ * already holds, before any of them is pinged.
+ *
+ * The ceiling is held against ordinary admission, never against work already
+ * running: a target the sweep faces is never a confirmed-idle handle, so it is
+ * either working or unaccounted for, and refusing it here would leave it
+ * unpinged rather than keeping the fleet small.
+ */
+async function admitTargets(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<void> {
+  if (!deps.roster) return;
+  const identities = [...targets.keys()];
+  try {
+    const result = await reconcileTargets(deps.roster.store, deps.roster.config, identities);
+    if (result.admitted.length) {
+      logger.info({ admitted: result.admitted.length }, "keepalive.roster_reconciled");
+    }
+    if (result.breach) {
+      logger.error(
+        { rosterSize: result.rosterSize, ceiling: deps.roster.config.ceiling,
+          beyondCeiling: result.beyondCeiling },
+        "keepalive.roster_capacity_breach",
+      );
+    }
+    await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
+  } catch (err) {
+    // Reported rather than swallowed: an unreconciled roster understates the
+    // fleet, and the deferral count every handle's refresh gap is derived from
+    // is then a number nobody can stand behind.
+    logger.error({ err: (err as Error)?.message }, "keepalive.roster_reconcile_failed");
+  }
+}
+
 /** The verdict the last sweep reached for a target, for tests. */
 const lastVerdict = new Map<string, { fails: number; gone: boolean }>();
 export function lastVerdictForTest(sessionId: string): { fails: number; gone: boolean } | null {
@@ -932,6 +979,7 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
   const targets = await collectTargets(deps, seenIdentities);
+  await admitTargets(deps, targets);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
