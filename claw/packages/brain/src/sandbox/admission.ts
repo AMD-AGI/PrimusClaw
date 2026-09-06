@@ -107,7 +107,16 @@ export async function isRosterStale(): Promise<boolean> {
 
 /** Record that the roster is incomplete, for every replica reading it. */
 export async function markRosterStale(reason: string): Promise<void> {
-  if (roster) await markFleetStale(roster.store, roster.config, reason);
+  if (!roster) return;
+  // Raised rather than swallowed: a marker that could not be written leaves the
+  // roster looking healthy to every replica while it is missing targets.
+  await markFleetStale(roster.store, roster.config, reason).catch((err) => {
+    logger.error(
+      { err: (err as Error)?.message, reason },
+      "admission.stale_marker_unwritten",
+    );
+    throw err;
+  });
 }
 
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
@@ -142,13 +151,15 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
-  if (await isRosterStale()) {
+  const claim = await claimProvisionalSlot(store, config);
+  if (!claim.ok && claim.reason === "stale") {
+    logger.warn({ sessionId, reason: claim.staleReason }, "admission.roster_stale");
     throw new SandboxCapacityRefused(
-      "sandbox admission refused: the keepalive roster could not be reconciled, so "
-      + "the fleet count it would be checked against is incomplete",
+      "sandbox admission refused: the keepalive roster could not be reconciled "
+      + `(${claim.staleReason}), so the fleet count it would be checked against is `
+      + "incomplete",
     );
   }
-  const claim = await claimProvisionalSlot(store, config);
   if (!claim.ok) {
     logger.warn(
       { sessionId, rosterSize: claim.rosterSize, reserveRemaining: claim.reserveRemaining },

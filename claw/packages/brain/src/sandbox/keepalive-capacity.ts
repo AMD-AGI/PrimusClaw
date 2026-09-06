@@ -79,6 +79,13 @@ export interface CapacityInput {
   pingsPerSweep: number;
   /** A whole guarded tick's declared ceiling, in seconds. */
   sweepSpanSec: number;
+  /**
+   * The longest the ping phase alone can run: its budget plus the one ping the
+   * budget lets start before it expires. The declared span has to cover it, or
+   * the span is a number the sweep routinely exceeds and every gap derived from
+   * it is short.
+   */
+  pingPhaseCeilingSec: number;
 }
 
 /** Refused at startup, naming the settings and their values. */
@@ -132,6 +139,13 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
   // than assumed: at N_max targets a rotation reaches every one within
   // ceil(N_max / C) sweeps, and the gap that implies has to clear the shortest
   // reclaim in force with room to spare. Equality is a breach, not a fit.
+  if (input.sweepSpanSec <= input.pingPhaseCeilingSec) {
+    throw new KeepaliveConfigRefused(
+      `SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=${input.sweepSpanSec} does not cover the ping `
+      + `phase's own worst case of ${input.pingPhaseCeilingSec}s, so the span every `
+      + "refresh gap is derived from is one the sweep routinely exceeds.",
+    );
+  }
   const deadline = requirePositiveInteger(
     "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC", input.idleDeadlineSec,
   );

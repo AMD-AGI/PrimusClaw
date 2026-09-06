@@ -70,6 +70,15 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
         throw err;
       }
     },
+    replace: async (key, value, expectedRevision) => {
+      try {
+        await kv.update(key, sc.encode(value), expectedRevision);
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
     delete: async (key, expectedRevision) => {
       try {
         await kv.delete(key, { previousSeq: expectedRevision });
@@ -126,7 +135,8 @@ export async function readHandsEntry(
  */
 export async function reconcileReservedKeys(kv: KV): Promise<void> {
   const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
-  if (result.migrated.length || result.resumed.length || result.conflicted.length) {
+  if (result.migrated.length || result.resumed.length
+    || result.converged.length || result.conflicted.length) {
     logger.warn(result, "hands.reserved_key_reconciled");
   }
 }
@@ -134,8 +144,11 @@ export async function reconcileReservedKeys(kv: KV): Promise<void> {
 export async function assertReservedKeysFree(kv: KV): Promise<void> {
   const store = reservedKeyStore(kv);
   const moved = await migrateReservedSessionKeys(store);
-  if (moved.migrated.length || moved.resumed.length) {
-    logger.warn({ migrated: moved.migrated, resumed: moved.resumed }, "hands.reserved_key_migration");
+  if (moved.migrated.length || moved.resumed.length || moved.converged.length) {
+    logger.warn(
+      { migrated: moved.migrated, resumed: moved.resumed, converged: moved.converged },
+      "hands.reserved_key_migration",
+    );
   }
   await assertRetentionSeparation(store);
 }

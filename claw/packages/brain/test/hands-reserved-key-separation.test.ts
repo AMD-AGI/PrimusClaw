@@ -53,6 +53,11 @@ function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & 
       map.set(key, { value, revision: 1 });
       return true;
     },
+    async replace(key, value, expectedRevision) {
+      if (map.get(key)?.revision !== expectedRevision) return false;
+      map.set(key, { value, revision: expectedRevision + 1 });
+      return true;
+    },
     async delete(key, expectedRevision) {
       if (map.get(key)?.revision !== expectedRevision) return false;
       map.delete(key);
@@ -61,18 +66,17 @@ function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & 
   };
 }
 
-const session = (id: string) => JSON.stringify({ status: "ready", handsUrl: `http://${id}/mcp` });
+const session = (id: string, createdAt = "2026-01-01T00:00:00.000Z") =>
+  JSON.stringify({ status: "ready", handsUrl: `http://${id}/mcp`, createdAt });
 const retention = () => JSON.stringify({ status: "ready", protected: true, handsUrl: "http://kept/mcp" });
 
 test("no session id can be keyed into the reserved namespace", () => {
   // The forward half: total and injective, so a plain key never begins with
   // either marker and no two ids share a key.
   assert.equal(handsSessionKey("sess_ordinary"), "hands.sess_ordinary");
-  for (const id of [`${RETAINED_PREFIX}odd`, "=weird"]) {
-    const key = handsSessionKey(id);
-    assert.ok(!isReservedRetentionKey(key), id);
-    assert.equal(sessionIdFromHandsKey(key), id, id);
-  }
+  const key = handsSessionKey(`${RETAINED_PREFIX}odd`);
+  assert.ok(!isReservedRetentionKey(key), "re-keyed out of the reserved namespace");
+  assert.equal(sessionIdFromHandsKey(key), `${RETAINED_PREFIX}odd`, "and still resolves back");
   assert.notEqual(handsSessionKey(`${RETAINED_PREFIX}a`), handsSessionKey(`${RETAINED_PREFIX}b`));
 });
 
@@ -194,18 +198,32 @@ test("the walk asks for whole session keys, because a wildcard is one token", as
   assert.ok(matchesKvFilter(`hands.${RETAINED_PREFIX}X`, "hands.*"));
 });
 
-test("an entry under the raw re-key marker is legacy too, and is migrated", async () => {
-  // Both markers are re-keyed, so both raw forms predate the scheme. Left
-  // behind, a `hands.=X` entry is read as an already-encoded key and decodes to
-  // something no session answers to.
-  const odd = "=already-odd";
-  const store = memoryStore({ [`hands.${odd}`]: session(odd) });
+test("an id whose key shape would be ambiguous is refused, not encoded", () => {
+  // A single-character marker could not separate an encoded key from a raw id
+  // that happened to look like one -- `=MZXW6` is valid base32, so it decoded
+  // to something no session answered to. The marker's second character is
+  // outside base32, and an id carrying it has no unambiguous key at all, so it
+  // is rejected by name rather than repaired.
+  assert.doesNotThrow(() => handsSessionKey("=MZXW6"),
+    "a single = is an ordinary id now; only the two-character marker is reserved");
+  assert.equal(handsSessionKey("=MZXW6"), "hands.=MZXW6");
+  assert.equal(sessionIdFromHandsKey("hands.=MZXW6"), "=MZXW6");
+
+  assert.throws(() => handsSessionKey("=.looks-encoded"), /no unambiguous key/);
+});
+
+test("a validly base32-shaped raw id is not mistaken for an encoded key", async () => {
+  // The case the old rule got wrong: nothing about this id's remainder should
+  // make the scan treat its key as one this scheme wrote.
+  const raw = "=MZXW6";
+  const store = memoryStore({ [`hands.${raw}`]: session(raw) });
 
   const result = await migrateReservedSessionKeys(store);
 
-  assert.deepEqual(result.migrated, [`hands.${odd}`]);
-  assert.equal(store.map.get(handsSessionKey(odd))!.value, session(odd));
-  assert.equal(sessionIdFromHandsKey(handsSessionKey(odd)), odd, "and still resolves back");
+  assert.deepEqual(result.migrated, [], "an ordinary id needs no migration");
+  assert.deepEqual(result.conflicted, []);
+  assert.equal(store.map.get(`hands.${raw}`)!.value, session(raw), "and is left alone");
+  assert.equal(sessionIdFromHandsKey(`hands.${raw}`), raw);
 });
 
 test("a properly encoded key is not mistaken for a legacy one", async () => {
@@ -242,11 +260,35 @@ test("an old reader and a new writer overlap without either losing the binding",
   assert.equal((await readThrough(colliding))!.value, session("written-by-an-old-pod"),
     "and it still resolves afterwards, now under the canonical name");
 
-  // An old pod writing again mid-window re-creates the legacy key; the next
-  // sweep's scan moves it rather than leaving two names for one session.
-  store.map.set(legacy, { value: session("written-again"), revision: 1 });
+  // An old pod writing again mid-window re-creates the legacy key with a newer
+  // binding. Two names for one session never converge on their own: one is
+  // routed to and the other swept, so the pair is resolved rather than reported
+  // and left. The newer binding names the sandbox that replaced the other.
+  const newer = session("written-again", "2026-06-01T00:00:00.000Z");
+  store.map.set(legacy, { value: newer, revision: 1 });
+
   const second = await migrateReservedSessionKeys(store);
-  assert.deepEqual(second.conflicted, [legacy],
-    "the destination holds different bytes, so nothing is overwritten silently");
-  assert.equal((await readThrough(colliding))!.value, session("written-by-an-old-pod"));
+
+  assert.deepEqual(second.converged, [legacy]);
+  assert.deepEqual(second.conflicted, []);
+  assert.equal(store.map.has(legacy), false, "one binding, under one name");
+  assert.equal((await readThrough(colliding))!.value, newer);
+});
+
+test("an older stray never overwrites the binding that replaced it", async () => {
+  // The other direction of the same race: convergence has to pick the live
+  // sandbox, not whichever key the scan happened to walk.
+  const colliding = `${RETAINED_PREFIX}STALE`;
+  const store = memoryStore({
+    [`hands.${colliding}`]: session("older", "2026-01-01T00:00:00.000Z"),
+    [handsSessionKey(colliding)]: session("newer", "2026-06-01T00:00:00.000Z"),
+  });
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.converged, []);
+  assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value,
+    session("newer", "2026-06-01T00:00:00.000Z"),
+    "the newer binding stands and the operator is told about the stray");
 });

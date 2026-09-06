@@ -32,13 +32,36 @@ export const RETAINED_PREFIX = "retained-";
 /**
  * Marks a re-keyed session entry.
  *
- * Inside the characters the key-value client admits and outside base32's
- * alphabet, so a re-keyed part can never be read as a plain one.
+ * Two characters, and the second is not in base32's alphabet, so an encoded key
+ * is distinguishable from a raw one *by shape alone* -- which a single marker
+ * was not: a raw session id beginning `=` whose remainder happened to be valid
+ * base32 was indistinguishable from an encoding, and either decoded to
+ * something no session answered to or was skipped by the scan.
+ *
+ * A session id that itself begins with this marker cannot be admitted, because
+ * no encoding of it could then be told from the raw form. Such an id is refused
+ * at the boundary rather than repaired (`assertSessionIdKeyable`).
  */
-export const REKEYED_MARKER = "=";
+export const REKEYED_MARKER = "=.";
 
 export function handsKeyNeedsRekey(sessionId: string): boolean {
-  return sessionId.startsWith(RETAINED_PREFIX) || sessionId.startsWith(REKEYED_MARKER);
+  return sessionId.startsWith(RETAINED_PREFIX);
+}
+
+/**
+ * Refuse a session id whose key shape would be ambiguous.
+ *
+ * There is no encoding that separates it from its own encoded form, so the id
+ * is rejected by name at the boundary instead of producing a key two readers
+ * could resolve differently.
+ */
+export function assertSessionIdKeyable(sessionId: string): void {
+  if (sessionId.startsWith(REKEYED_MARKER)) {
+    throw new Error(
+      `session id ${JSON.stringify(sessionId)} may not begin with ${JSON.stringify(REKEYED_MARKER)}: `
+      + "that prefix marks a re-keyed registry entry and an id carrying it has no unambiguous key",
+    );
+  }
 }
 
 /**
@@ -49,6 +72,7 @@ export function handsKeyNeedsRekey(sessionId: string): boolean {
  * session ids produce one key and no session id produces a retention's.
  */
 export function handsSessionKey(sessionId: string): string {
+  assertSessionIdKeyable(sessionId);
   return HANDS_KEY_PREFIX
     + (handsKeyNeedsRekey(sessionId) ? REKEYED_MARKER + encodeKeyPart(sessionId) : sessionId);
 }
@@ -56,7 +80,9 @@ export function handsSessionKey(sessionId: string): string {
 /** The session id a registry key names, whichever form it takes. */
 export function sessionIdFromHandsKey(key: string): string {
   const part = key.slice(HANDS_KEY_PREFIX.length);
-  return part.startsWith(REKEYED_MARKER) ? decodeKeyPart(part.slice(1)) : part;
+  return part.startsWith(REKEYED_MARKER)
+    ? decodeKeyPart(part.slice(REKEYED_MARKER.length))
+    : part;
 }
 
 /**
@@ -79,13 +105,12 @@ export function isReservedRetentionKey(key: string): boolean {
  * answers to.
  */
 export function isLegacySessionKey(key: string): boolean {
-  const part = key.slice(HANDS_KEY_PREFIX.length);
-  return part.startsWith(RETAINED_PREFIX)
-    || (part.startsWith(REKEYED_MARKER) && !isEncodedPart(part.slice(1)));
+  return key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX);
 }
 
-function isEncodedPart(part: string): boolean {
-  return part.length > 0 && /^[A-Z2-7]+$/.test(part);
+/** Whether this key is one this scheme wrote, by shape alone. */
+export function isEncodedSessionKey(key: string): boolean {
+  return key.slice(HANDS_KEY_PREFIX.length).startsWith(REKEYED_MARKER);
 }
 
 /** The key this session id would have had before re-keying existed. */

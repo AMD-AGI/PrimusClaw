@@ -41,7 +41,27 @@ export interface HandsKeyStore {
   read(key: string): Promise<{ value: string; revision: number } | null>;
   /** False where the key already exists. Never overwrites. */
   create(key: string, value: string): Promise<boolean>;
+  /** Overwrite, conditioned on the revision that value was read at. */
+  replace(key: string, value: string, expectedRevision: number): Promise<boolean>;
   delete(key: string, expectedRevision: number): Promise<boolean>;
+}
+
+/**
+ * Whether `a` is the newer of two bindings for one session.
+ *
+ * `createdAt` is stamped when a sandbox is provisioned, so the later one names
+ * the sandbox that replaced the other. A binding carrying no stamp is treated
+ * as older: it predates the field, so whatever carries one came after it.
+ */
+function newerThan(a: string, b: string): boolean {
+  const at = (raw: string): number => {
+    try {
+      return Date.parse((JSON.parse(raw) as { createdAt?: string }).createdAt ?? "") || 0;
+    } catch {
+      return 0;
+    }
+  };
+  return at(a) > at(b);
 }
 
 export interface ReservedKeyMigration {
@@ -49,6 +69,8 @@ export interface ReservedKeyMigration {
   migrated: string[];
   /** Moves a previous run had already copied and not yet deleted. */
   resumed: string[];
+  /** Pairs resolved to one binding, the newer having won. */
+  converged: string[];
   /** Keys something else already holds; the deployment is refused on these. */
   conflicted: string[];
 }
@@ -77,7 +99,7 @@ export async function migrateReservedSessionKeys(
   // one, which decodes to something no session answers to.
   const keys = (await store.keys(`${HANDS_KEY_PREFIX}*`)).filter(isLegacySessionKey);
   const result: ReservedKeyMigration = {
-    scanned: keys.length, migrated: [], resumed: [], conflicted: [],
+    scanned: keys.length, migrated: [], resumed: [], converged: [], conflicted: [],
   };
 
   for (const key of keys) {
@@ -92,11 +114,29 @@ export async function migrateReservedSessionKeys(
       const destination = handsSessionKey(key.slice(HANDS_KEY_PREFIX.length));
       if (!await store.create(destination, source.value)) {
         const existing = await store.read(destination);
-        if (existing?.value !== source.value) {
+        if (existing === null) {
           result.conflicted.push(key);
           continue;
         }
-        result.resumed.push(key);
+        if (existing.value !== source.value) {
+          // Two bindings for one session, which is what an old replica writing
+          // the legacy name after a new one migrated it produces. Left as they
+          // are they never converge: one is routed to and the other is swept.
+          // The newer binding is the live one -- the older names a sandbox
+          // something has already replaced -- so it wins, and the loser is
+          // removed rather than reported and kept.
+          if (!newerThan(source.value, existing.value)) {
+            result.conflicted.push(key);
+            continue;
+          }
+          if (!await store.replace(destination, source.value, existing.revision)) {
+            result.conflicted.push(key);
+            continue;
+          }
+          result.converged.push(key);
+        } else {
+          result.resumed.push(key);
+        }
       }
       if (!await store.delete(key, source.revision)) {
         result.conflicted.push(key);

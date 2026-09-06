@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 
 import { HandsClient } from "../src/clients/hands.js";
 import { ToolRouter } from "../src/tools/router.js";
+
 import { bindBgHandleRowsForTest } from "../src/sandbox/bg-row-store.js";
 
 /** A sandbox whose tool answers with `isError` and text of its own choosing. */

@@ -474,6 +474,14 @@ export function keepalivePingsPerSweep(): number {
   return pingsPerSweep(PING_MAX_IN_FLIGHT, PING_PHASE_BUDGET_MS, HANDS_PING_CEILING_MS);
 }
 
+/**
+ * The longest the ping phase can run: its budget bars the *starting* of a ping,
+ * so the pings already in flight when it expires run on for their own ceiling.
+ */
+export function keepalivePingPhaseCeilingSec(): number {
+  return Math.ceil((PING_PHASE_BUDGET_MS + HANDS_PING_CEILING_MS) / 1000);
+}
+
 /** Longest one ping may take before its own timeout ends it. */
 const HANDS_PING_CEILING_MS = 15_000;
 
@@ -1069,7 +1077,11 @@ async function admitTargets(
     // The sweep still serves what it collected -- refusing to ping is how a
     // sandbox with live work in it is reclaimed -- but nothing new is admitted
     // against a roster that is missing targets it was about to take on.
-    await markRosterStale((err as Error)?.message ?? "reconcile failed");
+    await markRosterStale((err as Error)?.message ?? "reconcile failed")
+      .catch((markErr) => logger.error(
+        { err: (markErr as Error)?.message },
+        "keepalive.roster_stale_marker_unwritten",
+      ));
     logger.error(
       { err: (err as Error)?.message, targets: identities.length },
       "keepalive.roster_reconcile_failed",

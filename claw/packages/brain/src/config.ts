@@ -1127,7 +1127,12 @@ export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONC
  */
 export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC");
 /** Declared ceiling on one whole guarded sweep, in seconds. */
-export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 120, { min: 1 });
+// Default chosen to cover the ping phase's own worst case -- half the record
+// TTL as a budget, plus one ping's ceiling for whatever was already in flight
+// when it expired -- with room for the walk and the failure handling around it.
+// A value that does not cover it refuses startup rather than understating every
+// refresh gap derived from it.
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 300, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can

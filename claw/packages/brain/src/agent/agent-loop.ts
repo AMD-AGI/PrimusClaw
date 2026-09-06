@@ -1852,6 +1852,11 @@ class AgentLoopRunner {
           "tool.result",
         );
       } catch (err: any) {
+        // A call that threw is a call that did not happen. Left at its
+        // optimistic default the outcome would fall through to the success
+        // count below, which is the one place a transport failure could be
+        // recorded as work the sandbox did.
+        toolOutcome.isError = true;
         // Both the name and the arguments as sent, because the deadline the
         // message reports is built from the two together: the tool decides the
         // ceiling a timeout argument is clamped to, and whether any of this is

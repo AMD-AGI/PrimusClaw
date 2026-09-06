@@ -47,6 +47,14 @@ export interface BgHandleRow extends BgHandleAddress {
   commandDigest?: string;
   /** Which start of this command under this run identity, from one upwards. */
   sequence?: number;
+  /**
+   * The replica that claimed this sequence.
+   *
+   * Recorded rather than relied on: a resumed run adopts a predecessor's
+   * unresolved row by design, so this does not gate adoption. It is what makes
+   * a handover legible afterwards -- which replica's unfinished call this was.
+   */
+  claimedBy?: string;
 }
 
 /**
@@ -98,7 +106,7 @@ const MAX_ATTEMPTS = 8;
  */
 export async function advanceRow(
   store: BgRowStore, address: BgHandleAddress, generation: string, state: BgRowState,
-  carry: Pick<BgHandleRow, "commandDigest" | "sequence"> = {},
+  carry: Pick<BgHandleRow, "commandDigest" | "sequence" | "claimedBy"> = {},
 ): Promise<void> {
   const key = rowKey(address);
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -109,6 +117,7 @@ export async function advanceRow(
       ...address, generation, state,
       commandDigest: carry.commandDigest ?? row?.commandDigest,
       sequence: carry.sequence ?? row?.sequence,
+      claimedBy: carry.claimedBy ?? row?.claimedBy,
     } satisfies BgHandleRow);
     if (await store.write(key, next, current?.revision ?? null)) return;
   }

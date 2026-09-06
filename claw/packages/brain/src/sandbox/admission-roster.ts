@@ -79,7 +79,8 @@ export interface RosterConfig {
 
 export type ClaimResult =
   | { ok: true; token: string; rosterSize: number }
-  | { ok: false; reason: "at_capacity"; rosterSize: number; reserveRemaining: number };
+  | { ok: false; reason: "at_capacity"; rosterSize: number; reserveRemaining: number }
+  | { ok: false; reason: "stale"; staleReason: string };
 
 export type BindResult =
   | { ok: true; added: boolean }
@@ -166,6 +167,13 @@ export async function claimProvisionalSlot(
 ): Promise<ClaimResult> {
   const token = randomUUID();
   return mutate<ClaimResult>(store, config, (roster, now) => {
+    // Read in the same decision the write is conditioned on. Checked before the
+    // claim and outside its compare-and-set, a reconcile can mark the roster
+    // incomplete in between and the claim still commits against a count nobody
+    // could write.
+    if (roster.stale) {
+      return { result: { ok: false, reason: "stale", staleReason: roster.stale.reason } };
+    }
     const boundary = config.ceiling - config.reconciliationReserve;
     if (roster.entries.length >= boundary) {
       return {
@@ -246,13 +254,20 @@ export interface ReconcileResult {
  * roster size above the ceiling is a declared capacity breach, reported as such.
  * Nothing is expired, reclaimed, evicted or terminated on account of it.
  */
+/**
+ * Record that the roster is incomplete, for every replica reading it.
+ *
+ * Throws where the marker itself cannot be written. Swallowed, the roster goes
+ * on looking healthy to every replica while it is missing targets -- which is
+ * the failure this marker exists to announce, now invisible as well.
+ */
 export async function markFleetStale(
   store: RosterStore, config: RosterConfig, reason: string,
 ): Promise<void> {
   await mutate<void>(store, config, (roster, now) => ({
     write: { ...roster, stale: { at: now, replicaId: config.replicaId, reason } },
     result: undefined,
-  })).catch(() => { /* a roster that cannot be written is already refusing */ });
+  }));
 }
 
 export async function isFleetStale(store: RosterStore): Promise<boolean> {

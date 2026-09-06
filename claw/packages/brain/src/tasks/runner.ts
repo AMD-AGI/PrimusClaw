@@ -77,7 +77,7 @@ import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
 import { deleteRunRows } from "../sandbox/bg-handle-rows.js";
 import { bgRowStore } from "../sandbox/bg-row-store.js";
-import { handsSessionKey } from "../sandbox/hands-key.js";
+import { readHandsEntry } from "../sandbox/registry.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
@@ -1538,9 +1538,12 @@ class TaskRunner {
   private async resolvePlatformKey(): Promise<void> {
     if (this.platformKey) return;
     try {
-      const e = await this.kv.get(handsSessionKey(this.sessionId));
+      // Read-through: an old replica in a rolling upgrade writes only the
+      // legacy key, and looking at the canonical one alone would lose the
+      // platform key this session's sandbox was created with.
+      const e = await readHandsEntry(this.kv, this.sessionId);
       if (e) {
-        const info = JSON.parse(sc.decode(e.value));
+        const info = JSON.parse(e.value);
         this.platformKey = info.platformKey || "";
         if (this.platformKey) {
           logger.info({ sessionId: this.sessionId }, "task.platform_key.recovered_from_kv");
@@ -3300,9 +3303,11 @@ class TaskRunner {
       // and a Hands restart. At one of these every ten seconds it was the
       // reason those CAS writes lost. A lost race here needs no handling: the
       // writer that beat us refreshed the same TTL.
-      const handsKey = handsSessionKey(this.sessionId);
-      this.kv.get(handsKey).then(e => {
-        if (e) this.kv.update(handsKey, e.value, e.revision).catch((err) => {
+      // Whichever key currently holds the binding: refreshing the canonical one
+      // while an old replica keeps the legacy one alive would let the live
+      // entry expire under a run that is still going.
+      readHandsEntry(this.kv, this.sessionId).then(e => {
+        if (e) this.kv.update(e.key, sc.encode(e.value), e.revision).catch((err) => {
           logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_refresh_failed");
         });
       }).catch((err) => {

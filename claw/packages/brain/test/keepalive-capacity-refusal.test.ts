@@ -22,8 +22,8 @@ import {
 /** A fleet whose refresh gap clears its reclaim with room to spare. */
 const DECLARED = {
   targetCeiling: "200", reconcileReserve: "20",
-  idleDeadlineSec: "900", pingsPerSweep: 64, sweepSpanSec: 30,
-  provisioningCeilingSec: 3600,
+  idleDeadlineSec: "3600", pingsPerSweep: 64, sweepSpanSec: 300,
+  provisioningCeilingSec: 3600, pingPhaseCeilingSec: 150,
 };
 
 test("background shells with the sweep disabled is refused, naming both settings", () => {
@@ -59,7 +59,7 @@ test("either half alone starts normally", () => {
   assert.equal(proven.ceiling, 200);
   assert.equal(proven.reconciliationReserve, 20);
   assert.equal(proven.deferralCount, Math.ceil(200 / 64) - 1, "D = ceil(N_max / C) - 1");
-  assert.ok(proven.activityGapSec < 900, "and the gap it implies clears the reclaim");
+  assert.ok(proven.activityGapSec < 3600, "and the gap it implies clears the reclaim");
 });
 
 test("an undeclared, non-integer or non-positive ceiling is refused, never defaulted", () => {
@@ -105,11 +105,11 @@ test("a ceiling whose deferral count breaks the refresh gap is refused", () => {
   assert.throws(
     () => validateKeepaliveCapacity({
       ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
-      targetCeiling: "20000", idleDeadlineSec: "900",
+      targetCeiling: "20000", idleDeadlineSec: "3600",
     }),
     (err: unknown) => err instanceof KeepaliveConfigRefused
       && /deferral/.test(err.message)
-      && /not under the 900s reclaim/.test(err.message),
+      && /not under the 3600s reclaim/.test(err.message),
   );
 });
 
@@ -118,7 +118,7 @@ test("equality with the reclaim is a breach, not a fit", () => {
   // does not, because a gap equal to the deadline is a gap that loses.
   const atBoundary = (deadline: number) => validateKeepaliveCapacity({
     ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
-    targetCeiling: "64", pingsPerSweep: 64, sweepSpanSec: 30,
+    targetCeiling: "64", pingsPerSweep: 64, sweepSpanSec: 30, pingPhaseCeilingSec: 10,
     idleDeadlineSec: String(deadline),
   });
   // D = 0, so the gap is 1*60 + 2*30 = 120s.
@@ -165,4 +165,22 @@ test("an unbounded provisioning ceiling is refused, since no horizon can exceed 
       && /unbounded/.test(err.message)
       && /still being provisioned/.test(err.message),
   );
+});
+
+test("a sweep span that does not cover its own ping phase is refused", () => {
+  // The span is what every refresh gap is derived from, so one the sweep
+  // routinely exceeds makes every gap short -- and short by exactly the amount
+  // that matters, since the overrun is a phase that ran long.
+  assert.throws(
+    () => validateKeepaliveCapacity({
+      ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
+      sweepSpanSec: 120, pingPhaseCeilingSec: 150,
+    }),
+    (err: unknown) => err instanceof KeepaliveConfigRefused
+      && /does not cover the ping/.test(err.message),
+  );
+  assert.doesNotThrow(() => validateKeepaliveCapacity({
+    ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
+    sweepSpanSec: 300, pingPhaseCeilingSec: 150,
+  }));
 });

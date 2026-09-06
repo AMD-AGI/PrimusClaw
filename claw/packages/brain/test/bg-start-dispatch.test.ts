@@ -410,3 +410,32 @@ test("a record-less sandbox never receives a replayed start, however its registr
     filesNoRecords();
   }
 });
+
+test("a replica taking the run over adopts its predecessor's unfinished call", async () => {
+  // The handover the design asks a resumed run to reconcile rather than
+  // re-issue: the new replica holds no claim of its own, so a dispatched row it
+  // did not write is the predecessor's call, and its own first start for that
+  // command is that call being finished.
+  const original = pod({ dieOnHandoff: true });
+  await assert.rejects(() => original.hands.callTool("bash", NO_ID_START));
+  const [key] = await bgRowStore()!.keys("bgshell.*.*.*");
+  const stranded = JSON.parse((await bgRowStore()!.read(key))!.value) as
+    { shellId: string; claimedBy?: string; sequence: number };
+  assert.ok(stranded.claimedBy, "the row names the replica that claimed it");
+
+  // A different replica: nothing of the first process's memory survives.
+  resetStartIdentityForTest();
+  const successor = pod();
+  await successor.hands.callTool("bash", NO_ID_START);
+
+  assert.equal(successor.sent[0].shell_id, stranded.shellId, "adopted, not re-issued");
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1);
+
+  // And a second call in that same successor cannot adopt it again: adopting
+  // claims it, so this one is a new intent with a sequence of its own.
+  await successor.hands.callTool("bash", NO_ID_START);
+  assert.equal(successor.sent.length, 2);
+  assert.notEqual(successor.sent[1].shell_id, stranded.shellId,
+    "two concurrent calls in one resumed process must not land on one shell");
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 2);
+});

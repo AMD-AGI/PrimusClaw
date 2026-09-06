@@ -55,7 +55,8 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { handsSessionKey, legacyHandsKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { readHandsEntry as readSessionBinding } from "./registry.js";
 
 const logger = pino({ name: "sandbox-reaper" });
 const sc = StringCodec();
@@ -70,9 +71,10 @@ const sc = StringCodec();
  */
 export async function readSessionPlatformKey(sessionId: string): Promise<string> {
   try {
-    const entry = await getHandsKv().get(handsSessionKey(sessionId));
+    // Read-through, so a teardown finds the binding an old replica wrote.
+    const entry = await readSessionBinding(getHandsKv(), sessionId);
     if (!entry) return "";
-    return String(JSON.parse(sc.decode(entry.value)).platformKey ?? "");
+    return String(JSON.parse(entry.value).platformKey ?? "");
   } catch {
     return "";
   }
@@ -91,7 +93,8 @@ interface RecordedHandsEntry {
  */
 async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
   try {
-    const entry = await getHandsKv().get(handsSessionKey(sessionId));
+    const entry = await getHandsKv().get(handsSessionKey(sessionId))
+      ?? await getHandsKv().get(legacyHandsKey(sessionId));
     // A deleted key reads back as an entry with an empty value, and letting it
     // reach the parser turns "gone" into "unreadable". The two are not
     // interchangeable here: `missing` lets teardown finish, while `unknown`
@@ -336,9 +339,11 @@ export async function destroyHands(
 export async function reapPendingHands(sessionId: string): Promise<void> {
   try {
     const kv = getHandsKv();
-    const entry = await kv.get(handsSessionKey(sessionId));
+    // Read-through: a pending binding an old replica wrote sits under the
+    // legacy name, and missing it leaks the workload it names.
+    const entry = await readSessionBinding(kv, sessionId);
     if (!entry) return;
-    const info = JSON.parse(sc.decode(entry.value));
+    const info = JSON.parse(entry.value);
     if (info.status !== "pending") return;
     logger.warn({ sessionId, workloadId: info.workloadId }, "hands.reap_pending");
     await destroyHands(

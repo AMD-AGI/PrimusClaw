@@ -17,10 +17,11 @@ import {
 } from "../sandbox/bg-handle-rows.js";
 
 /** What a fixed start carries onto its row, so a replay can find it again. */
-type StartCarry = Pick<BgHandleRow, "commandDigest" | "sequence">;
+type StartCarry = Pick<BgHandleRow, "commandDigest" | "sequence" | "claimedBy">;
 import { bgRowStore } from "../sandbox/bg-row-store.js";
 import {
-  BG_SHELL_ENABLED, BRAIN_CHECKPOINT_KEY, HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS,
+  BG_SHELL_ENABLED, BRAIN_CHECKPOINT_KEY, BRAIN_ID,
+  HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS,
 } from "../config.js";
 import {
   isSandboxTool, MCP_DEADLINE_SLACK_MS, toolTakesTimeout, toolTimeoutCeilingSec,
@@ -411,8 +412,15 @@ export interface StartIdentity {
  * Both hold by claiming a sequence number with an exclusive create. The create
  * is the arbitration: two concurrent calls cannot both win one sequence,
  * whatever order they scanned in, so neither can take the other's id. A row
- * this process did not claim and that is not yet confirmed is a predecessor's
- * unfinished call, and only then is it adopted.
+ * this process has not claimed and that is not yet confirmed is a predecessor's
+ * unfinished call, and only then is it adopted -- and adopting it claims it,
+ * so a second concurrent call in the same process cannot adopt it again.
+ *
+ * A replica taking a run over after a handover has an empty claim set and
+ * therefore adopts, which is what the design asks of a resumed run: its
+ * predecessor's dispatched-and-unconfirmed call is exactly the one it must
+ * reconcile rather than re-issue. The claiming replica is recorded on the row
+ * so the handover is legible afterwards, not to gate that decision.
  */
 export async function allocateStartIdentity(
   store: BgRowStore, owner: string, run: string, command: unknown,
@@ -428,6 +436,12 @@ export async function allocateStartIdentity(
     && row.state !== "spawn_confirmed"
     && !alreadyClaimed.has(row.sequence ?? 0));
   if (adoptable) {
+    // Taken as this process's own from here on. Without it a second concurrent
+    // call in the same resumed process finds the same unresolved row and adopts
+    // it too, which is two intents on one shell -- the collapse the exclusive
+    // create prevents for fresh claims and this prevents for adopted ones.
+    alreadyClaimed.add(adoptable.sequence ?? 1);
+    claimedSequences.set(mineKey, alreadyClaimed);
     return {
       shellId: adoptable.shellId,
       commandDigest,
@@ -448,7 +462,9 @@ export async function allocateStartIdentity(
     const address = { ownerScope: owner, runIdentity: run, shellId };
     const claimed = await store.write(
       rowKey(address),
-      JSON.stringify({ ...address, generation, state: "issued", commandDigest, sequence }),
+      JSON.stringify({
+        ...address, generation, state: "issued", commandDigest, sequence, claimedBy: BRAIN_ID,
+      }),
       null,
     );
     if (!claimed) continue;
@@ -704,7 +720,11 @@ export class HandsClient {
     );
     return {
       args: { ...args, shell_id: allocated.shellId },
-      carry: { commandDigest: allocated.commandDigest, sequence: allocated.sequence },
+      carry: {
+        commandDigest: allocated.commandDigest,
+        sequence: allocated.sequence,
+        claimedBy: BRAIN_ID,
+      },
     };
   }
 

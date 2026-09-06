@@ -321,36 +321,40 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
   assert.ok(pinged.includes("wl-latecomer"));
 });
 
-test("every target is served within the derived bound, on an injected clock", async () => {
-  // The bound stated as a bound. The clock is injected into the ping deadline
-  // itself, so the budget really expires mid-sweep and the sweep really defers
-  // -- which is the thing the bound is about. A test whose pings return
-  // instantly never defers at all and proves nothing.
+test("last activity never ages past the idle deadline, over four of them", async () => {
+  // The bound as the design states it: not sweep-index arithmetic but elapsed
+  // time, driven on an injected clock across long enough for the shortest
+  // reclaim to lapse four times over, asserting the age of each target's last
+  // activity rather than how many sweeps ago it was.
   const C = 2;
   const N = 7;
+  const INTERVAL_MS = 60_000;
+  const IDLE_DEADLINE_MS = 900_000;
   const PING_MS = 1_000;
-  const bound = Math.ceil(N / C);
 
   const targets = Array.from({ length: N }, (_, i) => `wl-${i}`);
   for (const [i, id] of targets.entries()) kv.seed(`hands.sess-${i}`, entry(id));
 
-  // One clock for the deadline and the pings alike: each ping consumes its
-  // whole ceiling, so a budget of C ceilings admits exactly C of them.
   let now = 0;
+  const lastActivity = new Map<string, number>();
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
       async exec(inst: { id: string }) {
         pinged.push(inst.id);
         now += PING_MS;
+        lastActivity.set(inst.id, now);
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     } as unknown as SandboxProvider,
   });
 
-  const servedAt = new Map<string, number[]>();
-  const perSweep: number[] = [];
-  for (let sweep = 0; sweep < bound * 4; sweep++) {
+  const sweepAt: number[] = [];
+  let worstAge = 0;
+  const until = IDLE_DEADLINE_MS * 4;
+  while (now < until) {
+    const sweepStart = now;
+    sweepAt.push(sweepStart);
     pinged.length = 0;
     await runKeepaliveTickForTest({
       kv,
@@ -359,21 +363,22 @@ test("every target is served within the derived bound, on an injected clock", as
       now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
-    perSweep.push(pinged.length);
-    for (const id of pinged) servedAt.set(id, [...(servedAt.get(id) ?? []), sweep]);
+    assert.ok(pinged.length <= C, `a sweep started ${pinged.length} pings past its budget`);
+    // The clock advances by one interval per sweep, as the timer would.
+    now = sweepStart + INTERVAL_MS;
+    for (const id of targets) {
+      // A target never pinged is at its full age since time zero.
+      worstAge = Math.max(worstAge, now - (lastActivity.get(id) ?? 0));
+    }
   }
 
-  assert.ok(perSweep.every((n) => n <= C && n > 0),
-    `the budget really bounded each sweep: ${JSON.stringify(perSweep)}`);
-  assert.ok(perSweep.some((n) => n < N),
-    "and sweeps really deferred, which is what the bound is about");
-
+  assert.ok(sweepAt.length >= (until / INTERVAL_MS) - 1, "the clock really advanced");
+  assert.ok(worstAge < IDLE_DEADLINE_MS,
+    `some target's last activity reached ${Math.round(worstAge / 1000)}s, past the `
+      + `${IDLE_DEADLINE_MS / 1000}s reclaim in force`);
   for (const id of targets) {
-    const served = servedAt.get(id) ?? [];
-    assert.ok(served.length > 0, `${id} was never served`);
-    const gaps = served.map((s, i) => s - (i === 0 ? -1 : served[i - 1]));
-    assert.ok(Math.max(...gaps) <= bound,
-      `${id} waited ${Math.max(...gaps)} sweeps, past the ceil(N/C) = ${bound} bound`);
+    assert.ok(lastActivity.has(id), `${id} was never pinged at all`);
+    assert.ok(now - lastActivity.get(id)! < IDLE_DEADLINE_MS, `${id} ended stale`);
   }
 });
 
