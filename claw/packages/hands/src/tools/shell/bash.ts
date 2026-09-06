@@ -39,7 +39,7 @@ const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "12
  * model is shown is the number enforced here; this fallback is for a Hands
  * started without it.
  */
-const MAX_TIMEOUT_SEC = parseInt(
+export const MAX_TIMEOUT_SEC = parseInt(
   process.env.BASH_MAX_TIMEOUT_SEC || (BG_SHELL_ENABLED ? "120" : "36000"),
   10,
 );

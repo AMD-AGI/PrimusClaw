@@ -17,9 +17,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { ToolRouter, isBackgroundShellCall } from "../src/tools/router.js";
-import { BASH_FOREGROUND_MAX_SEC } from "../src/config.js";
-import { toolTimeoutCeilingSec } from "../src/tools/hands.js";
+import {
+  BASH_FOREGROUND_DEFAULT_SEC, BASH_FOREGROUND_MAX_SEC, WAIT_DEFAULT_SEC,
+} from "../src/config.js";
+import { MCP_DEADLINE_SLACK_MS, toolTimeoutCeilingSec } from "../src/tools/hands.js";
+import { callDeadlineMs } from "../src/clients/hands.js";
+import { handsBaseEnv } from "../src/sandbox/bootstrap.js";
 import type { HandsClient } from "../src/clients/hands.js";
+import { assertBackgroundSurface, assertSurfaceMatches } from "./fixtures/builtin-tool-surface.js";
 
 /** Records what would have reached the sandbox. */
 function makeRouter(): { router: ToolRouter; calls: string[] } {
@@ -38,12 +43,19 @@ test("a background bash call is refused instead of forwarded", async () => {
   assert.deepEqual(calls, [], "the sandbox must never see a call the operator turned off");
 });
 
-test("a stale bash_output or kill_shell gets a legible answer", async () => {
+test("a stale bash_output, kill_shell or wait gets a legible answer", async () => {
   const { router, calls } = makeRouter();
 
   assert.match(String(await router.route("bash_output", { shell_id: "bg-1" })), /disabled/);
   assert.match(String(await router.route("kill_shell", { shell_id: "bg-1" })), /disabled/);
-  assert.deepEqual(calls, []);
+  assert.match(String(await router.route("wait", { shell_id: "bg-1" })), /disabled/);
+  assert.match(
+    String(await router.route("bash", { command: "sleep 999", run_in_background: true })),
+    /disabled/,
+  );
+  assert.deepEqual(calls, [],
+    "all four entry points, or the one left out is the one a replayed "
+      + "transcript reaches the sandbox through");
 });
 
 test("the refusal names the alternative", async () => {
@@ -105,31 +117,111 @@ test("the bash description still explains what the timeout does", () => {
 });
 
 test("without background shells, the ceiling is the one that lets work finish", async () => {
-  const { BASH_FOREGROUND_MAX_SEC: ceiling } = await import("../src/config.js");
+  const { BASH_FOREGROUND_MAX_SEC: rawSetting } = await import("../src/config.js");
   // The 120s ceiling buys a clean handover between replicas, and the price is
   // paid by run_in_background + wait taking the long work. With those refused
   // there is nothing to pay it with: a build, a test suite or a training step
-  // would have no route at all, so the ceiling stays where it was.
-  assert.equal(ceiling, 36_000);
+  // would have no route at all, so the setting stays where it was. The literal
+  // is the subject here -- this is the raw setting, not a surface value, and no
+  // surface states it.
+  assert.equal(rawSetting, 36_000);
 
   const { handsBaseEnv } = await import("../src/sandbox/bootstrap.js");
   const env = handsBaseEnv("s-1", "9100", "tok");
   assert.match(env, new RegExp(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")}`),
     "Hands is what enforces the limit, so it is told the number the schema "
       + "states and the deadline is built from: the setting held under the MCP "
-      + "hard cap, 3540s, and not the ten hours the setting alone would allow");
-  assert.match(env, /BASH_DEFAULT_TIMEOUT_SEC=120/,
-    "the default does not move with the ceiling, or every command is planned as "
-      + "if it had ten hours");
+      + "hard cap, and not the ten hours the setting alone would allow");
+  assert.notEqual(toolTimeoutCeilingSec("bash"), rawSetting,
+    "the held ceiling is what is forwarded; forwarding the raw setting would "
+      + "leave the schema promising one number against a sandbox honouring another");
 });
 
 test("isBackgroundShellCall recognises exactly the background paths", () => {
   assert.ok(isBackgroundShellCall("bash", { run_in_background: true }));
   assert.ok(isBackgroundShellCall("bash_output", {}));
   assert.ok(isBackgroundShellCall("kill_shell", {}));
+  assert.ok(isBackgroundShellCall("wait", {}));
 
   assert.ok(!isBackgroundShellCall("bash", {}));
   assert.ok(!isBackgroundShellCall("bash", { run_in_background: "yes" }),
     "a string is not the boolean the schema asks for and must not open the path");
   assert.ok(!isBackgroundShellCall("read", { path: "a" }));
+});
+
+test("the whole built-in surface is pinned, not only the tools that moved", () => {
+  // Every other feature flag is left at its shipped default by not being set
+  // here, so BG_SHELL_ENABLED is the only thing separating this snapshot from
+  // the enabled file's.
+  assertSurfaceMatches(makeRouter().router.getToolSchemas(), false);
+});
+
+test("the background tool set is exactly bash", () => {
+  assertBackgroundSurface(makeRouter().router.getToolSchemas(), false);
+  const names = makeRouter().router.getToolSchemas().map((s) => s.name);
+  for (const absent of ["bash_output", "kill_shell", "wait"]) {
+    assert.ok(!names.includes(absent), `${absent} must not be offered`);
+  }
+});
+
+test("the ceiling function's own answers are pinned, not only agreement with it", () => {
+  // Comparing surfaces to the function proves they cannot diverge from each
+  // other and nothing more: a changed hard cap or slack inside it moves all
+  // three together and satisfies every such comparison. These two literals are
+  // the subject rather than a copy of one.
+  assert.equal(toolTimeoutCeilingSec("bash"), 3540);
+  assert.equal(toolTimeoutCeilingSec("wait"), 1800);
+});
+
+test("schema, deadline and forwarded env all state the one held ceiling", () => {
+  const held = toolTimeoutCeilingSec("bash");
+  const { router } = makeRouter();
+  const timeout = (router.getToolSchemas().find((s) => s.name === "bash")!
+    .input_schema as { properties: Record<string, { description?: string }> }).properties.timeout!;
+
+  assert.match(timeout.description!, new RegExp(`\\b${held}\\b`));
+  assert.equal(
+    callDeadlineMs("bash", { command: "x", timeout: held * 10 }),
+    held * 1000 + MCP_DEADLINE_SLACK_MS,
+    "a request above the ceiling is deadlined at the ceiling, not at the request",
+  );
+  assert.match(handsBaseEnv("s-1", "9100", "tok"), new RegExp(`BASH_MAX_TIMEOUT_SEC=${held}(\\s|$)`));
+});
+
+test("the closed-state forwarding tuple is asserted whole, not key by key", () => {
+  // A key silently dropped from the string is the failure this shape catches;
+  // asserting one key at a time cannot. Every value is read from its source, so
+  // a surface holding its own copy of a number fails here rather than agreeing
+  // with itself.
+  const env = handsBaseEnv("s-1", "9100", "tok");
+  const pairs = Object.fromEntries(
+    env.split(" ").filter((p) => p.includes("=")).map((p) => {
+      const i = p.indexOf("=");
+      return [p.slice(0, i), p.slice(i + 1)];
+    }),
+  );
+
+  assert.equal(pairs.BG_SHELL_ENABLED, "false");
+  assert.equal(pairs.BASH_MAX_TIMEOUT_SEC, String(toolTimeoutCeilingSec("bash")));
+  assert.equal(pairs.BASH_DEFAULT_TIMEOUT_SEC, String(BASH_FOREGROUND_DEFAULT_SEC));
+  assert.equal(pairs.WAIT_MAX_SEC, String(toolTimeoutCeilingSec("wait")),
+    "unasserted, this is where the wait ceiling becomes a second instance of "
+      + "the divergence the bash ceiling already has");
+  assert.equal(pairs.WAIT_DEFAULT_SEC, String(WAIT_DEFAULT_SEC));
+});
+
+test("the disabled refusal names no duration, so it cannot be read as a timeout", async () => {
+  const { router, calls } = makeRouter();
+  const out = String(await router.route("wait", { shell_id: "bg-1" }));
+
+  assert.match(out, /disabled/);
+  assert.match(out, /foreground/, "the alternative this deployment does have");
+  assert.doesNotMatch(out, /\d+\s*s\b|\d+ seconds/,
+    "a seconds figure is what separates the two timeout classes from this one");
+  assert.doesNotMatch(out, /deadline|may still be running|process group/,
+    "nothing here implies the call reached a process");
+  assert.doesNotMatch(out, /not found|unknown shell|no longer available/,
+    "those are the natural shape of a lost-registry answer, which is a "
+      + "different class and out of scope here");
+  assert.deepEqual(calls, []);
 });

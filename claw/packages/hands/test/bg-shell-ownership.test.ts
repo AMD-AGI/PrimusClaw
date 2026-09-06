@@ -251,3 +251,14 @@ test("with background shells on, the foreground ceiling is the tight one and poi
   const res = await bash.execute({ command: "sleep 5", timeout: 1 });
   assert.match(res.content[0]!.text!, /run_in_background=true/);
 });
+
+test("the registry advertises the same four names with the feature on", async () => {
+  // The other half of the pair in bg-shell-disabled: identical in both states,
+  // which is what makes the tool list useless as a capability report and
+  // reconciliation against it worthless.
+  const { tools } = await import("../src/tools/index.js");
+  const names = tools.map((t) => t.name);
+  for (const name of ["bash", "bash_output", "kill_shell", "wait"]) {
+    assert.ok(names.includes(name), `${name} must stay registered`);
+  }
+});

@@ -23,6 +23,7 @@ import {
   stopStaleHandsCmdForPaths,
 } from "../src/sandbox/hands-restart.js";
 import { bindContainerProbeEffects } from "../src/sandbox/container-probe.js";
+import { toolTimeoutCeilingSec } from "../src/tools/hands.js";
 import type { SandboxExecResult } from "../src/sandbox/provider.js";
 
 const realFetch = globalThis.fetch;
@@ -492,4 +493,29 @@ test("a joiner that is cancelled stops waiting on the owner's repair", async () 
   assert.equal(res.detail, "aborted",
     `a cancelled joiner reports its own abort, not the owner's; got ${res.detail}`);
   await ownerRun; // let the owner finish rather than leaking its timer into the next test
+});
+
+test("a restarted Hands is handed the same ceilings a fresh bootstrap forwards", async () => {
+  // Restart reaches `handsBaseEnv` through the same bootstrap call as initial
+  // provisioning today, so this passes for free -- which is the point of
+  // asserting it here rather than inferring it from bootstrap's own coverage. A
+  // later restart-specific env path would leave the sandbox enforcing one
+  // ceiling while the schema promises another, and bootstrap's tests would stay
+  // green through it.
+  const cmds = execRecorder();
+  stubHealth(0);
+
+  await restartHandsInSandbox({
+    sessionId: "sess-1",
+    handsUrl: "http://sandbox:9100/mcp",
+    token: "tok-1",
+    entry: ENTRY,
+  });
+
+  const started = cmds.filter((c) => c.includes("BASH_MAX_TIMEOUT_SEC="));
+  assert.ok(started.length > 0, "the relaunch carries the forwarded env at all");
+  for (const cmd of started) {
+    assert.ok(cmd.includes(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")} `));
+    assert.ok(cmd.includes(`WAIT_MAX_SEC=${toolTimeoutCeilingSec("wait")} `));
+  }
 });
