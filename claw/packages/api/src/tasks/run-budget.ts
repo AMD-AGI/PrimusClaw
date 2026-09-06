@@ -36,7 +36,7 @@ export type RunScope = "chat" | "dag_node";
  * allowed to reap is exactly the one between a conversation and everything
  * else.
  */
-export type RunOrigin = "chat" | "task" | "dag_node";
+export type RunOrigin = "chat" | "task" | "dag_node" | "a2a";
 
 /**
  * A duration in seconds that must be positive to mean anything.
@@ -131,6 +131,18 @@ export const RUN_BUDGET_BACKSTOP_GRACE_SEC = envSec("RUN_BUDGET_BACKSTOP_GRACE_S
 export const RUN_QUEUE_MAX_SEC = envSec("RUN_QUEUE_MAX_SEC", 2 * 60 * 60);
 
 /**
+ * How long a dispatch has to get from its row insert to its publish before
+ * reconciliation may take the row from it.
+ *
+ * A horizon rather than a flag, because the marker is written before the
+ * publish and every marked row would otherwise be eligible on the first tick
+ * after the insert: a sweep would terminalize a healthy dispatch whose only
+ * fault was outlasting a sweeper interval. Comfortably above admission, the
+ * hard-limit recheck and the publish together, and above one sweeper tick.
+ */
+export const DISPATCH_RECONCILE_LEASE_SEC = envSec("DISPATCH_RECONCILE_LEASE_SEC", 300);
+
+/**
  * SQL that stamps the deadline when a run starts.
  *
  * Computed in the database from the row itself so it cannot disagree with the
@@ -166,7 +178,7 @@ const BUDGET_SECONDS_SQL = `NULLIF(
   COALESCE(
     (@META@->'derived'->>'budget_sec')::int,
     CASE
-      WHEN @ORIGIN@ = 'chat' THEN $CHAT$
+      WHEN @ORIGIN@ IN ('chat','a2a') THEN $CHAT$
       WHEN @ORIGIN@ IN ('task','dag_node') THEN $DAG$
       WHEN @DAGROOT@ IS NULL THEN $CHAT$
       ELSE $DAG$

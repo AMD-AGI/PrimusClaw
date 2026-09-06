@@ -20,7 +20,7 @@ import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import { openChatRun, failChatRunDispatch } from "../tasks/chat-run.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun } from "../tasks/run-dispatch.js";
 import { decideAdmission } from "../tasks/admission.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
@@ -39,7 +39,7 @@ const logger = pino({ name: "session-dispatch" });
 export const sessionDispatchPorts = {
   openChatRun,
   failChatRunDispatch,
-  doorbellDispatch: RUN_DOORBELL_DISPATCH,
+  doorbellDispatch: beginDoorbellDispatch,
   admit: decideAdmission,
   publishSse(sessionId: string, payload: string): void {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
@@ -265,46 +265,51 @@ export async function dispatchTaskToBrain(
     task.files_workspace_id = filesWorkspaceId;
     task.files_workspace_required = true;
 
-    if (sessionDispatchPorts.doorbellDispatch) {
-      const result = await dispatchByDoorbell({
-        task,
-        sessionId,
-        userId,
-        messageId,
-        prompt: content,
-        workspaceId,
-        filesWorkspaceId,
-        pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-        sandboxImage: finalSandboxImage,
-        rememberTaskId: (taskId) => { runTaskId = taskId; },
-      });
-      if (result.kind === "rejected") {
-        // The delete is the whole rollback, and it is enough. A refused turn
-        // was reported as leaving an unanswered UserMessage on any open
-        // stream, which would need the live push above to have reached a
-        // reader -- and it does not. `publishSse` writes to
-        // `sse.events.<sessionId>` on core NATS, and that subject has two
-        // publishers in this repository and no subscriber at all: both SSE
-        // routes read the JetStream `events.<sessionId>` subject through
-        // `createSessionSubscription`, which only `publishEvent` feeds.
-        //
-        // So nothing is announced here on purpose. Publishing the refusal
-        // through `publishEvent` instead would reach readers and also persist,
-        // leaving an assistant reply in history beside the UserMessage this
-        // statement just removed -- worse than the silence. Verified against
-        // the cluster: a rejected create leaves no session event, no task row,
-        // no conversation turn, and an idle session.
-        //
-        // The dead `sse.` channel is a real defect, but a wider one than this
-        // branch: it is also why a client already connected never sees its own
-        // UserMessage until it reconnects and replays history.
-        await db.query(
-          "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
-          [messageId, sessionId],
-        );
-        await onPublishFailure();
+    const doorbellToken = sessionDispatchPorts.doorbellDispatch();
+    if (doorbellToken) {
+      try {
+        const result = await dispatchByDoorbell({
+          task,
+          sessionId,
+          userId,
+          messageId,
+          prompt: content,
+          workspaceId,
+          filesWorkspaceId,
+          pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+          sandboxImage: finalSandboxImage,
+          rememberTaskId: (taskId) => { runTaskId = taskId; },
+        });
+        if (result.kind === "rejected") {
+          // The delete is the whole rollback, and it is enough. A refused turn
+          // was reported as leaving an unanswered UserMessage on any open
+          // stream, which would need the live push above to have reached a
+          // reader -- and it does not. `publishSse` writes to
+          // `sse.events.<sessionId>` on core NATS, and that subject has two
+          // publishers in this repository and no subscriber at all: both SSE
+          // routes read the JetStream `events.<sessionId>` subject through
+          // `createSessionSubscription`, which only `publishEvent` feeds.
+          //
+          // So nothing is announced here on purpose. Publishing the refusal
+          // through `publishEvent` instead would reach readers and also persist,
+          // leaving an assistant reply in history beside the UserMessage this
+          // statement just removed -- worse than the silence. Verified against
+          // the cluster: a rejected create leaves no session event, no task row,
+          // no conversation turn, and an idle session.
+          //
+          // The dead `sse.` channel is a real defect, but a wider one than this
+          // branch: it is also why a client already connected never sees its own
+          // UserMessage until it reconnects and replays history.
+          await db.query(
+            "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
+            [messageId, sessionId],
+          );
+          await onPublishFailure();
+        }
+        return result;
+      } finally {
+        doorbellToken.release();
       }
-      return result;
     }
 
     const run = await sessionDispatchPorts.openChatRun({

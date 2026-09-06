@@ -816,127 +816,7 @@ async function handleComplete(
   if (!gateOpened) {
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
-  const pending = !gateOpened ? undefined : (await db.query(
-    "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
-    [sessionId],
-  )).rows[0];
-
-  if (pending) {
-    const pendingUserId = pending.user_id || userId;
-    const history = await buildMessages(sessionId, pending.content, pendingUserId);
-
-    // Load local active skills (with sub-files) so the queued message keeps skill context
-    let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
-    try {
-      const activeSkills = await selectSkillsForTask(pendingUserId, pending.content || "");
-      pendingSkills = {};
-      for (const [name, bundle] of Object.entries(activeSkills)) {
-        pendingSkills[name] = {
-          content: bundle.content,
-          description: bundle.description,
-          enabled: true,
-          version: bundle.version,
-          files: bundle.files,
-        };
-      }
-      if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
-    } catch {
-      pendingSkills = undefined;
-    }
-
-    const rawTools = pending.tool_ids;
-    const toolIds: number[] = Array.isArray(rawTools)
-      ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
-      : [];
-    const pid = pending.plugin_id;
-    const pluginId =
-      pid !== undefined && pid !== null && pid !== "" ? Number(pid) : undefined;
-    const wsidRaw = pending.workspace_id;
-    const workspaceId =
-      typeof wsidRaw === "string" && wsidRaw.trim() !== "" ? wsidRaw.trim() : undefined;
-
-    // Default resource row for cpu/memory/gpu/ephemeralStorage + image.
-    const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
-    const defaultResource = asJsonObject(defaultResourceRow?.resource);
-    const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
-    let pluginImage: string | undefined;
-    let pluginResource: Record<string, unknown> | undefined;
-    if (pluginId !== undefined && Number.isFinite(pluginId)) {
-      try {
-        const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-        if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
-          const formatted = await formatPluginRow(pluginRow, true);
-          const imageFromPlugin = pluginSandboxImage(formatted.images);
-          if (imageFromPlugin) pluginImage = imageFromPlugin;
-          const resourceFromPlugin = asJsonObject(formatted.resource);
-          if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-        }
-      } catch (err) {
-        logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
-      }
-    }
-    const requestImage =
-      typeof pending.image === "string" && pending.image.trim() !== "" ? pending.image.trim() : undefined;
-    // claw_pending_messages.resources column stores the request body's
-    // `resource` (object) field; the column name is preserved unchanged.
-    const requestResource = asJsonObject(pending.resources);
-    const pendingTimeoutNum =
-      pending.timeout !== undefined && pending.timeout !== null ? Number(pending.timeout) : NaN;
-    const pendingTimeout = Number.isFinite(pendingTimeoutNum) ? Math.trunc(pendingTimeoutNum) : undefined;
-    // Resolution chain: pending row > plugin row > DB default (resources table).
-    const finalSandboxImage = requestImage || pluginImage || defaultImage;
-    const finalResources = requestResource || pluginResource || defaultResource || {};
-
-    // Same pairing as routes/sessions.ts immediate dispatch: tool_ids vs plugin_id (XOR at runtime; both keys for compat).
-    // user_env snapshot frozen on the row at POST /messages time (see
-    // routes/sessions.ts). Forward verbatim to Brain via ExecuteRequest.user_env.
-    const pendingUserEnv =
-      pending.user_env && typeof pending.user_env === "object" && !Array.isArray(pending.user_env)
-        ? (pending.user_env as Record<string, string>)
-        : undefined;
-    const pendingSessionEnv =
-      pending.session_env && typeof pending.session_env === "object" && !Array.isArray(pending.session_env)
-        ? (pending.session_env as Record<string, string>)
-        : undefined;
-    const pendingMessageId = queuedMessageId(pending.id as number);
-    const task: Record<string, unknown> = {
-      session_id: sessionId,
-      message_id: pendingMessageId,
-      prompt: pending.content,
-      history,
-      user_id: pendingUserId,
-      llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
-      platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
-      skills: pendingSkills,
-      tool_ids: toolIds.length ? toolIds : undefined,
-      plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      workspace_id: workspaceId,
-      sandbox_image: finalSandboxImage,
-      resources: finalResources,
-      timeout: pendingTimeout,
-      user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
-      session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
-      topology: asJsonObject(pending.topology),
-    };
-    const credentialsReadable = await applyPendingCredentials(task, pending, {
-      sessionId, userId: pendingUserId, messageId: pendingMessageId,
-    });
-    // A queued turn is a run like any other, so it gets the same row, lease and
-    // workspace binding the immediate path gives one. Without them a replayed
-    // turn is invisible to lease-based recovery: its worker can die and no
-    // sweep reclaims it, because there is no row saying it was ever owned.
-    if (credentialsReadable) await dispatchPendingMessage({
-      sessionId,
-      pendingId: pending.id,
-      userId: pendingUserId,
-      messageId: pendingMessageId,
-      prompt: pending.content,
-      workspaceId,
-      pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      sandboxImage: finalSandboxImage,
-      task,
-    });
-  }
+  if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
 
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
@@ -1066,6 +946,142 @@ async function handleComplete(
 
 const SUMMARIZE_THRESHOLD = 80_000;
 const KEEP_RECENT = 50_000;
+
+/**
+ * Dispatch the oldest message parked behind this session, if there is one.
+ *
+ * Extracted from the completion handler rather than duplicated, because the
+ * sweeper has to be able to run exactly this path: a dispatch that fails
+ * before execution emits no completion, so a session idled by publish-failure
+ * cleanup with a row still in the queue has no trigger left and that turn is
+ * parked for ever. Callers are responsible for proving the session is free.
+ */
+export async function drainOldestPendingMessage(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  const pending = (await db.query(
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  [sessionId],
+)).rows[0];
+
+if (pending) {
+  const pendingUserId = pending.user_id || userId;
+  const history = await buildMessages(sessionId, pending.content, pendingUserId);
+
+  // Load local active skills (with sub-files) so the queued message keeps skill context
+  let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
+  try {
+    const activeSkills = await selectSkillsForTask(pendingUserId, pending.content || "");
+    pendingSkills = {};
+    for (const [name, bundle] of Object.entries(activeSkills)) {
+      pendingSkills[name] = {
+        content: bundle.content,
+        description: bundle.description,
+        enabled: true,
+        version: bundle.version,
+        files: bundle.files,
+      };
+    }
+    if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
+  } catch {
+    pendingSkills = undefined;
+  }
+
+  const rawTools = pending.tool_ids;
+  const toolIds: number[] = Array.isArray(rawTools)
+    ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
+    : [];
+  const pid = pending.plugin_id;
+  const pluginId =
+    pid !== undefined && pid !== null && pid !== "" ? Number(pid) : undefined;
+  const wsidRaw = pending.workspace_id;
+  const workspaceId =
+    typeof wsidRaw === "string" && wsidRaw.trim() !== "" ? wsidRaw.trim() : undefined;
+
+  // Default resource row for cpu/memory/gpu/ephemeralStorage + image.
+  const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
+  const defaultResource = asJsonObject(defaultResourceRow?.resource);
+  const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
+  let pluginImage: string | undefined;
+  let pluginResource: Record<string, unknown> | undefined;
+  if (pluginId !== undefined && Number.isFinite(pluginId)) {
+    try {
+      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
+      if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
+        const formatted = await formatPluginRow(pluginRow, true);
+        const imageFromPlugin = pluginSandboxImage(formatted.images);
+        if (imageFromPlugin) pluginImage = imageFromPlugin;
+        const resourceFromPlugin = asJsonObject(formatted.resource);
+        if (resourceFromPlugin) pluginResource = resourceFromPlugin;
+      }
+    } catch (err) {
+      logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
+    }
+  }
+  const requestImage =
+    typeof pending.image === "string" && pending.image.trim() !== "" ? pending.image.trim() : undefined;
+  // claw_pending_messages.resources column stores the request body's
+  // `resource` (object) field; the column name is preserved unchanged.
+  const requestResource = asJsonObject(pending.resources);
+  const pendingTimeoutNum =
+    pending.timeout !== undefined && pending.timeout !== null ? Number(pending.timeout) : NaN;
+  const pendingTimeout = Number.isFinite(pendingTimeoutNum) ? Math.trunc(pendingTimeoutNum) : undefined;
+  // Resolution chain: pending row > plugin row > DB default (resources table).
+  const finalSandboxImage = requestImage || pluginImage || defaultImage;
+  const finalResources = requestResource || pluginResource || defaultResource || {};
+
+  // Same pairing as routes/sessions.ts immediate dispatch: tool_ids vs plugin_id (XOR at runtime; both keys for compat).
+  // user_env snapshot frozen on the row at POST /messages time (see
+  // routes/sessions.ts). Forward verbatim to Brain via ExecuteRequest.user_env.
+  const pendingUserEnv =
+    pending.user_env && typeof pending.user_env === "object" && !Array.isArray(pending.user_env)
+      ? (pending.user_env as Record<string, string>)
+      : undefined;
+  const pendingSessionEnv =
+    pending.session_env && typeof pending.session_env === "object" && !Array.isArray(pending.session_env)
+      ? (pending.session_env as Record<string, string>)
+      : undefined;
+  const pendingMessageId = queuedMessageId(pending.id as number);
+  const task: Record<string, unknown> = {
+    session_id: sessionId,
+    message_id: pendingMessageId,
+    prompt: pending.content,
+    history,
+    user_id: pendingUserId,
+    llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
+    platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
+    skills: pendingSkills,
+    tool_ids: toolIds.length ? toolIds : undefined,
+    plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    workspace_id: workspaceId,
+    sandbox_image: finalSandboxImage,
+    resources: finalResources,
+    timeout: pendingTimeout,
+    user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
+    session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
+    topology: asJsonObject(pending.topology),
+  };
+  const credentialsReadable = await applyPendingCredentials(task, pending, {
+    sessionId, userId: pendingUserId, messageId: pendingMessageId,
+  });
+  // A queued turn is a run like any other, so it gets the same row, lease and
+  // workspace binding the immediate path gives one. Without them a replayed
+  // turn is invisible to lease-based recovery: its worker can die and no
+  // sweep reclaims it, because there is no row saying it was ever owned.
+  if (credentialsReadable) await dispatchPendingMessage({
+    sessionId,
+    pendingId: pending.id,
+    userId: pendingUserId,
+    messageId: pendingMessageId,
+    prompt: pending.content,
+    workspaceId,
+    pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    sandboxImage: finalSandboxImage,
+    task,
+  });
+}
+}
 
 async function maybeSummarize(sessionId: string, userId: string): Promise<void> {
   const totalTokens = (await db.query(

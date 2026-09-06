@@ -84,6 +84,29 @@ export interface ClaimedRun {
   claimCount: number;
 }
 
+/**
+ * Doorbell rows an incoming Brain at `version` could not run, in any
+ * non-terminal state.
+ *
+ * The queued count alone is not the rollback precondition it looks like. A
+ * successful claim moves the row to `preparing` and writes a lease, and the
+ * Brain acks the doorbell immediately, so every queued-row check can read zero
+ * while the run is still executing -- and a post-claim nak is an HTTP unclaim,
+ * and a draining pod releases every row it was holding, so such a row becomes
+ * queued again exactly when the last compatible replica goes away. A check
+ * taken before those rows existed proved nothing.
+ */
+export async function countIncompatibleDoorbellRuns(version: number): Promise<number> {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM claw_tasks
+      WHERE COALESCE(metadata->>'dispatch', '') = 'doorbell'
+        AND status IN ('queued','preparing','running','cancelling')
+        AND COALESCE((metadata->>'doorbell_semantics')::int, 1) > $1::int`,
+    [version],
+  );
+  return Number((r.rows[0] as { n?: number } | undefined)?.n ?? 0);
+}
+
 export async function claimRunById(
   taskId: string,
   brainId: string,

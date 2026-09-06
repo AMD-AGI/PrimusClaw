@@ -28,10 +28,14 @@ import {
 } from "../config.js";
 import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
+import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { handleMap } from "./sandbox-stopper.js";
-import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
+import {
+  DISPATCH_RECONCILE_LEASE_SEC, RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
+  RUN_REQUEUE_RESET_SQL,
+} from "./run-budget.js";
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
 } from "../workspace/store.js";
@@ -76,6 +80,7 @@ const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 /** Injection seam for the terminal events a reap has to announce. */
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
+  drainPendingMessage: drainOldestPendingMessage,
 };
 
 let stopped = false;
@@ -1125,6 +1130,190 @@ export async function auditRefusedCompensations(limit = 20): Promise<number> {
   return r.rowCount;
 }
 
+/**
+ * Finish the publish-failure cleanup a dispatch could not conclude itself.
+ *
+ * A non-NULL `dispatch_reconcile_at` means compensation, or the caller cleanup
+ * behind it, never reached a durable conclusion. Two writers can reach such a
+ * row -- the publisher that wrote the marker, and this sweep -- and the horizon
+ * bounds the race while the marker itself decides it: taking a row extends the
+ * column in the statement that selects it, which invalidates every publisher
+ * compare-and-swap still outstanding, and a tick that dies mid-compensation
+ * leaves the row eligible again one lease later rather than wedged.
+ */
+export async function reconcileAmbiguousDispatches(limit = 100): Promise<number> {
+  const taken = await db.query(
+    `WITH due AS (
+       SELECT task_id FROM claw_tasks
+        WHERE dispatch_reconcile_at IS NOT NULL
+          AND dispatch_reconcile_at < NOW()
+        ORDER BY dispatch_reconcile_at
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE claw_tasks t
+        SET dispatch_reconcile_at = NOW() + ($2::int * INTERVAL '1 second')
+       FROM due
+      WHERE t.task_id = due.task_id
+      RETURNING t.task_id, t.session_id, t.status, t.failure_reason,
+                COALESCE(t.claim_count, 0) AS claim_count,
+                t.dispatch_reconcile_action AS action,
+                t.metadata->>'message_id' AS message_id`,
+    [limit, DISPATCH_RECONCILE_LEASE_SEC],
+  );
+  if (!taken.rowCount) return 0;
+  let resolved = 0;
+  for (const row of taken.rows as AmbiguousDispatch[]) {
+    try {
+      if (await resolveAmbiguousDispatch(row)) resolved += 1;
+    } catch (err) {
+      logger.warn({ err, taskId: row.task_id }, "sweeper.dispatch_reconcile_failed");
+    }
+  }
+  if (resolved) logger.warn({ resolved }, "sweeper.reconciled_ambiguous_dispatches");
+  return resolved;
+}
+
+interface AmbiguousDispatch {
+  task_id: string;
+  session_id: string;
+  status: string;
+  failure_reason: string | null;
+  claim_count: number;
+  action: string | null;
+  message_id: string | null;
+}
+
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * Settle one such row, then clear the marker -- in that order, so a throw or a
+ * process death leaves the same row eligible on the next tick.
+ *
+ * A row that is held, or was ever claimed, belongs to execution: it loses the
+ * marker without any session rollback, because rolling one back would idle or
+ * delete a session whose turn is running.
+ */
+async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean> {
+  const executed = row.claim_count > 0;
+  if (!executed && !TERMINAL_STATUSES.has(row.status)) {
+    const verdict = await failChatRunDispatch(
+      row.task_id,
+      "the dispatch never reported whether its message was published",
+      "dispatch_failed",
+      { statuses: SWEEPABLE_RUN_STATUSES, fleetAsserted: RUN_FAT_PREPARING_RECONCILE },
+    );
+    if (verdict !== "closed") return false;
+  }
+  const refused = !executed
+    && row.failure_reason === "dispatch_failed"
+    && TERMINAL_STATUSES.has(row.status);
+  if (refused || !executed) {
+    await releaseRunUse(row.task_id, false);
+    if (!await runCleanupAction(row)) return false;
+  }
+  return await clearReconcileMarker(row.task_id);
+}
+
+/**
+ * The cleanup the request path would have run, replayed from a stored value
+ * rather than a reconstructed closure.
+ *
+ * Both actions check occupancy first: later work may have adopted the session,
+ * and preserving that work is what stops the repair pairing a claimable row
+ * with an idle or missing session.
+ */
+async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
+  if (row.action === "idle_existing_session") {
+    await db.query(
+      `UPDATE claw_sessions s
+          SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
+        WHERE s.session_id = $1
+          AND s.agent_status = 'running'
+          AND s.deleted_at IS NULL
+          AND (NOT $3::boolean OR s.agent_gate_message_id IS NOT DISTINCT FROM $2)
+          AND NOT EXISTS (
+            SELECT 1 FROM claw_tasks t
+             WHERE t.session_id = s.session_id
+               AND t.origin = 'chat'
+               AND t.status IN ('queued','preparing','running','cancelling')
+          )`,
+      [row.session_id, row.message_id, gateOwnershipEnforced()],
+    );
+    return true;
+  }
+  if (row.action === "delete_created_session") {
+    const occupied = await db.query(
+      `SELECT 1 FROM claw_tasks
+        WHERE session_id = $1 AND origin = 'chat'
+          AND status IN ('queued','preparing','running','cancelling') LIMIT 1`,
+      [row.session_id],
+    );
+    if (occupied.rowCount) return true;
+    await db.query(
+      "UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+      [row.session_id],
+    );
+    return true;
+  }
+  return true;
+}
+
+async function clearReconcileMarker(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
+      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+      RETURNING task_id`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Drain a message parked behind a gate that was handed back without one.
+ *
+ * `dispatchPendingMessage` is reached from exactly one place, the completion
+ * consumer, and only when that completion opened the gate. A dispatch that
+ * fails before execution emits no completion, so a session idled by
+ * publish-failure cleanup with a row still in the queue has no trigger left and
+ * that turn is parked for ever. The occupancy test is the one the consumer
+ * already applies, so this cannot stack a second turn onto a live session.
+ */
+export async function drainOrphanedPendingMessages(limit = 20): Promise<number> {
+  const r = await db.query(
+    `SELECT DISTINCT ON (p.session_id) p.id, p.session_id, p.user_id
+       FROM claw_pending_messages p
+       JOIN claw_sessions s ON s.session_id = p.session_id
+      WHERE s.agent_status = 'idle'
+        AND s.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_tasks t
+           WHERE t.session_id = p.session_id
+             AND t.origin = 'chat'
+             AND t.status IN ('queued','preparing','running','cancelling')
+        )
+      ORDER BY p.session_id, p.created_at
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  let drained = 0;
+  for (const row of r.rows as Array<{ id: number; session_id: string; user_id: string | null }>) {
+    try {
+      await sweeperPorts.drainPendingMessage(row.session_id, row.user_id ?? "default");
+      drained += 1;
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: row.session_id, pendingId: row.id },
+        "sweeper.orphaned_pending_drain_failed",
+      );
+    }
+  }
+  if (drained) logger.warn({ drained }, "sweeper.drained_orphaned_pending");
+  return drained;
+}
+
 /** Fail `waiting_external` rows past their per-node timeout. */
 export async function reapWaitExternal(): Promise<number> {
   const r = await db.query(
@@ -1298,6 +1487,11 @@ export async function sweeperTick(): Promise<void> {
   // worker_lost by its own reaper rather than reclassified as one that never
   // executed. Each contained independently: a throw from one must not cost the
   // later passes or the tick's final idempotency-key prune.
+  // Before the queue and session reapers, so a dispatch whose outcome was never
+  // decided is settled by the path that owns it rather than aged out by one
+  // that does not know what it was.
+  await runContained("sweeper.dispatch_reconcile_failed", reconcileAmbiguousDispatches);
+  await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
   await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);
   await runContained("sweeper.finalize_compensations_failed", finalizeDispatchCompensations);
   await runContained("sweeper.audit_compensations_failed", auditRefusedCompensations);

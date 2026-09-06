@@ -14,6 +14,9 @@ import {
   resolveTaskStreamMaxAgeNs, resolveTombstoneTtlMs, taskSubject,
 } from "@claw/protocol";
 import pino from "pino";
+import {
+  closeDoorbellLatch, DOORBELL_SEMANTICS_KEY, latchFromOperation, setDoorbellLatch,
+} from "../tasks/doorbell-gate.js";
 
 const logger = pino({ name: "nats" });
 export const sc = StringCodec();
@@ -223,6 +226,32 @@ export function publishCertainlyFailed(err: unknown): boolean {
   return e?.code === "503" || e?.api_error !== undefined;
 }
 
+/**
+ * Follow the fleet's asserted doorbell-semantics floor.
+ *
+ * Re-read on every delivery rather than cached from the first, and a watch that
+ * throws or ends closes the gate: a floor whose feed is dead is an assertion
+ * nobody can revoke. An entry that merely ages out delivers no operation at
+ * all, so the latch is changed only by a write or a delete that actually
+ * arrives -- which is why revocation is an explicit, verified operator step.
+ */
+function startDoorbellSemanticsWatch(bucket: KV): void {
+  void (async () => {
+    try {
+      const watcher = await bucket.watch({ key: DOORBELL_SEMANTICS_KEY });
+      for await (const entry of watcher) {
+        setDoorbellLatch(latchFromOperation(
+          entry.operation,
+          entry.operation === "PUT" ? sc.decode(entry.value) : null,
+        ));
+      }
+      closeDoorbellLatch("watch ended");
+    } catch (err) {
+      closeDoorbellLatch(String((err as Error)?.message ?? err));
+    }
+  })();
+}
+
 export async function initNats(): Promise<void> {
   const opts: ConnectionOptions = { servers: NATS_URL };
   if (NATS_USER) {
@@ -268,6 +297,7 @@ export async function initNats(): Promise<void> {
   kvCkpt = buckets.checkpoints;
   kvTombstones = buckets.tombstones;
   kvSystemEnv = buckets.systemEnv;
+  startDoorbellSemanticsWatch(kv);
 
   logger.info(
     {

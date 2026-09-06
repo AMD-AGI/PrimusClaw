@@ -36,7 +36,8 @@
 import { doorbellDedupId, taskSubject, type ExecuteRequest } from "@claw/protocol";
 import pino from "pino";
 
-import { envInt, RUN_DOORBELL_DISPATCH } from "../config.js";
+import { envInt } from "../config.js";
+import { beginDoorbellDispatch } from "./doorbell-gate.js";
 import { db } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
@@ -157,7 +158,7 @@ export interface PendingDispatchResult {
 export const pendingDispatchPorts = {
   openChatRun,
   failChatRunDispatch,
-  doorbellDispatch: RUN_DOORBELL_DISPATCH,
+  doorbellDispatch: beginDoorbellDispatch,
   admit: decideAdmission,
   requireWorkspaceBinding,
   async bindWorkspace(sessionId: string, userId: string): Promise<string | undefined> {
@@ -486,8 +487,16 @@ export async function dispatchPendingMessage(
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
 
-  if (pendingDispatchPorts.doorbellDispatch) {
-    return finishPendingDoorbell(input, task);
+  const doorbellToken = pendingDispatchPorts.doorbellDispatch();
+  if (doorbellToken) {
+    // The token is released when this dispatch stops being able to publish a
+    // doorbell, on every path out -- the publish resolving, the publish
+    // throwing and its compensation returning, or any early return between.
+    try {
+      return await finishPendingDoorbell(input, task);
+    } finally {
+      doorbellToken.release();
+    }
   }
 
   if (!task.user_env || typeof task.user_env !== "object" || !Object.keys(task.user_env).length) {

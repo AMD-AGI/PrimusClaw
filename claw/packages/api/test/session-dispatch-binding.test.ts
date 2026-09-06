@@ -29,6 +29,7 @@ import { db } from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { dispatchTaskToBrain, sessionDispatchPorts } from "../src/sessions/dispatch.js";
 import { isWorkspaceBindingError } from "../src/workspace/store.js";
+import { closedDoorbellBarrier, openDoorbellBarrier } from "./doorbell-barrier-stub.js";
 
 interface SeenQuery { sql: string; params: unknown[] }
 
@@ -185,7 +186,7 @@ function boundWorkspace() {
 test("D5 a doorbell hard refusal rolls the session back and does not open a row", async () => {
   const seen = stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
   const published: string[] = [];
   sessionDispatchPorts.publishTask = async () => { published.push("task"); };
@@ -214,7 +215,7 @@ test("D6 a doorbell soft queue returns a position and does not publish a wakeup"
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "queue", position: 3 });
   const published: string[] = [];
   sessionDispatchPorts.publishTask = async () => { published.push("task"); };
@@ -235,7 +236,7 @@ test("D7 a doorbell whose wakeup cannot be published closes the queued row", asy
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "admit" });
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
@@ -264,7 +265,7 @@ test("D7b a failed wakeup does not roll back a run claim-next already claimed", 
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "admit" });
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
@@ -286,7 +287,7 @@ test("D8 the default path does not roll back a run a worker already holds", asyn
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("publish timed out"); };
   sessionDispatchPorts.failChatRunDispatch = (async () => "held") as typeof sessionDispatchPorts.failChatRunDispatch;
@@ -303,7 +304,7 @@ test("D8 it still rolls back when the row really was closed", async () => {
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
   sessionDispatchPorts.failChatRunDispatch = (async () => "closed") as typeof sessionDispatchPorts.failChatRunDispatch;
@@ -324,7 +325,7 @@ test("D9 a compensation that could not run rolls back rather than guessing", asy
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("publish timed out"); };
   sessionDispatchPorts.failChatRunDispatch =

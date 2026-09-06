@@ -83,7 +83,11 @@ CREATE TABLE claw_session_events (
 CREATE TABLE claw_pending_messages (
   id          SERIAL PRIMARY KEY,
   session_id  TEXT NOT NULL,
+  user_id     TEXT,
   content     TEXT,
+  -- The durable identity of the run a drain of this row already opened, so a
+  -- retry finishes that handoff instead of creating a sibling.
+  dispatch_task_id TEXT,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -123,7 +127,11 @@ CREATE TABLE claw_tasks (
   queued_at            TIMESTAMPTZ,
   started_at           TIMESTAMPTZ,
   deadline_at          TIMESTAMPTZ,
-  completed_at         TIMESTAMPTZ
+  completed_at         TIMESTAMPTZ,
+  -- When reconciliation may take a dispatch whose outcome was never decided,
+  -- and the cleanup it is then owed.
+  dispatch_reconcile_at     TIMESTAMPTZ,
+  dispatch_reconcile_action TEXT
 );
 
 CREATE TABLE claw_conversation_turns (

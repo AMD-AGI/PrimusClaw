@@ -45,6 +45,8 @@ import {
   pendingDispatchPorts,
 } from "../src/tasks/pending-dispatch.js";
 import { doorbellDedupId, RUN_DOORBELL_KIND } from "@claw/protocol";
+import { openDoorbellBarrier } from "./doorbell-barrier-stub.js";
+
 import { randomBytes } from "node:crypto";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 
@@ -509,7 +511,7 @@ test("P9 a turn that cannot be serialised is a publish that certainly failed", a
 function enableDoorbellCrypto(): void {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
-  pendingDispatchPorts.doorbellDispatch = true;
+  pendingDispatchPorts.doorbellDispatch = openDoorbellBarrier;
 }
 
 test("P10 a doorbell replay publishes a wakeup, not the execute request", async () => {
@@ -540,7 +542,7 @@ test("P11 a queued doorbell replay does not publish, and still clears the pendin
 });
 
 test("P12 a hard admission refusal abandons the pending row", async () => {
-  pendingDispatchPorts.doorbellDispatch = true;
+  pendingDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
   const rec = harness();
   const result = await dispatchPendingMessage(input());
