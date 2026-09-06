@@ -97,6 +97,24 @@ test("live DAG sandboxes are the other half of the fleet", async () => {
     "which is exactly why enumerating session keys alone is not a census");
 });
 
+test("a DAG row that names nothing to reach or delete fails the read too", async () => {
+  // The session half fails closed on a corrupt or empty record; a DAG row is
+  // the same sandbox reached a different way, and a row with no endpoint is one
+  // this census can neither drain nor prove drained.
+  for (const broken of [
+    {} as HandleInfo,
+    { workload_id: "", hands_url: "http://sb/mcp" } as HandleInfo,
+    { workload_id: "", sandbox_name: "sb", namespace: "n" } as HandleInfo,
+  ]) {
+    const inventory = await collectSandboxInventory(deps({
+      dagHandles: async () => [["dag-1", { primary: broken }]],
+    }));
+    assert.equal(inventory.ok, false, JSON.stringify(broken));
+    assert.equal(inventory.unreadable, 1, JSON.stringify(broken));
+    assert.deepEqual(inventory.dag_handles, [], JSON.stringify(broken));
+  }
+});
+
 test("a handle source that cannot be read fails the whole answer", async () => {
   // Never a sessions-only inventory: a build whose census cannot see a DAG
   // sandbox at all must not look like a deployment that has none.

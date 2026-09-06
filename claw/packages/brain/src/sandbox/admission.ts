@@ -35,6 +35,23 @@ export function bindAdmission(kv: KV, capacity: CapacitySettings): void {
   roster = rosterDeps(kv, capacity).roster ?? null;
 }
 
+/**
+ * Give back the slot a target held, on any path that ends it.
+ *
+ * The provisioning hold covers only the window before a sandbox becomes a ping
+ * target; after that the slot is released here, from the same place the target
+ * stops being pinged. Without it a slot outlives its sandbox until the stale
+ * horizon, and ordinary teardown of a busy deployment refuses admission for
+ * sandboxes that no longer exist.
+ */
+export async function releaseAdmission(identity: string): Promise<void> {
+  if (!roster) return;
+  await releaseSlot(roster.store, roster.config, { identity })
+    .catch((err) => logger.warn(
+      { identity, err: (err as Error)?.message }, "admission.release_failed",
+    ));
+}
+
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
 export class SandboxCapacityRefused extends Error {}
 

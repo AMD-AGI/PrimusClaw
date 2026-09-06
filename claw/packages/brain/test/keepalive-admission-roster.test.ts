@@ -170,20 +170,49 @@ test("a replica killed between claim and bind holds its slot until the reclaim h
 });
 
 test("a bound slot is never released while a handle record still names its target", async () => {
+  // One clock throughout, which is what production has: an entry past the
+  // horizon but still named by a handle record has to survive every mutation
+  // that touches the roster, not only the one that happens to carry the set.
   const shared = sharedStore();
   const a = shared.store("replica-a");
   const b = shared.store("replica-b");
   const claim = await claimProvisionalSlot(a, CONFIG);
   assert.ok(claim.ok);
   await bindSlot(a, CONFIG, claim.token, "sandbox-live");
+  const wellPastHorizon = Date.now() + CONFIG.reclaimHorizonMs * 10;
 
-  await renewAndReap(
-    b, configFor("replica-b"), new Set(["sandbox-live"]), Date.now() + CONFIG.reclaimHorizonMs * 10,
-  );
+  await renewAndReap(b, configFor("replica-b"), new Set(["sandbox-live"]), wellPastHorizon);
+
   assert.equal(shared.peek()!.entries.length, 1,
     "releasing a slot for a target still being pinged is what carries the fleet "
       + "past the ceiling");
   assert.equal(shared.peek()!.entries[0].claimedBy, "replica-b", "it is adopted and renewed");
+});
+
+test("an expired but still-named entry survives an ordinary claim on the same clock", async () => {
+  // Reaping used to happen inside every mutation with no set of named
+  // identities to consult, so a claim arriving first deleted the entry the
+  // sweep moments later would have adopted -- on one clock, in production,
+  // not only under a test's synthetic one.
+  const shared = sharedStore();
+  const a = shared.store("replica-a");
+  const claim = await claimProvisionalSlot(a, CONFIG);
+  assert.ok(claim.ok);
+  await bindSlot(a, CONFIG, claim.token, "sandbox-live");
+
+  // Age it past the horizon by rewriting the renewal stamp in place.
+  const aged = shared.peek()!;
+  aged.entries[0].renewedAtMs = Date.now() - CONFIG.reclaimHorizonMs * 2;
+  await a.write(aged, 1);
+
+  const next = await claimProvisionalSlot(a, configFor("replica-a"));
+  assert.ok(next.ok);
+  assert.ok(shared.peek()!.entries.some((e) => e.identity === "sandbox-live"),
+    "a claim must not reap; only the sweep does, and only with the named set");
+
+  await renewAndReap(a, configFor("replica-a"), new Set(["sandbox-live"]), Date.now());
+  assert.ok(shared.peek()!.entries.some((e) => e.identity === "sandbox-live"),
+    "and the sweep adopts it rather than releasing it");
 });
 
 test("a sweeper mid-tick takes on remote registrations past the reserve boundary", async () => {

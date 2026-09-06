@@ -168,7 +168,14 @@ app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, 
     return reply.status(400).send({ error: "owner_required" });
   }
 
-  return { running: runningShellCount(owner) };
+  const running = runningShellCount(owner);
+  if (running === null) {
+    // The durable state this process files could not be read, so how much work
+    // is live is unknown. Answering zero here is what marks a sandbox full of
+    // orphaned work idle; the caller's own unanswered-probe path keeps it.
+    return reply.status(503).send({ error: "shell_liveness_indeterminate" });
+  }
+  return { running };
 });
 
 /**

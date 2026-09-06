@@ -61,6 +61,16 @@ test("the rollback runs at the empty-fleet boundary", () => {
     "the inventory guard must not be a jq -e over the session array");
 });
 
+test("the metrics read covers every replica, not whichever the service picked", () => {
+  // The counter is process-local and BRAIN is the Service, so a baseline read
+  // and a soak read can land on different replicas and compare two different
+  // populations.
+  assert.match(GUIDE, /brain_pods\(\) \{/);
+  assert.match(GUIDE, /for ip in \$\(brain_pods\)/);
+  assert.ok(!/curl[^\n]*"\$BRAIN\/metrics"/.test(GUIDE),
+    "no metrics read may go through the load-balanced Service");
+});
+
 test("the foreground-ceiling stop condition reads a foreground-timeout signal", () => {
   // A killed-run count is not one: a clamped command is answered as a tool
   // result and its run completes normally, so the affected runs are
@@ -74,10 +84,11 @@ test("the absolute-lifetime gate cannot pass on idle reclamation", () => {
   // the CR was live before the deadline, and its deletion is accepted only at
   // or after it.
   assert.match(GUIDE, /activity dispatch failed; the session is no longer held busy/);
-  assert.match(GUIDE, /the session is not being held busy/);
   assert.match(GUIDE, /DEADLINE_EPOCH=\$\(date -d "\$DEADLINE" \+%s\)/);
   assert.match(GUIDE, /SEEN_LIVE=true/, "the live observation is recorded, not inferred");
   assert.match(GUIDE, /deadline_verdict "\$state" "\$SEEN_LIVE"/);
+  assert.match(GUIDE, /settle_verdict "\$\(settle "\$tid"\)"/,
+    "a refresh that merely reached a terminal state is not a refresh that worked");
   assert.ok(!/dispatch 'Run: echo alive' >\/dev\/null \|\| true/.test(GUIDE),
     "a loop that discards its own failed dispatches proves nothing about the cap");
 });

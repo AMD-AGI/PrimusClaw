@@ -433,8 +433,15 @@ export async function shutdownAllShells(graceMs = 2000): Promise<number> {
  * Only live work counts. A shell that has ended is one nobody is waiting on,
  * and counting it would hold a sandbox open for a process that finished hours
  * ago.
+ *
+ * Null where this process files records and cannot read them. That is not zero
+ * and must not be rounded to it: after a restart the in-memory view is empty
+ * for reasons that say nothing about the sandbox, so answering with it would
+ * file a sandbox full of orphaned work idle. The caller turns null into the
+ * probe's own unanswered case, which keeps the sandbox and gives up only after
+ * a run of them.
  */
-export function runningShellCount(owner: string): number {
+export function runningShellCount(owner: string): number | null {
   if (!owner) return 0;
   const inMemory = [...shells.values()].filter(
     (e) => e.owner === owner && e.shell.status === "running",
@@ -445,9 +452,7 @@ export function runningShellCount(owner: string): number {
     const entry = shells.get(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id));
     return entry?.shell.status === "running";
   });
-  // An unreadable subtree is not a count of zero, and answering zero here is
-  // what files the sandbox idle. The in-memory view is what is left to go on.
-  if (!liveness.determinate) return inMemory;
+  if (!liveness.determinate) return inMemory > 0 ? inMemory : null;
   return Math.max(inMemory, liveness.active);
 }
 

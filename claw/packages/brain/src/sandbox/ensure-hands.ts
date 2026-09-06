@@ -896,11 +896,31 @@ async function provisionHands(
   // assigns a workloadId (provider onProvisioned hook), before poll / bootstrap
   // / health. Rollback (stop) if the KV write fails so we never leak a workload.
   // Owned here so SafeWorkloadProvider stays KV-free.
+  /** Stop a workload this function created but could not finish tracking. */
+  const rollbackWorkload = async (workloadId: string): Promise<void> => {
+    await getSafeWorkloadProvider().stop({
+      provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+      namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
+    }).catch(() => {});
+  };
+
   const onProvisioned = async (workloadId: string): Promise<void> => {
     // The earliest moment this sandbox has an identity, and therefore where the
     // reservation stops naming a token and starts naming a target -- ahead of
     // the durable record below, of bootstrap, and of local registration.
-    await hold.bind(pingTargetIdentity(sessionId, { provider: "safe-workload", workloadId }));
+    //
+    // The workload already exists by the time this runs, so a bind that cannot
+    // commit has to take it with it: the outer rollback only ever sees the
+    // create call rejecting and has no handle to stop, which would leave a
+    // running workload holding no slot and named by no record -- the untracked
+    // target the ceiling exists to prevent.
+    try {
+      await hold.bind(pingTargetIdentity(sessionId, { provider: "safe-workload", workloadId }));
+    } catch (bindErr) {
+      logger.error({ sessionId, workloadId }, "hands.admission.bind_failed_rollback");
+      await rollbackWorkload(workloadId);
+      throw bindErr;
+    }
     const pendingPayload = sc.encode(JSON.stringify({
       status: "pending", workloadId, sandboxImage,
       platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
@@ -916,10 +936,7 @@ async function provisionHands(
     }
     if (!ok) {
       logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-      await getSafeWorkloadProvider().stop({
-        provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-        namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-      }).catch(() => {});
+      await rollbackWorkload(workloadId);
       throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
     }
     logger.info({ sessionId, workloadId }, "hands.kv.pending");

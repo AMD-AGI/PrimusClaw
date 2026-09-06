@@ -117,18 +117,36 @@ test("a destination already occupied is reported, never overwritten", async () =
     "two sessions cannot both own one binding");
 });
 
+test("a migration that crashed between the copy and the delete resumes", async () => {
+  // Both keys exist and the destination holds this move's own bytes. Calling
+  // that a conflict makes the next startup refuse to boot on its own unfinished
+  // work, with no way forward but a manual edit.
+  const colliding = `${RETAINED_PREFIX}HALFWAY`;
+  const store = memoryStore({
+    [`hands.${colliding}`]: session(colliding),
+    [handsSessionKey(colliding)]: session(colliding),
+  });
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.resumed, [`hands.${colliding}`]);
+  assert.deepEqual(result.conflicted, [], "not a conflict, and not a refusal to start");
+  assert.equal(store.map.has(`hands.${colliding}`), false, "the delete is finished");
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value, session(colliding));
+});
+
 test("a destination another replica just wrote is never overwritten", async () => {
   // A rolling upgrade runs this scan on several replicas at once against one
   // bucket. Create-not-put is what makes the second one a no-op instead of a
   // write over the first one's copy.
   const colliding = `${RETAINED_PREFIX}RACE`;
   const store = memoryStore({ [`hands.${colliding}`]: session(colliding) });
-  const other = memoryStore({ [handsSessionKey(colliding)]: session("already-copied") });
-  store.map.set(handsSessionKey(colliding), other.map.get(handsSessionKey(colliding))!);
+  store.map.set(handsSessionKey(colliding), { value: session("already-copied"), revision: 1 });
 
   const result = await migrateReservedSessionKeys(store);
 
-  assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
+  assert.deepEqual(result.conflicted, [`hands.${colliding}`],
+    "different content is a different session, and overwriting it loses a live binding");
   assert.equal(store.map.get(handsSessionKey(colliding))!.value, session("already-copied"));
 });
 

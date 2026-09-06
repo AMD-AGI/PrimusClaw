@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A key-value-safe, injective encoding for the parts of a background-shell
- * address.
+ * A key-value-safe, injective encoding for the parts of an address.
  *
  * The record subtree's own encoding escapes with `~`, which the key-value
  * client refuses in a key, so an address carrying any byte it escapes would be
@@ -20,7 +19,7 @@ const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 /** Unpadded base32 of a part's UTF-8 bytes. */
 export function encodeKeyPart(part: string): string {
-  const bytes = Buffer.from(part, "utf8");
+  const bytes = new TextEncoder().encode(part);
   let bits = 0;
   let value = 0;
   let out = "";
@@ -50,5 +49,5 @@ export function decodeKeyPart(encoded: string): string {
       bits -= 8;
     }
   }
-  return Buffer.from(bytes).toString("utf8");
+  return new TextDecoder().decode(new Uint8Array(bytes));
 }

@@ -19,7 +19,7 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { HandsClient } from "../src/clients/hands.js";
-import { decodeKeyPart } from "../src/sandbox/bg-key.js";
+import { decodeKeyPart } from "@claw/protocol";
 import { bindShellRecordsCapabilityForTest } from "../src/clients/hands.js";
 import { bindBgHandleRowsForTest } from "../src/sandbox/bg-row-store.js";
 
@@ -81,6 +81,31 @@ test("against a pre-scheme sandbox, two runs cannot name one shell", async () =>
   const [runPart, idPart] = String(mine.sent[0].shell_id).split(".");
   assert.equal(decodeKeyPart(runPart), "ktsk_1");
   assert.equal(decodeKeyPart(idPart), "server", "and the public id is carried whole, never truncated");
+});
+
+test("a start with no id of its own is still addressable afterwards", async () => {
+  // The common start: the caller names nothing and the sandbox mints an id. Left
+  // that way against an owner-keyed registry, the id that comes back is one
+  // Brain never qualified, and every later poll or kill qualifies it into
+  // something that sandbox never stored. Brain fixes the id before the dispatch
+  // instead, so the value it addresses with is the value that was stored.
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(false);
+
+  const { hands, sent } = clientFor("ktsk_1");
+  const started = await hands.callTool("bash", { command: "train", run_in_background: true });
+
+  const publicId = /background shell (\S+?)\./.exec(started)![1];
+  assert.match(publicId, /^bg-[0-9a-f]{8}$/, "in the sandbox's own format");
+  const onTheWire = String(sent[0].shell_id);
+  assert.notEqual(onTheWire, publicId, "qualified going out");
+
+  await hands.callTool("bash_output", { shell_id: publicId });
+  assert.equal(String(sent[1].shell_id), onTheWire,
+    "and a later read resolves to exactly the id the sandbox stored");
+
+  await hands.callTool("kill_shell", { shell_id: publicId });
+  assert.equal(String(sent[2].shell_id), onTheWire);
 });
 
 test("the model is never shown the wire form, so it can poll with what it sent", async () => {

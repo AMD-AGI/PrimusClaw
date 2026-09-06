@@ -196,9 +196,42 @@ test("a start under a replaced sandbox is answered from the row, not dispatched"
   assert.match(text, /lost/);
 });
 
-test("a start naming no id has nothing to key a row by and is dispatched as before", async () => {
+test("a start naming no id is protected too, which is the common start", async () => {
+  // The caller names nothing and the id is fixed here, before the dispatch, so
+  // the row exists to key the crash window by. Left to the sandbox to mint,
+  // this path had no protection at all -- and it is the one every ordinary
+  // background start takes.
+  const first = pod({ dieOnHandoff: true });
+  await assert.rejects(() => first.hands.callTool("bash", { command: "train.sh", run_in_background: true }));
+
+  const rows = await bgRowStore()!.keys("bgshell.*.*.*");
+  assert.equal(rows.length, 1, "a row was keyed before anything was sent");
+  const row = JSON.parse((await bgRowStore()!.read(rows[0]))!.value) as { state: string; shellId: string };
+  assert.equal(row.state, "dispatched");
+  assert.match(row.shellId, /^bg-[0-9a-f]{8}$/);
+});
+
+test("a script-mode start gets the same protection as an agent one", async () => {
+  // The script route used to carry the id rewriting and none of the resolution,
+  // so a replayed step could run a command the same crash already ran.
+  await assert.rejects(() => pod({ dieOnHandoff: true }).hands.callToolFull("bash", START));
+  assert.equal(await rowState(), "dispatched");
+
+  recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  const resumed = pod();
+  const result = await resumed.hands.callToolFull("bash", START);
+
+  assert.equal(resumed.sent.length, 0, "nothing goes out");
+  assert.equal(result.isError, true,
+    "and a script step reading this as ordinary output would carry on as though "
+      + "the command had run");
+  assert.match(result.text, /nothing was run a second time/);
+});
+
+test("a script-mode start that is a genuine first call goes out and is confirmed", async () => {
   const { hands, sent } = pod();
-  await hands.callTool("bash", { command: "train.sh", run_in_background: true });
+  const result = await hands.callToolFull("bash", START);
   assert.equal(sent.length, 1);
-  assert.deepEqual(probed, [], "and asks the sandbox nothing");
+  assert.equal(result.isError, false);
+  assert.equal(await rowState(), "spawn_confirmed");
 });

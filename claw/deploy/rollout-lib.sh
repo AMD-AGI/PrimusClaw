@@ -84,6 +84,28 @@ inventory_rows() {
 # The Hands base url for a recorded MCP url. `<HANDS_URL>/health` is not one.
 hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
 
+# Whether one dispatched activity task actually did its job.
+#
+# `completed` only. A terminal state is not a successful one: a run that failed
+# or was cancelled left the session idle, and an idle session is reclaimed by a
+# path that has nothing to do with the absolute cap -- so a gate that accepts any
+# terminal state as a refresh proves the wrong thing about the CR that then
+# disappears.
+settle_verdict() {
+  local status
+  status=$(printf '%s' "$1" | jq -r '.status // "MISSING"' 2>/dev/null) || {
+    echo "FAIL: activity result unparseable" >&2; return "$ROLLOUT_FAIL"; }
+  case "$status" in
+    completed) return "$ROLLOUT_PASS" ;;
+    NOT_TERMINAL|MISSING)
+      echo "FAIL: activity task never reached terminal ($status); the session is not being held busy" >&2
+      return "$ROLLOUT_FAIL" ;;
+    *)
+      echo "FAIL: activity task ended $status; a failed refresh leaves the session idle, and an idle session is reclaimed by the wrong path" >&2
+      return "$ROLLOUT_FAIL" ;;
+  esac
+}
+
 # Whether a sandbox's absolute lifetime was enforced, or something else took it.
 #
 # Three facts, and dropping any one lets idle reclamation pass as the absolute

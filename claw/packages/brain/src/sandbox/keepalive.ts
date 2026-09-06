@@ -15,6 +15,7 @@ import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
+import { releaseAdmission } from "./admission.js";
 import pino from "pino";
 import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 
@@ -227,6 +228,10 @@ export function unregisterSandbox(sessionId: string, known?: SandboxEntry): void
   for (const key of keys) {
     had = localRegistry.delete(key) || had;
     failCounts.delete(key);
+    // The slot goes with the target. Held past this, it counts against the
+    // ceiling for a sandbox that no longer exists, and an ordinary teardown
+    // becomes a capacity refusal for the next request.
+    void releaseAdmission(key);
   }
   if (had) {
     logger.info({ sessionId }, "keepalive.unregistered");
@@ -944,6 +949,7 @@ async function handleKeepaliveFailures(
       );
       failCounts.delete(targetKey);
       localRegistry.delete(targetKey);
+      await releaseAdmission(targetKey);
       logger.error(
         { sessionId, workloadId: entry.workloadId, fails },
         "keepalive.sandbox_evicted",

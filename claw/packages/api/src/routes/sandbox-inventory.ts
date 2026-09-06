@@ -96,17 +96,38 @@ function rowFromEntry(sessionId: string, info: Record<string, unknown>, healthy:
   };
 }
 
-function dagRows(all: Array<[string, Record<string, HandleInfo>]>): DagHandleRow[] {
-  return all.flatMap(([dagRootTaskId, handles]) =>
-    Object.entries(handles).map(([handle, info]) => ({
-      dag_root_task_id: dagRootTaskId,
-      handle,
-      sandbox_name: info.sandbox_name || "",
-      namespace: info.namespace || "",
-      hands_url: info.hands_url || "",
-      workload_id: info.workload_id || "",
-      provider: info.provider || "",
-    })));
+/**
+ * The DAG half of the fleet, and the rows of it that cannot be used.
+ *
+ * Held to the same standard as the session half: a handle carrying no endpoint
+ * and nothing to delete by is a sandbox this census can neither drain nor prove
+ * drained, whether it failed to parse or merely came back empty.
+ */
+function dagRows(
+  all: Array<[string, Record<string, HandleInfo>]>,
+): { rows: DagHandleRow[]; unreadable: number } {
+  const rows: DagHandleRow[] = [];
+  let unreadable = 0;
+  for (const [dagRootTaskId, handles] of all) {
+    for (const [handle, info] of Object.entries(handles ?? {})) {
+      if (!info || typeof info !== "object" || !isUsable({
+        handsUrl: info.hands_url, sandboxName: info.sandbox_name, workloadId: info.workload_id,
+      })) {
+        unreadable += 1;
+        continue;
+      }
+      rows.push({
+        dag_root_task_id: dagRootTaskId,
+        handle,
+        sandbox_name: info.sandbox_name || "",
+        namespace: info.namespace || "",
+        hands_url: info.hands_url || "",
+        workload_id: info.workload_id || "",
+        provider: info.provider || "",
+      });
+    }
+  }
+  return { rows, unreadable };
 }
 
 /**
@@ -155,7 +176,9 @@ export async function collectSandboxInventory(deps: InventoryDeps): Promise<Sand
     ));
   }
 
-  const dag_handles = dagRows(await deps.dagHandles());
+  const dag = dagRows(await deps.dagHandles());
+  unreadable += dag.unreadable;
+  const dag_handles = dag.rows;
   return {
     ok: unreadable === 0,
     count: sessions.length + dag_handles.length,

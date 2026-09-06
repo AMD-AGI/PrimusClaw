@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import {
   advanceRow, deleteRunRows, readRow, rowKey, runRowFilter, type BgRowStore,
 } from "../src/sandbox/bg-handle-rows.js";
-import { decodeKeyPart, encodeKeyPart } from "../src/sandbox/bg-key.js";
+import { decodeKeyPart, encodeKeyPart } from "@claw/protocol";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
 function memoryStore(): BgRowStore & {

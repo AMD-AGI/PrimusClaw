@@ -70,8 +70,11 @@ export async function migrateReservedKeys(kv: KV): Promise<void> {
     },
   });
 
-  if (result.migrated.length) {
-    logger.warn({ migrated: result.migrated }, "hands.reserved_key_migration");
+  if (result.migrated.length || result.resumed.length) {
+    logger.warn(
+      { migrated: result.migrated, resumed: result.resumed },
+      "hands.reserved_key_migration",
+    );
   }
   // A collision left standing is a live session's binding a retention can take,
   // and the retention is what protects work the sandbox is holding. Refusing to

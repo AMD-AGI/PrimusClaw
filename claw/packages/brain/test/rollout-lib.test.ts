@@ -120,6 +120,49 @@ test("hands_base strips the MCP suffix the census reports", () => {
   }
 });
 
+test("only a completed activity refresh counts as one", () => {
+  // Terminal is not successful. A run that failed or was cancelled left the
+  // session idle, and an idle session is reclaimed by a path that has nothing
+  // to do with the absolute cap -- so accepting any terminal state proves the
+  // wrong thing about the CR that then disappears.
+  assert.equal(callLib(`settle_verdict '{"status":"completed"}'`).code, 0);
+
+  for (const status of ["failed", "cancelled", "NOT_TERMINAL"]) {
+    const result = callLib(`settle_verdict '{"status":"${status}"}'`);
+    assert.equal(result.code, 1, status);
+    assert.match(result.err, /activity task/, status);
+  }
+  assert.equal(callLib(`settle_verdict 'not json'`).code, 1, "and an unreadable result is a failure");
+  assert.equal(callLib(`settle_verdict '{}'`).code, 1, "as is one carrying no status at all");
+});
+
+test("G7-d2 does not pass on a failed activity refresh", () => {
+  // The gate as written: dispatch, settle, judge. A failed refresh has to stop
+  // it before the CR is ever looked at.
+  const gate = `
+    dispatch() { echo "task-1"; }
+    settle() { echo '{"status":"failed","out":"boom"}'; }
+    tid=$(dispatch 'Run: echo alive') || exit 1
+    settle_verdict "$(settle "$tid")" || exit 1
+    echo REACHED_THE_CR_CHECK`;
+  const result = callLib(gate);
+
+  assert.equal(result.code, 1);
+  assert.doesNotMatch(result.out, /REACHED_THE_CR_CHECK/,
+    "the gate stops at the refresh, not at whatever the CR happens to be doing");
+  assert.match(result.err, /ended failed/);
+});
+
+test("G7-d2 proceeds past a genuinely completed refresh", () => {
+  const gate = `
+    dispatch() { echo "task-1"; }
+    settle() { echo '{"status":"completed"}'; }
+    tid=$(dispatch 'Run: echo alive') || exit 1
+    settle_verdict "$(settle "$tid")" || exit 1
+    deadline_verdict gone true 1200 1000`;
+  assert.equal(callLib(gate).code, 0);
+});
+
 test("the absolute-lifetime verdict cannot be reached without a live observation", () => {
   // A first look that finds the CR already gone proves only that it is gone
   // now. Without the prior live observation the whole gate passes trivially on

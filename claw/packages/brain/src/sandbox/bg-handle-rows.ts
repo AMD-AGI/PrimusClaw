@@ -22,7 +22,7 @@
  * is removed when its run ends, never because time passed.
  */
 
-import { encodeKeyPart } from "./bg-key.js";
+import { encodeKeyPart } from "@claw/protocol";
 
 export type BgRowState = "issued" | "dispatched" | "spawn_confirmed";
 

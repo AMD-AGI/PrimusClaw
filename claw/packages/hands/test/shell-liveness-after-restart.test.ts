@@ -25,15 +25,20 @@ import { join } from "node:path";
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "claw-liveness-"));
+process.env.AUTH_CLAW_TOKEN = "test-internal-token";
+if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 const records = await import("../src/runtime/shell-records.js");
 const { ownerLiveness } = await import("../src/runtime/shell-liveness.js");
+const { runningShellCount } = await import("../src/tools/shell/bg-manager.js");
+const { app } = await import("../src/index.js");
 
 const OWNER = "sess-restart";
 const RUN = "ktsk_1";
 const survivors: ChildProcess[] = [];
 
-after(() => {
+after(async () => {
   for (const child of survivors) child.kill("SIGKILL");
+  await app.close();
   rmSync(process.env.HANDS_STATE_DIR!, { recursive: true, force: true });
 });
 
@@ -118,13 +123,51 @@ test("a claim with no process yet still blocks reclamation after a restart", () 
   assert.equal(after.classes.spawn_indeterminate, 1);
 });
 
-test("an unreadable subtree is reported as such, never as an empty one", () => {
-  spawnRecorded("trainer2");
+test("the count Brain actually reads keeps a restarted sandbox's work", async () => {
+  // The predicate is only half of it: what decides whether the pod survives is
+  // the number the route answers with. A registry emptied by the restart must
+  // not be what that number comes from.
+  const child = spawnRecorded("trainer-route");
+  restartHands();
+
+  assert.equal(runningShellCount(OWNER), 1,
+    "the in-memory map is empty after a restart and would have answered zero");
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/internal/shells/active",
+    headers: { authorization: "Bearer test-internal-token" },
+    payload: { owner: OWNER },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { running: 1 });
+
+  child.kill("SIGKILL");
+});
+
+test("an unreadable subtree answers unknown, never zero", async () => {
+  // Falling back to the in-memory count is the same unsafe zero by another
+  // route: after a restart that count is empty for reasons that say nothing
+  // about the sandbox. The route reports that it cannot tell, and the sweep's
+  // own unanswered-probe path keeps the sandbox.
+  const child = spawnRecorded("trainer2");
+  restartHands();
   rmSync(process.env.HANDS_STATE_DIR!, { recursive: true, force: true });
 
-  const after = ownerLiveness(OWNER, emptyRegistry);
-  assert.equal(after.determinate, false,
-    "the caller falls back to what it does know rather than filing the sandbox idle");
+  assert.equal(ownerLiveness(OWNER, emptyRegistry).determinate, false);
+  assert.equal(runningShellCount(OWNER), null, "not zero, and not a guess");
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/internal/shells/active",
+    headers: { authorization: "Bearer test-internal-token" },
+    payload: { owner: OWNER },
+  });
+  assert.equal(res.statusCode, 503,
+    "a status the caller turns into its own unanswered-probe case, which keeps "
+      + "the sandbox rather than filing it idle");
+
+  child.kill("SIGKILL");
 });
 
 test("another owner's surviving work does not hold this owner's sandbox", () => {

@@ -110,7 +110,7 @@ async function mutate<T>(
     if (current && roster.ceiling !== config.ceiling) {
       throw new CeilingDisagreement(roster.ceiling, config.ceiling);
     }
-    const outcome = decide(reap(roster, config, Date.now()), Date.now());
+    const outcome = decide(roster, Date.now());
     if (!("write" in outcome)) return outcome.result;
     if (await store.write(outcome.write, current?.revision ?? null)) return outcome.result;
   }
@@ -122,10 +122,14 @@ async function mutate<T>(
  *
  * A bound entry is released only where no handle record names its identity --
  * releasing a slot for a target still being pinged is exactly what carries the
- * fleet past the ceiling -- so the caller supplies that set. A provisional entry
- * names no identity and carries no such guard.
+ * fleet past the ceiling -- so the caller supplies that set, and there is no
+ * default for it. Reaping used to happen inside every mutation with an empty
+ * set, which meant an ordinary claim could delete a stale-but-still-named entry
+ * moments before the sweep that would have adopted it. Only the sweep reaps,
+ * and only with the set in hand. A provisional entry names no identity and
+ * carries no such guard.
  */
-function reap(roster: Roster, config: RosterConfig, now: number, named: Set<string> = new Set()): Roster {
+function reap(roster: Roster, config: RosterConfig, now: number, named: Set<string>): Roster {
   const alive = roster.entries.filter((entry) => {
     if (now - entry.renewedAtMs <= config.reclaimHorizonMs) return true;
     return entry.identity !== null && named.has(entry.identity);
@@ -258,6 +262,8 @@ export async function renewAndReap(
   store: RosterStore, config: RosterConfig, named: Set<string>, now = Date.now(),
 ): Promise<number> {
   return mutate<number>(store, config, (roster) => {
+    // The one place reaping happens, and the only one that holds the set of
+    // identities a handle record still names.
     const kept = reap(roster, config, now, named);
     const entries = kept.entries.map((entry) =>
       (entry.claimedBy === config.replicaId || (entry.identity && named.has(entry.identity))

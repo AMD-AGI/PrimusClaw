@@ -10,6 +10,7 @@ import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
 import { collectSandboxInventory } from "./sandbox-inventory.js";
+import { sessionIdFromHandsKey } from "@claw/protocol";
 import { listDagHandles } from "../infra/dag-handles.js";
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
@@ -64,7 +65,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             return false;
           }
         },
-        sessionIdFromKey: (key) => key.slice("hands.".length),
+        // Decoded, not sliced: a re-keyed session would otherwise be reported
+        // under the encoded form, which names nothing an operator can act on.
+        sessionIdFromKey: sessionIdFromHandsKey,
       });
       return { ...inventory, config: { SAFE_API_URL: SAFE_API_URL || "(not set)" } };
     } catch (e: any) {

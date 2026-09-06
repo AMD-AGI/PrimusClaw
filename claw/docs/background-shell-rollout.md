@@ -34,14 +34,24 @@ right answer lives in `claw/deploy/rollout-lib.sh` and is exercised by
 . claw/deploy/rollout-lib.sh
 ```
 
-It provides `chart_dir`, `inventory_judge`, `inventory_rows`, `hands_base` and
-`deadline_verdict`, each returning `0` pass, `1` fail, `3` abort. **Return 3 is
+It provides `chart_dir`, `inventory_judge`, `inventory_rows`, `hands_base`,
+`settle_verdict` and `deadline_verdict`, each returning `0` pass, `1` fail,
+`3` abort. **Return 3 is
 `ABORT` at every call site**: nothing could be read, which is never the same as
 a clean reading.
 
 **Brain.** `BRAIN=http://primus-claw-brain.<NS>.svc.cluster.local:8100`. Name and
 port are chart-fixed, so only the namespace is a placeholder, and it is reachable
-from inside the cluster.
+from inside the cluster. **This is the Service, so it answers from whichever
+replica it picked** — fine for `/health`, which every replica answers
+identically once a rollout has settled, and wrong for `/metrics`, which is a
+per-process counter. Every metrics read below goes to every pod by name and
+sums, never to the Service:
+
+```sh
+brain_pods() { kubectl get pods -n "$NS" -l app=primus-claw,component=primus-claw-brain \
+    -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | rg -v '^$'; }
+```
 
 **The chart the deployment renders.** `chart_dir claw/deploy/values.<NS>.env`
 resolves the directory `render_chart` uses: `CLAW_CHART_DIR` is a supported
@@ -96,8 +106,8 @@ cr() { local out; out=$(kubectl get sandbox -n "$SBNS" "$SBNAME" --ignore-not-fo
 dispatch() { curl -sf -X POST "https://$API_HOST/v1/sessions/$SESSION_ID/tasks" -H "$USER" \
     -H 'content-type: application/json' -d "$(jq -n --arg p "$1" '{prompt:$p}')" \
   | jq -er 'select(.ok == true) | .task_id // empty'; }
-# Poll one task to terminal, printing the fields judged below; non-zero if it
-# never got there.
+# Poll one task to terminal, printing the fields `settle_verdict` judges.
+# Reaching terminal is not succeeding: `settle_verdict` is what says which.
 settle() { local i b; for i in $(seq 1 "$N_POLL"); do
     b=$(curl -sf --max-time "$T_CURL" -H "$USER" "https://$API_HOST/v1/tasks/$1") || { sleep "$I_POLL"; continue; }
     printf '%s' "$b" | jq -e '.item.status | test("^(completed|failed|cancelled)$")' >/dev/null \
@@ -246,7 +256,7 @@ for i in $(seq 1 "$N_FLEET"); do
   # absolute cap -- so a loop that ignores its own failures proves the wrong
   # thing about the CR that then disappears.
   tid=$(dispatch 'Run: echo alive') || { echo 'FAIL: activity dispatch failed; the session is no longer held busy'; exit 1; }
-  settle "$tid" >/dev/null || { echo 'FAIL: activity task never reached terminal; the session is not being held busy'; exit 1; }
+  settle_verdict "$(settle "$tid")" || exit 1
 
   state=$(cr); rc=$?; [ "$rc" = 2 ] && { echo 'ABORT: kubectl could not answer'; exit 1; }
   now=$(date +%s)
@@ -291,10 +301,24 @@ command that asked past the ceiling and met it — the regression a tightened
 ceiling produces — from one that simply ran out of its own timeout.
 
 ```sh
-timeouts() { curl -sf --max-time "$T_CURL" "$BRAIN/metrics" \
-    | rg '^claw_bash_foreground_timeout_total\{[^}]*clamped="true"' \
-    | rg -o '[0-9.]+$' || { echo 'ABORT: no reading'; return 1; }; }
+# Summed over every replica, by pod IP. The counter is process-local, so a
+# baseline read that landed on one replica and a soak read that landed on
+# another are two different populations -- and the fleet's own rollout,
+# rescheduling or scale-out silently moves work between them.
+timeouts() { local ip v total=0 seen=0
+  for ip in $(brain_pods); do
+    v=$(curl -sf --max-time "$T_CURL" "http://$ip:8100/metrics" \
+        | rg '^claw_bash_foreground_timeout_total\{[^}]*clamped="true"' \
+        | rg -o '[0-9.]+$') || { echo 'ABORT: a replica did not answer; a partial sum is not a reading' >&2; return 1; }
+    total=$(( total + ${v%%.*} )); seen=$(( seen + 1 ))
+  done
+  [ "$seen" -gt 0 ] || { echo 'ABORT: no Brain replicas found' >&2; return 1; }
+  printf '%s\n' "$total"; }
 ```
+
+A replica that does not answer aborts the read rather than shrinking the sum:
+the counters are per-process, so a missing replica is missing timeouts, which
+reads as a quiet window.
 
 Both label series are initialised at Brain startup, so a window in which nothing
 timed out reads `0` rather than producing no line at all — an absent series and

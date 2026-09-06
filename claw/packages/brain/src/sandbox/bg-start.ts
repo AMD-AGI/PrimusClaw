@@ -16,7 +16,7 @@
  * deletes a record while its sandbox lives.
  */
 
-import { encodeKeyPart } from "./bg-key.js";
+import { encodeKeyPart } from "@claw/protocol";
 import type { BgHandleRow } from "./bg-handle-rows.js";
 
 /** What a read of the sandbox's own record subtree returned. */

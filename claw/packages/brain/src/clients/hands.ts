@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
@@ -490,17 +491,78 @@ export class HandsClient {
   }
 
   /**
-   * The address a background start is deduplicated under, or null where there
-   * is nothing to key one by.
+   * Fix the shell id of a background start before it is dispatched.
    *
-   * A start that names no id has no address before the sandbox answers, and a
-   * caller with no owner or run scope is out-of-band. Both are dispatched as
-   * they always were: there is no intent to deduplicate.
+   * The common start names no id and lets the sandbox mint one. That is the
+   * path with no protection at all: there is nothing to key a reference row by
+   * before the request goes out, so the crash window it closes stays open, and
+   * against a sandbox that partitions by owner alone the id that comes back is
+   * one Brain never qualified and can never address again. Minting here fixes
+   * both by making every start a named one -- the value is in the sandbox's own
+   * format and the model is told the same string either way.
+   */
+  private fixStartArgs(args: Record<string, unknown>): Record<string, unknown> {
+    if (typeof args.shell_id === "string" && args.shell_id) return args;
+    return { ...args, shell_id: `bg-${randomUUID().slice(0, 8)}` };
+  }
+
+  /**
+   * The address a background start is deduplicated under, or null for a caller
+   * with no scope of its own -- a probe or an out-of-band request, which has no
+   * run to key a row by and no intent to deduplicate.
    */
   private startAddress(args: Record<string, unknown>): BgHandleAddress | null {
     const shellId = args.shell_id;
     if (!this.owner || !this.run || typeof shellId !== "string" || !shellId) return null;
     return { ownerScope: this.owner, runIdentity: this.run, shellId };
+  }
+
+  /**
+   * One dispatch, whichever result shape the caller wants.
+   *
+   * Both entry points go through here so neither is a way round the other's
+   * protection: the script route used to carry the id rewriting and none of the
+   * start resolution, which left a script step replaying a command the same
+   * crash could run twice.
+   */
+  private async dispatch(
+    name: string, args: Record<string, unknown>, signal?: AbortSignal,
+  ): Promise<{ text: string; isError: boolean; structured?: unknown } | { refused: string }> {
+    await this.connect();
+    const isStart = name === "bash" && args.run_in_background === true;
+    const fixed = isStart ? this.fixStartArgs(args) : args;
+    const store = bgRowStore();
+    const address = isStart ? this.startAddress(fixed) : null;
+    if (address && store) {
+      const settled = await this.resolveBackgroundStart(address, store);
+      if (settled !== null) return { refused: settled };
+    }
+
+    const wired = await this.wireArgs(name, fixed);
+    const result = await this.client.callTool(
+      { name, arguments: wired },
+      undefined,
+      { timeout: callDeadlineMs(name, args), signal } as any,
+    );
+    countForegroundTimeout(result);
+    const isError = !!(result as { isError?: boolean }).isError;
+    const texts = (result.content as Array<{ type: string; text?: string }>)
+      ?.filter((c) => c.type === "text" && c.text)
+      .map((c) => c.text!)
+      .join("\n");
+    // Durable before the result reaches the caller, so a crash after the spawn
+    // cannot leave a shell nothing attests to.
+    if (address && store && !isError) {
+      await advanceRow(store, address, this.generation, "spawn_confirmed");
+    }
+    // The caller is told the id it sent, or the one minted for it -- never the
+    // wire form, which is Brain's business and an id nothing else can reproduce.
+    return {
+      text: restorePublicShellId(texts || "", wired.shell_id, fixed.shell_id),
+      isError,
+      structured: (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
+        ?? (result as { structured?: unknown }).structured,
+    };
   }
 
   /**
@@ -556,39 +618,8 @@ export class HandsClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<string> {
-    await this.connect();
-    const store = bgRowStore();
-    const address = name === "bash" && args.run_in_background === true
-      ? this.startAddress(args)
-      : null;
-    if (address && store) {
-      const settled = await this.resolveBackgroundStart(address, store);
-      if (settled !== null) return settled;
-    }
-    const wired = await this.wireArgs(name, args);
-    // The deadline follows what the tool said it needs; see callDeadlineMs.
-    // Without one an LLM-issued `bash {timeout: 330}` would block the Brain for
-    // up to an hour if Hands went away mid-command, which is the deadlock this
-    // fixed.
-    const result = await this.client.callTool(
-      { name, arguments: wired },
-      undefined,
-      { timeout: callDeadlineMs(name, args), signal } as any,
-    );
-    countForegroundTimeout(result);
-    const texts = (result.content as Array<{ type: string; text?: string }>)
-      ?.filter((c) => c.type === "text" && c.text)
-      .map((c) => c.text!)
-      .join("\n");
-    // Durable before the result reaches the model, so a crash after the spawn
-    // cannot leave a shell nothing attests to.
-    if (address && store && !(result as { isError?: boolean }).isError) {
-      await advanceRow(store, address, this.generation, "spawn_confirmed");
-    }
-    // The model is told the id it sent, never the qualified form: the wire
-    // shape is Brain's business, and an id the model cannot reproduce would be
-    // one it cannot poll with.
-    return restorePublicShellId(texts || "", wired.shell_id, args.shell_id);
+    const result = await this.dispatch(name, args, signal);
+    return "refused" in result ? result.refused : result.text;
   }
 
   /**
@@ -603,24 +634,12 @@ export class HandsClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<{ text: string; isError: boolean; structured?: unknown }> {
-    await this.connect();
-    const wired = await this.wireArgs(name, args);
-    const result = await this.client.callTool(
-      { name, arguments: wired },
-      undefined,
-      { timeout: callDeadlineMs(name, args), signal } as any,
-    );
-    countForegroundTimeout(result);
-    const texts = (result.content as Array<{ type: string; text?: string }>)
-      ?.filter((c) => c.type === "text" && c.text)
-      .map((c) => c.text!)
-      .join("\n");
-    return {
-      text: restorePublicShellId(texts || "", wired.shell_id, args.shell_id),
-      isError: !!(result as { isError?: boolean }).isError,
-      structured: (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
-        ?? (result as { structured?: unknown }).structured,
-    };
+    const result = await this.dispatch(name, args, signal);
+    // A refusal is a refusal on this route too: a script step that read it as
+    // ordinary output would carry on as though the command had run.
+    return "refused" in result
+      ? { text: result.refused, isError: true }
+      : result;
   }
 
   /**
