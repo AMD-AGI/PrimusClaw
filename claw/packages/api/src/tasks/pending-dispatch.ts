@@ -41,7 +41,9 @@ import { beginDoorbellDispatch } from "./doorbell-gate.js";
 import { db } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
-import { openChatRun, failChatRunDispatch, takeSessionGate } from "./chat-run.js";
+import {
+  failChatRunDispatch, openChatRun, recordDispatchSeq, recordPublishState, takeSessionGate,
+} from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
 import { handOffAssembledRun } from "./run-dispatch.js";
 import { injectLiveUserEnv } from "./run-claim.js";
@@ -164,8 +166,8 @@ export const pendingDispatchPorts = {
   async bindWorkspace(sessionId: string, userId: string): Promise<string | undefined> {
     return (await ensureSessionWorkspace(sessionId, userId))?.workspace_id;
   },
-  async publish(subject: string, payload: string, msgId: string): Promise<void> {
-    await js.publish(subject, sc.encode(payload), { msgID: msgId });
+  async publish(subject: string, payload: string, msgId: string): Promise<number> {
+    return (await js.publish(subject, sc.encode(payload), { msgID: msgId })).seq;
   },
   publishSessionEvent: publishEvent,
 };
@@ -538,7 +540,14 @@ export async function dispatchPendingMessage(
     // Published under the queued row's id, so a drain that reaches this line
     // twice puts one task on the stream rather than two.
     publishAttempted = true;
-    await pendingDispatchPorts.publish(subject, payload, doorbellDedupId(sessionId, input.messageId));
+    // Durable before the call it describes, for the reason the immediate path
+    // records it: the reverse order leaves a row denying a message that is
+    // already on the stream.
+    await recordPublishState(run.taskId, "attempted");
+    const seq = await pendingDispatchPorts.publish(
+      subject, payload, doorbellDedupId(sessionId, input.messageId),
+    );
+    await recordDispatchSeq(run.taskId, seq);
   } catch (err) {
     // `certain` says whether the run row was torn down, which is the difference
     // between "this turn has not started" and "this turn may be running
@@ -547,6 +556,7 @@ export async function dispatchPendingMessage(
     // never reached the stream, and leaving its row open would leave one nobody
     // closes.
     const certain = !publishAttempted || publishCertainlyFailed(err);
+    if (certain) await recordPublishState(run.taskId, "refused");
     logger.error(
       { err, sessionId, pendingId: input.pendingId, certain },
       "pending.publish_failed",

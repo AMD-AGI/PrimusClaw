@@ -41,7 +41,8 @@ import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
 } from "../workspace/store.js";
 import {
-  ACTIONABLE_RECEIPT_SQL, failChatRunDispatch, gateOwnershipEnforced, noDeliveryInFlightSql,
+  ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
+  noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 
@@ -82,6 +83,7 @@ const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
   drainPendingMessage: drainOldestPendingMessage,
+  deliverySettlement: taskDeliverySettlement,
 };
 
 let stopped = false;
@@ -898,12 +900,36 @@ async function releaseSessionsOfLostRuns(gates: LostRunGate[]): Promise<void> {
  * consumer or stream answers "not settled", which keeps a session gate shut
  * rather than handing it back under a delivery that may still execute.
  */
-async function deliveryObservations(): Promise<{ wholeStream: boolean }> {
-  const settlement = await taskDeliverySettlement();
-  // A row whose receipt says a publish was attempted but carries no sequence is
-  // covered only by the whole-stream form: any message for it was published
-  // before this read, so a floor past `last_seq` is past that message too.
-  return { wholeStream: settlement !== null && settlement.ackFloor >= settlement.lastSeq };
+async function deliveryObservations(): Promise<DeliveryObservations> {
+  const settlement = await sweeperPorts.deliverySettlement();
+  if (settlement === null) return { wholeStream: false, ackFloor: null };
+  // Two forms, because a row that recorded which message carries it can be
+  // answered on its own sequence, while one whose receipt says a publish was
+  // attempted but carries no sequence has only the whole-stream form: any
+  // message for it was published before this read, so a floor past `last_seq`
+  // is past that message too.
+  return {
+    wholeStream: settlement.ackFloor >= settlement.lastSeq,
+    ackFloor: settlement.ackFloor,
+  };
+}
+
+interface DeliveryObservations {
+  /** Every message published before this tick has been settled. */
+  wholeStream: boolean;
+  /** How far the durable has settled, or null when it could not be read. */
+  ackFloor: number | null;
+}
+
+/** Whether this row's own message is at or below the durable's ack floor. */
+function rowDeliverySettled(
+  observations: DeliveryObservations,
+  dispatchSeq: unknown,
+): boolean {
+  if (observations.wholeStream) return true;
+  if (observations.ackFloor === null) return false;
+  const seq = Number(dispatchSeq);
+  return Number.isFinite(seq) && seq > 0 && seq <= observations.ackFloor;
 }
 
 /**
@@ -935,10 +961,13 @@ export async function reapOrphanedFatRuns(limit = 200): Promise<number> {
         AND started_at IS NOT NULL
         AND started_at < NOW() - ($1::int * INTERVAL '1 second')
         AND NOT (${UNSUPPORTED_RECEIPT_SQL})
-        AND (${noDeliveryInFlightSql("$2", "$3")})
+        AND (${noDeliveryInFlightSql("$2", deliverySettledSql("$3", "$4"))})
       ORDER BY started_at, task_id
-      LIMIT $4`,
-    [BRAIN_TASK_TIMEOUT_SEC, RUN_FAT_PREPARING_RECONCILE, settled.wholeStream, limit],
+      LIMIT $5`,
+    [
+      BRAIN_TASK_TIMEOUT_SEC, RUN_FAT_PREPARING_RECONCILE,
+      settled.wholeStream, settled.ackFloor, limit,
+    ],
   );
   if (!r.rowCount) return 0;
   let closed = 0;
@@ -956,7 +985,7 @@ export async function reapOrphanedFatRuns(limit = 200): Promise<number> {
         statuses: SWEEPABLE_RUN_STATUSES,
         observedReceipt: row.metadata?.dispatch_compensation,
         fleetAsserted: RUN_FAT_PREPARING_RECONCILE,
-        deliverySettled: settled.wholeStream,
+        deliverySettled: rowDeliverySettled(settled, row.metadata?.dispatch_seq),
       },
     );
     if (verdict === "closed") closed += 1;
@@ -978,7 +1007,7 @@ export async function reapOrphanedFatRuns(limit = 200): Promise<number> {
  */
 export async function finalizeDispatchCompensations(limit = 200): Promise<number> {
   const r = await db.query(
-    `SELECT task_id, session_id, failure_reason, error_message, metadata,
+    `SELECT task_id, session_id, status, failure_reason, error_message, metadata,
             metadata->>'message_id' AS message_id
        FROM claw_tasks
       WHERE status IN ('completed','failed','cancelled')
@@ -1017,6 +1046,7 @@ export async function finalizeDispatchCompensations(limit = 200): Promise<number
 interface FinalizableRow {
   task_id: string;
   session_id: string;
+  status: string;
   failure_reason: string | null;
   error_message: string | null;
   message_id: string | null;
@@ -1051,8 +1081,9 @@ async function finalizeOneCompensation(row: FinalizableRow): Promise<boolean> {
   const adopting = parsed.kind === "absent" || parsed.record.state === "armed";
   if (adopting && !await adoptTerminalReceipt(row, parsed)) return false;
   // A completed run's result is evidence that work changed the workspace; a
-  // never-held failed or cancelled row changed nothing.
-  await releaseRunUse(row.task_id, false);
+  // never-held failed or cancelled row changed nothing, and marking it changed
+  // would bump the workspace version for a run that never wrote a byte.
+  await releaseRunUse(row.task_id, row.status === "completed");
   if (await stillOwesResources(row.task_id)) {
     logger.warn({ taskId: row.task_id }, "sweeper.compensation_cleanup_incomplete");
     return false;

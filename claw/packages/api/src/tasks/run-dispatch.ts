@@ -18,7 +18,9 @@ import {
   decideAdmission, envAdmitLimits, hardLimitAfterInsert, sessionTreeShape,
   withOwnedAdmissionLock, type AdmissionAsk,
 } from "./admission.js";
-import { openChatRun, discardChatRunDispatch, failChatRunDispatch } from "./chat-run.js";
+import {
+  clearDispatchReconcile, discardChatRunDispatch, failChatRunDispatch, openChatRun,
+} from "./chat-run.js";
 import { RUN_CREDENTIALS_FIELD, gpuNodesFromSpec, stripRunSecrets, wantsSandboxFromSpec } from "./run-spec.js";
 import { credentialsFromTask, sealRunCredentials } from "./run-secrets.js";
 
@@ -31,6 +33,7 @@ export type HandOffResult =
   | { kind: "dispatched"; taskId: string; messageId: string }
   | { kind: "queued"; taskId: string; messageId: string; queuePosition: number }
   | { kind: "rejected"; reason: string; taskId?: string }
+  | { kind: "publish_unknown"; taskId: string; messageId: string }
   | { kind: "open_failed" };
 
 export interface HandOffInput {
@@ -45,7 +48,7 @@ export interface HandOffInput {
   filesWorkspaceId?: string;
   pluginId?: number;
   sandboxImage?: string;
-  publish: (subject: string, payload: string, msgId: string) => Promise<void>;
+  publish: (subject: string, payload: string, msgId: string) => Promise<unknown>;
   openRun?: typeof openChatRun;
   failRun?: typeof failChatRunDispatch;
   admit?: typeof decideAdmission;
@@ -219,6 +222,7 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   if (hard) return await discardRefusedRun(input, run.taskId, hard);
 
   if (admission.kind === "queue") {
+    await releaseReconcileClaim(run);
     logger.info(
       { taskId: run.taskId, sessionId: input.sessionId, position: admission.position },
       "run.queued",
@@ -233,6 +237,12 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
 
   try {
     await publishDoorbell(input.publish, run.taskId, input.sessionId, messageId);
+    if (!await releaseReconcileClaim(run)) {
+      // Reconciliation took the row while this dispatch was publishing, so the
+      // outcome is no longer this caller's to report.
+      logger.warn({ taskId: run.taskId, sessionId: input.sessionId }, "run.dispatch.reconcile_taken");
+      return { kind: "publish_unknown", taskId: run.taskId, messageId };
+    }
   } catch (err) {
     const verdict = await (input.failRun ?? failChatRunDispatch)(
       run.taskId, String((err as Error)?.message ?? err),
@@ -249,6 +259,17 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   return { kind: "dispatched", taskId: run.taskId, messageId };
 }
 
+/**
+ * Hand the reconciliation marker back, if this dispatch still owns it.
+ *
+ * A row opened with no horizon has nothing to release, which is not a loss of
+ * ownership -- so it answers true.
+ */
+async function releaseReconcileClaim(run: { taskId: string; reconcileAt?: Date }): Promise<boolean> {
+  if (!run.reconcileAt) return true;
+  return await clearDispatchReconcile(run.taskId, run.reconcileAt);
+}
+
 export function persistableSpec(task: Record<string, unknown>): Record<string, unknown> {
   const spec = stripRunSecrets(task);
   const existing = task[RUN_CREDENTIALS_FIELD];
@@ -260,7 +281,7 @@ export function persistableSpec(task: Record<string, unknown>): Record<string, u
 }
 
 export async function publishDoorbell(
-  publish: (subject: string, payload: string, msgId: string) => Promise<void>,
+  publish: (subject: string, payload: string, msgId: string) => Promise<unknown>,
   taskId: string,
   sessionId: string,
   messageId: string,

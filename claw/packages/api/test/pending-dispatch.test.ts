@@ -121,6 +121,9 @@ function harness(opts: {
     rec.calls.push("publish");
     if (opts.publishThrows) throw opts.publishThrows;
     rec.published.push({ subject, task: JSON.parse(payload), msgId });
+    // A stream sequence, because the row records which message carries it and
+    // a stub answering nothing would hide that write.
+    return rec.published.length;
   }) as typeof pendingDispatchPorts.publish;
 
   pendingDispatchPorts.failChatRunDispatch = (async (
@@ -140,7 +143,10 @@ function harness(opts: {
         : { rows: [{ bind_attempts: opts.bindAttempts }], rowCount: 1 };
     }
     const isDelete = /DELETE/.test(text);
-    rec.calls.push(isDelete ? "delete-pending" : "mark-running");
+    const step = /dispatch_compensation/.test(text)
+      ? "arm-publish"
+      : /dispatch_seq/.test(text) ? "record-seq" : "mark-running";
+    rec.calls.push(isDelete ? "delete-pending" : step);
     rec.sql.push({ text, params });
     if (isDelete && opts.deleteThrows) throw opts.deleteThrows;
     return { rows: [], rowCount: 1 };
@@ -462,13 +468,22 @@ test("P7 a published turn clears the queue row, then marks the session running",
 
   assert.deepEqual(
     rec.calls,
-    ["lookup", "bind", "open", "publish", "delete-pending", "mark-running"],
+    // The receipt saying a message may exist is durable before the publish
+    // that may create one; the sequence naming that message lands after it.
+    [
+      "lookup", "bind", "open", "arm-publish", "publish", "record-seq",
+      "delete-pending", "mark-running",
+    ],
   );
   assert.equal(result.runId, "ktsk_1");
-  assert.deepEqual(rec.sql[0].params, [42], "the row deleted is the one that was replayed");
-  assert.match(rec.sql[1].text, /agent_status = 'running'/);
+  // Found by what the statement is, not by how many precede it: the receipt
+  // and sequence writes sit between them.
+  const deleted = rec.sql.find((q) => /DELETE FROM claw_pending_messages/.test(q.text));
+  const gate = rec.sql.find((q) => /agent_status = 'running'/.test(q.text));
+  assert.deepEqual(deleted?.params, [42], "the row deleted is the one that was replayed");
+  assert.ok(gate, "the session is marked running");
   assert.match(
-    rec.sql[1].text, /deleted_at IS NULL/,
+    gate!.text, /deleted_at IS NULL/,
     "a session deleted mid-replay must not be resurrected as running",
   );
 });

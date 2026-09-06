@@ -13,13 +13,15 @@
 
 import { db, MarketplaceDb } from "../infra/db.js";
 import { canViewPlugin, formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
-import { js, sc, nc } from "../infra/nats.js";
+import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { buildMessages } from "./context-builder.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
-import { openChatRun, failChatRunDispatch } from "../tasks/chat-run.js";
+import {
+  failChatRunDispatch, openChatRun, recordDispatchSeq, recordPublishState,
+} from "../tasks/chat-run.js";
 import { metrics } from "../infra/metrics.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun } from "../tasks/run-dispatch.js";
@@ -45,14 +47,16 @@ export const sessionDispatchPorts = {
   publishSse(sessionId: string, payload: string): void {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
   },
-  async publishTask(subject: string, payload: string, msgId?: string): Promise<void> {
+  async publishTask(subject: string, payload: string, msgId?: string): Promise<number> {
+    let ack;
     try {
-      await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
+      ack = await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
     } catch (err) {
       metrics.onMessageDispatched("error");
       throw err;
     }
     metrics.onMessageDispatched("ok");
+    return ack.seq;
   },
 };
 
@@ -350,7 +354,12 @@ export async function dispatchTaskToBrain(
     task.run_lease = run.lease;
 
     subject = taskSubject();
-    await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
+    // Durable before the call it describes: a crash between the two leaves a
+    // row that correctly says a message may exist, where the reverse order
+    // leaves one that denies a message already on the stream.
+    await recordPublishState(run.taskId, "attempted");
+    const seq = await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
+    await recordDispatchSeq(run.taskId, seq);
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
     return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage };
   } catch (err: any) {
@@ -363,6 +372,9 @@ export async function dispatchTaskToBrain(
     // is running, so the next message dispatches on top of it. The doorbell
     // path reads this same verdict; leaving the default path deaf to it is the
     // asymmetry, not a different problem.
+    if (runTaskId && publishCertainlyFailed(err)) {
+      await recordPublishState(runTaskId, "refused");
+    }
     const verdict = await sessionDispatchPorts.failChatRunDispatch(
       runTaskId, String(err?.message ?? err),
     );

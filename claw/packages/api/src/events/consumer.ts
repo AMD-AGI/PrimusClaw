@@ -638,6 +638,29 @@ export async function resolveChatRunProvenance(
   return origin === "chat" ? taskId : "foreign";
 }
 
+/**
+ * What a completion that closed nothing may still do.
+ *
+ * `missing` and a settled row this reporter is still admissible for both leave
+ * the remaining steps owed -- the second is this event's own redelivery, and
+ * each later step is idempotent on its own terms. A reporter the row no longer
+ * admits is the case that must stop: a stale generation, or an unfenced report
+ * on a row a fenced successor took over.
+ */
+async function completionAdmissibility(
+  taskId: string,
+  runClaim: number | undefined,
+): Promise<"missing" | "admissible" | "superseded"> {
+  const r = await db.query(
+    "SELECT claim_count, metadata->>'lease_fenced' AS fenced FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const row = r.rows[0] as { claim_count?: unknown; fenced?: string | null } | undefined;
+  if (!row) return "missing";
+  if (runClaim === undefined) return row.fenced === "true" ? "superseded" : "admissible";
+  return Number(row.claim_count ?? 0) === runClaim ? "admissible" : "superseded";
+}
+
 /** The generation the reporter was issued, omitted rather than invented. */
 function runClaimOf(event: Record<string, unknown>): number | undefined {
   const raw = event.run_claim;
@@ -674,13 +697,29 @@ async function handleComplete(
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
   if (provenance !== "foreign") {
-    await closeChatRun(
+    const closed = await closeChatRun(
       sessionId,
       messageId ?? undefined,
       interrupted ? "cancelled" : failed ? "failed" : "completed",
       failed ? String(failure_reason ?? "agent_error") : undefined,
       { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
     );
+    // A zero match classifies the event; it is not a yes/no gate. This
+    // delivery may be its own redelivery, in which case every step below is
+    // still owed and each is idempotent -- but it may equally be a report the
+    // row's holder superseded, and then releasing the gate, recording a turn
+    // or draining the queue would overtake the holder whose own completion is
+    // still coming.
+    if (!closed.length && provenance) {
+      const verdict = await completionAdmissibility(provenance, runClaimOf(event));
+      if (verdict !== "admissible") {
+        logger.info(
+          { sessionId, messageId, taskId: provenance, verdict },
+          "exec_complete.not_admissible_for_row",
+        );
+        return;
+      }
+    }
   }
 
   // 2. Hand the conversation back -- but only if this was the last run on it.

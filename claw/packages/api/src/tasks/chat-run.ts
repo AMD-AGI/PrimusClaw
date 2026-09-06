@@ -92,6 +92,85 @@ export type ChatRunOutcome = "completed" | "failed" | "cancelled";
  * closes it alongside the row it reaps, keyed on this id being the one thing the
  * two rows share.
  */
+/**
+ * Give up this dispatch's claim on its own reconciliation marker.
+ *
+ * Compare-and-set on the exact horizon the insert wrote, because
+ * reconciliation takes a row by extending that column: a publisher whose clear
+ * matches nothing has been overtaken and no longer owns the outcome, so it must
+ * report that rather than a verdict it cannot stand behind.
+ *
+ * @returns whether this caller still owned the row.
+ */
+export async function clearDispatchReconcile(
+  taskId: string,
+  horizon: Date | string,
+): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
+      WHERE task_id = $1 AND dispatch_reconcile_at = $2`,
+    [taskId, horizon],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Commit what is known about this row's publish, before the publish is made.
+ *
+ * `not_attempted` and `refused` are both proofs that no message for this row
+ * can exist, and both outlive the process that observed them -- which is what
+ * lets a compensation that failed be retried from row state alone. Only
+ * `attempted` is ambiguous, and it must be durable *before* the call it
+ * describes: a crash between writing it and publishing leaves a row that
+ * correctly says a message may exist, while the reverse order leaves one that
+ * lies about a message already on the stream.
+ *
+ * CASed on the state it replaces, so a receipt a holder disarmed in between is
+ * not resurrected.
+ */
+export async function recordPublishState(
+  taskId: string,
+  publish: DispatchPublishState,
+): Promise<void> {
+  try {
+    await db.query(
+      `UPDATE claw_tasks
+          SET metadata = jsonb_set(
+                metadata, '{dispatch_compensation,publish}', to_jsonb($2::text)
+              )
+        WHERE task_id = $1
+          AND metadata->'dispatch_compensation'->>'version' = '1'
+          AND metadata->'dispatch_compensation'->>'state' = 'armed'`,
+      [taskId, publish],
+    );
+  } catch (err) {
+    logger.warn({ err, taskId, publish }, "chat_run.publish_state_write_failed");
+  }
+}
+
+/**
+ * Record which stream message carries this row's work.
+ *
+ * Without it an ambiguous publish can only be resolved against the whole
+ * stream; with it the sweeper can ask whether this row's own message has been
+ * settled. Best-effort: a row whose sequence never lands falls back to the
+ * whole-stream observation rather than blocking.
+ */
+export async function recordDispatchSeq(taskId: string, seq: number): Promise<void> {
+  if (!Number.isFinite(seq) || seq <= 0) return;
+  try {
+    await db.query(
+      `UPDATE claw_tasks
+          SET metadata = jsonb_set(metadata, '{dispatch_seq}', to_jsonb($2::bigint))
+        WHERE task_id = $1`,
+      [taskId, seq],
+    );
+  } catch (err) {
+    logger.warn({ err, taskId, seq }, "chat_run.dispatch_seq_write_failed");
+  }
+}
+
 /** The receipt a fat row is opened with, before any publish is attempted. */
 export function armedReceipt(publish: DispatchPublishState): DispatchCompensationRecord {
   return { version: 1, state: "armed", publish };
@@ -204,6 +283,25 @@ OR NOT (
      AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
 )`.trim();
 
+/**
+ * Whether the durable has settled this row's delivery.
+ *
+ * Two forms: the whole stream drained past everything published before the
+ * read, or this row's own recorded sequence is at or below the ack floor. The
+ * second is what lets one live delivery hold only its own row rather than
+ * every row in the batch.
+ */
+export function deliverySettledSql(wholeStreamParam: string, ackFloorParam: string): string {
+  return `(
+  ${wholeStreamParam}::boolean
+  OR (
+       ${ackFloorParam}::bigint IS NOT NULL
+       AND (metadata->>'dispatch_seq') IS NOT NULL
+       AND (metadata->>'dispatch_seq')::bigint <= ${ackFloorParam}::bigint
+  )
+)`;
+}
+
 /** Bind {@link NO_DELIVERY_IN_FLIGHT_SQL}'s two evidence arms to statement parameters. */
 export function noDeliveryInFlightSql(fleetParam: string, settledParam: string): string {
   return NO_DELIVERY_IN_FLIGHT_SQL
@@ -315,6 +413,11 @@ export interface OpenChatRunInput {
 /** What openChatRun hands back: the row's id, and how to keep it alive. */
 export interface OpenChatRunResult {
   taskId: string;
+  /**
+   * The reconciliation horizon written with the row, which the publisher CASes
+   * on to prove it still owns the outcome. Absent when none was armed.
+   */
+  reconcileAt?: Date;
   /** The workspace this run's files belong to, when one could be recorded. */
   workspaceId?: string;
   /**
@@ -425,6 +528,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
       : await recordRunUse(input.sessionId, input.userId, taskId, input.filesWorkspaceId);
     return {
       taskId,
+      reconcileAt: (row as { dispatch_reconcile_at?: Date | null }).dispatch_reconcile_at ?? undefined,
       workspaceId,
       ...(leaseToken ? {
         lease: {
