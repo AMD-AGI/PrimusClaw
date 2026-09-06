@@ -652,6 +652,36 @@ for _key, _var in (
     if env(_var):
         values["brain"][_key] = env(_var)
 
+# Doorbell dispatch and the admission ceilings, for the same reason: this
+# script installs the whole release from a values file it builds here, so a key
+# wired only into render_chart never reaches a fresh deploy. Unset forwards
+# nothing and the chart default stands.
+for _key, _var in (
+    ("runDoorbellDispatch", "RUN_DOORBELL_DISPATCH"),
+    ("brainDoorbellExecution", "BRAIN_DOORBELL_EXECUTION"),
+):
+    _raw = env(_var)
+    if not _raw:
+        continue
+    # Refused rather than coerced: anything unrecognised read as false would
+    # turn the Brain kill-switch off while looking like it had been set.
+    if _raw not in ("true", "false"):
+        raise SystemExit(f"{_var} must be true or false, got {_raw!r}")
+    values.setdefault("features", {})[_key] = _raw == "true"
+
+for _key, _var in (
+    ("admitSoftRuns", "ADMIT_SOFT_RUNS"),
+    ("admitHardRuns", "ADMIT_HARD_RUNS"),
+    ("admitSoftSandboxes", "ADMIT_SOFT_SANDBOXES"),
+    ("admitHardSandboxes", "ADMIT_HARD_SANDBOXES"),
+    ("admitSoftGpuNodes", "ADMIT_SOFT_GPU_NODES"),
+    ("admitHardGpuNodes", "ADMIT_HARD_GPU_NODES"),
+    ("admitTreeMaxNodes", "ADMIT_TREE_MAX_NODES"),
+    ("admitTreeMaxDepth", "ADMIT_TREE_MAX_DEPTH"),
+):
+    if env(_var):
+        values["api"][_key] = env(_var)
+
 if sandbox_workload_namespace:
     values["secret"]["sandboxNamespace"] = sandbox_workload_namespace
 

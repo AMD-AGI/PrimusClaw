@@ -206,6 +206,8 @@ if $UPGRADE_API; then
   log "═══ Upgrading API ═══"
   render_chart api-deployment.yaml "$WORK_DIR/api-deployment.yaml"
   preserve_rendered_deploy_replicas "primus-claw-api" "$WORK_DIR/api-deployment.yaml" "2"
+  # Patch before apply, so the pods the apply starts come up on the new Secret.
+  patch_admission_secret
   kubectl_apply "$WORK_DIR/api-deployment.yaml"
 
   if ! $DRY_RUN; then

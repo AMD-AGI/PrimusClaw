@@ -183,6 +183,12 @@ at `"0"`. Turning them on is a staged procedure with its own gates and a
 strict rollback order -- clear the ceilings first, disable Doorbell second, or
 the API refuses to start. See [`../docs/doorbell-rollout.md`](../docs/doorbell-rollout.md).
 
+`features.brainDoorbellExecution` is the Brain-side kill-switch and renders the
+same `RUN_DOORBELL_DISPATCH` variable on the Brain deployment. It ships **on**,
+and a rollback of `features.runDoorbellDispatch` must leave it on: a Brain
+reading it false claims no doorbell row, so the queued backlog the rollback is
+waiting to drain would strand instead.
+
 ### Grafana Dashboard
 
 `charts/claw/dashboards/claw-brain.json` is a Grafana dashboard for the Brain's

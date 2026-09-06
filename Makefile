@@ -165,6 +165,8 @@ verify-lint:
 	else \
 		echo "error: go is required for gofmt verification" >&2; exit 1; \
 	fi
+	@echo "==> lint: PromQL rollout gates"
+	@bash scripts/release-tests/promql-gates.sh
 	@# The last gate before anything reaches a public tree. It needs ripgrep with
 	@# PCRE2 and exits 2 rather than reporting a clean tree it never searched.
 	@echo "==> lint: public tree scan"

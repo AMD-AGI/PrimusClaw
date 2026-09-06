@@ -65,17 +65,36 @@ refusal_names() {
 rollout_base=(-f "$rollout_values")
 release_base=(-f "$release_values")
 
-# The nine env keys as the Secret spells them, which is the only form a pod
-# ever sees.
+# One rendered document out of a whole-chart render, by the `# Source:` comment
+# helm writes above each.
+document_of() {
+  awk -v want="$2" '
+    /^# Source: /  { emit = ($3 == want) }
+    emit           { print }
+  ' "$1"
+}
+
+# The eight ceilings as the Secret spells them, which is the only form a pod
+# ever sees. RUN_DOORBELL_DISPATCH must NOT be there: one key in one Secret is
+# what made a rollback of API dispatch also stop Brain draining the backlog.
 assert_safe_defaults() {
-  local render="$1" why="$2"
-  rg -q '^\s*RUN_DOORBELL_DISPATCH: "false"$' "$render" \
-    || bad "$why: RUN_DOORBELL_DISPATCH is not the shipped false"
+  local render="$1" why="$2" secret="$tmp/secret-doc.yaml"
+  document_of "$render" "primus-claw/templates/secret.yaml" >"$secret"
+  if rg -q 'RUN_DOORBELL_DISPATCH' "$secret"; then
+    bad "$why: RUN_DOORBELL_DISPATCH is in the shared Secret, so one value reaches both deployments"
+  fi
   local admit_lines
-  admit_lines="$(rg -c '^\s*ADMIT_[A-Z_]+: "0"$' "$render" || true)"
+  admit_lines="$(rg -c '^\s*ADMIT_[A-Z_]+: "0"$' "$secret" || true)"
   [ "$admit_lines" = "8" ] \
     || bad "$why: expected eight ADMIT_* keys at \"0\", found ${admit_lines:-0}"
   ok "$why"
+}
+
+# What the container actually gets for RUN_DOORBELL_DISPATCH, per deployment.
+doorbell_env_of() {
+  local template="$1"; shift
+  helm template rollout-test "$chart_dir" "$@" --show-only "templates/$template" 2>"$err" |
+    rg -A1 'name: RUN_DOORBELL_DISPATCH' | rg -o 'value: "\w+"'
 }
 
 echo "==> chart defaults and the rollout test profile"
@@ -85,6 +104,31 @@ assert_safe_defaults "$tmp/defaults.yaml" "chart defaults are Doorbell off and a
 
 renders "the rollout test profile renders" "$tmp/rollout.yaml" "${rollout_base[@]}"
 assert_safe_defaults "$tmp/rollout.yaml" "the rolled-back state renders clean"
+
+echo "==> one env name, two chart values"
+
+# The rollback 00d prescribes sets features.runDoorbellDispatch false and needs
+# every Brain still executing, or the rows it queued strand.
+for state in true false; do
+  api_env="$(doorbell_env_of api-deployment.yaml "${rollout_base[@]}" \
+    --set "features.runDoorbellDispatch=$state")"
+  [ "$api_env" = "value: \"$state\"" ] \
+    || bad "the API container did not take features.runDoorbellDispatch=$state, got: ${api_env:-nothing}"
+  brain_env="$(doorbell_env_of brain-deployment.yaml "${rollout_base[@]}" \
+    --set "features.runDoorbellDispatch=$state")"
+  [ "$brain_env" = 'value: "true"' ] \
+    || bad "features.runDoorbellDispatch=$state changed the Brain kill-switch, got: ${brain_env:-nothing}"
+done
+ok "each deployment renders RUN_DOORBELL_DISPATCH from its own value"
+
+brain_env="$(doorbell_env_of brain-deployment.yaml "${rollout_base[@]}" \
+  --set features.brainDoorbellExecution=false)"
+[ "$brain_env" = 'value: "false"' ] \
+  || bad "features.brainDoorbellExecution=false did not reach the Brain container, got: ${brain_env:-nothing}"
+ok "the Brain kill-switch is off when its own value is false"
+
+refuses "features.brainDoorbellExecution=notabool" \
+  "${rollout_base[@]}" --set-string features.brainDoorbellExecution=notabool
 
 echo "==> per-key schema refusals"
 

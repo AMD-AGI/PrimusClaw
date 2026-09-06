@@ -18,6 +18,10 @@ as a doorbell or as a full execute request, and `api.admitSoftRuns`,
 `api.admitTreeMaxDepth`, each of which enforces one admission dimension and
 each of which ships as `"0"`, meaning "not enforced".
 
+A third value, `features.brainDoorbellExecution`, is the Brain-side
+kill-switch. It ships **on**, it is not part of any stage below, and rolling
+Doorbell back does not touch it -- see *Rollback*.
+
 Every gate below is a PromQL expression you can paste into a query window. Each
 is written to answer `1` when it passes and `0` when it fails, including when
 nothing is reporting -- see *Why the expressions look like this*.
@@ -37,10 +41,26 @@ nothing is reporting -- see *Why the expressions look like this*.
 ## Preconditions
 
 1. Every API and Brain replica runs an image that understands the doorbell
-   protocol and the reconciled unclaim/fail-claim reason vocabulary. The
-   mixed-version capability gate is `TBD(00c)`.
-2. No legacy `preparing` rows are outstanding from a previous attempt; the
-   reconcile procedure for them is `TBD(00a)`.
+   protocol and the reconciled unclaim/fail-claim reason vocabulary, and the
+   fleet's floor has been asserted:
+
+   ```
+   POST /v1/internal/brain/doorbell-semantics   {"semantics": <version>}
+   ```
+
+   An API publishes a doorbell only while `features.runDoorbellDispatch` is
+   true **and** it has observed a floor at least as high as the semantics
+   version it implements. Every other state -- no assertion yet, a revoked
+   one, an unparseable one, a lost watch -- resolves to fat dispatch, which is
+   slower and never incorrect, so a stage that never starts is the failure
+   mode rather than a mixed fleet being handed a message it cannot read. The
+   API refuses an assertion above its own version.
+2. No legacy `preparing` rows are outstanding from a previous attempt.
+   Reconciling them is gated on `RUN_FAT_PREPARING_RECONCILE`, the API's
+   assertion that every Brain able to receive a task takes a durable holder
+   before it executes; it ships off and is read from the API process
+   environment, not from a chart value. Turning it on before every replica on
+   both sides is new lets a reaper close a delivery that is about to run.
 3. Prometheus reaches the API `/metrics` endpoint of every replica, and P1
    below passes.
 4. Every run-creating path is routed through admission, so a ceiling means what
@@ -49,8 +69,13 @@ nothing is reporting -- see *Why the expressions look like this*.
 ## Applying a value
 
 Every stage below changes chart values and nothing else. Two paths deliver
-them, and both restart the API pods, which is required: the nine keys reach a
-pod as environment variables and are read once at startup.
+them, and both restart the API pods, which is required: every one of these
+values reaches a pod as an environment variable, read once at startup.
+
+`features.runDoorbellDispatch` and `features.brainDoorbellExecution` render the
+**same** environment variable, `RUN_DOORBELL_DISPATCH`, once per deployment
+from its own value. The eight ceilings reach the API through the shared
+Secret.
 
 - **Through the deploy scripts.** The durable record is
   `claw/deploy/values.<namespace>.env`; a key left empty there means "use the
@@ -609,7 +634,7 @@ failure of a gate above.
 | The held gate returns `0` | A run executed after its create was refused or its publish failed. The correctness failure the whole feature exists to avoid. |
 | The dispatch failure share or the admission error share returns `0` | Creates are failing or throwing out of the hand-off, or admission's own usage queries are. |
 | `F` returns `0` for longer than one rollout | A replica is not reporting. Under the ordering rule below that is what a wrong-order config looks like from outside: the pod exits before `/metrics` is ever bound. |
-| Both `D0` and `D1` return `0` for longer than one rollout | A stuck replica; mixed-version semantics apply, `TBD(00c)`. |
+| Both `D0` and `D1` return `0` for longer than one rollout | A stuck replica, so the fleet is split over whether a chat turn is published as a doorbell. Revoking the capability floor closes every publisher's gate without waiting for that pod. |
 | The version-skew gate returns `0` | API and Brain disagree about the reason vocabulary. |
 | The by-id volume gate returns `0`, or the claim-share or unsuccessful-share gate returns `0` | The doorbell wakeup path is not running, or it is running and taking nothing. |
 | The claim-error, skip or backlog share returns `0` -- each sustained over `$k_windows`, the backlog one only while `Q(chat)` does not fall | The claim path is throwing, candidates are being terminalized rather than taken, or a backlog nobody can take is persisting. Never one increment. |
@@ -672,7 +697,7 @@ check, so it is for an emergency where a duplicated run is the lesser risk.
 | **R2** | Wait for the API rollout to complete. | `F`, `S`, `A` and `E(0)` below. |
 | **R3** | Confirm the *waiting* backlog has drained before touching dispatch. | The current-state query and its companion below. |
 | **R4** | Set `features.runDoorbellDispatch: false`. Apply. | `helm template` succeeds. |
-| **R5** | Wait for the rollout; leave Brain running. New chat dispatch goes fat; rows already `queued` stay claimable, since the pull loop does not read the flag, so the backlog drains rather than stranding. | `D0`, and the R3 row count still `0`. The Doorbell **message-class** drain predicate is `TBD(00c)`. |
+| **R5** | Wait for the rollout; leave Brain running and `features.brainDoorbellExecution` at `true`. New chat dispatch goes fat; rows already `queued` stay claimable, so the backlog drains rather than stranding. | `D0`, and the R3 row count still `0`. |
 | **R6** | Declare rolled back. | `F`, `A`, `E(0)` and `D0`, and an `helm get values` diff against R0 showing only the intended edits. |
 
 **R2 and R6 read exactly this**, `F` first: a replica that refused the config
@@ -723,12 +748,51 @@ R1 has already zeroed all eight ceilings, so admission short-circuits to
 `admit` and no new waiting arrival can be minted; what R3 waits out is the soft
 backlog admitted before R1 plus any lease returning through requeue.
 
-**The Doorbell message-class backlog is a separate, unresolved question.**
-Pull-loop claims are not doorbell message claims: the pull loop polls the
-database, while a doorbell *message* is claimed on the by-id path. So a falling
-`mode="next"` claim rate says nothing about whether JetStream still holds
-undelivered run doorbells. Draining that stream is `TBD(00c)`, and R5 does not
-claim to prove it.
+**Leave the Brain kill-switch alone.** `features.brainDoorbellExecution`
+renders the same `RUN_DOORBELL_DISPATCH` variable on the Brain deployment, and
+a Brain reading it false executes no doorbell run by any route: it declines one
+on the wire and its claim-next loop takes no doorbell row. Setting it false
+during R5 is what would strand the backlog R5 waits for.
+
+**The Doorbell message-class backlog is what R7 below covers.** Pull-loop
+claims are not doorbell message claims: the pull loop polls the database, while
+a doorbell *message* is claimed on the by-id path, so a falling `mode="next"`
+claim rate says nothing about whether JetStream still holds undelivered run
+doorbells. R5 does not claim to prove it, and R6 declares the values rolled
+back and nothing more.
+
+### R7 -- before an incompatible Brain may bind the durable
+
+Only needed when the rollback continues into an image that implements a lower
+doorbell semantics version than the one now deployed. A row count is not the
+precondition: a row can sit `queued` for hours safely, while an outstanding
+doorbell *message* delivered to a binary with no notion of one is cast straight
+to an execute request with no validation.
+
+1. **Close the barrier and let it drain.** Revoke the floor fleet-wide, with no
+   rollout, then read every API pod:
+
+   ```
+   DELETE /v1/internal/brain/doorbell-semantics
+   GET    /v1/internal/brain/doorbell-gate?version=<the incoming image's>
+   ```
+
+   Every pod must answer `gate: 0` **and** `in_flight: 0`. A closed gate with a
+   non-zero in-flight count is a dispatch that read the gate open and can still
+   reach the stream; wait, and if it does not drain in the time one dispatch
+   takes, stop the rollback. Only once both hold fleet-wide is the rest of this
+   list a measurement rather than a moving target.
+2. **Nothing outstanding on the durable.** From the `brain-workers` consumer
+   info: `num_pending`, `num_ack_pending` and `num_redelivered` all `0`. The
+   durable carries both message classes, which makes this conservative in the
+   right direction.
+3. **No incompatible run is non-terminal.** The same `doorbell-gate` reply
+   carries `incompatible_runs`, counting rows the incoming version could not
+   execute across `queued`, `preparing`, `running` and `cancelling` -- not only
+   `queued`, because a claimed row is not queued and becomes queued again the
+   moment a draining replica releases it. It must be `0`, and it is re-read
+   after the last compatible replica is gone, since that shutdown is itself a
+   requeue event.
 
 ## Metric reference
 
@@ -784,6 +848,5 @@ unclaim reason is still rejected. A non-trivial rate means version skew.
 - Production ceiling values, replica counts or any other capacity figure.
 - A soak duration per stage.
 - Dashboard panels, alert rules or an SLO artefact.
-- The mixed-version capability gate (`TBD(00c)`), the legacy `preparing`
-  reconcile (`TBD(00a)`), the Doorbell message-class drain predicate
-  (`TBD(00c)`), or the producer for the tree dimensions (`TBD(00b)`).
+- The producer for the tree dimensions (`TBD(00b)`), without which Stage 3T
+  fails at its first boundary probe.

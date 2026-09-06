@@ -168,6 +168,23 @@ BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
 # next upgrade silently reverts.
 AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+
+# Doorbell dispatch and the eight admission ceilings. Empty means the chart
+# default -- "0" for a ceiling, false for API dispatch, true for Brain
+# execution -- and forwards no --set at all, so the shipped default stands.
+# Recorded here for the same reason as the two above: upgrade.sh re-renders
+# from this file alone, so a ceiling staged through the chart and not written
+# down is reverted by the next ordinary upgrade, mid-canary and with no error.
+RUN_DOORBELL_DISPATCH="${RUN_DOORBELL_DISPATCH:-}"
+BRAIN_DOORBELL_EXECUTION="${BRAIN_DOORBELL_EXECUTION:-}"
+ADMIT_SOFT_RUNS="${ADMIT_SOFT_RUNS:-}"
+ADMIT_HARD_RUNS="${ADMIT_HARD_RUNS:-}"
+ADMIT_SOFT_SANDBOXES="${ADMIT_SOFT_SANDBOXES:-}"
+ADMIT_HARD_SANDBOXES="${ADMIT_HARD_SANDBOXES:-}"
+ADMIT_SOFT_GPU_NODES="${ADMIT_SOFT_GPU_NODES:-}"
+ADMIT_HARD_GPU_NODES="${ADMIT_HARD_GPU_NODES:-}"
+ADMIT_TREE_MAX_NODES="${ADMIT_TREE_MAX_NODES:-}"
+ADMIT_TREE_MAX_DEPTH="${ADMIT_TREE_MAX_DEPTH:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -184,8 +201,15 @@ _SHELL_S3_ENDPOINT="${S3_ENDPOINT:-}"
 _SHELL_S3_API_ENDPOINT="${S3_API_ENDPOINT:-}"
 _SHELL_S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
 _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
-_SHELL_AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
-_SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+# Fields the file may leave blank for the shell to answer, and which the run
+# that answers one records for every run after it.
+CLAW_RECORDED_KEYS="AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION
+RUN_DOORBELL_DISPATCH BRAIN_DOORBELL_EXECUTION
+ADMIT_SOFT_RUNS ADMIT_HARD_RUNS ADMIT_SOFT_SANDBOXES ADMIT_HARD_SANDBOXES
+ADMIT_SOFT_GPU_NODES ADMIT_HARD_GPU_NODES ADMIT_TREE_MAX_NODES ADMIT_TREE_MAX_DEPTH"
+for _recorded_key in $CLAW_RECORDED_KEYS; do
+  eval "_SHELL_${_recorded_key}=\${${_recorded_key}:-}"
+done
 
 set -a
 # shellcheck disable=SC1090
@@ -220,8 +244,12 @@ export BRAIN_CHECKPOINT_KEY
 [ -z "${S3_API_ENDPOINT:-}" ]     && S3_API_ENDPOINT="$_SHELL_S3_API_ENDPOINT"
 [ -z "${S3_ACCESS_KEY:-}" ]       && S3_ACCESS_KEY="$_SHELL_S3_ACCESS_KEY"
 [ -z "${S3_SECRET_KEY:-}" ]       && S3_SECRET_KEY="$_SHELL_S3_SECRET_KEY"
-[ -z "${AGENT_SANDBOX_SESSION_TIMEOUT:-}" ]      && AGENT_SANDBOX_SESSION_TIMEOUT="$_SHELL_AGENT_SANDBOX_SESSION_TIMEOUT"
-[ -z "${AGENT_SANDBOX_MAX_SESSION_DURATION:-}" ] && AGENT_SANDBOX_MAX_SESSION_DURATION="$_SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION"
+for _recorded_key in $CLAW_RECORDED_KEYS; do
+  # Exported: deploy.sh builds its values JSON from the environment, and a
+  # field the file left blank was never exported by sourcing it.
+  eval "[ -n \"\${${_recorded_key}:-}\" ] || ${_recorded_key}=\"\${_SHELL_${_recorded_key}}\"
+        export ${_recorded_key}"
+done
 
 # Write the shell's choice back, so the run that turns a knob on is the only
 # run that has to name it. This mirrors the override policy just above: the
@@ -234,23 +262,26 @@ export BRAIN_CHECKPOINT_KEY
 # Not during a dry-run: a preview that edits the values file is a side effect,
 # and scripts/release-tests/dry-run-no-side-effects.sh says so.
 if [ "${DRY_RUN:-false}" != "true" ]; then
-  for _lifetime_key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION; do
-    eval "_lifetime_val=\${$_lifetime_key:-}"
-    [ -n "$_lifetime_val" ] || continue
-    if grep -q "^${_lifetime_key}=\(\"\"\)\?$" "$_VALUES_FILE"; then
-      sed -i "s|^${_lifetime_key}=.*\$|${_lifetime_key}=\"${_lifetime_val}\"|" "$_VALUES_FILE"
-      log "$_lifetime_key: recorded in $_VALUES_FILE"
-    elif ! grep -q "^${_lifetime_key}=" "$_VALUES_FILE"; then
-      printf '\n# Sandbox lifetime; recorded so the next upgrade re-renders with it.\n%s="%s"\n' \
-        "$_lifetime_key" "$_lifetime_val" >> "$_VALUES_FILE"
-      log "$_lifetime_key: recorded in $_VALUES_FILE"
+  for _recorded_key in $CLAW_RECORDED_KEYS; do
+    eval "_recorded_val=\${$_recorded_key:-}"
+    [ -n "$_recorded_val" ] || continue
+    if grep -q "^${_recorded_key}=\(\"\"\)\?$" "$_VALUES_FILE"; then
+      sed -i "s|^${_recorded_key}=.*\$|${_recorded_key}=\"${_recorded_val}\"|" "$_VALUES_FILE"
+      log "$_recorded_key: recorded in $_VALUES_FILE"
+    elif ! grep -q "^${_recorded_key}=" "$_VALUES_FILE"; then
+      printf '\n# Recorded so the next upgrade re-renders with it.\n%s="%s"\n' \
+        "$_recorded_key" "$_recorded_val" >> "$_VALUES_FILE"
+      log "$_recorded_key: recorded in $_VALUES_FILE"
     fi
   done
-  unset _lifetime_key _lifetime_val
+  unset _recorded_val
 fi
 unset _SHELL_DOMAIN _SHELL_AUTH_INTERNAL_TOKEN _SHELL_S3_ENDPOINT \
-      _SHELL_S3_API_ENDPOINT _SHELL_S3_ACCESS_KEY _SHELL_S3_SECRET_KEY \
-      _SHELL_AGENT_SANDBOX_SESSION_TIMEOUT _SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION
+      _SHELL_S3_API_ENDPOINT _SHELL_S3_ACCESS_KEY _SHELL_S3_SECRET_KEY
+for _recorded_key in $CLAW_RECORDED_KEYS; do
+  unset "_SHELL_${_recorded_key}"
+done
+unset _recorded_key
 # Defaults for any placeholder not provided by the values file. Fallback to
 # the literal "<KEY>" so render output keeps the placeholder, and the
 # deploy.sh guard fails loudly rather than silently shipping empty secrets.
@@ -780,6 +811,16 @@ render_chart() {
     --set-string image.tag="$TAG" \
     ${AGENT_SANDBOX_SESSION_TIMEOUT:+--set-string brain.sessionTimeout="$AGENT_SANDBOX_SESSION_TIMEOUT"} \
     ${AGENT_SANDBOX_MAX_SESSION_DURATION:+--set-string brain.maxSessionDuration="$AGENT_SANDBOX_MAX_SESSION_DURATION"} \
+    ${RUN_DOORBELL_DISPATCH:+--set features.runDoorbellDispatch="$RUN_DOORBELL_DISPATCH"} \
+    ${BRAIN_DOORBELL_EXECUTION:+--set features.brainDoorbellExecution="$BRAIN_DOORBELL_EXECUTION"} \
+    ${ADMIT_SOFT_RUNS:+--set-string api.admitSoftRuns="$ADMIT_SOFT_RUNS"} \
+    ${ADMIT_HARD_RUNS:+--set-string api.admitHardRuns="$ADMIT_HARD_RUNS"} \
+    ${ADMIT_SOFT_SANDBOXES:+--set-string api.admitSoftSandboxes="$ADMIT_SOFT_SANDBOXES"} \
+    ${ADMIT_HARD_SANDBOXES:+--set-string api.admitHardSandboxes="$ADMIT_HARD_SANDBOXES"} \
+    ${ADMIT_SOFT_GPU_NODES:+--set-string api.admitSoftGpuNodes="$ADMIT_SOFT_GPU_NODES"} \
+    ${ADMIT_HARD_GPU_NODES:+--set-string api.admitHardGpuNodes="$ADMIT_HARD_GPU_NODES"} \
+    ${ADMIT_TREE_MAX_NODES:+--set-string api.admitTreeMaxNodes="$ADMIT_TREE_MAX_NODES"} \
+    ${ADMIT_TREE_MAX_DEPTH:+--set-string api.admitTreeMaxDepth="$ADMIT_TREE_MAX_DEPTH"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst"
@@ -787,6 +828,37 @@ render_chart() {
 
 # ── kubectl apply wrapper ────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"
+
+# The eight ceilings reach a pod only through the shared Secret, and
+# render_chart never renders it: it passes --set secret.create=false and
+# --show-only, under which secret.yaml is empty. A merge patch on stringData
+# sets exactly the configured keys and leaves the rest of the Secret -- the
+# cluster-resolved credentials among them -- as they are.
+#
+# The Doorbell values are deliberately absent: they render as container-level
+# env on each Deployment, so the apply that follows this carries them.
+patch_admission_secret() {
+  local payload
+  payload="$(python3 - <<'PY'
+import json, os
+keys = {
+    "ADMIT_SOFT_RUNS", "ADMIT_HARD_RUNS",
+    "ADMIT_SOFT_SANDBOXES", "ADMIT_HARD_SANDBOXES",
+    "ADMIT_SOFT_GPU_NODES", "ADMIT_HARD_GPU_NODES",
+    "ADMIT_TREE_MAX_NODES", "ADMIT_TREE_MAX_DEPTH",
+}
+configured = {k: os.environ[k] for k in sorted(keys) if os.environ.get(k)}
+print(json.dumps({"stringData": configured}) if configured else "")
+PY
+)"
+  [ -n "$payload" ] || return 0
+  if $DRY_RUN; then
+    log "[dry-run] kubectl patch secret primus-claw-secrets -n $NAMESPACE"
+    kubectl patch secret primus-claw-secrets -n "$NAMESPACE" --type=merge -p "$payload" --dry-run=client
+  else
+    kubectl patch secret primus-claw-secrets -n "$NAMESPACE" --type=merge -p "$payload"
+  fi
+}
 
 # All Claw objects are namespace-scoped. helm-rendered manifests carry no
 # metadata.namespace, so pin the target ns here (previously the flat manifests

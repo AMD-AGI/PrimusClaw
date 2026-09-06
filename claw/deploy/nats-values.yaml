@@ -163,6 +163,7 @@ config:
                   - "$KV.BRAIN_REGISTRY.deleted.*"
                   - "$KV.BRAIN_REGISTRY.dag-handles.>"
                   - "$KV.BRAIN_REGISTRY.brain.min_version"
+                  - "$KV.BRAIN_REGISTRY.brain.doorbell_semantics"
                   - "$KV.BRAIN_TOMBSTONES.deleted.*"
                   - "$KV.SYSTEM_ENV.current"
                   # Bucket lifecycle. api creates and reconciles four buckets,

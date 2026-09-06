@@ -175,6 +175,11 @@ spec:
         env:
         - name: CHECKPOINT_WRITE_VERSION
           value: {{ .Values.brain.checkpointWriteVersion | quote }}
+        # See the API deployment: the same env name, this deployment's own
+        # value. `dig` rather than `default`, which would read an explicit
+        # false as absent and render the kill-switch back on.
+        - name: RUN_DOORBELL_DISPATCH
+          value: {{ dig "brainDoorbellExecution" true (.Values.features | default dict) | quote }}
         {{- if .Values.secret.brainCheckpointKey }}
         - name: BRAIN_CHECKPOINT_KEY
           valueFrom:

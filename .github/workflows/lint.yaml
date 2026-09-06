@@ -175,6 +175,22 @@ jobs:
         run: |
           bash claw/scripts/lint-no-nullish-env-default.sh --all
 
+  promql-rollout-gates:
+    name: evaluate the rollout gates against the PromQL engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install promtool
+        run: |
+          bash scripts/release-tests/install-promtool.sh
+
+      - name: Run promql-gates
+        run: |
+          bash scripts/release-tests/promql-gates.sh
+
   gofmt:
     name: gofmt (Sandbox)
     runs-on: ubuntu-latest

@@ -28,6 +28,10 @@
         "runDoorbellDispatch": {
           "description": "Chat dispatch publishes a doorbell instead of a full execute request.",
           "type": "boolean"
+        },
+        "brainDoorbellExecution": {
+          "description": "A Brain replica executes doorbell runs, on the wire and from claim-next.",
+          "type": "boolean"
         }
       }
     },

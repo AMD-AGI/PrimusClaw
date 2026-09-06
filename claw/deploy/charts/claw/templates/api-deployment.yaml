@@ -104,6 +104,12 @@ spec:
               key: NATS_PASSWORD
         {{- end }}
         {{- end }}
+        # Container-level, so each deployment renders this one env name from
+        # its own value: the API publishes doorbells only once told to, a Brain
+        # executes them unless killed. A single Secret key would have made a
+        # rollback of the first also stop the second draining the backlog.
+        - name: RUN_DOORBELL_DISPATCH
+          value: {{ dig "runDoorbellDispatch" false (.Values.features | default dict) | quote }}
         - name: NODE_OPTIONS
           value: {{ .Values.api.nodeOptions | quote }}
         - name: BRAIN_TASK_TIMEOUT_SEC
