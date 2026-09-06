@@ -91,7 +91,12 @@ export interface ReservedKeyMigration {
 export async function migrateReservedSessionKeys(
   store: HandsKeyStore,
 ): Promise<ReservedKeyMigration> {
-  const keys = await store.keys(`${HANDS_KEY_PREFIX}${RETAINED_PREFIX}*`);
+  // Walked as whole session keys and narrowed here, because the store's `*`
+  // matches one whole token and never a prefix inside one -- a filter spelling
+  // the marker into the token would match nothing at all and the scan would
+  // report a clean namespace it never looked at.
+  const keys = (await store.keys(`${HANDS_KEY_PREFIX}*`))
+    .filter((key) => key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX));
   const result: ReservedKeyMigration = { scanned: keys.length, migrated: [], conflicted: [] };
 
   for (const key of keys) {

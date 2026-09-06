@@ -53,6 +53,8 @@ import {
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
+import { admitSandbox } from "./admission.js";
+import { pingTargetIdentity } from "./keepalive.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -895,6 +897,10 @@ async function provisionHands(
   // / health. Rollback (stop) if the KV write fails so we never leak a workload.
   // Owned here so SafeWorkloadProvider stays KV-free.
   const onProvisioned = async (workloadId: string): Promise<void> => {
+    // The earliest moment this sandbox has an identity, and therefore where the
+    // reservation stops naming a token and starts naming a target -- ahead of
+    // the durable record below, of bootstrap, and of local registration.
+    await hold.bind(pingTargetIdentity(sessionId, { provider: "safe-workload", workloadId }));
     const pendingPayload = sc.encode(JSON.stringify({
       status: "pending", workloadId, sandboxImage,
       platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
@@ -921,20 +927,36 @@ async function provisionHands(
 
   logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
 
-  const inst = await getSafeWorkloadProvider().create({
-    sessionId,
-    namespace: nsForSandbox,
-    image: workloadImage,
-    resources: action.params.resources,
-    resourcesArray: workloadResourcesArr,
-    env,
-    labels,
-    timeoutSec,
-    ttlSec: ttlSeconds,
-    platformKey: apiKey,
-    onProvisioned,
-    onEvent,
-  });
+  // Before the provider is called at all: a ceiling checked once the sandbox
+  // exists is not a ceiling, because two provisions racing the last slot both
+  // start and both are then live work nothing may evict.
+  const hold = await admitSandbox(sessionId);
+  let inst;
+  try {
+    inst = await getSafeWorkloadProvider().create({
+      sessionId,
+      namespace: nsForSandbox,
+      image: workloadImage,
+      resources: action.params.resources,
+      resourcesArray: workloadResourcesArr,
+      env,
+      labels,
+      timeoutSec,
+      ttlSec: ttlSeconds,
+      platformKey: apiKey,
+      onProvisioned,
+      onEvent,
+    });
+  } catch (err) {
+    await hold.release();
+    throw err;
+  }
+  // Set once the sandbox is a registered ping target, which is the point past
+  // which its slot is the sweep's to renew. Anything short of that -- bootstrap,
+  // health, the durable record -- gives the reservation back rather than
+  // holding capacity for a sandbox nobody will ping.
+  let admitted = false;
+  try {
   const workloadId = inst.id;
   const handsBaseUrl = `http://${workloadId}.${nsForSandbox}.svc.cluster.local:${mcpPort}`;
 
@@ -1052,6 +1074,7 @@ async function provisionHands(
     namespace: nsForSandbox,
   };
   reuseEffects.registerSandbox(sessionId, identity);
+  admitted = true;
 
   // task-design.md §9.4: when the calling task belongs to a DAG and declared
   // a sandbox.handle name, publish a HandleInfo to the DagHandleMap so any
@@ -1081,6 +1104,9 @@ async function provisionHands(
   }
 
   return { handsUrl, created: true, token: handsToken, identity };
+  } finally {
+    if (!admitted) await hold.release();
+  }
 }
 
 
@@ -1202,17 +1228,35 @@ async function ensureHandsAgentSandbox(
   };
 
   await onEvent({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
-  const inst = await provider.create({
-    sessionId,
-    namespace: ns,
-    image: workloadImage,
-    resources: action.params.resources,
-    env,
-    labels,
-    timeoutSec: action.params.timeout,
-    userId,
-  });
+  // Claimed before the provider is called, so two provisions racing the last
+  // slot cannot both start; bound below at the first moment an identity exists.
+  const hold = await admitSandbox(sessionId);
+  let inst;
   try {
+    inst = await provider.create({
+      sessionId,
+      namespace: ns,
+      image: workloadImage,
+      resources: action.params.resources,
+      env,
+      labels,
+      timeoutSec: action.params.timeout,
+      userId,
+    });
+  } catch (err) {
+    await hold.release();
+    throw err;
+  }
+  let admitted = false;
+  try {
+    // The identity the sweep will ping, field for field, or the slot names a
+    // target nobody looks for and the sandbox reads as un-admitted.
+    await hold.bind(pingTargetIdentity(sessionId, {
+      provider: "agent-sandbox",
+      sessionId: inst.id,
+      sandboxName: inst.sandboxName,
+      namespace: inst.namespace,
+    }));
     await onEvent({ type: "sandboxStatus", event: "phase", phase: "Running", status: "running" });
 
     logger.info(
@@ -1277,6 +1321,7 @@ async function ensureHandsAgentSandbox(
       userId,
     };
     reuseEffects.registerSandbox(sessionId, identity);
+    admitted = true;
 
     // task-design.md §9.4: publish the handle so downstream DAG nodes with
     // `sandbox.use=<handle>` can re-attach. agent-sandbox has no workload_id,
@@ -1315,5 +1360,10 @@ async function ensureHandsAgentSandbox(
       logger.warn({ err: String(stopErr), sessionId, agentSessionId: inst.id }, "ensureHands.agent_rollback_stop_failed"),
     );
     throw err;
+  } finally {
+    // A bind that could not commit is one of the ways this lands here, and the
+    // rollback above has already stopped the sandbox -- which is the obligation
+    // a live sandbox holding no slot creates.
+    if (!admitted) await hold.release();
   }
 }

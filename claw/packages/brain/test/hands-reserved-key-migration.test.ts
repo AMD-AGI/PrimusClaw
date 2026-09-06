@@ -21,6 +21,7 @@ import {
   RETAINED_PREFIX, handsSessionKey, migrateReservedSessionKeys, sessionIdFromHandsKey,
   type HandsKeyStore,
 } from "../src/sandbox/hands-key.js";
+import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
 function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & {
   map: Map<string, string | null>;
@@ -29,8 +30,7 @@ function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & 
   return {
     map,
     async keys(filter) {
-      const re = new RegExp(`^${filter.replace(/[.]/g, "\\.").replace(/\*/g, ".*")}$`);
-      return [...map.keys()].filter((k) => re.test(k));
+      return [...map.keys()].filter((k) => matchesKvFilter(k, filter));
     },
     async get(key) {
       if (!map.has(key)) return null;

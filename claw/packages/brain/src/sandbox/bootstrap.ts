@@ -262,9 +262,24 @@ export function handsBaseEnv(
     + `BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")} `
     + `BASH_DEFAULT_TIMEOUT_SEC=${BASH_FOREGROUND_DEFAULT_SEC} `
     + `WAIT_MAX_SEC=${toolTimeoutCeilingSec("wait")} `
-    + `WAIT_DEFAULT_SEC=${WAIT_DEFAULT_SEC}`
+    + `WAIT_DEFAULT_SEC=${WAIT_DEFAULT_SEC} `
+    + `HANDS_STATE_DIR=${HANDS_STATE_DIR}`
     + (envFile ? ` HANDS_ENV_FILE=${envFile}` : "");
 }
+
+/**
+ * Where Hands files its background-shell records.
+ *
+ * Named rather than left to Hands' own default, for the same reason the env
+ * file is: the default is a system path a sandbox image is not obliged to make
+ * writable, and Hands refuses to start where it cannot create this -- correctly,
+ * since a process serving shells it files no record of leaves every later
+ * destroy gate reading an empty count as an empty sandbox. Under /tmp rather
+ * than /workspace because the workspace is synced to S3 and to the shared
+ * filesystem, and a sync must not be able to carry the records out or write
+ * over them. Hands creates it owner-only.
+ */
+export const HANDS_STATE_DIR = "/tmp/.claw-hands";
 
 /**
  * Where the per-request environment is handed over.

@@ -22,7 +22,7 @@ import {
 } from "../src/config.js";
 import { MCP_DEADLINE_SLACK_MS, toolTimeoutCeilingSec } from "../src/tools/hands.js";
 import { callDeadlineMs } from "../src/clients/hands.js";
-import { handsBaseEnv } from "../src/sandbox/bootstrap.js";
+import { HANDS_STATE_DIR, handsBaseEnv } from "../src/sandbox/bootstrap.js";
 import type { HandsClient } from "../src/clients/hands.js";
 import { assertBackgroundSurface, assertSurfaceMatches } from "./fixtures/builtin-tool-surface.js";
 
@@ -208,6 +208,12 @@ test("the closed-state forwarding tuple is asserted whole, not key by key", () =
     "unasserted, this is where the wait ceiling becomes a second instance of "
       + "the divergence the bash ceiling already has");
   assert.equal(pairs.WAIT_DEFAULT_SEC, String(WAIT_DEFAULT_SEC));
+  assert.equal(pairs.HANDS_STATE_DIR, HANDS_STATE_DIR,
+    "Hands refuses to start where it cannot file records, so the sandbox is "
+      + "told a path it can own rather than left to a system default an image "
+      + "need not make writable");
+  assert.ok(!HANDS_STATE_DIR.startsWith("/workspace"),
+    "the workspace is synced, and a sync must not carry the records out");
 });
 
 test("the disabled refusal names no duration, so it cannot be read as a timeout", async () => {

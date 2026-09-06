@@ -16,6 +16,7 @@ import { startSandboxKeepalive } from "./sandbox/keepalive.js";
 import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
 import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
+import { bindAdmission } from "./sandbox/admission.js";
 import { initA2ARegistry } from "./clients/a2a.js";
 import { initSystemEnvCache } from "./infra/system-env.js";
 import {
@@ -875,6 +876,9 @@ async function main() {
     targetCeiling: SANDBOX_KEEPALIVE_TARGET_CEILING,
     reconcileReserve: SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
   });
+  // The same roster the sweep reconciles against, so a slot claimed before
+  // provisioning and a target discovered by a sweep are one accounting.
+  bindAdmission(kv, capacity);
   startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
 
   // Background sweeper: evict stale Hands KV entries whose workloads died

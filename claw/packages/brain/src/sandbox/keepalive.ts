@@ -110,6 +110,18 @@ interface RegisteredSandbox {
 
 const localRegistry = new Map<string, RegisteredSandbox>();
 
+/**
+ * The identity of one ping target.
+ *
+ * Exported because admission reserves a slot per target and has to name the
+ * same thing the sweep pings: a slot bound to anything else would leave the
+ * target un-admitted and reconciled in later, which is the ceiling being
+ * enforced after the fact rather than before provisioning.
+ */
+export function pingTargetIdentity(sessionId: string, entry: SandboxEntry): string {
+  return sandboxRegistryKey(sessionId, entry);
+}
+
 function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
   return entry.provider === "agent-sandbox"
     ? `${sessionId}:agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`

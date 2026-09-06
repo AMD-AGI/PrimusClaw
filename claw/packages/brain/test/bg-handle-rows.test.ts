@@ -18,6 +18,7 @@ import {
   advanceRow, deleteRunRows, readRow, rowKey, runRowFilter, type BgRowStore,
 } from "../src/sandbox/bg-handle-rows.js";
 import { decodeKeyPart, encodeKeyPart } from "../src/sandbox/bg-key.js";
+import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
 function memoryStore(): BgRowStore & { map: Map<string, string> } {
   const map = new Map<string, string>();
@@ -27,8 +28,7 @@ function memoryStore(): BgRowStore & { map: Map<string, string> } {
     async put(key, value) { map.set(key, value); },
     async delete(key) { map.delete(key); },
     async keys(filter) {
-      const re = new RegExp(`^${filter.split("*").map((p) => p.replace(/[.]/g, "\\.")).join("[^.]*")}$`);
-      return [...map.keys()].filter((k) => re.test(k));
+      return [...map.keys()].filter((k) => matchesKvFilter(k, filter));
     },
   };
 }
@@ -86,4 +86,20 @@ test("a run's rows go when the run ends, and only that run's", async () => {
   assert.ok(await readRow(store, { ...ADDRESS, runIdentity: "ktsk_2" }),
     "a sibling run under the same owner has not ended");
   assert.match(runRowFilter("sess", "ktsk_1"), /^bgshell\.[A-Z2-7]+\.[A-Z2-7]+\.\*$/);
+});
+
+test("the store stub matches subjects the way the bucket does", () => {
+  // A stub that matches more than the real bucket makes the tests above pass on
+  // a filter production would get nothing back from. `*` is one whole token,
+  // never a prefix inside one, which is why the reserved-namespace scan has to
+  // narrow in its own code.
+  const key = rowKey(ADDRESS);
+  assert.ok(matchesKvFilter(key, runRowFilter("sess", "ktsk_1")));
+  assert.ok(!matchesKvFilter(key, runRowFilter("sess", "ktsk_2")));
+  assert.ok(!matchesKvFilter("hands.retained-ABC", "hands.retained-*"),
+    "a wildcard inside a token matches nothing, so a scan spelled that way "
+      + "would report a namespace it never looked at");
+  assert.ok(matchesKvFilter("hands.retained-ABC", "hands.*"));
+  assert.ok(!matchesKvFilter("bgshell.A.B.C.D", "bgshell.A.B.*"),
+    "and a wildcard is one token, not the rest of the key");
 });
