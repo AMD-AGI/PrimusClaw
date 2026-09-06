@@ -43,6 +43,7 @@ import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { decayMemory } from "./memory/service.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
+import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
 import pino from "pino";
 
 const logger = pino({ name: "api" });
@@ -137,6 +138,7 @@ async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
+  assertRolloutConfigAtStartup();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
