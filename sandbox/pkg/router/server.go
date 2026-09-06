@@ -8,10 +8,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -49,6 +54,13 @@ type Server struct {
 	engine         *gin.Engine
 	jwt            *JWTManager
 	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
+
+	// Readiness edge tracking, so the log records transitions rather than every
+	// probe. Guarded because readiness is served concurrently.
+	readyMu        sync.Mutex
+	wasReady       bool
+	notReadySince  time.Time
+	lastUnreadyLog time.Time
 }
 
 // New creates a new Router server.
@@ -194,25 +206,121 @@ func (s *Server) handleHealthLive(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "alive"})
 }
 
+// wmHealthTimeout bounds the Workload Manager probe.
+//
+// It is shorter than the readiness probe's own timeoutSeconds=1 so the in-process
+// request cannot outlive the probe that started it. The previous code called
+// http.Get, which uses http.DefaultClient and has NO timeout: once the Workload
+// Manager stopped answering, every 10s probe left a request hanging with no
+// deadline, and the 72-minute outage on 2026-09-06 would have accumulated a few
+// hundred of them.
+const wmHealthTimeout = 900 * time.Millisecond
+
+var wmHealthClient = &http.Client{Timeout: wmHealthTimeout}
+
+// classifyProbeErr maps a transport error onto a small closed set.
+//
+// Never the raw error: it carries the dialled address, and as a metric label
+// that mints a series per address.
+func classifyProbeErr(err error) string {
+	switch {
+	case err == nil:
+		return "status"
+	case errors.Is(err, context.DeadlineExceeded), os.IsTimeout(err):
+		return "timeout"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "error"
+	}
+}
+
+// noteReadiness records the readiness result and logs only the edges.
+//
+// Logging every probe would add six lines a minute to a container log that
+// already rotates within the hour, which is precisely how the 2026-09-06 window
+// was lost. Logging only transitions would leave a single line that rotates away
+// just as easily, so a sustained outage also gets a heartbeat -- enough to still
+// be visible in a truncated log, few enough to read.
+func (s *Server) noteReadiness(ready bool, check, reason, detail string) {
+	if ready {
+		routerReady.Set(1)
+	} else {
+		routerReady.Set(0)
+		readinessFailures.WithLabelValues(check, reason).Inc()
+	}
+
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+
+	now := time.Now()
+	if ready {
+		if !s.wasReady && !s.notReadySince.IsZero() {
+			log.Info("router.ready.recovered",
+				"downSeconds", now.Sub(s.notReadySince).Seconds())
+		}
+		s.wasReady, s.notReadySince, s.lastUnreadyLog = true, time.Time{}, time.Time{}
+		return
+	}
+
+	if s.wasReady || s.notReadySince.IsZero() {
+		s.notReadySince, s.lastUnreadyLog = now, now
+		s.wasReady = false
+		log.Warn("router.ready.lost", "check", check, "reason", reason, "detail", detail)
+		return
+	}
+	if now.Sub(s.lastUnreadyLog) >= unreadyHeartbeat {
+		s.lastUnreadyLog = now
+		log.Warn("router.ready.still_failing", "check", check, "reason", reason,
+			"detail", detail, "downSeconds", now.Sub(s.notReadySince).Seconds())
+	}
+}
+
+// unreadyHeartbeat is how often a sustained not-ready state repeats itself in
+// the log. Five minutes turns a 72-minute outage into ~14 lines.
+const unreadyHeartbeat = 5 * time.Minute
+
 func (s *Server) handleHealthReady(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if err := s.store.Ping(ctx); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "redis: " + err.Error()})
+		s.noteReadiness(false, "store", "error", err.Error())
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "store: " + err.Error()})
 		return
 	}
 
-	resp, err := http.Get(s.cfg.WorkloadManagerURL + "/health")
-	if err != nil || resp.StatusCode != http.StatusOK {
-		reason := "unreachable"
-		if err != nil {
-			reason = err.Error()
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + reason})
+	// Bound by the caller's context as well as the client timeout: when kubelet
+	// gives up at timeoutSeconds it cancels the request, and this makes that
+	// cancellation reach the outbound call instead of orphaning it.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.WorkloadManagerURL+"/health", nil)
+	if err != nil {
+		s.noteReadiness(false, "workload_manager", "error", err.Error())
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + err.Error()})
 		return
 	}
-	resp.Body.Close()
+	resp, err := wmHealthClient.Do(req)
+	if err != nil {
+		s.noteReadiness(false, "workload_manager", classifyProbeErr(err), err.Error())
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + err.Error()})
+		return
+	}
+	// Drain and close on every path. The previous code closed the body only on
+	// the 200 path, so a Workload Manager answering non-200 leaked a connection
+	// per probe.
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		detail := "status " + strconv.Itoa(resp.StatusCode)
+		s.noteReadiness(false, "workload_manager", "status", detail)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + detail})
+		return
+	}
 
+	s.noteReadiness(true, "", "", "")
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
