@@ -115,6 +115,45 @@ test("a DAG row that names nothing to reach or delete fails the read too", async
   }
 });
 
+test("a DAG value that is not a handle map at all counts as unreadable", async () => {
+  // Turned into an empty map, a whole DAG's worth of sandboxes disappears from
+  // the census and it still reports clean.
+  for (const corrupt of [null, "a string", 42, ["not", "a", "map"]]) {
+    const inventory = await collectSandboxInventory(deps({
+      dagHandles: async () => [["dag-1", corrupt as never]],
+    }));
+    assert.equal(inventory.ok, false, JSON.stringify(corrupt));
+    assert.equal(inventory.unreadable, 1, JSON.stringify(corrupt));
+  }
+});
+
+test("a row that names only half of what a rollback deletes by fails the read", async () => {
+  // A kubernetes Sandbox is addressed by name and namespace together; a row
+  // carrying one without the other names nothing kubectl can reach, so it is a
+  // sandbox this census can neither drain nor prove drained.
+  const halves = [
+    { status: "ready", provider: "agent-sandbox", handsUrl: "http://sb/mcp", sandboxName: "sb-1" },
+    { status: "ready", provider: "agent-sandbox", handsUrl: "http://sb/mcp", namespace: "ns-a" },
+  ];
+  for (const broken of halves) {
+    const entries = { "hands.sess-1": READY, "hands.sess-2": JSON.stringify(broken) };
+    const inventory = await collectSandboxInventory(deps({
+      handsKeys: async () => Object.keys(entries),
+      handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+    }));
+    assert.equal(inventory.ok, false, JSON.stringify(broken));
+    assert.equal(inventory.unreadable, 1, JSON.stringify(broken));
+  }
+
+  // The DAG half is held to the same rule.
+  const inventory = await collectSandboxInventory(deps({
+    dagHandles: async () => [["dag-1", {
+      primary: { workload_id: "", hands_url: "http://sb/mcp", provider: "agent-sandbox", sandbox_name: "sb-dag" },
+    }]],
+  }));
+  assert.equal(inventory.ok, false, "no namespace, so nothing to delete it by");
+});
+
 test("a handle source that cannot be read fails the whole answer", async () => {
   // Never a sessions-only inventory: a build whose census cannot see a DAG
   // sandbox at all must not look like a deployment that has none.

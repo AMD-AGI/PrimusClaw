@@ -1795,10 +1795,14 @@ class AgentLoopRunner {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
       // executing split exists to measure.
+      // The model-issued tool-use identifier: a run resumed from a sealed
+      // checkpoint re-issues the same one, which is what lets a background
+      // start recognise its own replay instead of running twice.
+      const stepCtx = { stepIdentity: toolId };
       resultText = WAITING_TOOLS.has(toolName)
         ? await whileWaiting(this.opts.runKey, "background_command", () =>
-            this.router.route(toolName, finalInput, this.signal))
-        : await this.router.route(toolName, finalInput, this.signal);
+            this.router.route(toolName, finalInput, this.signal, stepCtx))
+        : await this.router.route(toolName, finalInput, this.signal, stepCtx);
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result
         // text describes a business-level failure (exit != 0), which still came

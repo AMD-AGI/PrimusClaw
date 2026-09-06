@@ -39,18 +39,19 @@ export function bindHandsKv(kv: KV): void {
  * indistinguishable from a retention by key shape, so the first retention under
  * a matching generation would write over a live session's binding.
  */
-export async function migrateReservedKeys(kv: KV): Promise<void> {
-  const result = await migrateReservedSessionKeys({
-    keys: async (filter) => {
+/** The store shape the scans need, over the registry bucket. */
+export function reservedKeyStore(kv: KV) {
+  return {
+    keys: async (filter: string) => {
       const out: string[] = [];
       for await (const key of await kv.keys(filter)) out.push(key);
       return out;
     },
-    read: async (key) => {
+    read: async (key: string) => {
       const entry = await kv.get(key);
       return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
     },
-    create: async (key, value) => {
+    create: async (key: string, value: string) => {
       try {
         await kv.create(key, sc.encode(value));
         return true;
@@ -59,7 +60,7 @@ export async function migrateReservedKeys(kv: KV): Promise<void> {
         throw err;
       }
     },
-    delete: async (key, expectedRevision) => {
+    delete: async (key: string, expectedRevision: number) => {
       try {
         await kv.delete(key, { previousSeq: expectedRevision });
         return true;
@@ -68,7 +69,30 @@ export async function migrateReservedKeys(kv: KV): Promise<void> {
         throw err;
       }
     },
-  });
+  };
+}
+
+/**
+ * Move strays out of the reserved namespace, every sweep.
+ *
+ * The startup scan alone does not hold the invariant at upgrade time: new
+ * replicas start alongside old ones, and an old replica can recreate a reserved
+ * key after every new replica has already scanned. Repeating the scan on the
+ * cadence the sweep already runs at bounds that window to one interval instead
+ * of to the next restart. Reported rather than fatal here -- refusing to serve
+ * mid-sweep would take down a healthy replica -- and harmless while it stands,
+ * because a retention can only ever create its key (`reserveRetentionKey`) and
+ * so can never overwrite the stray it collides with.
+ */
+export async function reconcileReservedKeys(kv: KV): Promise<void> {
+  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
+  if (result.migrated.length || result.resumed.length || result.conflicted.length) {
+    logger.warn(result, "hands.reserved_key_reconciled");
+  }
+}
+
+export async function migrateReservedKeys(kv: KV): Promise<void> {
+  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
 
   if (result.migrated.length || result.resumed.length) {
     logger.warn(

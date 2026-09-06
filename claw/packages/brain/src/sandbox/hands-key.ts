@@ -20,6 +20,25 @@ export {
   HANDS_KEY_PREFIX, RETAINED_PREFIX, handsSessionKey, sessionIdFromHandsKey,
 } from "@claw/protocol";
 
+/**
+ * Claim the registry key a retention keeps its container's binding under.
+ *
+ * Create-only, and that is the guarantee rather than an optimisation: a
+ * retention that overwrote an existing entry would destroy a live session's
+ * binding, and the session would then be routed nowhere and swept as idle. A
+ * key already taken is refused, which is a retention that does not happen --
+ * recoverable -- instead of a session that is silently lost.
+ *
+ * Every retention write must go through here. The startup and sweep scans move
+ * strays out of this namespace; this is what makes a stray that has not been
+ * moved yet harmless rather than fatal.
+ */
+export async function reserveRetentionKey(
+  store: Pick<HandsKeyStore, "create">, generation: string, value: string,
+): Promise<boolean> {
+  return store.create(`${HANDS_KEY_PREFIX}${RETAINED_PREFIX}${generation}`, value);
+}
+
 /** Whether an entry's value carries the marker only a retention writes. */
 export function isRetentionEntry(value: unknown): boolean {
   return !!value && typeof value === "object"

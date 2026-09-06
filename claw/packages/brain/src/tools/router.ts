@@ -246,6 +246,8 @@ export class ToolRouter {
     name: string,
     input: Record<string, unknown>,
     signal?: AbortSignal,
+    /** Replay-stable identity of this call site; see HandsClient.CallContext. */
+    ctx?: { stepIdentity?: string },
   ): Promise<string> {
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
@@ -349,7 +351,7 @@ export class ToolRouter {
       // and the file was missing (e.g. Pi/Codex don't materialize skills to disk),
       // the skill name still landed in skillsRead and polluted feedback / probation /
       // evolution stats with attribution to a skill that never actually loaded.
-      const result = await (await this.requireHands()).callTool(name, input, signal);
+      const result = await (await this.requireHands()).callTool(name, input, signal, ctx);
       if (name === "bash" && typeof input.command === "string") {
         this.trackSkillRead(input.command);
       } else if ((name === "read" || name === "grep" || name === "glob") && typeof input.path === "string") {

@@ -18,7 +18,7 @@
 import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -166,6 +166,27 @@ test("an unreadable subtree answers unknown, never zero", async () => {
   assert.equal(res.statusCode, 503,
     "a status the caller turns into its own unanswered-probe case, which keeps "
       + "the sandbox rather than filing it idle");
+
+  child.kill("SIGKILL");
+});
+
+test("one unreadable record makes the whole answer indeterminate, not smaller", async () => {
+  // Skipped, that record's shell simply vanishes from a count that still reads
+  // determinate -- so the sandbox is filed idle on the strength of a file
+  // nobody could open, which is the same reclaim by another route.
+  const child = spawnRecorded("readable");
+  spawnRecorded("corrupt");
+  const corruptPath = join(
+    process.env.HANDS_STATE_DIR!, "scopes",
+    ...["sess-restart", "ktsk_1", "corrupt"].map((p) => p.replace(/[^A-Za-z0-9_-]/g, (c) =>
+      `~${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)),
+  );
+  writeFileSync(corruptPath, "{ not a record");
+  restartHands();
+
+  assert.equal(ownerLiveness(OWNER, emptyRegistry).determinate, false);
+  assert.equal(runningShellCount(OWNER), null,
+    "not a determinate count of the records that happened to parse");
 
   child.kill("SIGKILL");
 });

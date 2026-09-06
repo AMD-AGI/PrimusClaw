@@ -109,9 +109,20 @@ function dagRows(
   const rows: DagHandleRow[] = [];
   let unreadable = 0;
   for (const [dagRootTaskId, handles] of all) {
-    for (const [handle, info] of Object.entries(handles ?? {})) {
+    // A row whose whole value is null or not an object is a DAG's entire handle
+    // set unreadable, not a DAG with no handles: turning it into an empty map
+    // drops every sandbox it named and reports a clean census.
+    if (!handles || typeof handles !== "object" || Array.isArray(handles)) {
+      unreadable += 1;
+      continue;
+    }
+    for (const [handle, info] of Object.entries(handles)) {
       if (!info || typeof info !== "object" || !isUsable({
-        handsUrl: info.hands_url, sandboxName: info.sandbox_name, workloadId: info.workload_id,
+        handsUrl: info.hands_url,
+        sandboxName: info.sandbox_name,
+        namespace: info.namespace,
+        workloadId: info.workload_id,
+        provider: info.provider,
       })) {
         unreadable += 1;
         continue;
@@ -140,8 +151,17 @@ function dagRows(
  */
 function isUsable(info: Record<string, unknown>): boolean {
   const nonEmpty = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
-  return nonEmpty(info.handsUrl)
-    && (nonEmpty(info.sandboxName) || nonEmpty(info.workloadId));
+  if (!nonEmpty(info.handsUrl)) return false;
+  // What a rollback deletes by differs per provider, so "has an identifier" is
+  // not the test: a kubernetes Sandbox is addressed by name *and* namespace,
+  // and a row carrying one without the other names nothing kubectl can reach.
+  if (info.provider === "agent-sandbox") {
+    return nonEmpty(info.sandboxName) && nonEmpty(info.namespace);
+  }
+  if (nonEmpty(info.workloadId)) return true;
+  // An unstated provider is classified by what it carries, and carries enough
+  // only if it is addressable as a Sandbox.
+  return nonEmpty(info.sandboxName) && nonEmpty(info.namespace);
 }
 
 /**

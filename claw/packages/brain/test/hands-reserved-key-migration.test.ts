@@ -18,8 +18,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  RETAINED_PREFIX, handsSessionKey, migrateReservedSessionKeys, sessionIdFromHandsKey,
-  type HandsKeyStore,
+  RETAINED_PREFIX, handsSessionKey, migrateReservedSessionKeys, reserveRetentionKey,
+  sessionIdFromHandsKey, type HandsKeyStore,
 } from "../src/sandbox/hands-key.js";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
@@ -174,4 +174,43 @@ test("no session id can be keyed into the reserved namespace afterwards", () => 
     assert.equal(sessionIdFromHandsKey(key), id, id);
   }
   assert.notEqual(handsSessionKey(`${RETAINED_PREFIX}a`), handsSessionKey(`${RETAINED_PREFIX}b`));
+});
+
+test("a key an old replica recreates after the scan is moved by the next sweep", async () => {
+  // The upgrade window this has to hold in: new replicas start alongside old
+  // ones, so a scan that runs once at startup can be overtaken by an old writer
+  // and the stray then stands until somebody restarts. Repeating the scan is
+  // what bounds it, so the same function has to be safe and effective run again
+  // and again.
+  const colliding = `${RETAINED_PREFIX}LATE`;
+  const store = memoryStore();
+
+  assert.deepEqual((await migrateReservedSessionKeys(store)).migrated, [],
+    "the first pass finds nothing, as it would mid-upgrade");
+
+  store.map.set(`hands.${colliding}`, { value: session(colliding), revision: 1 });
+
+  const second = await migrateReservedSessionKeys(store);
+  assert.deepEqual(second.migrated, [`hands.${colliding}`],
+    "the next pass moves what appeared after the last one");
+  assert.equal(store.map.has(`hands.${colliding}`), false);
+
+  const third = await migrateReservedSessionKeys(store);
+  assert.deepEqual(third, { scanned: 0, migrated: [], resumed: [], conflicted: [] },
+    "and running it again costs nothing, which is what lets it run every sweep");
+});
+
+test("a retention can never take a key a session still holds", async () => {
+  // What makes a stray harmless while it stands. A retention that overwrote an
+  // existing entry would destroy a live session's binding, and the session
+  // would then be routed nowhere and swept as idle.
+  const generation = "LATE";
+  const store = memoryStore({ [`hands.${RETAINED_PREFIX}${generation}`]: session("a-live-session") });
+
+  assert.equal(await reserveRetentionKey(store, generation, retention()), false,
+    "refused, which is a retention that does not happen -- recoverable");
+  assert.equal(store.map.get(`hands.${RETAINED_PREFIX}${generation}`)!.value, session("a-live-session"),
+    "and the session's own binding is exactly as it was");
+
+  assert.equal(await reserveRetentionKey(store, "FREE", retention()), true);
 });

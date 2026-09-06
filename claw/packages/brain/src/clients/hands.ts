@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
@@ -278,6 +278,60 @@ export function countForegroundTimeout(result: unknown): void {
 }
 
 /**
+ * The sandbox answered, and the answer is that it does not know.
+ *
+ * Kept apart from a probe that failed to arrive. A blip is transient and giving
+ * up on it eventually is right; this is the sandbox reporting that its own
+ * durable state is unreadable, and treating a run of those as "idle" reclaims
+ * exactly the sandbox whose records were lost.
+ */
+export class HandsLivenessIndeterminate extends Error {}
+
+/** What Hands answers with when it cannot read its own shell records. */
+export const HANDS_LIVENESS_INDETERMINATE = "shell_liveness_indeterminate";
+
+/** What one dispatch answers with, whichever route asked. */
+export interface DispatchOutcome {
+  text: string;
+  isError: boolean;
+  structured?: unknown;
+}
+
+/**
+ * What identifies this call for a replay that has to recognise it again.
+ *
+ * `stepIdentity` is the model-issued tool-use identifier in agent mode and the
+ * step's position in script mode. Both are reproduced byte for byte by a
+ * resumed run, which is the whole property a derived shell id needs.
+ */
+export interface CallContext {
+  stepIdentity?: string;
+}
+
+/**
+ * The shell id a background start gets when its caller named none.
+ *
+ * Derived, not minted: a fresh identifier on every call means a replay after a
+ * crash looks for a row keyed by an id nothing wrote, finds nothing, and
+ * dispatches the command a second time -- which is the duplicate execution the
+ * whole reference row exists to prevent, reintroduced on the path most starts
+ * take. Every input is reproduced exactly by a resumed run.
+ */
+export function derivedShellId(
+  owner: string, run: string, step: string | undefined, command: unknown,
+): string {
+  const digest = createHash("sha256")
+    .update(owner).update("\u0000")
+    .update(run).update("\u0000")
+    // The step identity alone would be enough where there is one; the command
+    // keeps two starts of one step apart where there is not.
+    .update(step ?? "").update("\u0000")
+    .update(typeof command === "string" ? command : "")
+    .digest("hex");
+  return `bg-${digest.slice(0, 12)}`;
+}
+
+/**
  * Header naming who a tool call is for. Hands files background shells under it
  * so a sandbox handed to a new run cannot read or kill the previous
  * occupant's processes, and so a caller-chosen `shell_id` is private to its
@@ -501,9 +555,11 @@ export class HandsClient {
    * both by making every start a named one -- the value is in the sandbox's own
    * format and the model is told the same string either way.
    */
-  private fixStartArgs(args: Record<string, unknown>): Record<string, unknown> {
+  private fixStartArgs(
+    args: Record<string, unknown>, step: string | undefined,
+  ): Record<string, unknown> {
     if (typeof args.shell_id === "string" && args.shell_id) return args;
-    return { ...args, shell_id: `bg-${randomUUID().slice(0, 8)}` };
+    return { ...args, shell_id: derivedShellId(this.owner, this.run, step, args.command) };
   }
 
   /**
@@ -526,16 +582,16 @@ export class HandsClient {
    * crash could run twice.
    */
   private async dispatch(
-    name: string, args: Record<string, unknown>, signal?: AbortSignal,
-  ): Promise<{ text: string; isError: boolean; structured?: unknown } | { refused: string }> {
+    name: string, args: Record<string, unknown>, signal?: AbortSignal, ctx: CallContext = {},
+  ): Promise<DispatchOutcome> {
     await this.connect();
     const isStart = name === "bash" && args.run_in_background === true;
-    const fixed = isStart ? this.fixStartArgs(args) : args;
+    const fixed = isStart ? this.fixStartArgs(args, ctx.stepIdentity) : args;
     const store = bgRowStore();
     const address = isStart ? this.startAddress(fixed) : null;
     if (address && store) {
       const settled = await this.resolveBackgroundStart(address, store);
-      if (settled !== null) return { refused: settled };
+      if (settled) return settled;
     }
 
     const wired = await this.wireArgs(name, fixed);
@@ -576,7 +632,7 @@ export class HandsClient {
    */
   private async resolveBackgroundStart(
     address: BgHandleAddress, store: BgRowStore,
-  ): Promise<string | null> {
+  ): Promise<DispatchOutcome | null> {
     let row: BgHandleRow | null = null;
     let rowReadable = true;
     try {
@@ -597,14 +653,30 @@ export class HandsClient {
       { shellId: address.shellId, action: decision.action, reported: decision.reported },
       "bg_start.resolved",
     );
+    // Two different answers, and collapsing them costs a script step its
+    // outcome: a start that was already made is a success carrying the existing
+    // shell, while one that cannot be resolved is a genuine failure. Reported
+    // as one, a safely-deduplicated replay fails a step whose work is done.
     if (decision.action === "resolve") {
-      return `Background shell ${address.shellId} was already started by this request; `
-        + `nothing was run a second time (${decision.reported}`
-        + `${decision.shellClass ? `, ${decision.shellClass}` : ""}). ${decision.reason}.`;
+      return {
+        text: `Background shell ${address.shellId} was already started by this request; `
+          + `nothing was run a second time (${decision.reported}`
+          + `${decision.shellClass ? `, ${decision.shellClass}` : ""}). ${decision.reason}.`,
+        isError: false,
+        structured: {
+          shell_id: address.shellId,
+          resolution: decision.reported,
+          ...(decision.shellClass ? { shell_class: decision.shellClass } : {}),
+        },
+      };
     }
     if (decision.action === "refuse") {
-      return `Error: whether background shell ${address.shellId} was started cannot be `
-        + `determined, so it was not started again. ${decision.reason}.`;
+      return {
+        text: `Error: whether background shell ${address.shellId} was started cannot be `
+          + `determined, so it was not started again. ${decision.reason}.`,
+        isError: true,
+        structured: { shell_id: address.shellId, resolution: decision.reported },
+      };
     }
     // A first call writes both states; a retransmission's row already carries
     // them and re-writing is a no-op the advance recognises.
@@ -617,9 +689,9 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    ctx?: CallContext,
   ): Promise<string> {
-    const result = await this.dispatch(name, args, signal);
-    return "refused" in result ? result.refused : result.text;
+    return (await this.dispatch(name, args, signal, ctx)).text;
   }
 
   /**
@@ -633,13 +705,9 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<{ text: string; isError: boolean; structured?: unknown }> {
-    const result = await this.dispatch(name, args, signal);
-    // A refusal is a refusal on this route too: a script step that read it as
-    // ordinary output would carry on as though the command had run.
-    return "refused" in result
-      ? { text: result.refused, isError: true }
-      : result;
+    ctx?: CallContext,
+  ): Promise<DispatchOutcome> {
+    return this.dispatch(name, args, signal, ctx);
   }
 
   /**
@@ -806,8 +874,18 @@ export async function countActiveShells(
     signal: AbortSignal.timeout(timeoutMs),
     dispatcher: HANDS_DISPATCHER,
   } as Parameters<typeof undiciFetch>[1]);
+  const body = await resp.json().catch(() => null) as
+    { running?: unknown; error?: unknown } | null;
+  // The sandbox saying it cannot tell is a different fact from a refusal, and
+  // from a probe that did not arrive: no number of repetitions turns it into
+  // "idle". Keyed on what it said rather than on the status alone, so an
+  // unrelated 503 keeps meaning what it meant.
+  if (body?.error === HANDS_LIVENESS_INDETERMINATE) {
+    throw new HandsLivenessIndeterminate(
+      "hands_active_shells_indeterminate: the sandbox cannot read its own shell records",
+    );
+  }
   if (!resp.ok) throw new Error(`hands_active_shells_failed: status=${resp.status}`);
-  const body = await resp.json().catch(() => null) as { running?: unknown } | null;
   const running = body?.running;
   if (typeof running !== "number" || !Number.isFinite(running) || running < 0) {
     throw new Error(`hands_active_shells_failed: malformed body running=${String(running)}`);

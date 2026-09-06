@@ -1765,10 +1765,16 @@ class TaskRunner {
    * the idle-skip-ping + expiry side of this.
    */
   private stopKeepaliveAfterTask(): void {
+    // The handle is kept for the next message, so the sandbox is still a target
+    // the sweep can reconcile back in. Its admission slot stays with it: given
+    // up here, the ceiling is handed to another provisioning while this sandbox
+    // is still counted, which is the over-cap state reached through ordinary
+    // use rather than through a race.
+    const keepSlot = { releaseSlot: false };
     if (this.handsIdentity) {
-      fx().unregisterSandbox(this.sessionId, this.handsIdentity);
+      fx().unregisterSandbox(this.sessionId, this.handsIdentity, keepSlot);
     } else if (this.handsWorkloadId) {
-      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId });
+      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId }, keepSlot);
     }
     if (this.handsIdentity) {
       fx().markHandsIdle(this.kv, this.sessionId, this.handsIdentity);

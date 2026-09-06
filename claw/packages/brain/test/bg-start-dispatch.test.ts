@@ -196,24 +196,62 @@ test("a start under a replaced sandbox is answered from the row, not dispatched"
   assert.match(text, /lost/);
 });
 
-test("a start naming no id is protected too, which is the common start", async () => {
-  // The caller names nothing and the id is fixed here, before the dispatch, so
-  // the row exists to key the crash window by. Left to the sandbox to mint,
-  // this path had no protection at all -- and it is the one every ordinary
-  // background start takes.
+const NO_ID_START = { command: "train.sh", run_in_background: true };
+const STEP = { stepIdentity: "toolu_abc123" };
+
+test("a start naming no id recovers its own id on the replay, not a fresh one", async () => {
+  // The common start names nothing. An id minted fresh per call means the
+  // replay looks for a row keyed by an id nothing wrote, finds none, and
+  // dispatches the command a second time -- the duplicate execution the row
+  // exists to prevent, on the path most starts take. The id is derived from
+  // what a resumed run reproduces exactly, so the replay finds its own row.
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", { command: "train.sh", run_in_background: true }));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP));
 
   const rows = await bgRowStore()!.keys("bgshell.*.*.*");
   assert.equal(rows.length, 1, "a row was keyed before anything was sent");
   const row = JSON.parse((await bgRowStore()!.read(rows[0]))!.value) as { state: string; shellId: string };
   assert.equal(row.state, "dispatched");
-  assert.match(row.shellId, /^bg-[0-9a-f]{8}$/);
+
+  // The resumed run: same tool-use identifier, same arguments, no id of its own.
+  recordAnswer = { marker: true, subtreeReadable: true, present: false };
+  const resumed = pod();
+  await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP);
+
+  assert.equal(resumed.sent.length, 1, "retransmitted, because no claim had landed");
+  assert.equal(resumed.sent[0].shell_id, row.shellId,
+    "and under the id the crashed dispatch already wrote a row for");
+  assert.deepEqual(await bgRowStore()!.keys("bgshell.*.*.*"), rows,
+    "one row, not a second one keyed by a freshly minted id");
 });
 
-test("a script-mode start gets the same protection as an agent one", async () => {
-  // The script route used to carry the id rewriting and none of the resolution,
-  // so a replayed step could run a command the same crash already ran.
+test("a no-id start whose send did land is resolved, never run twice", async () => {
+  const first = pod({ dieOnHandoff: true });
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP));
+  recordAnswer = { marker: true, subtreeReadable: true, present: true };
+
+  const resumed = pod();
+  const text = await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP);
+
+  assert.equal(resumed.sent.length, 0);
+  assert.match(text, /nothing was run a second time/);
+});
+
+test("two different call sites in one run get different ids", async () => {
+  // Deriving from the replay-stable identity must not collapse two genuinely
+  // different starts into one, which would refuse the second as a duplicate.
+  const { hands, sent } = pod();
+  await hands.callTool("bash", NO_ID_START, undefined, { stepIdentity: "toolu_one" });
+  await hands.callTool("bash", NO_ID_START, undefined, { stepIdentity: "toolu_two" });
+
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[0].shell_id, sent[1].shell_id);
+});
+
+test("a script-mode replay that is safely deduplicated is not a step failure", async () => {
+  // The step's work is done and its shell exists. Reported as an error, an
+  // `on_fail` policy fires on a replay that behaved exactly as intended, and
+  // the script stops or retries work that already succeeded.
   await assert.rejects(() => pod({ dieOnHandoff: true }).hands.callToolFull("bash", START));
   assert.equal(await rowState(), "dispatched");
 
@@ -222,10 +260,24 @@ test("a script-mode start gets the same protection as an agent one", async () =>
   const result = await resumed.hands.callToolFull("bash", START);
 
   assert.equal(resumed.sent.length, 0, "nothing goes out");
-  assert.equal(result.isError, true,
-    "and a script step reading this as ordinary output would carry on as though "
-      + "the command had run");
+  assert.equal(result.isError, false, "a start that was already made is a success");
   assert.match(result.text, /nothing was run a second time/);
+  assert.deepEqual(
+    (result.structured as { shell_id: string; resolution: string }),
+    { shell_id: "trainer", resolution: "deduplicated" },
+    "and the step can read which it was without matching prose",
+  );
+});
+
+test("a script-mode replay that cannot be resolved is a step failure", async () => {
+  // The other half: nothing says whether the command ran, so carrying on as
+  // though it had is exactly what `on_fail` is for.
+  await assert.rejects(() => pod({ dieOnHandoff: true }).hands.callToolFull("bash", START));
+  recordAnswer = { marker: true, subtreeReadable: false, present: false };
+
+  const result = await pod().hands.callToolFull("bash", START);
+  assert.equal(result.isError, true);
+  assert.match(result.text, /cannot be determined/);
 });
 
 test("a script-mode start that is a genuine first call goes out and is confirmed", async () => {

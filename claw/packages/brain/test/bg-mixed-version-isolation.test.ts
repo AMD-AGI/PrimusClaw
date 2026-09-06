@@ -96,7 +96,9 @@ test("a start with no id of its own is still addressable afterwards", async () =
   const started = await hands.callTool("bash", { command: "train", run_in_background: true });
 
   const publicId = /background shell (\S+?)\./.exec(started)![1];
-  assert.match(publicId, /^bg-[0-9a-f]{8}$/, "in the sandbox's own format");
+  assert.match(publicId, /^bg-[0-9a-f]{12}$/,
+    "in the sandbox's own shape, and derived rather than minted so a replay "
+      + "recovers the same one");
   const onTheWire = String(sent[0].shell_id);
   assert.notEqual(onTheWire, publicId, "qualified going out");
 

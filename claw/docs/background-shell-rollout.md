@@ -106,8 +106,9 @@ cr() { local out; out=$(kubectl get sandbox -n "$SBNS" "$SBNAME" --ignore-not-fo
 dispatch() { curl -sf -X POST "https://$API_HOST/v1/sessions/$SESSION_ID/tasks" -H "$USER" \
     -H 'content-type: application/json' -d "$(jq -n --arg p "$1" '{prompt:$p}')" \
   | jq -er 'select(.ok == true) | .task_id // empty'; }
-# Poll one task to terminal, printing the fields `settle_verdict` judges.
-# Reaching terminal is not succeeding: `settle_verdict` is what says which.
+# Poll one task to terminal, printing the fields `settle_verdict` judges --
+# including `by_tool`, which is what says a command actually ran in the sandbox.
+# Reaching terminal is not succeeding, and completing is not refreshing.
 settle() { local i b; for i in $(seq 1 "$N_POLL"); do
     b=$(curl -sf --max-time "$T_CURL" -H "$USER" "https://$API_HOST/v1/tasks/$1") || { sleep "$I_POLL"; continue; }
     printf '%s' "$b" | jq -e '.item.status | test("^(completed|failed|cancelled)$")' >/dev/null \

@@ -21,7 +21,8 @@
 import type { KV } from "nats";
 import pino from "pino";
 import {
-  bindSlot, claimProvisionalSlot, releaseSlot, type RosterConfig, type RosterStore,
+  CeilingDisagreement, bindSlot, claimProvisionalSlot, releaseSlot,
+  type RosterConfig, type RosterStore,
 } from "./admission-roster.js";
 import type { CapacitySettings } from "./keepalive-capacity.js";
 import { rosterDeps } from "./roster-store.js";
@@ -30,9 +31,24 @@ const logger = pino({ name: "sandbox-admission" });
 
 let roster: { store: RosterStore; config: RosterConfig } | null = null;
 
-/** Bind the roster this process admits against. Called once at boot. */
-export function bindAdmission(kv: KV, capacity: CapacitySettings): void {
+/**
+ * Bind the roster this process admits against, and check it agrees.
+ *
+ * The ceiling is stamped on the roster by the first claim made against it and
+ * one value governs the whole fleet, so a replica configured differently would
+ * compute a different deferral count and prove a different refresh gap against
+ * the same handles. Read here, at boot, and raised: discovering it on a later
+ * sweep means the replica is already serving requests under a bound it does not
+ * share, and is reported healthy while doing so.
+ */
+export async function bindAdmission(kv: KV, capacity: CapacitySettings): Promise<void> {
   roster = rosterDeps(kv, capacity).roster ?? null;
+  if (!roster) return;
+  const current = await roster.store.read();
+  if (current && current.roster.ceiling !== roster.config.ceiling) {
+    roster = null;
+    throw new CeilingDisagreement(current.roster.ceiling, capacity.ceiling);
+  }
 }
 
 /**
@@ -44,12 +60,20 @@ export function bindAdmission(kv: KV, capacity: CapacitySettings): void {
  * horizon, and ordinary teardown of a busy deployment refuses admission for
  * sandboxes that no longer exist.
  */
-export async function releaseAdmission(identity: string): Promise<void> {
-  if (!roster) return;
-  await releaseSlot(roster.store, roster.config, { identity })
-    .catch((err) => logger.warn(
-      { identity, err: (err as Error)?.message }, "admission.release_failed",
-    ));
+export async function releaseAdmission(identity: string): Promise<boolean> {
+  if (!roster) return true;
+  const released = await releaseSlot(roster.store, roster.config, { identity })
+    .catch((err) => {
+      logger.error({ identity, err: (err as Error)?.message }, "admission.release_failed");
+      return false;
+    });
+  if (!released) {
+    // Reported, not assumed: a release that lost every retry leaves the slot
+    // counted against the ceiling until the reclaim horizon, and a caller that
+    // treated this as done would never look again.
+    logger.error({ identity }, "admission.release_unconfirmed");
+  }
+  return released;
 }
 
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */

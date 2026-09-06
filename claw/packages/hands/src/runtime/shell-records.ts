@@ -269,6 +269,9 @@ export function listRecordsForOwner(owner: string): ShellRecord[] {
   return out;
 }
 
+/** Raised where a record exists and cannot be used. Never a smaller count. */
+export class UnreadableRecord extends Error {}
+
 /** The owner's own path components, taken from a triple whose other parts are
  *  fixed, so the chunking rule is applied in exactly one place. */
 function ownerComponents(owner: string): string[] {
@@ -290,9 +293,21 @@ function walkRecords(dir: string, out: ShellRecord[]): void {
       walkRecords(path, out);
       continue;
     }
+    // Raised, not skipped. A record that cannot be read may be the live shell,
+    // and dropping it lets the count come back a determinate zero -- which is
+    // the sandbox being reclaimed on the strength of a file nobody could open.
+    // The writer is atomic, so a torn read is a fault worth surfacing.
+    let raw: string;
     try {
-      out.push(JSON.parse(readFileSync(path, "utf8")) as ShellRecord);
-    } catch { /* a torn or foreign file is not a record; the writer is atomic */ }
+      raw = readFileSync(path, "utf8");
+    } catch (e) {
+      throw new UnreadableRecord(`record ${path} could not be read: ${(e as Error).message}`);
+    }
+    try {
+      out.push(JSON.parse(raw) as ShellRecord);
+    } catch (e) {
+      throw new UnreadableRecord(`record ${path} is not a record: ${(e as Error).message}`);
+    }
   }
 }
 

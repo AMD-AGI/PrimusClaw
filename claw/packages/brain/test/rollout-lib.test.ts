@@ -120,20 +120,32 @@ test("hands_base strips the MCP suffix the census reports", () => {
   }
 });
 
-test("only a completed activity refresh counts as one", () => {
-  // Terminal is not successful. A run that failed or was cancelled left the
-  // session idle, and an idle session is reclaimed by a path that has nothing
-  // to do with the absolute cap -- so accepting any terminal state proves the
-  // wrong thing about the CR that then disappears.
-  assert.equal(callLib(`settle_verdict '{"status":"completed"}'`).code, 0);
+const COMPLETED = `'{"status":"completed","by_tool":{"bash":1}}'`;
+
+test("only a completed activity refresh that actually ran counts as one", () => {
+  // Terminal is not successful, and completed is not refreshed. A run that
+  // failed or was cancelled left the session idle; so did one where the model
+  // answered "Run: echo alive" without calling anything, which completes
+  // cleanly while the sandbox goes the whole iteration untouched. Both are
+  // reclaimed by a path that has nothing to do with the absolute cap.
+  assert.equal(callLib(`settle_verdict ${COMPLETED}`).code, 0);
 
   for (const status of ["failed", "cancelled", "NOT_TERMINAL"]) {
-    const result = callLib(`settle_verdict '{"status":"${status}"}'`);
+    const result = callLib(`settle_verdict '{"status":"${status}","by_tool":{"bash":1}}'`);
     assert.equal(result.code, 1, status);
     assert.match(result.err, /activity task/, status);
   }
-  assert.equal(callLib(`settle_verdict 'not json'`).code, 1, "and an unreadable result is a failure");
-  assert.equal(callLib(`settle_verdict '{}'`).code, 1, "as is one carrying no status at all");
+
+  const noCall = callLib(`settle_verdict '{"status":"completed","by_tool":{}}'`);
+  assert.equal(noCall.code, 1, "completed without touching the sandbox is not a refresh");
+  assert.match(noCall.err, /without calling bash/);
+
+  const otherTool = callLib(`settle_verdict '{"status":"completed","by_tool":{"read":3}}'`);
+  assert.equal(otherTool.code, 1, "and a different tool is not the one that refreshes it");
+
+  assert.equal(callLib(`settle_verdict 'not json'`).code, 1, "an unreadable result is a failure");
+  assert.equal(callLib(`settle_verdict '{"status":"completed"}'`).code, 1,
+    "as is one carrying no call counts at all");
 });
 
 test("G7-d2 does not pass on a failed activity refresh", () => {
@@ -141,7 +153,7 @@ test("G7-d2 does not pass on a failed activity refresh", () => {
   // it before the CR is ever looked at.
   const gate = `
     dispatch() { echo "task-1"; }
-    settle() { echo '{"status":"failed","out":"boom"}'; }
+    settle() { echo '{"status":"failed","by_tool":{"bash":1}}'; }
     tid=$(dispatch 'Run: echo alive') || exit 1
     settle_verdict "$(settle "$tid")" || exit 1
     echo REACHED_THE_CR_CHECK`;
@@ -153,10 +165,24 @@ test("G7-d2 does not pass on a failed activity refresh", () => {
   assert.match(result.err, /ended failed/);
 });
 
+test("G7-d2 does not pass on a task that completed without touching the sandbox", () => {
+  const gate = `
+    dispatch() { echo "task-1"; }
+    settle() { echo '{"status":"completed","by_tool":{}}'; }
+    tid=$(dispatch 'Run: echo alive') || exit 1
+    settle_verdict "$(settle "$tid")" || exit 1
+    echo REACHED_THE_CR_CHECK`;
+  const result = callLib(gate);
+
+  assert.equal(result.code, 1);
+  assert.doesNotMatch(result.out, /REACHED_THE_CR_CHECK/);
+  assert.match(result.err, /no command ran in the sandbox/);
+});
+
 test("G7-d2 proceeds past a genuinely completed refresh", () => {
   const gate = `
     dispatch() { echo "task-1"; }
-    settle() { echo '{"status":"completed"}'; }
+    settle() { echo '{"status":"completed","by_tool":{"bash":1}}'; }
     tid=$(dispatch 'Run: echo alive') || exit 1
     settle_verdict "$(settle "$tid")" || exit 1
     deadline_verdict gone true 1200 1000`;

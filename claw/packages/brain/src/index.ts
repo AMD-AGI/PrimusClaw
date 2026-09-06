@@ -882,7 +882,10 @@ async function main() {
   });
   // The same roster the sweep reconciles against, so a slot claimed before
   // provisioning and a target discovered by a sweep are one accounting.
-  bindAdmission(kv, capacity);
+  // Awaited and unguarded: a ceiling this replica does not share with the
+  // fleet is a different refresh gap proven against the same handles, and
+  // discovering it on a later sweep means it is already serving requests.
+  await bindAdmission(kv, capacity);
   startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
 
   // Background sweeper: evict stale Hands KV entries whose workloads died

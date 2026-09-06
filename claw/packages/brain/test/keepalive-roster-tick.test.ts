@@ -76,16 +76,20 @@ let kv: KV & { seed(key: string, value: string): void };
 let restoreProviders: (() => void) | null = null;
 /** Which sandboxes this tick actually reached. */
 let pinged: string[];
+/** Runs inside the ping phase, so a test can make something arrive mid-sweep. */
+let onPing: (() => void) | null = null;
 
 beforeEach(() => {
   values = new Map();
   kv = makeKv(values);
   pinged = [];
+  onPing = null;
   resetBackgroundWorkStateForTest();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
       async exec(inst: { id: string }) {
         pinged.push(inst.id);
+        onPing?.();
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     } as unknown as SandboxProvider,
@@ -126,15 +130,65 @@ test("a handle record another replica wrote is admitted and pinged in the same t
   assert.ok(pinged.includes("wl-local"));
 });
 
-test("a full roster still admits and serves a remote target", async () => {
-  // At the reserve boundary an ordinary claim is refused. Reconciliation is not
-  // an ordinary claim: the target already exists and its refresh is this
-  // replica's business whoever created it.
+test("remote registrations past the ceiling are admitted, reported, and served", async () => {
+  // Genuinely over-cap: the roster is at the reserve boundary and three more
+  // targets appear that it does not hold, which is more than the reserve and
+  // more than the ceiling. Reconciliation is not an ordinary claim -- those
+  // sandboxes exist and their refresh is this replica's business whoever
+  // created them -- so it admits regardless and the size above the ceiling is
+  // declared rather than resolved by dropping one.
   const filler = Array.from({ length: CONFIG.ceiling - CONFIG.reconciliationReserve }, (_, i) => ({
     identity: `sandbox-filler-${i}`, token: `t${i}`, claimedBy: "replica-b", renewedAtMs: Date.now(),
   }));
   kv.seed("keepalive.roster", JSON.stringify({ ceiling: CONFIG.ceiling, entries: filler }));
-  kv.seed("hands.sess-remote", entry("wl-remote"));
+  for (const n of [1, 2, 3]) kv.seed(`hands.sess-remote-${n}`, entry(`wl-remote-${n}`));
+
+  const probed: string[] = [];
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async (_url, _token, owner) => { probed.push(owner); return 1; },
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  const after = roster()!;
+  assert.equal(after.entries.length, filler.length + 3);
+  assert.ok(after.entries.length > CONFIG.ceiling, "genuinely past the declared ceiling");
+  for (const n of [1, 2, 3]) {
+    assert.ok(after.entries.some((e) => e.identity === `sess-remote-${n}:safe:wl-remote-${n}`), `remote ${n}`);
+    assert.ok(pinged.includes(`wl-remote-${n}`),
+      "served in this tick, not deferred behind the admitted ones");
+  }
+  for (const seeded of filler) {
+    assert.ok(after.entries.some((e) => e.identity === seeded.identity),
+      "nothing is expired, reclaimed or evicted on account of the breach");
+  }
+
+  // An ordinary claim stays refused while the breach stands.
+  const { bindAdmission, admitSandbox, SandboxCapacityRefused } =
+    await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  await assert.rejects(() => admitSandbox("sess-new"), SandboxCapacityRefused);
+});
+
+test("a registration arriving mid-sweep is admitted and served by the next one", async () => {
+  // The sweep takes its target list once and then serves it, so a sandbox
+  // registered after that snapshot belongs to the next tick. What must hold is
+  // that it is not lost: the roster admits it when the next sweep sees it, and
+  // nothing about the tick it arrived during leaves it unaccounted for.
+  kv.seed("hands.sess-existing", entry("wl-existing"));
+  let arrived = false;
+  // The ping phase runs after the target list is taken and after admission, so
+  // a registration made from inside it is one that lands mid-sweep.
+  onPing = () => {
+    if (arrived) return;
+    arrived = true;
+    kv.seed("hands.sess-latecomer", entry("wl-latecomer"));
+    registerSandbox("sess-local", {
+      provider: "safe-workload", workloadId: "wl-local", platformKey: "pk", namespace: "ns",
+    });
+  };
 
   await runKeepaliveTickForTest({
     kv,
@@ -142,8 +196,22 @@ test("a full roster still admits and serves a remote target", async () => {
     roster: { store: rosterStore(kv), config: CONFIG },
   });
 
-  assert.ok(roster()!.entries.some((e) => e.identity === "sess-remote:safe:wl-remote"));
-  assert.ok(pinged.includes("wl-remote"));
+  assert.ok(arrived, "the registration really did land during the sweep");
+  assert.ok(!pinged.includes("wl-latecomer"), "it belongs to the next tick, not this one");
+
+  pinged.length = 0;
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => 1,
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  const identities = roster()!.entries.map((e) => e.identity);
+  assert.ok(identities.includes("sess-latecomer:safe:wl-latecomer"),
+    "admitted, so it counts against the ceiling like every other target");
+  assert.ok(identities.includes("sess-local:safe:wl-local"));
+  assert.ok(pinged.includes("wl-latecomer"), "and served");
+  assert.ok(pinged.includes("wl-local"));
 });
 
 test("a sandbox that is unregistered gives its slot straight back", async () => {
@@ -164,4 +232,29 @@ test("a sandbox that is unregistered gives its slot straight back", async () => 
 
   assert.ok(!roster()!.entries.some((e) => e.identity === identity),
     "released on the ordinary path, not left to the stale horizon");
+});
+
+test("a sandbox parked for idle reuse keeps its slot", async () => {
+  // A turn that ends stops pinging its sandbox but keeps the handle for the
+  // next message, and a background shell started that turn is expected to still
+  // be there. Releasing the slot then hands the ceiling to another provisioning
+  // while this sandbox is still a target the sweep will reconcile back in --
+  // the over-cap state admission exists to prevent, reached through ordinary
+  // use rather than through a race.
+  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  const identity = "sess-local:safe:wl-local";
+  const hold = await admitSandbox("sess-local");
+  await hold.bind(identity);
+  registerSandbox("sess-local", {
+    provider: "safe-workload", workloadId: "wl-local", platformKey: "pk", namespace: "ns",
+  });
+
+  unregisterSandbox("sess-local", undefined, { releaseSlot: false });
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(roster()!.entries.some((e) => e.identity === identity),
+    "the slot stays with a sandbox that is still reusable and still counted");
 });

@@ -18,8 +18,14 @@ import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { SandboxCapacityRefused, admitSandbox, bindAdmission } from "../src/sandbox/admission.js";
+import { CeilingDisagreement } from "../src/sandbox/admission-roster.js";
 import type { Roster } from "../src/sandbox/admission-roster.js";
 import type { CapacitySettings } from "../src/sandbox/keepalive-capacity.js";
+import { makeOnProvisioned } from "../src/sandbox/ensure-hands.js";
+import type { KV } from "nats";
+
+/** A registry bucket whose writes land, so the hook reaches its own end. */
+const kvThatWorks = (): KV => ({ async put() { return 1; } } as unknown as KV);
 
 const CAPACITY: CapacitySettings = { ceiling: 3, reconciliationReserve: 1 };
 const ROSTER_KEY = "keepalive.roster";
@@ -60,9 +66,9 @@ function fakeKv() {
 
 let store: ReturnType<typeof fakeKv>;
 
-beforeEach(() => {
+beforeEach(async () => {
   store = fakeKv();
-  bindAdmission(store.kv as never, CAPACITY);
+  await bindAdmission(store.kv as never, CAPACITY);
 });
 
 /** Fill the roster to one ordinary slot below the reserve boundary. */
@@ -134,40 +140,62 @@ test("a bind that cannot commit is raised, so the caller stops what it created",
       + "to prevent, so this cannot pass silently");
 });
 
-test("a bind failure through the provider callback stops the workload it was about", async () => {
+test("a bind failure through the production hook stops the workload it was about", async () => {
   // SaFE creates the workload before the provisioning hook runs, so a bind that
   // cannot commit is raised from inside `create` -- and the caller's own catch
-  // has no handle to stop, because `create` never returned one. Left there, a
-  // running workload holds no slot and is named by no record: the untracked
-  // target the ceiling exists to prevent.
+  // has no handle to stop, because `create` never returned one. Driven through
+  // `makeOnProvisioned`, which is the function production installs, so deleting
+  // the rollback call fails this rather than leaving a stand-in green.
   const stopped: string[] = [];
   const hold = await admitSandbox("sess-1");
   await hold.release();   // the token is gone, so the bind below cannot commit
 
-  // The provider's own shape: the workload exists, then the hook runs, then
-  // `create` resolves. The hook is what has the id to roll back with.
-  const create = async (onProvisioned: (id: string) => Promise<void>) => {
-    const workloadId = "wl-created";
-    try {
-      await onProvisioned(workloadId);
-    } catch (err) {
-      stopped.push(workloadId);
-      throw err;
-    }
-    return { id: workloadId };
-  };
+  const onProvisioned = makeOnProvisioned({
+    sessionId: "sess-1", namespace: "ns", apiKey: "pk", handsToken: "tok",
+    sandboxImage: null, kv: kvThatWorks(), hold,
+    stop: async (id) => { stopped.push(id); },
+  });
 
-  await assert.rejects(() => create(async (workloadId) => {
-    try {
-      await hold.bind(`sess-1:safe:${workloadId}`);
-    } catch (bindErr) {
-      stopped.push(workloadId);
-      throw bindErr;
-    }
-  }));
+  await assert.rejects(() => onProvisioned("wl-created"), /could not bind its slot/);
+  assert.deepEqual(stopped, ["wl-created"],
+    "the workload that already exists is taken down by the hook that has its id");
+});
 
-  assert.ok(stopped.includes("wl-created"),
-    "the workload that already exists is torn down by the hook that has its id");
+test("a rollback whose stop also fails is raised, not swallowed", async () => {
+  // Silently swallowed, the workload is left running, holding no slot and named
+  // by no record -- the untracked target the rollback exists to prevent, now
+  // invisible as well.
+  const hold = await admitSandbox("sess-1");
+  await hold.release();
+
+  const onProvisioned = makeOnProvisioned({
+    sessionId: "sess-1", namespace: "ns", apiKey: "pk", handsToken: "tok",
+    sandboxImage: null, kv: kvThatWorks(), hold,
+    stop: async () => { throw new Error("control plane unreachable"); },
+  });
+
+  await assert.rejects(
+    () => onProvisioned("wl-stuck"),
+    /running, unadmitted and untracked/,
+    "the operator is told which workload, and why it matters",
+  );
+});
+
+test("a durable-record write that never lands rolls the workload back too", async () => {
+  // The other obligation the hook carries: without the record, nothing can stop
+  // this workload later.
+  const stopped: string[] = [];
+  const hold = await admitSandbox("sess-1");
+
+  const onProvisioned = makeOnProvisioned({
+    sessionId: "sess-1", namespace: "ns", apiKey: "pk", handsToken: "tok",
+    sandboxImage: null, hold,
+    kv: { async put() { throw new Error("kv down"); } } as unknown as KV,
+    stop: async (id) => { stopped.push(id); },
+  });
+
+  await assert.rejects(() => onProvisioned("wl-unrecorded"), /KV pending write failed/);
+  assert.deepEqual(stopped, ["wl-unrecorded"]);
 });
 
 test("with no ceiling configured, admission reserves nothing and refuses nothing", async () => {
@@ -180,4 +208,29 @@ test("with no ceiling configured, admission reserves nothing and refuses nothing
     await hold.bind(`sandbox-${i}`);
   }
   assert.equal(store.roster(), null);
+});
+
+test("a replica configured at a different ceiling refuses to finish starting", async () => {
+  // One value governs the whole fleet: a replica computing a different deferral
+  // count proves a different refresh gap against the same handles. Discovered
+  // on a later sweep, it is already serving requests -- and reporting healthy
+  // -- under a bound it does not share, so the check is at the bind.
+  const hold = await admitSandbox("sess-1");
+  await hold.bind("sandbox-1");
+
+  await assert.rejects(
+    () => bindAdmission(store.kv as never, { ...CAPACITY, ceiling: CAPACITY.ceiling + 5 }),
+    (err: unknown) => err instanceof CeilingDisagreement
+      && err.stamped === CAPACITY.ceiling
+      && err.configured === CAPACITY.ceiling + 5,
+  );
+});
+
+test("a matching ceiling, and an unstamped roster, both bind", async () => {
+  await assert.doesNotReject(() => bindAdmission(store.kv as never, CAPACITY),
+    "nothing has claimed against it yet, so there is nothing to disagree with");
+
+  const hold = await admitSandbox("sess-1");
+  await hold.bind("sandbox-1");
+  await assert.doesNotReject(() => bindAdmission(store.kv as never, CAPACITY));
 });

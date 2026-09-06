@@ -91,12 +91,18 @@ hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
 # path that has nothing to do with the absolute cap -- so a gate that accepts any
 # terminal state as a refresh proves the wrong thing about the CR that then
 # disappears.
+# What counts as a refresh is a command that ran in the sandbox, so the second
+# argument names the tool that has to have run -- `bash` for the activity prompt.
+# A completed task proves the agent answered, not that it touched the sandbox:
+# a model can satisfy "Run: echo alive" by replying without calling anything,
+# and the sandbox then went the whole iteration untouched while the gate
+# recorded a refresh.
 settle_verdict() {
-  local status
-  status=$(printf '%s' "$1" | jq -r '.status // "MISSING"' 2>/dev/null) || {
+  local body="$1" tool="${2:-bash}" status calls
+  status=$(printf '%s' "$body" | jq -r '.status // "MISSING"' 2>/dev/null) || {
     echo "FAIL: activity result unparseable" >&2; return "$ROLLOUT_FAIL"; }
   case "$status" in
-    completed) return "$ROLLOUT_PASS" ;;
+    completed) ;;
     NOT_TERMINAL|MISSING)
       echo "FAIL: activity task never reached terminal ($status); the session is not being held busy" >&2
       return "$ROLLOUT_FAIL" ;;
@@ -104,6 +110,17 @@ settle_verdict() {
       echo "FAIL: activity task ended $status; a failed refresh leaves the session idle, and an idle session is reclaimed by the wrong path" >&2
       return "$ROLLOUT_FAIL" ;;
   esac
+
+  calls=$(printf '%s' "$body" | jq -r --arg t "$tool" '.by_tool[$t] // 0' 2>/dev/null) || calls=0
+  case "$calls" in
+    ''|*[!0-9]*)
+      echo "FAIL: activity result carries no $tool call count; nothing proves the sandbox was touched" >&2
+      return "$ROLLOUT_FAIL" ;;
+  esac
+  [ "$calls" -ge 1 ] || {
+    echo "FAIL: the activity task completed without calling $tool, so no command ran in the sandbox and nothing refreshed it" >&2
+    return "$ROLLOUT_FAIL"; }
+  return "$ROLLOUT_PASS"
 }
 
 # Whether a sandbox's absolute lifetime was enforced, or something else took it.

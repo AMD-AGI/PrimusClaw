@@ -11,9 +11,9 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { sessionHasActiveRunLease } from "./registry.js";
+import { reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { countActiveShells } from "../clients/hands.js";
+import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
 import { releaseAdmission } from "./admission.js";
 import pino from "pino";
@@ -218,7 +218,21 @@ function sameRegisteredSandbox(a: SandboxEntry, b: SandboxEntry): boolean {
  * Unregister a sandbox. With `known`, only remove that exact registration;
  * a DAG sibling may have replaced the session-keyed local entry meanwhile.
  */
-export function unregisterSandbox(sessionId: string, known?: SandboxEntry): void {
+export function unregisterSandbox(
+  sessionId: string,
+  known?: SandboxEntry,
+  /**
+   * Whether this sandbox is finished with.
+   *
+   * A turn that ends stops pinging its sandbox but keeps the handle for the
+   * next message, and a background shell started in that turn is expected to
+   * still be there. Releasing the slot then hands the ceiling to somebody else
+   * while the sandbox is still a target the sweep will reconcile back in --
+   * which is the over-cap state admission exists to prevent, reached through
+   * ordinary use.
+   */
+  opts: { releaseSlot?: boolean } = { releaseSlot: true },
+): void {
   const keys = known
     ? [sandboxRegistryKey(sessionId, known)]
     : [...localRegistry.entries()]
@@ -228,10 +242,14 @@ export function unregisterSandbox(sessionId: string, known?: SandboxEntry): void
   for (const key of keys) {
     had = localRegistry.delete(key) || had;
     failCounts.delete(key);
-    // The slot goes with the target. Held past this, it counts against the
-    // ceiling for a sandbox that no longer exists, and an ordinary teardown
-    // becomes a capacity refusal for the next request.
-    void releaseAdmission(key);
+    // The slot goes with the target where the target is gone. Held past that,
+    // it counts against the ceiling for a sandbox that no longer exists and an
+    // ordinary teardown becomes a capacity refusal for the next request.
+    if (opts.releaseSlot !== false) {
+      void releaseAdmission(key).then((ok) => {
+        if (!ok) logger.error({ sessionId, key }, "keepalive.admission_release_unconfirmed");
+      });
+    }
   }
   if (had) {
     logger.info({ sessionId }, "keepalive.unregistered");
@@ -631,6 +649,18 @@ function dispatchProbes(
       })
       .catch((err) => {
         if (stale()) return;
+        // A sandbox that says it cannot tell is not a sandbox that did not
+        // answer. Giving up on the second eventually is right -- one that has
+        // stopped answering entirely would otherwise be pinned to its absolute
+        // deadline. Giving up on the first reclaims the sandbox whose records
+        // were lost, which is the work this whole path protects.
+        if (err instanceof HandsLivenessIndeterminate) {
+          logger.error(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_indeterminate",
+          );
+          return;
+        }
         const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
         bgUnknownStreak.set(identity, streak);
         logger.warn(
@@ -1003,6 +1033,12 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
+  // Every sweep, not only at startup: new replicas run alongside old ones
+  // through an upgrade, and an old one can recreate a reserved key after every
+  // new one has already scanned. This bounds that window to one interval.
+  await reconcileReservedKeys(deps.kv).catch((err) => logger.error(
+    { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
+  ));
   const targets = await collectTargets(deps, seenIdentities);
   await admitTargets(deps, targets);
 

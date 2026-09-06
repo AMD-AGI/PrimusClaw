@@ -11,7 +11,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { webcrypto } from "node:crypto";
-import { StringCodec } from "nats";
+import { StringCodec, type KV } from "nats";
 import pino from "pino";
 import { composeSandboxEnv } from "@claw/protocol";
 import type { ExecuteRequest } from "@claw/protocol";
@@ -53,7 +53,7 @@ import {
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
-import { admitSandbox } from "./admission.js";
+import { admitSandbox, type AdmissionHold } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
 
 const logger = pino({ name: "ensure-hands" });
@@ -896,58 +896,16 @@ async function provisionHands(
   // assigns a workloadId (provider onProvisioned hook), before poll / bootstrap
   // / health. Rollback (stop) if the KV write fails so we never leak a workload.
   // Owned here so SafeWorkloadProvider stays KV-free.
-  /** Stop a workload this function created but could not finish tracking. */
-  const rollbackWorkload = async (workloadId: string): Promise<void> => {
-    await getSafeWorkloadProvider().stop({
-      provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-      namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-    }).catch(() => {});
-  };
-
-  const onProvisioned = async (workloadId: string): Promise<void> => {
-    // The earliest moment this sandbox has an identity, and therefore where the
-    // reservation stops naming a token and starts naming a target -- ahead of
-    // the durable record below, of bootstrap, and of local registration.
-    //
-    // The workload already exists by the time this runs, so a bind that cannot
-    // commit has to take it with it: the outer rollback only ever sees the
-    // create call rejecting and has no handle to stop, which would leave a
-    // running workload holding no slot and named by no record -- the untracked
-    // target the ceiling exists to prevent.
-    try {
-      await hold.bind(pingTargetIdentity(sessionId, { provider: "safe-workload", workloadId }));
-    } catch (bindErr) {
-      logger.error({ sessionId, workloadId }, "hands.admission.bind_failed_rollback");
-      await rollbackWorkload(workloadId);
-      throw bindErr;
-    }
-    const pendingPayload = sc.encode(JSON.stringify({
-      status: "pending", workloadId, sandboxImage,
-      platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
-      createdAt: new Date().toISOString(),
-    }));
-    let ok = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try { await kv.put(handsSessionKey(sessionId), pendingPayload); ok = true; break; }
-      catch (kvErr) {
-        logger.warn({ err: (kvErr as Error)?.message || String(kvErr), sessionId, workloadId, attempt }, "hands.kv.pending_put_retry");
-        if (attempt < 3) await sleep(200);
-      }
-    }
-    if (!ok) {
-      logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-      await rollbackWorkload(workloadId);
-      throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
-    }
-    logger.info({ sessionId, workloadId }, "hands.kv.pending");
-  };
-
-  logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
-
   // Before the provider is called at all: a ceiling checked once the sandbox
   // exists is not a ceiling, because two provisions racing the last slot both
   // start and both are then live work nothing may evict.
   const hold = await admitSandbox(sessionId);
+  const onProvisioned = makeOnProvisioned({
+    sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
+  });
+
+  logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
+
   let inst;
   try {
     inst = await getSafeWorkloadProvider().create({
@@ -1126,6 +1084,93 @@ async function provisionHands(
   }
 }
 
+
+/**
+ * The provisioning hook a SaFE create runs the moment a workload id exists.
+ *
+ * Its own function because both things it does are rollback obligations, and a
+ * rollback nothing can call is not one: the workload already exists by the time
+ * this runs, so a failure here has to take it down using the id only this hook
+ * holds -- the caller's own catch sees `create` rejecting and has no handle at
+ * all. Exported so the obligation is exercised where production installs it,
+ * rather than through a stand-in that would stay green if the call were
+ * deleted.
+ */
+export function makeOnProvisioned(deps: {
+  sessionId: string;
+  namespace: string;
+  apiKey: string;
+  handsToken: string;
+  sandboxImage: string | null;
+  kv: KV;
+  hold: AdmissionHold;
+  stop?: (workloadId: string) => Promise<void>;
+}): (workloadId: string) => Promise<void> {
+  const stopWorkload = deps.stop ?? (async (workloadId: string) => {
+    await getSafeWorkloadProvider().stop({
+      provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+      namespace: deps.namespace, handsBaseUrl: "", platformKey: deps.apiKey,
+    });
+  });
+
+  /**
+   * Take down a workload this call created and cannot finish tracking.
+   *
+   * A stop that fails is not swallowed: the workload is then live, holding no
+   * admission slot and named by no record, which is precisely the untracked
+   * target both the rollback and the ceiling exist to prevent. Raised with both
+   * causes so an operator sees the one that started it.
+   */
+  const rollback = async (workloadId: string, cause: unknown): Promise<never> => {
+    try {
+      await stopWorkload(workloadId);
+    } catch (stopErr) {
+      logger.error(
+        { sessionId: deps.sessionId, workloadId, err: (stopErr as Error)?.message },
+        "hands.rollback_stop_failed",
+      );
+      throw new Error(
+        `workload ${workloadId} could not be stopped after ${(cause as Error)?.message}: `
+        + `${(stopErr as Error)?.message}. It is running, unadmitted and untracked.`,
+      );
+    }
+    throw cause;
+  };
+
+  return async (workloadId: string): Promise<void> => {
+    // The reservation stops naming a token and starts naming a target here --
+    // ahead of the durable record below, of bootstrap, and of registration.
+    try {
+      await deps.hold.bind(pingTargetIdentity(deps.sessionId, {
+        provider: "safe-workload", workloadId,
+      }));
+    } catch (bindErr) {
+      logger.error({ sessionId: deps.sessionId, workloadId }, "hands.admission.bind_failed_rollback");
+      await rollback(workloadId, bindErr);
+    }
+
+    const pendingPayload = sc.encode(JSON.stringify({
+      status: "pending", workloadId, sandboxImage: deps.sandboxImage,
+      platformKey: deps.apiKey, token: deps.handsToken, namespace: deps.namespace,
+      createdAt: new Date().toISOString(),
+    }));
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await deps.kv.put(handsSessionKey(deps.sessionId), pendingPayload);
+        logger.info({ sessionId: deps.sessionId, workloadId }, "hands.kv.pending");
+        return;
+      } catch (kvErr) {
+        logger.warn(
+          { err: (kvErr as Error)?.message, sessionId: deps.sessionId, workloadId, attempt },
+          "hands.kv.pending_put_retry",
+        );
+        if (attempt < 3) await sleep(200);
+      }
+    }
+    logger.error({ sessionId: deps.sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
+    await rollback(workloadId, new Error(`KV pending write failed for workload ${workloadId}`));
+  };
+}
 
 /**
  * `provisionHands` plus the sandbox-creation counters.
