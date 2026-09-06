@@ -20,6 +20,7 @@ import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import { openChatRun, failChatRunDispatch } from "../tasks/chat-run.js";
+import { metrics } from "../infra/metrics.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun } from "../tasks/run-dispatch.js";
 import { decideAdmission } from "../tasks/admission.js";
@@ -45,7 +46,13 @@ export const sessionDispatchPorts = {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
   },
   async publishTask(subject: string, payload: string, msgId?: string): Promise<void> {
-    await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
+    try {
+      await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
+    } catch (err) {
+      metrics.onMessageDispatched("error");
+      throw err;
+    }
+    metrics.onMessageDispatched("ok");
   },
 };
 

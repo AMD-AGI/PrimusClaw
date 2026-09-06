@@ -33,6 +33,7 @@ import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "event-consumer" });
 
@@ -315,6 +316,7 @@ export async function consumeEventDelivery(msg: {
         [eventId, sessionId, (event.type as string) || "message", event],
       );
       if (insertResult.rowCount && insertResult.rows[0]) {
+        metrics.onEventPersisted("ok");
         rowId = insertResult.rows[0].id;
         needsProcessing = true; // newly inserted, never processed
       } else {
@@ -329,6 +331,7 @@ export async function consumeEventDelivery(msg: {
         }
       }
     } catch (e: any) {
+      metrics.onEventPersisted("error");
       const pgCode = e?.code || "";
       if (pgCode === "22P05" || pgCode === "22021") {
         logger.error({ err: e, sessionId, eventId }, "event-consumer.persist_poison_skipped");

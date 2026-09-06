@@ -19,6 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
@@ -391,6 +392,8 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
     { requeued: r.rowCount, graceSec: LEASE_LOST_GRACE_SEC, rows: r.rows },
     "sweeper.requeued_lost_doorbell_leases",
   );
+  metrics.onDoorbellLeaseRequeued(r.rowCount);
+  metrics.onQueueEntered("requeue", r.rowCount);
   return r.rowCount;
 }
 
@@ -430,6 +433,7 @@ export async function reapExpiredQueuedRuns(): Promise<number> {
         AND queued_at < NOW() - ($1::int * INTERVAL '1 second')
       RETURNING task_id, session_id, prompt, claim_count,
                 metadata->>'message_id' AS message_id,
+                metadata->>'queued_since' AS queued_since,
                 COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
     [RUN_QUEUE_MAX_SEC],
   );
@@ -461,17 +465,29 @@ function idsOf(rows: unknown[]): Array<{ task_id: string; session_id: string }> 
   }));
 }
 
+/** How many of these rows were leaving the queue, as opposed to execution. */
+function queuedExits(rows: unknown[]): number {
+  return rows.filter((row) => (row as { prior_status?: string }).prior_status === "queued").length;
+}
+
 interface ExpiredQueuedRow {
   task_id: string;
   session_id: string;
   prompt: string | null;
   claim_count: number | null;
   message_id: string | null;
+  /** When this row's current wait began, which is not when the row was written. */
+  queued_since: string | null;
   user_id: string | null;
 }
 
 async function announceQueueTimeout(row: ExpiredQueuedRow): Promise<void> {
   const everHeld = Number(row.claim_count ?? 0) > 0;
+  // Per row rather than once from the row count: whether a worker ever held it
+  // is a per-row fact, and it is the difference between a queue nobody is
+  // draining and one whose workers keep dying.
+  metrics.onQueueTimeout(everHeld ? "true" : "false");
+  metrics.observeQueueExit("chat", row.queued_since ?? null, "timed_out");
   const finalText = everHeld
     ? "This run lost its worker and no replacement claimed it before the queue "
       + "wait ran out. It may have partly run; check the session before resending."
@@ -554,7 +570,19 @@ async function announceRunFailure(
  */
 export async function reapExpiredDoorbellRuns(): Promise<number> {
   const r = await db.query(
-    `UPDATE claw_tasks
+    // RETURNING gives the new status, and the queue accounting needs the old
+    // one: this reaper's WHERE is not queued-only, so only some of the rows it
+    // closes are leaving the queue.
+    `WITH prior AS (
+       SELECT task_id, status FROM claw_tasks
+        WHERE origin = 'chat'
+          AND metadata->>'dispatch' = 'doorbell'
+          AND status IN ('queued','preparing','running')
+          AND deadline_at IS NOT NULL
+          AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
+          AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+     )
+     UPDATE claw_tasks
         SET status = 'failed',
             failure_reason = 'run_budget_exhausted',
             error_message = 'run budget exhausted at ' || deadline_at
@@ -564,13 +592,10 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
             lease_expires_at = NULL,
             heartbeat_at = NULL,
             internal_token_hash = NULL
-      WHERE origin = 'chat'
-        AND metadata->>'dispatch' = 'doorbell'
-        AND status IN ('queued','preparing','running')
-        AND deadline_at IS NOT NULL
-        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-      RETURNING task_id, session_id, prompt, claim_count,
+      FROM prior
+      WHERE claw_tasks.task_id = prior.task_id
+      RETURNING prior.status AS prior_status,
+                claw_tasks.task_id, session_id, prompt, claim_count,
                 metadata->>'message_id' AS message_id,
                 COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
     [RUN_BUDGET_BACKSTOP_GRACE_SEC],
@@ -592,6 +617,7 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
     (r.rows as Array<{ session_id: string; message_id?: string | null }>)
       .map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
   );
+  metrics.onQueueExited("budget_exhausted", queuedExits(r.rows));
   return r.rowCount;
 }
 
