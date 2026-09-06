@@ -158,6 +158,39 @@ export async function inTransaction<T>(run: (query: Querier) => Promise<T>): Pro
  */
 const SCHEMA_MIGRATION_LOCK_ID = 8_264_179_233_001;
 
+/**
+ * Advisory lock id serialising the chat-turn index against the claim path.
+ * The lock above serialises migrators only, so a replica already serving can
+ * claim a turn between the reconcile and the build and leave the unique index
+ * INVALID on arrival. Same namespace as that id; never reuse either.
+ */
+export const RUN_CLAIM_FENCE_LOCK_ID = 8_264_179_233_002;
+
+/**
+ * The fence conjunct `takeClaim` carries in its UPDATE's WHERE clause. Inside
+ * the statement because the claim path opens no transaction of its own, so a
+ * lock taken by a preceding one would be released before the UPDATE it fences.
+ */
+export const RUN_CLAIM_FENCE_SQL =
+  `pg_advisory_xact_lock_shared(${RUN_CLAIM_FENCE_LOCK_ID}) IS NOT NULL`;
+
+/** Anything that can run a statement: the pool, a pooled client, a bare client. */
+export interface StatementRunner {
+  query(text: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+}
+
+export const CHAT_TURN_CLAIM_INDEX = "idx_tasks_chat_turn_unique";
+
+// A chat row that occupies its turn, as takeClaim's sibling guard reads it.
+// `origin` belongs in it: without that the index would also constrain the DAG
+// and a2a rows the guard never looks at.
+const ACTIVE_CHAT_TURN_SQL = `origin = 'chat'
+        AND metadata->>'message_id' IS NOT NULL
+        AND status IN ('preparing','running','cancelling')`;
+
+// A row somebody is executing, or has executed, rather than an unclaimed spare.
+const TURN_HOLDER_SQL = "(lease_owner IS NOT NULL OR COALESCE(claim_count, 0) > 0)";
+
 // Pooled connections carry a 30s statement_timeout, which is right for serving
 // requests and wrong for migrating: waiting on the lock behind another
 // replica, or building an index on a table that has been accumulating rows for
@@ -214,6 +247,39 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
     logger.error({ problems }, "db.schema_incomplete");
     throw new Error(`database schema is incomplete after migration: ${problems.join("; ")}`);
   }
+  await assertChatTurnClaimIndex(client);
+}
+
+/**
+ * Refuse to serve unless the chat-turn uniqueness invariant is enforceable.
+ * Alone among the indexes here this one is a correctness property, so the
+ * warn-and-continue ending of {@link ensureConcurrentIndex} is wrong for it.
+ * An index left INVALID enforces nothing, which is the same answer as absent.
+ */
+export async function assertChatTurnClaimIndex(q: StatementRunner): Promise<void> {
+  const existing = await readIndexValidity(q, CHAT_TURN_CLAIM_INDEX);
+  if (existing.rowCount && existing.rows[0].indisvalid) return;
+  logger.error({ index: CHAT_TURN_CLAIM_INDEX }, "db.chat_turn_index_unusable");
+  throw new Error(
+    `refusing to serve: ${CHAT_TURN_CLAIM_INDEX} is ${existing.rowCount ? "not valid" : "absent"}, ` +
+    "so concurrent claims of one chat turn are not serialised",
+  );
+}
+
+async function readIndexValidity(
+  q: StatementRunner,
+  name: string,
+): Promise<{ rows: Array<{ indisvalid: boolean }>; rowCount: number | null }> {
+  const r = await q.query(
+    `SELECT i.indisvalid
+       FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1
+        AND n.nspname = CURRENT_SCHEMA()`,
+    [name],
+  );
+  return { rows: r.rows as Array<{ indisvalid: boolean }>, rowCount: r.rowCount };
 }
 
 async function ensureConcurrentIndex(
@@ -224,15 +290,7 @@ async function ensureConcurrentIndex(
   if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
     throw new Error(`unsafe index name: ${name}`);
   }
-  const readValidity = () => client.query<{ indisvalid: boolean }>(
-    `SELECT i.indisvalid
-       FROM pg_class c
-       JOIN pg_index i ON i.indexrelid = c.oid
-       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relname = $1
-        AND n.nspname = CURRENT_SCHEMA()`,
-    [name],
-  );
+  const readValidity = () => readIndexValidity(client, name);
   let existing = await readValidity();
   if (existing.rowCount && existing.rows[0].indisvalid) return;
   if (existing.rowCount) {
@@ -275,6 +333,84 @@ async function ensureConcurrentIndex(
       { index: name },
       "db.concurrent_index_not_valid",
     );
+  }
+}
+
+const TURN_DEBRIS_MESSAGE =
+  "a retried dispatch opened this row a second time for the same message; the turn "
+  + "belongs to the row that holds it, and this one is closed so it can never be claimed";
+
+/**
+ * Close the spare rows of a chat turn that has more than one, keeping whichever
+ * holds it.
+ *
+ * A retried dispatch's spare is the *newest* row of the group, so picking by
+ * recency terminates the execution that claimed the turn. Two holders is the
+ * state the index exists to forbid, and choosing which live execution to kill
+ * is not a migration's decision, so that group refuses instead.
+ */
+async function reconcileDuplicateChatTurns(client: pg.PoolClient): Promise<void> {
+  const ambiguous = await client.query<{ session_id: string; message_id: string }>(
+    `SELECT session_id, metadata->>'message_id' AS message_id
+       FROM claw_tasks
+      WHERE ${ACTIVE_CHAT_TURN_SQL}
+      GROUP BY session_id, metadata->>'message_id'
+     HAVING COUNT(*) FILTER (WHERE ${TURN_HOLDER_SQL}) > 1`,
+  );
+  if (ambiguous.rowCount) {
+    const groups = ambiguous.rows.map((r) => `${r.session_id}/${r.message_id}`);
+    logger.error({ groups }, "db.chat_turn_holders_ambiguous");
+    throw new Error(
+      "refusing to serve: more than one active row holds the same chat turn, "
+      + `so no uniqueness invariant can be established over it: ${groups.join(", ")}`,
+    );
+  }
+  const closed = await client.query(
+    `WITH ranked AS (
+       SELECT task_id,
+              ROW_NUMBER() OVER (
+                PARTITION BY session_id, metadata->>'message_id'
+                ORDER BY ${TURN_HOLDER_SQL} DESC, created_at DESC, task_id DESC
+              ) AS position
+         FROM claw_tasks
+        WHERE ${ACTIVE_CHAT_TURN_SQL}
+     )
+     UPDATE claw_tasks t
+        SET status         = 'failed',
+            failure_reason = 'dispatch_retried',
+            error_message  = $1,
+            completed_at   = NOW()
+       FROM ranked
+      WHERE ranked.task_id = t.task_id
+        AND ranked.position > 1
+      RETURNING t.task_id`,
+    [TURN_DEBRIS_MESSAGE],
+  );
+  if (!closed.rowCount) return;
+  logger.warn(
+    { closed: closed.rowCount, ids: closed.rows.map((r) => (r as { task_id: string }).task_id) },
+    "db.chat_turn_duplicates_closed",
+  );
+}
+
+/**
+ * Establish the uniqueness invariant behind `takeClaim`'s sibling guard. The
+ * fence covers the reconcile and the build together: a claim landing between
+ * them writes a fresh duplicate and the build then arrives INVALID.
+ */
+async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
+  await client.query("SELECT pg_advisory_lock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
+  try {
+    await reconcileDuplicateChatTurns(client);
+    await ensureConcurrentIndex(
+      client,
+      CHAT_TURN_CLAIM_INDEX,
+      `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${CHAT_TURN_CLAIM_INDEX}
+         ON claw_tasks(session_id, (metadata->>'message_id'))
+       WHERE ${ACTIVE_CHAT_TURN_SQL}`,
+    );
+  } finally {
+    await client.query("SELECT pg_advisory_unlock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
   }
 }
 
@@ -1112,6 +1248,11 @@ export async function initDb(): Promise<void> {
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.
     await addTaskCol("claim_count", "INT NOT NULL DEFAULT 0");
+    // When a dispatch stopped being able to say whether its publish landed, and
+    // what cleanup it owes. Cleared by the publisher's compare-and-set, so an
+    // elapsed horizon is the sweeper's licence to decide the row for it.
+    await addTaskCol("dispatch_reconcile_at", "TIMESTAMPTZ");
+    await addTaskCol("dispatch_reconcile_action", "TEXT");
     // What admission counts. It reads the fleet on every chat dispatch -- twice
     // when a ceiling is set -- and filters on the four occupying statuses,
     // which no other index covers, so the planner had nothing to choose but a
@@ -1189,6 +1330,7 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
+    await ensureChatTurnClaimIndex(client);
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_task_edges (
         id                BIGSERIAL PRIMARY KEY,
@@ -1344,6 +1486,12 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await client.query(
       "ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS session_env JSONB DEFAULT '{}'::jsonb",
+    ).catch(() => {});
+    // The durable run identity of a queued message. Without it a drain retried
+    // after its post-publish delete failed opens a second task, which the
+    // active-only chat-turn index cannot refuse once the first is terminal.
+    await client.query(
+      "ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS dispatch_task_id TEXT",
     ).catch(() => {});
 
     // System-level env vars (admin-managed, global). Same AES-256-GCM blob

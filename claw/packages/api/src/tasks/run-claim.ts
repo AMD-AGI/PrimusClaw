@@ -16,7 +16,7 @@ import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
@@ -90,7 +90,7 @@ export async function claimRunById(
   doorbellSemantics = 1,
   q: Querier = db,
 ): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | ExhaustedClaim> {
-  const taken = await takeClaim(taskId, brainId, doorbellSemantics, q);
+  const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, q);
   if (taken === "missing" || taken === "busy") return taken;
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
     const closed = await failExhaustedClaim(taken);
@@ -395,6 +395,7 @@ async function takeClaim(
              AND sibling.status IN ('preparing','running','cancelling')
         )
         AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$8")}
+        AND ${RUN_CLAIM_FENCE_SQL}
       RETURNING *`,
     [
       taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE,
@@ -410,6 +411,33 @@ async function takeClaim(
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }
+
+/**
+ * The sibling `NOT EXISTS` is a pre-check, not the guarantee.
+ *
+ * Under READ COMMITTED two transitions of siblings sharing one turn can each
+ * see the other still `queued` and both commit, so the unique index is what
+ * actually refuses the second. It surfaces as a unique violation rather than a
+ * zero-row CAS, and the loser is in exactly the state `busy` describes:
+ * somebody else holds the turn.
+ */
+async function takeClaimOrBusy(
+  taskId: string,
+  brainId: string,
+  doorbellSemantics: number,
+  q: Querier,
+): Promise<ClawTaskRow | "missing" | "busy"> {
+  try {
+    return await takeClaim(taskId, brainId, doorbellSemantics, q);
+  } catch (err) {
+    if ((err as { code?: string })?.code !== UNIQUE_VIOLATION) throw err;
+    logger.info({ taskId, brainId }, "run.claim.lost_to_sibling");
+    return "busy";
+  }
+}
+
+/** Postgres class 23505: the turn's uniqueness invariant refused this writer. */
+const UNIQUE_VIOLATION = "23505";
 
 async function assembleClaim(row: ClawTaskRow, brainId: string): Promise<ClaimedRun> {
   const token = (row as ClawTaskRow & { _lease_token?: string })._lease_token;
