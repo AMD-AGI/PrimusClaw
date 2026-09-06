@@ -132,6 +132,12 @@ export const bash = {
             + `\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
         }],
         isError: true,
+        // The same fact as a field. A tightened ceiling shows up nowhere in a
+        // run's own terminal state -- a clamped command is answered, not ended
+        // -- so an operator watching for the regression has nothing to read
+        // unless the timeout says so itself, and matching the prose above is
+        // one reword away from silence.
+        structuredContent: { outcome: "foreground_timeout", granted_sec: grantedSec, clamped },
       };
     }
     if (result.exitCode === 0) {

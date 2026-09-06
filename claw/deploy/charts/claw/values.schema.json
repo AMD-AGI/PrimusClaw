@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claw chart values (background-shell keys only)",
+  "description": "Scoped deliberately: helm applies a schema to the whole merged values document, so anything not named here stays unconstrained.",
+  "type": "object",
+  "properties": {
+    "features": {
+      "type": "object",
+      "properties": {
+        "backgroundShell": {
+          "description": "Enable background shell tools. Also tightens the foreground bash ceiling; pin brain.bashMaxTimeoutSec to decouple them.",
+          "default": false,
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["true", "false", ""] }
+          ]
+        }
+      }
+    },
+    "brain": {
+      "type": "object",
+      "properties": {
+        "bashMaxTimeoutSec": {
+          "description": "Foreground bash ceiling in seconds. Empty means the code default, which depends on features.backgroundShell. Zero is excluded because Brain refuses a ceiling below 1 at startup, so admitting it here moves the failure from helm to a crash-looping pod.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        }
+      }
+    }
+  }
+}

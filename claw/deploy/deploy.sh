@@ -648,9 +648,16 @@ if default_sandbox_image:
 for _key, _var in (
     ("sessionTimeout", "AGENT_SANDBOX_SESSION_TIMEOUT"),
     ("maxSessionDuration", "AGENT_SANDBOX_MAX_SESSION_DURATION"),
+    ("bashMaxTimeoutSec", "BASH_MAX_TIMEOUT_SEC"),
 ):
     if env(_var):
         values["brain"][_key] = env(_var)
+
+# Not part of the loop above: that one writes into values["brain"], which the
+# builder created. There is no "features" key to write into, so an enablement
+# added to the loop would be dropped without a word.
+if env("BG_SHELL_ENABLED"):
+    values.setdefault("features", {})["backgroundShell"] = env("BG_SHELL_ENABLED")
 
 if sandbox_workload_namespace:
     values["secret"]["sandboxNamespace"] = sandbox_workload_namespace

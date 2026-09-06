@@ -2,7 +2,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-# Sandbox lifetime knobs must survive the reference upgrade path.
+# The knobs an operator sets once must survive the reference upgrade path.
 #
 # deploy.sh takes them from the shell; upgrade.sh does not -- it re-renders the
 # Deployment from deploy/values.<ns>.env alone, and that file is the only thing
@@ -104,6 +104,14 @@ assert_rendered_with() {
           *"--set-string brain.maxSessionDuration=$duration"*) ;;
           *) echo "$phase: brain render lost maxSessionDuration=$duration" >&2; exit 1 ;;
         esac
+        # Rendered only once the operator has set it, and then on every upgrade:
+        # a re-render at the chart default would boot the fleet back to off.
+        if [ -n "${EXPECT_BG_SHELL:-}" ]; then
+          case "$line" in
+            *"--set-string features.backgroundShell=$EXPECT_BG_SHELL"*) ;;
+            *) echo "$phase: brain render lost features.backgroundShell=$EXPECT_BG_SHELL" >&2; exit 1 ;;
+          esac
+        fi
         ;;
     esac
   done <"$capture"
@@ -126,7 +134,8 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy-default.log" 2>&1 || { command cat "$tmp/deploy-default.log" >&2; exit 1; }
 
-for _key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION; do
+for _key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION \
+            BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC; do
   grep -q "^${_key}=\"\"$" "$default_values_file" || {
     echo "a no-knob install left $_key out of the generated values file" >&2
     command cat "$default_values_file" >&2
@@ -137,9 +146,14 @@ done
 python3 - "$values_capture" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
-    brain = json.load(f).get("brain", {})
+    values = json.load(f)
+brain = values.get("brain", {})
 assert "sessionTimeout" not in brain, f"unset knob reached the chart: {brain!r}"
 assert "maxSessionDuration" not in brain, f"unset knob reached the chart: {brain!r}"
+assert "bashMaxTimeoutSec" not in brain, f"unset knob reached the chart: {brain!r}"
+# `values["features"]` does not exist unless something creates it, so an
+# enablement wired into the brain loop above would be dropped without a word.
+assert "features" not in values, f"unset flag reached the chart: {values.get('features')!r}"
 PY
 
 # ── First install: the operator names the knobs once, on the command line ──
@@ -150,6 +164,8 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
   TAG="release-test" S3_ACCESS_KEY="ak" S3_SECRET_KEY="sk" \
   AGENT_SANDBOX_SESSION_TIMEOUT="6h" \
   AGENT_SANDBOX_MAX_SESSION_DURATION="48h" \
+  BG_SHELL_ENABLED="true" \
+  BASH_MAX_TIMEOUT_SEC="240" \
   bash "$repo_root/claw/deploy/deploy.sh" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy.log" 2>&1 || { command cat "$tmp/deploy.log" >&2; exit 1; }
@@ -166,6 +182,20 @@ grep -q '^AGENT_SANDBOX_MAX_SESSION_DURATION="48h"$' "$values_file" || {
   command cat "$values_file" >&2
   exit 1
 }
+for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="240"'; do
+  grep -q "^${_pair}\$" "$values_file" || {
+    echo "first install did not persist ${_pair%%=*}" >&2
+    command cat "$values_file" >&2
+    exit 1
+  }
+done
+python3 - "$values_capture" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    values = json.load(f)
+assert values["features"]["backgroundShell"] == "true", values.get("features")
+assert values["brain"]["bashMaxTimeoutSec"] == "240", values["brain"]
+PY
 
 # ── The upgrade an operator actually runs: `env -i`, no knobs re-passed ──
 # The empty environment is the point. If the values file is not carrying the
@@ -214,7 +244,7 @@ env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
   bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --dry-run \
     >"$tmp/upgrade1b.log" 2>&1 || { command cat "$tmp/upgrade1b.log" >&2; exit 1; }
 
-assert_rendered_with "upgrade after filling a blank" "9h" "36h"
+EXPECT_BG_SHELL=true assert_rendered_with "upgrade after filling a blank" "9h" "36h"
 
 # ── A values file written before the knobs existed ──
 # Every install that predates this feature has one. It has no line to source,

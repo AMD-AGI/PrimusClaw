@@ -16,7 +16,8 @@ import {
   normalizeDeadline, normalizeIntent, normalizeOwner, normalizeRun, withCaller,
 } from "./runtime/owner-context.js";
 import { mintEpoch, processStartToken, stateRoot } from "./runtime/shell-records.js";
-import { INTERNAL_TOKEN, MCP_PORT } from "./config.js";
+import { MAX_TIMEOUT_SEC } from "./tools/shell/bash.js";
+import { BG_SHELL_ENABLED, INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
 /**
  * Exported so route tests can reach the routes with `app.inject()` instead of
@@ -49,6 +50,12 @@ app.get("/health", async () => ({
   status: "ok",
   service: "hands",
   tools: tools.map((t) => t.name),
+  // What this sandbox actually booted with. The tool list above is identical
+  // in both switch states, so it is not a capability signal and a gate reading
+  // it would pass on a sandbox with the feature off. A running sandbox's
+  // environment is not visible from outside any other way.
+  bgShellEnabled: BG_SHELL_ENABLED,
+  bashMaxTimeoutSec: MAX_TIMEOUT_SEC,
 }));
 
 app.all("/mcp", async (req, reply) => {

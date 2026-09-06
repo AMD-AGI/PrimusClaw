@@ -603,7 +603,11 @@ function dispatchProbes(
         bgUnknownStreak.delete(identity);
         if (state === "running") {
           logger.info(
-            { sessionId, workloadId: info.workloadId, running },
+            // The sandbox name, beside the session id: a session id outlives
+            // every sandbox successively written under it, so one generation's
+            // reclamation would otherwise cancel the next generation's held
+            // count and neither event could be correlated per sandbox.
+            { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, running },
             "keepalive.idle_handle_kept_background_work",
           );
         }
@@ -800,7 +804,10 @@ async function collectTargets(
           }
           if (expired) {
             await deps.kv.delete(key, { previousSeq: e.revision }).catch(() => {});
-            logger.info({ sessionId, workloadId: info.workloadId }, "keepalive.idle_handle_expired");
+            logger.info(
+              { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId },
+              "keepalive.idle_handle_expired",
+            );
           } else {
             // Refresh the TTL only, no ping -- and conditionally, because an
             // unconditional put bumps the revision that ensureHands is holding

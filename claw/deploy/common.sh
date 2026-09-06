@@ -111,6 +111,8 @@ CLAW_DEPLOY_ROOT="${CLAW_DEPLOY_ROOT:-}"
 BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
 AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+BG_SHELL_ENABLED="${BG_SHELL_ENABLED:-}"
+BASH_MAX_TIMEOUT_SEC="${BASH_MAX_TIMEOUT_SEC:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   log "dry-run: using ephemeral placeholder values"
@@ -168,6 +170,14 @@ BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
 # next upgrade silently reverts.
 AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+
+# Background shells, and the foreground bash ceiling in seconds. Empty means
+# the chart default, which is off, and the code default the flag implies. They
+# live here for the same reason the lifetimes do: upgrade.sh re-renders the
+# Brain Deployment from this file alone, so an enablement passed once on the
+# command line is one the next upgrade silently reverts.
+BG_SHELL_ENABLED="${BG_SHELL_ENABLED:-}"
+BASH_MAX_TIMEOUT_SEC="${BASH_MAX_TIMEOUT_SEC:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -186,6 +196,8 @@ _SHELL_S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
 _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 _SHELL_AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 _SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+_SHELL_BG_SHELL_ENABLED="${BG_SHELL_ENABLED:-}"
+_SHELL_BASH_MAX_TIMEOUT_SEC="${BASH_MAX_TIMEOUT_SEC:-}"
 
 set -a
 # shellcheck disable=SC1090
@@ -222,6 +234,8 @@ export BRAIN_CHECKPOINT_KEY
 [ -z "${S3_SECRET_KEY:-}" ]       && S3_SECRET_KEY="$_SHELL_S3_SECRET_KEY"
 [ -z "${AGENT_SANDBOX_SESSION_TIMEOUT:-}" ]      && AGENT_SANDBOX_SESSION_TIMEOUT="$_SHELL_AGENT_SANDBOX_SESSION_TIMEOUT"
 [ -z "${AGENT_SANDBOX_MAX_SESSION_DURATION:-}" ] && AGENT_SANDBOX_MAX_SESSION_DURATION="$_SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION"
+[ -z "${BG_SHELL_ENABLED:-}" ]        && BG_SHELL_ENABLED="$_SHELL_BG_SHELL_ENABLED"
+[ -z "${BASH_MAX_TIMEOUT_SEC:-}" ]    && BASH_MAX_TIMEOUT_SEC="$_SHELL_BASH_MAX_TIMEOUT_SEC"
 
 # Write the shell's choice back, so the run that turns a knob on is the only
 # run that has to name it. This mirrors the override policy just above: the
@@ -234,14 +248,15 @@ export BRAIN_CHECKPOINT_KEY
 # Not during a dry-run: a preview that edits the values file is a side effect,
 # and scripts/release-tests/dry-run-no-side-effects.sh says so.
 if [ "${DRY_RUN:-false}" != "true" ]; then
-  for _lifetime_key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION; do
+  for _lifetime_key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION \
+                       BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC; do
     eval "_lifetime_val=\${$_lifetime_key:-}"
     [ -n "$_lifetime_val" ] || continue
     if grep -q "^${_lifetime_key}=\(\"\"\)\?$" "$_VALUES_FILE"; then
       sed -i "s|^${_lifetime_key}=.*\$|${_lifetime_key}=\"${_lifetime_val}\"|" "$_VALUES_FILE"
       log "$_lifetime_key: recorded in $_VALUES_FILE"
     elif ! grep -q "^${_lifetime_key}=" "$_VALUES_FILE"; then
-      printf '\n# Sandbox lifetime; recorded so the next upgrade re-renders with it.\n%s="%s"\n' \
+      printf '\n# Recorded so the next upgrade re-renders with it.\n%s="%s"\n' \
         "$_lifetime_key" "$_lifetime_val" >> "$_VALUES_FILE"
       log "$_lifetime_key: recorded in $_VALUES_FILE"
     fi
@@ -250,7 +265,8 @@ if [ "${DRY_RUN:-false}" != "true" ]; then
 fi
 unset _SHELL_DOMAIN _SHELL_AUTH_INTERNAL_TOKEN _SHELL_S3_ENDPOINT \
       _SHELL_S3_API_ENDPOINT _SHELL_S3_ACCESS_KEY _SHELL_S3_SECRET_KEY \
-      _SHELL_AGENT_SANDBOX_SESSION_TIMEOUT _SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION
+      _SHELL_AGENT_SANDBOX_SESSION_TIMEOUT _SHELL_AGENT_SANDBOX_MAX_SESSION_DURATION \
+      _SHELL_BG_SHELL_ENABLED _SHELL_BASH_MAX_TIMEOUT_SEC
 # Defaults for any placeholder not provided by the values file. Fallback to
 # the literal "<KEY>" so render output keeps the placeholder, and the
 # deploy.sh guard fails loudly rather than silently shipping empty secrets.
@@ -780,6 +796,8 @@ render_chart() {
     --set-string image.tag="$TAG" \
     ${AGENT_SANDBOX_SESSION_TIMEOUT:+--set-string brain.sessionTimeout="$AGENT_SANDBOX_SESSION_TIMEOUT"} \
     ${AGENT_SANDBOX_MAX_SESSION_DURATION:+--set-string brain.maxSessionDuration="$AGENT_SANDBOX_MAX_SESSION_DURATION"} \
+    ${BG_SHELL_ENABLED:+--set-string features.backgroundShell="$BG_SHELL_ENABLED"} \
+    ${BASH_MAX_TIMEOUT_SEC:+--set-string brain.bashMaxTimeoutSec="$BASH_MAX_TIMEOUT_SEC"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst"

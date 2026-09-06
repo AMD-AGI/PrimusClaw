@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
+import { metrics } from "../infra/metrics.js";
 import { BG_SHELL_ENABLED, HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS } from "../config.js";
 import {
   isSandboxTool, MCP_DEADLINE_SLACK_MS, toolTakesTimeout, toolTimeoutCeilingSec,
@@ -223,6 +224,21 @@ export function explainHandsError(
 }
 
 /**
+ * Count a foreground bash command the sandbox stopped at its granted second.
+ *
+ * Read off the result's own structured field rather than its prose: a clamped
+ * command is answered rather than ending its run, so nothing about the run's
+ * terminal state moves with the ceiling, and this is the only place the fact
+ * crosses from the sandbox into something an operator can read.
+ */
+export function countForegroundTimeout(result: unknown): void {
+  const outcome = (result as { structuredContent?: { outcome?: unknown; clamped?: unknown } })
+    ?.structuredContent;
+  if (outcome?.outcome !== "foreground_timeout") return;
+  metrics.onBashForegroundTimeout(outcome.clamped === true);
+}
+
+/**
  * Header naming who a tool call is for. Hands files background shells under it
  * so a sandbox handed to a new run cannot read or kill the previous
  * occupant's processes, and so a caller-chosen `shell_id` is private to its
@@ -363,6 +379,7 @@ export class HandsClient {
       undefined,
       { timeout: callDeadlineMs(name, args), signal } as any,
     );
+    countForegroundTimeout(result);
     const texts = (result.content as Array<{ type: string; text?: string }>)
       ?.filter((c) => c.type === "text" && c.text)
       .map((c) => c.text!)
@@ -388,6 +405,7 @@ export class HandsClient {
       undefined,
       { timeout: callDeadlineMs(name, args), signal } as any,
     );
+    countForegroundTimeout(result);
     const texts = (result.content as Array<{ type: string; text?: string }>)
       ?.filter((c) => c.type === "text" && c.text)
       .map((c) => c.text!)

@@ -72,6 +72,22 @@ const taskDuration = new Histogram({
 });
 
 // Hands-binary HTTP fallback (sandbox bootstrap downloads).
+/**
+ * Foreground bash commands the sandbox stopped at their granted second.
+ *
+ * The one operator-readable signal a tightened foreground ceiling causally
+ * emits. A clamped command comes back to the model as a tool result rather than
+ * ending its run, so nothing about the run's own terminal state moves with the
+ * ceiling and a killed-run count measures something else entirely. `clamped`
+ * separates a command that met the ceiling it asked past -- the regression a
+ * rollout is watching for -- from one that simply ran out of its own timeout.
+ */
+const bashForegroundTimeoutTotal = new Counter({
+  name: "claw_bash_foreground_timeout_total",
+  help: "Foreground bash commands killed at their granted timeout, by whether the request was clamped to the ceiling.",
+  labelNames: ["clamped"] as const,
+  registers: [registry],
+});
 const handsBinaryDownloadTotal = new Counter({
   name: "claw_brain_hands_binary_download_total",
   help: "GET /internal/assets/hands-binary by outcome.",
@@ -544,6 +560,11 @@ const sessionCleanupIncompleteTotal = new Counter({
 });
 
 export const metrics = {
+  /** One foreground bash command stopped at its granted second. */
+  onBashForegroundTimeout(clamped: boolean): void {
+    bashForegroundTimeoutTotal.inc({ clamped: clamped ? "true" : "false" });
+  },
+
   /**
    * One LLM turn's cache accounting.
    *

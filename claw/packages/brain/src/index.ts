@@ -14,6 +14,7 @@ import {
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
 import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
+import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
 import { initA2ARegistry } from "./clients/a2a.js";
 import { initSystemEnvCache } from "./infra/system-env.js";
@@ -900,6 +901,15 @@ async function main() {
     // is what upgrade.sh checks to confirm the signal actually landed.
     draining: drainState.draining,
     drainReason: drainState.reason,
+    // The two background-shell facts nothing else on this pod exposes. The
+    // Hands registry is identical in both switch states and this payload
+    // carried neither number, so "curl /health and look for bash_output" is a
+    // check that passes on a deployment with the feature off. `kubectl` cannot
+    // answer it either for a sandbox that is already running.
+    bgShellEnabled: BG_SHELL_ENABLED,
+    // The clamped value: the number the model is shown and the number forwarded
+    // into every sandbox, not the raw setting behind it.
+    bashForegroundMaxSec: toolTimeoutCeilingSec("bash"),
     activeTasks: activeAbort.size,
     maxConcurrent: MAX_CONCURRENT,
     maxResident: MAX_RESIDENT,
