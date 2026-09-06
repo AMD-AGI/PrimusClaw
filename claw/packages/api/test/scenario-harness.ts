@@ -104,6 +104,21 @@ CREATE TABLE claw_pending_messages (
 CREATE TABLE claw_tasks (
   task_id              TEXT PRIMARY KEY,
   session_id           TEXT NOT NULL,
+  -- Named by insertTask's column list, so a scenario driving a real open fails
+  -- on the column rather than on the behaviour under test.
+  parent_task_id       TEXT,
+  batch_id             TEXT,
+  dag_id               TEXT,
+  script               JSONB,
+  depends_on           TEXT[],
+  mode                 TEXT,
+  model                TEXT,
+  tools_allowlist      JSONB,
+  skills               JSONB,
+  rules_text           TEXT,
+  agent_hooks          JSONB,
+  backend_mcp_url      TEXT,
+  workspace_throwaway  BOOLEAN NOT NULL DEFAULT FALSE,
   dag_root_task_id     TEXT,
   dag_node_id          TEXT,
   plugin_id            BIGINT,

@@ -39,6 +39,8 @@ export type HandOffResult =
 export interface HandOffInput {
   /** Which caller this is, so a chat outage and a drain outage stay apart. */
   path?: DispatchPath;
+  /** The row id a durable handoff was already reserved under, when one was. */
+  taskId?: string;
   task: Record<string, unknown>;
   sessionId: string;
   userId: string;
@@ -116,6 +118,7 @@ async function openAdmittedRun(
   // the row. Opening at `preparing` made claim-next skip the work.
   return await openRun({
     dispatch: "doorbell",
+    taskId: input.taskId,
     // What this dispatch owes if it never reports its publish outcome. Both
     // hand-off callers dispatch into a session that already exists, so the
     // cleanup is to hand its gate back rather than to delete it.

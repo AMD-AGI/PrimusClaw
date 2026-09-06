@@ -363,6 +363,16 @@ export interface OpenChatRunInput {
   /** Which delivery carries the work. Fat rows get the compensation receipt. */
   dispatch: ChatDispatchKind;
   /**
+   * The row id this turn was already handed off under, when one is recorded.
+   *
+   * A queued drain that publishes and then fails to delete its queue row comes
+   * back to find the same message; without a durable identity it opens a second
+   * run, and once the first is terminal no active-state uniqueness index can
+   * stop the second executing. Supplying the recorded id makes the retry finish
+   * that handoff instead.
+   */
+  taskId?: string;
+  /**
    * What a dispatch that never reports its publish outcome leaves for the
    * sweeper to finish. Absent for a caller with nothing to undo.
    */
@@ -473,7 +483,7 @@ export interface OpenChatRunResult {
  * @returns the new row's id, or null if the row could not be written.
  */
 export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunResult | null> {
-  const taskId = newTaskId();
+  const taskId = input.taskId ?? newTaskId();
   // Scoped to this run and to lease renewal alone. The chat path deliberately
   // does not get `callback_url`: those endpoints move rows between states, wake
   // the scheduler and open the backend tool surface, and these rows are still a

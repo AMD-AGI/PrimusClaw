@@ -45,6 +45,7 @@ import {
   failChatRunDispatch, openChatRun, recordDispatchSeq, recordPublishState, takeSessionGate,
 } from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
+import { newTaskId } from "./ids.js";
 import { handOffAssembledRun } from "./run-dispatch.js";
 import { injectLiveUserEnv } from "./run-claim.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
@@ -588,11 +589,80 @@ export async function dispatchPendingMessage(
   return { runId: run.taskId };
 }
 
+/**
+ * The run id this queued message is handed off under, decided once.
+ *
+ * Compare-and-set rather than a plain write, so concurrent drains of one queue
+ * row converge on the same id instead of each minting its own.
+ */
+async function reserveDispatchTaskId(pendingId: unknown): Promise<string> {
+  const candidate = newTaskId();
+  const r = await db.query(
+    `UPDATE claw_pending_messages
+        SET dispatch_task_id = COALESCE(dispatch_task_id, $2)
+      WHERE id = $1
+      RETURNING dispatch_task_id`,
+    [pendingId, candidate],
+  );
+  const stored = (r.rows[0] as { dispatch_task_id?: string } | undefined)?.dispatch_task_id;
+  return stored ?? candidate;
+}
+
+/**
+ * Whether the run this queue row already opened has consumed the turn.
+ *
+ * A row that is still open owns the message: the drain finishes without
+ * publishing again, and claim-next plus the queue reaper are its wakeup and its
+ * bound. Only a compensated dispatch -- terminal, never claimed -- may be
+ * retried, because nothing executed under it.
+ */
+async function recordedHandoffState(
+  taskId: string,
+): Promise<"absent" | "open" | "retryable" | "consumed"> {
+  const r = await db.query(
+    "SELECT status, failure_reason, COALESCE(claim_count, 0) AS claims FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const row = r.rows[0] as
+    { status?: string; failure_reason?: string | null; claims?: number } | undefined;
+  if (!row) return "absent";
+  if (["queued", "preparing", "running", "cancelling"].includes(String(row.status))) return "open";
+  return row.failure_reason === "dispatch_failed" && Number(row.claims ?? 0) === 0
+    ? "retryable"
+    : "consumed";
+}
+
 async function finishPendingDoorbell(
   input: PendingDispatchInput,
   task: Record<string, unknown>,
 ): Promise<PendingDispatchResult> {
+  let handoffId = await reserveDispatchTaskId(input.pendingId);
+  const recorded = await recordedHandoffState(handoffId);
+  if (recorded === "retryable") {
+    // Terminal as a failed dispatch with no claim ever taken proves nothing
+    // executed under that id, so the turn is still owed -- but the id itself is
+    // spent, and reopening under it would collide with the row it names.
+    await db.query(
+      "UPDATE claw_pending_messages SET dispatch_task_id = NULL WHERE id = $1 AND dispatch_task_id = $2",
+      [input.pendingId, handoffId],
+    );
+    handoffId = await reserveDispatchTaskId(input.pendingId);
+  }
+  if (recorded === "open" || recorded === "consumed") {
+    // The recorded run already owns this message. Publishing again would be a
+    // second wakeup for a turn that has one, or a second turn for one that is
+    // over.
+    await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
+    forgetUncountedAttempts(input.pendingId);
+    if (recorded === "open") await takeSessionGate(input.sessionId, input.messageId);
+    logger.info(
+      { sessionId: input.sessionId, pendingId: input.pendingId, taskId: handoffId, recorded },
+      "pending.handoff_already_recorded",
+    );
+    return { runId: recorded === "open" ? handoffId : null };
+  }
   const result = await handOffAssembledRun({
+    taskId: handoffId,
     path: "pending",
     task,
     sessionId: input.sessionId,
