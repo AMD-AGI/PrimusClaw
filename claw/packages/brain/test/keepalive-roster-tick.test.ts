@@ -611,3 +611,62 @@ test("the clock seam is inert when it is not supplied", async () => {
   assert.match(source, /const clock = deps\.now \?\? Date\.now;/,
     "it is a default, not a mode");
 });
+
+test("a parked handle that expires gives its slot back", async () => {
+  // Idle expiry is the one exit that reaches no unregisterSandbox: the record
+  // is deleted by the sweep itself. A slot held past it counts against the
+  // ceiling for a sandbox that no longer exists, and because parking is
+  // ordinary use the loss is monotonic -- provisioning is eventually refused
+  // for capacity on a fleet that is nowhere near it.
+  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  const identity = "sess-park:safe:wl-park";
+  const hold = await admitSandbox("sess-park");
+  await hold.bind(identity);
+  kv.seed("hands.sess-park", retained("wl-park"));
+
+  // The background-work probe answers a tick behind, so the idle verdict this
+  // expiry depends on lands on a later sweep than the one that asks for it.
+  for (let i = 0; i < 3; i++) {
+    await runKeepaliveTickForTest({
+      kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+    });
+    await new Promise((r) => setImmediate(r));
+  }
+
+  assert.ok(!values.has("hands.sess-park"), "the parked handle should have expired");
+  assert.ok(!roster()!.entries.some((e) => e.identity === identity),
+    "the expired handle's slot is still held against the ceiling");
+});
+
+test("an expiry whose delete lost its race keeps the slot", async () => {
+  // `previousSeq` loses to a sibling reactivating this very handle. Releasing
+  // on a delete that did not happen strips the slot from a target that is live
+  // again, so the release cannot be unconditional.
+  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  const identity = "sess-park:safe:wl-park";
+  const hold = await admitSandbox("sess-park");
+  await hold.bind(identity);
+  kv.seed("hands.sess-park", retained("wl-park"));
+
+  const contended = Object.create(kv) as typeof kv;
+  contended.delete = async () => {
+    throw Object.assign(new Error("wrong last sequence"), { code: "10071" });
+  };
+
+  for (let i = 0; i < 3; i++) {
+    await runKeepaliveTickForTest({
+      kv: contended, countActiveShells: async () => 0,
+      roster: { store: rosterStore(kv), config: CONFIG },
+    });
+    await new Promise((r) => setImmediate(r));
+  }
+
+  assert.ok(roster()!.entries.some((e) => e.identity === identity),
+    "a slot was released for a record that is still there");
+});

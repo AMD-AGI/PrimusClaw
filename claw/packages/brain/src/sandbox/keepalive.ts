@@ -917,9 +917,29 @@ async function collectTargets(
             continue;
           }
           if (expired) {
-            await deps.kv.delete(key, { previousSeq: e.revision }).catch(() => {});
+            // The release is conditional on the delete: `previousSeq` loses to a
+            // sibling reactivating this very handle, and releasing then would
+            // strip the slot from a target that is live again. Idle expiry is
+            // the one exit that reaches no unregisterSandbox, so without this
+            // the ceiling leaks a slot per parked handle, monotonically, until
+            // ordinary provisioning is refused for capacity.
+            const deleted = await deps.kv.delete(key, { previousSeq: e.revision })
+              .then(() => true).catch(() => false);
+            if (deleted) {
+              const identity = pingTargetIdentity(sessionId, {
+                provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+                workloadId: info.workloadId,
+                platformKey: info.platformKey,
+                sessionId: info.sessionId,
+                sandboxName: info.sandboxName,
+                namespace: info.namespace,
+              });
+              if (!await releaseAdmission(identity)) {
+                logger.error({ sessionId, identity }, "keepalive.admission_release_unconfirmed");
+              }
+            }
             logger.info(
-              { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId },
+              { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, deleted },
               "keepalive.idle_handle_expired",
             );
           } else {
