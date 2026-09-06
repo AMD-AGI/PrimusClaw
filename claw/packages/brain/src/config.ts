@@ -99,11 +99,16 @@ export const HANDS_MCP_URL = env("HANDS_MCP_URL");
 export const AUTH_INTERNAL_TOKEN = env("AUTH_INTERNAL_TOKEN");
 
 /**
- * Chat doorbell dispatch. The API owns this flag. Brain still accepts the
- * same env so a mixed chart can set both; claim-next is enabled by
- * INTERNAL_BACKEND_URL so leftover doorbell rows drain after the flag is off.
+ * Whether this pod executes doorbell runs at all -- on the wire and through
+ * claim-next alike. Covering only the wire would not be a switch: claim-next
+ * runs from INTERNAL_BACKEND_URL and would take the row seconds later.
+ *
+ * Defaults true because a kill-switch that defaults to killed disables the
+ * feature it guards. The API's identically-named flag is a different question
+ * -- whether to publish doorbells -- and the chart renders the two per
+ * deployment rather than through the shared Secret.
  */
-export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", false);
+export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
 /** In-cluster API base used for claim-next when this pod is idle. */
 export const INTERNAL_BACKEND_URL = env("INTERNAL_BACKEND_URL");

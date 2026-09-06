@@ -6,7 +6,10 @@
  * doorbell. Shared by the immediate chat path and the pending-message drain.
  */
 
-import { RUN_DOORBELL_KIND, taskSubject, type RunDoorbell } from "@claw/protocol";
+import {
+  DOORBELL_SEMANTICS_VERSION, doorbellDedupId, RUN_DOORBELL_KIND, taskSubject,
+  type RunDoorbell,
+} from "@claw/protocol";
 import pino from "pino";
 
 import { decideAdmission, hardLimitAfterInsert } from "./admission.js";
@@ -35,7 +38,7 @@ export interface HandOffInput {
   filesWorkspaceId?: string;
   pluginId?: number;
   sandboxImage?: string;
-  publish: (subject: string, payload: string, msgId?: string) => Promise<void>;
+  publish: (subject: string, payload: string, msgId: string) => Promise<void>;
   openRun?: typeof openChatRun;
   failRun?: typeof failChatRunDispatch;
   admit?: typeof decideAdmission;
@@ -85,6 +88,7 @@ export async function handOffAssembledRun(input: HandOffInput): Promise<HandOffR
   // the row. Opening at `preparing` made claim-next skip the work.
   const openRun = input.openRun ?? openChatRun;
   const run = await openRun({
+    dispatch: "doorbell",
     sessionId: input.sessionId,
     userId: input.userId,
     messageId,
@@ -168,7 +172,7 @@ export function persistableSpec(task: Record<string, unknown>): Record<string, u
 }
 
 export async function publishDoorbell(
-  publish: (subject: string, payload: string, msgId?: string) => Promise<void>,
+  publish: (subject: string, payload: string, msgId: string) => Promise<void>,
   taskId: string,
   sessionId: string,
   messageId: string,
@@ -179,7 +183,11 @@ export async function publishDoorbell(
     session_id: sessionId,
     message_id: messageId,
     claim_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${taskId}/claim`,
+    semantics: DOORBELL_SEMANTICS_VERSION,
   };
-  await publish(taskSubject(), JSON.stringify(doorbell), messageId);
+  // The chat message id is a millisecond stamp with no session component and
+  // the duplicate window spans the whole stream, so the raw id would drop one
+  // of two turns dispatched in the same millisecond by different sessions.
+  await publish(taskSubject(), JSON.stringify(doorbell), doorbellDedupId(sessionId, messageId));
   logger.info({ taskId, sessionId, messageId }, "run.doorbell_published");
 }

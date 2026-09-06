@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import type { ExecuteRequest, RunFailClaimReason, RunUnclaimReason } from "@claw/protocol";
 import pino from "pino";
 
@@ -153,7 +154,9 @@ async function postClaim(url: string): Promise<ClaimedRun | null> {
   const resp = await fetch(url, {
     method: "POST",
     headers: claimHeaders(),
-    body: JSON.stringify({ brain_id: BRAIN_ID }),
+    // One body serves the by-id and claim-next routes, so the API refuses to
+    // hand either of them a row above what this binary implements.
+    body: JSON.stringify({ brain_id: BRAIN_ID, doorbell_semantics: DOORBELL_SEMANTICS_VERSION }),
     signal: AbortSignal.timeout(10_000),
   });
   // 422 is a settled row (unclaimable / retries exhausted), not a transport

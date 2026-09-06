@@ -17,6 +17,7 @@
  *   P2 the lease travels with the turn
  *   P3 the turn names the files it writes, and says it was required to
  *   P3b a replayed turn is published under the same id, so the stream sees one
+ *   P3c two sessions sharing a message id are two turns, not one
  *   P4 an unbindable turn is refused before anything is opened for it
  *   P5 a refusal that does not clear is abandoned, visibly, and stops retrying
  *   P5b a queue row that has already gone is not replayed and not retried
@@ -43,7 +44,7 @@ import {
   dispatchPendingMessage,
   pendingDispatchPorts,
 } from "../src/tasks/pending-dispatch.js";
-import { RUN_DOORBELL_KIND } from "@claw/protocol";
+import { doorbellDedupId, RUN_DOORBELL_KIND } from "@claw/protocol";
 import { randomBytes } from "node:crypto";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 
@@ -205,10 +206,24 @@ test("P3b the turn is published under the queue row's id, so a replay is one tur
   await dispatchPendingMessage(input({ messageId }));
   await dispatchPendingMessage(input({ messageId }));
 
+  const expected = doorbellDedupId("s-1", messageId);
   assert.deepEqual(
-    rec.published.map((p) => p.msgId), [messageId, messageId],
+    rec.published.map((p) => p.msgId), [expected, expected],
     "both attempts have to claim the same identity for the stream to see one",
   );
+});
+
+test("P3c two sessions sharing a message id are two turns, not one", async () => {
+  // The duplicate window is a property of the whole stream and the chat message
+  // id is a bare millisecond stamp, so the raw id makes the second session's
+  // turn a duplicate of the first: admitted, given a row, and never woken.
+  const rec = harness();
+  const messageId = "claw-1700000000000";
+  await dispatchPendingMessage(input({ messageId, sessionId: "s-1" }));
+  await dispatchPendingMessage(input({ messageId, sessionId: "s-2" }));
+
+  const [first, second] = rec.published.map((p) => p.msgId);
+  assert.notEqual(first, second);
 });
 
 test("P4 an unbindable turn is refused before anything is opened for it", async () => {

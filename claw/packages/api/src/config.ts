@@ -338,6 +338,19 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
 export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", false);
 
 /**
+ * The deployment's assertion that every Brain able to receive `tasks.execute`
+ * takes a durable SQL holder before its execution gate.
+ *
+ * Not a switch over one sweeper pass: it is the single evidence arm that makes
+ * a fat row's null holder columns trustworthy, so every no-holder terminalizer
+ * of a fat row is gated on it. Off by default, and enabling it before every
+ * API replica and every Brain is new -- and before the longest delayed
+ * in-process callback an old replica can have armed has expired -- would let a
+ * reaper close a delivery that is about to execute.
+ */
+export const RUN_FAT_PREPARING_RECONCILE = envBool("RUN_FAT_PREPARING_RECONCILE", false);
+
+/**
  * Cluster-wide admission ceilings. Zero means that dimension is not enforced.
  * Soft: further runs sit at `queued` for claim-next. Hard: the create is refused.
  * Counted by run-tree root so a recursive DAG cannot multiply a tenant's quota.

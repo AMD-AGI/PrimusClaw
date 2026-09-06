@@ -33,7 +33,7 @@
  * connection, a marketplace, an LLM and a skill store before it gets this far.
  */
 
-import { taskSubject, type ExecuteRequest } from "@claw/protocol";
+import { doorbellDedupId, taskSubject, type ExecuteRequest } from "@claw/protocol";
 import pino from "pino";
 
 import { envInt, RUN_DOORBELL_DISPATCH } from "../config.js";
@@ -324,6 +324,10 @@ async function abandonPendingMessage(
     "pending.workspace_bind_abandoned",
   );
   const run = await pendingDispatchPorts.openChatRun({
+    // Fat-shaped, though nothing will be dispatched: an undispatched refusal
+    // record that must stay eligible for fat reconciliation if its immediate
+    // compensation returns an unknown outcome.
+    dispatch: "fat",
     sessionId: input.sessionId,
     userId: input.userId,
     messageId: input.messageId,
@@ -483,6 +487,7 @@ export async function dispatchPendingMessage(
   }
 
   const run = await pendingDispatchPorts.openChatRun({
+    dispatch: "fat",
     sessionId,
     userId: input.userId,
     messageId: input.messageId,
@@ -516,7 +521,7 @@ export async function dispatchPendingMessage(
     // Published under the queued row's id, so a drain that reaches this line
     // twice puts one task on the stream rather than two.
     publishAttempted = true;
-    await pendingDispatchPorts.publish(subject, payload, input.messageId);
+    await pendingDispatchPorts.publish(subject, payload, doorbellDedupId(sessionId, input.messageId));
   } catch (err) {
     // `certain` says whether the run row was torn down, which is the difference
     // between "this turn has not started" and "this turn may be running
@@ -573,8 +578,7 @@ async function finishPendingDoorbell(
     filesWorkspaceId: typeof task.files_workspace_id === "string" ? task.files_workspace_id : undefined,
     pluginId: input.pluginId,
     sandboxImage: input.sandboxImage,
-    publish: (subject, payload, msgId) =>
-      pendingDispatchPorts.publish(subject, payload, msgId ?? input.messageId),
+    publish: (subject, payload, msgId) => pendingDispatchPorts.publish(subject, payload, msgId),
     openRun: pendingDispatchPorts.openChatRun,
     failRun: pendingDispatchPorts.failChatRunDispatch,
     admit: pendingDispatchPorts.admit,

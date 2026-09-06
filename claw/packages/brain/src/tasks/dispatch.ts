@@ -17,10 +17,12 @@
 
 import { StringCodec, type JsMsg, type KV } from "nats";
 import type { ExecuteRequest } from "@claw/protocol";
-import { isRunDoorbell } from "@claw/protocol";
+import {
+  DOORBELL_SEMANTICS_VERSION, doorbellSemanticsOf, isRunDoorbell, type RunDoorbell,
+} from "@claw/protocol";
 import pino from "pino";
-import { TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT } from "../config.js";
-import { metrics } from "../infra/metrics.js";
+import { RUN_DOORBELL_DISPATCH, TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT } from "../config.js";
+import { metrics, type DoorbellDeclineReason } from "../infra/metrics.js";
 import { clearRetryPending, hasFailedAttempt } from "./retry-pending.js";
 import { resolveSandboxImageFromRequest } from "../sandbox/ensure-hands.js";
 import {
@@ -182,6 +184,45 @@ function logTaskReceived(request: ExecuteRequest, msg: JsMsg): void {
   }
 }
 
+/**
+ * Whether this pod must refuse to act on a doorbell, and why.
+ *
+ * A malformed declared version is told apart from one this binary is too old
+ * for: the first is a corrupt or forged payload, the second a fleet below its
+ * asserted floor.
+ */
+function declineReasonFor(doorbell: RunDoorbell): DoorbellDeclineReason | null {
+  if (!RUN_DOORBELL_DISPATCH) return "kill_switch";
+  const declared = doorbellSemanticsOf(doorbell);
+  if (declared === "rejected") return "semantics_malformed";
+  if (declared > DOORBELL_SEMANTICS_VERSION) return "semantics_unsupported";
+  return null;
+}
+
+/**
+ * Ack a doorbell this pod will not act on, leaving the row queued for a
+ * sibling that can. Naking would be a poison loop: no pod in the fleet would
+ * take it and the row would end as max_retries_exceeded rather than as the
+ * queue timeout that names the real cause.
+ */
+function declineDoorbell(
+  msg: JsMsg,
+  doorbell: RunDoorbell,
+  reason: DoorbellDeclineReason,
+): void {
+  metrics.onDoorbellDeclined(reason);
+  const fields = {
+    reason,
+    sessionId: doorbell.session_id,
+    taskId: doorbell.task_id,
+    declared: doorbell.semantics,
+    supported: DOORBELL_SEMANTICS_VERSION,
+  };
+  if (reason === "kill_switch") logger.warn(fields, "task.doorbell_declined");
+  else logger.error(fields, "task.doorbell_declined");
+  msg.ack();
+}
+
 export async function handleTask(msg: JsMsg): Promise<void> {
   let parsed: unknown;
   try {
@@ -197,6 +238,11 @@ export async function handleTask(msg: JsMsg): Promise<void> {
   let claimGeneration: number | undefined;
   if (isRunDoorbell(parsed)) {
     const doorbell = parsed;
+    const decline = declineReasonFor(doorbell);
+    if (decline) {
+      declineDoorbell(msg, doorbell, decline);
+      return;
+    }
     const intake = await intakeDoorbell(doorbell, {
       sessionDeleted: sessionWasDeleted,
       claim: claimRun,
@@ -210,9 +256,30 @@ export async function handleTask(msg: JsMsg): Promise<void> {
         msg.ack();
         return;
       case "miss":
+        // The ordinary result of two pods racing one doorbell, so it stays a
+        // bare ack -- but a rising miss rate is the signature of a claim path
+        // failing open, and nothing else sees it.
+        metrics.onDoorbellClaimOutcome("miss");
+        logger.info(
+          { sessionId: doorbell.session_id, taskId: doorbell.task_id },
+          "task.claim_missed",
+        );
         msg.ack();
         return;
       case "retry":
+        // A nak on the durable's last delivery is not a retry: it stops
+        // redelivering with no log, no counter and no user-facing event,
+        // because the poison guard sits past the return below and is
+        // additionally gated on the claim having succeeded.
+        if (msg.info.deliveryCount >= TASK_MAX_DELIVER - 1) {
+          metrics.onDoorbellClaimOutcome("terminated");
+          logger.error(
+            { err: intake.err, taskId: doorbell.task_id, deliveries: msg.info.deliveryCount },
+            "task.claim_failed_terminal",
+          );
+          msg.term();
+          return;
+        }
         logger.error({ err: intake.err, taskId: doorbell.task_id }, "task.claim_failed");
         msg.nak(5_000);
         return;

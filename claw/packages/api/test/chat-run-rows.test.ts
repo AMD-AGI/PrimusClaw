@@ -25,6 +25,7 @@ import {
   closeChatRun,
   failChatRunDispatch,
   interruptUnstartedChatRuns,
+  parseDispatchCompensationRecord,
   queuedMessageId,
 } from "../src/tasks/chat-run.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../src/tasks/run-budget.js";
@@ -47,6 +48,7 @@ function stubDb(behaviour?: (sql: string) => unknown): SeenQuery[] {
 }
 
 const INPUT = {
+  dispatch: "fat" as const,
   sessionId: "s-1",
   userId: "u-1",
   messageId: "claw-1700000000000",
@@ -78,6 +80,84 @@ test("opening a run records what it is and what it owns", async () => {
     params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
   );
   assert.equal(metadata.message_id, INPUT.messageId, "how Brain refers to this run");
+});
+
+test("a fat run is marked as one and opens with an armed receipt", async () => {
+  // The marker is positive rather than inferred: it decides which reapers may
+  // touch the row, and a fat row that carried no marker would be
+  // indistinguishable from a legacy one.
+  const seen = stubDb();
+  await openChatRun(INPUT);
+
+  const metadata = JSON.parse(
+    seen[0].params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
+  );
+  assert.equal(metadata.dispatch, "fat");
+  assert.deepEqual(metadata.dispatch_compensation, {
+    version: 1, state: "armed", publish: "not_attempted",
+  });
+  assert.equal(
+    metadata.doorbell_semantics, undefined,
+    "the required-semantics key belongs to a doorbell row",
+  );
+});
+
+test("a doorbell run carries its required semantics and owes no receipt", async () => {
+  // The compensation receipt is the fat path's retry record; a doorbell row is
+  // reclaimed by the queue reapers instead.
+  const seen = stubDb();
+  await openChatRun({
+    ...INPUT, dispatch: "doorbell", spec: { prompt: "hello" }, issueLease: false, status: "queued",
+  });
+
+  const metadata = JSON.parse(
+    seen[0].params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
+  );
+  assert.equal(metadata.dispatch, "doorbell");
+  assert.equal(typeof metadata.doorbell_semantics, "number");
+  assert.equal(metadata.dispatch_compensation, undefined);
+});
+
+test("the receipt parser is the only reader, and it fails closed both ways", async () => {
+  const armed = { version: 1, state: "armed", publish: "not_attempted" };
+  assert.deepEqual(
+    parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: armed }),
+    { kind: "valid", record: armed },
+  );
+  // A newer deployment owns this row's contract, so no writer here may touch it.
+  assert.deepEqual(
+    parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: { version: 2, state: "armed" } }),
+    { kind: "unsupported", version: 2 },
+  );
+  // A legacy row with no dispatch key legitimately has no receipt.
+  assert.deepEqual(parseDispatchCompensationRecord({}), { kind: "absent" });
+  // A row that says it is fat owes one, so its absence is a broken invariant.
+  assert.deepEqual(parseDispatchCompensationRecord({ dispatch: "fat" }), { kind: "invalid" });
+  for (const bad of [
+    "armed",
+    [],
+    { version: 1, state: "armed" },
+    { version: 1, state: "armed", publish: "sent" },
+    { version: 1, state: "terminal", failure_reason: "x" },
+    { version: 1, state: "elsewhere" },
+    { state: "armed", publish: "not_attempted" },
+  ]) {
+    assert.deepEqual(
+      parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: bad }),
+      { kind: "invalid" },
+      `expected ${JSON.stringify(bad)} to be invalid`,
+    );
+  }
+  // A terminal receipt keeps both keys even when both are null.
+  assert.deepEqual(
+    parseDispatchCompensationRecord({
+      dispatch_compensation: { version: 1, state: "complete", failure_reason: null, error_message: null },
+    }),
+    {
+      kind: "valid",
+      record: { version: 1, state: "complete", failure_reason: null, error_message: null },
+    },
+  );
 });
 
 test("a run bound by its caller is not bound again here", async () => {
@@ -293,7 +373,9 @@ test("two queued turns are never dispatched under one id", async () => {
 
 test("the doorbell path opens without a lease token, because claim mints it", async () => {
   const seen = stubDb();
-  const run = await openChatRun({ ...INPUT, spec: { prompt: "hello" }, issueLease: false, status: "queued" });
+  const run = await openChatRun({
+    ...INPUT, dispatch: "doorbell", spec: { prompt: "hello" }, issueLease: false, status: "queued",
+  });
 
   assert.equal(run?.lease, undefined);
   const meta = seen[0].params.find((p) => typeof p === "string" && p.includes("doorbell"));

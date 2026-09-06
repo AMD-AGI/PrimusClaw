@@ -36,6 +36,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import pino from "pino";
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
 import { db } from "../infra/db.js";
 import { newTaskId } from "./ids.js";
@@ -90,13 +91,170 @@ export type ChatRunOutcome = "completed" | "failed" | "cancelled";
  * closes it alongside the row it reaps, keyed on this id being the one thing the
  * two rows share.
  */
+/** The receipt a fat row is opened with, before any publish is attempted. */
+export function armedReceipt(publish: DispatchPublishState): DispatchCompensationRecord {
+  return { version: 1, state: "armed", publish };
+}
+
+/** The receipt a close writes, carrying the same two values the row columns get. */
+export function terminalReceipt(
+  failureReason: string | null,
+  errorMessage: string | null,
+): DispatchCompensationRecord {
+  return { version: 1, state: "terminal", failure_reason: failureReason, error_message: errorMessage };
+}
+
+/** What a receipt on the row turned out to be. Only `valid` may be acted on. */
+export type CompensationParse =
+  | { kind: "absent" }
+  | { kind: "valid"; record: DispatchCompensationRecord }
+  | { kind: "unsupported"; version: number }
+  | { kind: "invalid" };
+
+const PUBLISH_STATES = new Set<string>(["not_attempted", "attempted", "refused"]);
+
+/**
+ * The only reader of `metadata.dispatch_compensation`.
+ *
+ * Fails closed in both directions: an unsupported version means a newer
+ * deployment owns this row's contract and no writer here may change it, while a
+ * malformed value must never be read as holder evidence and must never make an
+ * otherwise eligible open orphan permanent.
+ */
+export function parseDispatchCompensationRecord(
+  metadata: Record<string, unknown> | null | undefined,
+): CompensationParse {
+  const raw = metadata?.dispatch_compensation;
+  if (raw === undefined || raw === null) {
+    // A row that says it is fat owes a receipt; its absence is a broken
+    // invariant rather than a legacy row.
+    return metadata?.dispatch === "fat" ? { kind: "invalid" } : { kind: "absent" };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) return { kind: "invalid" };
+  const record = raw as Record<string, unknown>;
+  const version = Number(record.version);
+  if (!Number.isInteger(version)) return { kind: "invalid" };
+  if (!SUPPORTED_COMPENSATION_VERSIONS.includes(version as 1)) {
+    return { kind: "unsupported", version };
+  }
+  if (record.state === "armed") {
+    return typeof record.publish === "string" && PUBLISH_STATES.has(record.publish)
+      ? { kind: "valid", record: armedReceipt(record.publish as DispatchPublishState) }
+      : { kind: "invalid" };
+  }
+  if (record.state !== "terminal" && record.state !== "complete") return { kind: "invalid" };
+  if (!("failure_reason" in record) || !("error_message" in record)) return { kind: "invalid" };
+  return {
+    kind: "valid",
+    record: {
+      version: 1,
+      state: record.state,
+      failure_reason: (record.failure_reason ?? null) as string | null,
+      error_message: (record.error_message ?? null) as string | null,
+    },
+  };
+}
+
+/**
+ * The parser's SQL image, for the two states a writer may act on.
+ *
+ * Exported once and reused verbatim wherever a predicate needs it, so the
+ * statement and {@link parseDispatchCompensationRecord} cannot drift about what
+ * is actionable.
+ */
+export const ACTIONABLE_RECEIPT_SQL = `
+metadata->'dispatch_compensation'->>'version' = '1'
+AND (
+     (
+          metadata->'dispatch_compensation'->>'state' = 'armed'
+          AND metadata->'dispatch_compensation'->>'publish'
+              IN ('not_attempted','attempted','refused')
+     )
+     OR (
+          metadata->'dispatch_compensation'->>'state' = 'terminal'
+          AND jsonb_exists(metadata->'dispatch_compensation', 'failure_reason')
+          AND jsonb_exists(metadata->'dispatch_compensation', 'error_message')
+     )
+)`.trim();
+
+/** The one shape no pass may act on or even fetch: a contract written by a newer deployment. */
+export const UNSUPPORTED_RECEIPT_SQL = `
+metadata->'dispatch_compensation'->>'version' IS NOT NULL
+AND metadata->'dispatch_compensation'->>'version' <> '1'`.trim();
+
+/**
+ * Whether this row's null holder columns are trustworthy evidence that no
+ * delivery is in flight for it.
+ *
+ * One guard, written once and bound by every no-holder terminalizer of a fat
+ * row. `$fleet` is the deployment's assertion that every Brain takes a durable
+ * SQL holder before its execution gate; `$settled` is a per-row observation of
+ * the durable; the publish state answers it from the row itself; and the last
+ * arm is construction, a doorbell row's claim writing owner and expiry in the
+ * statement that takes it. The fat set is written positively so an unknown
+ * dispatch value stays outside the guard.
+ */
+export const NO_DELIVERY_IN_FLIGHT_SQL = `
+$fleet::boolean
+OR $settled::boolean
+OR metadata->'dispatch_compensation'->>'publish' IN ('not_attempted','refused')
+OR NOT (
+     origin = 'chat'
+     AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+)`.trim();
+
+/** Bind {@link NO_DELIVERY_IN_FLIGHT_SQL}'s two evidence arms to statement parameters. */
+export function noDeliveryInFlightSql(fleetParam: string, settledParam: string): string {
+  return NO_DELIVERY_IN_FLIGHT_SQL
+    .replace("$fleet", fleetParam)
+    .replace("$settled", settledParam);
+}
+
 export function queuedMessageId(pendingRowId: number | string): string {
   return `claw-pending-${pendingRowId}`;
 }
 
+/**
+ * Which delivery carries this run's work.
+ *
+ * Explicit rather than inferred from whether a spec happens to be present: the
+ * marker decides which reapers may touch the row, and a fat row that silently
+ * lost it becomes indistinguishable from a legacy one.
+ */
+export type ChatDispatchKind = "fat" | "doorbell";
+
+/**
+ * The durable receipt a fat dispatch leaves on its own row.
+ *
+ * The row columns stay authoritative for status, reason, message and
+ * timestamps; this records only what a later process needs in order to retry a
+ * compensation the process that owed it did not finish.
+ */
+export type DispatchCompensationRecord =
+  | { version: 1; state: "armed"; publish: DispatchPublishState }
+  | {
+    version: 1;
+    state: "terminal" | "complete";
+    failure_reason: string | null;
+    error_message: string | null;
+  };
+
+/**
+ * Whether a message for this row can exist.
+ *
+ * `not_attempted` and `refused` are both proofs that none does, and both
+ * outlive the process that observed them, which is what makes a failed
+ * compensation retryable from row state alone. Only `attempted` is ambiguous.
+ */
+export type DispatchPublishState = "not_attempted" | "attempted" | "refused";
+
+export const SUPPORTED_COMPENSATION_VERSIONS = [1] as const;
+
 export interface OpenChatRunInput {
   sessionId: string;
   userId: string;
+  /** Which delivery carries the work. Fat rows get the compensation receipt. */
+  dispatch: ChatDispatchKind;
   /** The chat message id, which is how Brain refers to this run. */
   messageId: string;
   prompt: string;
@@ -232,7 +390,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
         message_id: input.messageId,
         user_id: input.userId,
         ...(input.sandboxImage ? { sandbox_image: input.sandboxImage } : {}),
-        ...(input.spec ? { dispatch: "doorbell" } : {}),
+        dispatch: input.dispatch,
+        // One spread writes both, so every doorbell row carries the version it
+        // requires. The spec goes to the separate `input` column, where no
+        // predicate here or in the reapers can see it.
+        ...(input.dispatch === "doorbell"
+          ? { doorbell_semantics: DOORBELL_SEMANTICS_VERSION }
+          : { dispatch_compensation: armedReceipt("not_attempted") }),
       },
     });
     const workspaceId = input.recordWorkspaceUse === false

@@ -44,8 +44,8 @@ export const sessionDispatchPorts = {
   publishSse(sessionId: string, payload: string): void {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
   },
-  async publishTask(subject: string, payload: string): Promise<void> {
-    await js.publish(subject, sc.encode(payload));
+  async publishTask(subject: string, payload: string, msgId?: string): Promise<void> {
+    await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
   },
 };
 
@@ -295,6 +295,7 @@ export async function dispatchTaskToBrain(
     }
 
     const run = await sessionDispatchPorts.openChatRun({
+      dispatch: "fat",
       sessionId,
       userId,
       messageId,
@@ -368,7 +369,10 @@ async function dispatchByDoorbell(input: {
   const { rememberTaskId, ...handOff } = input;
   const result = await handOffAssembledRun({
     ...handOff,
-    publish: (subject, payload) => sessionDispatchPorts.publishTask(subject, payload),
+    // The third argument is the dedup id. Dropping it here left every live
+    // chat doorbell with no duplicate-window protection at all.
+    publish: (subject, payload, msgId) =>
+      sessionDispatchPorts.publishTask(subject, payload, msgId),
     openRun: sessionDispatchPorts.openChatRun,
     // Forwards the verdict. Swallowing it here would restore the bug one layer
     // up: handOffAssembledRun would read every compensation as successful and

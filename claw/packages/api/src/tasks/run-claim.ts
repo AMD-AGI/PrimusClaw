@@ -25,6 +25,16 @@ import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
 import type { ClawTaskRow } from "./types.js";
 
+/**
+ * Anything that can run a statement: the pool, a pooled client, or a bare
+ * `pg.Client`. The claim path takes one so a test can drive the production
+ * statement inside its own transaction; replacing the `db` singleton instead
+ * puts both transactions on one connection, which is no interleaving at all.
+ */
+export interface Querier {
+  query(text: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+}
+
 const logger = pino({ name: "run-claim" });
 
 export const runClaimPorts = {
@@ -77,8 +87,10 @@ export interface ClaimedRun {
 export async function claimRunById(
   taskId: string,
   brainId: string,
+  doorbellSemantics = 1,
+  q: Querier = db,
 ): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | ExhaustedClaim> {
-  const taken = await takeClaim(taskId, brainId);
+  const taken = await takeClaim(taskId, brainId, doorbellSemantics, q);
   if (taken === "missing" || taken === "busy") return taken;
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
     const closed = await failExhaustedClaim(taken);
@@ -112,10 +124,13 @@ export async function claimRunById(
 
 const CLAIM_NEXT_ATTEMPTS = 8;
 
-export async function claimNextRun(brainId: string): Promise<ClaimedRun | null> {
+export async function claimNextRun(
+  brainId: string,
+  doorbellSemantics = 1,
+): Promise<ClaimedRun | null> {
   const skip: string[] = [];
   for (let i = 0; i < CLAIM_NEXT_ATTEMPTS; i++) {
-    const taskId = await peekNextQueued(skip);
+    const taskId = await peekNextQueued(skip, doorbellSemantics);
     if (!taskId) return null;
     // A hydrate failure that is not about credentials is rethrown by
     // claimRunById, and it used to leave through here: no catch on this loop
@@ -126,7 +141,7 @@ export async function claimNextRun(brainId: string): Promise<ClaimedRun | null> 
     // ordinary database blip reaches here.
     let claimed: Awaited<ReturnType<typeof claimRunById>>;
     try {
-      claimed = await claimRunById(taskId, brainId);
+      claimed = await claimRunById(taskId, brainId, doorbellSemantics);
     } catch (err) {
       logger.warn({ err, taskId, brainId }, "run.claim_next.skipped_after_error");
       skip.push(taskId);
@@ -141,7 +156,16 @@ export async function claimNextRun(brainId: string): Promise<ClaimedRun | null> 
   return null;
 }
 
-async function peekNextQueued(skip: string[]): Promise<string | null> {
+/**
+ * A doorbell row records the contract it requires; a caller that implements
+ * less is never offered it. Filtered server-side rather than claimed and
+ * released, which would burn a `claim_count` increment on every poll of every
+ * pod. A row with no key is the version-1 row it actually is.
+ */
+const SEMANTICS_FITS_SQL =
+  "COALESCE((metadata->>'doorbell_semantics')::int, 1) <= $SEM::int";
+
+async function peekNextQueued(skip: string[], doorbellSemantics: number): Promise<string | null> {
   const r = await db.query(
     `SELECT task_id FROM claw_tasks
       WHERE status = 'queued'
@@ -158,13 +182,14 @@ async function peekNextQueued(skip: string[]): Promise<string | null> {
         -- run_budget_exhausted -- and the claim installs a fresh lease, which
         -- takes the row out of reapExpiredDoorbellRuns' reach on the way past.
         AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$2")}
         AND NOT (task_id = ANY($1::text[]))
       ORDER BY
         priority DESC,
         COALESCE(queued_at, created_at) ASC,
         created_at ASC
       LIMIT 1`,
-    [skip],
+    [skip, doorbellSemantics],
   );
   return (r.rows[0] as { task_id?: string } | undefined)?.task_id ?? null;
 }
@@ -338,12 +363,14 @@ export async function failHeldClaim(
 async function takeClaim(
   taskId: string,
   brainId: string,
+  doorbellSemantics: number,
+  q: Querier,
 ): Promise<ClawTaskRow | "missing" | "busy"> {
   const token = randomBytes(32).toString("hex");
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
-  const r = await db.query(
+  const r = await q.query(
     `UPDATE claw_tasks
         SET lease_owner = $2,
             lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
@@ -367,11 +394,15 @@ async function takeClaim(
              AND sibling.metadata->>'message_id' = claw_tasks.metadata->>'message_id'
              AND sibling.status IN ('preparing','running','cancelling')
         )
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$8")}
       RETURNING *`,
-    [taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE, RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node],
+    [
+      taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE,
+      RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node, doorbellSemantics,
+    ],
   );
   if ((r.rowCount ?? 0) === 0) {
-    const exists = await db.query(`SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId]);
+    const exists = await q.query(`SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId]);
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }

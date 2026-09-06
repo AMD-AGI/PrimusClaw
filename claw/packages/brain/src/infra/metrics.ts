@@ -26,6 +26,13 @@ import type { HandsRecoveryAction } from "../agent/index.js";
  */
 export type SandboxRecoveryDecision = HandsRecoveryAction | "failed" | "exhausted";
 
+/**
+ * Why a doorbell was acked without a claim. A malformed declared version and
+ * one this binary is simply too old for are separate values: the first is a
+ * corrupt or forged payload, the second a fleet below its floor.
+ */
+export type DoorbellDeclineReason = "kill_switch" | "semantics_malformed" | "semantics_unsupported";
+
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-brain" });
 collectDefaultMetrics({ register: registry });
@@ -479,6 +486,20 @@ const deliveryRefusedTotal = new Counter({
   registers: [registry],
 });
 
+const doorbellDeclinedTotal = new Counter({
+  name: "claw_brain_doorbell_declined_total",
+  help: "Doorbells this pod acked without claiming, by reason.",
+  labelNames: ["reason"] as const, // DoorbellDeclineReason
+  registers: [registry],
+});
+
+const doorbellClaimOutcomeTotal = new Counter({
+  name: "claw_brain_doorbell_claim_outcome_total",
+  help: "Wire-side doorbell claim attempts by outcome.",
+  labelNames: ["outcome"] as const, // "miss" | "terminated"
+  registers: [registry],
+});
+
 const gateInflight = new Gauge({
   name: "claw_brain_gate_inflight",
   help: "Tasks holding an execution slot on this pod.",
@@ -796,6 +817,12 @@ export const metrics = {
   },
   onDeliveryRefused(reason: "surplus" | "drain"): void {
     deliveryRefusedTotal.inc({ reason });
+  },
+  onDoorbellDeclined(reason: DoorbellDeclineReason): void {
+    doorbellDeclinedTotal.inc({ reason });
+  },
+  onDoorbellClaimOutcome(outcome: "miss" | "terminated"): void {
+    doorbellClaimOutcomeTotal.inc({ outcome });
   },
   setDeliveryGauges(state: {
     inflight: number;
