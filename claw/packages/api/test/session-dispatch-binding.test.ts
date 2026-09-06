@@ -316,11 +316,13 @@ test("D8 it still rolls back when the row really was closed", async () => {
   assert.ok(rolledBack, "nothing will execute it, so the turn is refused");
 });
 
-test("D9 a compensation that could not run rolls back rather than guessing", async () => {
-  // `unknown`, not `held`. Nothing established that a worker has the row, so
-  // the honest move is the rollback: it hands the session back. Treating this
-  // as "a worker is running it" left the row at `preparing` with no lease --
-  // invisible to every reaper, and occupying a fleet-wide admission slot.
+test("D9 a compensation that could not run settles nothing and rolls nothing back", async () => {
+  // `unknown`, not `held`, and not `closed` either. Nothing was established:
+  // the row may still be claimable and about to run, so rolling the session
+  // back here would delete the user's message out from under it. The row is
+  // left with its reconciliation marker, and the sweep that owns that marker
+  // is what eventually reaches a verdict -- which is also what keeps the row
+  // from sitting at `preparing` invisible to every reaper.
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
@@ -334,6 +336,6 @@ test("D9 a compensation that could not run rolls back rather than guessing", asy
   let rolledBack = false;
   const result = await dispatchTaskToBrain(INPUT, async () => { rolledBack = true; });
 
-  assert.equal(result.kind, "publish_failed");
-  assert.ok(rolledBack, "the session is handed back, which is the one thing still in reach");
+  assert.equal(result.kind, "publish_unknown");
+  assert.equal(rolledBack, false, "an undecided state is not a licence to unwind the turn");
 });

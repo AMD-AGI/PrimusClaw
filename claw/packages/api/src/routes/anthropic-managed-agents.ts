@@ -1259,7 +1259,7 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
         );
       },
     );
-    if (dispatch.kind === "publish_failed") {
+    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
       return sendError(reply, 503, "api_error", "internal dispatch failed");
     }
     if (dispatch.kind === "rejected") {

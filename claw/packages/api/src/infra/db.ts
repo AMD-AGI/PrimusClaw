@@ -181,6 +181,16 @@ export interface StatementRunner {
 
 export const CHAT_TURN_CLAIM_INDEX = "idx_tasks_chat_turn_unique";
 
+/** One counted A2A row per `(session_id, message_id)` execution. */
+export const A2A_EXECUTION_INDEX = "idx_tasks_a2a_execution";
+
+// Disjoint from ACTIVE_CHAT_TURN_SQL by origin, so the two unique indexes
+// never constrain the same row. No status filter: a repeated pair must answer
+// with the existing execution however that execution ended, or a client
+// replaying one message id executes it again for every terminal row it left.
+const A2A_EXECUTION_SQL = `origin = 'a2a'
+        AND metadata->>'message_id' IS NOT NULL`;
+
 // A chat row that occupies its turn, as takeClaim's sibling guard reads it.
 // `origin` belongs in it: without that the index would also constrain the DAG
 // and a2a rows the guard never looks at.
@@ -248,6 +258,11 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
     throw new Error(`database schema is incomplete after migration: ${problems.join("; ")}`);
   }
   await assertChatTurnClaimIndex(client);
+  await assertUniqueIndexValid(
+    client,
+    A2A_EXECUTION_INDEX,
+    "one A2A execution per (session_id, message_id) is not enforced",
+  );
 }
 
 /**
@@ -257,12 +272,24 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
  * An index left INVALID enforces nothing, which is the same answer as absent.
  */
 export async function assertChatTurnClaimIndex(q: StatementRunner): Promise<void> {
-  const existing = await readIndexValidity(q, CHAT_TURN_CLAIM_INDEX);
+  await assertUniqueIndexValid(
+    q,
+    CHAT_TURN_CLAIM_INDEX,
+    "concurrent claims of one chat turn are not serialised",
+  );
+}
+
+/** An INVALID unique index enforces nothing, which is the same answer as absent. */
+export async function assertUniqueIndexValid(
+  q: StatementRunner,
+  name: string,
+  consequence: string,
+): Promise<void> {
+  const existing = await readIndexValidity(q, name);
   if (existing.rowCount && existing.rows[0].indisvalid) return;
-  logger.error({ index: CHAT_TURN_CLAIM_INDEX }, "db.chat_turn_index_unusable");
+  logger.error({ index: name }, "db.unique_index_unusable");
   throw new Error(
-    `refusing to serve: ${CHAT_TURN_CLAIM_INDEX} is ${existing.rowCount ? "not valid" : "absent"}, ` +
-    "so concurrent claims of one chat turn are not serialised",
+    `refusing to serve: ${name} is ${existing.rowCount ? "not valid" : "absent"}, so ${consequence}`,
   );
 }
 
@@ -1267,6 +1294,14 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_tasks_occupying ON claw_tasks(executor)
          WHERE status IN ('queued','preparing','running','cancelling')`,
     ).catch(() => {});
+    // `waiting_external` joined the occupying set, and `CREATE INDEX IF NOT
+    // EXISTS` will not alter an existing predicate -- so widening the count
+    // without a new index silently returns `loadUsage` to a sequential scan.
+    // The old one is retained for this rolling upgrade, as the rule below says.
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_tasks_occupying_v2 ON claw_tasks(executor)
+         WHERE status IN ('queued','preparing','running','cancelling','waiting_external')`,
+    ).catch(() => {});
 
     // Reclaiming runs whose worker died. Partial for the same reason as the
     // deadline index: terminal rows are almost all of the table.
@@ -1335,6 +1370,13 @@ export async function initDb(): Promise<void> {
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
     await ensureChatTurnClaimIndex(client);
+    await ensureConcurrentIndex(
+      client,
+      A2A_EXECUTION_INDEX,
+      `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${A2A_EXECUTION_INDEX}
+         ON claw_tasks(session_id, (metadata->>'message_id'))
+       WHERE ${A2A_EXECUTION_SQL}`,
+    );
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_task_edges (
         id                BIGSERIAL PRIMARY KEY,

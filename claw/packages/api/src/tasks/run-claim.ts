@@ -147,14 +147,42 @@ export async function claimRunById(
 
 const CLAIM_NEXT_ATTEMPTS = 8;
 
+/**
+ * Why one candidate was passed over.
+ *
+ * A discriminated union rather than an optional field, so the exhaustion
+ * reason is required exactly when the cause is `exhausted`: an optional field
+ * would compile with it dropped, and the pull loop's poison would then be
+ * unreportable.
+ */
+export type ClaimNextSkip =
+  | { cause: "exhausted"; exhaustion: "lock_contention_exhausted" | "max_retries_exceeded" }
+  | { cause: "raced" | "unclaimable" | "error" };
+
+/**
+ * What a claim-next call did besides answering.
+ *
+ * "No row" has three meanings and collapsing them is what makes a stalled
+ * queue look idle: nothing was there, everything there was passed over, or the
+ * attempt budget ran out.
+ */
+export interface ClaimNextDiagnostics {
+  skipped: ClaimNextSkip[];
+  outcome: "claimed" | "empty" | "all_skipped" | "retry_limit";
+}
+
 export async function claimNextRun(
   brainId: string,
   doorbellSemantics = 1,
+  diag?: ClaimNextDiagnostics,
 ): Promise<ClaimedRun | null> {
   const skip: string[] = [];
   for (let i = 0; i < CLAIM_NEXT_ATTEMPTS; i++) {
     const taskId = await peekNextQueued(skip, doorbellSemantics);
-    if (!taskId) return null;
+    if (!taskId) {
+      if (diag) diag.outcome = skip.length ? "all_skipped" : "empty";
+      return null;
+    }
     // A hydrate failure that is not about credentials is rethrown by
     // claimRunById, and it used to leave through here: no catch on this loop
     // and none on the route, so the whole cycle answered 500. The row itself
@@ -167,16 +195,35 @@ export async function claimNextRun(
       claimed = await claimRunById(taskId, brainId, doorbellSemantics);
     } catch (err) {
       logger.warn({ err, taskId, brainId }, "run.claim_next.skipped_after_error");
+      diag?.skipped.push({ cause: "error" });
       skip.push(taskId);
       continue;
     }
     if (typeof claimed === "string" || "kind" in claimed) {
+      diag?.skipped.push(skipCauseOf(claimed));
       skip.push(taskId);
       continue;
     }
+    if (diag) diag.outcome = "claimed";
     return claimed;
   }
+  if (diag) diag.outcome = "retry_limit";
   return null;
+}
+
+/**
+ * A skipped candidate's cause, split by what it says about the queue.
+ *
+ * `missing` and `busy` are both the queue moving under this pod -- a second
+ * one won the row a microsecond earlier, or it closed meanwhile -- so they
+ * share one value. Only the other two are properties of the candidate itself,
+ * and only those can mean a queue that is stuck.
+ */
+function skipCauseOf(claimed: "missing" | "busy" | "unclaimable" | ExhaustedClaim): ClaimNextSkip {
+  if (typeof claimed !== "string") {
+    return { cause: "exhausted", exhaustion: claimed.reason };
+  }
+  return { cause: claimed === "unclaimable" ? "unclaimable" : "raced" };
 }
 
 /**

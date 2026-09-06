@@ -13,11 +13,13 @@ import {
   DOORBELL_SEMANTICS_MAX, RUN_UNCLAIM_REASONS, type RunUnclaimReason,
 } from "@claw/protocol";
 import { constantTimeEquals } from "@claw/utils";
+import { metrics } from "../infra/metrics.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
 
 import {
   claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim,
+  type ClaimedRun, type ClaimNextDiagnostics,
 } from "../tasks/run-claim.js";
 
 const logger = pino({ name: "internal-runs" });
@@ -90,7 +92,14 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
       const semantics = doorbellSemanticsFrom(req.body);
       if (semantics === "invalid") return reply.status(400).send(SEMANTICS_INVALID);
-      const claimed = await claimRunById(req.params.taskId, brainId, semantics);
+      let claimed: Awaited<ReturnType<typeof claimRunById>>;
+      try {
+        claimed = await claimRunById(req.params.taskId, brainId, semantics);
+      } catch (err) {
+        metrics.onRunClaim("by_id", "error");
+        throw err;
+      }
+      if (typeof claimed === "string") metrics.onRunClaim("by_id", claimed);
       if (claimed === "missing") return reply.status(404).send({ ok: false, error: "not_found" });
       if (claimed === "busy") return reply.status(409).send({ ok: false, error: "busy" });
       if (claimed === "unclaimable") return reply.status(422).send({ ok: false, error: "unclaimable" });
@@ -99,8 +108,11 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       // differently from one that kept crashing, and the archive already
       // distinguishes them.
       if (typeof claimed !== "string" && "kind" in claimed) {
+        metrics.onRunClaim("by_id", "exhausted");
+        metrics.onRunClaimExhausted("by_id", claimed.reason);
         return reply.status(422).send({ ok: false, error: claimed.reason });
       }
+      metrics.onRunClaim("by_id", "claimed");
       logger.info({ taskId: req.params.taskId, brainId }, "run.claim.http");
       // `claim_count` travels with the request so the holder can back off on
       // the row's own retry history; see ClaimedRun.claimCount.
@@ -114,9 +126,17 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
     async (req, reply) => {
       const brainId = brainIdFrom(req.body);
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
-      const released = await releaseClaim(
-        req.params.taskId, brainId, claimCountFrom(req.body), releaseReasonFrom(req.body),
-      );
+      const reason = releaseReasonFrom(req.body) ?? "unspecified";
+      let released: boolean;
+      try {
+        released = await releaseClaim(
+          req.params.taskId, brainId, claimCountFrom(req.body), releaseReasonFrom(req.body),
+        );
+      } catch (err) {
+        metrics.onRunUnclaim(reason, "error");
+        throw err;
+      }
+      metrics.onRunUnclaim(reason, released ? "accepted" : "not_holder");
       if (!released) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };
     },
@@ -128,12 +148,17 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
     async (req, reply) => {
       const brainId = brainIdFrom(req.body);
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
-      const failed = await failHeldClaim(
-        req.params.taskId,
-        brainId,
-        heldClaimReasonFrom(req.body),
-        claimCountFrom(req.body),
-      );
+      const reason = heldClaimReasonFrom(req.body);
+      let failed: boolean;
+      try {
+        failed = await failHeldClaim(
+          req.params.taskId, brainId, reason, claimCountFrom(req.body),
+        );
+      } catch (err) {
+        metrics.onRunFailClaim(reason, "error");
+        throw err;
+      }
+      metrics.onRunFailClaim(reason, failed ? "accepted" : "not_holder");
       if (!failed) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };
     },
@@ -147,7 +172,23 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
       const semantics = doorbellSemanticsFrom(req.body);
       if (semantics === "invalid") return reply.status(400).send(SEMANTICS_INVALID);
-      const claimed = await claimNextRun(brainId, semantics);
+      // The loop swallows its skips, so the counts an operator needs -- how
+      // often the queue was empty versus occupied by rows this pod could not
+      // take -- come back on a plain struct rather than through a metrics
+      // import in the claim core.
+      const diag: ClaimNextDiagnostics = { skipped: [], outcome: "empty" };
+      let claimed: ClaimedRun | null;
+      try {
+        claimed = await claimNextRun(brainId, semantics, diag);
+      } catch (err) {
+        metrics.onRunClaim("next", "error");
+        throw err;
+      }
+      metrics.onRunClaim("next", diag.outcome);
+      for (const skip of diag.skipped) {
+        metrics.onRunClaimSkipped(skip.cause);
+        if (skip.cause === "exhausted") metrics.onRunClaimExhausted("next", skip.exhaustion);
+      }
       if (!claimed) return { ok: true, request: null };
       logger.info({ taskId: claimed.request.task_id, brainId }, "run.claim_next.http");
       return { ok: true, request: claimed.request, claim_count: claimed.claimCount };

@@ -21,6 +21,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { RUN_CLAIM_FENCE_LOCK_ID, RUN_CLAIM_FENCE_SQL } from "../src/infra/db.js";
+
 const SRC = readFileSync(new URL("../src/infra/db.ts", import.meta.url), "utf8");
 const FN = SRC.slice(
   SRC.indexOf("async function ensureConcurrentIndex"),
@@ -99,7 +101,11 @@ test("an invalid chat-turn index refuses startup rather than warning", () => {
   // ensureConcurrentIndex ends in a warn, which is right for a performance
   // index and wrong for the one carrying a correctness invariant.
   assert.match(SRC, /export async function assertChatTurnClaimIndex/);
-  assert.match(SRC, /refusing to serve: \$\{CHAT_TURN_CLAIM_INDEX\}/);
+  assert.match(SRC, /refusing to serve: \$\{name\} is/);
+  assert.match(SRC, /assertUniqueIndexValid\(\s*q,\s*CHAT_TURN_CLAIM_INDEX/);
+  // The A2A execution index carries the same class of invariant -- one counted
+  // row per execution -- so it is asserted rather than warned about too.
+  assert.match(SRC, /assertUniqueIndexValid\(\s*client,\s*A2A_EXECUTION_INDEX/);
   const assertFn = SRC.slice(
     SRC.indexOf("async function assertSchema"),
     SRC.indexOf("* Refuse to serve unless the chat-turn"),
@@ -140,11 +146,16 @@ test("the claim path's fence is shared and statement-scoped", () => {
   // takeClaim opens no transaction of its own, so a lock taken by a preceding
   // statement would already be released by the time its UPDATE runs.
   assert.match(SRC, /export const RUN_CLAIM_FENCE_SQL =\s*\n?\s*`pg_advisory_xact_lock_shared/);
+  // Asserted on the live values rather than on the source text, because both
+  // ids are now mixed with the schema name: advisory locks share one namespace
+  // per database, so a fixed id would make two deployments sharing one database
+  // serialise their migrations and index builds against each other.
   assert.notEqual(
-    /RUN_CLAIM_FENCE_LOCK_ID = ([\d_]+)/.exec(SRC)?.[1],
-    /SCHEMA_MIGRATION_LOCK_ID = ([\d_]+)/.exec(SRC)?.[1],
+    RUN_CLAIM_FENCE_LOCK_ID,
+    Number(/schemaScopedLockId\(([\d_]+)\);/.exec(SRC)?.[1]?.replace(/_/g, "")),
     "the fence must not reuse the migration lock, which claims never take",
   );
+  assert.ok(RUN_CLAIM_FENCE_SQL.includes(String(RUN_CLAIM_FENCE_LOCK_ID)));
 });
 
 test("a rebuild from an INVALID index says so", () => {

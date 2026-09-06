@@ -91,7 +91,16 @@ export type DispatchResult =
   | { kind: "dispatched"; messageId: string; sandboxImage: string | undefined }
   | { kind: "queued"; messageId: string; sandboxImage: string | undefined; queuePosition: number; runId: string }
   | { kind: "rejected"; messageId: string; reason: string }
-  | { kind: "publish_failed"; messageId: string; error: Error };
+  | { kind: "publish_failed"; messageId: string; error: Error }
+  /**
+   * The compensation could not establish what happened to the row.
+   *
+   * Distinct from `publish_failed`, which follows a committed terminal verdict
+   * and has already run its cleanup. Here nothing is settled: the caller must
+   * not idle or delete the session, because the row may still be claimable and
+   * about to run. Reconciliation owns the state until it reaches a verdict.
+   */
+  | { kind: "publish_unknown"; messageId: string; error: Error };
 
 /**
  * Brain-dispatch helper shared by native `POST /v1/sessions[/:id/messages]`
@@ -361,6 +370,16 @@ export async function dispatchTaskToBrain(
       // The image the run is actually using is on the row the holder claimed;
       // this path never learns it, and the callers use it only for a log line.
       return { kind: "dispatched", messageId, sandboxImage: undefined };
+    }
+    // An unknown verdict is not a settled state, so the rollback that a
+    // `closed` one earns would delete the user's message out from under a run
+    // that may still execute.
+    if (verdict === "unknown") {
+      logger.error(
+        { err, sessionId, messageId, subject, runTaskId },
+        "message.dispatch_unknown_awaiting_reconcile",
+      );
+      return { kind: "publish_unknown", messageId, error: err };
     }
     try {
       await onPublishFailure();
