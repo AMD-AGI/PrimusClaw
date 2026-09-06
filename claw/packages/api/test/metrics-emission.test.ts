@@ -28,6 +28,19 @@ function sample(text: string, name: string, labels: Record<string, string> = {})
 }
 
 /** What one action moved, as a reader of `/metrics` would see it. */
+/**
+ * How far below a nominal lower bound a measured sum may legitimately land.
+ *
+ * `delta` reads an accumulating histogram sum before and after, so what it
+ * returns is a difference of two floats, not the observations themselves. Three
+ * observations of exactly 10, 20 and 30 seconds subtract to 59.99999999999999
+ * whenever the accumulator's earlier value has the wrong fractional part -- a
+ * property of what ran before, and so of wall-clock timing, which is why it
+ * shows up on a loaded machine and not on an idle one. The bound is about
+ * telling one sojourn from three, and a hundredth of a second does not blur it.
+ */
+const SUM_EPSILON = 0.01;
+
 async function delta(
   act: () => void,
   probes: ReadonlyArray<{ name: string; labels?: Record<string, string> }>,
@@ -54,7 +67,10 @@ test("a claimed exit with a marker books the exit and one observed wait", async 
   );
   assert.equal(exits, 1);
   assert.equal(count, 1);
-  assert.ok(sum >= 45 && sum < 50, `expected roughly 45s of wait, got ${sum}`);
+  assert.ok(
+    sum >= 45 - SUM_EPSILON && sum < 50,
+    `expected roughly 45s of wait, got ${sum}`,
+  );
 });
 
 test("a claimed exit without a marker still books the exit and observes nothing", async () => {
@@ -114,7 +130,10 @@ test("a marker re-stamped between sojourns is measured per sojourn, not cumulati
   );
   assert.equal(count, 3);
   // A cumulative marker would put 10 + 30 + 60 here; three sojourns put 60.
-  assert.ok(sum >= 60 && sum < 65, `expected the three waits to sum to about 60s, got ${sum}`);
+  assert.ok(
+    sum >= 60 - SUM_EPSILON && sum < 65,
+    `expected the three waits to sum to about 60s, got ${sum}`,
+  );
 });
 
 test("a marker ahead of this pod's clock reads as no wait rather than a negative one", async () => {

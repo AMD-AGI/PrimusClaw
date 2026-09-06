@@ -146,15 +146,32 @@ const granted = (status: string, claimCount?: number): LeaseAnswer =>
 
 describe("the pre-gate lease", () => {
   it("F1 completes before the delivery queues for a slot", async () => {
+    // Recorded by kind, not by count. Once the acceptance is granted the
+    // pre-gate heartbeat starts renewing while the gate is blocked -- that is
+    // the whole point of it -- so counting lease POSTs races the heartbeat
+    // interval and says nothing about the ordering this case is named for.
     const order: string[] = [];
-    const h = harness({ answers: () => { order.push("lease"); return granted("preparing", 1); } });
+    const h = harness({
+      answers: (_n, renewal) => {
+        order.push(renewal.accept ? "accept" : "renew");
+        return granted("preparing", 1);
+      },
+    });
     const acquire = h.gate.acquire.bind(h.gate);
     h.gate.acquire = async () => { order.push("gate"); return acquire(); };
 
     void runDelivery(msgFor(fatRequest()), h.deps);
     await settle();
+    await tick();
 
-    assert.deepEqual(order, ["lease", "gate"]);
+    assert.deepEqual(
+      order.filter((step) => step !== "renew"), ["accept", "gate"],
+      "exactly one acceptance, and it completed before the delivery queued for a slot",
+    );
+    assert.ok(
+      order.indexOf("gate") < order.lastIndexOf("renew"),
+      "and the lease keeps being renewed while the gate is blocked",
+    );
     assert.equal(h.deps.fatPreGate!.target(msgFor(fatRequest())) !== null, true);
   });
 
