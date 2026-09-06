@@ -29,19 +29,6 @@ export const OWNER_HEADER = "x-claw-owner";
 /** Header Brain stamps with the id of the single run making the call. */
 export const RUN_HEADER = "x-claw-run";
 
-/**
- * Header Brain stamps with replay-stable evidence of *which* start this is, so
- * a redispatched crash does not execute the same work twice.
- *
- * A header rather than a tool field, under the same normalisation as the two
- * scopes: the model can neither read it, set it, nor collide with another
- * caller's.
- */
-export const INTENT_HEADER = "x-claw-intent";
-
-/** Header Brain stamps with the owning run's execution deadline, which fixes
- *  how long this shell's terminal outcome stays surfaced. */
-export const DEADLINE_HEADER = "x-claw-deadline";
 
 /**
  * Owner used when the header is absent: an older Brain, a probe, a test, a
@@ -61,8 +48,6 @@ export const NO_RUN = "";
 interface CallerContext {
   owner: string;
   run: string;
-  intentKey?: string;
-  deadlineAt?: string;
 }
 
 const store = new AsyncLocalStorage<CallerContext>();
@@ -95,22 +80,7 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
-export function normalizeIntent(raw: unknown): string {
-  return normalizeCallerKey(raw, "");
-}
 
-/**
- * The stamped deadline, substituted rather than repaired.
- *
- * Missing, malformed, or not a future instant is treated as absent -- the named
- * fallback, an outcome that never expires -- never partially parsed into a
- * shorter retention window than the run was granted.
- */
-export function normalizeDeadline(raw: unknown, nowMs = Date.now()): string {
-  const value = normalizeCallerKey(raw, "");
-  const at = value ? Date.parse(value) : NaN;
-  return Number.isFinite(at) && at > nowMs ? new Date(at).toISOString() : "";
-}
 
 export function withCaller<T>(ctx: CallerContext, fn: () => T): T {
   return store.run(ctx, fn);
@@ -124,10 +94,3 @@ export function currentRun(): string {
   return store.getStore()?.run ?? NO_RUN;
 }
 
-export function currentStartIntent(): { intentKey?: string; deadlineAt?: string } {
-  const ctx = store.getStore();
-  return {
-    ...(ctx?.intentKey ? { intentKey: ctx.intentKey } : {}),
-    ...(ctx?.deadlineAt ? { deadlineAt: ctx.deadlineAt } : {}),
-  };
-}

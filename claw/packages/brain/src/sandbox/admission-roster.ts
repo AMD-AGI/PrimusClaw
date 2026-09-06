@@ -73,7 +73,7 @@ export type ClaimResult =
 
 export type BindResult =
   | { ok: true; added: boolean }
-  | { ok: false; reason: "token_gone" | "contended" };
+  | { ok: false; reason: "token_gone" };
 
 /**
  * The ceiling is stamped on the roster at the first claim made against it, and
@@ -98,11 +98,12 @@ const EMPTY = (ceiling: number): Roster => ({ ceiling, entries: [] });
  *
  * `decide` returns the roster to write, or a result to report without writing.
  */
+export class RosterContended extends Error {}
+
 async function mutate<T>(
   store: RosterStore,
   config: RosterConfig,
   decide: (roster: Roster, now: number) => { write: Roster; result: T } | { result: T },
-  contended: T,
 ): Promise<T> {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const current = await store.read();
@@ -114,7 +115,13 @@ async function mutate<T>(
     if (!("write" in outcome)) return outcome.result;
     if (await store.write(outcome.write, current?.revision ?? null)) return outcome.result;
   }
-  return contended;
+  // Raised, never answered with an empty roster. A caller handed
+  // `{admitted: [], rosterSize: 0}` reads a fleet with no targets in it: the
+  // count every deferral bound rests on is understated, no breach is reported,
+  // and ordinary admission carries on against a number nobody could write.
+  throw new RosterContended(
+    `the admission roster could not be updated in ${MAX_ATTEMPTS} attempts under contention`,
+  );
 }
 
 /**
@@ -165,7 +172,7 @@ export async function claimProvisionalSlot(
       write: { ...roster, entries: [...roster.entries, entry] },
       result: { ok: true, token, rosterSize: roster.entries.length + 1 },
     };
-  }, { ok: false, reason: "at_capacity", rosterSize: config.ceiling, reserveRemaining: 0 });
+  });
 }
 
 /**
@@ -193,7 +200,7 @@ export async function bindSlot(
       write: { ...roster, entries: [...withoutToken, bound] },
       result: { ok: true, added: true },
     };
-  }, { ok: false, reason: "contended" });
+  });
 }
 
 /** Give a slot back, by token or by identity. A release that loses re-reads. */
@@ -206,7 +213,7 @@ export async function releaseSlot(
     return entries.length === roster.entries.length
       ? { result: true }
       : { write: { ...roster, entries }, result: true };
-  }, false);
+  });
 }
 
 export interface ReconcileResult {
@@ -248,7 +255,7 @@ export async function reconcileTargets(
       beyondCeiling: beyond,
     };
     return missing.length === 0 ? { result } : { write: { ...roster, entries }, result };
-  }, { admitted: [], rosterSize: 0, breach: false, beyondCeiling: [] });
+  });
 }
 
 /**
@@ -270,7 +277,7 @@ export async function renewAndReap(
         ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now }
         : entry));
     return { write: { ...roster, entries }, result: entries.length };
-  }, -1);
+  });
 }
 
 /**

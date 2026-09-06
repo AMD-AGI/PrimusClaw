@@ -32,11 +32,16 @@ const CONFIG: RosterConfig = {
   ceiling: 8, reconciliationReserve: 2, reclaimHorizonMs: 900_000, replicaId: "replica-a",
 };
 
-const entry = (workloadId: string) => JSON.stringify({
+const entry = (workloadId: string, over: Record<string, unknown> = {}) => JSON.stringify({
   status: "ready", provider: "safe-workload", workloadId,
   platformKey: "pk", namespace: "ns",
   handsUrl: `http://${workloadId}:9100/mcp`, token: "tok",
+  ...over,
 });
+
+/** An idle-parked handle: not pinged until something says it is still working,
+ *  which is the only shape that reaches the active-shell probe. */
+const retained = (workloadId: string) => entry(workloadId, { keepalive: false, idleSince: 0 });
 
 /** A revision-aware KV whose contents a test can change mid-tick. */
 function makeKv(values: Map<string, Uint8Array>): KV & { seed(key: string, value: string): void } {
@@ -257,4 +262,61 @@ test("a sandbox parked for idle reuse keeps its slot", async () => {
 
   assert.ok(roster()!.entries.some((e) => e.identity === identity),
     "the slot stays with a sandbox that is still reusable and still counted");
+});
+
+test("mid-sweep arrival, over-cap result, and a retained shell that must not be lost", async () => {
+  // The three at once, which is where they interact: the roster is already at
+  // its reserve boundary, more remote targets appear than the reserve can
+  // cover, one of them is an idle-parked handle whose sandbox still holds a
+  // background shell, and a further registration lands while the sweep is
+  // running. What must survive all of it is the retained shell's host.
+  const filler = Array.from({ length: CONFIG.ceiling - CONFIG.reconciliationReserve }, (_, i) => ({
+    identity: `sandbox-filler-${i}`, token: `t${i}`, claimedBy: "replica-b", renewedAtMs: Date.now(),
+  }));
+  kv.seed("keepalive.roster", JSON.stringify({ ceiling: CONFIG.ceiling, entries: filler }));
+  // The one holding live work is idle-parked, so it is the one the probe is
+  // asked about -- and the one a wrong answer expires.
+  kv.seed("hands.sess-working", retained("wl-working"));
+  for (const n of [1, 2, 3]) kv.seed(`hands.sess-remote-${n}`, entry(`wl-remote-${n}`));
+
+  const probedOwners: string[] = [];
+  let arrived = false;
+  onPing = () => {
+    if (arrived) return;
+    arrived = true;
+    kv.seed("hands.sess-latecomer", entry("wl-latecomer"));
+  };
+
+  const probe = async (_u: string, _t: string, owner: string) => {
+    probedOwners.push(owner);
+    return owner === "sess-working" ? 1 : 0;
+  };
+  // Twice, because the probe answers behind the sweep: the first tick reads
+  // `unknown` and the second acts on the answer.
+  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+  await new Promise((r) => setImmediate(r));
+  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+
+  assert.ok(arrived, "the registration really did land during a sweep");
+  assert.ok(probedOwners.includes("sess-working"), "the retained handle was actually asked about");
+
+  const identities = roster()!.entries.map((e) => e.identity);
+  assert.ok(roster()!.entries.length > CONFIG.ceiling, "genuinely past the declared ceiling");
+  for (const n of [1, 2, 3]) {
+    assert.ok(identities.includes(`sess-remote-${n}:safe:wl-remote-${n}`), `remote ${n} admitted`);
+  }
+  assert.ok(identities.includes("sess-working:safe:wl-working"),
+    "the target holding live work is admitted, not left to residual capacity");
+  assert.ok(kv.get, "sanity");
+  assert.ok(values.has("hands.sess-working"),
+    "and its handle survives the breach: nothing is expired or reclaimed on account of it");
+  assert.ok(pinged.includes("wl-working"),
+    "a handle held by a running shell is pinged rather than left to idle out");
+
+  // A third tick picks up what arrived during the first two.
+  pinged.length = 0;
+  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+  assert.ok(roster()!.entries.some((e) => e.identity === "sess-latecomer:safe:wl-latecomer"),
+    "the mid-sweep arrival is admitted rather than lost");
+  assert.ok(pinged.includes("wl-latecomer"));
 });

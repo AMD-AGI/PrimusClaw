@@ -91,14 +91,26 @@ hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
 # path that has nothing to do with the absolute cap -- so a gate that accepts any
 # terminal state as a refresh proves the wrong thing about the CR that then
 # disappears.
-# What counts as a refresh is a command that ran in the sandbox, so the second
-# argument names the tool that has to have run -- `bash` for the activity prompt.
-# A completed task proves the agent answered, not that it touched the sandbox:
-# a model can satisfy "Run: echo alive" by replying without calling anything,
-# and the sandbox then went the whole iteration untouched while the gate
-# recorded a refresh.
+# Whether one dispatched activity task actually refreshed the sandbox.
+#
+# Three things have to be true, and each of the first two is satisfiable without
+# the third. A terminal state is not a successful one: a run that failed or was
+# cancelled left the session idle, and an idle session is reclaimed by a path
+# that has nothing to do with the absolute cap. A completed run is not a run
+# that touched the sandbox: a model can satisfy "Run: echo alive" by replying
+# without calling anything. And a counted call is not a call that worked --
+# `by_tool` is incremented before the tool executes, a pre-hook can reject it
+# immediately afterwards, and a failed command comes back as result text with
+# the task still completing.
+#
+# So the evidence is the command's own output. The activity prompt echoes a
+# token that only the sandbox can produce, and the task's output carrying it is
+# the one fact that cannot be true unless a command ran there and succeeded.
 settle_verdict() {
-  local body="$1" tool="${2:-bash}" status calls
+  local body="$1" marker="$2" status
+  [ -n "$marker" ] || {
+    echo "FAIL: settle_verdict needs the marker the activity command echoes" >&2
+    return "$ROLLOUT_FAIL"; }
   status=$(printf '%s' "$body" | jq -r '.status // "MISSING"' 2>/dev/null) || {
     echo "FAIL: activity result unparseable" >&2; return "$ROLLOUT_FAIL"; }
   case "$status" in
@@ -111,14 +123,8 @@ settle_verdict() {
       return "$ROLLOUT_FAIL" ;;
   esac
 
-  calls=$(printf '%s' "$body" | jq -r --arg t "$tool" '.by_tool[$t] // 0' 2>/dev/null) || calls=0
-  case "$calls" in
-    ''|*[!0-9]*)
-      echo "FAIL: activity result carries no $tool call count; nothing proves the sandbox was touched" >&2
-      return "$ROLLOUT_FAIL" ;;
-  esac
-  [ "$calls" -ge 1 ] || {
-    echo "FAIL: the activity task completed without calling $tool, so no command ran in the sandbox and nothing refreshed it" >&2
+  printf '%s' "$body" | jq -e --arg m "$marker" '(.out // "") | contains($m)' >/dev/null 2>&1 || {
+    echo "FAIL: the activity task completed without the sandbox echoing $marker, so no command ran there successfully and nothing refreshed it" >&2
     return "$ROLLOUT_FAIL"; }
   return "$ROLLOUT_PASS"
 }

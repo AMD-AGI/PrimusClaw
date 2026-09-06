@@ -55,7 +55,7 @@ import { existsSync, createReadStream } from "fs";
 import { initDagHandles } from "./sandbox/handles.js";
 import { initBgHandleRows } from "./sandbox/bg-row-store.js";
 import {
-  bindHandsKv, isValidHandsToken, migrateReservedKeys,
+  assertReservedKeysFree, bindHandsKv, isValidHandsToken,
 } from "./sandbox/registry.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "./sandbox/multi-node/factory.js";
 import type { SessionDestroyResult } from "./sandbox/multi-node/types.js";
@@ -532,11 +532,11 @@ async function main() {
   // (sandbox/registry.ts) so it can read/write `hands.<sessionId>` without a
   // circular import back into this file.
   bindHandsKv(kv);
-  // Before anything can mint a retention, so no live session's binding is
-  // written over by one: an entry already sitting in the reserved namespace
-  // predates it and is moved out, and one that cannot be read is reported
-  // rather than dropped.
-  await migrateReservedKeys(kv);
+  // Before anything can be provisioned: a session binding sitting in the
+  // namespace reserved for retained containers means a container retained under
+  // that generation could not keep its binding, and would be reclaimed with its
+  // work in it.
+  await assertReservedKeysFree(kv);
   // Bind the same registry bucket for the task-lock module (lock.<key>
   // entries) and the KV buckets + emitter + engine singletons for
   // tasks/runner.ts — both extracted out of this file to keep handleTask's

@@ -56,9 +56,15 @@ export async function resolveStart(input: {
   row: BgHandleRow | null;
   rowReadable: boolean;
   currentGeneration: string | null;
+  /**
+   * Whether the answering sandbox files durable records at all. A process that
+   * files none has no record route to ask, so waiting for one to answer is
+   * waiting forever.
+   */
+  sandboxFilesRecords: boolean;
   probe: () => Promise<RecordProbe>;
 }): Promise<StartResolution> {
-  const { row, rowReadable, currentGeneration, probe } = input;
+  const { row, rowReadable, currentGeneration, sandboxFilesRecords, probe } = input;
 
   if (!rowReadable) {
     return {
@@ -81,6 +87,28 @@ export async function resolveStart(input: {
         action: "refuse", reported: "unknown", shellClass: "unknown",
         reason: "the crash between the request leaving and its confirmation, read "
           + "against a sandbox that can no longer be asked",
+      };
+  }
+
+  // A sandbox that files no records can never answer the read this resolution
+  // is built on, so a `dispatched` row against one would be refused for the
+  // life of that sandbox -- a request that may never have left Brain, refused
+  // forever, for the whole mixed-version window. It is retransmitted instead,
+  // and the arbitration moves to where such a process does have one: the id is
+  // fixed and run-qualified before it goes out, so a send that already landed
+  // comes back as that process's own duplicate-name refusal and a send that
+  // did not starts exactly once. A `spawn_confirmed` row is never sent, here as
+  // everywhere -- it attests a shell, and nothing may run a second one.
+  if (!sandboxFilesRecords) {
+    return row.state === "dispatched"
+      ? {
+        action: "retransmit", reported: "first_call",
+        reason: "the sandbox files no records, so the unfinished send is finished "
+          + "and its own duplicate-name refusal arbitrates one that already landed",
+      }
+      : {
+        action: "resolve", reported: "deduplicated", shellClass: "lost",
+        reason: "the row attests a shell on a sandbox that keeps no record of it",
       };
   }
 

@@ -87,8 +87,10 @@ test("the absolute-lifetime gate cannot pass on idle reclamation", () => {
   assert.match(GUIDE, /DEADLINE_EPOCH=\$\(date -d "\$DEADLINE" \+%s\)/);
   assert.match(GUIDE, /SEEN_LIVE=true/, "the live observation is recorded, not inferred");
   assert.match(GUIDE, /deadline_verdict "\$state" "\$SEEN_LIVE"/);
-  assert.match(GUIDE, /settle_verdict "\$\(settle "\$tid"\)"/,
-    "a refresh that merely reached a terminal state is not a refresh that worked");
+  assert.match(GUIDE, /settle_verdict "\$\(settle "\$tid"\)" "\$ACTIVITY_MARKER"/,
+    "judged against a token only the sandbox can produce: a task that completed, "
+      + "or counted a call, or attempted one that failed, is none of them a refresh");
+  assert.match(GUIDE, /ACTIVITY_MARKER=/, "and the marker is defined where the gates can see it");
   assert.ok(!/dispatch 'Run: echo alive' >\/dev\/null \|\| true/.test(GUIDE),
     "a loop that discards its own failed dispatches proves nothing about the cap");
 });

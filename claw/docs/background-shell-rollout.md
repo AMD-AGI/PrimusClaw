@@ -36,7 +36,18 @@ right answer lives in `claw/deploy/rollout-lib.sh` and is exercised by
 
 It provides `chart_dir`, `inventory_judge`, `inventory_rows`, `hands_base`,
 `settle_verdict` and `deadline_verdict`, each returning `0` pass, `1` fail,
-`3` abort. **Return 3 is
+`3` abort.
+
+**The activity marker.** G7-d2 has to know the sandbox was touched, and every
+weaker signal is satisfiable without it: a task can complete without calling
+anything, and a call is counted before it runs and stays counted when it fails.
+So the activity prompt asks for a token only the sandbox can produce, and
+`settle_verdict` requires it in the task's output:
+
+```sh
+ACTIVITY_MARKER="claw-alive-$$-$(date +%s)"
+ACTIVITY_PROMPT="Run exactly: echo $ACTIVITY_MARKER — then reply with nothing else."
+``` **Return 3 is
 `ABORT` at every call site**: nothing could be read, which is never the same as
 a clean reading.
 
@@ -107,7 +118,7 @@ dispatch() { curl -sf -X POST "https://$API_HOST/v1/sessions/$SESSION_ID/tasks" 
     -H 'content-type: application/json' -d "$(jq -n --arg p "$1" '{prompt:$p}')" \
   | jq -er 'select(.ok == true) | .task_id // empty'; }
 # Poll one task to terminal, printing the fields `settle_verdict` judges --
-# including `by_tool`, which is what says a command actually ran in the sandbox.
+# including the output, which is where the sandbox's own echo shows up.
 # Reaching terminal is not succeeding, and completing is not refreshing.
 settle() { local i b; for i in $(seq 1 "$N_POLL"); do
     b=$(curl -sf --max-time "$T_CURL" -H "$USER" "https://$API_HOST/v1/tasks/$1") || { sleep "$I_POLL"; continue; }
@@ -256,8 +267,8 @@ for i in $(seq 1 "$N_FLEET"); do
   # and an idle session is reclaimed by a path that has nothing to do with the
   # absolute cap -- so a loop that ignores its own failures proves the wrong
   # thing about the CR that then disappears.
-  tid=$(dispatch 'Run: echo alive') || { echo 'FAIL: activity dispatch failed; the session is no longer held busy'; exit 1; }
-  settle_verdict "$(settle "$tid")" || exit 1
+  tid=$(dispatch "$ACTIVITY_PROMPT") || { echo 'FAIL: activity dispatch failed; the session is no longer held busy'; exit 1; }
+  settle_verdict "$(settle "$tid")" "$ACTIVITY_MARKER" || exit 1
 
   state=$(cr); rc=$?; [ "$rc" = 2 ] && { echo 'ABORT: kubectl could not answer'; exit 1; }
   now=$(date +%s)

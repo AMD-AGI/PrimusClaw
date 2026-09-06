@@ -2,46 +2,55 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Which registry key names a session's sandbox.
+ * Which registry key names a session's sandbox, and how the reserved retention
+ * namespace stays separate from it.
  *
- * Shared rather than owned by Brain because three services read these keys, and
- * a reader that builds the key itself sees a migrated session as one that has
- * no sandbox at all -- reporting no workload for a live one, and skipping the
- * TTL refresh that keeps its record alive.
+ * A container retained because it still holds live work would keep its binding
+ * in this same keyspace -- anywhere else and the keepalive sweep never walks it,
+ * so it is reclaimed as idle, which is the destruction the retention exists to
+ * prevent. Its key's variable part is the fixed marker below followed by the
+ * sandbox generation.
  *
- * A container retained because it still holds live work keeps its binding in
- * the same keyspace, under a reserved marker, so no acquisition can select it.
- * A session whose own id begins with that marker is therefore re-keyed into a
- * namespace of its own: the mapping is total and injective, so a plain key
- * never begins with either marker, a re-keyed one always begins with the
- * re-key marker, and no two session ids can produce one key.
+ * A session key is the session id verbatim, deliberately and permanently.
+ * Re-keying colliding ids was tried and is worse than what it fixed: old and
+ * new replicas run together through a rolling upgrade, so one side moving a key
+ * the other still reads by its old name produces two divergent bindings for one
+ * session -- a live sandbox nothing routes to, and a second one provisioned
+ * beside it. Nothing here moves a key, and no reader has to know which form to
+ * look under.
+ *
+ * Separation is carried by the entry's **value** instead, which is where the
+ * design puts it: only a retention writes the protection marker, so a
+ * pre-existing session entry that happens to sit under the prefix is
+ * unambiguously not one. Two rules make that sufficient rather than merely
+ * legible, and both are enforced elsewhere: a retention key is only ever
+ * *created*, never written over, so it can never take a session's binding; and
+ * a deployment already holding such an entry is refused at startup, because
+ * there the separation cannot be promised for the generation it collides with.
  */
-
-import { decodeKeyPart, encodeKeyPart } from "./base32.js";
 
 export const HANDS_KEY_PREFIX = "hands.";
 
 /** The variable part a retention's entry takes, which no session may hold. */
 export const RETAINED_PREFIX = "retained-";
 
-/**
- * Marks a re-keyed session entry. Inside the characters the key-value client
- * admits and outside base32's alphabet, so a re-keyed part can never be read as
- * a plain one.
- */
-export const REKEYED_MARKER = "=";
-
-export function handsKeyNeedsRekey(sessionId: string): boolean {
-  return sessionId.startsWith(RETAINED_PREFIX) || sessionId.startsWith(REKEYED_MARKER);
-}
-
+/** The registry key for one session's sandbox binding. */
 export function handsSessionKey(sessionId: string): string {
-  return HANDS_KEY_PREFIX
-    + (handsKeyNeedsRekey(sessionId) ? REKEYED_MARKER + encodeKeyPart(sessionId) : sessionId);
+  return HANDS_KEY_PREFIX + sessionId;
 }
 
-/** The session id a registry key names, whichever form it takes. */
+/** The session id a registry key names. */
 export function sessionIdFromHandsKey(key: string): string {
-  const part = key.slice(HANDS_KEY_PREFIX.length);
-  return part.startsWith(REKEYED_MARKER) ? decodeKeyPart(part.slice(1)) : part;
+  return key.slice(HANDS_KEY_PREFIX.length);
+}
+
+/** Whether a registry key sits in the namespace reserved for retentions. */
+export function isReservedRetentionKey(key: string): boolean {
+  return sessionIdFromHandsKey(key).startsWith(RETAINED_PREFIX);
+}
+
+/** Whether an entry's value carries the marker only a retention writes. */
+export function isRetentionEntry(value: unknown): boolean {
+  return !!value && typeof value === "object"
+    && (value as { protected?: unknown }).protected === true;
 }

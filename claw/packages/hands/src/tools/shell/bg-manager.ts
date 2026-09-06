@@ -25,8 +25,8 @@ import { BG_SHELL_ENABLED } from "../../config.js";
 import { NO_RUN } from "../../runtime/owner-context.js";
 import { assertShellId } from "../../runtime/record-path.js";
 import {
-  attachRecord, claimRecord, currentEpoch, processStartToken, readRecord,
-  recordOutcome, releaseOutput, resolveIntent, type ProcessIdentity,
+  attachRecord, claimRecord, currentEpoch, processStartToken,
+  recordOutcome, releaseOutput, type ProcessIdentity,
 } from "../../runtime/shell-records.js";
 import { ownerLiveness } from "../../runtime/shell-liveness.js";
 import {
@@ -53,17 +53,6 @@ export type BgShell = ManagedShell;
 export const BG_SHELL_DISABLED_MESSAGE =
   "background shells are disabled in this deployment (BG_SHELL_ENABLED). "
   + "Run the command in the foreground with a suitable bash timeout instead.";
-
-/** Brain-stamped evidence about a start, carried on headers and never in the
- *  tool schema, so the model can neither read it nor forge it. */
-export interface BgStartIntent {
-  /** Replay-stable evidence of which start this is. Optional: a caller without
-   *  one behaves as before, minting or accepting an id. */
-  intentKey?: string;
-  /** The owning run's stamped execution deadline, which fixes how long a
-   *  terminal outcome stays surfaced. Absent where the request carried none. */
-  deadlineAt?: string;
-}
 
 /** What a start answers with: the shell, and whether this call is the one that
  *  produced it. A machine-readable field rather than an inference from wording. */
@@ -129,7 +118,6 @@ export function spawnBackground(
   command: string,
   shellId?: string,
   kind: BgShellKind = "background",
-  intent?: BgStartIntent,
 ): BgStart {
   if (!BG_SHELL_ENABLED) throw new Error(BG_SHELL_DISABLED_MESSAGE);
   if (shells.size >= BG_SHELL_MAX_CONCURRENT) {
@@ -137,15 +125,12 @@ export function spawnBackground(
   }
   if (shellId) assertShellId(shellId);
 
-  const deduplicated = resolveExistingIntent(owner, run, intent);
-  if (deduplicated) return deduplicated;
-
   const id = shellId || `bg-${randomUUID().slice(0, 8)}`;
   const key = regKey(owner, run, id);
   if (shells.has(key)) throw new Error(`Shell ${id} already exists`);
   // The claim is durable before anything is spawned, and its exclusive create
   // is the arbiter: a start that lost it never reaches a process.
-  if (!claimShell(owner, run, id, command, kind, intent)) {
+  if (!claimShell(owner, run, id, command, kind)) {
     throw new Error(`Shell ${id} already exists`);
   }
 
@@ -176,39 +161,18 @@ export function spawnBackground(
   return { shell, resolution: "first_call" };
 }
 
-/** The prior start this intent already produced, where one exists. */
-function resolveExistingIntent(
-  owner: string, run: string, intent?: BgStartIntent,
-): BgStart | undefined {
-  if (!filesRecords() || !intent?.intentKey) return undefined;
-  const priorId = resolveIntent(owner, recordRun(run), intent.intentKey);
-  if (!priorId) return undefined;
-  const record = readRecord(owner, recordRun(run), priorId);
-  if (!record) return undefined;
-  // Redoing the work requires a start under a different intent, which is a
-  // deliberate act with a visible cause. No branch here respawns.
-  return {
-    shell: lookup(owner, run, priorId),
-    shellId: priorId,
-    resolution: "deduplicated",
-  };
-}
-
 function claimShell(
-  owner: string, run: string, id: string, command: string,
-  kind: BgShellKind, intent?: BgStartIntent,
+  owner: string, run: string, id: string, command: string, kind: BgShellKind,
 ): boolean {
   if (!filesRecords()) return true;
   return claimRecord({
     owner_scope: owner,
     run_identity: recordRun(run),
     shell_id: id,
-    ...(intent?.intentKey ? { intent_key: intent.intentKey } : {}),
     command_digest: commandDigest(owner, run, command),
     kind,
     claimed_at: new Date().toISOString(),
     hands_epoch: currentEpoch()!.epoch,
-    ...(intent?.deadlineAt ? { deadline_at: intent.deadlineAt } : {}),
   });
 }
 

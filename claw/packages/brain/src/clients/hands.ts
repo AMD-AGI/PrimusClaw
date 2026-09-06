@@ -298,34 +298,33 @@ export interface DispatchOutcome {
 }
 
 /**
- * What identifies this call for a replay that has to recognise it again.
- *
- * `stepIdentity` is the model-issued tool-use identifier in agent mode and the
- * step's position in script mode. Both are reproduced byte for byte by a
- * resumed run, which is the whole property a derived shell id needs.
- */
-export interface CallContext {
-  stepIdentity?: string;
-}
-
-/**
  * The shell id a background start gets when its caller named none.
  *
  * Derived, not minted: a fresh identifier on every call means a replay after a
  * crash looks for a row keyed by an id nothing wrote, finds nothing, and
- * dispatches the command a second time -- which is the duplicate execution the
- * whole reference row exists to prevent, reintroduced on the path most starts
- * take. Every input is reproduced exactly by a resumed run.
+ * dispatches the command a second time -- the duplicate execution the reference
+ * row exists to prevent, on the path most starts take.
+ *
+ * Every input is durable before the dispatch and independent of anything the
+ * model has to reproduce. A provider-issued tool-use identifier is neither: it
+ * is not sealed until the turn's checkpoint, which is written after the tool
+ * has already run, so a crash before that leaves the model re-queried and free
+ * to hand back a different one -- and a different one is a different shell id
+ * and a second execution. The owner scope and run identity are stamped on the
+ * request; the command is the thing being dispatched. A resumed run that asks
+ * the model afresh and gets a different command is a genuinely new intent, and
+ * executing it is correct -- the guarantee is that one intent runs once, not
+ * that one command text ever runs twice.
+ *
+ * The cost is stated rather than hidden: two starts of the *identical* command
+ * under one run identity resolve to one shell, and the second is answered with
+ * the first rather than started. That is the safe direction of the trade, and
+ * the caller that wants two names them.
  */
-export function derivedShellId(
-  owner: string, run: string, step: string | undefined, command: unknown,
-): string {
+export function derivedShellId(owner: string, run: string, command: unknown): string {
   const digest = createHash("sha256")
     .update(owner).update("\u0000")
     .update(run).update("\u0000")
-    // The step identity alone would be enough where there is one; the command
-    // keeps two starts of one step apart where there is not.
-    .update(step ?? "").update("\u0000")
     .update(typeof command === "string" ? command : "")
     .digest("hex");
   return `bg-${digest.slice(0, 12)}`;
@@ -555,11 +554,9 @@ export class HandsClient {
    * both by making every start a named one -- the value is in the sandbox's own
    * format and the model is told the same string either way.
    */
-  private fixStartArgs(
-    args: Record<string, unknown>, step: string | undefined,
-  ): Record<string, unknown> {
+  private fixStartArgs(args: Record<string, unknown>): Record<string, unknown> {
     if (typeof args.shell_id === "string" && args.shell_id) return args;
-    return { ...args, shell_id: derivedShellId(this.owner, this.run, step, args.command) };
+    return { ...args, shell_id: derivedShellId(this.owner, this.run, args.command) };
   }
 
   /**
@@ -582,11 +579,11 @@ export class HandsClient {
    * crash could run twice.
    */
   private async dispatch(
-    name: string, args: Record<string, unknown>, signal?: AbortSignal, ctx: CallContext = {},
+    name: string, args: Record<string, unknown>, signal?: AbortSignal,
   ): Promise<DispatchOutcome> {
     await this.connect();
     const isStart = name === "bash" && args.run_in_background === true;
-    const fixed = isStart ? this.fixStartArgs(args, ctx.stepIdentity) : args;
+    const fixed = isStart ? this.fixStartArgs(args) : args;
     const store = bgRowStore();
     const address = isStart ? this.startAddress(fixed) : null;
     if (address && store) {
@@ -646,6 +643,7 @@ export class HandsClient {
       row,
       rowReadable,
       currentGeneration: this.generation,
+      sandboxFilesRecords: await this.filesShellRecords(),
       probe: () => this.probeShellRecord(address.shellId),
     });
 
@@ -689,9 +687,8 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-    ctx?: CallContext,
   ): Promise<string> {
-    return (await this.dispatch(name, args, signal, ctx)).text;
+    return (await this.dispatch(name, args, signal)).text;
   }
 
   /**
@@ -705,9 +702,8 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-    ctx?: CallContext,
   ): Promise<DispatchOutcome> {
-    return this.dispatch(name, args, signal, ctx);
+    return this.dispatch(name, args, signal);
   }
 
   /**

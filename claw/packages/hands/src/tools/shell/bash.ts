@@ -3,7 +3,7 @@
 
 import { z } from "zod";
 import { spawnBackground } from "./bg-manager.js";
-import { currentOwner, currentRun, currentStartIntent } from "../../runtime/owner-context.js";
+import { currentOwner, currentRun } from "../../runtime/owner-context.js";
 import { runForegroundShell } from "./process-runner.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
@@ -74,7 +74,7 @@ export const bash = {
       try {
         const start = spawnBackground(
           currentOwner(), currentRun(), args.command, args.shell_id,
-          args.background_kind ?? "background", currentStartIntent(),
+          args.background_kind ?? "background",
         );
         const id = start.shell?.id ?? start.shellId!;
         const already = start.resolution === "deduplicated"

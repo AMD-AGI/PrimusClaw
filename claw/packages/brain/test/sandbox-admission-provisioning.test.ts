@@ -202,12 +202,13 @@ test("with no ceiling configured, admission reserves nothing and refuses nothing
   // Background shells off: there is no ceiling to hold and no work to protect,
   // and provisioning must not acquire a dependency on a roster that has no
   // reason to exist.
-  bindAdmission(store.kv as never, { ceiling: 0, reconciliationReserve: 0 });
+  const fresh = fakeKv();
+  await bindAdmission(fresh.kv as never, { ceiling: 0, reconciliationReserve: 0 });
   for (let i = 0; i < CAPACITY.ceiling * 3; i++) {
     const hold = await admitSandbox(`sess-${i}`);
     await hold.bind(`sandbox-${i}`);
   }
-  assert.equal(store.roster(), null);
+  assert.equal(fresh.roster(), null, "no roster is even created");
 });
 
 test("a replica configured at a different ceiling refuses to finish starting", async () => {
@@ -226,11 +227,33 @@ test("a replica configured at a different ceiling refuses to finish starting", a
   );
 });
 
-test("a matching ceiling, and an unstamped roster, both bind", async () => {
-  await assert.doesNotReject(() => bindAdmission(store.kv as never, CAPACITY),
-    "nothing has claimed against it yet, so there is nothing to disagree with");
+test("binding an empty bucket stamps the ceiling rather than agreeing with every one", async () => {
+  // An empty roster agrees with any configured value, so leaving it unstamped
+  // lets two differently-configured replicas both start and both report
+  // healthy -- and one of them discovers the disagreement mid-sweep, already
+  // serving, having proved a different refresh gap against the same handles.
+  const fresh = fakeKv();
+  await bindAdmission(fresh.kv as never, CAPACITY);
+  assert.equal(fresh.roster()!.ceiling, CAPACITY.ceiling, "stamped at the bind");
+  assert.deepEqual(fresh.roster()!.entries, [], "and holding nothing yet");
 
-  const hold = await admitSandbox("sess-1");
-  await hold.bind("sandbox-1");
-  await assert.doesNotReject(() => bindAdmission(store.kv as never, CAPACITY));
+  await assert.doesNotReject(() => bindAdmission(fresh.kv as never, CAPACITY),
+    "a replica that agrees binds again without complaint");
+});
+
+test("two replicas binding an empty bucket at different ceilings: one refuses", async () => {
+  const fresh = fakeKv();
+  const results = await Promise.allSettled([
+    bindAdmission(fresh.kv as never, CAPACITY),
+    bindAdmission(fresh.kv as never, { ...CAPACITY, ceiling: CAPACITY.ceiling + 5 }),
+  ]);
+
+  const started = results.filter((r) => r.status === "fulfilled");
+  const refused = results.filter((r) => r.status === "rejected");
+  assert.equal(started.length, 1, "exactly one becomes the fleet's value");
+  assert.equal(refused.length, 1);
+  assert.ok((refused[0] as PromiseRejectedResult).reason instanceof CeilingDisagreement,
+    "and the other refuses to serve rather than discovering it on a later sweep");
+  assert.equal(fresh.roster()!.ceiling === CAPACITY.ceiling
+    || fresh.roster()!.ceiling === CAPACITY.ceiling + 5, true);
 });

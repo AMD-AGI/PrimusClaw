@@ -48,7 +48,6 @@ export interface ShellRecord {
   /** Null is the typed absence of N4.1.2a.3, distinct from every string. */
   run_identity: string | null;
   shell_id: string;
-  intent_key?: string;
   command_digest: string;
   kind: "background" | "monitor";
   claimed_at: string;
@@ -70,7 +69,6 @@ export function stateRoot(): string {
 }
 
 const SCOPES = "scopes";
-const INTENTS = "intents";
 /** Fixed names sit at the root, never under `scopes/`, so no encoded segment
  *  can collide with one. */
 const EPOCH_MARKER = "epoch.json";
@@ -140,9 +138,6 @@ function recordPath(owner: string, run: RunPart, shellId: string): string {
   return join(stateRoot(), SCOPES, ...recordComponents(owner, run, shellId));
 }
 
-function intentPath(owner: string, run: RunPart, intentKey: string): string {
-  return join(stateRoot(), INTENTS, ...recordComponents(owner, run, intentKey));
-}
 
 const asRunPart = (run: string | null): RunPart => (run === null ? ABSENT_RUN : run);
 
@@ -162,11 +157,6 @@ export function claimRecord(record: ShellRecord): boolean {
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw e;
-  }
-  if (record.intent_key) {
-    const link = intentPath(record.owner_scope, asRunPart(record.run_identity), record.intent_key);
-    mkdirSync(join(link, ".."), { recursive: true, mode: 0o700 });
-    writeFileSync(link, record.shell_id, { mode: 0o600 });
   }
   return true;
 }
@@ -242,17 +232,6 @@ export function readRecord(
   return componentsMatch(onDisk, record.owner_scope, asRunPart(record.run_identity), record.shell_id)
     ? record
     : null;
-}
-
-/** The shell id this run already committed to for an intent, if any. */
-export function resolveIntent(
-  owner: string, run: string | null, intentKey: string,
-): string | null {
-  try {
-    return readFileSync(intentPath(owner, asRunPart(run), intentKey), "utf8") || null;
-  } catch {
-    return null;
-  }
 }
 
 /**

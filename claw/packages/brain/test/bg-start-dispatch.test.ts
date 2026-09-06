@@ -197,7 +197,6 @@ test("a start under a replaced sandbox is answered from the row, not dispatched"
 });
 
 const NO_ID_START = { command: "train.sh", run_in_background: true };
-const STEP = { stepIdentity: "toolu_abc123" };
 
 test("a start naming no id recovers its own id on the replay, not a fresh one", async () => {
   // The common start names nothing. An id minted fresh per call means the
@@ -206,17 +205,19 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
   // exists to prevent, on the path most starts take. The id is derived from
   // what a resumed run reproduces exactly, so the replay finds its own row.
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
 
   const rows = await bgRowStore()!.keys("bgshell.*.*.*");
   assert.equal(rows.length, 1, "a row was keyed before anything was sent");
   const row = JSON.parse((await bgRowStore()!.read(rows[0]))!.value) as { state: string; shellId: string };
   assert.equal(row.state, "dispatched");
 
-  // The resumed run: same tool-use identifier, same arguments, no id of its own.
+  // The resumed run, as a crash before the turn's checkpoint really leaves it:
+  // the model is re-queried and free to hand back a different tool-use
+  // identifier, so nothing about the provider's id may enter the derivation.
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
   const resumed = pod();
-  await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP);
+  await resumed.hands.callTool("bash", NO_ID_START);
 
   assert.equal(resumed.sent.length, 1, "retransmitted, because no claim had landed");
   assert.equal(resumed.sent[0].shell_id, row.shellId,
@@ -227,25 +228,39 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
 
 test("a no-id start whose send did land is resolved, never run twice", async () => {
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
   recordAnswer = { marker: true, subtreeReadable: true, present: true };
 
   const resumed = pod();
-  const text = await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP);
+  const text = await resumed.hands.callTool("bash", NO_ID_START);
 
   assert.equal(resumed.sent.length, 0);
   assert.match(text, /nothing was run a second time/);
 });
 
-test("two different call sites in one run get different ids", async () => {
-  // Deriving from the replay-stable identity must not collapse two genuinely
-  // different starts into one, which would refuse the second as a duplicate.
+test("two different commands in one run get different ids", async () => {
   const { hands, sent } = pod();
-  await hands.callTool("bash", NO_ID_START, undefined, { stepIdentity: "toolu_one" });
-  await hands.callTool("bash", NO_ID_START, undefined, { stepIdentity: "toolu_two" });
+  await hands.callTool("bash", { command: "train.sh", run_in_background: true });
+  await hands.callTool("bash", { command: "monitor.sh", run_in_background: true });
 
   assert.equal(sent.length, 2);
   assert.notEqual(sent[0].shell_id, sent[1].shell_id);
+});
+
+test("two starts of the identical command in one run resolve to one shell", async () => {
+  // The stated cost of deriving from durable state alone. A provider-issued
+  // tool-use id would separate these, and is exactly what a crash before the
+  // turn's checkpoint lets the model change -- which is a second execution of
+  // work that already ran. Over-deduplicating an identical command is the safe
+  // direction of that trade, and a caller wanting two names them.
+  const { hands, sent } = pod();
+  const first = await hands.callTool("bash", NO_ID_START);
+  recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  const second = await hands.callTool("bash", NO_ID_START);
+
+  assert.equal(sent.length, 1, "the second is answered from the first, not started");
+  assert.match(first, /Started background shell/);
+  assert.match(second, /nothing was run a second time/);
 });
 
 test("a script-mode replay that is safely deduplicated is not a step failure", async () => {

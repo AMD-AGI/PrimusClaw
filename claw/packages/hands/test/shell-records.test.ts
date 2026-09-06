@@ -105,13 +105,6 @@ test("retention is fixed from the run's own deadline, and an absent one never ex
       + "invent one for it");
 });
 
-test("an intent already committed to resolves to its own shell, and only its own", () => {
-  claim("bg-6", RUN, { intent_key: "i-1" });
-  assert.equal(records.resolveIntent(OWNER, RUN, "i-1"), "bg-6");
-  assert.equal(records.resolveIntent(OWNER, "ktsk_other", "i-1"), null,
-    "an intent is indexed per owner scope and run identity, not shared across runs");
-});
-
 test("a record hand-written into another triple's location is not read as that triple's", () => {
   claim("bg-7", "ktsk_1");
   const stolen = { ...records.readRecord(OWNER, "ktsk_1", "bg-7")!, run_identity: "ktsk_1" };

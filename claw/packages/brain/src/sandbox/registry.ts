@@ -14,14 +14,11 @@
 import { LRUCache } from "lru-cache";
 import type { KV } from "nats";
 import { isTombstone } from "../tasks/lock.js";
-import { isRevisionConflict } from "@claw/utils";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
-import { migrateReservedSessionKeys, sessionIdFromHandsKey } from "./hands-key.js";
-import pino from "pino";
+import { assertRetentionSeparation, sessionIdFromHandsKey } from "./hands-key.js";
 
 const sc = StringCodec();
-const logger = pino({ name: "sandbox-registry" });
 
 let _kv: KV | null = null;
 
@@ -39,78 +36,26 @@ export function bindHandsKv(kv: KV): void {
  * indistinguishable from a retention by key shape, so the first retention under
  * a matching generation would write over a live session's binding.
  */
-/** The store shape the scans need, over the registry bucket. */
-export function reservedKeyStore(kv: KV) {
-  return {
-    keys: async (filter: string) => {
+/**
+ * Refuse to serve where a session binding occupies a retention's key.
+ *
+ * At boot, before anything can be provisioned. Nothing is moved: old and new
+ * replicas run together through an upgrade, and a key one side relocates is one
+ * the other still reads under its old name -- two divergent bindings for one
+ * session, which is worse than the collision it would have fixed.
+ */
+export async function assertReservedKeysFree(kv: KV): Promise<void> {
+  await assertRetentionSeparation({
+    keys: async (filter) => {
       const out: string[] = [];
       for await (const key of await kv.keys(filter)) out.push(key);
       return out;
     },
-    read: async (key: string) => {
+    read: async (key) => {
       const entry = await kv.get(key);
-      return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
+      return entry ? { value: sc.decode(entry.value) } : null;
     },
-    create: async (key: string, value: string) => {
-      try {
-        await kv.create(key, sc.encode(value));
-        return true;
-      } catch (err) {
-        if (isRevisionConflict(err)) return false;
-        throw err;
-      }
-    },
-    delete: async (key: string, expectedRevision: number) => {
-      try {
-        await kv.delete(key, { previousSeq: expectedRevision });
-        return true;
-      } catch (err) {
-        if (isRevisionConflict(err)) return false;
-        throw err;
-      }
-    },
-  };
-}
-
-/**
- * Move strays out of the reserved namespace, every sweep.
- *
- * The startup scan alone does not hold the invariant at upgrade time: new
- * replicas start alongside old ones, and an old replica can recreate a reserved
- * key after every new replica has already scanned. Repeating the scan on the
- * cadence the sweep already runs at bounds that window to one interval instead
- * of to the next restart. Reported rather than fatal here -- refusing to serve
- * mid-sweep would take down a healthy replica -- and harmless while it stands,
- * because a retention can only ever create its key (`reserveRetentionKey`) and
- * so can never overwrite the stray it collides with.
- */
-export async function reconcileReservedKeys(kv: KV): Promise<void> {
-  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
-  if (result.migrated.length || result.resumed.length || result.conflicted.length) {
-    logger.warn(result, "hands.reserved_key_reconciled");
-  }
-}
-
-export async function migrateReservedKeys(kv: KV): Promise<void> {
-  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
-
-  if (result.migrated.length || result.resumed.length) {
-    logger.warn(
-      { migrated: result.migrated, resumed: result.resumed },
-      "hands.reserved_key_migration",
-    );
-  }
-  // A collision left standing is a live session's binding a retention can take,
-  // and the retention is what protects work the sandbox is holding. Refusing to
-  // start is the loud version of a failure whose quiet version is a reclaimed
-  // sandbox with a training run in it, hours later and attributed to nothing.
-  if (result.conflicted.length) {
-    throw new Error(
-      `refusing to start: ${result.conflicted.length} registry key(s) sit in the `
-      + `reserved retention namespace and could not be moved out `
-      + `(${result.conflicted.join(", ")}). Resolve them before restarting.`,
-    );
-  }
+  });
 }
 
 /** Read back the bound KV bucket. Throws if bindHandsKv() was never called. */

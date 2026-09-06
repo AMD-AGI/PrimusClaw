@@ -19,8 +19,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  CeilingDisagreement, bindSlot, claimProvisionalSlot, deferralCount, reconcileTargets,
-  releaseSlot, renewAndReap, type Roster, type RosterConfig, type RosterStore,
+  CeilingDisagreement, RosterContended, bindSlot, claimProvisionalSlot, deferralCount,
+  reconcileTargets, releaseSlot, renewAndReap,
+  type Roster, type RosterConfig, type RosterStore,
 } from "../src/sandbox/admission-roster.js";
 
 const CONFIG: RosterConfig = {
@@ -282,4 +283,20 @@ test("from two slots below the boundary both replicas succeed", async () => {
   assert.ok(first.ok && second.ok);
   assert.notEqual(first.token, second.token);
   assert.equal(shared.peek()!.entries.length, CONFIG.ceiling - CONFIG.reconciliationReserve);
+});
+
+test("a roster that cannot be written is raised, never answered as an empty fleet", async () => {
+  // The shape this forbids: a contended reconcile answering
+  // `{admitted: [], rosterSize: 0}` and the sweep reading it as a successful
+  // census of nothing. The count every deferral bound rests on is then
+  // understated, no breach is reported, and ordinary admission carries on
+  // against a number nobody could write.
+  const alwaysStale: RosterStore = {
+    async read() { return { roster: { ceiling: CONFIG.ceiling, entries: [] }, revision: 1 }; },
+    async write() { return false; },
+  };
+
+  await assert.rejects(() => reconcileTargets(alwaysStale, CONFIG, ["sandbox-x"]), RosterContended);
+  await assert.rejects(() => claimProvisionalSlot(alwaysStale, CONFIG), RosterContended);
+  await assert.rejects(() => renewAndReap(alwaysStale, CONFIG, new Set()), RosterContended);
 });

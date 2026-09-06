@@ -12,8 +12,7 @@ import { constantTimeEquals } from "@claw/utils";
 import { tools } from "./tools/index.js";
 import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
 import {
-  DEADLINE_HEADER, INTENT_HEADER, NO_RUN, OWNER_HEADER, RUN_HEADER, UNOWNED,
-  normalizeDeadline, normalizeIntent, normalizeOwner, normalizeRun, withCaller,
+  NO_RUN, OWNER_HEADER, RUN_HEADER, UNOWNED, normalizeOwner, normalizeRun, withCaller,
 } from "./runtime/owner-context.js";
 import {
   mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
@@ -127,12 +126,7 @@ app.all("/mcp", async (req, reply) => {
   // handed it. An absent or malformed owner collapses to the shared `unowned`
   // bucket, and an absent run means no run will reap what this call starts.
   await withCaller(
-    {
-      owner: normalizeOwner(req.headers[OWNER_HEADER]),
-      run: normalizeRun(req.headers[RUN_HEADER]),
-      intentKey: normalizeIntent(req.headers[INTENT_HEADER]),
-      deadlineAt: normalizeDeadline(req.headers[DEADLINE_HEADER]),
-    },
+    { owner: normalizeOwner(req.headers[OWNER_HEADER]), run: normalizeRun(req.headers[RUN_HEADER]) },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
 });

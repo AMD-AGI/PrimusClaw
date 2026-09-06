@@ -35,6 +35,7 @@ test("a crash between the dispatched write and the handoff retransmits, not stra
   const out = await resolveStart({
     row: row("dispatched"),
     rowReadable: true,
+    sandboxFilesRecords: true,
     currentGeneration: "gen-1",
     probe: probing("determinately_absent"),
   });
@@ -52,6 +53,7 @@ test("the retransmission is safe because the sandbox arbitrates, not the read", 
   const landed = await resolveStart({
     row: row("dispatched"),
     rowReadable: true,
+    sandboxFilesRecords: true,
     currentGeneration: "gen-1",
     probe: probing("record_present"),
   });
@@ -62,17 +64,20 @@ test("the retransmission is safe because the sandbox arbitrates, not the read", 
 test("every gate that cannot answer sends nothing", async () => {
   const cases: Array<[string, Parameters<typeof resolveStart>[0]]> = [
     ["subtree or marker unreadable", {
-      row: row("dispatched"), rowReadable: true, currentGeneration: "gen-1",
-      probe: probing("indeterminate"),
+      row: row("dispatched"), rowReadable: true, sandboxFilesRecords: true,
+      currentGeneration: "gen-1", probe: probing("indeterminate"),
     }],
     ["a prior generation", {
-      row: row("dispatched", "gen-0"), rowReadable: true, currentGeneration: "gen-1", probe: never,
+      row: row("dispatched", "gen-0"), rowReadable: true, sandboxFilesRecords: true,
+      currentGeneration: "gen-1", probe: never,
     }],
     ["a sandbox destroyed and not replaced", {
-      row: row("dispatched"), rowReadable: true, currentGeneration: null, probe: never,
+      row: row("dispatched"), rowReadable: true, sandboxFilesRecords: true,
+      currentGeneration: null, probe: never,
     }],
     ["an unreadable row", {
-      row: null, rowReadable: false, currentGeneration: "gen-1", probe: never,
+      row: null, rowReadable: false, sandboxFilesRecords: true,
+      currentGeneration: "gen-1", probe: never,
     }],
   ];
   for (const [name, input] of cases) {
@@ -111,4 +116,36 @@ test("a first call is dispatched, and asks the sandbox nothing", async () => {
     assert.equal(out.action, "dispatch");
     assert.equal(out.reported, "first_call");
   }
+});
+
+test("against a sandbox that files no records, a dispatched row is finished, not deadlocked", () => {
+  // Such a process has no record route to ask, so waiting for one to answer is
+  // waiting forever: the request would be refused for the life of that sandbox,
+  // through the whole mixed-version window, possibly having never left Brain.
+  // It is retransmitted instead, and the arbitration moves to where that
+  // process does have one -- the id is fixed and run-qualified before it goes
+  // out, so its own duplicate-name refusal answers a send that already landed.
+  return resolveStart({
+    row: { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1", generation: "gen-1", state: "dispatched" },
+    rowReadable: true,
+    sandboxFilesRecords: false,
+    currentGeneration: "gen-1",
+    probe: never,
+  }).then((out) => {
+    assert.equal(out.action, "retransmit");
+    assert.equal(out.reported, "first_call");
+    assert.match(out.reason, /files no records/);
+  });
+});
+
+test("a confirmed row is still never re-sent to such a sandbox", async () => {
+  const out = await resolveStart({
+    row: { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1", generation: "gen-1", state: "spawn_confirmed" },
+    rowReadable: true,
+    sandboxFilesRecords: false,
+    currentGeneration: "gen-1",
+    probe: never,
+  });
+  assert.equal(out.action, "resolve");
+  assert.equal(out.shellClass, "lost", "it attests a shell, and nothing may run a second one");
 });

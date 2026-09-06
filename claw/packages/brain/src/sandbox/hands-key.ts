@@ -2,142 +2,66 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Moving a session binding out of the reserved retention namespace.
+ * The startup check that makes the retention namespace's separation a fact
+ * rather than a convention.
  *
- * Refusing to mint new colliding keys protects a fresh deployment and nothing
- * else: a session whose id already begins with the marker is indistinguishable
- * from a retention by key shape, so the first retention minted under a matching
- * generation would write over a live session's binding.
+ * Reads already tell the two apart by the entry's value, and a retention only
+ * ever creates its key. What neither covers is a deployment that *already*
+ * holds a session binding under the reserved prefix: for the one generation
+ * whose key it occupies, a retention could not be written at all, and the
+ * container it would have protected is reclaimed as idle with its work in it.
+ * There is no repair that is safe to make automatically -- moving the key
+ * diverges from every replica still reading the old name -- so the deployment
+ * is refused instead, loudly and with the key named.
  *
  * The key shape itself lives in `@claw/protocol`, because three services read
- * these keys and a reader that builds one itself sees a migrated session as one
- * with no sandbox at all.
+ * these keys and a reader that builds one itself resolves a different entry.
  */
 
-import { HANDS_KEY_PREFIX, RETAINED_PREFIX, handsSessionKey } from "@claw/protocol";
-
-export {
-  HANDS_KEY_PREFIX, RETAINED_PREFIX, handsSessionKey, sessionIdFromHandsKey,
+import {
+  HANDS_KEY_PREFIX, isReservedRetentionKey, isRetentionEntry,
 } from "@claw/protocol";
 
-/**
- * Claim the registry key a retention keeps its container's binding under.
- *
- * Create-only, and that is the guarantee rather than an optimisation: a
- * retention that overwrote an existing entry would destroy a live session's
- * binding, and the session would then be routed nowhere and swept as idle. A
- * key already taken is refused, which is a retention that does not happen --
- * recoverable -- instead of a session that is silently lost.
- *
- * Every retention write must go through here. The startup and sweep scans move
- * strays out of this namespace; this is what makes a stray that has not been
- * moved yet harmless rather than fatal.
- */
-export async function reserveRetentionKey(
-  store: Pick<HandsKeyStore, "create">, generation: string, value: string,
-): Promise<boolean> {
-  return store.create(`${HANDS_KEY_PREFIX}${RETAINED_PREFIX}${generation}`, value);
-}
+export {
+  HANDS_KEY_PREFIX, RETAINED_PREFIX, handsSessionKey, isRetentionEntry,
+  isReservedRetentionKey, sessionIdFromHandsKey,
+} from "@claw/protocol";
 
-/** Whether an entry's value carries the marker only a retention writes. */
-export function isRetentionEntry(value: unknown): boolean {
-  return !!value && typeof value === "object"
-    && (value as { protected?: unknown }).protected === true;
-}
-
-/**
- * The store the scan needs, narrowed so a test can supply one.
- *
- * Revision-aware, because a rolling upgrade runs this on several replicas at
- * once against one bucket. A read-then-put would let two of them write the same
- * destination and the loser's delete then remove a source whose value never
- * landed anywhere; a delete not conditioned on what was read would remove an
- * entry a live session rewrote in between.
- */
+/** The store the check needs, narrowed so a test can supply one. */
 export interface HandsKeyStore {
   keys(filter: string): Promise<string[]>;
-  read(key: string): Promise<{ value: string; revision: number } | null>;
-  /** False where the key already exists. Never overwrites. */
-  create(key: string, value: string): Promise<boolean>;
-  delete(key: string, expectedRevision: number): Promise<boolean>;
+  read(key: string): Promise<{ value: string } | null>;
 }
 
-export interface ReservedKeyMigration {
-  scanned: number;
-  migrated: string[];
-  /** Moves a previous run had already copied and not yet deleted. */
-  resumed: string[];
-  /** Keys left alone because something else already holds the destination. */
-  conflicted: string[];
-}
+/** Refused at startup, naming the entries that cannot be separated. */
+export class ReservedKeyCollision extends Error {}
 
 /**
- * Move any pre-existing session entry out of the reserved retention namespace.
+ * Refuse the deployment where a session binding occupies a retention's key.
  *
- * Run once at startup, before anything can mint a retention. A session-keyed
- * entry is one whose value carries no retention marker; a retention's own entry
- * is left exactly as it is. The move is collision-safe: an entry is written to
- * its re-keyed destination and the original removed only once the write has
- * landed, and a destination already occupied is reported rather than
- * overwritten, since two sessions cannot both own one binding.
+ * An entry that cannot be read is refused too: it may be either, and a check
+ * that passed on what it could not open would be no check.
  */
-export async function migrateReservedSessionKeys(
-  store: HandsKeyStore,
-): Promise<ReservedKeyMigration> {
-  // Walked as whole session keys and narrowed here, because the store's `*`
-  // matches one whole token and never a prefix inside one -- a filter spelling
-  // the marker into the token would match nothing at all and the scan would
-  // report a clean namespace it never looked at.
-  const keys = (await store.keys(`${HANDS_KEY_PREFIX}*`))
-    .filter((key) => key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX));
-  const result: ReservedKeyMigration = {
-    scanned: keys.length, migrated: [], resumed: [], conflicted: [],
-  };
-
-  for (const key of keys) {
-    // An unreadable entry is not an absent one: it may name a live sandbox, and
-    // deleting or passing over it silently would be the loss this scan exists
-    // to prevent. It is reported and left in place for operator repair, and so
-    // is a destination already occupied -- two sessions cannot own one binding.
+export async function assertRetentionSeparation(store: HandsKeyStore): Promise<void> {
+  const colliding: string[] = [];
+  // Walked as whole session keys and narrowed here: the store's `*` matches one
+  // whole token and never a prefix inside one, so a filter spelling the marker
+  // into the token would match nothing and report a namespace it never looked at.
+  for (const key of await store.keys(`${HANDS_KEY_PREFIX}*`)) {
+    if (!isReservedRetentionKey(key)) continue;
     try {
-      const source = await store.read(key);
-      if (source === null) {
-        result.conflicted.push(key);
-        continue;
-      }
-      if (isRetentionEntry(JSON.parse(source.value))) continue;
-
-      const destination = handsSessionKey(key.slice(HANDS_KEY_PREFIX.length));
-      // Create, never put: a destination that already exists belongs to
-      // something else -- a session that legitimately owns it -- and
-      // overwriting it loses a live binding.
-      //
-      // Except when it is this same move, finished halfway. A crash between the
-      // copy and the delete leaves both keys, and a later startup that called
-      // that a conflict would refuse to boot on its own unfinished work, with
-      // no way forward but a manual edit. Matching content identifies it: the
-      // copy is byte-for-byte what the source holds, so it is this migration
-      // resuming rather than a second session.
-      if (!await store.create(destination, source.value)) {
-        const existing = await store.read(destination);
-        if (existing?.value !== source.value) {
-          result.conflicted.push(key);
-          continue;
-        }
-        result.resumed.push(key);
-      }
-      // Conditioned on the revision the value came from, so a session that
-      // rewrote its own entry between the read and here keeps it. The copy
-      // stands either way; a source left behind is reported, never a silent
-      // divergence.
-      if (!await store.delete(key, source.revision)) {
-        result.conflicted.push(key);
-        continue;
-      }
-      result.migrated.push(key);
+      const entry = await store.read(key);
+      if (entry === null || !isRetentionEntry(JSON.parse(entry.value))) colliding.push(key);
     } catch {
-      result.conflicted.push(key);
+      colliding.push(key);
     }
   }
-  return result;
+  if (colliding.length) {
+    throw new ReservedKeyCollision(
+      `refusing to start: ${colliding.length} registry key(s) occupy the namespace `
+      + `reserved for retained containers (${colliding.join(", ")}). A container `
+      + `retained under the colliding generation could not keep its binding and `
+      + `would be reclaimed with its work. Remove or rename these sessions first.`,
+    );
+  }
 }

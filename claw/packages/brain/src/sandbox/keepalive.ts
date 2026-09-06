@@ -11,7 +11,7 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
+import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -1017,10 +1017,15 @@ async function admitTargets(
     }
     await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
   } catch (err) {
-    // Reported rather than swallowed: an unreconciled roster understates the
-    // fleet, and the deferral count every handle's refresh gap is derived from
-    // is then a number nobody can stand behind.
-    logger.error({ err: (err as Error)?.message }, "keepalive.roster_reconcile_failed");
+    // Reported rather than swallowed, and the sweep still serves what it
+    // collected: an unreconciled roster understates the fleet, so the deferral
+    // count every handle's refresh gap rests on is a number nobody can stand
+    // behind -- but refusing to ping is how a sandbox with live work in it is
+    // reclaimed, which is worse than an understated count nobody admits against.
+    logger.error(
+      { err: (err as Error)?.message, targets: identities.length },
+      "keepalive.roster_reconcile_failed",
+    );
   }
 }
 
@@ -1033,12 +1038,6 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
-  // Every sweep, not only at startup: new replicas run alongside old ones
-  // through an upgrade, and an old one can recreate a reserved key after every
-  // new one has already scanned. This bounds that window to one interval.
-  await reconcileReservedKeys(deps.kv).catch((err) => logger.error(
-    { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
-  ));
   const targets = await collectTargets(deps, seenIdentities);
   await admitTargets(deps, targets);
 

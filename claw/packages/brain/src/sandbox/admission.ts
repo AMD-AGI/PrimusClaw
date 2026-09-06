@@ -44,11 +44,27 @@ let roster: { store: RosterStore; config: RosterConfig } | null = null;
 export async function bindAdmission(kv: KV, capacity: CapacitySettings): Promise<void> {
   roster = rosterDeps(kv, capacity).roster ?? null;
   if (!roster) return;
-  const current = await roster.store.read();
-  if (current && current.roster.ceiling !== roster.config.ceiling) {
-    roster = null;
-    throw new CeilingDisagreement(current.roster.ceiling, capacity.ceiling);
+  const { store, config } = roster;
+
+  // Stamped here, not left to whichever sweep claims first. An empty bucket
+  // agrees with every ceiling, so two replicas configured differently would
+  // both start, both report healthy, and only later discover -- one of them,
+  // mid-sweep, already serving -- that they had been proving different refresh
+  // gaps against the same handles. Creating it is the atomic act that makes one
+  // of them the fleet's value and the other's a disagreement.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = await store.read();
+    if (current) {
+      if (current.roster.ceiling !== config.ceiling) {
+        roster = null;
+        throw new CeilingDisagreement(current.roster.ceiling, config.ceiling);
+      }
+      return;
+    }
+    if (await store.write({ ceiling: config.ceiling, entries: [] }, null)) return;
   }
+  roster = null;
+  throw new Error("the admission roster could not be read or stamped at startup");
 }
 
 /**
