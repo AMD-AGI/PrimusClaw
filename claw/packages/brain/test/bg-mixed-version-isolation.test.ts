@@ -192,3 +192,42 @@ test("a foreground call carries no shell id and is left alone", async () => {
   await hands.callTool("bash", { command: "ls" });
   assert.deepEqual(sent[0], { command: "ls" });
 });
+
+test("the structured shell id is restored too, so a script step can address it", async () => {
+  // The id comes back in two places. A script step keeps the structured result
+  // and a later step interpolates the shell id from it -- left qualified there,
+  // the next read qualifies an already-qualified id and finds nothing.
+  restoreRows = bindBgHandleRowsForTest(rowBucket() as never);
+  sandboxOfVersion(false);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const hands = new HandsClient("http://sandbox:9100/mcp", "tok", "sess-shared", "ktsk_1");
+  (hands as unknown as { connected: boolean }).connected = true;
+  (hands as unknown as { client: unknown }).client = {
+    callTool: async ({ arguments: args }: { arguments: Record<string, unknown> }) => {
+      sent.push(args);
+      // What Hands answers with: the id *it* received, in both places.
+      return {
+        content: [{ type: "text", text: `Started background shell ${args.shell_id}.` }],
+        structuredContent: { shell_id: args.shell_id, resolution: "first_call" },
+      };
+    },
+  };
+
+  const started = await hands.callToolFull(
+    "bash", { command: "train", run_in_background: true }, undefined, { stepIdentity: "toolu_1" },
+  );
+  const wire = String(sent[0].shell_id);
+  const fromStructured = (started.structured as { shell_id: string }).shell_id;
+
+  assert.notEqual(fromStructured, wire, "the wire form does not leak into the step's result");
+  assert.ok(!fromStructured.includes("."), "and carries no qualification of its own");
+
+  // The next step addresses the shell through that value.
+  await hands.callToolFull("bash_output", { shell_id: fromStructured });
+  assert.equal(String(sent[1].shell_id), wire,
+    "which resolves to the id the sandbox actually stored");
+
+  await hands.callToolFull("kill_shell", { shell_id: fromStructured });
+  assert.equal(String(sent[2].shell_id), wire);
+});

@@ -123,6 +123,22 @@ export async function registerDagHandle(
  * anything: the fallback that exists for a node whose token lives only in the
  * handle map, because a sibling owns `hands.<sessionId>`, always answered no.
  */
+/**
+ * Every DAG handle currently registered, for the keepalive census.
+ *
+ * A DAG node's sandbox is reachable only through this map, so a sweep that
+ * walks session keys alone leaves it unpinged -- and after a restart that is
+ * every DAG sandbox this replica did not create.
+ */
+export async function listAllDagHandles(): Promise<Array<[string, Record<string, HandleInfo>]>> {
+  // Not bound is not unreadable: the sweep can start before the bucket is
+  // attached, and treating that as a failed read would mark every census
+  // incomplete until it is. A bucket that is bound and cannot be read still
+  // throws, which is the case that matters.
+  if (!_map) return [];
+  return _map.listAll();
+}
+
 export async function isValidDagHandleToken(token: string): Promise<boolean> {
   if (!token || !_kvBucket) return false;
   try {

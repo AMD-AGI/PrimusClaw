@@ -8,8 +8,8 @@ import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 import { metrics } from "../infra/metrics.js";
 import {
-  isShellAddressingCall, resolveStart, restorePublicShellId, runQualifiedShellId,
-  type RecordProbe,
+  isShellAddressingCall, resolveStart, restorePublicShellId, restoreStructuredShellId,
+  runQualifiedShellId, type RecordProbe,
 } from "../sandbox/bg-start.js";
 import {
   advanceRow, readRow, readRunRows, rowKey,
@@ -17,7 +17,21 @@ import {
 } from "../sandbox/bg-handle-rows.js";
 
 /** What a fixed start carries onto its row, so a replay can find it again. */
-type StartCarry = Pick<BgHandleRow, "commandDigest" | "sequence" | "claimedBy">;
+type StartCarry = Pick<
+  BgHandleRow, "commandDigest" | "sequence" | "claimedBy" | "stepIdentity"
+>;
+
+/**
+ * What identifies this call for a replay that has to recognise it again.
+ *
+ * The model-issued tool-use identifier in agent mode, the step's position in
+ * script mode. It is sealed onto the reference row before the dispatch, which
+ * is what makes it usable on resume -- the provider is free to hand back a
+ * different one, and a call that does is a new call.
+ */
+export interface CallContext {
+  stepIdentity?: string;
+}
 import { bgRowStore } from "../sandbox/bg-row-store.js";
 import {
   BG_SHELL_ENABLED, BRAIN_CHECKPOINT_KEY, BRAIN_ID,
@@ -372,24 +386,19 @@ export function derivedShellId(
  * sequence is Brain's own, never the model's.
  */
 /**
- * Sequences this process has itself claimed, per (owner, run, command).
+ * Reconcile every start this run committed to and never confirmed.
  *
- * Process-local by design, and that is what makes it the right discriminator.
- * Two concurrent starts of one command inside one live process are two
- * deliberate intents; an unresolved row this process did not write is a
- * predecessor's unfinished call, which is exactly what a replay is repeating.
- * A run identity is executed by one replica at a time, so there is no third
- * case for this to miss.
+ * Called before a resumed run issues anything. A commitment whose call site
+ * does not reappear is exactly the dispatch that was made and never
+ * checkpointed: it is resolved on its own terms here rather than being matched
+ * against whatever the resumed model happens to ask for next, so a new call is
+ * genuinely new and the old one is not left outstanding behind it.
  */
-const claimedSequences = new Map<string, Set<number>>();
-
-function claimKey(owner: string, run: string, commandDigest: string): string {
-  return `${owner}\u0000${run}\u0000${commandDigest}`;
-}
-
-/** Forget this process's claims. For tests, which drive several in one process. */
-export function resetStartIdentityForTest(): void {
-  claimedSequences.clear();
+export async function outstandingStarts(
+  store: BgRowStore, owner: string, run: string,
+): Promise<BgHandleRow[]> {
+  const rows = await readRunRows(store, owner, run);
+  return rows.filter((row) => row.state !== "spawn_confirmed");
 }
 
 export interface StartIdentity {
@@ -424,28 +433,26 @@ export interface StartIdentity {
  */
 export async function allocateStartIdentity(
   store: BgRowStore, owner: string, run: string, command: unknown,
-  generation: string,
+  generation: string, stepIdentity: string | undefined,
 ): Promise<StartIdentity> {
   const commandDigest = commandDigestOf(owner, run, command);
-  const mineKey = claimKey(owner, run, commandDigest);
-  const alreadyClaimed = claimedSequences.get(mineKey) ?? new Set<number>();
-
   const rows = await readRunRows(store, owner, run);
-  const adoptable = rows.find((row) =>
-    row.commandDigest === commandDigest
-    && row.state !== "spawn_confirmed"
-    && !alreadyClaimed.has(row.sequence ?? 0));
-  if (adoptable) {
-    // Taken as this process's own from here on. Without it a second concurrent
-    // call in the same resumed process finds the same unresolved row and adopts
-    // it too, which is two intents on one shell -- the collapse the exclusive
-    // create prevents for fresh claims and this prevents for adopted ones.
-    alreadyClaimed.add(adoptable.sequence ?? 1);
-    claimedSequences.set(mineKey, alreadyClaimed);
+
+  // The one row this call may take: the one its own call site sealed before a
+  // previous dispatch of it, in whatever state that left it. Recognising a
+  // replay by command text instead merges a genuinely new same-command call
+  // into a predecessor's unfinished one, and does so silently. Confirmed rows
+  // are matched too -- one call site owns one shell for good, and a replay of a
+  // step that already finished is resolved from its row rather than started
+  // again under a fresh id.
+  const mine = stepIdentity
+    ? rows.find((row) => row.stepIdentity === stepIdentity)
+    : undefined;
+  if (mine) {
     return {
-      shellId: adoptable.shellId,
+      shellId: mine.shellId,
       commandDigest,
-      sequence: adoptable.sequence ?? 1,
+      sequence: mine.sequence ?? 1,
       replayed: true,
     };
   }
@@ -453,23 +460,20 @@ export async function allocateStartIdentity(
   // Walk upward until an exclusive create wins. A create that loses means some
   // other call took that sequence between the scan and here, which is the race
   // this loop exists to settle rather than to detect.
-  const taken = new Set(rows
-    .filter((row) => row.commandDigest === commandDigest)
-    .map((row) => row.sequence ?? 0));
+  const taken = new Set(rows.map((row) => row.sequence ?? 0));
   for (let sequence = 1; sequence <= taken.size + MAX_SEQUENCE_ATTEMPTS; sequence++) {
-    if (taken.has(sequence) || alreadyClaimed.has(sequence)) continue;
+    if (taken.has(sequence)) continue;
     const shellId = derivedShellId(owner, run, command, sequence);
     const address = { ownerScope: owner, runIdentity: run, shellId };
     const claimed = await store.write(
       rowKey(address),
       JSON.stringify({
-        ...address, generation, state: "issued", commandDigest, sequence, claimedBy: BRAIN_ID,
+        ...address, generation, state: "issued", commandDigest, sequence,
+        claimedBy: BRAIN_ID, ...(stepIdentity ? { stepIdentity } : {}),
       }),
       null,
     );
     if (!claimed) continue;
-    alreadyClaimed.add(sequence);
-    claimedSequences.set(mineKey, alreadyClaimed);
     return { shellId, commandDigest, sequence, replayed: false };
   }
   throw new Error(
@@ -705,7 +709,7 @@ export class HandsClient {
    * format and the model is told the same string either way.
    */
   private async fixStartArgs(
-    args: Record<string, unknown>, store: BgRowStore | null,
+    args: Record<string, unknown>, store: BgRowStore | null, stepIdentity: string | undefined,
   ): Promise<{ args: Record<string, unknown>; carry: StartCarry }> {
     if (typeof args.shell_id === "string" && args.shell_id) {
       return { args, carry: {} };
@@ -716,7 +720,7 @@ export class HandsClient {
       return { args, carry: {} };
     }
     const allocated = await allocateStartIdentity(
-      store, this.owner, this.run, args.command, this.generation,
+      store, this.owner, this.run, args.command, this.generation, stepIdentity,
     );
     return {
       args: { ...args, shell_id: allocated.shellId },
@@ -724,6 +728,7 @@ export class HandsClient {
         commandDigest: allocated.commandDigest,
         sequence: allocated.sequence,
         claimedBy: BRAIN_ID,
+        ...(stepIdentity ? { stepIdentity } : {}),
       },
     };
   }
@@ -748,13 +753,13 @@ export class HandsClient {
    * crash could run twice.
    */
   private async dispatch(
-    name: string, args: Record<string, unknown>, signal?: AbortSignal,
+    name: string, args: Record<string, unknown>, signal?: AbortSignal, ctx: CallContext = {},
   ): Promise<DispatchOutcome> {
     await this.connect();
     const isStart = name === "bash" && args.run_in_background === true;
     const store = bgRowStore();
     const start = isStart
-      ? await this.fixStartArgs(args, store)
+      ? await this.fixStartArgs(args, store, ctx.stepIdentity)
       : { args, carry: {} as StartCarry };
     const fixed = start.args;
     const address = isStart ? this.startAddress(fixed) : null;
@@ -785,8 +790,12 @@ export class HandsClient {
     return {
       text: restorePublicShellId(texts || "", wired.shell_id, fixed.shell_id),
       isError,
-      structured: (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
-        ?? (result as { structured?: unknown }).structured,
+      structured: restoreStructuredShellId(
+        (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
+          ?? (result as { structured?: unknown }).structured,
+        wired.shell_id,
+        fixed.shell_id,
+      ),
     };
   }
 
@@ -859,8 +868,9 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    ctx?: CallContext,
   ): Promise<string> {
-    return (await this.dispatch(name, args, signal)).text;
+    return (await this.dispatch(name, args, signal, ctx)).text;
   }
 
   /**
@@ -874,8 +884,9 @@ export class HandsClient {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    ctx?: CallContext,
   ): Promise<DispatchOutcome> {
-    return this.dispatch(name, args, signal);
+    return this.dispatch(name, args, signal, ctx);
   }
 
   /**

@@ -37,14 +37,20 @@ export interface BgHandleRow extends BgHandleAddress {
   generation: string;
   state: BgRowState;
   /**
-   * Non-reversible digest of the command this start carries.
-   *
-   * Not an identity: two deliberate starts of one command are two intents and
-   * get two rows. It is how a replay recognises the call it is repeating among
-   * this run's unresolved rows, since nothing the model returns can be trusted
-   * to name it again.
+   * Non-reversible digest of the command this start carries. Diagnostic only:
+   * two deliberate starts of one command are two intents and two rows, so it
+   * identifies nothing on its own.
    */
   commandDigest?: string;
+  /**
+   * The call site this start came from, sealed here before the dispatch.
+   *
+   * This is what a replay is recognised by. Matching command text instead
+   * merges a genuinely new same-command call into a predecessor's unfinished
+   * one, and leaves a genuinely different call with the predecessor's still
+   * unresolved -- neither of which the run has any way to notice.
+   */
+  stepIdentity?: string;
   /** Which start of this command under this run identity, from one upwards. */
   sequence?: number;
   /**
@@ -106,7 +112,7 @@ const MAX_ATTEMPTS = 8;
  */
 export async function advanceRow(
   store: BgRowStore, address: BgHandleAddress, generation: string, state: BgRowState,
-  carry: Pick<BgHandleRow, "commandDigest" | "sequence" | "claimedBy"> = {},
+  carry: Pick<BgHandleRow, "commandDigest" | "sequence" | "claimedBy" | "stepIdentity"> = {},
 ): Promise<void> {
   const key = rowKey(address);
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -118,6 +124,7 @@ export async function advanceRow(
       commandDigest: carry.commandDigest ?? row?.commandDigest,
       sequence: carry.sequence ?? row?.sequence,
       claimedBy: carry.claimedBy ?? row?.claimedBy,
+      stepIdentity: carry.stepIdentity ?? row?.stepIdentity,
     } satisfies BgHandleRow);
     if (await store.write(key, next, current?.revision ?? null)) return;
   }

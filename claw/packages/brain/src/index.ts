@@ -14,7 +14,7 @@ import {
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
 import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
-import { keepalivePingPhaseCeilingSec, keepalivePingsPerSweep } from "./sandbox/keepalive.js";
+import { keepalivePingsPerSweep, keepaliveSweepCeilingSec } from "./sandbox/keepalive.js";
 import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
 import { bindAdmission } from "./sandbox/admission.js";
@@ -883,7 +883,7 @@ async function main() {
     reconcileReserve: SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
     idleDeadlineSec: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC,
     pingsPerSweep: keepalivePingsPerSweep(),
-    pingPhaseCeilingSec: keepalivePingPhaseCeilingSec(),
+    pingPhaseCeilingSec: keepaliveSweepCeilingSec(),
     sweepSpanSec: SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC,
     // The Pending wait is the real provisioning ceiling; the poll timeout is
     // only the backstop for an unreadable status and bounds nothing a slot has

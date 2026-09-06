@@ -1816,10 +1816,14 @@ class AgentLoopRunner {
       // Filled by the router from the tool's own result, so what counts as
       // success is the tool's answer rather than the shape of its wording.
       const outcome = { isError: false };
+      // The model-issued tool-use identifier. Sealed onto the reference row
+      // before the dispatch, so a resumed run recognises its own retry of this
+      // exact call rather than one that merely produced the same command.
+      const stepCtx = { stepIdentity: toolId };
       resultText = WAITING_TOOLS.has(toolName)
         ? await whileWaiting(this.opts.runKey, "background_command", () =>
-            this.router.route(toolName, finalInput, this.signal, outcome))
-        : await this.router.route(toolName, finalInput, this.signal, outcome);
+            this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
+        : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
       toolOutcome = outcome;
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result

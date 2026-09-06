@@ -42,6 +42,9 @@ let roster: { store: RosterStore; config: RosterConfig } | null = null;
  * share, and is reported healthy while doing so.
  */
 export async function bindAdmission(kv: KV, capacity: CapacitySettings): Promise<void> {
+  // A fresh bind is a fresh view: whatever this process could not reconcile
+  // before it bound belonged to a roster it is no longer looking at.
+  localStaleLatch = false;
   roster = rosterDeps(kv, capacity).roster ?? null;
   if (!roster) return;
   const { store, config } = roster;
@@ -102,7 +105,23 @@ export async function releaseAdmission(identity: string): Promise<boolean> {
  */
 export async function isRosterStale(): Promise<boolean> {
   if (!roster) return false;
+  if (localStaleLatch) return true;
   return isFleetStale(roster.store).catch(() => true);
+}
+
+/**
+ * Refuse this replica's own claims even where the shared marker could not be
+ * written.
+ *
+ * A reconcile that failed and a stale marker that also failed leave the roster
+ * looking healthy to everyone, including this process. The latch is what stops
+ * this one admitting against it once contention clears, and only a sweep that
+ * reconciled a complete census lifts it.
+ */
+let localStaleLatch = false;
+
+export function latchRosterStale(stale: boolean): void {
+  localStaleLatch = stale;
 }
 
 /** Record that the roster is incomplete, for every replica reading it. */
@@ -151,6 +170,13 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
+  if (localStaleLatch) {
+    throw new SandboxCapacityRefused(
+      "sandbox admission refused: this replica could not reconcile the keepalive "
+      + "roster and could not record that it had not, so the count a claim would "
+      + "be checked against is unknown here",
+    );
+  }
   const claim = await claimProvisionalSlot(store, config);
   if (!claim.ok && claim.reason === "stale") {
     logger.warn({ sessionId, reason: claim.staleReason }, "admission.roster_stale");

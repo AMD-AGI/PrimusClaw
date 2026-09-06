@@ -23,6 +23,7 @@ import {
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { rosterStore } from "../src/sandbox/roster-store.js";
+import { latchRosterStale } from "../src/sandbox/admission.js";
 import type { Roster, RosterConfig } from "../src/sandbox/admission-roster.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
@@ -89,6 +90,8 @@ beforeEach(() => {
   kv = makeKv(values);
   pinged = [];
   onPing = null;
+  // Module state: a replica that latched in one test must not refuse in the next.
+  latchRosterStale(false);
   resetBackgroundWorkStateForTest();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
@@ -491,4 +494,120 @@ test("a census that could not be read does not clear staleness", async () => {
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
   assert.equal(await isRosterStale(), false);
+});
+
+test("a KV read that rejects makes the census incomplete, not the key absent", async () => {
+  // Folded into absence, the target drops out of the census and the next
+  // reconcile clears a staleness the fleet still has.
+  const { bindAdmission, admitSandbox, SandboxCapacityRefused, isRosterStale } =
+    await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  kv.seed("hands.sess-a", entry("wl-a"));
+  kv.seed("hands.sess-unreadable", entry("wl-unreadable"));
+  const realGet = kv.get.bind(kv);
+  (kv as unknown as { get: unknown }).get = async (key: string) => {
+    if (key === "hands.sess-unreadable") throw new Error("kv unavailable");
+    return realGet(key);
+  };
+
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.equal(await isRosterStale(), true);
+  await assert.rejects(() => admitSandbox("sess-new"), SandboxCapacityRefused);
+
+  (kv as unknown as { get: unknown }).get = realGet;
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  assert.equal(await isRosterStale(), false);
+});
+
+test("a DAG sandbox surviving a restart is admitted and pinged", async () => {
+  // Its session key may name nothing, or a stale sibling: every node of a DAG
+  // shares one session id. Walked from session keys alone it holds no slot and
+  // is pinged by nobody, which after a restart is every DAG sandbox this
+  // replica did not create.
+  const { bindAdmission } = await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => 1,
+    listDagHandles: async () => [["dag-root-1", {
+      primary: {
+        workload_id: "wl-dag", platform_key: "pk", provider: "safe-workload",
+        hands_url: "http://wl-dag:9100/mcp", namespace: "ns",
+      },
+    }]],
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.ok(roster()!.entries.some((e) => e.identity === "dag-root-1:safe:wl-dag"),
+    "admitted, so it counts against the ceiling like every other target");
+  assert.ok(pinged.includes("wl-dag"), "and pinged, so its idle clock is held off");
+});
+
+test("many simultaneous eviction failures do not stretch the sweep past its span", async () => {
+  // Evictions run serially and each awaits a stop, so an unbounded failure
+  // phase is fleet-sized -- and the declared span, which every refresh gap is
+  // derived from, becomes a number the sweep routinely exceeds.
+  const failing = 40;
+  for (let i = 0; i < failing; i++) kv.seed(`hands.sess-bad-${i}`, entry(`wl-bad-${i}`));
+
+  let now = 0;
+  const STOP_MS = 5_000;
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async exec() { now += 100; throw new Error("sandbox gone"); },
+      async stop() { now += STOP_MS; throw new Error("control plane unreachable"); },
+    } as unknown as SandboxProvider,
+  });
+
+  const started = now;
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, now: () => now,
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  const elapsedSec = (now - started) / 1000;
+  const { keepaliveSweepCeilingSec } = await import("../src/sandbox/keepalive.js");
+  assert.ok(elapsedSec <= keepaliveSweepCeilingSec(),
+    `the sweep ran ${elapsedSec}s against a declared worst case of `
+      + `${keepaliveSweepCeilingSec()}s with ${failing} targets failing at once`);
+});
+
+test("the clock seam is inert when it is not supplied", async () => {
+  // A seam that changes behaviour by existing is a second code path nobody runs
+  // in production. Nothing branches on whether it is set: the deadline reads
+  // whichever clock it was handed, and the default is the real one.
+  kv.seed("hands.sess-a", entry("wl-a"));
+  kv.seed("hands.sess-b", entry("wl-b"));
+
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  const withoutSeam = [...pinged].sort();
+
+  pinged.length = 0;
+  // The same sweep with the seam supplied as the real clock: identical work.
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, now: () => Date.now(),
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.deepEqual([...pinged].sort(), withoutSeam);
+  const source = await import("node:fs").then((fs) => fs.readFileSync(
+    new URL("../src/sandbox/keepalive.ts", import.meta.url), "utf8",
+  ));
+  assert.ok(!/if\s*\(\s*deps\.now\s*\)/.test(source),
+    "no path may branch on whether the seam was supplied");
+  assert.match(source, /const clock = deps\.now \?\? Date\.now;/,
+    "it is a default, not a mode");
 });

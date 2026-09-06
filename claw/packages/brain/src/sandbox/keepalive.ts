@@ -13,9 +13,11 @@ import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../ta
 import { destroyHands } from "./reaper.js";
 import { reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
+import { listAllDagHandles } from "./handles.js";
+import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
-import { markRosterStale, releaseAdmission } from "./admission.js";
+import { latchRosterStale, markRosterStale, releaseAdmission } from "./admission.js";
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
@@ -75,6 +77,8 @@ interface KeepaliveDeps {
    * a confirmed `idle` could be reached without stubbing the call.
    */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
+  listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
   /**
    * Test seam for the ping-phase budget. The real one is derived from the
    * record TTL and is minutes long, which no test can exhaust without sleeping
@@ -482,6 +486,19 @@ export function keepalivePingPhaseCeilingSec(): number {
   return Math.ceil((PING_PHASE_BUDGET_MS + HANDS_PING_CEILING_MS) / 1000);
 }
 
+/**
+ * The whole guarded tick's worst case: the ping phase, plus the failure phase
+ * and the one eviction its budget lets start. Fleet-size independent, which is
+ * the property the declared span has to have.
+ */
+export function keepaliveSweepCeilingSec(): number {
+  return keepalivePingPhaseCeilingSec()
+    + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
+}
+
+/** Longest one started eviction may take, stop and retries together. */
+const HANDS_STOP_CEILING_MS = 30_000;
+
 /** Longest one ping may take before its own timeout ends it. */
 const HANDS_PING_CEILING_MS = 15_000;
 
@@ -805,7 +822,17 @@ async function collectTargets(
     const keys = await deps.kv.keys("hands.*");
     for await (const key of keys) {
       const sessionId = sessionIdFromHandsKey(key);
-      const e = await deps.kv.get(key).catch(() => null);
+      // A read that failed is not a key that is absent: folding the two
+      // together drops the target from the census, and the reconcile that
+      // follows then clears a staleness the fleet still has.
+      let e: Awaited<ReturnType<typeof deps.kv.get>> = null;
+      try {
+        e = await deps.kv.get(key);
+      } catch (err) {
+        complete = false;
+        logger.warn({ err: (err as Error)?.message, key }, "keepalive.entry_read_failed");
+        continue;
+      }
       if (!e) continue;
       try {
         const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
@@ -945,6 +972,39 @@ async function collectTargets(
     logger.warn({ err }, "keepalive.kv_scan_failed");
   }
 
+  // The other half of the fleet. A DAG node resolves its sandbox through the
+  // handle map, and every node of a DAG shares one session id -- so a live DAG
+  // sandbox may be named by no session entry at all, or only by a stale
+  // sibling's. Missed here it holds no slot and is pinged by nobody, which
+  // after a restart is every DAG sandbox this replica did not create.
+  try {
+    for (const [dagRoot, handles] of await (deps.listDagHandles ?? listAllDagHandles)()) {
+      for (const info of Object.values(handles)) {
+        const entry: SandboxEntry = {
+          provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+          workloadId: info.workload_id,
+          platformKey: info.platform_key,
+          sessionId: info.session_id,
+          sandboxName: info.sandbox_name,
+          namespace: info.namespace,
+          userId: info.user_id,
+        };
+        const usable = entry.provider === "agent-sandbox"
+          ? !!entry.sessionId
+          : !!(entry.workloadId && entry.platformKey);
+        if (!usable) continue;
+        const key = sandboxRegistryKey(dagRoot, entry);
+        seenIdentities.add(key);
+        if (!targets.has(key)) targets.set(key, { sessionId: dagRoot, entry });
+      }
+    }
+  } catch (err) {
+    // Unreadable, not empty: a census missing this half is one the roster is
+    // reconciled against as if those sandboxes did not exist.
+    complete = false;
+    logger.warn({ err: (err as Error)?.message }, "keepalive.dag_handle_scan_failed");
+  }
+
   // After the walk, not during it: the cap is global and the cursor rotates, so
   // who gets a slot has to be decided once the candidates are all known.
   dispatchProbes(deps, probeCandidates);
@@ -975,9 +1035,23 @@ interface KeepaliveFailure {
   gone: boolean;
 }
 
+/**
+ * How long the failure-handling phase may spend starting evictions.
+ *
+ * A budget rather than a count, and independent of how many targets failed:
+ * evictions run serially and each awaits a stop, so a fleet-sized failure
+ * makes this phase fleet-sized and the declared sweep span -- which every
+ * refresh gap is derived from -- becomes a number the sweep routinely exceeds.
+ * An eviction not started inside it is deferred, which costs nothing: a handle
+ * that stays unreachable keeps failing and is evicted on a later sweep, and no
+ * deferral expires a handle or reclaims anything.
+ */
+const FAILURE_PHASE_BUDGET_MS = 30_000;
+
 async function handleKeepaliveFailures(
   failures: KeepaliveFailure[],
   targetCount: number,
+  now: () => number = Date.now,
 ): Promise<void> {
   // More than one independently "gone" result in one tick is more likely to be
   // a shared routing/control-plane fault than simultaneous sandbox loss. Delay
@@ -991,6 +1065,8 @@ async function handleKeepaliveFailures(
     );
   }
 
+  const phaseDeadline = now() + FAILURE_PHASE_BUDGET_MS;
+  let deferredEvictions = 0;
   for (const failure of failures) {
     const { targetKey, sessionId, entry, error } = failure;
     const goneCircuitOpen = suppressImmediateGone && failure.gone;
@@ -1013,6 +1089,12 @@ async function handleKeepaliveFailures(
     );
     // Automatic eviction is opt-in; the default leaves recovery to platform
     // idle/TTL GC rather than acting on an unavailable control plane.
+    if (now() >= phaseDeadline) {
+      // Counted and left for the next sweep. The fail count is already
+      // recorded, so nothing is forgotten -- only postponed.
+      deferredEvictions += 1;
+      continue;
+    }
     if (
       SANDBOX_KEEPALIVE_FAIL_LIMIT > 0
       && fails >= SANDBOX_KEEPALIVE_FAIL_LIMIT
@@ -1031,6 +1113,12 @@ async function handleKeepaliveFailures(
         "keepalive.sandbox_evicted",
       );
     }
+  }
+  if (deferredEvictions > 0) {
+    logger.warn(
+      { deferred: deferredEvictions, budgetMs: FAILURE_PHASE_BUDGET_MS },
+      "keepalive.failure_budget_exhausted",
+    );
   }
 }
 
@@ -1065,7 +1153,13 @@ async function admitTargets(
       );
     }
     await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
-    if (!censusComplete) {
+    if (censusComplete) {
+      // Only a sweep that reconciled a complete census may lift the local
+      // latch: anything less returns the replica to apparent health on the
+      // strength of a reading it could not take.
+      latchRosterStale(false);
+    } else {
+      latchRosterStale(true);
       logger.error({ targets: identities.length }, "keepalive.census_incomplete");
     }
   } catch (err) {
@@ -1077,11 +1171,18 @@ async function admitTargets(
     // The sweep still serves what it collected -- refusing to ping is how a
     // sandbox with live work in it is reclaimed -- but nothing new is admitted
     // against a roster that is missing targets it was about to take on.
+    // If the marker itself cannot be written, the shared roster still looks
+    // healthy -- so this replica latches locally as well and every claim it
+    // sees is refused until a sweep completes clean. A neighbour that can write
+    // is unaffected; one that cannot is at least not the one admitting.
     await markRosterStale((err as Error)?.message ?? "reconcile failed")
-      .catch((markErr) => logger.error(
-        { err: (markErr as Error)?.message },
-        "keepalive.roster_stale_marker_unwritten",
-      ));
+      .catch((markErr) => {
+        latchRosterStale(true);
+        logger.error(
+          { err: (markErr as Error)?.message },
+          "keepalive.roster_stale_marker_unwritten",
+        );
+      });
     logger.error(
       { err: (err as Error)?.message, targets: identities.length },
       "keepalive.roster_reconcile_failed",
@@ -1245,7 +1346,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // sweep. Reported rather than silent: a sweep that cannot cover the fleet
   // inside half a TTL is a capacity signal, and the failure it precedes -- a
   // handle expiring un-pinged -- looks like nothing at all from the outside.
-  await handleKeepaliveFailures(failures, targets.size);
+  await handleKeepaliveFailures(failures, targets.size, clock);
 
   pingDeferred = deferredNow;
   if (deferred > 0) {

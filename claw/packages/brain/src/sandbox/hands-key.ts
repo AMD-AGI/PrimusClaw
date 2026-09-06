@@ -24,8 +24,8 @@ import {
 
 export {
   HANDS_KEY_PREFIX, REKEYED_MARKER, RETAINED_PREFIX, handsKeyNeedsRekey,
-  handsSessionKey, isLegacySessionKey, isRetentionEntry, isReservedRetentionKey,
-  legacyHandsKey, sessionIdFromHandsKey,
+  handsSessionKey, isEncodedSessionKey, isLegacySessionKey, isRetentionEntry,
+  isReservedRetentionKey, legacyHandsKey, sessionIdFromHandsKey,
 } from "@claw/protocol";
 
 /**
@@ -125,11 +125,13 @@ export async function migrateReservedSessionKeys(
           // The newer binding is the live one -- the older names a sandbox
           // something has already replaced -- so it wins, and the loser is
           // removed rather than reported and kept.
-          if (!newerThan(source.value, existing.value)) {
-            result.conflicted.push(key);
-            continue;
-          }
-          if (!await store.replace(destination, source.value, existing.revision)) {
+          // Whichever binding is newer names the sandbox that replaced the
+          // other, and the loser is removed either way -- two names for one
+          // session never converge on their own, so leaving the older in place
+          // because it happens to be the one the scan walked is the same
+          // non-convergence by a different route.
+          if (newerThan(source.value, existing.value)
+            && !await store.replace(destination, source.value, existing.revision)) {
             result.conflicted.push(key);
             continue;
           }

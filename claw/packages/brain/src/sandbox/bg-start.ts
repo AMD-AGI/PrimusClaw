@@ -180,3 +180,26 @@ export function restorePublicShellId(
   }
   return text.split(wireId).join(publicId);
 }
+
+/**
+ * The same restoration inside a tool's structured answer.
+ *
+ * The text is not the only place the id comes back: a start echoes it as a
+ * field, a script step keeps that result, and a later step interpolates the
+ * shell id from it. Left qualified there, the next read or kill qualifies an
+ * already-qualified id and addresses a shell that does not exist -- a failure
+ * that only appears on the script route and only against an older sandbox.
+ */
+export function restoreStructuredShellId(
+  structured: unknown, wireId: unknown, publicId: unknown,
+): unknown {
+  if (typeof wireId !== "string" || typeof publicId !== "string" || wireId === publicId) {
+    return structured;
+  }
+  if (!structured || typeof structured !== "object") return structured;
+  const out: Record<string, unknown> = { ...(structured as Record<string, unknown>) };
+  for (const [field, value] of Object.entries(out)) {
+    if (typeof value === "string") out[field] = value.split(wireId).join(publicId);
+  }
+  return out;
+}

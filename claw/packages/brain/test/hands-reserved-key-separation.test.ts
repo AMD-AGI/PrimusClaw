@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 
 import {
   RETAINED_PREFIX, ReservedKeyCollision, assertRetentionSeparation,
-  handsSessionKey, isReservedRetentionKey, isRetentionEntry,
+  handsSessionKey, isEncodedSessionKey, isReservedRetentionKey, isRetentionEntry,
   migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
 } from "../src/sandbox/hands-key.js";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
@@ -107,19 +107,24 @@ test("a migration that crashed between the copy and the delete resumes", async (
   assert.equal(store.map.has(`hands.${colliding}`), false, "the delete is finished");
 });
 
-test("a destination another replica already wrote differently is never overwritten", async () => {
+test("a destination whose write is refused leaves both, and refuses the deployment", async () => {
+  // Convergence needs a write to land. One that cannot -- the revision moved
+  // under it -- is the one case the pair is left as it is, and the startup
+  // check is what stops the deployment serving with two names for one session.
   const colliding = `${RETAINED_PREFIX}TAKEN`;
   const store = memoryStore({
-    [`hands.${colliding}`]: session(colliding),
-    [handsSessionKey(colliding)]: session("someone-else"),
+    [`hands.${colliding}`]: session(colliding, "2026-06-01T00:00:00.000Z"),
+    [handsSessionKey(colliding)]: session("someone-else", "2026-01-01T00:00:00.000Z"),
   });
+  const refusing: HandsKeyStore = { ...store, async replace() { return false; } };
 
-  const result = await migrateReservedSessionKeys(store);
+  const result = await migrateReservedSessionKeys(refusing);
 
   assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
-  assert.equal(store.map.get(handsSessionKey(colliding))!.value, session("someone-else"));
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value,
+    session("someone-else", "2026-01-01T00:00:00.000Z"));
   await assert.rejects(() => assertRetentionSeparation(store), ReservedKeyCollision,
-    "and what the migration could not resolve refuses the deployment");
+    "what the migration could not resolve refuses the deployment");
 });
 
 test("a source rewritten between the read and the delete keeps its entry", async () => {
@@ -204,26 +209,40 @@ test("an id whose key shape would be ambiguous is refused, not encoded", () => {
   // to something no session answered to. The marker's second character is
   // outside base32, and an id carrying it has no unambiguous key at all, so it
   // is rejected by name rather than repaired.
-  assert.doesNotThrow(() => handsSessionKey("=MZXW6"),
-    "a single = is an ordinary id now; only the two-character marker is reserved");
-  assert.equal(handsSessionKey("=MZXW6"), "hands.=MZXW6");
-  assert.equal(sessionIdFromHandsKey("hands.=MZXW6"), "=MZXW6");
-
-  assert.throws(() => handsSessionKey("=.looks-encoded"), /no unambiguous key/);
+  // `=MZXW6` is valid base32 and decodes to ordinary text, and ordinary text is
+  // not something this scheme would ever have encoded -- which is what says it
+  // is a raw id. It is re-keyed like any other id needing one.
+  const raw = "=MZXW6";
+  assert.ok(handsSessionKey(raw).startsWith("hands.="));
+  assert.equal(sessionIdFromHandsKey(handsSessionKey(raw)), raw);
+  assert.ok(!isEncodedSessionKey(`hands.${raw}`), "the raw form is not read as an encoding");
+  assert.ok(isEncodedSessionKey(handsSessionKey(raw)), "and the encoded form is");
 });
 
-test("a validly base32-shaped raw id is not mistaken for an encoded key", async () => {
-  // The case the old rule got wrong: nothing about this id's remainder should
-  // make the scan treat its key as one this scheme wrote.
+test("a validly base32-shaped raw id is migrated, not read as an encoding", async () => {
+  // The case a shape-only rule got wrong: `MZXW6` is valid base32, so nothing
+  // about the remainder separates the two -- what does is that it decodes to
+  // something this scheme would never have encoded.
   const raw = "=MZXW6";
   const store = memoryStore({ [`hands.${raw}`]: session(raw) });
 
   const result = await migrateReservedSessionKeys(store);
 
-  assert.deepEqual(result.migrated, [], "an ordinary id needs no migration");
-  assert.deepEqual(result.conflicted, []);
-  assert.equal(store.map.get(`hands.${raw}`)!.value, session(raw), "and is left alone");
-  assert.equal(sessionIdFromHandsKey(`hands.${raw}`), raw);
+  assert.deepEqual(result.migrated, [`hands.${raw}`]);
+  assert.equal(store.map.has(`hands.${raw}`), false);
+  assert.equal(store.map.get(handsSessionKey(raw))!.value, session(raw));
+  assert.equal(sessionIdFromHandsKey(handsSessionKey(raw)), raw, "and still resolves back");
+});
+
+test("a migrated key is still enumerable by the filter every walk uses", () => {
+  // The sweeps and the census all enumerate with `hands.*`, and `*` spans one
+  // dot-delimited token -- so a marker carrying a dot makes every migrated
+  // session invisible to every walk the moment the legacy key is deleted.
+  const key = handsSessionKey(`${RETAINED_PREFIX}x`);
+  assert.ok(matchesKvFilter(key, "hands.*"),
+    `${key} is not reachable by the filter production scans with`);
+  assert.ok(!key.slice("hands.".length).includes("."),
+    "the key part is one token, which is what makes that true");
 });
 
 test("a properly encoded key is not mistaken for a legacy one", async () => {
@@ -275,20 +294,22 @@ test("an old reader and a new writer overlap without either losing the binding",
   assert.equal((await readThrough(colliding))!.value, newer);
 });
 
-test("an older stray never overwrites the binding that replaced it", async () => {
-  // The other direction of the same race: convergence has to pick the live
-  // sandbox, not whichever key the scan happened to walk.
+test("an older stray converges too: the newer binding stands and it is removed", async () => {
+  // The other direction of the same race. Two names for one session never
+  // converge on their own, so leaving the older in place because it happens to
+  // be the one the scan walked is the same non-convergence by another route.
   const colliding = `${RETAINED_PREFIX}STALE`;
+  const newer = session("newer", "2026-06-01T00:00:00.000Z");
   const store = memoryStore({
     [`hands.${colliding}`]: session("older", "2026-01-01T00:00:00.000Z"),
-    [handsSessionKey(colliding)]: session("newer", "2026-06-01T00:00:00.000Z"),
+    [handsSessionKey(colliding)]: newer,
   });
 
   const result = await migrateReservedSessionKeys(store);
 
-  assert.deepEqual(result.converged, []);
-  assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
-  assert.equal(store.map.get(handsSessionKey(colliding))!.value,
-    session("newer", "2026-06-01T00:00:00.000Z"),
-    "the newer binding stands and the operator is told about the stray");
+  assert.deepEqual(result.converged, [`hands.${colliding}`]);
+  assert.deepEqual(result.conflicted, []);
+  assert.equal(store.map.has(`hands.${colliding}`), false, "one binding, under one name");
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value, newer,
+    "and the newer one is the one that stands");
 });

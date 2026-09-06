@@ -32,20 +32,21 @@ export const RETAINED_PREFIX = "retained-";
 /**
  * Marks a re-keyed session entry.
  *
- * Two characters, and the second is not in base32's alphabet, so an encoded key
- * is distinguishable from a raw one *by shape alone* -- which a single marker
- * was not: a raw session id beginning `=` whose remainder happened to be valid
- * base32 was indistinguishable from an encoding, and either decoded to
- * something no session answered to or was skipped by the scan.
+ * One character, and it carries no `.`: the sweeps and the census enumerate
+ * these keys with a `hands.*` filter, and `*` spans exactly one dot-delimited
+ * token -- so a marker containing a dot makes every migrated key invisible to
+ * every walk, which is worse than the ambiguity it was introduced to fix.
  *
- * A session id that itself begins with this marker cannot be admitted, because
- * no encoding of it could then be told from the raw form. Such an id is refused
- * at the boundary rather than repaired (`assertSessionIdKeyable`).
+ * Encoded and raw are separated by what the encoding can have been *of* rather
+ * than by shape: this scheme only ever encodes an id that needs re-keying, so a
+ * part that decodes to something which does not need re-keying was never
+ * produced by it. `=MZXW6` is valid base32 and decodes to ordinary text, which
+ * is exactly what says it is a raw id and not an encoding.
  */
-export const REKEYED_MARKER = "=.";
+export const REKEYED_MARKER = "=";
 
 export function handsKeyNeedsRekey(sessionId: string): boolean {
-  return sessionId.startsWith(RETAINED_PREFIX);
+  return sessionId.startsWith(RETAINED_PREFIX) || sessionId.startsWith(REKEYED_MARKER);
 }
 
 /**
@@ -56,11 +57,29 @@ export function handsKeyNeedsRekey(sessionId: string): boolean {
  * could resolve differently.
  */
 export function assertSessionIdKeyable(sessionId: string): void {
-  if (sessionId.startsWith(REKEYED_MARKER)) {
+  // The one shape the discriminator below cannot separate: an id that is itself
+  // the marker followed by the encoding of something that needs re-keying.
+  if (sessionId.startsWith(REKEYED_MARKER) && isEncodedPart(sessionId.slice(REKEYED_MARKER.length))) {
     throw new Error(
-      `session id ${JSON.stringify(sessionId)} may not begin with ${JSON.stringify(REKEYED_MARKER)}: `
-      + "that prefix marks a re-keyed registry entry and an id carrying it has no unambiguous key",
+      `session id ${JSON.stringify(sessionId)} is shaped exactly like a re-keyed `
+      + "registry entry and has no key that could be told from one",
     );
+  }
+}
+
+/**
+ * Whether this part is something this scheme wrote.
+ *
+ * Decisive rather than shape-based: only an id that needs re-keying is ever
+ * encoded, so a part decoding to one that does not is a raw id that merely
+ * looks like base32.
+ */
+function isEncodedPart(part: string): boolean {
+  if (!/^[A-Z2-7]+$/.test(part)) return false;
+  try {
+    return handsKeyNeedsRekey(decodeKeyPart(part));
+  } catch {
+    return false;
   }
 }
 
@@ -80,9 +99,7 @@ export function handsSessionKey(sessionId: string): string {
 /** The session id a registry key names, whichever form it takes. */
 export function sessionIdFromHandsKey(key: string): string {
   const part = key.slice(HANDS_KEY_PREFIX.length);
-  return part.startsWith(REKEYED_MARKER)
-    ? decodeKeyPart(part.slice(REKEYED_MARKER.length))
-    : part;
+  return isEncodedSessionKey(key) ? decodeKeyPart(part.slice(REKEYED_MARKER.length)) : part;
 }
 
 /**
@@ -105,12 +122,15 @@ export function isReservedRetentionKey(key: string): boolean {
  * answers to.
  */
 export function isLegacySessionKey(key: string): boolean {
-  return key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX);
+  const part = key.slice(HANDS_KEY_PREFIX.length);
+  return part.startsWith(RETAINED_PREFIX)
+    || (part.startsWith(REKEYED_MARKER) && !isEncodedPart(part.slice(REKEYED_MARKER.length)));
 }
 
-/** Whether this key is one this scheme wrote, by shape alone. */
+/** Whether this key is one this scheme wrote. */
 export function isEncodedSessionKey(key: string): boolean {
-  return key.slice(HANDS_KEY_PREFIX.length).startsWith(REKEYED_MARKER);
+  const part = key.slice(HANDS_KEY_PREFIX.length);
+  return part.startsWith(REKEYED_MARKER) && isEncodedPart(part.slice(REKEYED_MARKER.length));
 }
 
 /** The key this session id would have had before re-keying existed. */

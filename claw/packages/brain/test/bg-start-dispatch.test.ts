@@ -18,9 +18,7 @@
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  HandsClient, bindShellRecordsCapabilityForTest, resetStartIdentityForTest,
-} from "../src/clients/hands.js";
+import { HandsClient, bindShellRecordsCapabilityForTest } from "../src/clients/hands.js";
 import { bindBgHandleRowsForTest } from "../src/sandbox/bg-row-store.js";
 import { readRow, type BgRowState } from "../src/sandbox/bg-handle-rows.js";
 import { bgRowStore } from "../src/sandbox/bg-row-store.js";
@@ -67,7 +65,6 @@ beforeEach(() => {
   restoreCapability = bindShellRecordsCapabilityForTest(async () => true);
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
   probed.length = 0;
-  resetStartIdentityForTest();
 });
 
 afterEach(() => {
@@ -203,6 +200,8 @@ test("a start under a replaced sandbox is answered from the row, not dispatched"
 });
 
 const NO_ID_START = { command: "train.sh", run_in_background: true };
+/** The call site a start came from, as the agent loop supplies it. */
+const STEP = (id: string) => ({ stepIdentity: id });
 
 test("a start naming no id recovers its own id on the replay, not a fresh one", async () => {
   // The common start names nothing. An id minted fresh per call means the
@@ -211,7 +210,7 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
   // exists to prevent, on the path most starts take. The id is derived from
   // what a resumed run reproduces exactly, so the replay finds its own row.
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1")));
 
   const rows = await bgRowStore()!.keys("bgshell.*.*.*");
   assert.equal(rows.length, 1, "a row was keyed before anything was sent");
@@ -222,9 +221,8 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
   // the model is re-queried and free to hand back a different tool-use
   // identifier, so nothing about the provider's id may enter the derivation.
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
-  resetStartIdentityForTest();
   const resumed = pod();
-  await resumed.hands.callTool("bash", NO_ID_START);
+  await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1"));
 
   assert.equal(resumed.sent.length, 1, "retransmitted, because no claim had landed");
   assert.equal(resumed.sent[0].shell_id, row.shellId,
@@ -235,12 +233,11 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
 
 test("a no-id start whose send did land is resolved, never run twice", async () => {
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1")));
   recordAnswer = { marker: true, subtreeReadable: true, present: true };
-  resetStartIdentityForTest();
 
   const resumed = pod();
-  const text = await resumed.hands.callTool("bash", NO_ID_START);
+  const text = await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1"));
 
   assert.equal(resumed.sent.length, 0);
   assert.match(text, /nothing was run a second time/);
@@ -261,8 +258,8 @@ test("two deliberate starts of the identical command are two shells", async () =
   // already confirmed is a start that finished, so the next call takes the next
   // sequence rather than adopting it.
   const { hands, sent } = pod();
-  const first = await hands.callTool("bash", NO_ID_START);
-  const second = await hands.callTool("bash", NO_ID_START);
+  const first = await hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_first"));
+  const second = await hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_second"));
 
   assert.equal(sent.length, 2, "both go out");
   assert.notEqual(sent[0].shell_id, sent[1].shell_id, "and each gets its own shell");
@@ -279,9 +276,9 @@ test("concurrent identical starts never collapse, with no confirmation ordering"
   // settles it: two calls cannot both win one sequence.
   const { hands, sent } = pod({ slowHandoff: true });
   const [a, b, c] = await Promise.all([
-    hands.callTool("bash", NO_ID_START),
-    hands.callTool("bash", NO_ID_START),
-    hands.callTool("bash", NO_ID_START),
+    hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_a")),
+    hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_b")),
+    hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_c")),
   ]);
 
   assert.equal(sent.length, 3, "three intents, three starts");
@@ -296,8 +293,8 @@ test("confirmation arriving out of order across several starts keeps them apart"
   // still take a sequence of its own rather than adopting whichever row happens
   // to be unconfirmed at the moment it looks.
   const { hands, sent } = pod();
-  await hands.callTool("bash", NO_ID_START);
-  await hands.callTool("bash", NO_ID_START);
+  await hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1"));
+  await hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_2"));
 
   // The second start's row is confirmed first; the first is still `dispatched`.
   const keys = await bgRowStore()!.keys("bgshell.*.*.*");
@@ -313,7 +310,7 @@ test("confirmation arriving out of order across several starts keeps them apart"
     (await bgRowStore()!.read(keys[0]))!.revision,
   );
 
-  await hands.callTool("bash", NO_ID_START);
+  await hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_3"));
   assert.equal(sent.length, 3);
   assert.equal(new Set(sent.map((s) => s.shell_id)).size, 3,
     "a start of this process never adopts a row this process claimed");
@@ -323,7 +320,7 @@ test("a replay adopts the unresolved start rather than allocating a new one", as
   // What separates the two: an unconfirmed row is a call that was sent and
   // never came back, which is exactly what a replay is repeating.
   const first = pod({ dieOnHandoff: true });
-  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1")));
   const [key] = await bgRowStore()!.keys("bgshell.*.*.*");
   const stranded = JSON.parse((await bgRowStore()!.read(key))!.value) as
     { shellId: string; sequence: number; commandDigest: string };
@@ -333,9 +330,8 @@ test("a replay adopts the unresolved start rather than allocating a new one", as
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
   // A different process resuming the run: it made no claim of its own, so the
   // unresolved row is its predecessor's unfinished call.
-  resetStartIdentityForTest();
   const resumed = pod();
-  await resumed.hands.callTool("bash", NO_ID_START);
+  await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_1"));
 
   assert.equal(resumed.sent[0].shell_id, stranded.shellId, "the same start, finished");
   assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1, "and no second intent");
@@ -349,7 +345,6 @@ test("a script-mode replay that is safely deduplicated is not a step failure", a
   assert.equal(await rowState(), "dispatched");
 
   recordAnswer = { marker: true, subtreeReadable: true, present: true };
-  resetStartIdentityForTest();
   const resumed = pod();
   const result = await resumed.hands.callToolFull("bash", START);
 
@@ -411,31 +406,77 @@ test("a record-less sandbox never receives a replayed start, however its registr
   }
 });
 
+test("a resumed run recognises its own retry, not a same-command neighbour", async () => {
+  // The distinction command-text matching cannot make. The predecessor's call
+  // came from one call site; the resumed model may re-issue that exact call, or
+  // may decide afresh and issue a different one that happens to run the same
+  // command. Only the first is a replay.
+  const original = pod({ dieOnHandoff: true });
+  await assert.rejects(
+    () => original.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_original")),
+  );
+  const [key] = await bgRowStore()!.keys("bgshell.*.*.*");
+  const stranded = JSON.parse((await bgRowStore()!.read(key))!.value) as
+    { shellId: string; stepIdentity?: string };
+  assert.equal(stranded.stepIdentity, "toolu_original", "the call site is sealed on the row");
+
+  // The model decided afresh: a new call site, the same command text.
+  const resumed = pod();
+  await resumed.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_decided_afresh"));
+  assert.notEqual(resumed.sent[0].shell_id, stranded.shellId,
+    "a new call is a new intent, however familiar its command looks");
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 2);
+
+  // The same call being retried resolves to the shell it already started.
+  const retry = pod();
+  await retry.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_original"));
+  assert.equal(retry.sent[0].shell_id, stranded.shellId, "the retry, recognised as one");
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 2, "and no third intent");
+});
+
+test("a resumed run can see every start it committed to and never confirmed", async () => {
+  // What the resumed run reconciles before issuing anything: its predecessor's
+  // outstanding commitments, on their own terms rather than by being matched
+  // against whatever it asks for next.
+  const { outstandingStarts } = await import("../src/clients/hands.js");
+  const pod1 = pod({ dieOnHandoff: true });
+  await assert.rejects(
+    () => pod1.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_left_open")),
+  );
+  const done = pod();
+  await done.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_finished"));
+
+  const outstanding = await outstandingStarts(bgRowStore()!, OWNER, RUN);
+
+  assert.deepEqual(outstanding.map((r) => r.stepIdentity), ["toolu_left_open"],
+    "the confirmed one is settled; the unconfirmed one is what must be resolved");
+});
+
 test("a replica taking the run over adopts its predecessor's unfinished call", async () => {
   // The handover the design asks a resumed run to reconcile rather than
   // re-issue: the new replica holds no claim of its own, so a dispatched row it
   // did not write is the predecessor's call, and its own first start for that
   // command is that call being finished.
   const original = pod({ dieOnHandoff: true });
-  await assert.rejects(() => original.hands.callTool("bash", NO_ID_START));
+  await assert.rejects(
+    () => original.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_taken_over")),
+  );
   const [key] = await bgRowStore()!.keys("bgshell.*.*.*");
   const stranded = JSON.parse((await bgRowStore()!.read(key))!.value) as
     { shellId: string; claimedBy?: string; sequence: number };
   assert.ok(stranded.claimedBy, "the row names the replica that claimed it");
 
-  // A different replica: nothing of the first process's memory survives.
-  resetStartIdentityForTest();
+  // A second replica, which may be executing before the first notices its lease
+  // is gone. Nothing of the first process's memory reaches it -- the row is all
+  // it has, and the call site on the row is what makes the retry recognisable.
   const successor = pod();
-  await successor.hands.callTool("bash", NO_ID_START);
+  await successor.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_taken_over"));
 
   assert.equal(successor.sent[0].shell_id, stranded.shellId, "adopted, not re-issued");
   assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1);
 
-  // And a second call in that same successor cannot adopt it again: adopting
-  // claims it, so this one is a new intent with a sequence of its own.
-  await successor.hands.callTool("bash", NO_ID_START);
-  assert.equal(successor.sent.length, 2);
-  assert.notEqual(successor.sent[1].shell_id, stranded.shellId,
-    "two concurrent calls in one resumed process must not land on one shell");
-  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 2);
+  // Once that call is confirmed it is settled, so the same call site retried
+  // again starts nothing new and the row count does not move.
+  await successor.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_taken_over"));
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1);
 });

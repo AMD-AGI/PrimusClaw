@@ -167,20 +167,32 @@ test("an unbounded provisioning ceiling is refused, since no horizon can exceed 
   );
 });
 
-test("a sweep span that does not cover its own ping phase is refused", () => {
+test("a sweep span that does not cover a whole tick's worst case is refused", () => {
   // The span is what every refresh gap is derived from, so one the sweep
   // routinely exceeds makes every gap short -- and short by exactly the amount
-  // that matters, since the overrun is a phase that ran long.
+  // that matters, since the overrun is a phase that ran long. The worst case is
+  // the ping phase and the failure handling behind it, each with its own
+  // budget, which is what keeps it independent of how many targets failed.
   assert.throws(
     () => validateKeepaliveCapacity({
       ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
-      sweepSpanSec: 120, pingPhaseCeilingSec: 150,
+      sweepSpanSec: 120, pingPhaseCeilingSec: 210,
     }),
     (err: unknown) => err instanceof KeepaliveConfigRefused
-      && /does not cover the ping/.test(err.message),
+      && /does not cover a sweep's/.test(err.message),
   );
   assert.doesNotThrow(() => validateKeepaliveCapacity({
     ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60,
-    sweepSpanSec: 300, pingPhaseCeilingSec: 150,
+    sweepSpanSec: 300, pingPhaseCeilingSec: 210,
   }));
+});
+
+test("the declared span default covers this build's own worst case", async () => {
+  // The relation has to hold for the values that actually ship, not only for
+  // the ones a test picks.
+  const { SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC } = await import("../src/config.js");
+  const { keepaliveSweepCeilingSec } = await import("../src/sandbox/keepalive.js");
+  assert.ok(SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC > keepaliveSweepCeilingSec(),
+    `the shipped span ${SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC}s does not cover a worst-case `
+      + `tick of ${keepaliveSweepCeilingSec()}s`);
 });
