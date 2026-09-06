@@ -3,6 +3,7 @@
 
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
+import { applyRunEndedIdleFields } from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -473,33 +474,19 @@ export function markHandsIdle(
         namespace: info.namespace,
       }));
 
-      info.keepalive = false;
-      info.idleSince = Date.now();
-      // A new idle period, so the verdict from the last one is not about it.
-      // forgetBackgroundWork above drops this replica's copy; the handle is
-      // where every OTHER replica reads it, and it is re-serialized here either
-      // way -- so leaving the fields alone republishes a stale answer to the
-      // whole fleet at the exact moment the sweep starts acting on it.
-      info.idleEpoch = info.idleSince;
-      // And the half of the period's name that two periods cannot share. The
-      // revision this write is conditioned on: the bucket takes one write per
-      // revision, so no other idle-opening write on this key can ever be given
-      // the same one -- unlike the stamp above, which is a clock reading and can
-      // repeat. Read here rather than after the write because the write's own
-      // revision is not knowable until it lands, and the value only has to be
-      // unique, not to be the write's own number.
-      info.idleRev = entry.revision;
-      delete info.bgCheckedAt;
-      delete info.bgRunning;
-      delete info.bgEpoch;
-      delete info.bgIdleSince;
-      delete info.bgIdleRev;
-      delete info.bgRev;
-      // Same reason, for the clock those verdicts moved: work seen during the
-      // last idle period says nothing about this one. `reuseWindowStart` would
-      // ignore it anyway -- the stamp above is later than anything from before
-      // it -- but leaving it published invites the next reader to disagree.
-      delete info.workSeenAt;
+      // The fields themselves live in @claw/protocol, because the API's reapers
+      // have to open an idle period on a handle whose worker died before it
+      // could reach this line, and two writers of one shape is how the sweep
+      // comes to disagree with itself. What each field is for is documented
+      // there; the short of it is that a new idle period gets a name
+      // (`idleEpoch` plus the revision, which two periods cannot share) and
+      // every verdict from the previous one is dropped rather than republished
+      // to the fleet at the moment the sweep starts acting on it.
+      applyRunEndedIdleFields(
+        info as unknown as Record<string, unknown>,
+        Date.now(),
+        entry.revision,
+      );
       // Conditioned on the revision just read, because a session teardown can
       // delete this entry between the read and the write. An unconditional put
       // would resurrect the handle of a deleted session, and collectTargets

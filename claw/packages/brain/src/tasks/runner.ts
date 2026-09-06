@@ -1767,12 +1767,25 @@ class TaskRunner {
     } else if (this.handsWorkloadId) {
       fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId });
     }
+    // Only a turn that actually took a sandbox has one to put away. Under
+    // BRAIN_LAZY_SANDBOX a turn the model answers from context alone never
+    // builds one, so both of these are unset and nothing is parked -- which is
+    // correct, and was also invisible, because the line below used to be
+    // emitted either way. A handle left unparked by a previous run whose worker
+    // died is pinged by the whole fleet until the workload's absolute deadline,
+    // and this log said it had been put away. Report what happened instead.
+    let parked = false;
     if (this.handsIdentity) {
       fx().markHandsIdle(this.kv, this.sessionId, this.handsIdentity);
+      parked = true;
     } else if (this.handsWorkloadId) {
       fx().markHandsIdle(this.kv, this.sessionId, this.handsWorkloadId);
+      parked = true;
     }
-    logger.info({ sessionId: this.sessionId, workloadId: this.handsWorkloadId }, "keepalive.stopped_after_task");
+    logger.info(
+      { sessionId: this.sessionId, workloadId: this.handsWorkloadId, parked },
+      "keepalive.stopped_after_task",
+    );
   }
 
   /**
