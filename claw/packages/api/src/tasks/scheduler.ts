@@ -78,15 +78,19 @@ export function acceptWithinHardHeadroom(
   usage: AdmissionUsage,
   roots: Set<string>,
 ): ClawTaskRow[] {
-  const limits = envAdmitLimits();
-  const accepted: ClawTaskRow[] = [];
-  for (const row of candidates) {
-    const ask = askFromRow(row, roots);
-    if (hardOverflow(usage, ask, limits)) continue;
-    chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
-    accepted.push(row);
-  }
-  return accepted;
+  return candidates.filter((row) => chargeIfWithinHardHeadroom(row, usage, roots));
+}
+
+/** One candidate's half of {@link acceptWithinHardHeadroom}, so paging can test as it reads. */
+function chargeIfWithinHardHeadroom(
+  row: ClawTaskRow,
+  usage: AdmissionUsage,
+  roots: Set<string>,
+): boolean {
+  const ask = askFromRow(row, roots);
+  if (hardOverflow(usage, ask, envAdmitLimits())) return false;
+  chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
+  return true;
 }
 
 /**
@@ -112,13 +116,12 @@ export async function promoteReadyTasks(): Promise<number> {
   }
   return await withOwnedAdmissionLock(async (client) => {
     const { usage, roots } = await loadUsageWithRoots("occupying", client);
-    const accepted = await fillWithinCeiling<ClawTaskRow>({
+    const admitted = await fillWithinCeiling<ClawTaskRow>({
       page: (skip) => readyCandidates(client, skip, MAX_PROMOTE_PAGE),
-      fits: () => true,
+      fits: (row) => chargeIfWithinHardHeadroom(row, usage, roots),
       want: MAX_PROMOTE_PAGE,
       idOf: (row) => row.task_id,
     });
-    const admitted = acceptWithinHardHeadroom(accepted, usage, roots);
     if (!admitted.length) return 0;
     // The readiness predicate is repeated in the write: the advisory lock
     // serialises admission decisions, not the whole task lifecycle, so

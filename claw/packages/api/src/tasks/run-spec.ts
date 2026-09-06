@@ -16,7 +16,8 @@
  * that they may be written in the clear.
  */
 
-import type { EnvironmentTopology } from "@claw/protocol";
+import { validateTopology, type EnvironmentTopology } from "@claw/protocol";
+import { PG_INT4_MAX } from "@claw/utils";
 
 /** Top-level fields stripped before the spec is written to `claw_tasks.input`. */
 export const RUN_SPEC_SECRET_KEYS = [
@@ -71,11 +72,33 @@ export function stripRunSecrets(
   return spec;
 }
 
+/**
+ * Check a spec's declared topology at whichever boundary is about to persist it.
+ *
+ * The one validator, reached from every path that writes `input.topology`:
+ * `gpuNodesFromSpec` and the SQL aggregate both trust the bound it enforces, so
+ * a path that skips it can persist a figure that aborts every later admission.
+ *
+ * @returns the validator's own messages, or null when nothing was declared.
+ */
+export function topologyErrors(
+  task: Record<string, unknown> | null | undefined,
+): string[] | null {
+  const topology = task?.topology;
+  if (topology === undefined || topology === null) return null;
+  const result = validateTopology(topology);
+  return result.ok ? null : result.errors;
+}
+
 export function gpuNodesFromSpec(task: Record<string, unknown>): number {
   const topology = task.topology;
   if (!topology || typeof topology !== "object" || Array.isArray(topology)) return 0;
   const nodes = (topology as EnvironmentTopology).nodes;
-  return typeof nodes === "number" && Number.isFinite(nodes) && nodes > 0 ? nodes : 0;
+  // An ask must never name a number the `int4` count cannot express: the
+  // aggregate it is compared against clamps at PG_INT4_MAX, and a fractional
+  // value is not something the row's own cast could have produced.
+  if (typeof nodes !== "number" || !Number.isInteger(nodes) || nodes <= 0) return 0;
+  return Math.min(nodes, PG_INT4_MAX);
 }
 
 export function wantsSandboxFromSpec(task: Record<string, unknown>): boolean {

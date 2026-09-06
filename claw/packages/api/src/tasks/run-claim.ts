@@ -17,6 +17,7 @@ import pino from "pino";
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
+import { deferQueuedBySoftCeiling } from "./admission.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
@@ -112,7 +113,11 @@ export async function claimRunById(
   brainId: string,
   doorbellSemantics = 1,
   q: Querier = db,
-): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | ExhaustedClaim> {
+): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim> {
+  // Only a `queued` row: CLAIMABLE also admits `preparing`, which is already
+  // counted as executing, so re-claiming one after an unclaim adds nothing to
+  // the executing set and must not be refused.
+  if (await deferQueuedBySoftCeiling(taskId)) return "deferred";
   const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, q);
   if (taken === "missing" || taken === "busy") return taken;
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
@@ -157,7 +162,7 @@ const CLAIM_NEXT_ATTEMPTS = 8;
  */
 export type ClaimNextSkip =
   | { cause: "exhausted"; exhaustion: "lock_contention_exhausted" | "max_retries_exceeded" }
-  | { cause: "raced" | "unclaimable" | "error" };
+  | { cause: "raced" | "unclaimable" | "error" | "deferred" };
 
 /**
  * What a claim-next call did besides answering.
@@ -219,11 +224,14 @@ export async function claimNextRun(
  * share one value. Only the other two are properties of the candidate itself,
  * and only those can mean a queue that is stuck.
  */
-function skipCauseOf(claimed: "missing" | "busy" | "unclaimable" | ExhaustedClaim): ClaimNextSkip {
+function skipCauseOf(
+  claimed: "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim,
+): ClaimNextSkip {
   if (typeof claimed !== "string") {
     return { cause: "exhausted", exhaustion: claimed.reason };
   }
-  return { cause: claimed === "unclaimable" ? "unclaimable" : "raced" };
+  if (claimed === "unclaimable" || claimed === "deferred") return { cause: claimed };
+  return { cause: "raced" };
 }
 
 /**

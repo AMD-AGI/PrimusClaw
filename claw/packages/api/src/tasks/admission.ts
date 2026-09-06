@@ -12,6 +12,7 @@
  */
 
 import pino from "pino";
+import type { PoolClient } from "pg";
 
 import {
   ADMIT_HARD_GPU_NODES,
@@ -535,6 +536,32 @@ export async function withOwnedAdmissionLock<T>(
   }
 }
 
+/**
+ * One transaction for an endpoint's preparation and its create, lock first.
+ *
+ * Unlike {@link withOwnedAdmissionLock} the transaction is opened whether or
+ * not a ceiling is set: the preparation these endpoints perform -- a credential
+ * stamp, a session insert -- must be undone by the same refusal that writes no
+ * run, and only a transaction does that. `commit: false` rolls all of it back.
+ */
+export async function withAdmissionTransaction<T>(
+  fn: (client: PoolClient) => Promise<{ commit: boolean; value: T }>,
+): Promise<T> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await acquireAdmissionLock(client);
+    const { commit, value } = await fn(client);
+    await client.query(commit ? "COMMIT" : "ROLLBACK");
+    return value;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /** {@link loadUsage}'s totals plus the run-tree roots of one counted set. */
 export interface UsageWithRoots {
   usage: AdmissionUsage;
@@ -690,6 +717,30 @@ export async function reserveForExecution<T>(
     if (result !== null) reserved.push(result);
   }
   return reserved;
+}
+
+/**
+ * Whether the soft ceiling declines to hand this row to a worker right now.
+ *
+ * Only a row at `queued` is gated: `CLAIMABLE` also admits `preparing`, which
+ * is already inside `EXECUTING`, so re-claiming it after an unclaim adds
+ * nothing and blocking it would strand work a holder gave back. Never a
+ * refusal -- the row stays `queued` and the caller comes back.
+ */
+export async function deferQueuedBySoftCeiling(
+  taskId: string,
+  client?: StatementRunner,
+): Promise<boolean> {
+  const limits = envAdmitLimits();
+  if (!anySoftCeilingSet(limits)) return false;
+  const r = await (client ?? db).query(
+    "SELECT * FROM claw_tasks WHERE task_id = $1 AND status = 'queued'",
+    [taskId],
+  );
+  const row = r.rows[0] as ClawTaskRow | undefined;
+  if (!row) return false;
+  const { usage, roots } = await loadUsageWithRoots("executing", client);
+  return softOverflow(usage, askFromRow(row, roots), limits);
 }
 
 /** The structural shape of a session tree, over `claw_sessions` alone. */

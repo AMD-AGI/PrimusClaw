@@ -19,6 +19,8 @@ import { startPgCluster, type PgCluster } from "./pg-cluster.js";
 export type AdmissionModules = {
   admission: typeof import("../../src/tasks/admission.js");
   chatRun: typeof import("../../src/tasks/chat-run.js");
+  dagExpander: typeof import("../../src/tasks/dag-expander.js");
+  lifecycle: typeof import("../../src/tasks/lifecycle.js");
   sessions: typeof import("../../src/routes/sessions.js");
   scheduler: typeof import("../../src/tasks/scheduler.js");
   db: typeof import("../../src/infra/db.js");
@@ -47,6 +49,8 @@ export async function startAdmissionCluster(
     app = {
       admission: await import("../../src/tasks/admission.js"),
       chatRun: await import("../../src/tasks/chat-run.js"),
+      dagExpander: await import("../../src/tasks/dag-expander.js"),
+      lifecycle: await import("../../src/tasks/lifecycle.js"),
       sessions: await import("../../src/routes/sessions.js"),
       scheduler: await import("../../src/tasks/scheduler.js"),
       db: await import("../../src/infra/db.js"),

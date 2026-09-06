@@ -11,8 +11,13 @@
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
 import { db } from "../infra/db.js";
+import type { PoolClient } from "pg";
 import pino from "pino";
+import {
+  acquireAdmissionLock, askFromRow, decideAdmission, type AdmissionRefusal,
+} from "./admission.js";
 import { getTask, transitionStatus, updateTask } from "./db.js";
+import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import type { TaskStatus } from "./types.js";
@@ -258,7 +263,12 @@ export async function cancelTask(
  * do *not* mutate the original row so retries are auditable. Retries are
  * only allowed for terminal failure / cancelled tasks.
  */
-export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task_id?: string }> {
+export type RetryResult =
+  | { ok: true; new_task_id: string }
+  | { ok: false }
+  | AdmissionRefusal;
+
+export async function retryTask(taskId: string, client?: PoolClient): Promise<RetryResult> {
   const task = await getTask(taskId);
   if (!task) return { ok: false };
   if (task.status !== "failed" && task.status !== "cancelled") return { ok: false };
@@ -275,9 +285,16 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
   // virtual root. Until attempts are modelled explicitly, reject DAG retries
   // instead of returning a task that can never repair the graph.
   if (task.dag_root_task_id) return { ok: false };
+  // The clone copies a persisted value no boundary re-checks, so a row written
+  // before the `int4` bound would otherwise re-enter the fleet through retry.
+  if (topologyErrors(task.input as Record<string, unknown> | null)) return { ok: false };
+
+  await acquireAdmissionLock(client ?? db);
+  const decision = await decideAdmission(askFromRow(task, new Set()), client ?? db);
+  if (decision.kind === "reject") return { admitted: false, reason: decision.reason };
 
   const newId = newTaskId();
-  await db.query(
+  await (client ?? db).query(
     `INSERT INTO claw_tasks
        (task_id, session_id, parent_task_id, batch_id,
         dag_id, dag_node_id, dag_root_task_id, plugin_id, name,

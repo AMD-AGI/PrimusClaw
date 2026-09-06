@@ -39,6 +39,7 @@ import pino from "pino";
 import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
 import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
+import type { PoolClient } from "pg";
 import { db } from "../infra/db.js";
 import { newTaskId } from "./ids.js";
 import { insertTask } from "./db.js";
@@ -418,6 +419,11 @@ export interface OpenChatRunInput {
    * token at claim time instead, because nothing holds it between the two.
    */
   issueLease?: boolean;
+  /**
+   * The transaction the admission decision was made on. The insert must run on
+   * it, or the lock holder's own row is invisible to the read that admitted it.
+   */
+  client?: PoolClient;
 }
 
 /** What openChatRun hands back: the row's id, and how to keep it alive. */
@@ -528,7 +534,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
           ? { doorbell_semantics: DOORBELL_SEMANTICS_VERSION }
           : { dispatch_compensation: armedReceipt("not_attempted") }),
       },
-    });
+    }, input.client);
     // Only for the idempotent open: the pair already has its execution, and
     // recording a workspace use for a row that was not written would leak a
     // reference nothing releases.

@@ -61,10 +61,10 @@ const DISPATCH_HELD_CAUSES = [
 const CLAIM_MODES = ["by_id", "next"] as const satisfies readonly ClaimMode[];
 const CLAIM_OUTCOMES = [
   "claimed", "empty", "all_skipped", "retry_limit",
-  "missing", "busy", "unclaimable", "exhausted", "error",
+  "missing", "busy", "unclaimable", "deferred", "exhausted", "error",
 ] as const satisfies readonly ClaimOutcome[];
 const CLAIM_SKIP_CAUSES = [
-  "raced", "unclaimable", "exhausted", "error",
+  "raced", "unclaimable", "deferred", "exhausted", "error",
 ] as const satisfies readonly ClaimSkipCause[];
 const CLAIM_EXHAUSTION_REASONS = [
   "lock_contention_exhausted", "max_retries_exceeded",

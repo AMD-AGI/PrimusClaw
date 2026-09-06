@@ -35,6 +35,7 @@
  *   P10 a doorbell replay publishes a wakeup, not the execute request
  *   P11 a queued doorbell replay does not publish, and still clears the pending row
  *   P12 a hard admission refusal abandons the pending row
+ *   P13 a refused turn names the row it terminalized
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -569,3 +570,18 @@ test("P12 a hard admission refusal abandons the pending row", async () => {
   assert.ok(rec.events.some((e) => e.type === "exec_complete" && e.failure_reason === "runs_hard_limit"));
 });
 
+
+test("P13 a refused turn names the row it terminalized", async () => {
+  // The refusal's `exec_complete` is what the consumer routes on. Without the
+  // row's id, a message-scoped terminal event can be read as belonging to a
+  // sibling row that carries holder evidence.
+  const rec = harness({ bound: undefined, bindAttempts: 6 });
+
+  await dispatchPendingMessage(input());
+
+  assert.deepEqual(
+    rec.events.map((e) => e.task_id), ["ktsk_1", "ktsk_1", "ktsk_1"],
+    "every event of the turn names it, not only the completion",
+  );
+  assert.equal(rec.failed[0].runId, "ktsk_1", "and it is the row this refusal closed");
+});

@@ -206,8 +206,29 @@ CREATE TABLE claw_workspaces (
   -- difference a scenario reading the release back has to be able to see.
   version       INT NOT NULL DEFAULT 0,
   writer_expires_at TIMESTAMPTZ,
+  -- workspaceForSession selects all three, and it is the first statement of
+  -- every dispatch: without them the binding fails and a scenario that meant to
+  -- drive a publish never reaches one.
+  owner_user_id TEXT,
+  storage_prefix TEXT,
+  retention_expires_at TIMESTAMPTZ,
+  deleted_at    TIMESTAMPTZ,
   updated_at    TIMESTAMPTZ DEFAULT NOW(),
   created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- The default sandbox image and resource shape, read on every dispatch.
+CREATE TABLE resources (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL DEFAULT '',
+  type          TEXT NOT NULL DEFAULT '',
+  image         TEXT NOT NULL DEFAULT '',
+  resource      JSONB NOT NULL DEFAULT '{}'::jsonb,
+  owner_user_id TEXT,
+  author        TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at    TIMESTAMPTZ
 );
 
 -- Read by injectLiveUserEnv on every claim: the vault is re-read at claim
@@ -239,6 +260,7 @@ const TABLES = [
   "claw_session_events",
   "claw_pending_messages",
   "claw_workspaces",
+  "resources",
   "claw_workspace_refs",
   "claw_user_env_vars",
   "claw_conversation_turns",

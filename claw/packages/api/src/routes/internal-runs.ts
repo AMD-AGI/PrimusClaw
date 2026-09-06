@@ -102,6 +102,9 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       if (typeof claimed === "string") metrics.onRunClaim("by_id", claimed);
       if (claimed === "missing") return reply.status(404).send({ ok: false, error: "not_found" });
       if (claimed === "busy") return reply.status(409).send({ ok: false, error: "busy" });
+      // The same "come back later" class as busy: the row is untouched and
+      // nothing is failed, the fleet simply has no executing headroom yet.
+      if (claimed === "deferred") return reply.status(409).send({ ok: false, error: "deferred" });
       if (claimed === "unclaimable") return reply.status(422).send({ ok: false, error: "unclaimable" });
       // The reason the row was closed with, not a fixed string: a run that
       // spent its whole budget waiting for one workspace lock reads

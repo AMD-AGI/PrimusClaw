@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
-import { db, MarketplaceDb } from "../infra/db.js";
+import { db, MarketplaceDb, type StatementRunner } from "../infra/db.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
 import { getUser } from "../auth/middleware.js";
@@ -11,9 +11,12 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
-  type AdmissionAsk, type AdmissionDecision,
+  type AdmissionAsk,
 } from "../tasks/admission.js";
 import { openChatRun } from "../tasks/chat-run.js";
+import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
+import type { EnvironmentTopology } from "@claw/protocol";
+import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import {
@@ -228,7 +231,23 @@ interface SendTarget {
   taskId: string;
   contextId: string;
   created: boolean;
+  /**
+   * The values {@link TOUCHED_TARGET_COLUMNS} held before this send wrote them.
+   *
+   * Only for an existing target: a rollback restores them rather than deleting
+   * a session the caller has been using.
+   */
+  preImage?: Record<string, unknown>;
 }
+
+/**
+ * The columns a send writes on a target that already exists.
+ *
+ * The pre-image SELECT and the rollback UPDATE are both generated from this
+ * list, so a column added to the update below must be added here or the
+ * rollback silently stops restoring it.
+ */
+const TOUCHED_TARGET_COLUMNS = ["agent_status", "context_id", "updated_at"] as const;
 
 function hasUnsupportedPushConfig(configuration: SendMessageRequest["configuration"]): boolean {
   return configuration?.taskPushNotificationConfig !== undefined;
@@ -239,10 +258,11 @@ async function resolveSendTarget(
   text: string,
   callerId: string,
   rpcId: string | number,
+  q: StatementRunner,
 ): Promise<{ target?: SendTarget; error?: JsonRpcResponse }> {
   if (message.taskId) {
-    const result = await db.query(
-      `SELECT session_id, agent_status, context_id
+    const result = await q.query(
+      `SELECT session_id, agent_status, context_id, ${TOUCHED_TARGET_COLUMNS.join(", ")}
        FROM claw_sessions
        WHERE session_id = $1 AND deleted_at IS NULL AND a2a_caller_id = $2`,
       [message.taskId, callerId],
@@ -267,19 +287,20 @@ async function resolveSendTarget(
       return makeInvalidParams(rpcId, "message.contextId does not match message.taskId");
     }
 
+    const preImage = Object.fromEntries(TOUCHED_TARGET_COLUMNS.map((c) => [c, row[c]]));
     const contextId = existingContextId || message.contextId || `ctx-${randomUUID()}`;
-    await db.query(
+    await q.query(
       `UPDATE claw_sessions
        SET agent_status = 'pending', context_id = $2, updated_at = NOW()
        WHERE session_id = $1 AND deleted_at IS NULL`,
       [message.taskId, contextId],
     );
-    return { target: { taskId: message.taskId, contextId, created: false } };
+    return { target: { taskId: message.taskId, contextId, created: false, preImage } };
   }
 
   const taskId = `a2a-${randomUUID()}`;
   const contextId = message.contextId || `ctx-${randomUUID()}`;
-  await db.query(
+  await q.query(
     `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [taskId, text.slice(0, 80), "a2a", "claw", "pending", contextId, callerId],
@@ -300,6 +321,71 @@ interface A2AAuthContext {
 
 
 /**
+ * The one resolved definition of an A2A execution.
+ *
+ * Built before anything is written, so the admission ask, the counted row and
+ * the publish payload all derive from the same value and cannot disagree about
+ * what the execution will hold. Deriving the ask from raw metadata instead read
+ * a sandbox the request had not asked for as none, and never saw a GPU node.
+ */
+interface A2ARunSpec {
+  messageId: string;
+  sandboxImage?: string;
+  resources?: Record<string, unknown>;
+  topology?: EnvironmentTopology;
+  pluginId?: number;
+  pluginTools?: unknown[];
+  workspaceId?: string;
+  parentSessionId?: string;
+  teamRole?: string;
+}
+
+async function resolveA2ARunSpec(
+  messageId: string,
+  metadata?: Record<string, unknown>,
+): Promise<{ spec: A2ARunSpec } | { invalidTopology: string[] }> {
+  const invalid = topologyErrors(metadata);
+  if (invalid) return { invalidTopology: invalid };
+
+  const rawPluginId = metadata?.plugin_id !== undefined ? Number(metadata.plugin_id) : undefined;
+  const pluginId = rawPluginId !== undefined && Number.isFinite(rawPluginId) ? rawPluginId : undefined;
+  let pluginTools: unknown[] | undefined;
+  let pluginImage: string | undefined;
+  let pluginResource: Record<string, unknown> | undefined;
+  if (pluginId !== undefined) {
+    const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
+    if (pluginRow) {
+      const formatted = await formatPluginRow(pluginRow, true);
+      pluginTools = (formatted.tools as unknown[]) ?? [];
+      pluginImage = pluginSandboxImage(formatted.images) || undefined;
+      pluginResource = asJsonObject(formatted.resource);
+    }
+  }
+
+  // Sandbox image / resources resolution chain (mirrors routes/sessions.ts):
+  // metadata (request body) > plugin row > default workload row.
+  const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
+  const defaultRes = asJsonObject(defaultResourceRow?.resource) || {};
+  const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
+  const requestImage = (metadata?.sandbox_image as string | undefined)?.trim() || undefined;
+  const resources = asJsonObject(metadata?.resources) || pluginResource || defaultRes;
+
+  return {
+    spec: {
+      messageId,
+      sandboxImage: requestImage || pluginImage || defaultImage,
+      resources: Object.keys(resources).length ? resources : undefined,
+      topology: metadata?.topology as EnvironmentTopology | undefined,
+      pluginId,
+      pluginTools,
+      workspaceId: (metadata?.workspace_id as string) || undefined,
+      parentSessionId: (metadata?.parent_session_id as string) || undefined,
+      teamRole: (metadata?.team_role as string) || undefined,
+    },
+  };
+}
+
+/**
  * What an A2A send asks the fleet for, before anything is written.
  *
  * A send is a tree of one as a *run* root and not as a session tree: the
@@ -309,19 +395,19 @@ interface A2AAuthContext {
  */
 async function a2aAdmissionAsk(
   targetSessionId: string | null,
-  metadata?: Record<string, unknown>,
+  spec: A2ARunSpec,
+  client?: StatementRunner,
 ): Promise<AdmissionAsk> {
   const ask: AdmissionAsk = {
     origin: "a2a",
     newRunRoots: 1,
-    sandboxes: (metadata?.sandbox_image as string | undefined)?.trim() ? 1 : 0,
-    gpuNodes: 0,
+    sandboxes: spec.sandboxImage ? 1 : 0,
+    gpuNodes: gpuNodesFromSpec({ topology: spec.topology }),
   };
   const limits = envAdmitLimits();
   if (limits.treeMaxNodes <= 0 && limits.treeMaxDepth <= 0) return ask;
-  const parentSid = (metadata?.parent_session_id as string) || null;
-  if (parentSid) {
-    const shape = await sessionTreeShape(parentSid);
+  if (spec.parentSessionId) {
+    const shape = await sessionTreeShape(spec.parentSessionId, client);
     return {
       ...ask,
       treeRootId: shape.rootId,
@@ -330,17 +416,8 @@ async function a2aAdmissionAsk(
     };
   }
   if (!targetSessionId) return ask;
-  const shape = await sessionTreeShape(targetSessionId);
+  const shape = await sessionTreeShape(targetSessionId, client);
   return { ...ask, treeRootId: shape.rootId, treeNodeCount: shape.nodeCount, treeDepth: shape.depth };
-}
-
-/** Admission for a send, decided before `resolveSendTarget` mints anything. */
-async function admitA2ASend(
-  targetSessionId: string | null,
-  metadata?: Record<string, unknown>,
-): Promise<AdmissionDecision> {
-  const ask = await a2aAdmissionAsk(targetSessionId, metadata);
-  return await withOwnedAdmissionLock((client) => decideAdmission(ask, client));
 }
 
 /**
@@ -351,35 +428,37 @@ async function admitA2ASend(
  * single row the aggregate collapsed it to, clears the ceiling, and executes
  * indefinitely while being counted once.
  *
- * @returns false when the pair already has its execution, so nothing is
+ * @returns null when the pair already has its execution, so nothing is
  *   published and the request answers with that task's state.
  */
 async function openA2ARun(
   target: SendTarget,
   text: string,
-  message: Message,
   auth: A2AAuthContext,
-  metadata?: Record<string, unknown>,
-): Promise<boolean> {
+  spec: A2ARunSpec,
+): Promise<string | null> {
   const run = await openChatRun({
     dispatch: "fat",
     origin: "a2a",
     sessionId: target.taskId,
     userId: auth.userId || "a2a",
-    messageId: message.messageId,
+    messageId: spec.messageId,
     prompt: text,
     status: "preparing",
     issueLease: false,
     recordWorkspaceUse: false,
-    sandboxSpec: (metadata?.sandbox_image as string | undefined)?.trim() ? "default" : undefined,
-    sandboxImage: (metadata?.sandbox_image as string | undefined)?.trim() || undefined,
-    workspaceId: (metadata?.workspace_id as string) || undefined,
+    sandboxSpec: spec.sandboxImage ? "default" : undefined,
+    sandboxImage: spec.sandboxImage,
+    workspaceId: spec.workspaceId,
+    // The declared topology goes on the row the ceiling counts, or the GPU
+    // demand the ask was charged for is invisible to every later admission.
+    spec: spec.topology ? { topology: spec.topology } : undefined,
   });
   if (!run) {
-    logger.info({ taskId: target.taskId, messageId: message.messageId }, "a2a.execution_already_counted");
-    return false;
+    logger.info({ taskId: target.taskId, messageId: spec.messageId }, "a2a.execution_already_counted");
+    return null;
   }
-  return true;
+  return run.taskId;
 }
 
 /**
@@ -405,94 +484,177 @@ function makeAdmissionRejectedError(
 /** How long a deferred A2A caller is told to wait. One scheduler tick is too eager. */
 const A2A_DEFER_RETRY_SECONDS = 5;
 
+/** What one admitted-and-materialised send left behind, or why it left nothing. */
+type A2AEntry =
+  | { kind: "opened"; target: SendTarget; taskId: string }
+  | { kind: "duplicate"; target: SendTarget }
+  | { kind: "rejected"; reason: string }
+  | { kind: "deferred" }
+  | { kind: "error"; error: JsonRpcResponse };
+
+/**
+ * Decide and materialise one send under a single hold of the admission lock.
+ *
+ * The tree shape, the decision, the session write and the parent attachment all
+ * run on the locked transaction, so two concurrent children of one parent cannot
+ * both pass a stale shape and both be admitted.
+ *
+ * The counted row is written last, and deliberately not on that transaction:
+ * `openChatRun` binds the pool, so it commits as it is written. Nothing after it
+ * can fail before the lock transaction commits, which is what keeps the pair
+ * from separating.
+ */
+async function admitAndOpenA2ASend(
+  message: Message,
+  text: string,
+  callerId: string,
+  rpcId: string | number,
+  auth: A2AAuthContext,
+  spec: A2ARunSpec,
+): Promise<A2AEntry> {
+  return await withOwnedAdmissionLock(async (client) => {
+    const ask = await a2aAdmissionAsk(message.taskId ?? null, spec, client);
+    const decision = await decideAdmission(ask, client);
+    if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
+    if (decision.kind === "queue") return { kind: "deferred" };
+
+    const { target, error } = await resolveSendTarget(message, text, callerId, rpcId, client);
+    if (error) return { kind: "error", error };
+    if (!target) {
+      return {
+        kind: "error",
+        error: makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to resolve task target"),
+      };
+    }
+    await attachA2AParent(target.taskId, auth, spec, client);
+    const taskId = await openA2ARun(target, text, auth, spec);
+    return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
+  });
+}
+
+/**
+ * Attach the request's parent link, once the caller is shown to own the parent.
+ *
+ * Inside the admission lock and before the counted row: a throw here must leave
+ * no row behind, and the tree ceiling was decided against the shape this write
+ * produces.
+ */
+async function attachA2AParent(
+  taskId: string,
+  auth: A2AAuthContext,
+  spec: A2ARunSpec,
+  q: StatementRunner,
+): Promise<void> {
+  if (!spec.parentSessionId) return;
+  const parent = (await q.query(
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    [spec.parentSessionId],
+  )).rows[0] as { user_id?: string | null } | undefined;
+  const caller: UserInfo = {
+    userId: auth.userId,
+    userName: auth.userId,
+    roles: auth.roles,
+    platformKey: auth.platformKey,
+    virtualKey: auth.virtualKey,
+  };
+  if (!parent || !canWriteSessionAsOperator(parent.user_id, caller)) {
+    throw new Error("parent_session_access_denied");
+  }
+  await q.query(
+    "UPDATE claw_sessions SET parent_session_id = $1, team_role = $2 WHERE session_id = $3",
+    [spec.parentSessionId, spec.teamRole || "", taskId],
+  );
+}
+
 async function publishA2AExecuteTask(
   taskId: string,
   text: string,
-  message: Message,
   auth: A2AAuthContext,
-  metadata?: Record<string, unknown>,
+  spec: A2ARunSpec,
 ): Promise<void> {
-  const pluginId = metadata?.plugin_id !== undefined ? Number(metadata.plugin_id) : undefined;
-  const workspaceId = (metadata?.workspace_id as string) || undefined;
-  const parentSessionId = (metadata?.parent_session_id as string) || undefined;
-  const teamRole = (metadata?.team_role as string) || undefined;
-
   const payload: Record<string, unknown> = {
     session_id: taskId,
-    message_id: message.messageId,
+    message_id: spec.messageId,
     prompt: text,
     history: [],
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
-    workspace_id: workspaceId,
-    parent_session_id: parentSessionId,
-    team_role: teamRole,
+    workspace_id: spec.workspaceId,
+    parent_session_id: spec.parentSessionId,
+    team_role: spec.teamRole,
   };
-
-  // Sandbox image / resources resolution chain (mirrors routes/sessions.ts):
-  // metadata (request body) > plugin row > default workload row.
-  // Defer the default-row lookup so non-plugin / metadata-only paths
-  // don't pay for an extra DB round-trip.
-  const requestSandboxImage = (metadata?.sandbox_image as string | undefined)?.trim() || undefined;
-  const requestResources = asJsonObject(metadata?.resources);
-
-  let pluginImage: string | undefined;
-  let pluginResource: Record<string, unknown> | undefined;
-
-  if (pluginId !== undefined && Number.isFinite(pluginId)) {
-    payload.plugin_id = pluginId;
-    const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-    if (pluginRow) {
-      const formatted = await formatPluginRow(pluginRow, true);
-      payload.plugin_tools = (formatted.tools as unknown[]) ?? [];
-      const imageFromPlugin = pluginSandboxImage(formatted.images);
-      if (imageFromPlugin) pluginImage = imageFromPlugin;
-      const resourceFromPlugin = asJsonObject(formatted.resource);
-      if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-    }
+  if (spec.pluginId !== undefined) {
+    payload.plugin_id = spec.pluginId;
+    payload.plugin_tools = spec.pluginTools ?? [];
   }
-
-  // Brain ensureHands requires `sandbox_image` to create a K8s workload.
-  // Resolution chain: metadata > plugin row > DB default (resources table).
-  {
-    const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
-    const defaultRes = asJsonObject(defaultResourceRow?.resource) || {};
-    const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
-    const finalImage = requestSandboxImage || pluginImage || defaultImage;
-    const finalRes = requestResources || pluginResource || defaultRes;
-
-    if (finalImage) {
-      payload.sandbox_image = finalImage;
-      // Brain ensureHands reads `request.resources` (top-level) for workload spec
-      if (Object.keys(finalRes).length) {
-        payload.resources = finalRes;
-      }
-    }
+  if (spec.topology) payload.topology = spec.topology;
+  // Brain ensureHands requires `sandbox_image` to create a K8s workload, and
+  // reads `request.resources` (top-level) for the workload spec.
+  if (spec.sandboxImage) {
+    payload.sandbox_image = spec.sandboxImage;
+    if (spec.resources) payload.resources = spec.resources;
   }
+  await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
+}
 
-  if (parentSessionId) {
-    const parent = (await db.query(
-      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-      [parentSessionId],
-    )).rows[0] as { user_id?: string | null } | undefined;
-    const caller: UserInfo = {
-      userId: auth.userId,
-      userName: auth.userId,
-      roles: auth.roles,
-      platformKey: auth.platformKey,
-      virtualKey: auth.virtualKey,
-    };
-    if (!parent || !canWriteSessionAsOperator(parent.user_id, caller)) {
-      throw new Error("parent_session_access_denied");
+/**
+ * Codes that prove the bytes never reached JetStream.
+ *
+ * Everything else -- a timeout, a closed or draining connection, an unknown
+ * code -- is ambiguous: the message may be on the stream with only the `PubAck`
+ * lost, so the row is cancelled rather than deleted. Deleting the accounting for
+ * work that may be running is bounded by nothing; holding it is bounded by the
+ * budget.
+ */
+const PRE_DELIVERY_ERROR_CODES = new Set<string>([ErrorCode.NoResponders]);
+
+function publishWasPreDelivery(err: unknown): boolean {
+  if (!(err instanceof NatsError)) return true;
+  return PRE_DELIVERY_ERROR_CODES.has(err.code);
+}
+
+/**
+ * Settle the counted row and the session a failed publish left behind.
+ *
+ * Without it the row holds its slice of every ceiling until its deadline, which
+ * is the stranding this compensation exists to prevent.
+ */
+async function rollbackA2AAdmission(
+  target: SendTarget,
+  taskId: string,
+  err: unknown,
+): Promise<void> {
+  try {
+    if (!publishWasPreDelivery(err)) {
+      await db.query(
+        `UPDATE claw_tasks SET status = 'cancelling'
+          WHERE task_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')`,
+        [taskId],
+      );
+      await js.publish(
+        `tasks.${target.taskId}.cancel`,
+        sc.encode(JSON.stringify({ type: "cancel", session_id: target.taskId })),
+      ).catch(() => { /* the row's deadline is the backstop */ });
+      return;
     }
     await db.query(
-      "UPDATE claw_sessions SET parent_session_id = $1, team_role = $2 WHERE session_id = $3",
-      [parentSessionId, teamRole || "", taskId],
+      "DELETE FROM claw_tasks WHERE task_id = $1 AND origin = 'a2a' AND status = 'preparing'",
+      [taskId],
     );
+    if (target.created) {
+      await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [target.taskId]);
+      return;
+    }
+    if (!target.preImage) return;
+    const assignments = TOUCHED_TARGET_COLUMNS.map((c, i) => `${c} = $${i + 2}`).join(", ");
+    await db.query(
+      `UPDATE claw_sessions SET ${assignments} WHERE session_id = $1`,
+      [target.taskId, ...TOUCHED_TARGET_COLUMNS.map((c) => target.preImage![c])],
+    );
+  } catch (rollbackErr) {
+    logger.error({ err: rollbackErr, taskId }, "a2a.publish_rollback_failed");
   }
-
-  await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
 }
 
 function isTaskState(value: unknown): value is TaskState {
@@ -554,20 +716,25 @@ async function handleSendMessage(
     return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, "No text content found in message parts");
   }
 
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined);
+  if ("invalidTopology" in resolved) {
+    return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; "));
+  }
+
   try {
-    const meta = metadata as Record<string, unknown> | undefined;
-    // Before `resolveSendTarget` mints anything, so a refusal or a deferral
-    // leaves nothing to roll back.
-    const admission = await admitA2ASend(message.taskId ?? null, meta);
-    if (admission.kind === "reject") return makeAdmissionRejectedError(rpcId, admission.reason);
-    if (admission.kind === "queue") return makeAdmissionDeferredError(rpcId);
+    const entry = await admitAndOpenA2ASend(message, text, callerId, rpcId, auth, resolved.spec);
+    if (entry.kind === "rejected") return makeAdmissionRejectedError(rpcId, entry.reason);
+    if (entry.kind === "deferred") return makeAdmissionDeferredError(rpcId);
+    if (entry.kind === "error") return entry.error;
+    const target = entry.target;
 
-    const { target, error } = await resolveSendTarget(message, text, callerId, rpcId);
-    if (error) return error;
-    if (!target) return makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to resolve task target");
-
-    if (await openA2ARun(target, text, message, auth, meta)) {
-      await publishA2AExecuteTask(target.taskId, text, message, auth, meta);
+    if (entry.kind === "opened") {
+      try {
+        await publishA2AExecuteTask(target.taskId, text, auth, resolved.spec);
+      } catch (err) {
+        await rollbackA2AAdmission(target, entry.taskId, err);
+        throw err;
+      }
     }
 
     logger.info({
@@ -761,6 +928,14 @@ async function handleCancelTask(
     "UPDATE claw_sessions SET agent_status = 'cancelled', updated_at = NOW() WHERE session_id = $1",
     [params.id],
   );
+  // `cancelling` rather than a terminal state: the execution may be live off
+  // JetStream with no lease to prove it, and the state is in both counted sets,
+  // so the slot is held exactly as long as the work is.
+  await db.query(
+    `UPDATE claw_tasks SET status = 'cancelling'
+      WHERE session_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')`,
+    [params.id],
+  );
 
   try {
     const cancelPayload = { type: "cancel", session_id: params.id };
@@ -945,38 +1120,39 @@ async function handleSendStreamingMessage(
     return;
   }
 
-  const meta = metadata as Record<string, unknown> | undefined;
-  // Answered over the ordinary JSON-RPC reply, before any subscription or SSE
-  // header: suppressing only the publish leaves a socket that never receives an
-  // event and never closes, and opening the stream to write one deferral event
-  // and close it reads to an SSE client as a completed task.
-  const admission = await admitA2ASend(message.taskId ?? null, meta);
-  if (admission.kind === "reject") {
-    reply.send(makeAdmissionRejectedError(rpcId, admission.reason));
-    return;
-  }
-  if (admission.kind === "queue") {
-    reply.send(makeAdmissionDeferredError(rpcId));
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined);
+  if ("invalidTopology" in resolved) {
+    reply.status(400).send(
+      makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; ")),
+    );
     return;
   }
 
-  let target: SendTarget;
+  let entry: A2AEntry;
   try {
-    const resolved = await resolveSendTarget(message, text, callerId, rpcId);
-    if (resolved.error) {
-      reply.send(resolved.error);
-      return;
-    }
-    if (!resolved.target) {
-      reply.send(makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to resolve task target"));
-      return;
-    }
-    target = resolved.target;
+    entry = await admitAndOpenA2ASend(message, text, callerId, rpcId, auth, resolved.spec);
   } catch (err: unknown) {
     logger.error({ err, taskId: message.taskId ?? null }, "a2a.SendStreamingMessage.resolve_failed");
     reply.status(500).send(makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to create task"));
     return;
   }
+  // Answered over the ordinary JSON-RPC reply, before any subscription or SSE
+  // header: suppressing only the publish leaves a socket that never receives an
+  // event and never closes, and opening the stream to write one deferral event
+  // and close it reads to an SSE client as a completed task.
+  if (entry.kind === "rejected") {
+    reply.send(makeAdmissionRejectedError(rpcId, entry.reason));
+    return;
+  }
+  if (entry.kind === "deferred") {
+    reply.send(makeAdmissionDeferredError(rpcId));
+    return;
+  }
+  if (entry.kind === "error") {
+    reply.send(entry.error);
+    return;
+  }
+  const target = entry.target;
 
   // Subscribe before publishing. Core NATS does not replay, so any event
   // emitted between publish and subscribe would otherwise be silently lost.
@@ -985,25 +1161,36 @@ async function handleSendStreamingMessage(
   // sub-token and would never match.
   const sub = nc.subscribe(`events.${target.taskId}`);
 
-  try {
-    if (await openA2ARun(target, text, message, auth, meta)) {
-      await publishA2AExecuteTask(target.taskId, text, message, auth, meta);
+  if (entry.kind === "opened") {
+    try {
+      await publishA2AExecuteTask(target.taskId, text, auth, resolved.spec);
+    } catch (err: unknown) {
+      await rollbackA2AAdmission(target, entry.taskId, err);
+      logger.error({ err, taskId: target.taskId }, "a2a.SendStreamingMessage.failed");
+      sub.unsubscribe();
+      reply.status(500).send(makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to create task"));
+      return;
     }
-    logger.info({
-      taskId: target.taskId,
-      contextId: target.contextId,
-      created: target.created,
-      pluginId: metadata?.plugin_id,
-    }, "a2a.SendStreamingMessage");
-  } catch (err: unknown) {
-    logger.error({ err, taskId: target.taskId }, "a2a.SendStreamingMessage.failed");
-    sub.unsubscribe();
-    reply.status(500).send(makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to create task"));
-    return;
   }
+  logger.info({
+    taskId: target.taskId,
+    contextId: target.contextId,
+    created: target.created,
+    pluginId: metadata?.plugin_id,
+  }, "a2a.SendStreamingMessage");
 
+  const keepalive = openA2AStream(reply, rpcId, target, sub);
+  await pumpA2AStream(sub, reply, rpcId, target, keepalive);
+}
+
+/** The stream's opening frame and its keepalive, armed together with the close handler. */
+function openA2AStream(
+  reply: FastifyReply,
+  rpcId: string | number,
+  target: SendTarget,
+  sub: ReturnType<typeof nc.subscribe>,
+): StreamLifetime {
   sseHeaders(reply);
-
   const initialTask: Task = {
     id: target.taskId,
     contextId: target.contextId,
@@ -1011,48 +1198,59 @@ async function handleSendStreamingMessage(
   };
   sseWrite(reply.raw, rpcId, { task: initialTask });
 
-  let closed = false;
-  const keepalive = setInterval(() => {
-    if (closed) return;
+  const lifetime: StreamLifetime = { closed: false, timer: null };
+  lifetime.timer = setInterval(() => {
+    if (lifetime.closed) return;
     reply.raw.write(": keepalive\n\n");
   }, 15_000);
-
   reply.raw.on("close", () => {
-    closed = true;
-    clearInterval(keepalive);
+    lifetime.closed = true;
+    if (lifetime.timer) clearInterval(lifetime.timer);
     sub.unsubscribe();
   });
+  return lifetime;
+}
 
+interface StreamLifetime {
+  closed: boolean;
+  timer: NodeJS.Timeout | null;
+}
+
+async function pumpA2AStream(
+  sub: ReturnType<typeof nc.subscribe>,
+  reply: FastifyReply,
+  rpcId: string | number,
+  target: SendTarget,
+  lifetime: StreamLifetime,
+): Promise<void> {
   const streamState: StreamingState = { textStarted: false, toolsStarted: false };
   try {
     for await (const msg of sub) {
-      if (closed) break;
+      if (lifetime.closed) break;
       try {
         const event = JSON.parse(sc.decode(msg.data)) as Record<string, unknown>;
         const mapped = mapInternalEventToStream(target.taskId, target.contextId, event, streamState);
-        if (mapped) {
-          for (const resp of mapped.responses) sseWrite(reply.raw, rpcId, resp);
-          if (mapped.terminal) {
-            closed = true;
-            clearInterval(keepalive);
-            reply.raw.end();
-            sub.unsubscribe();
-            break;
-          }
+        if (!mapped) continue;
+        for (const resp of mapped.responses) sseWrite(reply.raw, rpcId, resp);
+        if (mapped.terminal) {
+          lifetime.closed = true;
+          if (lifetime.timer) clearInterval(lifetime.timer);
+          reply.raw.end();
+          sub.unsubscribe();
+          break;
         }
       } catch { /* skip malformed */ }
     }
   } catch (err) {
     logger.warn({ err, taskId: target.taskId }, "a2a.stream_error");
-    if (!closed) {
-      const errStatus: TaskStatusUpdateEvent = {
-        taskId: target.taskId,
-        contextId: target.contextId,
-        status: { state: TaskState.FAILED, message: { messageId: randomUUID(), role: Role.AGENT, parts: [{ text: "Stream error" }] }, timestamp: new Date().toISOString() },
-      };
-      sseWrite(reply.raw, rpcId, { statusUpdate: errStatus });
-      reply.raw.end();
-    }
+    if (lifetime.closed) return;
+    const errStatus: TaskStatusUpdateEvent = {
+      taskId: target.taskId,
+      contextId: target.contextId,
+      status: { state: TaskState.FAILED, message: { messageId: randomUUID(), role: Role.AGENT, parts: [{ text: "Stream error" }] }, timestamp: new Date().toISOString() },
+    };
+    sseWrite(reply.raw, rpcId, { statusUpdate: errStatus });
+    reply.raw.end();
   }
 }
 
@@ -1268,6 +1466,11 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   });
 }
 
+/** The identity a legacy invoke executes under: it carries no authenticated caller. */
+const LEGACY_INVOKE_AUTH: A2AAuthContext = {
+  userId: "a2a", roles: [], platformKey: "", virtualKey: "",
+};
+
 async function handleLegacyInvoke(
   body: Record<string, unknown>,
   skill: string | undefined,
@@ -1284,27 +1487,66 @@ async function handleLegacyInvoke(
     return { success: false, error: "question is required" };
   }
 
-  const taskId = `a2a-${randomUUID()}`;
+  // This path declares nothing: no sandbox image, no topology and no parent, so
+  // the spec that reaches the ask and the row is the empty one rather than the
+  // resolved chain a `message/send` gets.
+  const spec: A2ARunSpec = { messageId: randomUUID() };
+  const target: SendTarget = { taskId: `a2a-${randomUUID()}`, contextId: "", created: true };
+
+  let entry: A2AEntry;
   try {
-    await db.query(
-      `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [taskId, text.slice(0, 80), "a2a", "claw", "pending"],
-    );
-    const payload = { session_id: taskId, prompt: text, history: [], user_id: "a2a" };
-    await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
-    logger.info({ taskId, skill, textLen: text.length }, "a2a.legacy_invoke");
-    return {
-      success: true,
-      result: {
-        skill_id: skill || "general",
-        task_id: taskId,
-        answer: `Task ${taskId} submitted.`,
-      },
-    };
+    entry = await admitLegacyInvoke(target, text, spec);
   } catch (err: unknown) {
-    logger.error({ err, taskId }, "a2a.legacy_invoke.failed");
+    logger.error({ err, taskId: target.taskId }, "a2a.legacy_invoke.failed");
     reply.status(500);
     return { success: false, error: "Failed to process request" };
   }
+  if (entry.kind === "rejected") {
+    reply.status(429);
+    return { success: false, error: "admission_rejected", reason: entry.reason };
+  }
+  if (entry.kind === "deferred") {
+    reply.status(429).header("Retry-After", String(A2A_DEFER_RETRY_SECONDS));
+    return { success: false, error: "admission_deferred" };
+  }
+
+  try {
+    const payload = { session_id: target.taskId, prompt: text, history: [], user_id: "a2a" };
+    await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
+  } catch (err: unknown) {
+    if (entry.kind === "opened") await rollbackA2AAdmission(target, entry.taskId, err);
+    logger.error({ err, taskId: target.taskId }, "a2a.legacy_invoke.failed");
+    reply.status(500);
+    return { success: false, error: "Failed to process request" };
+  }
+
+  logger.info({ taskId: target.taskId, skill, textLen: text.length }, "a2a.legacy_invoke");
+  return {
+    success: true,
+    result: {
+      skill_id: skill || "general",
+      task_id: target.taskId,
+      answer: `Task ${target.taskId} submitted.`,
+    },
+  };
+}
+
+/** The legacy path's half of {@link admitAndOpenA2ASend}: it mints its own session. */
+async function admitLegacyInvoke(
+  target: SendTarget,
+  text: string,
+  spec: A2ARunSpec,
+): Promise<A2AEntry> {
+  return await withOwnedAdmissionLock(async (client) => {
+    const decision = await decideAdmission(await a2aAdmissionAsk(null, spec, client), client);
+    if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
+    if (decision.kind === "queue") return { kind: "deferred" };
+    await client.query(
+      `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [target.taskId, text.slice(0, 80), "a2a", "claw", "pending"],
+    );
+    const taskId = await openA2ARun(target, text, LEGACY_INVOKE_AUTH, spec);
+    return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
+  });
 }

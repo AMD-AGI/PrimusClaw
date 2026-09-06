@@ -104,3 +104,47 @@ test("a lost run's reaper releases the gate by the pair, not by the session", as
     "the reaped run is not the turn holding this gate",
   );
 });
+
+/**
+ * An old replica taking the gate: the column is flipped and the marker is not.
+ *
+ * That is the writer this whole flip has to survive, so the race is built from
+ * it rather than from a seeded row.
+ */
+async function oldReplicaTakesGate(sessionId: string): Promise<void> {
+  await h.sql(
+    `UPDATE claw_sessions SET agent_status = 'running', updated_at = NOW()
+      WHERE session_id = $1 AND deleted_at IS NULL`,
+    [sessionId],
+  );
+}
+
+test("an old writer's completion cannot open the gate a newer turn took from it", async () => {
+  // The newer turn is between its gate flip and its row insert, which is the
+  // window that has no row to argue from -- only the marker.
+  const { releaseSessionGateIfLastRun } = await import("../src/events/consumer.js");
+  const { takeSessionGate } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  await oldReplicaTakesGate("s1");
+  await takeSessionGate("s1", "m-new");
+
+  assert.equal(await releaseSessionGateIfLastRun("s1", "m-old", false), false);
+  const row = await sessionRow(h, "s1");
+  assert.equal(row.agent_status, "running");
+  assert.equal(row.agent_gate_message_id, "m-new", "and the newer turn still owns it");
+});
+
+test("an old Stop timer with no marker cannot idle a newer turn that is preparing", async () => {
+  // The timer predates the column, so it captured nothing to compare. What
+  // stays its hand is the newer turn's own row, which under this assertion
+  // counts as a holder even before a lease exists.
+  const { forceIdleAfterInterrupt, takeSessionGate } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  await takeSessionGate("s1", "m-new");
+  await seedRun(h, "newer", "s1", {
+    status: "preparing", dispatch: "fat", leaseOwner: null, messageId: "m-new",
+  });
+
+  assert.equal(await forceIdleAfterInterrupt("s1", null), false);
+  assert.equal((await sessionRow(h, "s1")).agent_status, "running");
+});

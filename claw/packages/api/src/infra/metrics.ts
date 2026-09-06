@@ -63,7 +63,7 @@ export type ClaimMode = "by_id" | "next";
 
 export type ClaimOutcome =
   | "claimed" | "empty" | "all_skipped" | "retry_limit"
-  | "missing" | "busy" | "unclaimable" | "exhausted" | "error";
+  | "missing" | "busy" | "unclaimable" | "deferred" | "exhausted" | "error";
 
 /**
  * Why one candidate row was passed over.
@@ -71,7 +71,7 @@ export type ClaimOutcome =
  * `missing` and `busy` share `raced`: both mean another pod moved the row, and
  * only the persistent causes below them can mean a stuck queue.
  */
-export type ClaimSkipCause = "raced" | "unclaimable" | "exhausted" | "error";
+export type ClaimSkipCause = "raced" | "unclaimable" | "deferred" | "exhausted" | "error";
 
 export type ClaimExhaustionReason = ExhaustedClaim["reason"];
 

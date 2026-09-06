@@ -175,3 +175,50 @@ test("a busy session's queue is left to the completion that will open its gate",
     sweeperPorts.drainPendingMessage = original;
   }
 });
+
+/** What a queued-row rollback check would have read, so the two can be compared. */
+async function queuedIncompatibleCount(version: number): Promise<number> {
+  return Number((await h.sql(
+    `SELECT COUNT(*)::int AS n FROM claw_tasks
+      WHERE COALESCE(metadata->>'dispatch', '') = 'doorbell'
+        AND status = 'queued'
+        AND COALESCE((metadata->>'doorbell_semantics')::int, 1) > $1::int`,
+    [version],
+  ))[0].n);
+}
+
+test("a holder that drains and unclaims never lets the precondition read clear", async () => {
+  // The whole interleaving, because the misleading reading is a moment rather
+  // than a state: the row leaves the queue on the claim and comes back to it on
+  // the unclaim, and a check taken in between says nothing is outstanding while
+  // the run is executing.
+  const { claimRunById, countIncompatibleDoorbellRuns, releaseClaim } =
+    await import("../src/tasks/run-claim.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "ahead", "s1", { claimable: true, prompt: "needs the newer binary" });
+  await h.sql(
+    `UPDATE claw_tasks SET metadata = metadata || '{"doorbell_semantics":"2"}'::jsonb
+      WHERE task_id = 'ahead'`,
+  );
+
+  assert.equal(await countIncompatibleDoorbellRuns(1), 1, "queued and unrunnable by version 1");
+
+  const claimed = await claimRunById("ahead", "brain-capable", 2);
+  assert.ok(typeof claimed === "object" && "request" in claimed, "the capable replica takes it");
+  assert.equal((await runRow(h, "ahead")).status, "preparing");
+  assert.equal(
+    await queuedIncompatibleCount(1), 0,
+    "this is the reading that let an incompatible binary bind the durable",
+  );
+  assert.equal(await countIncompatibleDoorbellRuns(1), 1, "while the run is executing");
+
+  assert.equal(
+    await releaseClaim("ahead", "brain-capable", claimed.claimCount, "drain"), true,
+    "the holder shuts down and hands the row back",
+  );
+  assert.equal((await runRow(h, "ahead")).status, "queued");
+  assert.equal(
+    await countIncompatibleDoorbellRuns(1), 1,
+    "and it is outstanding again the instant the last capable replica goes away",
+  );
+});

@@ -72,3 +72,37 @@ test("but a new replica writes the marker even so, so the flip has something to 
   assert.equal(row.agent_status, "running");
   assert.equal(row.agent_gate_message_id, "m-7");
 });
+
+async function oldReplicaTakesGate(sessionId: string): Promise<void> {
+  await h.sql(
+    `UPDATE claw_sessions SET agent_status = 'running', updated_at = NOW()
+      WHERE session_id = $1 AND deleted_at IS NULL`,
+    [sessionId],
+  );
+}
+
+test("an old writer's completion still opens the gate a newer turn took, as it does today", async () => {
+  // The marker names the newer turn and is ignored, so the release lands. That
+  // is the exposure the flip closes; until the fleet asserts it, closing it
+  // here would wedge every gate an old replica owns.
+  const { releaseSessionGateIfLastRun } = await import("../src/events/consumer.js");
+  const { takeSessionGate } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  await oldReplicaTakesGate("s1");
+  await takeSessionGate("s1", "m-new");
+
+  assert.equal(await releaseSessionGateIfLastRun("s1", "m-old", false), true);
+  assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
+});
+
+test("an old Stop timer with no marker still idles a newer preparing turn", async () => {
+  const { forceIdleAfterInterrupt, takeSessionGate } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  await takeSessionGate("s1", "m-new");
+  await seedRun(h, "newer", "s1", {
+    status: "preparing", dispatch: "fat", leaseOwner: null, messageId: "m-new",
+  });
+
+  assert.equal(await forceIdleAfterInterrupt("s1", null), true);
+  assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
+});
