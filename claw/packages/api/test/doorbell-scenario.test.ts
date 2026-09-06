@@ -427,7 +427,7 @@ test("the ordinal recheck sheds the excess rather than every racer", async () =>
     softRuns: 0, hardRuns: 2, softSandboxes: 0, hardSandboxes: 0,
     softGpuNodes: 0, hardGpuNodes: 0, treeMaxNodes: 0, treeMaxDepth: 0,
   };
-  const ask = { origin: "chat" as const, wantsSandbox: false, gpuNodes: 0 };
+  const ask = { origin: "chat" as const, newRunRoots: 1, sandboxes: 0, gpuNodes: 0 };
   // Two creates race the last slot with one run already occupying. Comparing
   // totals refused both; counting what came first keeps the one inside the
   // ceiling and sheds only the one past it.

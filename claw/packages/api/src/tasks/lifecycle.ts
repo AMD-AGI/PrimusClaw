@@ -266,6 +266,11 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
   // would drop `origin` and `workspace_id`, and the replacement would look like
   // a DAG-less task with no lease. Refuse rather than mint that row.
   if (task.origin === "chat") return { ok: false };
+  // An A2A row has neither `origin='chat'` nor a `dag_root_task_id`, and the
+  // clone below lists neither `origin` nor `workspace_id` -- so without this it
+  // becomes a NULL-origin queued row the generic scheduler dispatches as an
+  // ordinary task, over a payload only the A2A consumer understands.
+  if (task.origin === "a2a") return { ok: false };
   // A replacement row does not rewire downstream depends_on IDs or reopen the
   // virtual root. Until attempts are modelled explicitly, reject DAG retries
   // instead of returning a task that can never repair the graph.

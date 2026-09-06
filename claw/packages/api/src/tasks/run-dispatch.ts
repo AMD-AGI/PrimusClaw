@@ -12,8 +12,13 @@ import {
 } from "@claw/protocol";
 import pino from "pino";
 
-import { decideAdmission, hardLimitAfterInsert } from "./admission.js";
-import { openChatRun, failChatRunDispatch } from "./chat-run.js";
+import { metrics, type DispatchHeldCause, type DispatchPath } from "../infra/metrics.js";
+
+import {
+  decideAdmission, envAdmitLimits, hardLimitAfterInsert, sessionTreeShape,
+  withOwnedAdmissionLock, type AdmissionAsk,
+} from "./admission.js";
+import { openChatRun, discardChatRunDispatch, failChatRunDispatch } from "./chat-run.js";
 import { RUN_CREDENTIALS_FIELD, gpuNodesFromSpec, stripRunSecrets, wantsSandboxFromSpec } from "./run-spec.js";
 import { credentialsFromTask, sealRunCredentials } from "./run-secrets.js";
 
@@ -29,6 +34,8 @@ export type HandOffResult =
   | { kind: "open_failed" };
 
 export interface HandOffInput {
+  /** Which caller this is, so a chat outage and a drain outage stay apart. */
+  path?: DispatchPath;
   task: Record<string, unknown>;
   sessionId: string;
   userId: string;
@@ -43,6 +50,7 @@ export interface HandOffInput {
   failRun?: typeof failChatRunDispatch;
   admit?: typeof decideAdmission;
   hardAfterInsert?: typeof hardLimitAfterInsert;
+  discardRun?: typeof discardChatRunDispatch;
 }
 
 /**
@@ -66,42 +74,128 @@ function heldByWorker(
   taskId: string,
   messageId: string,
   sessionId: string,
-  cause: string,
+  cause: DispatchHeldCause,
 ): HandOffResult {
+  metrics.onRunDispatchHeld(cause);
   logger.warn({ taskId, sessionId, cause }, "run.dispatch.compensation_declined_row_held");
   return { kind: "dispatched", taskId, messageId };
 }
 
-export async function handOffAssembledRun(input: HandOffInput): Promise<HandOffResult> {
-  const { task, messageId } = input;
-  const ask = {
-    origin: "chat" as const,
-    wantsSandbox: wantsSandboxFromSpec(task),
-    gpuNodes: gpuNodesFromSpec(task),
+/**
+ * The ask for one chat turn.
+ *
+ * A chat row's `dag_root_task_id` is NULL, so it is its own run root -- a team
+ * child included, whose session differs but whose run root is itself. The tree
+ * walk runs only when a tree ceiling is set, so an unmetered or fleet-only
+ * deployment pays nothing for it.
+ */
+export async function admissionAskFor(input: HandOffInput): Promise<AdmissionAsk> {
+  const ask: AdmissionAsk = {
+    origin: "chat",
+    newRunRoots: 1,
+    sandboxes: wantsSandboxFromSpec(input.task) ? 1 : 0,
+    gpuNodes: gpuNodesFromSpec(input.task),
   };
-  const admission = await (input.admit ?? decideAdmission)(ask);
-  if (admission.kind === "reject") return { kind: "rejected", reason: admission.reason };
+  const limits = envAdmitLimits();
+  if (limits.treeMaxNodes <= 0 && limits.treeMaxDepth <= 0) return ask;
+  // The child a create just inserted is already a node here, so a turn in it
+  // adds neither a node nor a level.
+  const shape = await sessionTreeShape(input.sessionId);
+  return { ...ask, treeRootId: shape.rootId, treeNodeCount: shape.nodeCount, treeDepth: shape.depth };
+}
 
-  const spec = persistableSpec(task);
+async function openAdmittedRun(
+  input: HandOffInput,
+): Promise<{ taskId: string } | null> {
+  const openRun = input.openRun ?? openChatRun;
   // Always `queued` until a worker claims. An admitted run still rings a
   // doorbell; a full replica acks that wakeup and an idle one claim-next's
   // the row. Opening at `preparing` made claim-next skip the work.
-  const openRun = input.openRun ?? openChatRun;
-  const run = await openRun({
+  return await openRun({
     dispatch: "doorbell",
+    // What this dispatch owes if it never reports its publish outcome. Both
+    // hand-off callers dispatch into a session that already exists, so the
+    // cleanup is to hand its gate back rather than to delete it.
+    reconcileAction: "idle_existing_session",
     sessionId: input.sessionId,
     userId: input.userId,
-    messageId,
+    messageId: input.messageId,
     prompt: input.prompt,
     workspaceId: input.workspaceId,
     filesWorkspaceId: input.filesWorkspaceId,
     pluginId: input.pluginId,
     sandboxImage: input.sandboxImage,
-    spec,
+    spec: persistableSpec(input.task),
     status: "queued",
     issueLease: false,
   });
+}
+
+/**
+ * Erase the row a post-insert hard refusal declined, or refuse to answer.
+ *
+ * `unknown` is a statement that raced rather than a settled state, and the row
+ * it describes is open, unheld and claimable -- answering `rejected` over it
+ * would tell the caller the turn was declined while claim-next runs it, and the
+ * caller's rollback would then delete the `UserMessage` out from under it. It
+ * is retried once, and a throw routes the caller to its dispatch-failure path.
+ */
+async function discardRefusedRun(
+  input: HandOffInput,
+  taskId: string,
+  reason: string,
+): Promise<HandOffResult> {
+  const discard = input.discardRun ?? discardChatRunDispatch;
+  let verdict = await discard(taskId);
+  if (verdict === "unknown") verdict = await discard(taskId);
+  if (verdict === "held") {
+    return heldByWorker(taskId, input.messageId, input.sessionId, "hard_limit_exceeded");
+  }
+  if (verdict !== "closed") {
+    logger.error({ taskId, sessionId: input.sessionId, reason }, "run.dispatch.discard_unknown");
+    throw new Error(`could not discard refused run ${taskId}: ${reason}`);
+  }
+  return { kind: "rejected", reason, taskId };
+}
+
+/**
+ * Count what the hand-off answered, throws included.
+ *
+ * This function leaves by `throw` as well as by return -- an uncompensated
+ * post-insert fault, a publish failure, and whatever admission propagates --
+ * and counting only the returns would keep a publish outage out of the
+ * denominator instead of inside it.
+ */
+export async function handOffAssembledRun(input: HandOffInput): Promise<HandOffResult> {
+  const path = input.path ?? "chat";
+  let result: HandOffResult;
+  try {
+    result = await handOffUncounted(input);
+  } catch (err) {
+    metrics.onRunDispatch(path, "error");
+    throw err;
+  }
+  metrics.onRunDispatch(path, result.kind);
+  return result;
+}
+
+async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
+  const { messageId } = input;
+  const ask = await admissionAskFor(input);
+  // The decision and the insert are one critical section: creation order and
+  // commit order must be the same order, or two creates that each cleared the
+  // pre-insert check are both admitted against one free slot.
+  const opened = await withOwnedAdmissionLock(async (client) => {
+    const admission = await (input.admit ?? decideAdmission)(ask, client);
+    if (admission.kind === "reject") return { admission } as const;
+    return { admission, run: await openAdmittedRun(input) } as const;
+  });
+  if (opened.admission.kind === "reject") {
+    return { kind: "rejected", reason: opened.admission.reason };
+  }
+  const run = opened.run;
   if (!run) return { kind: "open_failed" };
+  const admission = opened.admission;
 
   // The recheck reads the fleet, so it can fail the way any query can. A throw
   // here used to unwind past every caller with the row already inserted at
@@ -122,13 +216,7 @@ export async function handOffAssembledRun(input: HandOffInput): Promise<HandOffR
     }
     throw err;
   }
-  if (hard) {
-    const verdict = await (input.failRun ?? failChatRunDispatch)(run.taskId, hard, hard);
-    if (verdict === "held") {
-      return heldByWorker(run.taskId, messageId, input.sessionId, "hard_limit_exceeded");
-    }
-    return { kind: "rejected", reason: hard, taskId: run.taskId };
-  }
+  if (hard) return await discardRefusedRun(input, run.taskId, hard);
 
   if (admission.kind === "queue") {
     logger.info(

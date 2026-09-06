@@ -5,11 +5,12 @@
  * Thin DB helpers for `claw_tasks` / `claw_task_edges` / `claw_batches`.
  * No business logic; scheduler / dispatcher / sweeper consume these.
  */
-import { db } from "../infra/db.js";
+import { db, type StatementRunner } from "../infra/db.js";
 import type { PoolClient } from "pg";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 import {
-  deadlineAtInsertSql, deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, type RunOrigin,
+  deadlineAtInsertSql, deadlineStampSql, DISPATCH_RECONCILE_LEASE_SEC,
+  RUN_BUDGET_DEFAULT_SEC, type RunOrigin,
 } from "./run-budget.js";
 
 export async function getTask(taskId: string): Promise<ClawTaskRow | null> {
@@ -58,6 +59,21 @@ export interface InsertTaskParams {
   /** Which workspace the run's files live in, so ownership is recorded not guessed. */
   workspace_id?: string | null;
   workspace_throwaway?: boolean;
+  /**
+   * The cleanup a dispatch owes if it never reports what happened to its
+   * publish. Written with the row rather than after it, so a process that dies
+   * between the two leaves the marker rather than an unreconcilable row; the
+   * horizon it is stamped with is what stops a sweep taking a dispatch that is
+   * merely still in progress.
+   */
+  dispatch_reconcile_action?: "idle_existing_session" | "delete_created_session" | null;
+  /**
+   * Yield to a partial unique index instead of throwing on conflict.
+   *
+   * The A2A caller alone: a repeated `(session_id, message_id)` pair is one
+   * execution, and no row returned means that execution already exists.
+   */
+  onConflictDoNothing?: boolean;
 }
 
 /**
@@ -82,7 +98,7 @@ export interface InsertTaskParams {
 export async function insertTask(
   p: InsertTaskParams,
   client?: PoolClient,
-): Promise<ClawTaskRow> {
+): Promise<ClawTaskRow | null> {
   const r = await (client ?? db).query(
     `INSERT INTO claw_tasks (
        task_id, session_id, parent_task_id, batch_id,
@@ -90,7 +106,8 @@ export async function insertTask(
        name, input, prompt, script, depends_on, priority,
        executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
        sandbox_spec, callback_url, backend_mcp_url, internal_token_hash,
-       status, metadata, origin, workspace_id, workspace_throwaway, queued_at, started_at, deadline_at
+       status, metadata, origin, workspace_id, workspace_throwaway, queued_at, started_at, deadline_at,
+       dispatch_reconcile_at, dispatch_reconcile_action
      ) VALUES (
        $1, $2, $3, $4,
        $5, $6, $7, $8,
@@ -102,8 +119,11 @@ export async function insertTask(
        CASE WHEN $26::text = 'preparing' THEN NOW() END,
        CASE WHEN $26::text = 'preparing' THEN ${deadlineAtInsertSql({
          metadataParam: 27, originParam: 28, dagRootParam: 7, chatParam: 30, dagParam: 31,
-       })} END
-     ) RETURNING *`,
+       })} END,
+       CASE WHEN $33::text IS NULL THEN NULL
+            ELSE NOW() + ($34::int * INTERVAL '1 second') END,
+       $33
+     )${p.onConflictDoNothing ? " ON CONFLICT DO NOTHING" : ""} RETURNING *`,
     [
       p.task_id,
       p.session_id,
@@ -137,9 +157,11 @@ export async function insertTask(
       RUN_BUDGET_DEFAULT_SEC.chat,
       RUN_BUDGET_DEFAULT_SEC.dag_node,
       p.workspace_throwaway ?? false,
+      p.dispatch_reconcile_action ?? null,
+      DISPATCH_RECONCILE_LEASE_SEC,
     ],
   );
-  return r.rows[0] as ClawTaskRow;
+  return (r.rows[0] as ClawTaskRow | undefined) ?? null;
 }
 
 export async function insertEdge(
@@ -204,6 +226,7 @@ export async function transitionStatus(
   expected: TaskStatus[],
   next: TaskStatus,
   extra: Record<string, unknown> = {},
+  client?: StatementRunner,
 ): Promise<ClawTaskRow | null> {
   const sets: string[] = ["status = $1"];
   const values: unknown[] = [next];
@@ -241,7 +264,9 @@ export async function transitionStatus(
   }
   values.push(taskId);
   values.push(expected);
-  const r = await db.query(
+  // On the caller's connection when it has one: a reservation issued on a
+  // second connection blocks on rows the selecting transaction still holds.
+  const r = await (client ?? db).query(
     `UPDATE claw_tasks SET ${sets.join(", ")}
      WHERE task_id = $${i++} AND status = ANY($${i})
      RETURNING *`,

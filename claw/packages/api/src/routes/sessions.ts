@@ -3,7 +3,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
-import { db } from "../infra/db.js";
+import { db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
@@ -31,6 +31,9 @@ import {
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
+import {
+  acquireAdmissionLock, decideAdmission, sessionTreeShape,
+} from "../tasks/admission.js";
 import { S3_BUCKET, UPLOAD_TTL_DAYS } from "../config.js";
 import { getS3Client } from "../infra/s3-client.js";
 import type { S3Client } from "@aws-sdk/client-s3";
@@ -42,6 +45,110 @@ import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
 
 const logger = pino({ name: "sessions" });
+
+/** What the create route answers with, when it cannot write the session row. */
+interface SessionCreateRefusal {
+  statusCode: number;
+  response: { ok: false; error: string; reason?: string };
+}
+
+/** The columns `POST /v1/sessions` writes, whichever path writes them. */
+export interface NewSessionRow {
+  sessionId: string;
+  name: string;
+  userId: string;
+  mode: string;
+  agentStatus: string;
+  systemPrompt: string;
+  config: Record<string, unknown>;
+  parentSid: string | null;
+  role: string;
+}
+
+async function insertSessionRow(q: StatementRunner, row: NewSessionRow): Promise<void> {
+  await q.query(
+    `INSERT INTO claw_sessions
+     (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
+    [
+      row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
+      row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
+    ],
+  );
+}
+
+async function readParentAuthorisation(
+  q: StatementRunner,
+  parentSid: string,
+  user: ReturnType<typeof getUser>,
+): Promise<SessionCreateRefusal | null> {
+  const parent = (await q.query(
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    [parentSid],
+  )).rows[0] as { user_id?: string | null } | undefined;
+  if (!parent) return { statusCode: 404, response: { ok: false, error: "parent_session_not_found" } };
+  if (!canWriteSessionAsOperator(parent.user_id, user)) {
+    return { statusCode: 403, response: { ok: false, error: "parent_session_access_denied" } };
+  }
+  return null;
+}
+
+/**
+ * Write a child session that carries a first message, under the admission lock.
+ *
+ * The parent read, the tree decision and the INSERT are one transaction whose
+ * first statement is the lock: with the INSERT outside it, two message-bearing
+ * child creates both commit before either admission runs, and each then reads a
+ * tree the other has already grown -- both admitted while one slot remained, or
+ * both refused while one was free.
+ *
+ * The shape is prospective, this child not being a node yet, and both bounds
+ * are checked because a write that adds no level still adds a node.
+ */
+export async function admitParentedSessionCreate(
+  parentSid: string,
+  user: ReturnType<typeof getUser>,
+  row: NewSessionRow,
+): Promise<SessionCreateRefusal | null> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    try {
+      await acquireAdmissionLock(client);
+      const denied = await readParentAuthorisation(client, parentSid, user);
+      if (denied) {
+        await client.query("ROLLBACK");
+        return denied;
+      }
+      const shape = await sessionTreeShape(parentSid, client);
+      const decision = await decideAdmission({
+        origin: "chat",
+        newRunRoots: 0,
+        sandboxes: 0,
+        gpuNodes: 0,
+        treeRootId: shape.rootId,
+        treeNodeCount: shape.nodeCount + 1,
+        treeDepth: shape.depth + 1,
+      }, client);
+      if (decision.kind === "reject") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 429,
+          response: { ok: false, error: "admission_rejected", reason: decision.reason },
+        };
+      }
+      await insertSessionRow(client, row);
+      await client.query("COMMIT");
+      return null;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 
 // --- Zip download constants & state ---
 //
@@ -591,20 +698,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       });
     }
 
-    if (parentSid) {
-      if (!user) {
-        return reply.status(401).send({ ok: false, error: "authentication required" });
-      }
-      const parent = (await db.query(
-        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-        [parentSid],
-      )).rows[0] as { user_id?: string | null } | undefined;
-      if (!parent) {
-        return reply.status(404).send({ ok: false, error: "parent_session_not_found" });
-      }
-      if (!canWriteSessionAsOperator(parent.user_id, user)) {
-        return reply.status(403).send({ ok: false, error: "parent_session_access_denied" });
-      }
+    if (parentSid && !user) {
+      return reply.status(401).send({ ok: false, error: "authentication required" });
     }
 
     // --- Parse optional message up-front so validation errors don't
@@ -726,19 +821,33 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // so the row is born consistent with its dispatch state). Single
         // INSERT: no transaction needed because there's no row to lock yet.
         const initialStatus = firstMessage ? "running" : "idle";
-        await db.query(
-          `INSERT INTO claw_sessions
-           (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
-          [
-            sessionId,
-            (name as string || "").slice(0, 255),
-            userId, mode, initialStatus,
-            (system_prompt as string || ""),
-            JSON.stringify(sessionConfig),
-            parentSid, role,
-          ],
-        );
+        const newRow: NewSessionRow = {
+          sessionId,
+          name: (name as string || "").slice(0, 255),
+          userId, mode, agentStatus: initialStatus,
+          systemPrompt: (system_prompt as string || ""),
+          config: sessionConfig,
+          parentSid, role,
+        };
+        // A create with no parent grows no existing tree, and one with no
+        // message writes no run, so only the two together take the lock.
+        if (parentSid && firstMessage) {
+          const refused = await admitParentedSessionCreate(parentSid, user, newRow);
+          if (refused) {
+            if (idemKey && idemLock) {
+              await saveIdempotencyBestEffort(
+                idemLock.client, userId, route, idemKey, refused.statusCode, refused.response,
+              );
+            }
+            return { statusCode: refused.statusCode, response: refused.response };
+          }
+        } else {
+          if (parentSid) {
+            const denied = await readParentAuthorisation(db, parentSid, user);
+            if (denied) return { statusCode: denied.statusCode, response: denied.response };
+          }
+          await insertSessionRow(db, newRow);
+        }
 
         const dispMode = mode.replace(/-harness$/, "");
 
@@ -813,7 +922,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [sessionId]);
           },
         );
-        if (dispatch.kind === "publish_failed") {
+        if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
           return { statusCode: 503, response: errResp };
@@ -1218,7 +1327,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         await releaseSessionGateForTurn(sessionId, turnMessageId);
       },
     );
-    if (dispatch.kind === "publish_failed") {
+    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
       return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
     }
     if (dispatch.kind === "rejected") {

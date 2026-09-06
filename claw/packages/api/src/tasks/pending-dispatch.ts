@@ -583,6 +583,7 @@ async function finishPendingDoorbell(
   task: Record<string, unknown>,
 ): Promise<PendingDispatchResult> {
   const result = await handOffAssembledRun({
+    path: "pending",
     task,
     sessionId: input.sessionId,
     userId: input.userId,

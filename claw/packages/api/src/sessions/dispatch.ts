@@ -413,6 +413,7 @@ async function dispatchByDoorbell(input: {
   const { rememberTaskId, ...handOff } = input;
   const result = await handOffAssembledRun({
     ...handOff,
+    path: "chat",
     // The third argument is the dedup id. Dropping it here left every live
     // chat doorbell with no duplicate-window protection at all.
     publish: (subject, payload, msgId) =>

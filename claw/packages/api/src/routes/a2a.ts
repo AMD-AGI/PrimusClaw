@@ -9,6 +9,11 @@ import { getUser } from "../auth/middleware.js";
 import { canWriteSessionAsOperator, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
+import {
+  decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
+  type AdmissionAsk, type AdmissionDecision,
+} from "../tasks/admission.js";
+import { openChatRun } from "../tasks/chat-run.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import {
@@ -22,7 +27,8 @@ import {
   A2A_METHODS,
   JSON_RPC_PARSE_ERROR, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
   JSON_RPC_INVALID_PARAMS, JSON_RPC_INTERNAL_ERROR,
-  makeJsonRpcSuccess, makeJsonRpcError, makeTaskNotFoundError,
+  makeJsonRpcSuccess, makeJsonRpcError, makeA2AErrorDetail, makeTaskNotFoundError,
+  type JsonRpcErrorResponse,
   makeUnsupportedOperationError, makePushNotificationNotSupportedError,
   makeTaskNotCancelableError, makeVersionNotSupportedError,
 } from "./a2a-types.js";
@@ -292,6 +298,113 @@ interface A2AAuthContext {
   virtualKey: string;
 }
 
+
+/**
+ * What an A2A send asks the fleet for, before anything is written.
+ *
+ * A send is a tree of one as a *run* root and not as a session tree: the
+ * parent attachment builds a team tree of any depth, so a request naming a
+ * parent is decided on the prospective shape -- one node and one level past it
+ * -- and one naming an existing target on that target's own shape.
+ */
+async function a2aAdmissionAsk(
+  targetSessionId: string | null,
+  metadata?: Record<string, unknown>,
+): Promise<AdmissionAsk> {
+  const ask: AdmissionAsk = {
+    origin: "a2a",
+    newRunRoots: 1,
+    sandboxes: (metadata?.sandbox_image as string | undefined)?.trim() ? 1 : 0,
+    gpuNodes: 0,
+  };
+  const limits = envAdmitLimits();
+  if (limits.treeMaxNodes <= 0 && limits.treeMaxDepth <= 0) return ask;
+  const parentSid = (metadata?.parent_session_id as string) || null;
+  if (parentSid) {
+    const shape = await sessionTreeShape(parentSid);
+    return {
+      ...ask,
+      treeRootId: shape.rootId,
+      treeNodeCount: shape.nodeCount + 1,
+      treeDepth: shape.depth + 1,
+    };
+  }
+  if (!targetSessionId) return ask;
+  const shape = await sessionTreeShape(targetSessionId);
+  return { ...ask, treeRootId: shape.rootId, treeNodeCount: shape.nodeCount, treeDepth: shape.depth };
+}
+
+/** Admission for a send, decided before `resolveSendTarget` mints anything. */
+async function admitA2ASend(
+  targetSessionId: string | null,
+  metadata?: Record<string, unknown>,
+): Promise<AdmissionDecision> {
+  const ask = await a2aAdmissionAsk(targetSessionId, metadata);
+  return await withOwnedAdmissionLock((client) => decideAdmission(ask, client));
+}
+
+/**
+ * Open the counted run row for one A2A execution.
+ *
+ * The identity of an execution is the pair `(session_id, message_id)`, held by
+ * `idx_tasks_a2a_execution`: without it a resend of one pair observes the
+ * single row the aggregate collapsed it to, clears the ceiling, and executes
+ * indefinitely while being counted once.
+ *
+ * @returns false when the pair already has its execution, so nothing is
+ *   published and the request answers with that task's state.
+ */
+async function openA2ARun(
+  target: SendTarget,
+  text: string,
+  message: Message,
+  auth: A2AAuthContext,
+  metadata?: Record<string, unknown>,
+): Promise<boolean> {
+  const run = await openChatRun({
+    dispatch: "fat",
+    origin: "a2a",
+    sessionId: target.taskId,
+    userId: auth.userId || "a2a",
+    messageId: message.messageId,
+    prompt: text,
+    status: "preparing",
+    issueLease: false,
+    recordWorkspaceUse: false,
+    sandboxSpec: (metadata?.sandbox_image as string | undefined)?.trim() ? "default" : undefined,
+    sandboxImage: (metadata?.sandbox_image as string | undefined)?.trim() || undefined,
+    workspaceId: (metadata?.workspace_id as string) || undefined,
+  });
+  if (!run) {
+    logger.info({ taskId: target.taskId, messageId: message.messageId }, "a2a.execution_already_counted");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * A deferral has no identity a client could poll, so it is an explicit
+ * retryable error rather than a task at `SUBMITTED`. Distinct from a refusal,
+ * so an operator can tell a full fleet from an over-ceiling request.
+ */
+function makeAdmissionDeferredError(rpcId: string | number): JsonRpcErrorResponse {
+  return makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "admission_deferred", [
+    makeA2AErrorDetail("admission_deferred", { retry_after_seconds: A2A_DEFER_RETRY_SECONDS }),
+  ]);
+}
+
+function makeAdmissionRejectedError(
+  rpcId: string | number,
+  reason: string,
+): JsonRpcErrorResponse {
+  return makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "admission_rejected", [
+    makeA2AErrorDetail("admission_rejected", { reason }),
+  ]);
+}
+
+/** How long a deferred A2A caller is told to wait. One scheduler tick is too eager. */
+const A2A_DEFER_RETRY_SECONDS = 5;
+
 async function publishA2AExecuteTask(
   taskId: string,
   text: string,
@@ -442,11 +555,20 @@ async function handleSendMessage(
   }
 
   try {
+    const meta = metadata as Record<string, unknown> | undefined;
+    // Before `resolveSendTarget` mints anything, so a refusal or a deferral
+    // leaves nothing to roll back.
+    const admission = await admitA2ASend(message.taskId ?? null, meta);
+    if (admission.kind === "reject") return makeAdmissionRejectedError(rpcId, admission.reason);
+    if (admission.kind === "queue") return makeAdmissionDeferredError(rpcId);
+
     const { target, error } = await resolveSendTarget(message, text, callerId, rpcId);
     if (error) return error;
     if (!target) return makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to resolve task target");
 
-    await publishA2AExecuteTask(target.taskId, text, message, auth, metadata as Record<string, unknown> | undefined);
+    if (await openA2ARun(target, text, message, auth, meta)) {
+      await publishA2AExecuteTask(target.taskId, text, message, auth, meta);
+    }
 
     logger.info({
       taskId: target.taskId,
@@ -823,6 +945,21 @@ async function handleSendStreamingMessage(
     return;
   }
 
+  const meta = metadata as Record<string, unknown> | undefined;
+  // Answered over the ordinary JSON-RPC reply, before any subscription or SSE
+  // header: suppressing only the publish leaves a socket that never receives an
+  // event and never closes, and opening the stream to write one deferral event
+  // and close it reads to an SSE client as a completed task.
+  const admission = await admitA2ASend(message.taskId ?? null, meta);
+  if (admission.kind === "reject") {
+    reply.send(makeAdmissionRejectedError(rpcId, admission.reason));
+    return;
+  }
+  if (admission.kind === "queue") {
+    reply.send(makeAdmissionDeferredError(rpcId));
+    return;
+  }
+
   let target: SendTarget;
   try {
     const resolved = await resolveSendTarget(message, text, callerId, rpcId);
@@ -849,7 +986,9 @@ async function handleSendStreamingMessage(
   const sub = nc.subscribe(`events.${target.taskId}`);
 
   try {
-    await publishA2AExecuteTask(target.taskId, text, message, auth, metadata as Record<string, unknown> | undefined);
+    if (await openA2ARun(target, text, message, auth, meta)) {
+      await publishA2AExecuteTask(target.taskId, text, message, auth, meta);
+    }
     logger.info({
       taskId: target.taskId,
       contextId: target.contextId,

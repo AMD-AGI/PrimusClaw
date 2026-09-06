@@ -42,7 +42,7 @@ import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import { db } from "../infra/db.js";
 import { newTaskId } from "./ids.js";
 import { insertTask } from "./db.js";
-import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC } from "./run-budget.js";
+import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, type RunOrigin } from "./run-budget.js";
 import type { TaskStatus } from "./types.js";
 import { recordRunUse, releaseRunUse } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
@@ -254,8 +254,21 @@ export const SUPPORTED_COMPENSATION_VERSIONS = [1] as const;
 export interface OpenChatRunInput {
   sessionId: string;
   userId: string;
+  /**
+   * What produced this run. `"a2a"` opens the row idempotently against
+   * `idx_tasks_a2a_execution`, so a repeated `(session_id, message_id)` pair
+   * writes nothing and returns null.
+   */
+  origin?: RunOrigin;
+  /** Written to the `sandbox_spec` column, which is what the sandbox count reads. */
+  sandboxSpec?: unknown;
   /** Which delivery carries the work. Fat rows get the compensation receipt. */
   dispatch: ChatDispatchKind;
+  /**
+   * What a dispatch that never reports its publish outcome leaves for the
+   * sweeper to finish. Absent for a caller with nothing to undo.
+   */
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   /** The chat message id, which is how Brain refers to this run. */
   messageId: string;
   prompt: string;
@@ -374,10 +387,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
   const leaseToken = issueLease ? randomBytes(32).toString("hex") : null;
   const status = input.status ?? "preparing";
   try {
-    await insertTask({
+    const row = await insertTask({
       task_id: taskId,
       session_id: input.sessionId,
-      origin: "chat",
+      origin: input.origin ?? "chat",
+      sandbox_spec: input.sandboxSpec,
+      onConflictDoNothing: input.origin === "a2a",
+      dispatch_reconcile_action: input.reconcileAction ?? null,
       workspace_id: input.workspaceId ?? null,
       plugin_id: input.pluginId ?? null,
       name: input.prompt.slice(0, 64) || "chat",
@@ -400,6 +416,10 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
           : { dispatch_compensation: armedReceipt("not_attempted") }),
       },
     });
+    // Only for the idempotent open: the pair already has its execution, and
+    // recording a workspace use for a row that was not written would leak a
+    // reference nothing releases.
+    if (!row) return null;
     const workspaceId = input.recordWorkspaceUse === false
       ? undefined
       : await recordRunUse(input.sessionId, input.userId, taskId, input.filesWorkspaceId);
@@ -526,7 +546,7 @@ async function closeNamedChatRun(
         SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
       WHERE task_id = $1
         AND session_id = $2
-        AND origin = 'chat'
+        AND origin IN ('chat','a2a')
         AND status = ANY($6::text[])
         AND (
              COALESCE(claim_count, 0) = $7::int
@@ -560,7 +580,7 @@ async function closeUnnamedChatRun(
     `UPDATE claw_tasks
         SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
       WHERE session_id = $1
-        AND origin = 'chat'
+        AND origin IN ('chat','a2a')
         AND metadata->>'lease_fenced' IS DISTINCT FROM 'true'
         AND (
           (
@@ -569,7 +589,7 @@ async function closeUnnamedChatRun(
             AND NOT EXISTS (
               SELECT 1 FROM claw_tasks settled
                WHERE settled.session_id = $1
-                 AND settled.origin = 'chat'
+                 AND settled.origin IN ('chat','a2a')
                  AND settled.metadata->>'message_id' = $6
                  AND NOT (settled.status = ANY($2::text[]))
             )
@@ -580,7 +600,7 @@ async function closeUnnamedChatRun(
             AND NOT EXISTS (
               SELECT 1 FROM claw_tasks other
                WHERE other.session_id = $1
-                 AND other.origin = 'chat'
+                 AND other.origin IN ('chat','a2a')
                  AND other.status = ANY($2::text[])
                  AND other.task_id <> claw_tasks.task_id
             )
@@ -813,6 +833,32 @@ export interface FailDispatchOptions {
 }
 
 /**
+ * The row a dispatch compensation is allowed to act on, whatever it then does.
+ *
+ * Bound identically by the terminalizing UPDATE and by {@link
+ * discardChatRunDispatch}'s DELETE, so the two cannot drift into disagreeing
+ * about which rows are safe to touch. Takes its placeholders because the two
+ * statements carry different numbers of parameters of their own, and Postgres
+ * refuses a bind that supplies one the statement does not reference.
+ */
+function unheldOpenRowSql(
+  task: string, statuses: string, receipt: string, fleet: string, settled: string,
+): string {
+  return `task_id = ${task}
+          AND origin = 'chat'
+          AND status = ANY(${statuses}::text[])
+          AND lease_owner IS NULL
+          AND lease_expires_at IS NULL
+          AND COALESCE(claim_count, 0) = 0
+          AND (
+               metadata->'dispatch_compensation'->>'version' = '1'
+               OR metadata->'dispatch_compensation' IS NULL
+               OR metadata->'dispatch_compensation' IS NOT DISTINCT FROM ${receipt}::jsonb
+          )
+          AND (${noDeliveryInFlightSql(fleet, settled)})`;
+}
+
+/**
  * The one terminalizing CAS, taking the states it may close from as a parameter
  * so that one predicate serves every caller.
  *
@@ -860,18 +906,7 @@ export async function failChatRunDispatch(
                   'error_message', $3::text
                 )
               )
-        WHERE task_id = $1
-          AND origin = 'chat'
-          AND status = ANY($4::text[])
-          AND lease_owner IS NULL
-          AND lease_expires_at IS NULL
-          AND COALESCE(claim_count, 0) = 0
-          AND (
-               metadata->'dispatch_compensation'->>'version' = '1'
-               OR metadata->'dispatch_compensation' IS NULL
-               OR metadata->'dispatch_compensation' IS NOT DISTINCT FROM $5::jsonb
-          )
-          AND (${noDeliveryInFlightSql("$6", "$7")})
+        WHERE ${unheldOpenRowSql("$1", "$4", "$5", "$6", "$7")}
         RETURNING task_id, session_id, status`,
       [
         taskId, failureReason, message, statuses, observed,
@@ -891,6 +926,48 @@ export async function failChatRunDispatch(
     // unavailable dependency as the statement that just failed. The INSERT-time
     // armed receipt is what the sweeper retries from.
     logger.warn({ err, taskId }, "chat_run.fail_dispatch_failed");
+    return "unknown";
+  }
+}
+
+/**
+ * Erase a refused run's row instead of recording it as failed.
+ *
+ * A turn the fleet declined is not a fault the caller should find recorded --
+ * criterion: a refused create leaves nothing behind. Shares {@link
+ * unheldOpenRowSql} and the unmatched-row verdict with {@link
+ * failChatRunDispatch}, differing only in the verb, so a row a worker already
+ * holds is still left to its holder and still answers `"held"`.
+ *
+ * @returns `closed` when the row is gone, `held` when a worker has it, and
+ *   `unknown` for a row still open and unheld that the DELETE did not match --
+ *   which is a row `peekNextQueued` can still claim and run.
+ */
+export async function discardChatRunDispatch(
+  taskId: string | null,
+  opts: FailDispatchOptions = {},
+): Promise<FailDispatchVerdict> {
+  if (!taskId) {
+    logger.info({}, "chat_run.discard_dispatch_no_row");
+    return "closed";
+  }
+  const statuses = opts.statuses ?? OPEN_RUN_STATUSES;
+  const observed = opts.observedReceipt === undefined ? null : JSON.stringify(opts.observedReceipt);
+  try {
+    const r = await db.query(
+      `DELETE FROM claw_tasks
+        WHERE ${unheldOpenRowSql("$1", "$2", "$3", "$4", "$5")}
+        RETURNING task_id`,
+      [
+        taskId, statuses, observed,
+        opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
+      ],
+    );
+    if (!r.rowCount) return await verdictForUnmatchedRow(taskId, statuses);
+    await releaseRunUse(taskId, false);
+    return "closed";
+  } catch (err) {
+    logger.warn({ err, taskId }, "chat_run.discard_dispatch_failed");
     return "unknown";
   }
 }

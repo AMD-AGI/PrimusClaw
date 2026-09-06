@@ -60,7 +60,7 @@ export interface ClawTaskRow {
   turns: number | null;
   metadata: Record<string, unknown>;
   /** What produced this run. Null on rows that predate the column. */
-  origin: "chat" | "task" | "dag_node" | null;
+  origin: "chat" | "task" | "dag_node" | "a2a" | null;
   created_at: string;
   queued_at: string | null;
   started_at: string | null;

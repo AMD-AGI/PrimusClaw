@@ -178,7 +178,8 @@ const BUDGET_SECONDS_SQL = `NULLIF(
   COALESCE(
     (@META@->'derived'->>'budget_sec')::int,
     CASE
-      WHEN @ORIGIN@ IN ('chat','a2a') THEN $CHAT$
+      WHEN @ORIGIN@ = 'chat' THEN $CHAT$
+      WHEN @ORIGIN@ = 'a2a' THEN $CHAT$
       WHEN @ORIGIN@ IN ('task','dag_node') THEN $DAG$
       WHEN @DAGROOT@ IS NULL THEN $CHAT$
       ELSE $DAG$
