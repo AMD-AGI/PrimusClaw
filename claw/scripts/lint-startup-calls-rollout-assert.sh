@@ -58,6 +58,16 @@ if [ -z "$listen_line" ]; then
   fail=1
 fi
 
+# The rollout assertion applies the enablement gauges on its way through, so an
+# assertion that can throw first would leave a started pod exporting neither.
+admission_line=$(grep -nE '^[[:space:]]*assertAdmissionSettings\(' "$TARGET" | head -n 1 | cut -d: -f1)
+if [ -n "$admission_line" ] && [ -n "$assert_line" ] && [ "$assert_line" -gt "$admission_line" ]; then
+  echo "ERROR: $TARGET_REL: assertRolloutConfigAtStartup() must run before" >&2
+  echo "       assertAdmissionSettings(), which can throw before the rollout" >&2
+  echo "       gauges have been applied." >&2
+  fail=1
+fi
+
 if [ -n "$assert_line" ] && [ -n "$listen_line" ] && [ "$assert_line" -gt "$listen_line" ]; then
   echo "ERROR: $TARGET_REL: assertRolloutConfigAtStartup() is called at line" >&2
   echo "       $assert_line, below app.listen() at line $listen_line. The pod would" >&2

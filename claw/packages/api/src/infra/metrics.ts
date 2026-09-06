@@ -20,7 +20,7 @@
 import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from "prom-client";
 import type { RunFailClaimReason, RunUnclaimReason } from "@claw/protocol";
 // Type-only, so this stays a leaf module: the emitting modules import it at runtime.
-import type { AdmissionAsk } from "../tasks/admission.js";
+import type { AdmissionAsk, AdmissionRejectReason } from "../tasks/admission.js";
 import type { ExhaustedClaim } from "../tasks/run-claim.js";
 import type { HandOffResult } from "../tasks/run-dispatch.js";
 
@@ -33,18 +33,11 @@ export type AdmissionDecisionLabel = "admit" | "queue" | "reject" | "error";
 export type AdmissionStage = "pre_insert" | "post_insert";
 
 /**
- * Refusal vocabulary of `decideAdmission`.
- *
- * Stated structurally because `admission.ts` does not yet declare
- * `ADMISSION_REJECT_REASONS`; replace with a type-only import of
- * `AdmissionRejectReason` once it does, rather than growing a second enum here.
+ * Refusal vocabulary of `decideAdmission`, taken from the module that produces
+ * it: a second copy here would let admission invent a reason that fails only at
+ * the label call.
  */
-export type AdmissionRejectReasonLabel =
-  | "runs_hard_limit"
-  | "sandboxes_hard_limit"
-  | "gpu_nodes_hard_limit"
-  | "tree_nodes_exceeded"
-  | "tree_depth_exceeded";
+export type AdmissionRejectReasonLabel = AdmissionRejectReason;
 
 export const ADMISSION_DIMENSIONS = [
   "soft_runs", "hard_runs",
@@ -136,7 +129,6 @@ const eventPersistedTotal = new Counter({
   registers: [registry],
 });
 
-// ─── Admission ────────────────────────────────────────────────────────
 // `decision="error"` is not decoration: loadUsage and queueLength are
 // unguarded db.query calls, so without it a partial database outage would
 // drop failed creates out of every rollout ratio's denominator while the
@@ -171,14 +163,12 @@ const admissionEnforced = new Gauge({
   registers: [registry],
 });
 
-// ─── Doorbell state ───────────────────────────────────────────────────
 const doorbellDispatchEnabled = new Gauge({
   name: "claw_api_doorbell_dispatch_enabled",
   help: "1 when RUN_DOORBELL_DISPATCH is true in this process, set once at startup.",
   registers: [registry],
 });
 
-// ─── Dispatch hand-off ────────────────────────────────────────────────
 const runDispatchTotal = new Counter({
   name: "claw_api_run_dispatch_total",
   help: "handOffAssembledRun results by caller, including throws.",
@@ -199,7 +189,6 @@ const runDispatchHeldTotal = new Counter({
   registers: [registry],
 });
 
-// ─── Claim / unclaim ──────────────────────────────────────────────────
 const runClaimTotal = new Counter({
   name: "claw_api_run_claim_total",
   help: "Claim requests by route and outcome.",
@@ -243,7 +232,6 @@ const runFailClaimTotal = new Counter({
   registers: [registry],
 });
 
-// ─── Queue behaviour ──────────────────────────────────────────────────
 const runQueueEnteredTotal = new Counter({
   name: "claw_api_run_queue_entered_total",
   help: "Rows reaching status queued, by what put them there.",

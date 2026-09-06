@@ -990,6 +990,74 @@ const SUMMARIZE_THRESHOLD = 80_000;
 const KEEP_RECENT = 50_000;
 
 /**
+ * What the queued row asked for, resolved against the plugin and the defaults.
+ *
+ * Resolution chain, in order: the pending row, then the plugin row, then the
+ * database default. `claw_pending_messages.resources` holds the request body's
+ * `resource` object; the column name is older than the field name.
+ */
+function resolvePendingRequestShape(
+  pending: Record<string, unknown>,
+  fallbacks: {
+    pluginImage: string | undefined;
+    pluginResource: Record<string, unknown> | undefined;
+    defaultImage: string | undefined;
+    defaultResource: Record<string, unknown> | undefined;
+  },
+): {
+  finalSandboxImage: string | undefined;
+  finalResources: Record<string, unknown>;
+  pendingTimeout: number | undefined;
+} {
+  const requestImage = typeof pending.image === "string" && pending.image.trim() !== ""
+    ? pending.image.trim()
+    : undefined;
+  const requestResource = asJsonObject(pending.resources);
+  const timeout = pending.timeout !== undefined && pending.timeout !== null
+    ? Number(pending.timeout)
+    : NaN;
+  return {
+    finalSandboxImage: requestImage || fallbacks.pluginImage || fallbacks.defaultImage,
+    finalResources: requestResource || fallbacks.pluginResource || fallbacks.defaultResource || {},
+    pendingTimeout: Number.isFinite(timeout) ? Math.trunc(timeout) : undefined,
+  };
+}
+
+/**
+ * The active skills a queued turn keeps, bundled the way a live turn gets them.
+ *
+ * Absent rather than empty when nothing is active, because an empty object and
+ * "no skills were resolved" mean different things downstream.
+ */
+async function pendingSkillBundle(
+  userId: string,
+  content: string,
+): Promise<Record<string, {
+  content: string; enabled: boolean; version?: number; description?: string;
+  files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+}> | undefined> {
+let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
+try {
+  const activeSkills = await selectSkillsForTask(userId, content);
+  pendingSkills = {};
+  for (const [name, bundle] of Object.entries(activeSkills)) {
+    pendingSkills[name] = {
+      content: bundle.content,
+      description: bundle.description,
+      enabled: true,
+      version: bundle.version,
+      files: bundle.files,
+    };
+  }
+  if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
+} catch {
+  pendingSkills = undefined;
+}
+
+  return pendingSkills;
+}
+
+/**
  * Dispatch the oldest message parked behind this session, if there is one.
  *
  * Extracted from the completion handler rather than duplicated, because the
@@ -1011,25 +1079,7 @@ if (pending) {
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
-  // Load local active skills (with sub-files) so the queued message keeps skill context
-  let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
-  try {
-    const activeSkills = await selectSkillsForTask(pendingUserId, pending.content || "");
-    pendingSkills = {};
-    for (const [name, bundle] of Object.entries(activeSkills)) {
-      pendingSkills[name] = {
-        content: bundle.content,
-        description: bundle.description,
-        enabled: true,
-        version: bundle.version,
-        files: bundle.files,
-      };
-    }
-    if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
-  } catch {
-    pendingSkills = undefined;
-  }
-
+  const pendingSkills = await pendingSkillBundle(pendingUserId, pending.content || "");
   const rawTools = pending.tool_ids;
   const toolIds: number[] = Array.isArray(rawTools)
     ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
@@ -1061,17 +1111,9 @@ if (pending) {
       logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
     }
   }
-  const requestImage =
-    typeof pending.image === "string" && pending.image.trim() !== "" ? pending.image.trim() : undefined;
-  // claw_pending_messages.resources column stores the request body's
-  // `resource` (object) field; the column name is preserved unchanged.
-  const requestResource = asJsonObject(pending.resources);
-  const pendingTimeoutNum =
-    pending.timeout !== undefined && pending.timeout !== null ? Number(pending.timeout) : NaN;
-  const pendingTimeout = Number.isFinite(pendingTimeoutNum) ? Math.trunc(pendingTimeoutNum) : undefined;
-  // Resolution chain: pending row > plugin row > DB default (resources table).
-  const finalSandboxImage = requestImage || pluginImage || defaultImage;
-  const finalResources = requestResource || pluginResource || defaultResource || {};
+  const { finalSandboxImage, finalResources, pendingTimeout } = resolvePendingRequestShape(
+    pending, { pluginImage, pluginResource, defaultImage, defaultResource },
+  );
 
   // Same pairing as routes/sessions.ts immediate dispatch: tool_ids vs plugin_id (XOR at runtime; both keys for compat).
   // user_env snapshot frozen on the row at POST /messages time (see

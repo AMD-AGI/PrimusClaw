@@ -35,7 +35,12 @@ import {
 
 const OUTCOMES = ["ok", "error"] as const;
 
-const ADMISSION_ORIGINS = ["chat", "task", "dag_node"] as const satisfies readonly AdmissionOrigin[];
+// Every value the ask can carry, a2a included: a list narrower than the union
+// leaves a live label domain unasserted, which is the cardinality this file
+// exists to bound.
+const ADMISSION_ORIGINS = [
+  "chat", "task", "dag_node", "a2a",
+] as const satisfies readonly AdmissionOrigin[];
 const ADMISSION_DECISIONS = [
   "admit", "queue", "reject", "error",
 ] as const satisfies readonly AdmissionDecisionLabel[];
