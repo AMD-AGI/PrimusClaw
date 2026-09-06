@@ -202,6 +202,11 @@ CREATE TABLE claw_workspaces (
   session_id    TEXT,
   user_id       TEXT,
   writer_run_id TEXT,
+  -- Bumped only when a run releases having changed the files, which is the
+  -- difference a scenario reading the release back has to be able to see.
+  version       INT NOT NULL DEFAULT 0,
+  writer_expires_at TIMESTAMPTZ,
+  updated_at    TIMESTAMPTZ DEFAULT NOW(),
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
