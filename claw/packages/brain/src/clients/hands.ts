@@ -12,7 +12,7 @@ import {
   type RecordProbe,
 } from "../sandbox/bg-start.js";
 import {
-  advanceRow, readRow, readRunRows,
+  advanceRow, readRow, readRunRows, rowKey,
   type BgHandleAddress, type BgHandleRow, type BgRowStore,
 } from "../sandbox/bg-handle-rows.js";
 
@@ -370,24 +370,99 @@ export function derivedShellId(
  * finished, so the next call is a new intent and takes the next sequence. The
  * sequence is Brain's own, never the model's.
  */
+/**
+ * Sequences this process has itself claimed, per (owner, run, command).
+ *
+ * Process-local by design, and that is what makes it the right discriminator.
+ * Two concurrent starts of one command inside one live process are two
+ * deliberate intents; an unresolved row this process did not write is a
+ * predecessor's unfinished call, which is exactly what a replay is repeating.
+ * A run identity is executed by one replica at a time, so there is no third
+ * case for this to miss.
+ */
+const claimedSequences = new Map<string, Set<number>>();
+
+function claimKey(owner: string, run: string, commandDigest: string): string {
+  return `${owner}\u0000${run}\u0000${commandDigest}`;
+}
+
+/** Forget this process's claims. For tests, which drive several in one process. */
+export function resetStartIdentityForTest(): void {
+  claimedSequences.clear();
+}
+
+export interface StartIdentity {
+  shellId: string;
+  commandDigest: string;
+  sequence: number;
+  /** True where this call adopted a predecessor's unfinished row. */
+  replayed: boolean;
+}
+
+/**
+ * Which start this is, and the id it gets, decided before anything is sent.
+ *
+ * Two requirements that pull apart. The identity has to survive a crash without
+ * depending on the model reproducing anything -- a provider tool-use id is not
+ * sealed until the turn's checkpoint, which is written after the tool has
+ * already run. And it has to be per *start*: two deliberate starts of one
+ * command are two intents and must produce two shells.
+ *
+ * Both hold by claiming a sequence number with an exclusive create. The create
+ * is the arbitration: two concurrent calls cannot both win one sequence,
+ * whatever order they scanned in, so neither can take the other's id. A row
+ * this process did not claim and that is not yet confirmed is a predecessor's
+ * unfinished call, and only then is it adopted.
+ */
 export async function allocateStartIdentity(
   store: BgRowStore, owner: string, run: string, command: unknown,
-): Promise<{ shellId: string; commandDigest: string; sequence: number }> {
+  generation: string,
+): Promise<StartIdentity> {
   const commandDigest = commandDigestOf(owner, run, command);
-  const rows = await readRunRows(store, owner, run);
-  const mine = rows.filter((row) => row.commandDigest === commandDigest);
+  const mineKey = claimKey(owner, run, commandDigest);
+  const alreadyClaimed = claimedSequences.get(mineKey) ?? new Set<number>();
 
-  const unresolved = mine.find((row) => row.state !== "spawn_confirmed");
-  if (unresolved) {
+  const rows = await readRunRows(store, owner, run);
+  const adoptable = rows.find((row) =>
+    row.commandDigest === commandDigest
+    && row.state !== "spawn_confirmed"
+    && !alreadyClaimed.has(row.sequence ?? 0));
+  if (adoptable) {
     return {
-      shellId: unresolved.shellId,
+      shellId: adoptable.shellId,
       commandDigest,
-      sequence: unresolved.sequence ?? 1,
+      sequence: adoptable.sequence ?? 1,
+      replayed: true,
     };
   }
-  const sequence = mine.reduce((max, row) => Math.max(max, row.sequence ?? 0), 0) + 1;
-  return { shellId: derivedShellId(owner, run, command, sequence), commandDigest, sequence };
+
+  // Walk upward until an exclusive create wins. A create that loses means some
+  // other call took that sequence between the scan and here, which is the race
+  // this loop exists to settle rather than to detect.
+  const taken = new Set(rows
+    .filter((row) => row.commandDigest === commandDigest)
+    .map((row) => row.sequence ?? 0));
+  for (let sequence = 1; sequence <= taken.size + MAX_SEQUENCE_ATTEMPTS; sequence++) {
+    if (taken.has(sequence) || alreadyClaimed.has(sequence)) continue;
+    const shellId = derivedShellId(owner, run, command, sequence);
+    const address = { ownerScope: owner, runIdentity: run, shellId };
+    const claimed = await store.write(
+      rowKey(address),
+      JSON.stringify({ ...address, generation, state: "issued", commandDigest, sequence }),
+      null,
+    );
+    if (!claimed) continue;
+    alreadyClaimed.add(sequence);
+    claimedSequences.set(mineKey, alreadyClaimed);
+    return { shellId, commandDigest, sequence, replayed: false };
+  }
+  throw new Error(
+    `no background-shell sequence could be claimed for this run under contention`,
+  );
 }
+
+/** Bounded, because contention has to settle rather than climb forever. */
+const MAX_SEQUENCE_ATTEMPTS = 16;
 
 /**
  * Header naming who a tool call is for. Hands files background shells under it
@@ -624,7 +699,9 @@ export class HandsClient {
       // scope of its own. Today's behaviour: the sandbox mints the id.
       return { args, carry: {} };
     }
-    const allocated = await allocateStartIdentity(store, this.owner, this.run, args.command);
+    const allocated = await allocateStartIdentity(
+      store, this.owner, this.run, args.command, this.generation,
+    );
     return {
       args: { ...args, shell_id: allocated.shellId },
       carry: { commandDigest: allocated.commandDigest, sequence: allocated.sequence },

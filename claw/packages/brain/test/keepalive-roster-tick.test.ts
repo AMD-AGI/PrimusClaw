@@ -322,71 +322,100 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
 });
 
 test("every target is served within the derived bound, on an injected clock", async () => {
-  // The bound the ceiling exists to prove, asserted as a bound rather than as
-  // "eventually": with N targets and a sweep guaranteed to start C pings, a
-  // rotation that resumes where the last one stopped reaches every target
-  // within ceil(N / C) sweeps -- so the active-shell target's last activity is
-  // never older than the shortest reclaim in force, across enough sweeps for
-  // that deadline to lapse several times over.
+  // The bound stated as a bound. The clock is injected into the ping deadline
+  // itself, so the budget really expires mid-sweep and the sweep really defers
+  // -- which is the thing the bound is about. A test whose pings return
+  // instantly never defers at all and proves nothing.
   const C = 2;
   const N = 7;
-  const INTERVAL_SEC = 60;
-  const DEADLINE_SEC = 900;
+  const PING_MS = 1_000;
   const bound = Math.ceil(N / C);
 
   const targets = Array.from({ length: N }, (_, i) => `wl-${i}`);
   for (const [i, id] of targets.entries()) kv.seed(`hands.sess-${i}`, entry(id));
-  const ACTIVE = "wl-3";
 
+  // One clock for the deadline and the pings alike: each ping consumes its
+  // whole ceiling, so a budget of C ceilings admits exactly C of them.
   let now = 0;
-  const lastActivity = new Map<string, number>();
-  // The budget is what bounds how many pings one sweep starts: each stubbed
-  // ping consumes its whole ceiling, so exactly C of them fit.
-  const PING_MS = 1_000;
-  onPing = null;
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
       async exec(inst: { id: string }) {
         pinged.push(inst.id);
-        lastActivity.set(inst.id, now);
         now += PING_MS;
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     } as unknown as SandboxProvider,
   });
 
-  // Enough sweeps for the deadline to lapse several times over.
-  const sweeps = Math.ceil((DEADLINE_SEC * 4) / INTERVAL_SEC);
   const servedAt = new Map<string, number[]>();
-  for (let sweep = 0; sweep < sweeps; sweep++) {
+  const perSweep: number[] = [];
+  for (let sweep = 0; sweep < bound * 4; sweep++) {
     pinged.length = 0;
     await runKeepaliveTickForTest({
       kv,
       countActiveShells: async (_u, _t, owner) => (owner === "sess-3" ? 1 : 0),
       pingBudgetMs: C * PING_MS,
+      now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
-    for (const id of pinged) {
-      servedAt.set(id, [...(servedAt.get(id) ?? []), sweep]);
-    }
-    now = (sweep + 1) * INTERVAL_SEC * 1000;
+    perSweep.push(pinged.length);
+    for (const id of pinged) servedAt.set(id, [...(servedAt.get(id) ?? []), sweep]);
   }
 
+  assert.ok(perSweep.every((n) => n <= C && n > 0),
+    `the budget really bounded each sweep: ${JSON.stringify(perSweep)}`);
+  assert.ok(perSweep.some((n) => n < N),
+    "and sweeps really deferred, which is what the bound is about");
+
   for (const id of targets) {
-    const sweepsServed = servedAt.get(id) ?? [];
-    assert.ok(sweepsServed.length > 0, `${id} was never served`);
-    // No target waits longer than the bound between two turns, first included.
-    const gaps = sweepsServed.map((s, i) => s - (i === 0 ? -1 : sweepsServed[i - 1]));
+    const served = servedAt.get(id) ?? [];
+    assert.ok(served.length > 0, `${id} was never served`);
+    const gaps = served.map((s, i) => s - (i === 0 ? -1 : served[i - 1]));
     assert.ok(Math.max(...gaps) <= bound,
       `${id} waited ${Math.max(...gaps)} sweeps, past the ceil(N/C) = ${bound} bound`);
   }
+});
 
-  const activeGapSweeps = Math.max(
-    ...(servedAt.get(ACTIVE) ?? []).map((s, i, all) => s - (i === 0 ? -1 : all[i - 1])),
-  );
-  assert.ok(activeGapSweeps * INTERVAL_SEC < DEADLINE_SEC,
-    "the target holding a live shell is refreshed well inside the shortest reclaim");
+test("a target that arrives or leaves cannot push a deferred one further back", async () => {
+  // The starvation the cursor exists to prevent: a served target reordered
+  // ahead of one still waiting, repeatedly. Driven with the population changing
+  // between every sweep.
+  const C = 2;
+  const PING_MS = 1_000;
+  let now = 0;
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async exec(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += PING_MS;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    } as unknown as SandboxProvider,
+  });
+
+  // The one that must not starve is seeded first and never leaves.
+  kv.seed("hands.sess-stay", entry("wl-stay"));
+  for (let i = 0; i < 4; i++) kv.seed(`hands.sess-base-${i}`, entry(`wl-base-${i}`));
+
+  let servedStay = 0;
+  for (let sweep = 0; sweep < 12; sweep++) {
+    pinged.length = 0;
+    // Churn: one target joins and another leaves before every sweep.
+    kv.seed(`hands.sess-churn-${sweep}`, entry(`wl-churn-${sweep}`));
+    if (sweep > 0) values.delete(`hands.sess-churn-${sweep - 1}`);
+
+    await runKeepaliveTickForTest({
+      kv, countActiveShells: async () => 0, pingBudgetMs: C * PING_MS, now: () => now,
+      roster: { store: rosterStore(kv), config: CONFIG },
+    });
+    if (pinged.includes("wl-stay")) servedStay += 1;
+  }
+
+  assert.ok(servedStay >= 3,
+    `the never-leaving target was served ${servedStay} times in 12 sweeps; a cursor `
+      + "that lets arrivals reorder it ahead of waiting targets starves it");
 });
 
 test("a contended reconciliation blocks the next ordinary claim until it recovers", async () => {
@@ -407,16 +436,54 @@ test("a contended reconciliation blocks the next ordinary claim until it recover
     kv, countActiveShells: async () => 0, roster: { store: contended, config: CONFIG },
   });
 
-  assert.equal(isRosterStale(), true);
+  assert.equal(await isRosterStale(), true);
   await assert.rejects(() => admitSandbox("sess-new"), SandboxCapacityRefused,
     "nothing new is admitted against a roster missing targets");
+
+  // A second replica, which never hit the contention, reads the same roster --
+  // and the flag is on it, not in the first replica's memory.
+  const { bindAdmission: bindOther, admitSandbox: admitOther } =
+    await import("../src/sandbox/admission.js");
+  await bindOther(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  await assert.rejects(() => admitOther("sess-neighbour"), SandboxCapacityRefused,
+    "a replica that never saw the fault must not go on admitting against the "
+      + "same understated count");
 
   // A later sweep that lands clears it.
   await runKeepaliveTickForTest({
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
-  assert.equal(isRosterStale(), false);
+  assert.equal(await isRosterStale(), false);
   const hold = await admitSandbox("sess-new");
   assert.ok(hold, "and admission resumes once the roster is whole again");
   await hold.release();
+});
+
+test("a census that could not be read does not clear staleness", async () => {
+  // A walk that failed produces a smaller target set, and reconciling that set
+  // as if whole announces a fleet nobody counted -- which is the same
+  // understated roster arrived at without any contention at all.
+  const { bindAdmission, admitSandbox, SandboxCapacityRefused, isRosterStale } =
+    await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  kv.seed("hands.sess-a", entry("wl-a"));
+  kv.seed("hands.sess-broken", "{ not json");
+
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.equal(await isRosterStale(), true, "an unreadable record is a missing sandbox");
+  await assert.rejects(() => admitSandbox("sess-new"), SandboxCapacityRefused);
+
+  // Repaired, and the next sweep clears it.
+  values.delete("hands.sess-broken");
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  assert.equal(await isRosterStale(), false);
 });

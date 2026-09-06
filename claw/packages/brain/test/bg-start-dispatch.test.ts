@@ -18,7 +18,9 @@
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { HandsClient, bindShellRecordsCapabilityForTest } from "../src/clients/hands.js";
+import {
+  HandsClient, bindShellRecordsCapabilityForTest, resetStartIdentityForTest,
+} from "../src/clients/hands.js";
 import { bindBgHandleRowsForTest } from "../src/sandbox/bg-row-store.js";
 import { readRow, type BgRowState } from "../src/sandbox/bg-handle-rows.js";
 import { bgRowStore } from "../src/sandbox/bg-row-store.js";
@@ -65,6 +67,7 @@ beforeEach(() => {
   restoreCapability = bindShellRecordsCapabilityForTest(async () => true);
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
   probed.length = 0;
+  resetStartIdentityForTest();
 });
 
 afterEach(() => {
@@ -78,13 +81,16 @@ afterEach(() => {
  * One Brain pod's client. `dieOnHandoff` is the crash this exists for: the row
  * has been written and the transport call throws before anything is sent.
  */
-function pod(options: { dieOnHandoff?: boolean } = {}) {
+function pod(options: { dieOnHandoff?: boolean; slowHandoff?: boolean } = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const hands = new HandsClient(URL, "tok", OWNER, RUN);
   (hands as unknown as { connected: boolean }).connected = true;
   (hands as unknown as { client: unknown }).client = {
     callTool: async ({ arguments: args }: { arguments: Record<string, unknown> }) => {
       if (options.dieOnHandoff) throw new Error("pod died before the request went out");
+      // Holds every concurrent call inside the handoff together, so none has
+      // confirmed by the time the others allocate.
+      if (options.slowHandoff) await new Promise((r) => setTimeout(r, 20));
       sent.push(args);
       return { content: [{ type: "text", text: `Started background shell ${args.shell_id}.` }] };
     },
@@ -216,6 +222,7 @@ test("a start naming no id recovers its own id on the replay, not a fresh one", 
   // the model is re-queried and free to hand back a different tool-use
   // identifier, so nothing about the provider's id may enter the derivation.
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
+  resetStartIdentityForTest();
   const resumed = pod();
   await resumed.hands.callTool("bash", NO_ID_START);
 
@@ -230,6 +237,7 @@ test("a no-id start whose send did land is resolved, never run twice", async () 
   const first = pod({ dieOnHandoff: true });
   await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
   recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  resetStartIdentityForTest();
 
   const resumed = pod();
   const text = await resumed.hands.callTool("bash", NO_ID_START);
@@ -265,6 +273,52 @@ test("two deliberate starts of the identical command are two shells", async () =
   assert.equal(rows.length, 2, "two intents, two rows");
 });
 
+test("concurrent identical starts never collapse, with no confirmation ordering", async () => {
+  // Both scan before either has written a row, so neither can see the other's
+  // and a scan-then-write would hand them one id. The exclusive create is what
+  // settles it: two calls cannot both win one sequence.
+  const { hands, sent } = pod({ slowHandoff: true });
+  const [a, b, c] = await Promise.all([
+    hands.callTool("bash", NO_ID_START),
+    hands.callTool("bash", NO_ID_START),
+    hands.callTool("bash", NO_ID_START),
+  ]);
+
+  assert.equal(sent.length, 3, "three intents, three starts");
+  const ids = sent.map((s) => s.shell_id);
+  assert.equal(new Set(ids).size, 3, `collapsed to ${JSON.stringify(ids)}`);
+  for (const text of [a, b, c]) assert.match(text, /Started background shell/);
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 3);
+});
+
+test("confirmation arriving out of order across several starts keeps them apart", async () => {
+  // The rows are confirmed in an order nothing controls, and a later start must
+  // still take a sequence of its own rather than adopting whichever row happens
+  // to be unconfirmed at the moment it looks.
+  const { hands, sent } = pod();
+  await hands.callTool("bash", NO_ID_START);
+  await hands.callTool("bash", NO_ID_START);
+
+  // The second start's row is confirmed first; the first is still `dispatched`.
+  const keys = await bgRowStore()!.keys("bgshell.*.*.*");
+  const first = JSON.parse((await bgRowStore()!.read(keys[0]))!.value) as { shellId: string };
+  await bgRowStore()!.write(
+    keys[0],
+    JSON.stringify({
+      ownerScope: OWNER, runIdentity: RUN, shellId: first.shellId,
+      generation: URL, state: "dispatched",
+      commandDigest: JSON.parse((await bgRowStore()!.read(keys[0]))!.value).commandDigest,
+      sequence: 1,
+    }),
+    (await bgRowStore()!.read(keys[0]))!.revision,
+  );
+
+  await hands.callTool("bash", NO_ID_START);
+  assert.equal(sent.length, 3);
+  assert.equal(new Set(sent.map((s) => s.shell_id)).size, 3,
+    "a start of this process never adopts a row this process claimed");
+});
+
 test("a replay adopts the unresolved start rather than allocating a new one", async () => {
   // What separates the two: an unconfirmed row is a call that was sent and
   // never came back, which is exactly what a replay is repeating.
@@ -277,6 +331,9 @@ test("a replay adopts the unresolved start rather than allocating a new one", as
   assert.ok(stranded.commandDigest, "the row carries what a replay recognises it by");
 
   recordAnswer = { marker: true, subtreeReadable: true, present: false };
+  // A different process resuming the run: it made no claim of its own, so the
+  // unresolved row is its predecessor's unfinished call.
+  resetStartIdentityForTest();
   const resumed = pod();
   await resumed.hands.callTool("bash", NO_ID_START);
 
@@ -292,6 +349,7 @@ test("a script-mode replay that is safely deduplicated is not a step failure", a
   assert.equal(await rowState(), "dispatched");
 
   recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  resetStartIdentityForTest();
   const resumed = pod();
   const result = await resumed.hands.callToolFull("bash", START);
 

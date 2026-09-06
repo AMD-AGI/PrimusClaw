@@ -24,6 +24,12 @@ export interface CapacitySettings {
   deferralCount: number;
   /** Longest gap between two refreshes of one handle, in seconds. */
   activityGapSec: number;
+  /**
+   * How long an unrenewed roster entry is held before any replica may release
+   * it. Derived rather than configured: the design pins the relation, not the
+   * number.
+   */
+  reclaimHorizonMs: number;
 }
 
 /**
@@ -52,6 +58,16 @@ export function activityGapSec(
 }
 
 export interface CapacityInput {
+  /**
+   * Longest a provisioning may legitimately take -- create, bootstrap and
+   * health together -- in seconds.
+   *
+   * The reclaim horizon has to exceed it: a slot released while its sandbox is
+   * still being provisioned is a live sandbox holding none, which is the
+   * un-slotted target the ceiling exists to prevent. Zero means unbounded, and
+   * no horizon can exceed that.
+   */
+  provisioningCeilingSec: number;
   bgShellEnabled: boolean;
   keepaliveIntervalSec: number;
   /** Raw, because "declared" is the question and an empty string is not one. */
@@ -95,7 +111,10 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
     );
   }
   if (!input.bgShellEnabled) {
-    return { ceiling: 0, reconciliationReserve: 0, deferralCount: 0, activityGapSec: 0 };
+    return {
+      ceiling: 0, reconciliationReserve: 0, deferralCount: 0,
+      activityGapSec: 0, reclaimHorizonMs: 0,
+    };
   }
 
   const ceiling = requirePositiveInteger("SANDBOX_KEEPALIVE_TARGET_CEILING", input.targetCeiling);
@@ -127,7 +146,20 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       + `or declare a longer deadline.`,
     );
   }
+  // The design pins the relation rather than the value: the horizon must exceed
+  // both one sweep span and the declared provisioning ceiling, so that neither
+  // a slow sweeper nor a slow but live provisioning loses its reservation.
+  // Derived from them so it cannot drift out of that relation by being tuned.
+  if (input.provisioningCeilingSec <= 0) {
+    throw new KeepaliveConfigRefused(
+      "the provisioning ceiling is unbounded (SANDBOX_POLL_TIMEOUT_MS=0), so no "
+      + "reclaim horizon can exceed it and a slot could be released while its "
+      + "sandbox is still being provisioned. Set a finite ceiling.",
+    );
+  }
+  const reclaimHorizonMs = (Math.max(input.provisioningCeilingSec, input.sweepSpanSec) + gap) * 1000;
   return {
     ceiling, reconciliationReserve: reserve, deferralCount: deferrals, activityGapSec: gap,
+    reclaimHorizonMs,
   };
 }

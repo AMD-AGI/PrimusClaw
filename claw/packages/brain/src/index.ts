@@ -884,11 +884,13 @@ async function main() {
     idleDeadlineSec: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC,
     pingsPerSweep: keepalivePingsPerSweep(),
     sweepSpanSec: SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC,
+    provisioningCeilingSec: Math.floor(SANDBOX_POLL_TIMEOUT_MS / 1000),
   });
   if (capacity.ceiling > 0) {
     logger.info(
       { ceiling: capacity.ceiling, deferrals: capacity.deferralCount,
-        activityGapSec: capacity.activityGapSec },
+        activityGapSec: capacity.activityGapSec,
+        reclaimHorizonMs: capacity.reclaimHorizonMs },
       "keepalive.capacity_proven",
     );
   }

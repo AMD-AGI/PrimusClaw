@@ -17,8 +17,8 @@ import { isTombstone } from "../tasks/lock.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
 import {
-  assertRetentionSeparation, migrateReservedSessionKeys, sessionIdFromHandsKey,
-  type HandsKeyStore,
+  assertRetentionSeparation, handsSessionKey, legacyHandsKey,
+  migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
 } from "./hands-key.js";
 import { isRevisionConflict } from "@claw/utils";
 import pino from "pino";
@@ -93,6 +93,44 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
  * its work in it. There is no safe automatic repair for that, so the deployment
  * is refused with the keys named.
  */
+/**
+ * Read a session's binding, whichever key currently holds it.
+ *
+ * The canonical key first, then the key an unmigrated -- or an
+ * old-replica-written -- entry sits under. Both have to be tried for the whole
+ * length of a rolling upgrade: an old pod reads and writes the legacy name and
+ * knows nothing of the other, so a new pod that looked only at the canonical
+ * one would read a live session as having no sandbox and provision a second.
+ */
+export async function readHandsEntry(
+  kv: KV, sessionId: string,
+): Promise<{ key: string; value: string; revision: number } | null> {
+  // Errors are not caught: an unavailable store is not a session with no
+  // sandbox, and reading it as one is how a live workload gets replaced.
+  const canonical = handsSessionKey(sessionId);
+  const legacy = legacyHandsKey(sessionId);
+  for (const key of canonical === legacy ? [canonical] : [canonical, legacy]) {
+    const entry = await kv.get(key);
+    if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision };
+  }
+  return null;
+}
+
+/**
+ * Move strays out of the legacy namespace, every sweep.
+ *
+ * Once at boot is not enough: new replicas start alongside old ones, and an old
+ * one writes the legacy key throughout the rollout -- after every new replica
+ * has already scanned. Repeating on the sweep's own cadence bounds that to one
+ * interval, and the read-through above covers the interval itself.
+ */
+export async function reconcileReservedKeys(kv: KV): Promise<void> {
+  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
+  if (result.migrated.length || result.resumed.length || result.conflicted.length) {
+    logger.warn(result, "hands.reserved_key_reconciled");
+  }
+}
+
 export async function assertReservedKeysFree(kv: KV): Promise<void> {
   const store = reservedKeyStore(kv);
   const moved = await migrateReservedSessionKeys(store);

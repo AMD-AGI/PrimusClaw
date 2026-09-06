@@ -70,6 +70,29 @@ export function isReservedRetentionKey(key: string): boolean {
   return key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX);
 }
 
+/**
+ * Whether a key is one this scheme would never write.
+ *
+ * Both markers, because both are re-keyed: an entry sitting under the raw
+ * re-key marker predates the scheme exactly as one under the reserved marker
+ * does, and read as an already-encoded key it decodes to something no session
+ * answers to.
+ */
+export function isLegacySessionKey(key: string): boolean {
+  const part = key.slice(HANDS_KEY_PREFIX.length);
+  return part.startsWith(RETAINED_PREFIX)
+    || (part.startsWith(REKEYED_MARKER) && !isEncodedPart(part.slice(1)));
+}
+
+function isEncodedPart(part: string): boolean {
+  return part.length > 0 && /^[A-Z2-7]+$/.test(part);
+}
+
+/** The key this session id would have had before re-keying existed. */
+export function legacyHandsKey(sessionId: string): string {
+  return HANDS_KEY_PREFIX + sessionId;
+}
+
 /** Whether an entry's value carries the marker only a retention writes. */
 export function isRetentionEntry(value: unknown): boolean {
   return !!value && typeof value === "object"

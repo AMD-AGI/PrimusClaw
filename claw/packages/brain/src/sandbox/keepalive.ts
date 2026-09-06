@@ -11,7 +11,7 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { sessionHasActiveRunLease } from "./registry.js";
+import { reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -82,6 +82,15 @@ interface KeepaliveDeps {
    * it. Never set in production.
    */
   pingBudgetMs?: number;
+  /**
+   * Test seam for the clock the ping deadline is measured against.
+   *
+   * The budget is what makes a sweep defer, and deferral is what the refresh
+   * bound is stated over -- so a test that cannot move this clock cannot
+   * exercise the bound at all, whatever it does to the pings themselves.
+   * Never set in production.
+   */
+  now?: () => number;
   /**
    * The fleet-wide admission roster, where one is bound.
    *
@@ -432,16 +441,15 @@ const PING_MAX_IN_FLIGHT = 16;
  */
 const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
 /**
- * The first target the last sweep left unserved.
+ * Every target the last sweep left unserved, in the order it deferred them.
  *
- * By identity rather than by position: the target list is rebuilt every sweep,
- * so an index into it moves under arrivals and departures -- and a deferred
- * target can be carried back behind ones already served, repeatedly, which
- * makes the deferral count unbounded and the refresh gap with it. Naming the
- * target means the next sweep resumes at it wherever it now sits, and at the
- * front where it has since gone away.
+ * The whole list rather than a resume point: the target set is rebuilt each
+ * sweep, so a position moves under arrivals and departures and a single
+ * identity vanishes when its sandbox does -- and either way an already-served
+ * target can be carried back ahead of one still waiting, repeatedly, which is
+ * what makes the deferral count unbounded and the refresh gap with it.
  */
-let pingResumeAt: string | null = null;
+let pingDeferred: string[] = [];
 
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
@@ -761,8 +769,11 @@ async function forEachWithLimit<T>(
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
-): Promise<Map<string, RegisteredSandbox>> {
+): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
   const targets = new Map<string, RegisteredSandbox>();
+  // A walk that could not read everything yields a smaller census, and a
+  // smaller census reconciled as if whole announces a fleet nobody counted.
+  let complete = true;
   const probeCandidates: Array<{
     identity: string; sessionId: string; info: HandsKvEntry; generation: number;
   }> = [];
@@ -914,9 +925,15 @@ async function collectTargets(
 
         const targetKey = sandboxRegistryKey(sessionId, entry);
         if (!targets.has(targetKey)) targets.set(targetKey, { sessionId, entry });
-      } catch { /* malformed — skip */ }
+      } catch (err) {
+        // A record that cannot be used is a sandbox missing from the census,
+        // not a sandbox that does not exist.
+        complete = false;
+        logger.warn({ err: (err as Error)?.message, key }, "keepalive.entry_unreadable");
+      }
     }
   } catch (err) {
+    complete = false;
     logger.warn({ err }, "keepalive.kv_scan_failed");
   }
 
@@ -924,7 +941,7 @@ async function collectTargets(
   // who gets a slot has to be decided once the candidates are all known.
   dispatchProbes(deps, probeCandidates);
 
-  return targets;
+  return { targets, complete };
 }
 
 /**
@@ -1021,11 +1038,14 @@ async function handleKeepaliveFailures(
 async function admitTargets(
   deps: KeepaliveDeps,
   targets: Map<string, RegisteredSandbox>,
+  censusComplete: boolean,
 ): Promise<void> {
   if (!deps.roster) return;
   const identities = [...targets.keys()];
   try {
-    const result = await reconcileTargets(deps.roster.store, deps.roster.config, identities);
+    const result = await reconcileTargets(
+      deps.roster.store, deps.roster.config, identities, censusComplete,
+    );
     if (result.admitted.length) {
       logger.info({ admitted: result.admitted.length }, "keepalive.roster_reconciled");
     }
@@ -1037,8 +1057,9 @@ async function admitTargets(
       );
     }
     await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
-    // Whole again: whatever contention or fault left it incomplete is behind us.
-    markRosterStale(false);
+    if (!censusComplete) {
+      logger.error({ targets: identities.length }, "keepalive.census_incomplete");
+    }
   } catch (err) {
     // Reported rather than swallowed, and the sweep still serves what it
     // collected: an unreconciled roster understates the fleet, so the deferral
@@ -1048,7 +1069,7 @@ async function admitTargets(
     // The sweep still serves what it collected -- refusing to ping is how a
     // sandbox with live work in it is reclaimed -- but nothing new is admitted
     // against a roster that is missing targets it was about to take on.
-    markRosterStale(true);
+    await markRosterStale((err as Error)?.message ?? "reconcile failed");
     logger.error(
       { err: (err as Error)?.message, targets: identities.length },
       "keepalive.roster_reconcile_failed",
@@ -1065,8 +1086,14 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
-  const targets = await collectTargets(deps, seenIdentities);
-  await admitTargets(deps, targets);
+  // Every sweep, not only at boot: an old replica writes the legacy key
+  // throughout a rolling upgrade, after every new one has already scanned.
+  await reconcileReservedKeys(deps.kv).catch((err) => logger.error(
+    { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
+  ));
+  const census = await collectTargets(deps, seenIdentities);
+  const targets = census.targets;
+  await admitTargets(deps, targets, census.complete);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
@@ -1111,24 +1138,32 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
 
   // Rotated, so a sweep that cannot finish does not always give up on the same
   // tail. Ordering is otherwise insertion order, which is stable across sweeps.
+  // Whatever the last sweep left unserved goes first, in the order it was
+  // deferred, and the rest follow. Resuming at a position -- or at one identity
+  // and falling back to the front when it has gone -- lets an arrival or a
+  // departure put an already-served target ahead of a waiting one, repeatedly,
+  // which is what makes the deferral count unbounded.
   const ordered = [...targets.entries()];
-  const resumeIndex = pingResumeAt === null
-    ? 0
-    : Math.max(0, ordered.findIndex(([key]) => key === pingResumeAt));
-  const rotated = ordered.slice(resumeIndex).concat(ordered.slice(0, resumeIndex));
-  const pingDeadline = Date.now() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
+  const waiting = pingDeferred.filter((key) => targets.has(key));
+  const waitingSet = new Set(waiting);
+  const rotated = [
+    ...waiting.map((key) => [key, targets.get(key)!] as const),
+    ...ordered.filter(([key]) => !waitingSet.has(key)),
+  ];
+  const clock = deps.now ?? Date.now;
+  const pingDeadline = clock() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
   let pinged = 0;
   let deferred = 0;
   const failures: KeepaliveFailure[] = [];
 
-  let firstDeferred: string | null = null;
+  const deferredNow: string[] = [];
   await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
     // Checked as each target is picked up, so this bounds when a ping may
     // start, not when the phase ends: the pings already running continue past
     // the deadline. See PING_PHASE_BUDGET_MS.
-    if (Date.now() >= pingDeadline) {
+    if (clock() >= pingDeadline) {
       deferred += 1;
-      if (firstDeferred === null) firstDeferred = targetKey;
+      deferredNow.push(targetKey);
       return;
     }
     pinged += 1;
@@ -1200,9 +1235,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // handle expiring un-pinged -- looks like nothing at all from the outside.
   await handleKeepaliveFailures(failures, targets.size);
 
-  // Nothing deferred means the sweep reached every target, so the next one
-  // starts wherever it likes.
-  pingResumeAt = firstDeferred;
+  pingDeferred = deferredNow;
   if (deferred > 0) {
     logger.warn(
       { pinged, deferred, total: ordered.length,

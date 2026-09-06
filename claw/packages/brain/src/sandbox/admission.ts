@@ -21,8 +21,8 @@
 import type { KV } from "nats";
 import pino from "pino";
 import {
-  CeilingDisagreement, bindSlot, claimProvisionalSlot, releaseSlot,
-  type RosterConfig, type RosterStore,
+  CeilingDisagreement, bindSlot, claimProvisionalSlot, isFleetStale, markFleetStale,
+  releaseSlot, type RosterConfig, type RosterStore,
 } from "./admission-roster.js";
 import type { CapacitySettings } from "./keepalive-capacity.js";
 import { rosterDeps } from "./roster-store.js";
@@ -93,22 +93,21 @@ export async function releaseAdmission(identity: string): Promise<boolean> {
 }
 
 /**
- * Whether the roster is known to be complete.
+ * Whether the roster is known to be incomplete, as the fleet sees it.
  *
- * A reconciliation that exhausted its retries wrote nothing, so the roster is
- * missing every target it was about to take on. Admitting against it would be
- * admitting against an understated count -- the ceiling checked against a
- * number nobody could write -- so ordinary claims are refused until a later
- * reconciliation succeeds and says the roster is whole again.
+ * Recorded on the shared roster rather than in this process's memory: an
+ * incomplete roster is incomplete for everyone reading it, and a replica that
+ * never hit the fault would otherwise go on admitting against the same
+ * understated count.
  */
-let rosterStale = false;
-
-export function markRosterStale(stale: boolean): void {
-  rosterStale = stale;
+export async function isRosterStale(): Promise<boolean> {
+  if (!roster) return false;
+  return isFleetStale(roster.store).catch(() => true);
 }
 
-export function isRosterStale(): boolean {
-  return rosterStale;
+/** Record that the roster is incomplete, for every replica reading it. */
+export async function markRosterStale(reason: string): Promise<void> {
+  if (roster) await markFleetStale(roster.store, roster.config, reason);
 }
 
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
@@ -143,7 +142,7 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
-  if (rosterStale) {
+  if (await isRosterStale()) {
     throw new SandboxCapacityRefused(
       "sandbox admission refused: the keepalive roster could not be reconciled, so "
       + "the fleet count it would be checked against is incomplete",

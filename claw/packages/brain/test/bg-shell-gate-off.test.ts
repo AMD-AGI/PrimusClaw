@@ -29,8 +29,14 @@ import { assertBackgroundSurface, assertSurfaceMatches } from "./fixtures/builti
 /** Records what would have reached the sandbox. */
 function makeRouter(): { router: ToolRouter; calls: string[] } {
   const calls: string[] = [];
+  // Both entry points, because the router uses the one that carries the error
+  // bit and a stub with only the other would answer undefined.
   const hands = {
     callTool: async (name: string) => { calls.push(name); return "ran"; },
+    callToolFull: async (name: string) => {
+      calls.push(name);
+      return { text: "ran", isError: false };
+    },
   } as unknown as HandsClient;
   return { router: new ToolRouter(hands), calls };
 }

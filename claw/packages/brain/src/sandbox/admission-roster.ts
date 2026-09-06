@@ -40,6 +40,16 @@ export interface Roster {
   /** The ceiling this roster was stamped at, so a disagreeing replica refuses. */
   ceiling: number;
   entries: RosterEntry[];
+  /**
+   * Set where a reconciliation could not complete, so the roster is missing
+   * targets it was about to take on.
+   *
+   * On the record rather than in one process's memory: the roster is shared, so
+   * an incomplete one is incomplete for every replica reading it, and a
+   * neighbour that never hit the contention would otherwise go on admitting
+   * against the same understated count.
+   */
+  stale?: { at: number; replicaId: string; reason: string };
 }
 
 export interface RosterRead {
@@ -236,8 +246,29 @@ export interface ReconcileResult {
  * roster size above the ceiling is a declared capacity breach, reported as such.
  * Nothing is expired, reclaimed, evicted or terminated on account of it.
  */
+export async function markFleetStale(
+  store: RosterStore, config: RosterConfig, reason: string,
+): Promise<void> {
+  await mutate<void>(store, config, (roster, now) => ({
+    write: { ...roster, stale: { at: now, replicaId: config.replicaId, reason } },
+    result: undefined,
+  })).catch(() => { /* a roster that cannot be written is already refusing */ });
+}
+
+export async function isFleetStale(store: RosterStore): Promise<boolean> {
+  const current = await store.read();
+  return !!current?.roster.stale;
+}
+
+/**
+ * Take on every target the roster does not already hold, before serving it.
+ *
+ * `complete` says whether the census this was given can be trusted: a target
+ * scan that could not read everything produces a smaller set, and reconciling
+ * that set would clear a staleness the fleet still has.
+ */
 export async function reconcileTargets(
-  store: RosterStore, config: RosterConfig, identities: string[],
+  store: RosterStore, config: RosterConfig, identities: string[], complete = true,
 ): Promise<ReconcileResult> {
   return mutate<ReconcileResult>(store, config, (roster, now) => {
     const held = new Set(roster.entries.map((e) => e.identity).filter((i): i is string => !!i));
@@ -254,7 +285,16 @@ export async function reconcileTargets(
       breach: entries.length > config.ceiling,
       beyondCeiling: beyond,
     };
-    return missing.length === 0 ? { result } : { write: { ...roster, entries }, result };
+    // Only a complete census clears the flag. Reconciling a partial one would
+    // announce a fleet whole on the strength of a scan that could not read it.
+    const stale = complete
+      ? undefined
+      : roster.stale ?? { at: now, replicaId: config.replicaId, reason: "incomplete target scan" };
+    const next: Roster = { ...roster, entries, ...(stale ? { stale } : {}) };
+    if (complete) delete next.stale;
+    return missing.length === 0 && complete && !roster.stale
+      ? { result }
+      : { write: next, result };
   });
 }
 

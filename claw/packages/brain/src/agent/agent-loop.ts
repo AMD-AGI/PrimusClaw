@@ -1808,14 +1808,19 @@ class AgentLoopRunner {
 
       const toolStart = Date.now();
       let resultText: string;
+      let toolOutcome = { isError: false };
       try {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
       // executing split exists to measure.
+      // Filled by the router from the tool's own result, so what counts as
+      // success is the tool's answer rather than the shape of its wording.
+      const outcome = { isError: false };
       resultText = WAITING_TOOLS.has(toolName)
         ? await whileWaiting(this.opts.runKey, "background_command", () =>
-            this.router.route(toolName, finalInput, this.signal))
-        : await this.router.route(toolName, finalInput, this.signal);
+            this.router.route(toolName, finalInput, this.signal, outcome))
+        : await this.router.route(toolName, finalInput, this.signal, outcome);
+      toolOutcome = outcome;
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result
         // text describes a business-level failure (exit != 0), which still came
@@ -1885,12 +1890,10 @@ class AgentLoopRunner {
       // `start` (above); not re-sending it halves bytes vs always-double
       // serialising args without breaking the frontend reducer (which
       // matches by actionId and updates description on success/error).
-      // Counted from the result, not from the attempt: a tool whose own answer
-      // says it failed did not happen, whatever the turn goes on to report.
-      // Hands reports a failure as result text beginning `Error:` or, for a
-      // command, `timeout after` / `exit <n>` -- the same shapes the router
-      // returns for a refusal.
-      if (!/^(Error:|timeout after |exit \d)/.test(resultText.trimStart())) {
+      // Counted from the tool's own error bit, not from the attempt and not
+      // from the wording: a failure's phrasing is the tool's to choose, and a
+      // prefix match counts every one it did not anticipate as a success.
+      if (!toolOutcome.isError) {
         this.toolOkByName[toolName] = (this.toolOkByName[toolName] || 0) + 1;
       }
     await this.onEvent({

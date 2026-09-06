@@ -53,6 +53,7 @@ import {
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
+import { readHandsEntry } from "./registry.js";
 import { admitSandbox, type AdmissionHold } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
 
@@ -408,7 +409,11 @@ async function readReusableEntry(
 ): Promise<{ entry: NonNullable<Awaited<ReturnType<typeof kv.get>>>; info: any } | null> {
   let entry: Awaited<ReturnType<typeof kv.get>>;
   try {
-    entry = await kv.get(handsSessionKey(sessionId));
+    // Read-through, because an old replica in a rolling upgrade writes and
+    // reads only the legacy key: looking at the canonical one alone would read
+    // a live session as having no sandbox and provision a second.
+    const found = await readHandsEntry(kv, sessionId);
+    entry = found ? { value: sc.encode(found.value), revision: found.revision } as typeof entry : null;
   } catch (cause) {
     throw new Error("hands KV is unavailable; refusing unsafe sandbox replacement", { cause });
   }

@@ -19,9 +19,6 @@ import type { CapacitySettings } from "./keepalive-capacity.js";
 
 const sc = StringCodec();
 const ROSTER_KEY = "keepalive.roster";
-/** Held long enough that neither a slow sweep nor a slow but live provisioning
- *  loses its reservation. */
-const RECLAIM_HORIZON_MS = 15 * 60_000;
 
 export function rosterStore(kv: KV): RosterStore {
   return {
@@ -58,7 +55,10 @@ export function rosterDeps(
       config: {
         ceiling: capacity.ceiling,
         reconciliationReserve: capacity.reconciliationReserve,
-        reclaimHorizonMs: RECLAIM_HORIZON_MS,
+        // Derived at startup from the provisioning ceiling and the sweep span,
+        // because the relation is what matters: a slot released while its
+        // sandbox is still being provisioned is a live sandbox holding none.
+        reclaimHorizonMs: capacity.reclaimHorizonMs,
         replicaId: BRAIN_ID,
       },
     },

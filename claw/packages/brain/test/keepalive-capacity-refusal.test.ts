@@ -23,6 +23,7 @@ import {
 const DECLARED = {
   targetCeiling: "200", reconcileReserve: "20",
   idleDeadlineSec: "900", pingsPerSweep: 64, sweepSpanSec: 30,
+  provisioningCeilingSec: 3600,
 };
 
 test("background shells with the sweep disabled is refused, naming both settings", () => {
@@ -49,7 +50,7 @@ test("no path substitutes a default interval for the rejected one", () => {
 test("either half alone starts normally", () => {
   assert.deepEqual(
     validateKeepaliveCapacity({ bgShellEnabled: false, keepaliveIntervalSec: 0, ...DECLARED }),
-    { ceiling: 0, reconciliationReserve: 0, deferralCount: 0, activityGapSec: 0 },
+    { ceiling: 0, reconciliationReserve: 0, deferralCount: 0, activityGapSec: 0, reclaimHorizonMs: 0 },
     "with background shells off there is no ceiling to hold and no work to protect",
   );
   const proven = validateKeepaliveCapacity({
@@ -137,4 +138,31 @@ test("an undeclared reclaim deadline is refused rather than read as absent", () 
       JSON.stringify(idleDeadlineSec),
     );
   }
+});
+
+test("the reclaim horizon is derived to exceed the provisioning ceiling", () => {
+  // The design pins the relation, not the number: a slot released while its
+  // sandbox is still being provisioned is a live sandbox holding none, which is
+  // the un-slotted target the ceiling exists to prevent. A fixed horizon beside
+  // a configurable ceiling cannot hold that.
+  for (const provisioningCeilingSec of [600, 3600, 3 * 3600]) {
+    const proven = validateKeepaliveCapacity({
+      ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60, provisioningCeilingSec,
+    });
+    assert.ok(proven.reclaimHorizonMs > provisioningCeilingSec * 1000,
+      `horizon ${proven.reclaimHorizonMs}ms does not exceed a ${provisioningCeilingSec}s ceiling`);
+    assert.ok(proven.reclaimHorizonMs > DECLARED.sweepSpanSec * 1000,
+      "and it exceeds one sweep span too");
+  }
+});
+
+test("an unbounded provisioning ceiling is refused, since no horizon can exceed it", () => {
+  assert.throws(
+    () => validateKeepaliveCapacity({
+      ...DECLARED, bgShellEnabled: true, keepaliveIntervalSec: 60, provisioningCeilingSec: 0,
+    }),
+    (err: unknown) => err instanceof KeepaliveConfigRefused
+      && /unbounded/.test(err.message)
+      && /still being provisioned/.test(err.message),
+  );
 });

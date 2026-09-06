@@ -19,12 +19,13 @@
  */
 
 import {
-  HANDS_KEY_PREFIX, handsSessionKey, isReservedRetentionKey, isRetentionEntry,
+  HANDS_KEY_PREFIX, handsSessionKey, isLegacySessionKey, isRetentionEntry,
 } from "@claw/protocol";
 
 export {
   HANDS_KEY_PREFIX, REKEYED_MARKER, RETAINED_PREFIX, handsKeyNeedsRekey,
-  handsSessionKey, isRetentionEntry, isReservedRetentionKey, sessionIdFromHandsKey,
+  handsSessionKey, isLegacySessionKey, isRetentionEntry, isReservedRetentionKey,
+  legacyHandsKey, sessionIdFromHandsKey,
 } from "@claw/protocol";
 
 /**
@@ -70,7 +71,11 @@ export async function migrateReservedSessionKeys(
   // Walked as whole session keys and narrowed here: the store's `*` matches one
   // whole token and never a prefix inside one, so a filter spelling the marker
   // into the token would match nothing and report a namespace it never looked at.
-  const keys = (await store.keys(`${HANDS_KEY_PREFIX}*`)).filter(isReservedRetentionKey);
+  // Both markers, not just the reserved one: an id beginning with the re-key
+  // marker is re-keyed as well, so a pre-existing entry under its raw form is
+  // equally a legacy key -- and left behind it is read as an already-encoded
+  // one, which decodes to something no session answers to.
+  const keys = (await store.keys(`${HANDS_KEY_PREFIX}*`)).filter(isLegacySessionKey);
   const result: ReservedKeyMigration = {
     scanned: keys.length, migrated: [], resumed: [], conflicted: [],
   };
@@ -120,7 +125,7 @@ export async function assertRetentionSeparation(store: HandsKeyStore): Promise<v
   // whole token and never a prefix inside one, so a filter spelling the marker
   // into the token would match nothing and report a namespace it never looked at.
   for (const key of await store.keys(`${HANDS_KEY_PREFIX}*`)) {
-    if (!isReservedRetentionKey(key)) continue;
+    if (!isLegacySessionKey(key)) continue;
     try {
       const entry = await store.read(key);
       if (entry === null || !isRetentionEntry(JSON.parse(entry.value))) colliding.push(key);
