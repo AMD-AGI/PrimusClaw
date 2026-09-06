@@ -28,6 +28,12 @@ let seen: Array<{ sql: string; params: unknown[] }>;
 let updateRows: Array<Record<string, unknown>> = [{ status: "running" }];
 /** The row the refusal lookup finds, once the UPDATE has already declined. */
 let refusalRows: Array<Record<string, unknown>> = [];
+/**
+ * Whether the renewal statement finds a lease this caller already holds. False
+ * is how a case reaches the acquisition statement behind it, which is the only
+ * one that may write an owner.
+ */
+let renewalMatches = true;
 
 before(async () => {
   process.env.AUTH_INTERNAL_TOKEN = TOKEN;
@@ -45,6 +51,7 @@ after(async () => {
 
 function stubDb(): void {
   seen = [];
+  renewalMatches = true;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push({ sql, params });
@@ -53,6 +60,11 @@ function stubDb(): void {
     if (sql.startsWith("SELECT internal_token_hash")) return { rows: [{}], rowCount: 1 };
     if (sql.startsWith("SELECT status, lease_owner")) {
       return { rows: refusalRows, rowCount: refusalRows.length };
+    }
+    // The renewal is the statement that writes no owner; the acquisition
+    // behind it is the one that does.
+    if (sql.startsWith("UPDATE claw_tasks SET lease_expires_at") && !renewalMatches) {
+      return { rows: [], rowCount: 0 };
     }
     return { rows: updateRows, rowCount: updateRows.length };
   }) as typeof db.query;
@@ -71,6 +83,23 @@ async function renew(body: Record<string, unknown>) {
 /** The lease UPDATE, as opposed to the auth lookup that precedes it. */
 function leaseUpdate() {
   return seen.find((q) => q.sql.startsWith("UPDATE claw_tasks"))!;
+}
+
+/** The second statement: the one a caller that holds nothing yet must match. */
+function acquisition() {
+  return seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET lease_owner"))!;
+}
+
+/** A renewal that finds no lease of its own, so acquisition is reached. */
+async function acquire(body: Record<string, unknown>) {
+  stubDb();
+  renewalMatches = false;
+  return app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/t-1/lease",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: body,
+  });
 }
 
 test("a renewal extends the lease and records the heartbeat", async () => {
@@ -214,12 +243,13 @@ test("only the worker the row recognises may renew it", async () => {
 test("a lease nobody holds yet can still be claimed", async () => {
   // Two of them: the first renewal a run ever makes, and a run dispatched
   // before leases existed. Neither has an owner to compare against, and both
-  // have to be able to become one.
+  // have to be able to become one -- which the renewal above may not do, so
+  // it is the acquisition behind it that has to.
   updateRows = [{ status: "running" }];
-  await renew({ brain_id: "brain-7", lease_seconds: 45 });
+  await acquire({ brain_id: "brain-7", lease_seconds: 45 });
 
-  assert.match(leaseUpdate().sql, /lease_owner IS NULL/);
-  assert.match(leaseUpdate().sql, /lease_expires_at IS NULL/);
+  assert.match(acquisition().sql, /lease_owner IS NULL/);
+  assert.match(acquisition().sql, /lease_expires_at IS NULL/);
 });
 
 test("an expired lease may change hands, which is what a takeover is", async () => {
@@ -228,9 +258,59 @@ test("an expired lease may change hands, which is what a takeover is", async () 
   // as "owner is null or owner is me" would refuse every takeover there is and
   // leave the run to be reaped instead of resumed.
   updateRows = [{ status: "running" }];
-  await renew({ brain_id: "brain-8", lease_seconds: 45 });
+  await acquire({ brain_id: "brain-8", lease_seconds: 45 });
 
-  assert.match(leaseUpdate().sql, /lease_expires_at < NOW\(\)/);
+  assert.match(acquisition().sql, /lease_expires_at < NOW\(\)/);
+});
+
+test("a renewal may not write the owner, the generation or the receipt", async () => {
+  // The reason the two statements exist. `brain_id` is a pod name rather than
+  // a per-claim identity, so a statement that could both renew and open a
+  // generation would let a redelivery landing on the incumbent pod be read as
+  // a fresh claim on the row its own previous attempt is still running.
+  updateRows = [{ status: "running" }];
+  await renew({ brain_id: "brain-7", lease_seconds: 45 });
+
+  const assignments = leaseUpdate().sql.split(/\bWHERE\b/)[0];
+  assert.doesNotMatch(assignments, /lease_owner\s+=/);
+  assert.doesNotMatch(assignments, /claim_count\s+=/);
+  assert.doesNotMatch(assignments, /dispatch_compensation/);
+});
+
+test("a blank brain_id is refused before anything is written", async () => {
+  updateRows = [{ status: "running" }];
+  stubDb();
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/t-1/lease",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "", lease_seconds: 45 },
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(seen.some((q) => q.sql.startsWith("UPDATE claw_tasks")), false);
+});
+
+test("a database failure is retryable rather than a lease", async () => {
+  // Answering 200 with an unknown status told an acceptance it held a lease it
+  // did not, and the delivery then waited for an execution slot with no
+  // durable holder state behind it.
+  stubDb();
+  db.query = (async (text: string) => {
+    if (text.replace(/\s+/g, " ").trim().startsWith("SELECT internal_token_hash")) {
+      return { rows: [{}], rowCount: 1 };
+    }
+    throw new Error("connection terminated");
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/t-1/lease",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", lease_seconds: 45 },
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.json().ok, false);
 });
 
 test("the phase and the waiting total travel with the renewal", async () => {

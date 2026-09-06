@@ -168,6 +168,58 @@ export interface RunLease {
   url: string;
   /** Bearer token scoped to this run; the same per-run token the callbacks use. */
   token: string;
+  /**
+   * That the worker must hold this lease before it waits for an execution slot.
+   *
+   * Additive: a message published before the marker existed is recognised by
+   * its shape instead — a non-doorbell request carrying `run_lease` and no
+   * `callback_url` — so an in-flight legacy payload still pre-leases.
+   */
+  accept_before_execution?: true;
+}
+
+/** What one lease POST asks of the row. */
+export interface RunLeaseRequest {
+  brain_id: string;
+  lease_seconds?: number;
+  phase?: RunPhase;
+  wait_reason?: RunWaitReason;
+  waited_ms?: number;
+  waits?: number;
+  /**
+   * That this POST is the worker's acceptance of the delivery rather than a
+   * renewal of a lease it already holds. Only an acceptance may open a
+   * generation, and only a caller that sends it will quote one afterwards.
+   */
+  accept?: true;
+  /**
+   * The generation the acceptance issued this worker. Omitted, never invented,
+   * when the acceptance was served by an API that returned none.
+   */
+  run_claim?: number;
+}
+
+/** What the lease endpoint answers a caller it accepted. */
+export interface RunLeaseResponse {
+  ok: true;
+  status: string;
+  /**
+   * The row's generation. Absent from an API that predates it, which is a
+   * successful acceptance carrying no generation rather than a malformed one.
+   */
+  claim_count?: number;
+}
+
+/**
+ * Which row and which generation a completion is reporting for.
+ *
+ * Both additive on `exec_complete`: a completion that names neither is one
+ * from a worker whose acceptance issued neither, and is admissible only while
+ * the row it names is unfenced.
+ */
+export interface ExecCompleteRunIdentity {
+  task_id?: string;
+  run_claim?: number;
 }
 
 /** What a run is doing right now, as reported with each lease renewal. */

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import { StringCodec, type JsMsg, type KV } from "nats";
-import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import type { ExecCompleteRunIdentity, ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import { currentFatDelivery } from "../delivery/dispatch.js";
 import {
   HandsRebuildFailed,
   HandsRecoveryBudgetExhausted,
@@ -216,6 +217,23 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
 }
 
 /**
+ * Which row and which generation a completion is reporting for.
+ *
+ * The generation belongs to the delivery rather than to any one phase of it,
+ * so it is read from the delivery context the handler runs under. Omitted,
+ * never invented, when the acceptance was served by an API that issued none:
+ * a completion carrying a generation the row never handed out would close a
+ * row this run does not own.
+ */
+function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
+  const runClaim = currentFatDelivery()?.runClaim;
+  return {
+    ...(request.task_id ? { task_id: request.task_id } : {}),
+    ...(runClaim === undefined ? {} : { run_claim: runClaim }),
+  };
+}
+
+/**
  * Resolve a task whose JetStream delivery budget is exhausted.
  *
  * DAG tasks must use the same durable callback/outbox handoff as every other
@@ -243,6 +261,7 @@ export async function resolvePoisonedTask(
     skills_used: {},
     prompt: request.prompt,
     delivery_count: msg.info.deliveryCount,
+    ...runIdentity(request),
   };
   if (messageId) event.message_id = messageId;
 
@@ -2417,6 +2436,7 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     // Persist the user-visible completion event before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
@@ -2822,6 +2842,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     await deliverAgentDone(
       this.kvCkpt,
@@ -3046,6 +3067,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     // Every failed run asks the platform, not only one that reached the rebuild
     // path: a sandbox can vanish in ways that surface as an ordinary tool error,
@@ -3189,6 +3211,7 @@ class TaskRunner {
     if (!this.request.run_lease?.url) return null;
     const tick = () => {
       const phase = phaseOf(this.lockKey);
+      const runClaim = currentFatDelivery()?.runClaim;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
@@ -3196,6 +3219,7 @@ class TaskRunner {
         waitReason: phase.waitReason,
         waitedMs: phase.waitedMs,
         waits: phase.waits,
+        ...(runClaim === undefined ? {} : { runClaim }),
       }).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
         // two workers driving one sandbox, or a run writing a workspace a
@@ -3244,6 +3268,10 @@ class TaskRunner {
     // own request timeout.
     let cancelDeadline: () => void = () => {};
     const leaseTimer = this.startLeaseHeartbeat();
+    // Only once this run's own renewal is armed, so the two owners overlap:
+    // the delivery layer keeps the lease alive until this line, and a gap
+    // between them is a lease another pod could take the row over on.
+    if (leaseTimer) currentFatDelivery()?.handOffRenewal();
     // keepAlive must be much shorter than the consumer's ack_wait to avoid
     // redelivery while a task is still making progress. That is
     // TASK_CONSUMER_ACK_WAIT_NS, two minutes, against the ten seconds here.

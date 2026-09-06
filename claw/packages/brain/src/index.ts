@@ -72,7 +72,7 @@ import { taskExecutionGate } from "./tasks/execution-gate.js";
 import { setParkHooks } from "./tasks/run-phase.js";
 import { keepDeliveryAlive } from "./delivery/heartbeat.js";
 import {
-  runDelivery, DeliveryResidency, SURPLUS_REFUSALS, type DeliveryDeps,
+  runDelivery, createFatPreGate, DeliveryResidency, SURPLUS_REFUSALS, type DeliveryDeps,
 } from "./delivery/dispatch.js";
 import pino from "pino";
 import {
@@ -659,6 +659,9 @@ async function main() {
         return false;
       }
     },
+    // A fat chat delivery holds a durable SQL lease before it queues for a
+    // slot, so a Stop reaches it through the row while nothing else can.
+    fatPreGate: createFatPreGate({ emit: (sessionId, evt) => emitter.emit(sessionId, evt) }),
     handle: (m) => handleTask(m),
     onError: (err) => logger.error({ err }, "task.unhandled"),
     onRefuse: (kind) => {
