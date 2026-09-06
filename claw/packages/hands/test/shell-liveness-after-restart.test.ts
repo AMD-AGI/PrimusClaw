@@ -18,7 +18,7 @@
 import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -106,6 +106,46 @@ test("a shell that ended before the restart does not hold the sandbox open", asy
   const after = ownerLiveness(OWNER, emptyRegistry);
   assert.equal(after.active, 0);
   assert.equal(after.classes.ended_unreaped, 1);
+});
+
+test("a zombie is not work, so it does not hold the sandbox open", async () => {
+  // The case presence cannot answer: an exited child whose parent has not
+  // waited on it keeps its /proc entry and its start token, so every check
+  // short of reading the process state reports it alive. Counted as work, one
+  // of these holds a sandbox open for as long as its parent lives.
+  // A shell parent is no good here: it reaps its own background children, and
+  // Node's child_process does too. This parent provably never waits.
+  const parent = spawn(
+    "python3",
+    ["-c", "import subprocess,time; print(subprocess.Popen(['/bin/true']).pid, flush=True); time.sleep(60)"],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+  );
+  survivors.push(parent);
+  const zombiePid = await new Promise<number>((resolve, reject) => {
+    parent.stdout!.once("data", (b: Buffer) => resolve(Number(b.toString().trim())));
+    parent.once("error", (e) => reject(new Error(`cannot build a zombie: ${e.message}`)));
+  });
+  // The parent has to reach `sleep` before the child is reaped-by-nobody.
+  await new Promise((r) => setTimeout(r, 200));
+
+  records.claimRecord({
+    owner_scope: OWNER, run_identity: RUN, shell_id: "zombie",
+    command_digest: "d", kind: "background",
+    claimed_at: new Date().toISOString(), hands_epoch: records.currentEpoch()!.epoch,
+  });
+  records.attachRecord(OWNER, RUN, "zombie", {
+    pid: zombiePid, startToken: records.processStartToken(zombiePid),
+  });
+
+  assert.equal(existsSync(`/proc/${zombiePid}`), true,
+    "sanity: the entry is still there, which is why presence is not the test");
+
+  const live = ownerLiveness(OWNER, emptyRegistry);
+  assert.equal(live.determinate, true);
+  assert.equal(live.active, 0, "a zombie was counted as live work");
+  assert.equal(live.classes.ended_unreaped, 1);
+
+  parent.kill("SIGKILL");
 });
 
 test("a claim with no process yet still blocks reclamation after a restart", () => {
