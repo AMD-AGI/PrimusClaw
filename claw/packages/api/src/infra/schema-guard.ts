@@ -52,6 +52,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "session_id", "user_id", "agent_status", "status", "config", "created_at",
       "cleanup_state", "cleanup_attempts", "cleanup_next_at", "cleanup_error",
+      // Absent, every gate acquisition fails and no turn can start at all.
+      "agent_gate_message_id",
     ],
   },
   {

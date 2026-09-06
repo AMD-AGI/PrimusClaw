@@ -36,7 +36,7 @@ import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
 } from "../workspace/store.js";
 import {
-  ACTIONABLE_RECEIPT_SQL, failChatRunDispatch, noDeliveryInFlightSql,
+  ACTIONABLE_RECEIPT_SQL, failChatRunDispatch, gateOwnershipEnforced, noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 
@@ -441,8 +441,10 @@ export async function reapExpiredQueuedRuns(): Promise<number> {
     await releaseRunUse(row.task_id, false);
     await announceQueueTimeout(row);
   }
-  const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
-  await releaseSessionsOfLostRuns(ids);
+  await releaseSessionsOfLostRuns(
+    (r.rows as Array<{ session_id: string; message_id?: string | null }>)
+      .map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
+  );
   return r.rowCount;
 }
 
@@ -482,6 +484,7 @@ async function announceRunFailure(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: row.session_id,
     message_id: row.message_id ?? undefined,
+    task_id: row.task_id,
     ...event,
   });
   try {
@@ -581,7 +584,8 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
     await releaseRunUse(row.task_id, false);
   }
   await releaseSessionsOfLostRuns(
-    r.rows.map((row) => (row as { session_id: string }).session_id),
+    (r.rows as Array<{ session_id: string; message_id?: string | null }>)
+      .map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
   );
   return r.rowCount;
 }
@@ -642,7 +646,9 @@ export async function reapLostLeases(): Promise<number> {
   // Ahead of the gate release, not after it: the spare row is non-terminal, and
   // the release refuses to act on a session with anything non-terminal left.
   await closeUnclaimedDispatchSiblings(chatRows);
-  await releaseSessionsOfLostRuns(chatRows.map((row) => row.session_id));
+  await releaseSessionsOfLostRuns(
+    chatRows.map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
+  );
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
   // the workload detail still exists. Best-effort because liveness cleanup must
@@ -806,22 +812,45 @@ async function countPendingBySession(
  * the log below so the wait is visible while that path is still unreachable
  * from here.
  */
-async function releaseSessionsOfLostRuns(sessionIds: string[]): Promise<void> {
-  if (!sessionIds.length) return;
+/** One run's claim on the gate: the session it holds, and the turn that took it. */
+export interface LostRunGate {
+  sessionId: string;
+  messageId: string | null;
+}
+
+/**
+ * Hand back the gates of runs this tick closed, and only those.
+ *
+ * Keyed by the turn as well as the session because occupancy alone answers a
+ * different question: the immediate path commits `agent_status = 'running'` and
+ * inserts the run row several awaits later, so a release evaluated in that
+ * window opens the gate under a live turn. Timestamps cannot close it either --
+ * NOW() is transaction-start time, so a newer turn's flip can carry a stamp
+ * older than the compensated row's completed_at.
+ */
+async function releaseSessionsOfLostRuns(gates: LostRunGate[]): Promise<void> {
+  if (!gates.length) return;
   const r = await db.query(
     `UPDATE claw_sessions s
         SET agent_status = 'idle',
+            agent_gate_message_id = NULL,
             updated_at = NOW()
-      WHERE s.session_id = ANY($1::text[])
+       FROM UNNEST($1::text[], $2::text[]) AS g(session_id, message_id)
+      WHERE s.session_id = g.session_id
         AND s.agent_status = 'running'
         AND s.deleted_at IS NULL
+        AND (NOT $3::boolean OR s.agent_gate_message_id = g.message_id)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = s.session_id
              AND t.status IN ('queued','preparing','running','cancelling')
         )
-      RETURNING session_id`,
-    [sessionIds],
+      RETURNING s.session_id`,
+    [
+      gates.map((g) => g.sessionId),
+      gates.map((g) => g.messageId),
+      gateOwnershipEnforced(),
+    ],
   );
   if (!r.rowCount) return;
   const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
@@ -997,7 +1026,7 @@ async function finalizeOneCompensation(row: FinalizableRow): Promise<boolean> {
     logger.warn({ taskId: row.task_id }, "sweeper.compensation_cleanup_incomplete");
     return false;
   }
-  await releaseSessionsOfLostRuns([row.session_id]);
+  await releaseSessionsOfLostRuns([{ sessionId: row.session_id, messageId: row.message_id }]);
   return await markReceiptComplete(row.task_id);
 }
 

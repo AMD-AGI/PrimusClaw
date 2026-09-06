@@ -25,7 +25,9 @@ import {
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { markChatRunRunning, closeChatRun, queuedMessageId } from "../tasks/chat-run.js";
+import {
+  markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+} from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
@@ -345,12 +347,18 @@ export async function consumeEventDelivery(msg: {
         // Two questions, because there are two ways the same completion arrives
         // twice: this delivery was processed before (its own row says so), or
         // the turn was published again and processed under a different row.
+        // The message-level gate must not reach an event that names a chat
+        // row: two generations of one turn share a message id, so the stale
+        // one's marked event would suppress the live one's. Row-level
+        // admissibility is what settles that case instead.
+        const provenance = await resolveChatRunProvenance(event);
+        const namesChatRow = provenance !== null && provenance !== "foreign";
         const alreadyDone = !needsProcessing
-          || await completionAlreadyProcessed(sessionId, messageId);
+          || (!namesChatRow && await completionAlreadyProcessed(sessionId, messageId));
         if (alreadyDone) {
           logger.info({ sessionId, eventId, messageId }, "exec_complete.skipped_already_processed");
         } else {
-          await handleComplete(sessionId, event, rowId);
+          await handleComplete(sessionId, event, rowId, provenance);
         }
         // Marked either way: nothing is left for a retry of this row to do, and
         // a row left NULL says the opposite to anything reading for pending work.
@@ -544,11 +552,15 @@ export async function releaseSessionGateIfLastRun(
   messageId: string | null,
   failed: boolean,
 ): Promise<boolean> {
+  // A NULL marker fails closed rather than matching: a session gated before the
+  // column existed is released by no run-scoped caller, and reapStuckSessions
+  // is the backstop for that bounded population.
   const r = await db.query(
     `UPDATE claw_sessions
-        SET agent_status = $1, updated_at = NOW()
+        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
+        AND (NOT $4::boolean OR agent_gate_message_id = $3)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
@@ -556,7 +568,7 @@ export async function releaseSessionGateIfLastRun(
              AND t.status IN ('queued','preparing','running','cancelling')
              AND t.metadata->>'message_id' IS DISTINCT FROM $3
         )`,
-    [failed ? "failed" : "idle", sessionId, messageId],
+    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced()],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -599,7 +611,42 @@ export async function applyPendingCredentials(
   }
 }
 
-async function handleComplete(sessionId: string, event: Record<string, unknown>, eventRowId?: number | null): Promise<void> {
+/**
+ * Which chat row this completion belongs to, if any.
+ *
+ * Routing is by what the named row *is*, not by whether the field is present:
+ * DAG and standalone execute requests have always carried `task_id`, and their
+ * completions must keep doing exactly what they do today. A `task_id` naming a
+ * row that is not a chat row, or naming no row at all, is not a chat completion.
+ *
+ * @returns the chat row's id, `"foreign"` for a task id that names something
+ *   else, or null when the event names no task at all.
+ */
+export async function resolveChatRunProvenance(
+  event: Record<string, unknown>,
+): Promise<string | "foreign" | null> {
+  const taskId = typeof event.task_id === "string" && event.task_id ? event.task_id : null;
+  if (!taskId) return null;
+  const r = await db.query(
+    "SELECT origin FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const origin = (r.rows[0] as { origin?: string } | undefined)?.origin;
+  return origin === "chat" ? taskId : "foreign";
+}
+
+/** The generation the reporter was issued, omitted rather than invented. */
+function runClaimOf(event: Record<string, unknown>): number | undefined {
+  const raw = event.run_claim;
+  return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
+}
+
+async function handleComplete(
+  sessionId: string,
+  event: Record<string, unknown>,
+  eventRowId?: number | null,
+  provenance: string | "foreign" | null = null,
+): Promise<void> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
   // Null rather than "" when absent: the unique index over the turns is partial
@@ -611,6 +658,10 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
     ? (event as any).message_id
     : null;
 
+  // A completion whose task id names a DAG or standalone row keeps every step
+  // below and touches no chat row: widening the close to it would terminalize
+  // that row before its own authoritative result applied.
+
   // 1. Close this turn's shadow row, saying how the run that was occupying the
   // session ended.
   //
@@ -619,12 +670,15 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
   // that question. `closeChatRun` is safe to run first: with no message id it
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
-  await closeChatRun(
-    sessionId,
-    messageId ?? undefined,
-    interrupted ? "cancelled" : failed ? "failed" : "completed",
-    failed ? String(failure_reason ?? "agent_error") : undefined,
-  );
+  if (provenance !== "foreign") {
+    await closeChatRun(
+      sessionId,
+      messageId ?? undefined,
+      interrupted ? "cancelled" : failed ? "failed" : "completed",
+      failed ? String(failure_reason ?? "agent_error") : undefined,
+      { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
+    );
+  }
 
   // 2. Hand the conversation back -- but only if this was the last run on it.
   //

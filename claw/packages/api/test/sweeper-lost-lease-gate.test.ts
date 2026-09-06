@@ -86,7 +86,9 @@ test("a conversation whose run was given up on can be spoken to again", async ()
   const updates = sessionUpdates(seen);
   assert.equal(updates.length, 1, "the row was closed but the gate was left shut");
   assert.match(updates[0].sql, /agent_status = 'idle'/);
-  assert.deepEqual(updates[0].params, [["s-1"]]);
+  // The turn travels with the session: occupancy alone cannot tell this run's
+  // gate from one a newer turn took while the reaper was deciding.
+  assert.deepEqual(updates[0].params, [["s-1"], ["claw-pending-7"], false]);
 });
 
 test("the gate stays shut while anything is still executing", async () => {

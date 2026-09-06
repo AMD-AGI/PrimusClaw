@@ -494,6 +494,10 @@ export async function initDb(): Promise<void> {
     await addCol("a2a_caller_id", "TEXT DEFAULT ''");
     await addCol("parent_session_id", "TEXT");
     await addCol("team_role", "TEXT DEFAULT ''");
+    // Which turn holds the gate, so a release made on one run's behalf cannot
+    // open it under a later one. NULL is the correct value for a session gated
+    // before this column existed, and every reader treats it as fail-closed.
+    await addCol("agent_gate_message_id", "TEXT");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_context ON claw_sessions(context_id) WHERE context_id != ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_a2a_caller ON claw_sessions(a2a_caller_id) WHERE a2a_caller_id != ''").catch(() => {});

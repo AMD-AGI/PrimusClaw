@@ -40,7 +40,7 @@ import { envInt, RUN_DOORBELL_DISPATCH } from "../config.js";
 import { db } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
-import { openChatRun, failChatRunDispatch } from "./chat-run.js";
+import { openChatRun, failChatRunDispatch, takeSessionGate } from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
 import { handOffAssembledRun } from "./run-dispatch.js";
 import { injectLiveUserEnv } from "./run-claim.js";
@@ -242,6 +242,12 @@ async function countBindAttempt(
 export async function publishRefusedTurn(
   input: PendingDispatchInput,
   failureReason = "workspace_bind_failed",
+  /**
+   * The row this refusal terminalized, when it opened one. Supplied rather
+   * than inferred: without it a message-scoped terminal event can be read as
+   * belonging to a sibling row that carries holder evidence.
+   */
+  taskId?: string,
 ): Promise<void> {
   const finalText = failureReason === "workspace_bind_failed"
     ? "This message was not started: its workspace could not be prepared. "
@@ -251,6 +257,7 @@ export async function publishRefusedTurn(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: input.sessionId,
     message_id: input.messageId,
+    ...(taskId ? { task_id: taskId } : {}),
     ...event,
   });
   await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
@@ -273,12 +280,13 @@ export async function publishRefusedTurn(
 async function refusePendingAdmission(
   input: PendingDispatchInput,
   reason: string,
+  taskId?: string,
 ): Promise<void> {
   logger.error(
     { sessionId: input.sessionId, pendingId: input.pendingId, err: reason },
     "pending.admission_rejected",
   );
-  await publishRefusedTurn(input, reason);
+  await publishRefusedTurn(input, reason, taskId);
   forgetUncountedAttempts(input.pendingId);
   try {
     await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
@@ -374,7 +382,7 @@ async function abandonPendingMessage(
   // and opens a second run row for the same message, one per attempt for as
   // long as the event bus is down. Bounded by the event's own retention, and
   // the alternative is the message itself being the thing that goes missing.
-  await publishRefusedTurn(input);
+  await publishRefusedTurn(input, "workspace_bind_failed", run?.taskId);
   // Settled here, whatever the delete below does: the turn is written and the
   // run row is terminal, so nothing more is owed to this attempt. A tally kept
   // past that point has the next drain of this session abandon the row on
@@ -556,10 +564,7 @@ export async function dispatchPendingMessage(
   // The row is gone, so any tally kept for it while the counter was failing is
   // about a message that has now been dispatched.
   forgetUncountedAttempts(input.pendingId);
-  await db.query(
-    "UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1 AND deleted_at IS NULL",
-    [sessionId],
-  );
+  await takeSessionGate(sessionId, input.messageId);
   logger.info({ sessionId }, "pending.dispatched");
   return { runId: run.taskId };
 }
@@ -588,15 +593,12 @@ async function finishPendingDoorbell(
     throw new Error("chat_run.open_failed");
   }
   if (result.kind === "rejected") {
-    await refusePendingAdmission(input, result.reason);
+    await refusePendingAdmission(input, result.reason, result.taskId);
     return { runId: null };
   }
   await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
   forgetUncountedAttempts(input.pendingId);
-  await db.query(
-    "UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1 AND deleted_at IS NULL",
-    [input.sessionId],
-  );
+  await takeSessionGate(input.sessionId, input.messageId);
   logger.info(
     { sessionId: input.sessionId, kind: result.kind, runId: result.taskId },
     "pending.dispatched",

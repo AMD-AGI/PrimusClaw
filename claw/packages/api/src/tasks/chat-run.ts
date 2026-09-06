@@ -38,6 +38,7 @@ import { createHash, randomBytes } from "node:crypto";
 import pino from "pino";
 import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
+import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import { db } from "../infra/db.js";
 import { newTaskId } from "./ids.js";
 import { insertTask } from "./db.js";
@@ -462,96 +463,206 @@ export async function markChatRunRunning(sessionId: string): Promise<void> {
  * @returns the ids of the rows it closed, so a caller releasing resources acts
  *   only on rows this statement actually settled.
  */
+export interface CloseChatRunTarget {
+  /** The row the reporter says it held. Absent from a Brain older than this contract. */
+  taskId?: string;
+  /** The generation that reporter was issued. Absent when its acceptance returned none. */
+  runClaim?: number;
+}
+
 export async function closeChatRun(
   sessionId: string,
   messageId: string | undefined,
   outcome: ChatRunOutcome,
   failureReason?: string,
+  target: CloseChatRunTarget = {},
 ): Promise<string[]> {
-  // Two lists, because this statement asks two different questions.
-  //
-  // `queued` belongs in what a *named* turn may close: a lease judged lost puts
-  // a row back on the queue while its worker may still be finishing, and the
-  // `exec_complete` that follows found nothing to close -- the row stayed
-  // queued, kept its workspace reference and its slice of the admission count,
-  // and two hours later the queue reaper archived a completed run as one that
-  // never started.
-  //
-  // It does not belong in what an *unnamed* one may close. With no message id
-  // the fallback below closes the row on the grounds that it is the only open
-  // one, and a queued row is the one state where that inference is wrong: it
-  // is a turn that has not run, and the event in hand belongs to a different
-  // turn whose row is already terminal. Closing it as completed would drop a
-  // user's message with no trace. A queued row still *counts* as another open
-  // row, though, so its presence stops the fallback guessing at anything else.
-  const openStatuses: TaskStatus[] = ["queued", "preparing", "running", "cancelling"];
-  const guessableStatuses: TaskStatus[] = ["preparing", "running", "cancelling"];
+  const reason = outcome === "completed" ? null : (failureReason ?? outcome);
+  const message = outcome === "completed" ? null : (failureReason ?? "").slice(0, 2000) || null;
   try {
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = $3,
-              failure_reason = $4,
-              error_message = $5,
-              completed_at = NOW()
-        WHERE session_id = $1
-          AND origin = 'chat'
-          AND (
-            (status = ANY($2) AND metadata->>'message_id' = $6)
-            OR (
-              $6::text IS NULL
-              AND status = ANY($7)
-              AND NOT EXISTS (
-                SELECT 1 FROM claw_tasks other
-                 WHERE other.session_id = $1
-                   AND other.origin = 'chat'
-                   AND other.status = ANY($2)
-                   AND other.task_id <> claw_tasks.task_id
-              )
-            )
-          )
-        RETURNING task_id`,
-      [
-        sessionId,
-        openStatuses,
-        outcome,
-        outcome === "completed" ? null : (failureReason ?? outcome),
-        outcome === "completed" ? null : (failureReason ?? "").slice(0, 2000) || null,
-        messageId ?? null,
-        guessableStatuses,
-      ],
-    );
-    if (!r.rowCount) {
+    const closed = target.taskId
+      ? await closeNamedChatRun(sessionId, target, outcome, reason, message)
+      : await closeUnnamedChatRun(sessionId, messageId, outcome, reason, message);
+    if (!closed.length) {
       // Not an error on its own: a run swept, cancelled or already closed by a
-      // duplicate event has nothing left to close. Logged because during the
-      // shadow phase a run that ends without a row to close is exactly the
-      // discrepancy worth knowing about.
-      //
-      // Except for one case, which is not a discrepancy at all and would
-      // otherwise be the loudest source of this line: an abandoned queued
-      // message closes its own row and then publishes the `exec_complete` that
-      // ends the turn, so this statement is guaranteed to match nothing. Logged
-      // a level down, because a line that fires by construction is what teaches
-      // people to filter the ones that do not.
+      // duplicate event has nothing left to close. The one case that fires by
+      // construction is an abandoned queued message, which closes its own row
+      // and then publishes the event that ends the turn.
       const expected = failureReason === "workspace_bind_failed";
       logger[expected ? "debug" : "info"](
-        { sessionId, messageId, outcome, failureReason },
+        { sessionId, messageId, taskId: target.taskId, outcome, failureReason },
         "chat_run.close_matched_nothing",
       );
       return [];
     }
+    if (messageId) await closeDuplicateDispatchSiblings(sessionId, messageId, closed[0]);
     // The run is over, so it is no longer a reason to keep the files and no
     // longer the workspace's writer. A run that failed still counts as having
     // changed it: it may have written half of what it meant to.
-    const closed = (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
-    for (const taskId of closed) {
-      await releaseRunUse(taskId);
-    }
+    for (const taskId of closed) await releaseRunUse(taskId);
     return closed;
   } catch (err) {
     logger.warn({ err, sessionId, messageId, outcome }, "chat_run.close_failed");
     return [];
   }
 }
+
+/**
+ * Close the exact row the reporter held, under the generation it was issued.
+ *
+ * A superseded report -- a stale generation, or an unfenced attempt whose row a
+ * fenced successor now holds -- matches nothing, so it can neither close the row
+ * nor release its workspace under the successor.
+ */
+async function closeNamedChatRun(
+  sessionId: string,
+  target: CloseChatRunTarget,
+  outcome: ChatRunOutcome,
+  reason: string | null,
+  message: string | null,
+): Promise<string[]> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
+      WHERE task_id = $1
+        AND session_id = $2
+        AND origin = 'chat'
+        AND status = ANY($6::text[])
+        AND (
+             COALESCE(claim_count, 0) = $7::int
+          OR ($7::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
+        )
+      RETURNING task_id`,
+    [
+      target.taskId, sessionId, outcome, reason, message,
+      CLOSEABLE_RUN_STATUSES, target.runClaim ?? null,
+    ],
+  );
+  return (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
+}
+
+/**
+ * Close the row a completion that names no task must have meant.
+ *
+ * Only ever a guess, so it refuses whenever the guess could be wrong: more than
+ * one candidate, a row for this message that is already terminal -- the event's
+ * own subject may be the closed one -- or a candidate whose holder is fenced,
+ * because a fenced holder always names its task.
+ */
+async function closeUnnamedChatRun(
+  sessionId: string,
+  messageId: string | undefined,
+  outcome: ChatRunOutcome,
+  reason: string | null,
+  message: string | null,
+): Promise<string[]> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
+      WHERE session_id = $1
+        AND origin = 'chat'
+        AND metadata->>'lease_fenced' IS DISTINCT FROM 'true'
+        AND (
+          (
+            status = ANY($2::text[])
+            AND metadata->>'message_id' = $6
+            AND NOT EXISTS (
+              SELECT 1 FROM claw_tasks settled
+               WHERE settled.session_id = $1
+                 AND settled.origin = 'chat'
+                 AND settled.metadata->>'message_id' = $6
+                 AND NOT (settled.status = ANY($2::text[]))
+            )
+          )
+          OR (
+            $6::text IS NULL
+            AND status = ANY($7::text[])
+            AND NOT EXISTS (
+              SELECT 1 FROM claw_tasks other
+               WHERE other.session_id = $1
+                 AND other.origin = 'chat'
+                 AND other.status = ANY($2::text[])
+                 AND other.task_id <> claw_tasks.task_id
+            )
+          )
+        )
+      RETURNING task_id`,
+    [
+      sessionId, CLOSEABLE_RUN_STATUSES, outcome, reason, message,
+      messageId ?? null, GUESSABLE_RUN_STATUSES,
+    ],
+  );
+  const closed = (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
+  if (closed.length > 1) {
+    logger.warn({ sessionId, messageId, closed }, "chat_run.close_ambiguous");
+  }
+  return closed;
+}
+
+/**
+ * A replayed dispatch's spare row, closed as the duplicate it is.
+ *
+ * Never given the reporting run's outcome: this row executed nothing. It closes
+ * only with no holder evidence and only under the shared rollback guard, so a
+ * second publish that outlived the stream's duplicate window is left to the
+ * sweeper rather than terminalized under the Brain still holding it.
+ */
+async function closeDuplicateDispatchSiblings(
+  sessionId: string,
+  messageId: string,
+  closedTaskId: string,
+): Promise<void> {
+  await db.query(
+    `UPDATE claw_tasks
+        SET status = 'failed',
+            failure_reason = 'duplicate_dispatch_row',
+            error_message = 'a sibling row for this turn carried the run',
+            completed_at = NOW(),
+            metadata = jsonb_set(
+              metadata, '{dispatch_compensation}',
+              jsonb_build_object(
+                'version', 1, 'state', 'terminal',
+                'failure_reason', to_jsonb('duplicate_dispatch_row'::text),
+                'error_message', to_jsonb('a sibling row for this turn carried the run'::text)
+              )
+            )
+      WHERE session_id = $1
+        AND origin = 'chat'
+        AND metadata->>'message_id' = $2
+        AND task_id <> $3
+        AND status = ANY($4::text[])
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND NOT (${UNSUPPORTED_RECEIPT_SQL})
+        AND (${noDeliveryInFlightSql("$5", "$6")})`,
+    [sessionId, messageId, closedTaskId, CLOSEABLE_RUN_STATUSES, RUN_FAT_PREPARING_RECONCILE, false],
+  ).catch((err) => {
+    logger.warn({ err, sessionId, messageId }, "chat_run.duplicate_sibling_close_failed");
+  });
+}
+
+/**
+ * What a completion may close from.
+ *
+ * `queued` belongs here: a lease judged lost puts a row back on the queue while
+ * its worker may still be finishing, and the completion that follows found
+ * nothing to close -- the row stayed queued, kept its workspace reference and
+ * its slice of the admission count, and hours later the queue reaper archived a
+ * completed run as one that never started.
+ */
+const CLOSEABLE_RUN_STATUSES = ["queued", "preparing", "running", "cancelling"] as const;
+
+/**
+ * What an unnamed completion may guess at.
+ *
+ * `queued` is excluded: with no id the fallback closes a row on the grounds that
+ * it is the only open one, and a queued row is the one state where that
+ * inference is wrong -- it is a turn that has not run, and the event in hand
+ * belongs to a turn whose row is already terminal. It still counts as another
+ * open row, so its presence stops the fallback guessing at anything else.
+ */
+const GUESSABLE_RUN_STATUSES = ["preparing", "running", "cancelling"] as const;
 
 /**
  * Close a run that was persisted but will never execute.
@@ -859,7 +970,7 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
   if ((stillHeld.rowCount ?? 0) === 0) {
     await db.query(
       `UPDATE claw_sessions
-          SET agent_status = 'idle', updated_at = NOW()
+          SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
         WHERE session_id = $1 AND agent_status = 'running' AND deleted_at IS NULL`,
       [sessionId],
     );
@@ -885,22 +996,97 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
  *
  * @returns whether the gate was actually released.
  */
-export async function forceIdleAfterInterrupt(sessionId: string): Promise<boolean> {
+export async function forceIdleAfterInterrupt(
+  sessionId: string,
+  gateOwner: string | null = null,
+): Promise<boolean> {
   const r = await db.query(
     `UPDATE claw_sessions
-        SET agent_status = 'idle', updated_at = NOW()
+        SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $1
         AND agent_status = 'running'
+        AND (NOT $2::boolean OR agent_gate_message_id = $3)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $1
              AND t.origin = 'chat'
              AND t.status IN ('preparing','running','cancelling')
-             AND t.lease_expires_at > NOW()
+             AND (
+               t.lease_expires_at > NOW()
+               OR ($4::boolean AND ${UNSETTLED_FAT_DELIVERY_SQL})
+             )
         )`,
-    [sessionId],
+    [sessionId, gateOwner !== null && gateOwnershipEnforced(), gateOwner, gateOwnershipEnforced()],
   );
   return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * A fat or legacy-fat delivery this session may still be holding.
+ *
+ * An absent lease is not an absent holder here: a fat run has null holder
+ * columns for the whole of delivery, the workspace gate and the lock wait, so
+ * handing the gate back on that evidence dispatches a second turn on top of a
+ * live one. The cost is a gate that stays shut until the row is terminal, which
+ * is bounded by the reconciliation pass that only runs under the same
+ * assertion.
+ */
+const UNSETTLED_FAT_DELIVERY_SQL = `(
+  t.origin = 'chat'
+  AND (t.metadata->>'dispatch' = 'fat' OR t.metadata->>'dispatch' IS NULL)
+  AND t.status IN ('preparing','running','cancelling')
+)`;
+
+/**
+ * Whether a reader may act on the gate-ownership marker.
+ *
+ * Writers set it unconditionally from the moment this ships, so the value is
+ * accurate for every new replica. Reading it is what must wait: a replica that
+ * predates the column takes the gate without naming its turn and releases it
+ * without clearing the marker, so a value one turn wrote can survive under a
+ * later turn an old replica owns. Until the fleet assertion holds, releases
+ * behave exactly as they do today.
+ */
+export function gateOwnershipEnforced(): boolean {
+  return RUN_FAT_PREPARING_RECONCILE;
+}
+
+/** Take the session gate for one turn, naming the turn that holds it. */
+export async function takeSessionGate(
+  sessionId: string,
+  messageId: string,
+  client?: { query: (text: string, params?: unknown[]) => Promise<unknown> },
+): Promise<void> {
+  const q = client ?? db;
+  await q.query(
+    `UPDATE claw_sessions
+        SET agent_status = 'running', agent_gate_message_id = $2, updated_at = NOW()
+      WHERE session_id = $1 AND deleted_at IS NULL`,
+    [sessionId, messageId],
+  );
+}
+
+/**
+ * Hand the gate back on behalf of one turn.
+ *
+ * The rollback clears the marker only while it still names the message being
+ * rolled back: a later turn may already own the gate by the time a failed
+ * dispatch gets here, and clearing it then would leave that turn unnamed.
+ */
+export async function releaseSessionGateForTurn(
+  sessionId: string,
+  messageId: string,
+): Promise<void> {
+  await db.query(
+    `UPDATE claw_sessions
+        SET agent_status = 'idle',
+            agent_gate_message_id = NULL,
+            updated_at = NOW()
+      WHERE session_id = $1
+        AND deleted_at IS NULL
+        AND (NOT $3::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $2)`,
+    [sessionId, messageId, gateOwnershipEnforced()],
+  );
 }
 
 async function announceInterruptedUnstarted(
@@ -911,6 +1097,7 @@ async function announceInterruptedUnstarted(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: sessionId,
     message_id: row.message_id ?? undefined,
+    task_id: row.task_id,
     ...event,
   });
   try {

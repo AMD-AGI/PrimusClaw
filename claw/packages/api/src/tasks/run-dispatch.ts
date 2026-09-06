@@ -25,7 +25,7 @@ const INTERNAL_BACKEND_URL =
 export type HandOffResult =
   | { kind: "dispatched"; taskId: string; messageId: string }
   | { kind: "queued"; taskId: string; messageId: string; queuePosition: number }
-  | { kind: "rejected"; reason: string }
+  | { kind: "rejected"; reason: string; taskId?: string }
   | { kind: "open_failed" };
 
 export interface HandOffInput {
@@ -127,7 +127,7 @@ export async function handOffAssembledRun(input: HandOffInput): Promise<HandOffR
     if (verdict === "held") {
       return heldByWorker(run.taskId, messageId, input.sessionId, "hard_limit_exceeded");
     }
-    return { kind: "rejected", reason: hard };
+    return { kind: "rejected", reason: hard, taskId: run.taskId };
   }
 
   if (admission.kind === "queue") {

@@ -26,7 +26,7 @@ import { canViewPlugin, ownerOrAdmin, formatPluginRow } from "../marketplace/plu
 import { getUser } from "../auth/middleware.js";
 import { anthropicErrorPayload } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
-import { asJsonObject, dispatchTaskToBrain } from "../sessions/dispatch.js";
+import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
@@ -1158,6 +1158,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     // Transaction: lock row -> queue (agent busy) or flip to running (idle).
     // Mirrors the native POST /v1/sessions/:id/messages flow exactly so both
     // entry points share identical queueing semantics.
+    // Minted before the gate is taken, so the marker naming the gate's owner
+    // and the turn it names are one string.
+    const turnMessageId = newChatMessageId();
     const client = await db.pool.connect();
     let queued = false;
     let capturedUserEnvSnapshot: Record<string, string> = {};
@@ -1195,8 +1198,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       } else {
         capturedUserEnvSnapshot = userEnvSnapshot;
         await client.query(
-          "UPDATE claw_sessions SET agent_status = 'running', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-          [sessionId],
+          "UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2, "
+          + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+          [sessionId, turnMessageId],
         );
         await client.query("COMMIT");
       }
@@ -1245,10 +1249,12 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
         mcpServers,
         capturedUserEnvSnapshot,
         capturedSessionEnv: sessionEnv,
+        messageId: turnMessageId,
       },
       async () => {
         await db.query(
-          "UPDATE claw_sessions SET agent_status = 'idle', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+          "UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL, "
+          + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
           [sessionId],
         );
       },

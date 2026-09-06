@@ -72,6 +72,14 @@ export interface DispatchInput {
   capturedUserEnvSnapshot: Record<string, string>;
   capturedSessionEnv: Record<string, string>;
   /**
+   * The id this turn was already announced under.
+   *
+   * Supplied by a caller that took the session gate before dispatching, so the
+   * gate's owner marker and the turn it names are the same string. Minted here
+   * for callers that take no gate of their own.
+   */
+  messageId?: string;
+  /**
    * The environment this run declares it needs (node count, per-node shape,
    * backend). Validated by the route, so by the time it reaches here it is
    * either absent or well-formed.
@@ -99,6 +107,11 @@ export type DispatchResult =
  * last: the rollback cannot take back an event that has already been published
  * to subscribers.
  */
+/** The id one chat turn is known by, everywhere from the gate marker to the row. */
+export function newChatMessageId(): string {
+  return `claw-${Date.now()}`;
+}
+
 export async function dispatchTaskToBrain(
   input: DispatchInput,
   onPublishFailure: () => Promise<void>,
@@ -109,7 +122,7 @@ export async function dispatchTaskToBrain(
     mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
   } = input;
 
-  const messageId = `claw-${Date.now()}`;
+  const messageId = input.messageId ?? newChatMessageId();
   let subject = "";
   // Shadow row for this turn, written before anything is published so a
   // process that dies mid-dispatch leaves a record rather than nothing. Not

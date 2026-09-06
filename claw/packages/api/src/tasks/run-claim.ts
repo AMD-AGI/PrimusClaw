@@ -612,6 +612,7 @@ async function announceClaimFailure(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: row.session_id,
     message_id: messageId,
+    task_id: row.task_id,
     ...event,
   });
   try {

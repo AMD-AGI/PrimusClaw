@@ -56,6 +56,7 @@ CREATE TABLE claw_sessions (
   session_id     TEXT PRIMARY KEY,
   user_id        TEXT DEFAULT 'default',
   agent_status   TEXT DEFAULT 'idle',
+  agent_gate_message_id TEXT,
   status         TEXT DEFAULT 'active',
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
@@ -263,12 +264,22 @@ export async function startHarness(): Promise<Harness> {
 export async function seedSession(
   h: Harness,
   sessionId: string,
-  opts: { agentStatus?: string; updatedAgoSec?: number; userId?: string } = {},
+  opts: {
+    agentStatus?: string;
+    updatedAgoSec?: number;
+    userId?: string;
+    /** Which turn holds the gate. Absent is a session gated before the column existed. */
+    gateOwner?: string | null;
+  } = {},
 ): Promise<void> {
   await h.sql(
-    `INSERT INTO claw_sessions (session_id, user_id, agent_status, updated_at)
-     VALUES ($1, $2, $3, NOW() - ($4::int * INTERVAL '1 second'))`,
-    [sessionId, opts.userId ?? "u-1", opts.agentStatus ?? "running", opts.updatedAgoSec ?? 0],
+    `INSERT INTO claw_sessions
+       (session_id, user_id, agent_status, agent_gate_message_id, updated_at)
+     VALUES ($1, $2, $3, $5, NOW() - ($4::int * INTERVAL '1 second'))`,
+    [
+      sessionId, opts.userId ?? "u-1", opts.agentStatus ?? "running",
+      opts.updatedAgoSec ?? 0, opts.gateOwner ?? null,
+    ],
   );
 }
 

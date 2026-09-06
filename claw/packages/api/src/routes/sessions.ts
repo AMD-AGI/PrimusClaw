@@ -6,11 +6,13 @@ import type { PoolClient } from "pg";
 import { db } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { asJsonObject, dispatchTaskToBrain } from "../sessions/dispatch.js";
+import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { forceIdleAfterInterrupt, interruptUnstartedChatRuns } from "../tasks/chat-run.js";
+import {
+  forceIdleAfterInterrupt, interruptUnstartedChatRuns, releaseSessionGateForTurn, takeSessionGate,
+} from "../tasks/chat-run.js";
 import { nc, kv } from "../infra/nats.js";
 import { getUser } from "../auth/middleware.js";
 import {
@@ -1057,7 +1059,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // admin boundary as the dedicated control endpoint.
     if (messageType === "interrupt") {
       const row = (await db.query(
-        "SELECT user_id, agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        "SELECT user_id, agent_status, agent_gate_message_id FROM claw_sessions "
+        + "WHERE session_id = $1 AND deleted_at IS NULL",
         [sessionId],
       )).rows[0];
       if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
@@ -1070,6 +1073,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // doesn't arrive within 30s (e.g. Brain stuck in a2a_call HTTP fetch).
       if (row.agent_status === "running") {
         const sid = sessionId;
+        // Captured now, not read when the timer fires: a turn armed for one
+        // message must not idle a later one that took the gate in between.
+        const gateOwner = (row.agent_gate_message_id ?? null) as string | null;
         setTimeout(async () => {
           try {
             const check = await db.query(
@@ -1077,7 +1083,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
               [sid],
             );
             if (check.rows[0]?.agent_status === "running") {
-              const released = await forceIdleAfterInterrupt(sid);
+              const released = await forceIdleAfterInterrupt(sid, gateOwner);
               if (released) logger.warn({ sessionId: sid }, "interrupt.forced_idle_after_timeout");
               else logger.info({ sessionId: sid }, "interrupt.forced_idle_declined_live_lease");
             }
@@ -1102,6 +1108,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // can inject user_env without re-reading the DB. Queue path freezes it
     // onto claw_pending_messages directly and leaves this map empty.
     let capturedUserEnvSnapshot: Record<string, string> = {};
+
+    // Minted before the gate is taken rather than by the dispatch below, so the
+    // marker naming the gate's owner and the turn it names are one string.
+    const turnMessageId = newChatMessageId();
 
     // Transaction: lock row → check status → queue or dispatch
     const client = await db.pool.connect();
@@ -1171,7 +1181,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // Hoisted via outer-scope variable defined after the try/finally block.
       capturedUserEnvSnapshot = userEnvSnapshot;
 
-      await client.query("UPDATE claw_sessions SET agent_status = 'running', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL", [sessionId]);
+      await takeSessionGate(sessionId, turnMessageId, client);
       await client.query("COMMIT");
     } catch (e) {
       await client.query("ROLLBACK");
@@ -1184,10 +1194,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // phantom 'running' spinner is left behind (mirrors the publish-failure
     // rollback below). The transaction above already committed 'running'.
     if (isClientGone(req)) {
-      await db.query(
-        "UPDATE claw_sessions SET agent_status = 'idle', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-        [sessionId],
-      );
+      await releaseSessionGateForTurn(sessionId, turnMessageId);
       logger.warn({ sessionId, userId }, "message.client_gone_pre_dispatch");
       return reply.status(499).send({ ok: false, error: "client_closed_request" });
     }
@@ -1205,12 +1212,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         workspaceId, mcpServers,
         capturedUserEnvSnapshot,
         capturedSessionEnv: sessionEnv,
+        messageId: turnMessageId,
       },
       async () => {
-        await db.query(
-          "UPDATE claw_sessions SET agent_status = 'idle', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-          [sessionId],
-        );
+        await releaseSessionGateForTurn(sessionId, turnMessageId);
       },
     );
     if (dispatch.kind === "publish_failed") {
