@@ -11,7 +11,8 @@
  * claim statement under test is the production one, reached by handing
  * `claimRunById` the client that opened the transaction.
  *
- * The application modules are imported dynamically, after `DB_SCHEMA` is set:
+ * The application modules are imported dynamically, after `DATABASE_URL` is
+ * pointed at this file's own database:
  * `db.ts` reads it once at module load to point its pools at the schema, and a
  * static import would run that before this file could choose one.
  */
@@ -83,7 +84,8 @@ const BACKEND_PID = "SELECT pg_backend_pid() AS pid";
 
 export async function startConcurrencyHarness(): Promise<ConcurrencyHarness> {
   const cluster = await startPgCluster();
-  process.env.DB_SCHEMA = cluster.schema;
+  process.env.DATABASE_URL = cluster.url;
+  delete process.env.DB_SCHEMA;
   process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
 
   let started: App | undefined;
@@ -129,7 +131,7 @@ export async function startConcurrencyHarness(): Promise<ConcurrencyHarness> {
            JOIN pg_index i ON i.indexrelid = c.oid
            JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relname = $1 AND n.nspname = $2`,
-        [app.chatTurnClaimIndex, cluster.schema],
+        [app.chatTurnClaimIndex, "public"],
       );
       return r.rowCount ? r.rows[0].indisvalid : null;
     },
@@ -138,9 +140,8 @@ export async function startConcurrencyHarness(): Promise<ConcurrencyHarness> {
     },
     async invalidateClaimIndex() {
       const r = await observer.query(
-        `UPDATE pg_index SET indisvalid = false
-          WHERE indexrelid = ($1 || '.' || $2)::regclass`,
-        [cluster.schema, app.chatTurnClaimIndex],
+        `UPDATE pg_index SET indisvalid = false WHERE indexrelid = $1::regclass`,
+        [app.chatTurnClaimIndex],
       );
       if (!r.rowCount) throw new Error("could not mark the claim index invalid");
     },

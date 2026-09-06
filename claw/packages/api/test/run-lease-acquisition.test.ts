@@ -101,7 +101,8 @@ const flaglessFirstLease = (taskId: string, brainId: string) => renew(taskId, br
 before(async () => {
   if (skip) return;
   cluster = await startPgCluster();
-  process.env.DB_SCHEMA = cluster.schema;
+  process.env.DATABASE_URL = cluster.url;
+  delete process.env.DB_SCHEMA;
   process.env.AUTH_INTERNAL_TOKEN = TOKEN;
   process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
   const db = await import("../src/infra/db.js");

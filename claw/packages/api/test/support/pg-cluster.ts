@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A private schema on the Postgres `DATABASE_URL` names.
+ * A private database on the server `DATABASE_URL` names.
  *
  * PGlite cannot host the suites that need two connections at once, so those run
- * against a server. Isolation is a schema rather than a database: node:test
- * gives each file its own process, and `search_path` keeps two files -- or two
- * runs on a shared developer cluster -- from migrating and truncating each
- * other's `claw_tasks`.
+ * against a server. Isolation is a whole database, not a schema, and the reason
+ * is `CREATE INDEX CONCURRENTLY`: it waits for every transaction open anywhere
+ * in the database, whatever schema they touch. These suites exist precisely to
+ * hold transactions open, so on a shared database one file's forced
+ * interleaving stalls another file's migration until both time out -- and the
+ * failure looks like a broken index rather than a fixture that cannot isolate.
  */
 
 import { randomBytes } from "node:crypto";
@@ -32,8 +34,10 @@ export function isCi(): boolean {
 }
 
 export interface PgCluster {
+  /** The database this file owns, also usable as its schema name. */
   schema: string;
-  /** A fresh connection with `search_path` already pointed at the schema. */
+  /** Its connection string, for code that builds its own pool. */
+  url: string;
   connect(): Promise<pg.Client>;
   end(): Promise<void>;
 }
@@ -41,23 +45,28 @@ export interface PgCluster {
 export async function startPgCluster(): Promise<PgCluster> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error("startPgCluster needs DATABASE_URL");
-  const schema = `claw_test_${randomBytes(6).toString("hex")}`;
+  const name = `claw_test_${randomBytes(6).toString("hex")}`;
   const admin = new pg.Client({ connectionString });
   await admin.connect();
-  await admin.query(`CREATE SCHEMA "${schema}"`);
+  await admin.query(`CREATE DATABASE "${name}"`);
+  const url = new URL(connectionString);
+  url.pathname = `/${name}`;
+  const own = url.toString();
   const clients: pg.Client[] = [];
   return {
-    schema,
+    schema: name,
+    url: own,
     async connect() {
-      const client = new pg.Client({ connectionString });
+      const client = new pg.Client({ connectionString: own });
       await client.connect();
-      await client.query(`SET search_path TO "${schema}"`);
       clients.push(client);
       return client;
     },
     async end() {
       for (const client of clients) await client.end().catch(() => {});
-      await admin.query(`DROP SCHEMA "${schema}" CASCADE`).catch(() => {});
+      // A database with a live backend cannot be dropped, and a leftover test
+      // database is cheaper than a suite that fails on teardown.
+      await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
       await admin.end().catch(() => {});
     },
   };
