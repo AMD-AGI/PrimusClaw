@@ -118,24 +118,21 @@ test("a first call is dispatched, and asks the sandbox nothing", async () => {
   }
 });
 
-test("against a sandbox that files no records, a dispatched row is finished, not deadlocked", () => {
-  // Such a process has no record route to ask, so waiting for one to answer is
-  // waiting forever: the request would be refused for the life of that sandbox,
-  // through the whole mixed-version window, possibly having never left Brain.
-  // It is retransmitted instead, and the arbitration moves to where that
-  // process does have one -- the id is fixed and run-qualified before it goes
-  // out, so its own duplicate-name refusal answers a send that already landed.
-  return resolveStart({
+test("a replay is never sent as a start to a sandbox that files no records", async () => {
+  // Retransmitting there looks safe and is not: such a process arbitrates a
+  // duplicate name only from an in-process map that loses the entry when the
+  // shell is reaped and loses every entry when it restarts, so the same send
+  // starts a second process against a shell that is still running.
+  const out = await resolveStart({
     row: { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1", generation: "gen-1", state: "dispatched" },
     rowReadable: true,
     sandboxFilesRecords: false,
     currentGeneration: "gen-1",
     probe: never,
-  }).then((out) => {
-    assert.equal(out.action, "retransmit");
-    assert.equal(out.reported, "first_call");
-    assert.match(out.reason, /files no records/);
   });
+  assert.equal(out.action, "refuse", "nothing is sent");
+  assert.equal(out.reported, "unknown");
+  assert.equal(out.shellClass, "unknown");
 });
 
 test("a confirmed row is still never re-sent to such a sandbox", async () => {

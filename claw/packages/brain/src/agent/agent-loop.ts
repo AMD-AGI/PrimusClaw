@@ -191,6 +191,8 @@ export interface ToolStats {
   total_calls: number;
   error_calls: number;
   by_tool: Record<string, number>;
+  /** Calls of each tool that came back without an error; see toolOkByName. */
+  by_tool_ok?: Record<string, number>;
 }
 
 export interface LoopResult {
@@ -599,6 +601,17 @@ class AgentLoopRunner {
   private usage: TokenUsage;
   private errorCount: number;
   private toolCallsByName: Record<string, number>;
+  /**
+   * Calls of each tool that reached the sandbox and came back without an error.
+   *
+   * Separate from the attempt count above, which is incremented before the tool
+   * runs: a pre-hook rejection, a refusal, or a command that failed all leave
+   * that count raised and nothing done. A caller asking "did this actually
+   * happen" -- a rollout gate proving a sandbox was touched -- has to read a
+   * number the tool machinery produces after the fact, not one the model's own
+   * text can be made to imply.
+   */
+  private toolOkByName: Record<string, number>;
   private totalToolCalls: number;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
@@ -721,6 +734,7 @@ class AgentLoopRunner {
       ? { ...resumeFrom.usage }
       : { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 };
     this.errorCount = resumeFrom?.error_count ?? 0;
+    this.toolOkByName = {};
     this.toolCallsByName = resumeFrom
       ? { ...resumeFrom.tool_calls_by_name }
       : {};
@@ -807,7 +821,10 @@ class AgentLoopRunner {
       tokenUsage: this.usage,
       turns: this.turnsExecuted,
       errorCount: this.errorCount,
-      toolStats: { total_calls: this.totalToolCalls, error_calls: this.errorCount, by_tool: this.toolCallsByName },
+      toolStats: {
+        total_calls: this.totalToolCalls, error_calls: this.errorCount,
+        by_tool: this.toolCallsByName, by_tool_ok: this.toolOkByName,
+      },
       elapsedMs: Date.now() - this.startTime,
     };
   }
@@ -1868,6 +1885,14 @@ class AgentLoopRunner {
       // `start` (above); not re-sending it halves bytes vs always-double
       // serialising args without breaking the frontend reducer (which
       // matches by actionId and updates description on success/error).
+      // Counted from the result, not from the attempt: a tool whose own answer
+      // says it failed did not happen, whatever the turn goes on to report.
+      // Hands reports a failure as result text beginning `Error:` or, for a
+      // command, `timeout after` / `exit <n>` -- the same shapes the router
+      // returns for a refusal.
+      if (!/^(Error:|timeout after |exit \d)/.test(resultText.trimStart())) {
+        this.toolOkByName[toolName] = (this.toolOkByName[toolName] || 0) + 1;
+      }
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),

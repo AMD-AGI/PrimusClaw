@@ -20,6 +20,35 @@
 export interface CapacitySettings {
   ceiling: number;
   reconciliationReserve: number;
+  /** Sweeps a target may wait, worst case, before it is served again. */
+  deferralCount: number;
+  /** Longest gap between two refreshes of one handle, in seconds. */
+  activityGapSec: number;
+}
+
+/**
+ * How many pings one sweep is guaranteed to start.
+ *
+ * The phase budget bars the *starting* of a ping and nothing else, so even a
+ * phase whose every ping runs to its ceiling hands out this many.
+ */
+export function pingsPerSweep(
+  concurrency: number, phaseBudgetMs: number, pingCeilingMs: number,
+): number {
+  return Math.max(1, concurrency * Math.ceil(phaseBudgetMs / pingCeilingMs));
+}
+
+/**
+ * The worst-case gap between two refreshes of one sandbox handle.
+ *
+ * `(1 + D)` intervals for the ordinary cadence and each deferral, plus
+ * `(2 + D)` sweep spans: one for the dropped tick, one for where inside its
+ * sweep a ping falls, and one more per deferral.
+ */
+export function activityGapSec(
+  intervalSec: number, sweepSpanSec: number, deferrals: number,
+): number {
+  return (1 + deferrals) * intervalSec + (2 + deferrals) * sweepSpanSec;
 }
 
 export interface CapacityInput {
@@ -28,6 +57,12 @@ export interface CapacityInput {
   /** Raw, because "declared" is the question and an empty string is not one. */
   targetCeiling: string;
   reconcileReserve: string;
+  /** The shortest idle reclaim in force, which the activity gap must clear. */
+  idleDeadlineSec: string;
+  /** How many pings one sweep is guaranteed to start. */
+  pingsPerSweep: number;
+  /** A whole guarded tick's declared ceiling, in seconds. */
+  sweepSpanSec: number;
 }
 
 /** Refused at startup, naming the settings and their values. */
@@ -60,7 +95,7 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
     );
   }
   if (!input.bgShellEnabled) {
-    return { ceiling: 0, reconciliationReserve: 0 };
+    return { ceiling: 0, reconciliationReserve: 0, deferralCount: 0, activityGapSec: 0 };
   }
 
   const ceiling = requirePositiveInteger("SANDBOX_KEEPALIVE_TARGET_CEILING", input.targetCeiling);
@@ -73,5 +108,26 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       + `below SANDBOX_KEEPALIVE_TARGET_CEILING=${ceiling}.`,
     );
   }
-  return { ceiling, reconciliationReserve: reserve };
+
+  // The relation the whole ceiling exists to make provable, checked here rather
+  // than assumed: at N_max targets a rotation reaches every one within
+  // ceil(N_max / C) sweeps, and the gap that implies has to clear the shortest
+  // reclaim in force with room to spare. Equality is a breach, not a fit.
+  const deadline = requirePositiveInteger(
+    "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC", input.idleDeadlineSec,
+  );
+  const deferrals = Math.max(0, Math.ceil(ceiling / Math.max(1, input.pingsPerSweep)) - 1);
+  const gap = activityGapSec(input.keepaliveIntervalSec, input.sweepSpanSec, deferrals);
+  if (gap >= deadline) {
+    throw new KeepaliveConfigRefused(
+      `these settings cannot keep a sandbox alive: at SANDBOX_KEEPALIVE_TARGET_CEILING`
+      + `=${ceiling} a handle waits up to ${deferrals} deferral(s), so two refreshes of `
+      + `one handle can be ${gap}s apart, which is not under the ${deadline}s reclaim in `
+      + `force (SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC). Lower the ceiling or the interval, `
+      + `or declare a longer deadline.`,
+    );
+  }
+  return {
+    ceiling, reconciliationReserve: reserve, deferralCount: deferrals, activityGapSec: gap,
+  };
 }

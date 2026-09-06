@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
@@ -12,10 +12,16 @@ import {
   type RecordProbe,
 } from "../sandbox/bg-start.js";
 import {
-  advanceRow, readRow, type BgHandleAddress, type BgHandleRow, type BgRowStore,
+  advanceRow, readRow, readRunRows,
+  type BgHandleAddress, type BgHandleRow, type BgRowStore,
 } from "../sandbox/bg-handle-rows.js";
+
+/** What a fixed start carries onto its row, so a replay can find it again. */
+type StartCarry = Pick<BgHandleRow, "commandDigest" | "sequence">;
 import { bgRowStore } from "../sandbox/bg-row-store.js";
-import { BG_SHELL_ENABLED, HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS } from "../config.js";
+import {
+  BG_SHELL_ENABLED, BRAIN_CHECKPOINT_KEY, HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS,
+} from "../config.js";
 import {
   isSandboxTool, MCP_DEADLINE_SLACK_MS, toolTakesTimeout, toolTimeoutCeilingSec,
 } from "../tools/hands.js";
@@ -321,13 +327,66 @@ export interface DispatchOutcome {
  * the first rather than started. That is the safe direction of the trade, and
  * the caller that wants two names them.
  */
-export function derivedShellId(owner: string, run: string, command: unknown): string {
-  const digest = createHash("sha256")
+export function commandDigestOf(owner: string, run: string, command: unknown): string {
+  return createHmac("sha256", BRAIN_CHECKPOINT_KEY || "claw-bg-intent")
     .update(owner).update("\u0000")
     .update(run).update("\u0000")
     .update(typeof command === "string" ? command : "")
     .digest("hex");
-  return `bg-${digest.slice(0, 12)}`;
+}
+
+/**
+ * The id of the `sequence`-th start of this command under this run identity.
+ *
+ * Keyed rather than plain: every other input is either stored on the row beside
+ * it or low-entropy, so an unkeyed digest would be a guessing oracle over the
+ * command for anyone who can read the rows.
+ */
+export function derivedShellId(
+  owner: string, run: string, command: unknown, sequence: number,
+): string {
+  const digest = createHmac("sha256", BRAIN_CHECKPOINT_KEY || "claw-bg-intent")
+    .update(owner).update("\u0000")
+    .update(run).update("\u0000")
+    .update(String(sequence)).update("\u0000")
+    .update(typeof command === "string" ? command : "")
+    .digest("hex");
+  return `bg-${digest.slice(0, 16)}`;
+}
+
+/**
+ * Which start this is, and the id it gets, decided before anything is sent.
+ *
+ * Two requirements that pull apart. The identity has to survive a crash without
+ * depending on the model reproducing anything -- a provider tool-use id is not
+ * sealed until the turn's checkpoint, which is written after the tool has
+ * already run. And it has to be per *start*: two deliberate starts of one
+ * command are two intents and must produce two shells.
+ *
+ * Both hold by allocating against this run's own durable rows. A row still
+ * `issued` or `dispatched` for this command is a call that was sent and never
+ * confirmed -- which is exactly what a replay is -- so the replay adopts its id
+ * and its sequence. Anything already `spawn_confirmed` is a start that
+ * finished, so the next call is a new intent and takes the next sequence. The
+ * sequence is Brain's own, never the model's.
+ */
+export async function allocateStartIdentity(
+  store: BgRowStore, owner: string, run: string, command: unknown,
+): Promise<{ shellId: string; commandDigest: string; sequence: number }> {
+  const commandDigest = commandDigestOf(owner, run, command);
+  const rows = await readRunRows(store, owner, run);
+  const mine = rows.filter((row) => row.commandDigest === commandDigest);
+
+  const unresolved = mine.find((row) => row.state !== "spawn_confirmed");
+  if (unresolved) {
+    return {
+      shellId: unresolved.shellId,
+      commandDigest,
+      sequence: unresolved.sequence ?? 1,
+    };
+  }
+  const sequence = mine.reduce((max, row) => Math.max(max, row.sequence ?? 0), 0) + 1;
+  return { shellId: derivedShellId(owner, run, command, sequence), commandDigest, sequence };
 }
 
 /**
@@ -554,9 +613,22 @@ export class HandsClient {
    * both by making every start a named one -- the value is in the sandbox's own
    * format and the model is told the same string either way.
    */
-  private fixStartArgs(args: Record<string, unknown>): Record<string, unknown> {
-    if (typeof args.shell_id === "string" && args.shell_id) return args;
-    return { ...args, shell_id: derivedShellId(this.owner, this.run, args.command) };
+  private async fixStartArgs(
+    args: Record<string, unknown>, store: BgRowStore | null,
+  ): Promise<{ args: Record<string, unknown>; carry: StartCarry }> {
+    if (typeof args.shell_id === "string" && args.shell_id) {
+      return { args, carry: {} };
+    }
+    if (!store || !this.owner || !this.run) {
+      // Nothing durable to allocate against -- an out-of-band caller with no
+      // scope of its own. Today's behaviour: the sandbox mints the id.
+      return { args, carry: {} };
+    }
+    const allocated = await allocateStartIdentity(store, this.owner, this.run, args.command);
+    return {
+      args: { ...args, shell_id: allocated.shellId },
+      carry: { commandDigest: allocated.commandDigest, sequence: allocated.sequence },
+    };
   }
 
   /**
@@ -583,11 +655,14 @@ export class HandsClient {
   ): Promise<DispatchOutcome> {
     await this.connect();
     const isStart = name === "bash" && args.run_in_background === true;
-    const fixed = isStart ? this.fixStartArgs(args) : args;
     const store = bgRowStore();
+    const start = isStart
+      ? await this.fixStartArgs(args, store)
+      : { args, carry: {} as StartCarry };
+    const fixed = start.args;
     const address = isStart ? this.startAddress(fixed) : null;
     if (address && store) {
-      const settled = await this.resolveBackgroundStart(address, store);
+      const settled = await this.resolveBackgroundStart(address, store, start.carry);
       if (settled) return settled;
     }
 
@@ -606,7 +681,7 @@ export class HandsClient {
     // Durable before the result reaches the caller, so a crash after the spawn
     // cannot leave a shell nothing attests to.
     if (address && store && !isError) {
-      await advanceRow(store, address, this.generation, "spawn_confirmed");
+      await advanceRow(store, address, this.generation, "spawn_confirmed", start.carry);
     }
     // The caller is told the id it sent, or the one minted for it -- never the
     // wire form, which is Brain's business and an id nothing else can reproduce.
@@ -628,7 +703,7 @@ export class HandsClient {
    * go ahead and dispatch.
    */
   private async resolveBackgroundStart(
-    address: BgHandleAddress, store: BgRowStore,
+    address: BgHandleAddress, store: BgRowStore, carry: StartCarry,
   ): Promise<DispatchOutcome | null> {
     let row: BgHandleRow | null = null;
     let rowReadable = true;
@@ -678,8 +753,8 @@ export class HandsClient {
     }
     // A first call writes both states; a retransmission's row already carries
     // them and re-writing is a no-op the advance recognises.
-    await advanceRow(store, address, this.generation, "issued");
-    await advanceRow(store, address, this.generation, "dispatched");
+    await advanceRow(store, address, this.generation, "issued", carry);
+    await advanceRow(store, address, this.generation, "dispatched", carry);
     return null;
   }
 

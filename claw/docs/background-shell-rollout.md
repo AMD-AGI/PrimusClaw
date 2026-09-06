@@ -38,15 +38,16 @@ It provides `chart_dir`, `inventory_judge`, `inventory_rows`, `hands_base`,
 `settle_verdict` and `deadline_verdict`, each returning `0` pass, `1` fail,
 `3` abort.
 
-**The activity marker.** G7-d2 has to know the sandbox was touched, and every
-weaker signal is satisfiable without it: a task can complete without calling
-anything, and a call is counted before it runs and stays counted when it fails.
-So the activity prompt asks for a token only the sandbox can produce, and
-`settle_verdict` requires it in the task's output:
+**Proving the sandbox was touched.** Every weaker signal is satisfiable without
+a command having run there: a task can complete without calling anything, a call
+is counted before it runs and stays counted when it fails, and the task's output
+is model-written text — a model handed a token in its prompt can echo it back
+having done nothing. `settle_verdict` reads `by_tool_ok` instead, which the
+agent loop increments from the tool's own result after the call returned and
+only where that result was not an error. Nothing the model says reaches it.
 
 ```sh
-ACTIVITY_MARKER="claw-alive-$$-$(date +%s)"
-ACTIVITY_PROMPT="Run exactly: echo $ACTIVITY_MARKER — then reply with nothing else."
+ACTIVITY_PROMPT='Run: echo alive'
 ``` **Return 3 is
 `ABORT` at every call site**: nothing could be read, which is never the same as
 a clean reading.
@@ -118,12 +119,12 @@ dispatch() { curl -sf -X POST "https://$API_HOST/v1/sessions/$SESSION_ID/tasks" 
     -H 'content-type: application/json' -d "$(jq -n --arg p "$1" '{prompt:$p}')" \
   | jq -er 'select(.ok == true) | .task_id // empty'; }
 # Poll one task to terminal, printing the fields `settle_verdict` judges --
-# including the output, which is where the sandbox's own echo shows up.
+# including by_tool_ok, which the agent loop writes from the tool's own result.
 # Reaching terminal is not succeeding, and completing is not refreshing.
 settle() { local i b; for i in $(seq 1 "$N_POLL"); do
     b=$(curl -sf --max-time "$T_CURL" -H "$USER" "https://$API_HOST/v1/tasks/$1") || { sleep "$I_POLL"; continue; }
     printf '%s' "$b" | jq -e '.item.status | test("^(completed|failed|cancelled)$")' >/dev/null \
-      && { printf '%s' "$b" | jq -c '.item | {status, out: (.output // "")[0:400], by_tool: .tool_stats.by_tool}'; return 0; }
+      && { printf '%s' "$b" | jq -c '.item | {status, out: (.output // "")[0:400], by_tool_ok: .tool_stats.by_tool_ok}'; return 0; }
     sleep "$I_POLL"; done; echo '{"status":"NOT_TERMINAL"}'; return 1; }
 ```
 
@@ -139,7 +140,7 @@ per-sandbox fallback.
 | # | Prerequisite | Why |
 |---|---|---|
 | PRE-1 | The deployed build carries this change: both `/health` payloads expose `bgShellEnabled`. Verified by **P0** | Every gate reads it. A build without it cannot be gated by this guide at all |
-| PRE-2 | `BG_SHELL_ENABLED`, `SANDBOX_KEEPALIVE_TARGET_CEILING`, `SANDBOX_KEEPALIVE_RECONCILE_RESERVE` and `BASH_MAX_TIMEOUT_SEC` are wired through `values.<NS>.env` | Otherwise the enablement is reverted by the next upgrade, and the two capacity settings are what Brain refuses to start without |
+| PRE-2 | `BG_SHELL_ENABLED`, `SANDBOX_KEEPALIVE_TARGET_CEILING`, `SANDBOX_KEEPALIVE_RECONCILE_RESERVE`, `SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC` and `BASH_MAX_TIMEOUT_SEC` are wired through `values.<NS>.env` | Otherwise the enablement is reverted by the next upgrade, and the two capacity settings are what Brain refuses to start without |
 | PRE-3 | The foreground ceiling `S` satisfies `S <= brain.terminationGracePeriodSeconds` | A rolling update must not hand a run over with a command still writing |
 | PRE-4 | If long foreground work must survive enablement, `brain.bashMaxTimeoutSec` is pinned first | Enablement otherwise moves the ceiling to 120s in the same step |
 | PRE-5 | Thresholds fixed and written down: `T_KILLED`, `T_STALE`, `N_PROBE`, `T_CURL`, `I_POLL`, `N_FLEET`, `I_FLEET` | A threshold chosen after the reading is not a threshold |
@@ -215,6 +216,11 @@ echo "exit=$rc"
    # served; a few percent of the ceiling, never zero.
    SANDBOX_KEEPALIVE_TARGET_CEILING="200"
    SANDBOX_KEEPALIVE_RECONCILE_RESERVE="20"
+   # The shortest idle reclaim in force here. Brain proves the worst-case gap
+   # between two refreshes of one handle against it and refuses to start where
+   # the gap is not under it, so a ceiling too large for the interval is
+   # rejected here rather than found later as a reclaimed sandbox.
+   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="900"
    # Only if PRE-4 applies.
    BASH_MAX_TIMEOUT_SEC=""
    ```
@@ -268,7 +274,7 @@ for i in $(seq 1 "$N_FLEET"); do
   # absolute cap -- so a loop that ignores its own failures proves the wrong
   # thing about the CR that then disappears.
   tid=$(dispatch "$ACTIVITY_PROMPT") || { echo 'FAIL: activity dispatch failed; the session is no longer held busy'; exit 1; }
-  settle_verdict "$(settle "$tid")" "$ACTIVITY_MARKER" || exit 1
+  settle_verdict "$(settle "$tid")" bash || exit 1
 
   state=$(cr); rc=$?; [ "$rc" = 2 ] && { echo 'ABORT: kubectl could not answer'; exit 1; }
   now=$(date +%s)

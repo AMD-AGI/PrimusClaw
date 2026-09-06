@@ -83,20 +83,44 @@ test("against a pre-scheme sandbox, two runs cannot name one shell", async () =>
   assert.equal(decodeKeyPart(idPart), "server", "and the public id is carried whole, never truncated");
 });
 
+/** A revision-aware bucket, so the id allocation has somewhere to record itself. */
+function rowBucket() {
+  const map = new Map<string, { value: Uint8Array; revision: number }>();
+  const conflict = () => Object.assign(new Error("wrong last sequence"), { code: "10071" });
+  return {
+    async get(key: string) { return map.get(key) ?? null; },
+    async create(key: string, value: Uint8Array) {
+      if (map.has(key)) throw conflict();
+      map.set(key, { value, revision: 1 });
+    },
+    async update(key: string, value: Uint8Array, expected: number) {
+      if (map.get(key)?.revision !== expected) throw conflict();
+      map.set(key, { value, revision: expected + 1 });
+    },
+    async delete(key: string) { map.delete(key); },
+    async keys() {
+      const hits = [...map.keys()];
+      return (async function* () { yield* hits; })();
+    },
+  };
+}
+
 test("a start with no id of its own is still addressable afterwards", async () => {
   // The common start: the caller names nothing and the sandbox mints an id. Left
   // that way against an owner-keyed registry, the id that comes back is one
   // Brain never qualified, and every later poll or kill qualifies it into
   // something that sandbox never stored. Brain fixes the id before the dispatch
   // instead, so the value it addresses with is the value that was stored.
-  restoreRows = bindBgHandleRowsForTest(null);
+  // A row store, because the id is allocated against this run's own rows --
+  // which is what makes it survive a replay.
+  restoreRows = bindBgHandleRowsForTest(rowBucket() as never);
   sandboxOfVersion(false);
 
   const { hands, sent } = clientFor("ktsk_1");
   const started = await hands.callTool("bash", { command: "train", run_in_background: true });
 
   const publicId = /background shell (\S+?)\./.exec(started)![1];
-  assert.match(publicId, /^bg-[0-9a-f]{12}$/,
+  assert.match(publicId, /^bg-[0-9a-f]{16}$/,
     "in the sandbox's own shape, and derived rather than minted so a replay "
       + "recovers the same one");
   const onTheWire = String(sent[0].shell_id);

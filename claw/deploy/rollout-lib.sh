@@ -93,24 +93,21 @@ hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
 # disappears.
 # Whether one dispatched activity task actually refreshed the sandbox.
 #
-# Three things have to be true, and each of the first two is satisfiable without
-# the third. A terminal state is not a successful one: a run that failed or was
-# cancelled left the session idle, and an idle session is reclaimed by a path
-# that has nothing to do with the absolute cap. A completed run is not a run
-# that touched the sandbox: a model can satisfy "Run: echo alive" by replying
-# without calling anything. And a counted call is not a call that worked --
-# `by_tool` is incremented before the tool executes, a pre-hook can reject it
-# immediately afterwards, and a failed command comes back as result text with
-# the task still completing.
+# Every weaker signal is satisfiable without a command having run there. A
+# terminal state is not a successful one. A completed run is not a run that
+# touched the sandbox: a model can answer without calling anything. A counted
+# call is not a call that worked -- `by_tool` is incremented before the tool
+# executes, a pre-hook can reject it immediately afterwards, and a failed
+# command comes back as result text with the task still completing. And the
+# task's own output is model-written text: a model handed a token in its prompt
+# can echo it back having done nothing at all, so nothing said there is
+# evidence.
 #
-# So the evidence is the command's own output. The activity prompt echoes a
-# token that only the sandbox can produce, and the task's output carrying it is
-# the one fact that cannot be true unless a command ran there and succeeded.
+# `by_tool_ok` is none of those: the agent loop increments it from the tool's
+# own result, after the call returned and only where that result was not an
+# error. It is produced by the machinery, not by the model.
 settle_verdict() {
-  local body="$1" marker="$2" status
-  [ -n "$marker" ] || {
-    echo "FAIL: settle_verdict needs the marker the activity command echoes" >&2
-    return "$ROLLOUT_FAIL"; }
+  local body="$1" tool="${2:-bash}" status ok
   status=$(printf '%s' "$body" | jq -r '.status // "MISSING"' 2>/dev/null) || {
     echo "FAIL: activity result unparseable" >&2; return "$ROLLOUT_FAIL"; }
   case "$status" in
@@ -123,8 +120,19 @@ settle_verdict() {
       return "$ROLLOUT_FAIL" ;;
   esac
 
-  printf '%s' "$body" | jq -e --arg m "$marker" '(.out // "") | contains($m)' >/dev/null 2>&1 || {
-    echo "FAIL: the activity task completed without the sandbox echoing $marker, so no command ran there successfully and nothing refreshed it" >&2
+  # An absent field and a zero count are different facts: the first is a build
+  # that cannot answer, which leaves the gate no reading at all, and passing on
+  # it would make the gate vacuous exactly where it is introduced.
+  printf '%s' "$body" | jq -e 'has("by_tool_ok")' >/dev/null 2>&1 || {
+    echo "FAIL: activity result carries no by_tool_ok; this build cannot report whether $tool succeeded, so G7-d2 has no reading" >&2
+    return "$ROLLOUT_FAIL"; }
+  ok=$(printf '%s' "$body" | jq -r --arg t "$tool" '.by_tool_ok[$t] // 0' 2>/dev/null) || ok=0
+  case "$ok" in
+    ''|*[!0-9]*)
+      echo "FAIL: by_tool_ok.$tool is not a count" >&2; return "$ROLLOUT_FAIL" ;;
+  esac
+  [ "$ok" -ge 1 ] || {
+    echo "FAIL: the activity task completed with no successful $tool call, so no command ran in the sandbox and nothing refreshed it" >&2
     return "$ROLLOUT_FAIL"; }
   return "$ROLLOUT_PASS"
 }

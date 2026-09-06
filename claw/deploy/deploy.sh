@@ -660,6 +660,7 @@ for _key, _var in (
     ("backgroundShell", "BG_SHELL_ENABLED"),
     ("keepaliveTargetCeiling", "SANDBOX_KEEPALIVE_TARGET_CEILING"),
     ("keepaliveReconcileReserve", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE"),
+    ("keepaliveIdleDeadlineSec", "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC"),
 ):
     if env(_var):
         values.setdefault("features", {})[_key] = env(_var)

@@ -22,6 +22,13 @@
             { "type": "integer", "minimum": 1 }
           ]
         },
+        "keepaliveIdleDeadlineSec": {
+          "description": "Shortest idle reclaim in force, in seconds. Required when backgroundShell is true: Brain proves the worst-case refresh gap against it at startup and refuses to start if the gap is not under it.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
         "keepaliveReconcileReserve": {
           "description": "Slots held back from ordinary admission so a target another replica created can be taken on before it is served. Required when backgroundShell is true, and must be below keepaliveTargetCeiling.",
           "oneOf": [

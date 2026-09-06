@@ -36,6 +36,17 @@ export interface BgHandleRow extends BgHandleAddress {
   /** The sandbox generation the dispatch was issued against. */
   generation: string;
   state: BgRowState;
+  /**
+   * Non-reversible digest of the command this start carries.
+   *
+   * Not an identity: two deliberate starts of one command are two intents and
+   * get two rows. It is how a replay recognises the call it is repeating among
+   * this run's unresolved rows, since nothing the model returns can be trusted
+   * to name it again.
+   */
+  commandDigest?: string;
+  /** Which start of this command under this run identity, from one upwards. */
+  sequence?: number;
 }
 
 /**
@@ -87,13 +98,18 @@ const MAX_ATTEMPTS = 8;
  */
 export async function advanceRow(
   store: BgRowStore, address: BgHandleAddress, generation: string, state: BgRowState,
+  carry: Pick<BgHandleRow, "commandDigest" | "sequence"> = {},
 ): Promise<void> {
   const key = rowKey(address);
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const current = await store.read(key);
     const row = current ? JSON.parse(current.value) as BgHandleRow : null;
     if (row && row.generation === generation && RANK[row.state] >= RANK[state]) return;
-    const next = JSON.stringify({ ...address, generation, state } satisfies BgHandleRow);
+    const next = JSON.stringify({
+      ...address, generation, state,
+      commandDigest: carry.commandDigest ?? row?.commandDigest,
+      sequence: carry.sequence ?? row?.sequence,
+    } satisfies BgHandleRow);
     if (await store.write(key, next, current?.revision ?? null)) return;
   }
   throw new Error(`bg handle row ${key} could not be advanced to ${state} under contention`);
@@ -110,6 +126,18 @@ export async function readRow(
 ): Promise<BgHandleRow | null> {
   const entry = await store.read(rowKey(address));
   return entry === null ? null : JSON.parse(entry.value) as BgHandleRow;
+}
+
+/** Every row this run identity holds, whatever state each is in. */
+export async function readRunRows(
+  store: BgRowStore, ownerScope: string, runIdentity: string,
+): Promise<BgHandleRow[]> {
+  const rows: BgHandleRow[] = [];
+  for (const key of await store.keys(runRowFilter(ownerScope, runIdentity))) {
+    const entry = await store.read(key);
+    if (entry) rows.push(JSON.parse(entry.value) as BgHandleRow);
+  }
+  return rows;
 }
 
 /**

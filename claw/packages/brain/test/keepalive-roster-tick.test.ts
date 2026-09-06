@@ -320,3 +320,103 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
     "the mid-sweep arrival is admitted rather than lost");
   assert.ok(pinged.includes("wl-latecomer"));
 });
+
+test("every target is served within the derived bound, on an injected clock", async () => {
+  // The bound the ceiling exists to prove, asserted as a bound rather than as
+  // "eventually": with N targets and a sweep guaranteed to start C pings, a
+  // rotation that resumes where the last one stopped reaches every target
+  // within ceil(N / C) sweeps -- so the active-shell target's last activity is
+  // never older than the shortest reclaim in force, across enough sweeps for
+  // that deadline to lapse several times over.
+  const C = 2;
+  const N = 7;
+  const INTERVAL_SEC = 60;
+  const DEADLINE_SEC = 900;
+  const bound = Math.ceil(N / C);
+
+  const targets = Array.from({ length: N }, (_, i) => `wl-${i}`);
+  for (const [i, id] of targets.entries()) kv.seed(`hands.sess-${i}`, entry(id));
+  const ACTIVE = "wl-3";
+
+  let now = 0;
+  const lastActivity = new Map<string, number>();
+  // The budget is what bounds how many pings one sweep starts: each stubbed
+  // ping consumes its whole ceiling, so exactly C of them fit.
+  const PING_MS = 1_000;
+  onPing = null;
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async exec(inst: { id: string }) {
+        pinged.push(inst.id);
+        lastActivity.set(inst.id, now);
+        now += PING_MS;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    } as unknown as SandboxProvider,
+  });
+
+  // Enough sweeps for the deadline to lapse several times over.
+  const sweeps = Math.ceil((DEADLINE_SEC * 4) / INTERVAL_SEC);
+  const servedAt = new Map<string, number[]>();
+  for (let sweep = 0; sweep < sweeps; sweep++) {
+    pinged.length = 0;
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async (_u, _t, owner) => (owner === "sess-3" ? 1 : 0),
+      pingBudgetMs: C * PING_MS,
+      roster: { store: rosterStore(kv), config: CONFIG },
+    });
+    for (const id of pinged) {
+      servedAt.set(id, [...(servedAt.get(id) ?? []), sweep]);
+    }
+    now = (sweep + 1) * INTERVAL_SEC * 1000;
+  }
+
+  for (const id of targets) {
+    const sweepsServed = servedAt.get(id) ?? [];
+    assert.ok(sweepsServed.length > 0, `${id} was never served`);
+    // No target waits longer than the bound between two turns, first included.
+    const gaps = sweepsServed.map((s, i) => s - (i === 0 ? -1 : sweepsServed[i - 1]));
+    assert.ok(Math.max(...gaps) <= bound,
+      `${id} waited ${Math.max(...gaps)} sweeps, past the ceil(N/C) = ${bound} bound`);
+  }
+
+  const activeGapSweeps = Math.max(
+    ...(servedAt.get(ACTIVE) ?? []).map((s, i, all) => s - (i === 0 ? -1 : all[i - 1])),
+  );
+  assert.ok(activeGapSweeps * INTERVAL_SEC < DEADLINE_SEC,
+    "the target holding a live shell is refreshed well inside the shortest reclaim");
+});
+
+test("a contended reconciliation blocks the next ordinary claim until it recovers", async () => {
+  // A reconcile that exhausted its retries wrote nothing, so the roster is
+  // missing every target it was about to take on. Admitting against it is
+  // admitting against a count nobody could write.
+  const { bindAdmission, admitSandbox, SandboxCapacityRefused, isRosterStale } =
+    await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  kv.seed("hands.sess-remote", entry("wl-remote"));
+
+  // A store whose writes are always refused is a roster under permanent
+  // contention, which is what exhaustion looks like from inside the sweep.
+  const contended = { ...rosterStore(kv)!, async write() { return false; } };
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: contended, config: CONFIG },
+  });
+
+  assert.equal(isRosterStale(), true);
+  await assert.rejects(() => admitSandbox("sess-new"), SandboxCapacityRefused,
+    "nothing new is admitted against a roster missing targets");
+
+  // A later sweep that lands clears it.
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  assert.equal(isRosterStale(), false);
+  const hold = await admitSandbox("sess-new");
+  assert.ok(hold, "and admission resumes once the roster is whole again");
+  await hold.release();
+});

@@ -43,7 +43,8 @@ test("the enablement step names every setting Brain refuses to start without", (
   // settings are required with the flag on and the chart ships them empty.
   const enable = GUIDE.slice(GUIDE.indexOf("## 3. Enable"), GUIDE.indexOf("## 4. Gates"));
   for (const key of [
-    "BG_SHELL_ENABLED", "SANDBOX_KEEPALIVE_TARGET_CEILING", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE",
+    "BG_SHELL_ENABLED", "SANDBOX_KEEPALIVE_TARGET_CEILING",
+    "SANDBOX_KEEPALIVE_RECONCILE_RESERVE", "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC",
   ]) {
     assert.ok(enable.includes(key), `${key} must be set in the same change as the flag`);
   }
@@ -87,10 +88,12 @@ test("the absolute-lifetime gate cannot pass on idle reclamation", () => {
   assert.match(GUIDE, /DEADLINE_EPOCH=\$\(date -d "\$DEADLINE" \+%s\)/);
   assert.match(GUIDE, /SEEN_LIVE=true/, "the live observation is recorded, not inferred");
   assert.match(GUIDE, /deadline_verdict "\$state" "\$SEEN_LIVE"/);
-  assert.match(GUIDE, /settle_verdict "\$\(settle "\$tid"\)" "\$ACTIVITY_MARKER"/,
-    "judged against a token only the sandbox can produce: a task that completed, "
-      + "or counted a call, or attempted one that failed, is none of them a refresh");
-  assert.match(GUIDE, /ACTIVITY_MARKER=/, "and the marker is defined where the gates can see it");
+  assert.match(GUIDE, /settle_verdict "\$\(settle "\$tid"\)" bash/,
+    "judged on the tool machinery's own success count: a task that completed, or "
+      + "counted a call, or attempted one that failed, is none of them a refresh");
+  assert.match(GUIDE, /by_tool_ok/, "and the field it reads is what settle prints");
+  assert.ok(!/ACTIVITY_MARKER/.test(GUIDE),
+    "nothing the model is handed in its prompt can be evidence it did anything");
   assert.ok(!/dispatch 'Run: echo alive' >\/dev\/null \|\| true/.test(GUIDE),
     "a loop that discards its own failed dispatches proves nothing about the cap");
 });

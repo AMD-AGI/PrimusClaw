@@ -14,6 +14,7 @@ import {
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
 import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
+import { keepalivePingsPerSweep } from "./sandbox/keepalive.js";
 import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
 import { bindAdmission } from "./sandbox/admission.js";
@@ -50,6 +51,7 @@ import {
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
   BG_SHELL_ENABLED, SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_TARGET_CEILING, SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
+  SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC, SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC,
 } from "./config.js";
 import { existsSync, createReadStream } from "fs";
 import { initDagHandles } from "./sandbox/handles.js";
@@ -879,7 +881,17 @@ async function main() {
     keepaliveIntervalSec: SANDBOX_KEEPALIVE_INTERVAL_SEC,
     targetCeiling: SANDBOX_KEEPALIVE_TARGET_CEILING,
     reconcileReserve: SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
+    idleDeadlineSec: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC,
+    pingsPerSweep: keepalivePingsPerSweep(),
+    sweepSpanSec: SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC,
   });
+  if (capacity.ceiling > 0) {
+    logger.info(
+      { ceiling: capacity.ceiling, deferrals: capacity.deferralCount,
+        activityGapSec: capacity.activityGapSec },
+      "keepalive.capacity_proven",
+    );
+  }
   // The same roster the sweep reconciles against, so a slot claimed before
   // provisioning and a target discovered by a sweep are one accounting.
   // Awaited and unguarded: a ceiling this replica does not share with the

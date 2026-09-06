@@ -127,7 +127,12 @@ test("routes a tool call, feeds the result back, and stops on end_turn", async (
   assert.equal(result.finalText, "done reading");
   assert.equal(result.turns, 2);
   assert.equal(result.errorCount, 0);
-  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 0, by_tool: { read: 1 } });
+  // `by_tool` counts the attempt; `by_tool_ok` counts the result coming back
+  // without an error, which is the only one of the two that says the work
+  // happened.
+  assert.deepEqual(result.toolStats, {
+    total_calls: 1, error_calls: 0, by_tool: { read: 1 }, by_tool_ok: { read: 1 },
+  });
 
   assert.deepEqual(router.calls, [{ name: "read", input: { path: "/a.txt" } }]);
 

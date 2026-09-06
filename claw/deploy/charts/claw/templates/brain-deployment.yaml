@@ -244,6 +244,8 @@ spec:
           value: {{ .Values.features.keepaliveTargetCeiling | quote }}
         - name: SANDBOX_KEEPALIVE_RECONCILE_RESERVE
           value: {{ .Values.features.keepaliveReconcileReserve | quote }}
+        - name: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
+          value: {{ .Values.features.keepaliveIdleDeadlineSec | quote }}
         # Read by brain and, until now, reachable only by editing the Deployment
         # by hand -- which the next helm upgrade would have undone. Each renders
         # empty when the value is absent, and each answers an empty value with

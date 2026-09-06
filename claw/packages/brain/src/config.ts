@@ -1117,6 +1117,17 @@ export const SANDBOX_KEEPALIVE_TARGET_CEILING = env("SANDBOX_KEEPALIVE_TARGET_CE
  * leave it unpinged. Counted inside the ceiling, so the relation is unaffected.
  */
 export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONCILE_RESERVE");
+/**
+ * The shortest idle reclaim in force on this deployment, in seconds.
+ *
+ * Deployment-declared because Brain neither sends nor reads it on every
+ * provider: the sweep's exec exists precisely to hold off a platform's own
+ * inactivity reclaim, and reading an unnameable deadline as absent would
+ * license any interval at all against a reclaim that still happens.
+ */
+export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC");
+/** Declared ceiling on one whole guarded sweep, in seconds. */
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 120, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can

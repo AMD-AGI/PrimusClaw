@@ -613,6 +613,12 @@ features:
   # number the fleet exceeds.
   keepaliveTargetCeiling: ""
   keepaliveReconcileReserve: ""
+  # The shortest idle reclaim in force on this deployment, in seconds. Brain
+  # proves the worst-case gap between two refreshes of one sandbox handle
+  # against it at startup and refuses to start if the gap is not under it, so a
+  # ceiling too large for the interval is rejected rather than discovered as a
+  # reclaimed sandbox with work in it.
+  keepaliveIdleDeadlineSec: ""
   # Chat dispatch publishes a doorbell and injects credentials at claim time
   # instead of putting the full execute request on the shared durable. Off
   # until every Brain replica understands the doorbell: a mixed fleet must

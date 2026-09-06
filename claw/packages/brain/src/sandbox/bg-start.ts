@@ -90,25 +90,22 @@ export async function resolveStart(input: {
       };
   }
 
-  // A sandbox that files no records can never answer the read this resolution
-  // is built on, so a `dispatched` row against one would be refused for the
-  // life of that sandbox -- a request that may never have left Brain, refused
-  // forever, for the whole mixed-version window. It is retransmitted instead,
-  // and the arbitration moves to where such a process does have one: the id is
-  // fixed and run-qualified before it goes out, so a send that already landed
-  // comes back as that process's own duplicate-name refusal and a send that
-  // did not starts exactly once. A `spawn_confirmed` row is never sent, here as
-  // everywhere -- it attests a shell, and nothing may run a second one.
+  // A replay is never sent as a start to a sandbox that files no records, and
+  // the row's state answers it instead. Retransmitting there looks safe and is
+  // not: such a process arbitrates a duplicate name only from an in-process map
+  // that loses the entry when the shell is reaped and loses every entry when it
+  // restarts, so the same send starts a second process against a shell that is
+  // still running -- which is what the row exists to prevent.
   if (!sandboxFilesRecords) {
-    return row.state === "dispatched"
+    return row.state === "spawn_confirmed"
       ? {
-        action: "retransmit", reported: "first_call",
-        reason: "the sandbox files no records, so the unfinished send is finished "
-          + "and its own duplicate-name refusal arbitrates one that already landed",
-      }
-      : {
         action: "resolve", reported: "deduplicated", shellClass: "lost",
         reason: "the row attests a shell on a sandbox that keeps no record of it",
+      }
+      : {
+        action: "refuse", reported: "unknown", shellClass: "unknown",
+        reason: "no arbiter answers on a sandbox that files no records, so whether "
+          + "this start reached it cannot be determined",
       };
   }
 

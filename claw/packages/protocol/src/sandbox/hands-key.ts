@@ -11,42 +11,63 @@
  * prevent. Its key's variable part is the fixed marker below followed by the
  * sandbox generation.
  *
- * A session key is the session id verbatim, deliberately and permanently.
- * Re-keying colliding ids was tried and is worse than what it fixed: old and
- * new replicas run together through a rolling upgrade, so one side moving a key
- * the other still reads by its old name produces two divergent bindings for one
- * session -- a live sandbox nothing routes to, and a second one provisioned
- * beside it. Nothing here moves a key, and no reader has to know which form to
- * look under.
+ * A session id that begins with that marker is re-keyed out of the way, so no
+ * session can take a retention's key going forward. `handsSessionKey` is the
+ * one place the shape is decided, and every service resolves through it -- a
+ * reader that builds the key itself would look under a name a re-keyed session
+ * no longer answers to.
  *
- * Separation is carried by the entry's **value** instead, which is where the
- * design puts it: only a retention writes the protection marker, so a
- * pre-existing session entry that happens to sit under the prefix is
- * unambiguously not one. Two rules make that sufficient rather than merely
- * legible, and both are enforced elsewhere: a retention key is only ever
- * *created*, never written over, so it can never take a session's binding; and
- * a deployment already holding such an entry is refused at startup, because
- * there the separation cannot be promised for the generation it collides with.
+ * Separation is also carried by the entry's **value**, which is what makes the
+ * two legible where both exist: only a retention writes the protection marker,
+ * so a pre-existing session entry under the prefix is unambiguously not one.
  */
+
+import { decodeKeyPart, encodeKeyPart } from "./base32.js";
 
 export const HANDS_KEY_PREFIX = "hands.";
 
 /** The variable part a retention's entry takes, which no session may hold. */
 export const RETAINED_PREFIX = "retained-";
 
-/** The registry key for one session's sandbox binding. */
+/**
+ * Marks a re-keyed session entry.
+ *
+ * Inside the characters the key-value client admits and outside base32's
+ * alphabet, so a re-keyed part can never be read as a plain one.
+ */
+export const REKEYED_MARKER = "=";
+
+export function handsKeyNeedsRekey(sessionId: string): boolean {
+  return sessionId.startsWith(RETAINED_PREFIX) || sessionId.startsWith(REKEYED_MARKER);
+}
+
+/**
+ * The registry key for one session's sandbox binding.
+ *
+ * Total and injective: a plain key never begins with either marker, a re-keyed
+ * one always begins with the re-key marker, and base32 is injective, so no two
+ * session ids produce one key and no session id produces a retention's.
+ */
 export function handsSessionKey(sessionId: string): string {
-  return HANDS_KEY_PREFIX + sessionId;
+  return HANDS_KEY_PREFIX
+    + (handsKeyNeedsRekey(sessionId) ? REKEYED_MARKER + encodeKeyPart(sessionId) : sessionId);
 }
 
-/** The session id a registry key names. */
+/** The session id a registry key names, whichever form it takes. */
 export function sessionIdFromHandsKey(key: string): string {
-  return key.slice(HANDS_KEY_PREFIX.length);
+  const part = key.slice(HANDS_KEY_PREFIX.length);
+  return part.startsWith(REKEYED_MARKER) ? decodeKeyPart(part.slice(1)) : part;
 }
 
-/** Whether a registry key sits in the namespace reserved for retentions. */
+/**
+ * Whether a registry key sits in the namespace reserved for retentions.
+ *
+ * Read off the key as written, not off the session id it decodes to: a
+ * re-keyed session decodes back to an id that begins with the marker while its
+ * key deliberately does not, and that is the whole point of re-keying it.
+ */
 export function isReservedRetentionKey(key: string): boolean {
-  return sessionIdFromHandsKey(key).startsWith(RETAINED_PREFIX);
+  return key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX);
 }
 
 /** Whether an entry's value carries the marker only a retention writes. */

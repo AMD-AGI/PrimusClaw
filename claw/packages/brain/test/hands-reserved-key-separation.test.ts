@@ -19,23 +19,44 @@ import assert from "node:assert/strict";
 
 import {
   RETAINED_PREFIX, ReservedKeyCollision, assertRetentionSeparation,
-  handsSessionKey, isReservedRetentionKey, isRetentionEntry, sessionIdFromHandsKey,
-  type HandsKeyStore,
+  handsSessionKey, isReservedRetentionKey, isRetentionEntry,
+  migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
 } from "../src/sandbox/hands-key.js";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
-function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore {
-  const map = new Map(Object.entries(seed));
+function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & {
+  map: Map<string, { value: string | null; revision: number }>;
+  bumpOnRead: Set<string>;
+} {
+  const map = new Map(
+    Object.entries(seed).map(([k, v]) => [k, { value: v, revision: 1 }] as const),
+  );
+  /** Keys another writer rewrites between the read and the delete. */
+  const bumpOnRead = new Set<string>();
   return {
+    map,
+    bumpOnRead,
     async keys(filter) {
       return [...map.keys()].filter((k) => matchesKvFilter(k, filter));
     },
     async read(key) {
-      if (!map.has(key)) return null;
-      const value = map.get(key)!;
+      const entry = map.get(key);
+      if (!entry) return null;
       // A stored null stands for an entry that exists and cannot be read.
-      if (value === null) throw new Error("unreadable");
-      return { value };
+      if (entry.value === null) throw new Error("unreadable");
+      const seen = { value: entry.value, revision: entry.revision };
+      if (bumpOnRead.has(key)) map.set(key, { ...entry, revision: entry.revision + 1 });
+      return seen;
+    },
+    async create(key, value) {
+      if (map.has(key)) return false;
+      map.set(key, { value, revision: 1 });
+      return true;
+    },
+    async delete(key, expectedRevision) {
+      if (map.get(key)?.revision !== expectedRevision) return false;
+      map.delete(key);
+      return true;
     },
   };
 }
@@ -43,14 +64,70 @@ function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore {
 const session = (id: string) => JSON.stringify({ status: "ready", handsUrl: `http://${id}/mcp` });
 const retention = () => JSON.stringify({ status: "ready", protected: true, handsUrl: "http://kept/mcp" });
 
-test("a session key is the session id, and stays that way", () => {
-  // Re-keying a colliding id was tried and is worse than what it fixed: through
-  // a rolling upgrade one side would move a key the other still reads under its
-  // old name, producing two divergent bindings for one session.
-  for (const id of ["sess_ordinary", `${RETAINED_PREFIX}odd`, "=weird"]) {
-    assert.equal(handsSessionKey(id), `hands.${id}`, id);
-    assert.equal(sessionIdFromHandsKey(handsSessionKey(id)), id, id);
+test("no session id can be keyed into the reserved namespace", () => {
+  // The forward half: total and injective, so a plain key never begins with
+  // either marker and no two ids share a key.
+  assert.equal(handsSessionKey("sess_ordinary"), "hands.sess_ordinary");
+  for (const id of [`${RETAINED_PREFIX}odd`, "=weird"]) {
+    const key = handsSessionKey(id);
+    assert.ok(!isReservedRetentionKey(key), id);
+    assert.equal(sessionIdFromHandsKey(key), id, id);
   }
+  assert.notEqual(handsSessionKey(`${RETAINED_PREFIX}a`), handsSessionKey(`${RETAINED_PREFIX}b`));
+});
+
+test("a pre-existing colliding entry is migrated out, collision-safely", async () => {
+  const colliding = `${RETAINED_PREFIX}ABCDEF`;
+  const store = memoryStore({ [`hands.${colliding}`]: session(colliding) });
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.migrated, [`hands.${colliding}`]);
+  assert.equal(store.map.has(`hands.${colliding}`), false, "the reserved key is free");
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value, session(colliding),
+    "and the session is reachable under the key every reader now derives");
+  await assert.doesNotReject(() => assertRetentionSeparation(store));
+});
+
+test("a migration that crashed between the copy and the delete resumes", async () => {
+  const colliding = `${RETAINED_PREFIX}HALFWAY`;
+  const store = memoryStore({
+    [`hands.${colliding}`]: session(colliding),
+    [handsSessionKey(colliding)]: session(colliding),
+  });
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.resumed, [`hands.${colliding}`]);
+  assert.deepEqual(result.conflicted, [], "not a conflict, and not a refusal to start");
+  assert.equal(store.map.has(`hands.${colliding}`), false, "the delete is finished");
+});
+
+test("a destination another replica already wrote differently is never overwritten", async () => {
+  const colliding = `${RETAINED_PREFIX}TAKEN`;
+  const store = memoryStore({
+    [`hands.${colliding}`]: session(colliding),
+    [handsSessionKey(colliding)]: session("someone-else"),
+  });
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
+  assert.equal(store.map.get(handsSessionKey(colliding))!.value, session("someone-else"));
+  await assert.rejects(() => assertRetentionSeparation(store), ReservedKeyCollision,
+    "and what the migration could not resolve refuses the deployment");
+});
+
+test("a source rewritten between the read and the delete keeps its entry", async () => {
+  const colliding = `${RETAINED_PREFIX}BUSY`;
+  const store = memoryStore({ [`hands.${colliding}`]: session(colliding) });
+  store.bumpOnRead.add(`hands.${colliding}`);
+
+  const result = await migrateReservedSessionKeys(store);
+
+  assert.deepEqual(result.migrated, []);
+  assert.deepEqual(result.conflicted, [`hands.${colliding}`]);
+  assert.ok(store.map.has(`hands.${colliding}`), "reported for repair, not destroyed");
 });
 
 test("the value tells a retention from a session, whatever the key looks like", () => {
@@ -61,7 +138,7 @@ test("the value tells a retention from a session, whatever the key looks like", 
   assert.equal(isReservedRetentionKey("hands.sess_ordinary"), false);
 });
 
-test("a pre-existing session binding under the reserved prefix refuses the deployment", async () => {
+test("a collision the migration could not resolve refuses the deployment", async () => {
   const colliding = `${RETAINED_PREFIX}ABCDEF`;
   const store = memoryStore({
     "hands.sess_ordinary": session("ordinary"),

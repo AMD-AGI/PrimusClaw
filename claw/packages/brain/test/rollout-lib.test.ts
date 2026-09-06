@@ -120,85 +120,90 @@ test("hands_base strips the MCP suffix the census reports", () => {
   }
 });
 
-const MARKER = "claw-alive-1234";
-/** What the API returns for a task whose bash call really ran and echoed. */
+/** What the API returns for a task whose bash call really ran and succeeded. */
 const refreshed = (over: Record<string, unknown> = {}) => JSON.stringify({
-  status: "completed", out: `${MARKER}\n`, by_tool: { bash: 1 }, ...over,
+  status: "completed", out: "alive", by_tool: { bash: 1 }, by_tool_ok: { bash: 1 }, ...over,
 });
 
-test("a refresh counts only where the sandbox itself echoed the marker", () => {
-  assert.equal(callLib(`settle_verdict '${refreshed()}' ${MARKER}`).code, 0);
+test("a refresh counts only where the machinery says the call succeeded", () => {
+  assert.equal(callLib(`settle_verdict '${refreshed()}' bash`).code, 0);
 
   for (const status of ["failed", "cancelled", "NOT_TERMINAL"]) {
-    const result = callLib(`settle_verdict '${refreshed({ status })}' ${MARKER}`);
+    const result = callLib(`settle_verdict '${refreshed({ status })}' bash`);
     assert.equal(result.code, 1, status);
     assert.match(result.err, /activity task/, status);
   }
 });
 
-test("a task that completed with a FAILED bash call does not count as a refresh", () => {
+test("a completed task whose bash call FAILED is not a refresh", () => {
   // The gap a call count cannot see: `by_tool` is incremented before the tool
   // runs, a pre-hook can reject it immediately afterwards, and a command that
   // failed comes back as result text with the task completing normally. All
   // three leave `by_tool.bash == 1` and the sandbox untouched.
-  const failedBash = JSON.stringify({
+  const failed = JSON.stringify({
     status: "completed",
-    out: "The command failed: bash: echo: command not found. I could not run it.",
-    by_tool: { bash: 1 },
+    out: "The command failed and I could not run it.",
+    by_tool: { bash: 1 }, by_tool_ok: {},
   });
-  const result = callLib(`settle_verdict '${failedBash}' ${MARKER}`);
+  const result = callLib(`settle_verdict '${failed}' bash`);
 
   assert.equal(result.code, 1, "counted, attempted, and still no refresh");
-  assert.match(result.err, /without the sandbox echoing/);
+  assert.match(result.err, /no successful bash call/);
 });
 
-test("a task that completed without calling anything does not count either", () => {
-  const noCall = JSON.stringify({ status: "completed", out: "Done.", by_tool: {} });
-  assert.equal(callLib(`settle_verdict '${noCall}' ${MARKER}`).code, 1);
-
-  const claimsSuccess = JSON.stringify({
-    status: "completed", out: "I ran it and it printed the token.", by_tool: { bash: 1 },
+test("a model that merely says the right words is not evidence", () => {
+  // The decisive case for anything read out of model text: the final response
+  // asserts the command ran, and even repeats a token the prompt handed it,
+  // while no successful call happened. Nothing the model writes reaches the
+  // verdict.
+  const talkedAboutIt = JSON.stringify({
+    status: "completed",
+    out: "I ran `echo alive` in the sandbox and it printed: alive claw-alive-1234",
+    by_tool: { bash: 1 }, by_tool_ok: {},
   });
-  assert.equal(callLib(`settle_verdict '${claimsSuccess}' ${MARKER}`).code, 1,
-    "a model describing the output is not the sandbox producing it");
+  assert.equal(callLib(`settle_verdict '${talkedAboutIt}' bash`).code, 1);
+
+  const neverCalled = JSON.stringify({
+    status: "completed", out: "alive claw-alive-1234", by_tool: {}, by_tool_ok: {},
+  });
+  assert.equal(callLib(`settle_verdict '${neverCalled}' bash`).code, 1);
 });
 
-test("settle_verdict refuses to judge without the marker it is judging against", () => {
-  const result = callLib(`settle_verdict '${refreshed()}' ''`);
+test("a build that cannot report tool success has no reading, and says so", () => {
+  // Silently passing on an older payload would make the whole gate vacuous
+  // exactly where it is being introduced.
+  const older = JSON.stringify({ status: "completed", out: "alive", by_tool: { bash: 1 } });
+  const result = callLib(`settle_verdict '${older}' bash`);
   assert.equal(result.code, 1);
-  assert.match(result.err, /needs the marker/);
+  assert.match(result.err, /cannot report whether bash succeeded/);
 });
 
 test("an unreadable activity result is a failure", () => {
-  assert.equal(callLib(`settle_verdict 'not json' ${MARKER}`).code, 1);
-  assert.equal(callLib(`settle_verdict '{}' ${MARKER}`).code, 1);
+  assert.equal(callLib(`settle_verdict 'not json' bash`).code, 1);
+  assert.equal(callLib(`settle_verdict '{}' bash`).code, 1);
 });
 
 test("G7-d2 stops at a refresh whose command failed", () => {
-  // The gate as written: dispatch, settle, judge. A bash call that ran and
-  // failed has to stop it before the CR is ever looked at.
   const gate = `
-    ACTIVITY_MARKER=${MARKER}
     dispatch() { echo "task-1"; }
-    settle() { echo '{"status":"completed","out":"bash: not found","by_tool":{"bash":1}}'; }
-    tid=$(dispatch "$ACTIVITY_MARKER") || exit 1
-    settle_verdict "$(settle "$tid")" "$ACTIVITY_MARKER" || exit 1
+    settle() { echo '{"status":"completed","out":"I ran it.","by_tool":{"bash":1},"by_tool_ok":{}}'; }
+    tid=$(dispatch 'Run: echo alive') || exit 1
+    settle_verdict "$(settle "$tid")" bash || exit 1
     echo REACHED_THE_CR_CHECK`;
   const result = callLib(gate);
 
   assert.equal(result.code, 1);
   assert.doesNotMatch(result.out, /REACHED_THE_CR_CHECK/,
     "the gate stops at the refresh, not at whatever the CR happens to be doing");
-  assert.match(result.err, /without the sandbox echoing/);
+  assert.match(result.err, /no successful bash call/);
 });
 
 test("G7-d2 proceeds past a refresh the sandbox actually performed", () => {
   const gate = `
-    ACTIVITY_MARKER=${MARKER}
     dispatch() { echo "task-1"; }
     settle() { echo '${refreshed()}'; }
-    tid=$(dispatch "$ACTIVITY_MARKER") || exit 1
-    settle_verdict "$(settle "$tid")" "$ACTIVITY_MARKER" || exit 1
+    tid=$(dispatch 'Run: echo alive') || exit 1
+    settle_verdict "$(settle "$tid")" bash || exit 1
     deadline_verdict gone true 1200 1000`;
   assert.equal(callLib(gate).code, 0);
 });

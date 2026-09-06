@@ -15,7 +15,8 @@ import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
-import { releaseAdmission } from "./admission.js";
+import { markRosterStale, releaseAdmission } from "./admission.js";
+import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
 
@@ -430,8 +431,17 @@ const PING_MAX_IN_FLIGHT = 16;
  * for whoever sorts last.
  */
 const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
-/** Where the last sweep stopped handing out pings. */
-let pingCursor = 0;
+/**
+ * The first target the last sweep left unserved.
+ *
+ * By identity rather than by position: the target list is rebuilt every sweep,
+ * so an index into it moves under arrivals and departures -- and a deferred
+ * target can be carried back behind ones already served, repeatedly, which
+ * makes the deferral count unbounded and the refresh gap with it. Naming the
+ * target means the next sweep resumes at it wherever it now sits, and at the
+ * front where it has since gone away.
+ */
+let pingResumeAt: string | null = null;
 
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
@@ -448,6 +458,17 @@ const bgProbeInFlight = new Set<string>();
  * this sandbox back" looks like from inside a promise that started before it.
  */
 const bgGeneration = new Map<string, number>();
+/**
+ * How many pings one sweep is guaranteed to start, from this build's own
+ * concurrency and budgets. Read at startup to prove the refresh-gap relation.
+ */
+export function keepalivePingsPerSweep(): number {
+  return pingsPerSweep(PING_MAX_IN_FLIGHT, PING_PHASE_BUDGET_MS, HANDS_PING_CEILING_MS);
+}
+
+/** Longest one ping may take before its own timeout ends it. */
+const HANDS_PING_CEILING_MS = 15_000;
+
 /** Where the last sweep stopped handing out probe slots. */
 let bgProbeCursor = 0;
 
@@ -1016,12 +1037,18 @@ async function admitTargets(
       );
     }
     await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
+    // Whole again: whatever contention or fault left it incomplete is behind us.
+    markRosterStale(false);
   } catch (err) {
     // Reported rather than swallowed, and the sweep still serves what it
     // collected: an unreconciled roster understates the fleet, so the deferral
     // count every handle's refresh gap rests on is a number nobody can stand
     // behind -- but refusing to ping is how a sandbox with live work in it is
     // reclaimed, which is worse than an understated count nobody admits against.
+    // The sweep still serves what it collected -- refusing to ping is how a
+    // sandbox with live work in it is reclaimed -- but nothing new is admitted
+    // against a roster that is missing targets it was about to take on.
+    markRosterStale(true);
     logger.error(
       { err: (err as Error)?.message, targets: identities.length },
       "keepalive.roster_reconcile_failed",
@@ -1085,19 +1112,23 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // Rotated, so a sweep that cannot finish does not always give up on the same
   // tail. Ordering is otherwise insertion order, which is stable across sweeps.
   const ordered = [...targets.entries()];
-  const pingStart = pingCursor % ordered.length;
-  const rotated = ordered.slice(pingStart).concat(ordered.slice(0, pingStart));
+  const resumeIndex = pingResumeAt === null
+    ? 0
+    : Math.max(0, ordered.findIndex(([key]) => key === pingResumeAt));
+  const rotated = ordered.slice(resumeIndex).concat(ordered.slice(0, resumeIndex));
   const pingDeadline = Date.now() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
   let pinged = 0;
   let deferred = 0;
   const failures: KeepaliveFailure[] = [];
 
+  let firstDeferred: string | null = null;
   await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
     // Checked as each target is picked up, so this bounds when a ping may
     // start, not when the phase ends: the pings already running continue past
     // the deadline. See PING_PHASE_BUDGET_MS.
     if (Date.now() >= pingDeadline) {
       deferred += 1;
+      if (firstDeferred === null) firstDeferred = targetKey;
       return;
     }
     pinged += 1;
@@ -1169,7 +1200,9 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // handle expiring un-pinged -- looks like nothing at all from the outside.
   await handleKeepaliveFailures(failures, targets.size);
 
-  pingCursor = (pingStart + pinged) % ordered.length;
+  // Nothing deferred means the sweep reached every target, so the next one
+  // starts wherever it likes.
+  pingResumeAt = firstDeferred;
   if (deferred > 0) {
     logger.warn(
       { pinged, deferred, total: ordered.length,

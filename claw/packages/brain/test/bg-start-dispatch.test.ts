@@ -247,20 +247,41 @@ test("two different commands in one run get different ids", async () => {
   assert.notEqual(sent[0].shell_id, sent[1].shell_id);
 });
 
-test("two starts of the identical command in one run resolve to one shell", async () => {
-  // The stated cost of deriving from durable state alone. A provider-issued
-  // tool-use id would separate these, and is exactly what a crash before the
-  // turn's checkpoint lets the model change -- which is a second execution of
-  // work that already ran. Over-deduplicating an identical command is the safe
-  // direction of that trade, and a caller wanting two names them.
+test("two deliberate starts of the identical command are two shells", async () => {
+  // The guarantee is per intent, not per command text: a second start of the
+  // same command is a second intent and must produce a second process. A row
+  // already confirmed is a start that finished, so the next call takes the next
+  // sequence rather than adopting it.
   const { hands, sent } = pod();
   const first = await hands.callTool("bash", NO_ID_START);
-  recordAnswer = { marker: true, subtreeReadable: true, present: true };
   const second = await hands.callTool("bash", NO_ID_START);
 
-  assert.equal(sent.length, 1, "the second is answered from the first, not started");
+  assert.equal(sent.length, 2, "both go out");
+  assert.notEqual(sent[0].shell_id, sent[1].shell_id, "and each gets its own shell");
   assert.match(first, /Started background shell/);
-  assert.match(second, /nothing was run a second time/);
+  assert.match(second, /Started background shell/);
+
+  const rows = await bgRowStore()!.keys("bgshell.*.*.*");
+  assert.equal(rows.length, 2, "two intents, two rows");
+});
+
+test("a replay adopts the unresolved start rather than allocating a new one", async () => {
+  // What separates the two: an unconfirmed row is a call that was sent and
+  // never came back, which is exactly what a replay is repeating.
+  const first = pod({ dieOnHandoff: true });
+  await assert.rejects(() => first.hands.callTool("bash", NO_ID_START));
+  const [key] = await bgRowStore()!.keys("bgshell.*.*.*");
+  const stranded = JSON.parse((await bgRowStore()!.read(key))!.value) as
+    { shellId: string; sequence: number; commandDigest: string };
+  assert.equal(stranded.sequence, 1);
+  assert.ok(stranded.commandDigest, "the row carries what a replay recognises it by");
+
+  recordAnswer = { marker: true, subtreeReadable: true, present: false };
+  const resumed = pod();
+  await resumed.hands.callTool("bash", NO_ID_START);
+
+  assert.equal(resumed.sent[0].shell_id, stranded.shellId, "the same start, finished");
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1, "and no second intent");
 });
 
 test("a script-mode replay that is safely deduplicated is not a step failure", async () => {
@@ -301,4 +322,33 @@ test("a script-mode start that is a genuine first call goes out and is confirmed
   assert.equal(sent.length, 1);
   assert.equal(result.isError, false);
   assert.equal(await rowState(), "spawn_confirmed");
+});
+
+test("a record-less sandbox never receives a replayed start, however its registry looks", async () => {
+  // Both shapes the old registry takes, driven through the client rather than
+  // the resolver: the shell reaped out of its map, and the whole map gone with
+  // a restart. Neither can arbitrate a duplicate name, so neither may be sent a
+  // start it might already be running.
+  const filesNoRecords = bindShellRecordsCapabilityForTest(async () => false);
+  try {
+    for (const [why, answer] of [
+      ["the shell was reaped out of the map", { marker: false, subtreeReadable: false, present: false }],
+      ["Hands restarted and lost the map", { marker: false, subtreeReadable: false, present: false }],
+    ] as const) {
+      bucket = durableBucket();
+      restoreRows?.();
+      restoreRows = bindBgHandleRowsForTest(bucket as never);
+      recordAnswer = answer;
+
+      await assert.rejects(() => pod({ dieOnHandoff: true }).hands.callTool("bash", START), why);
+      assert.equal(await rowState(), "dispatched", why);
+
+      const resumed = pod();
+      const text = await resumed.hands.callTool("bash", START);
+      assert.equal(resumed.sent.length, 0, why);
+      assert.match(text, /cannot be determined/, why);
+    }
+  } finally {
+    filesNoRecords();
+  }
 });

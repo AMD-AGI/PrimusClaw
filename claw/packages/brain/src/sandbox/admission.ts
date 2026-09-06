@@ -92,6 +92,25 @@ export async function releaseAdmission(identity: string): Promise<boolean> {
   return released;
 }
 
+/**
+ * Whether the roster is known to be complete.
+ *
+ * A reconciliation that exhausted its retries wrote nothing, so the roster is
+ * missing every target it was about to take on. Admitting against it would be
+ * admitting against an understated count -- the ceiling checked against a
+ * number nobody could write -- so ordinary claims are refused until a later
+ * reconciliation succeeds and says the roster is whole again.
+ */
+let rosterStale = false;
+
+export function markRosterStale(stale: boolean): void {
+  rosterStale = stale;
+}
+
+export function isRosterStale(): boolean {
+  return rosterStale;
+}
+
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
 export class SandboxCapacityRefused extends Error {}
 
@@ -124,6 +143,12 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
+  if (rosterStale) {
+    throw new SandboxCapacityRefused(
+      "sandbox admission refused: the keepalive roster could not be reconciled, so "
+      + "the fleet count it would be checked against is incomplete",
+    );
+  }
   const claim = await claimProvisionalSlot(store, config);
   if (!claim.ok) {
     logger.warn(

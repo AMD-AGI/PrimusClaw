@@ -16,9 +16,15 @@ import type { KV } from "nats";
 import { isTombstone } from "../tasks/lock.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
-import { assertRetentionSeparation, sessionIdFromHandsKey } from "./hands-key.js";
+import {
+  assertRetentionSeparation, migrateReservedSessionKeys, sessionIdFromHandsKey,
+  type HandsKeyStore,
+} from "./hands-key.js";
+import { isRevisionConflict } from "@claw/utils";
+import pino from "pino";
 
 const sc = StringCodec();
+const logger = pino({ name: "sandbox-registry" });
 
 let _kv: KV | null = null;
 
@@ -44,8 +50,8 @@ export function bindHandsKv(kv: KV): void {
  * the other still reads under its old name -- two divergent bindings for one
  * session, which is worse than the collision it would have fixed.
  */
-export async function assertReservedKeysFree(kv: KV): Promise<void> {
-  await assertRetentionSeparation({
+function reservedKeyStore(kv: KV): HandsKeyStore {
+  return {
     keys: async (filter) => {
       const out: string[] = [];
       for await (const key of await kv.keys(filter)) out.push(key);
@@ -53,9 +59,47 @@ export async function assertReservedKeysFree(kv: KV): Promise<void> {
     },
     read: async (key) => {
       const entry = await kv.get(key);
-      return entry ? { value: sc.decode(entry.value) } : null;
+      return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
     },
-  });
+    create: async (key, value) => {
+      try {
+        await kv.create(key, sc.encode(value));
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+    delete: async (key, expectedRevision) => {
+      try {
+        await kv.delete(key, { previousSeq: expectedRevision });
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+  };
+}
+
+/**
+ * Move any session binding out of the retention namespace, then prove none is
+ * left. At boot, before anything can be provisioned.
+ *
+ * The move is what B41 asks for and the check is what makes its failure loud:
+ * a collision the migration could not resolve -- a destination something else
+ * holds, an entry that cannot be read -- would leave a container retained under
+ * that generation unable to keep its binding, and it would be reclaimed with
+ * its work in it. There is no safe automatic repair for that, so the deployment
+ * is refused with the keys named.
+ */
+export async function assertReservedKeysFree(kv: KV): Promise<void> {
+  const store = reservedKeyStore(kv);
+  const moved = await migrateReservedSessionKeys(store);
+  if (moved.migrated.length || moved.resumed.length) {
+    logger.warn({ migrated: moved.migrated, resumed: moved.resumed }, "hands.reserved_key_migration");
+  }
+  await assertRetentionSeparation(store);
 }
 
 /** Read back the bound KV bucket. Throws if bindHandsKv() was never called. */
