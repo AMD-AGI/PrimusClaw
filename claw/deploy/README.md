@@ -176,6 +176,13 @@ kubectl rollout restart deployment/primus-claw-api -n primus-claw
 kubectl rollout restart deployment/primus-claw-brain -n primus-claw
 ```
 
+### Doorbell Dispatch and Admission Ceilings
+
+`features.runDoorbellDispatch` and the eight `api.admit*` ceilings ship off and
+at `"0"`. Turning them on is a staged procedure with its own gates and a
+strict rollback order -- clear the ceilings first, disable Doorbell second, or
+the API refuses to start. See [`../docs/doorbell-rollout.md`](../docs/doorbell-rollout.md).
+
 ### Grafana Dashboard
 
 `charts/claw/dashboards/claw-brain.json` is a Grafana dashboard for the Brain's
@@ -315,3 +322,6 @@ Requires `boto3` (`pip install boto3`). See `deploy/minio-lifecycle.py` for user
 | `minio-lifecycle.py` | S3 bucket lifecycle rules script (boto3) |
 | `charts/claw/dashboards/claw-brain.json` | Grafana dashboard for the Brain metrics (installed by the chart when `grafanaDashboard.enabled`, or imported by hand) |
 | `charts/claw/templates/servicemonitor.yaml` | Prometheus Operator ServiceMonitors for API and Brain (`serviceMonitor.enabled`) |
+| `charts/claw/values.schema.json` | JSON Schema for the Doorbell switch and the eight admission ceilings, enforced by `helm lint`/`template`/`upgrade` |
+| `charts/claw/templates/admission-preflight.yaml` | Render-time refusal of a soft ceiling above its hard ceiling, and of any ceiling set while Doorbell dispatch is off |
+| `promql/rollout-gates.test.yaml` | `promtool test rules` fixture for the rollout gates in `../docs/doorbell-rollout.md`, under both scrape modes |

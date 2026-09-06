@@ -53,6 +53,22 @@ spec:
         # every workload that reads it, so a routine api rotation also bounced
         # brain and threw away its in-flight turns.
         checksum/nats-user: {{ include "primus-claw.natsUserSecret" (dict "root" . "component" "api") | sha256sum }}
+        # The Doorbell switch and the eight admission ceilings, hashed from
+        # .Values rather than from the rendered Secret. upgrade.sh renders this
+        # Deployment with --show-only and secret.create=false, under which
+        # secret.yaml renders empty and checksum/secret cannot move -- so on
+        # that path a changed ceiling would reach the Secret and never reach a
+        # pod, which reads its environment once at start.
+        checksum/rollout-config: {{ printf "%v|%v|%v|%v|%v|%v|%v|%v|%v"
+          (get (.Values.features | default dict) "runDoorbellDispatch" | default false)
+          (get .Values.api "admitSoftRuns" | default 0)
+          (get .Values.api "admitHardRuns" | default 0)
+          (get .Values.api "admitSoftSandboxes" | default 0)
+          (get .Values.api "admitHardSandboxes" | default 0)
+          (get .Values.api "admitSoftGpuNodes" | default 0)
+          (get .Values.api "admitHardGpuNodes" | default 0)
+          (get .Values.api "admitTreeMaxNodes" | default 0)
+          (get .Values.api "admitTreeMaxDepth" | default 0) | sha256sum }}
     spec:
       securityContext:
         runAsNonRoot: true

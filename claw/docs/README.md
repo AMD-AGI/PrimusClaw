@@ -17,6 +17,7 @@ wins.
 | [`builtin-tools-design.md`](builtin-tools-design.md) | The built-in tool set, including the web-fetch SSRF guard and its denylist |
 | [`execution-template-design.md`](execution-template-design.md) | Execution templates: how a run's image, resources, and prompt are composed |
 | [`memory-skill-evolution-design.md`](memory-skill-evolution-design.md) | Long-term memory and skill self-evolution, both behind feature flags |
+| [`doorbell-rollout.md`](doorbell-rollout.md) | Staged rollout and rollback of Doorbell chat dispatch and the eight admission ceilings, with the gate expressions for each step |
 | [`brain-graceful-upgrade.md`](brain-graceful-upgrade.md) | Draining and restarting Brain without losing in-flight runs |
 | [`litellm-auto-routing-design.md`](litellm-auto-routing-design.md) | Complexity-based model routing through the LiteLLM gateway |
 | [`plugins.md`](plugins.md) | The plugin format and the marketplace import path |

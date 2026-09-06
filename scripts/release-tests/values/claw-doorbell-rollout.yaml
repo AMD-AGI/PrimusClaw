@@ -1,0 +1,52 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Base values for the Doorbell rollout render tests, independent of
+# claw-release.yaml so a change made for the release smoke cannot silently
+# move what the rollout gates assert. Everything below is fake.
+#
+# The nine rollout keys restate the shipped safe defaults key by key rather
+# than inheriting them, so a chart-side default change shows up as a diff here
+# and fails the case that asserts the rolled-back state renders clean.
+
+image:
+  registry: example.invalid
+  repository: claw
+  tag: rollout-test@sha256:5555555555555555555555555555555555555555555555555555555555555555
+postgres:
+  clusterName: rollout-pg
+  appUser: rollout-user
+  appDb: rollout-db
+  userSecretName: rollout-pguser-rollout-user
+  storageClass: release-test-sc
+  dataSize: 1Gi
+  backupSize: 1Gi
+ingress:
+  enabled: false
+secret:
+  create: true
+  authInternalToken: release-test-internal-token
+  userEnvEncryptionKey: 01234567890123456789012345678901
+  natsPassword: release-test-nats-password
+  clawDeployMode: release-test
+  llmApiStyle: anthropic
+  anthropicBaseUrl: https://llm.release.example
+  openaiBaseUrl: https://llm.release.example/v1
+  byokVerifyApiStyle: openai
+  s3Endpoint: https://s3.release.example
+  s3ApiEndpoint: https://s3.release.example
+  s3AccessKey: release-test-access
+  s3SecretKey: release-test-secret
+
+features:
+  runDoorbellDispatch: false
+
+api:
+  admitSoftRuns: "0"
+  admitHardRuns: "0"
+  admitSoftSandboxes: "0"
+  admitHardSandboxes: "0"
+  admitSoftGpuNodes: "0"
+  admitHardGpuNodes: "0"
+  admitTreeMaxNodes: "0"
+  admitTreeMaxDepth: "0"
