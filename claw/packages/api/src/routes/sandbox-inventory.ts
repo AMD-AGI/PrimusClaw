@@ -9,9 +9,12 @@
  * drains "everything it can see" then stops early.
  *
  * A record it could not decode was skipped and the answer still said `ok`, so a
- * corrupt row dropped a live sandbox out of both the listing and the count. The
- * skipped ones are counted and returned instead, and a caller that needs a
- * census refuses any answer whose count is not zero.
+ * corrupt row dropped a live sandbox out of both the listing and the count. An
+ * unreadable record now fails the whole read: the count of them is reported so
+ * an operator knows what to repair, but the answer is not `ok` and no step may
+ * proceed on it. A row that parses but carries no usable identity is the same
+ * failure wearing valid JSON -- nothing can be pinged or deleted by it -- and is
+ * counted the same way.
  *
  * And it enumerated session keys only. A DAG node resolves its sandbox through
  * the handle map instead -- deliberately, because every node of a DAG shares one
@@ -21,7 +24,7 @@
  * beside it, keyed by the name and namespace a rollback actually deletes by.
  */
 
-import { HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
+import type { HandleInfo } from "@claw/protocol";
 
 export interface SandboxRow {
   session_id: string;
@@ -47,12 +50,15 @@ export interface DagHandleRow {
 }
 
 export interface SandboxInventory {
-  ok: true;
+  /** False where any record could not be read; never a smaller fleet. */
+  ok: boolean;
+  /** Every row returned, session and DAG handle alike. */
   count: number;
-  /** Records that exist and could not be decoded. A census with any is refused. */
+  /** Records that exist and could not be used. Any at all fails the read. */
   unreadable: number;
   sessions: SandboxRow[];
   dag_handles: DagHandleRow[];
+  error?: string;
 }
 
 export interface InventoryDeps {
@@ -104,10 +110,27 @@ function dagRows(all: Array<[string, Record<string, HandleInfo>]>): DagHandleRow
 }
 
 /**
+ * A row that parses and still cannot be used.
+ *
+ * A binding with no endpoint cannot be pinged and one with no name and no
+ * workload id cannot be deleted, so it is a sandbox this census can neither
+ * drain nor prove drained -- the same hole a corrupt record leaves, and treated
+ * the same way rather than returned as a row that looks complete.
+ */
+function isUsable(info: Record<string, unknown>): boolean {
+  const nonEmpty = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
+  return nonEmpty(info.handsUrl)
+    && (nonEmpty(info.sandboxName) || nonEmpty(info.workloadId));
+}
+
+/**
  * Read the whole fleet, or fail.
  *
- * Throws where either half cannot be read. The caller reports that as
- * `ok:false`; nothing here converts an unreadable source into an empty one.
+ * Throws where either half cannot be read, and answers `ok:false` where any
+ * individual record could not be used. Nothing here converts an unreadable
+ * source into an empty one: every gate and every rollback step iterates this,
+ * and a step that drains what it can see and then reports itself finished is
+ * exactly what a silently shortened fleet produces.
  */
 export async function collectSandboxInventory(deps: InventoryDeps): Promise<SandboxInventory> {
   const sessions: SandboxRow[] = [];
@@ -123,19 +146,24 @@ export async function collectSandboxInventory(deps: InventoryDeps): Promise<Sand
       unreadable += 1;
       continue;
     }
-    const handsUrl = (info.handsUrl as string) || "";
+    if (!isUsable(info)) {
+      unreadable += 1;
+      continue;
+    }
     sessions.push(rowFromEntry(
-      deps.sessionIdFromKey(key), info, handsUrl ? await deps.probeHealth(handsUrl) : false,
+      deps.sessionIdFromKey(key), info, await deps.probeHealth(info.handsUrl as string),
     ));
   }
 
+  const dag_handles = dagRows(await deps.dagHandles());
   return {
-    ok: true,
-    count: sessions.length,
+    ok: unreadable === 0,
+    count: sessions.length + dag_handles.length,
     unreadable,
     sessions,
-    dag_handles: dagRows(await deps.dagHandles()),
+    dag_handles,
+    ...(unreadable > 0
+      ? { error: `${unreadable} sandbox record(s) could not be read; this inventory is incomplete` }
+      : {}),
   };
 }
-
-export const DAG_HANDLE_PREFIX = `${HANDLE_MAP_PREFIX}.`;

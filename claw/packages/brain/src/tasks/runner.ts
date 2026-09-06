@@ -75,6 +75,9 @@ import {
 } from "./checkpoint-codec.js";
 import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
+import { deleteRunRows } from "../sandbox/bg-handle-rows.js";
+import { bgRowStore } from "../sandbox/bg-row-store.js";
+import { handsSessionKey } from "../sandbox/hands-key.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
@@ -1535,7 +1538,7 @@ class TaskRunner {
   private async resolvePlatformKey(): Promise<void> {
     if (this.platformKey) return;
     try {
-      const e = await this.kv.get(`hands.${this.sessionId}`);
+      const e = await this.kv.get(handsSessionKey(this.sessionId));
       if (e) {
         const info = JSON.parse(sc.decode(e.value));
         this.platformKey = info.platformKey || "";
@@ -2251,11 +2254,29 @@ class TaskRunner {
   private async releaseAfterTerminal(): Promise<void> {
     await this.releaseStep("rayjob", () => this.teardownRayJob());
     await this.releaseStep("background_shells", () => this.reapBackgroundShells());
+    await this.releaseStep("bg_handle_rows", () => this.dropBackgroundHandleRows());
     await this.releaseStep("keepalive", () => this.stopKeepaliveAfterTask());
   }
 
   /**
-   * Run one release step, isolated from the other two.
+   * Drop this run's background-shell reference rows.
+   *
+   * Only from here, and only because this path means the run is over: a
+   * termination checkpoint, a lost lease or a retryable error all mean the run
+   * will be picked up again, and its rows are what stop the resumed attempt
+   * executing a command that already ran.
+   */
+  private async dropBackgroundHandleRows(): Promise<void> {
+    const store = bgRowStore();
+    if (!store || !this.handsOwner || !this.runId) return;
+    const dropped = await deleteRunRows(store, this.handsOwner, this.runId);
+    if (dropped) {
+      logger.info({ sessionId: this.sessionId, runId: this.runId, dropped }, "task.bg_rows_dropped");
+    }
+  }
+
+  /**
+   * Run one release step, isolated from the others.
    *
    * Each of the three is independently worth doing, and each can fail on its
    * own: the cluster release inspects the request's topology and reaches SaFE,
@@ -3273,8 +3294,9 @@ class TaskRunner {
       // and a Hands restart. At one of these every ten seconds it was the
       // reason those CAS writes lost. A lost race here needs no handling: the
       // writer that beat us refreshed the same TTL.
-      this.kv.get(`hands.${this.sessionId}`).then(e => {
-        if (e) this.kv.update(`hands.${this.sessionId}`, e.value, e.revision).catch((err) => {
+      const handsKey = handsSessionKey(this.sessionId);
+      this.kv.get(handsKey).then(e => {
+        if (e) this.kv.update(handsKey, e.value, e.revision).catch((err) => {
           logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_refresh_failed");
         });
       }).catch((err) => {

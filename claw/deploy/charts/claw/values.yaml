@@ -601,6 +601,18 @@ features:
   # over. Pin brain.bashMaxTimeoutSec if you need the short ceiling without the
   # background tools.
   backgroundShell: false
+  # Capacity data the keepalive sweep is proven against, required whenever
+  # backgroundShell is true and refused when absent -- a deferral bound stated
+  # against a number nobody declared is not a bound.
+  #
+  # keepaliveTargetCeiling is the largest number of distinct ping targets one
+  # Brain replica may face; keepaliveReconcileReserve is how many of those slots
+  # are held back so a target another replica created can always be taken on
+  # before it is served. Size the ceiling to the deployment's real fleet: too
+  # low refuses new sandboxes, too high means the refresh gap was proven at a
+  # number the fleet exceeds.
+  keepaliveTargetCeiling: ""
+  keepaliveReconcileReserve: ""
   # Chat dispatch publishes a doorbell and injects credentials at claim time
   # instead of putting the full execute request on the shared durable. Off
   # until every Brain replica understands the doorbell: a mixed fleet must

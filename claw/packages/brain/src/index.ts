@@ -53,6 +53,7 @@ import {
 } from "./config.js";
 import { existsSync, createReadStream } from "fs";
 import { initDagHandles } from "./sandbox/handles.js";
+import { initBgHandleRows } from "./sandbox/bg-row-store.js";
 import {
   bindHandsKv, isValidHandsToken, migrateReservedKeys,
 } from "./sandbox/registry.js";
@@ -524,6 +525,9 @@ async function main() {
   // Bind the cross-instance DAG handle map (used by sandbox.use lookups and
   // sandbox.create registration when a task carries a `dag_root_task_id`).
   await initDagHandles(js);
+  // Its own bucket with no expiry: a run whose budget is configured off has no
+  // deadline, so no finite lifetime bounds how long one of these must answer.
+  await initBgHandleRows(js);
   // Bind BRAIN_REGISTRY for the ensureHands/destroyHands token registry
   // (sandbox/registry.ts) so it can read/write `hands.<sessionId>` without a
   // circular import back into this file.

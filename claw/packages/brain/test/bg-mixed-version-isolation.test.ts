@@ -4,83 +4,140 @@
 /**
  * B36 -- the mixed-version window must not open a cross-run door.
  *
- * A sandbox whose Hands predates the run-partitioned scheme resolves read, wait
- * and kill by owner scope and id alone. Talking to it while discarding the run
- * identity leaves N10.2.1's first negative case unenforced for as long as it
- * answers: two run identities under one owner -- a later message in a
- * conversation, a sibling node under one graph root -- could read and terminate
- * each other's shells, with no fail-closed refusal anywhere.
+ * A sandbox whose Hands predates the record scheme resolves read, wait and kill
+ * by owner scope and id alone. Brain stamping a run header changes nothing
+ * there: an older Hands does not read it, so two run identities sharing an
+ * owner -- a later message in a conversation, a sibling node under one graph
+ * root -- could name one id and reach each other's shells for as long as it
+ * answers. N10.2.1's first negative case has no mixed-version exemption.
  *
- * A reference row cannot supply the missing half by itself: an id is freed when
- * its shell is reaped, a second run may then be given the same one, and the
- * first run's row still names it. So the boundary is folded into the id, by a
- * transform two run identities can never collide under, and the row is used
- * only to narrow what is sent -- never to authorise it.
+ * Exercised through `HandsClient` against a sandbox shaped like each version,
+ * because the boundary is only real if the transform is on the call path the
+ * model's tool calls actually take.
  */
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { mayAddressUnpartitioned, runQualifiedShellId } from "../src/sandbox/bg-start.js";
-import { advanceRow, type BgRowStore } from "../src/sandbox/bg-handle-rows.js";
+import { HandsClient } from "../src/clients/hands.js";
 import { decodeKeyPart } from "../src/sandbox/bg-key.js";
+import { bindShellRecordsCapabilityForTest } from "../src/clients/hands.js";
+import { bindBgHandleRowsForTest } from "../src/sandbox/bg-row-store.js";
 
-function memoryStore(): BgRowStore {
-  const map = new Map<string, string>();
-  return {
-    async get(key) { return map.get(key) ?? null; },
-    async put(key, value) { map.set(key, value); },
-    async delete(key) { map.delete(key); },
-    async keys() { return [...map.keys()]; },
-  };
+let restoreRows: (() => void) | null = null;
+let restoreCapability: (() => void) | null = null;
+
+afterEach(() => {
+  restoreRows?.();
+  restoreCapability?.();
+  restoreRows = null;
+  restoreCapability = null;
+});
+
+/** Which sandbox version this client is talking to. */
+function sandboxOfVersion(filesRecords: boolean | "unreachable"): void {
+  restoreCapability = bindShellRecordsCapabilityForTest(async () => {
+    if (filesRecords === "unreachable") throw new Error("unreachable");
+    return filesRecords;
+  });
 }
 
-test("two run identities under one owner can never present one wire id", () => {
-  const mine = runQualifiedShellId("ktsk_1", "server");
-  const theirs = runQualifiedShellId("ktsk_2", "server");
+/**
+ * A client wired to a recording stand-in for the MCP transport.
+ *
+ * The transport is replaced rather than stubbed at a seam of its own: what is
+ * under test is which arguments leave Brain, so the substitution has to sit
+ * exactly where the SDK call does.
+ */
+function clientFor(run: string): { hands: HandsClient; sent: Array<Record<string, unknown>> } {
+  const sent: Array<Record<string, unknown>> = [];
+  const hands = new HandsClient("http://sandbox:9100/mcp", "tok", "sess-shared", run);
+  (hands as unknown as { connected: boolean }).connected = true;
+  (hands as unknown as { client: unknown }).client = {
+    callTool: async ({ arguments: args }: { arguments: Record<string, unknown> }) => {
+      sent.push(args);
+      return { content: [{ type: "text", text: `Started background shell ${args.shell_id}.` }] };
+    },
+  };
+  return { hands, sent };
+}
 
-  assert.notEqual(mine, theirs,
-    "'server' is the obvious name and both runs will pick it; against an "
-      + "owner-keyed registry the qualified form is what keeps them apart");
+test("against a pre-scheme sandbox, two runs cannot name one shell", async () => {
+  // No rows bound: the transform alone is what makes the boundary hold, so this
+  // is the weakest configuration it has to hold in.
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(false);
 
-  const [run, id] = mine.split(".");
-  assert.equal(decodeKeyPart(run), "ktsk_1");
-  assert.equal(decodeKeyPart(id), "server", "and the public id is carried whole, never truncated");
+  const mine = clientFor("ktsk_1");
+  const theirs = clientFor("ktsk_2");
+  await mine.hands.callTool("bash", { command: "train", run_in_background: true, shell_id: "server" });
+  await theirs.hands.callTool("bash_output", { shell_id: "server" });
+
+  assert.notEqual(mine.sent[0].shell_id, "server",
+    "an unqualified id is the address an owner-keyed registry cannot partition");
+  assert.notEqual(mine.sent[0].shell_id, theirs.sent[0].shell_id,
+    "'server' is the obvious name and both runs will pick it; the wire form is "
+      + "what keeps them apart on a sandbox that cannot");
+
+  const [runPart, idPart] = String(mine.sent[0].shell_id).split(".");
+  assert.equal(decodeKeyPart(runPart), "ktsk_1");
+  assert.equal(decodeKeyPart(idPart), "server", "and the public id is carried whole, never truncated");
 });
 
-test("the transform is total and injective, so no pair can be confused for another", () => {
-  // Truncating to fit a length limit would cost exactly this property, which is
-  // why nothing here truncates.
-  const seen = new Map<string, string>();
-  for (const run of ["a", "a.b", "ab", "", "ünïcode"]) {
-    for (const id of ["x", "x.y", "xy", "server"]) {
-      const wire = runQualifiedShellId(run, id);
-      const prior = seen.get(wire);
-      assert.equal(prior, undefined, `${prior} and ${run}/${id} collide on ${wire}`);
-      seen.set(wire, `${run}/${id}`);
-    }
-  }
+test("the model is never shown the wire form, so it can poll with what it sent", async () => {
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(false);
+
+  const { hands, sent } = clientFor("ktsk_1");
+  const text = await hands.callTool(
+    "bash", { command: "train", run_in_background: true, shell_id: "server" },
+  );
+
+  assert.match(text, /Started background shell server\./);
+  assert.ok(!text.includes(String(sent[0].shell_id)),
+    "left in the text, the qualified id becomes what the model sends back -- and "
+      + "Brain would qualify it a second time, addressing a shell that does not exist");
 });
 
-test("no read, wait or kill is forwarded for an id this run holds no row for", async () => {
-  const store = memoryStore();
-  await advanceRow(store, { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1" },
-    "gen-1", "spawn_confirmed");
+test("against a record-writing sandbox the id goes out untouched", async () => {
+  // There the run identity is part of the address the sandbox itself resolves,
+  // so qualifying would be a second boundary over one that already holds.
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(true);
 
-  assert.equal(
-    await mayAddressUnpartitioned(store, { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1" }),
-    true,
-  );
-  assert.equal(
-    await mayAddressUnpartitioned(store, { ownerScope: "sess", runIdentity: "ktsk_2", shellId: "bg-1" }),
-    false,
-    "a sibling run naming the same id is refused rather than forwarded, and is "
-      + "answered exactly as a never-issued id",
-  );
-  assert.equal(
-    await mayAddressUnpartitioned(store, { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "pre-upgrade" }),
-    false,
-    "a shell predating the rows has no recorded run identity, so no wire form "
-      + "can carry a boundary for it and a verbatim carve-out would let any run "
-      + "of one owner reach it",
-  );
+  const { hands, sent } = clientFor("ktsk_1");
+  await hands.callTool("bash", { command: "train", run_in_background: true, shell_id: "server" });
+  assert.equal(sent[0].shell_id, "server");
+});
+
+test("a sandbox that cannot be asked is treated as the more restrictive version", async () => {
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion("unreachable");
+
+  const { hands, sent } = clientFor("ktsk_1");
+  await hands.callTool("kill_shell", { shell_id: "server" });
+  assert.notEqual(sent[0].shell_id, "server",
+    "guessing the permissive way round costs the boundary; guessing this way "
+      + "costs at most a qualified id a newer Hands would have taken plain");
+});
+
+test("an id predating the transform is answered as never-issued, not served verbatim", async () => {
+  // Such a shell went out unqualified, so a qualified lookup finds nothing --
+  // which is the answer it has to get: it carries no recorded run identity, and
+  // serving it verbatim would let any run of one owner reach it.
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(false);
+
+  const { hands, sent } = clientFor("ktsk_1");
+  await hands.callTool("kill_shell", { shell_id: "started-before-the-upgrade" });
+
+  assert.notEqual(sent[0].shell_id, "started-before-the-upgrade");
+});
+
+test("a foreground call carries no shell id and is left alone", async () => {
+  restoreRows = bindBgHandleRowsForTest(null);
+  sandboxOfVersion(false);
+
+  const { hands, sent } = clientFor("ktsk_1");
+  await hands.callTool("bash", { command: "ls" });
+  assert.deepEqual(sent[0], { command: "ls" });
 });

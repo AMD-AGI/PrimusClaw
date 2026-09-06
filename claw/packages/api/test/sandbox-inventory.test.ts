@@ -41,18 +41,36 @@ test("a session row names the resource a rollback deletes by", async () => {
     "the workload id is empty on this path, so the provider is what classifies a row");
 });
 
-test("an undecodable record is counted, never dropped from a still-ok answer", async () => {
+test("an undecodable record fails the whole read, rather than shrinking it", async () => {
   const entries: Record<string, string> = { "hands.sess-1": READY, "hands.sess-2": "{corrupt" };
   const inventory = await collectSandboxInventory(deps({
     handsKeys: async () => Object.keys(entries),
     handsGet: async (key) => entries[key] ?? null,
   }));
 
-  assert.equal(inventory.unreadable, 1,
-    "dropped silently, this row is a live sandbox every consumer reads as absent");
-  assert.equal(inventory.count, 1);
-  assert.notEqual(inventory.unreadable, 0,
-    "which is what a census caller refuses on: an incomplete inventory is not a small fleet");
+  assert.equal(inventory.ok, false,
+    "an incomplete inventory is not a small fleet, and a step that drains what "
+      + "it can see then reports itself finished is what a still-ok answer buys");
+  assert.equal(inventory.unreadable, 1, "and says how much is missing, so it can be repaired");
+  assert.match(inventory.error!, /could not be read/);
+});
+
+test("a row that parses but names nothing to reach or delete fails it too", async () => {
+  // The same hole wearing valid JSON: no endpoint to ping, and no name or
+  // workload id to delete by, so it can be neither drained nor proved drained.
+  for (const broken of [
+    { status: "ready", sandboxName: "s", namespace: "n" },
+    { status: "ready", handsUrl: "http://sb/mcp", sandboxName: "", workloadId: "" },
+    { status: "ready", handsUrl: "   ", sandboxName: "s" },
+  ]) {
+    const entries = { "hands.sess-1": READY, "hands.sess-2": JSON.stringify(broken) };
+    const inventory = await collectSandboxInventory(deps({
+      handsKeys: async () => Object.keys(entries),
+      handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+    }));
+    assert.equal(inventory.ok, false, JSON.stringify(broken));
+    assert.equal(inventory.unreadable, 1, JSON.stringify(broken));
+  }
 });
 
 test("live DAG sandboxes are the other half of the fleet", async () => {
@@ -72,6 +90,9 @@ test("live DAG sandboxes are the other half of the fleet", async () => {
     sandbox_name: "sandbox-dag", namespace: "ns-b",
     hands_url: "http://sb-dag:9100/mcp", workload_id: "", provider: "agent-sandbox",
   }]);
+  assert.equal(inventory.count, 2,
+    "the count is the whole returned set, or a consumer sizing the fleet by it "
+      + "misses every DAG sandbox");
   assert.ok(!inventory.sessions.some((r) => r.sandbox_name === "sandbox-dag"),
     "which is exactly why enumerating session keys alone is not a census");
 });

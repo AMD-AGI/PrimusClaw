@@ -20,13 +20,30 @@ import {
 import { decodeKeyPart, encodeKeyPart } from "../src/sandbox/bg-key.js";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
-function memoryStore(): BgRowStore & { map: Map<string, string> } {
-  const map = new Map<string, string>();
+function memoryStore(): BgRowStore & {
+  map: Map<string, { value: string; revision: number }>;
+  conflictOnce(): void;
+} {
+  const map = new Map<string, { value: string; revision: number }>();
+  let stale = false;
   return {
     map,
-    async get(key) { return map.get(key) ?? null; },
-    async put(key, value) { map.set(key, value); },
-    async delete(key) { map.delete(key); },
+    conflictOnce() { stale = true; },
+    async read(key) { return map.get(key) ?? null; },
+    async write(key, value, expectedRevision) {
+      // One injected lost race, so the retry path is exercised rather than
+      // assumed: a store that never refuses cannot tell a compare-and-set from
+      // an unconditional put.
+      if (stale) { stale = false; return false; }
+      const current = map.get(key);
+      if ((current?.revision ?? null) !== expectedRevision) return false;
+      map.set(key, { value, revision: (current?.revision ?? 0) + 1 });
+      return true;
+    },
+    async delete(key, expectedRevision) {
+      if (map.get(key)?.revision !== expectedRevision) return;
+      map.delete(key);
+    },
     async keys(filter) {
       return [...map.keys()].filter((k) => matchesKvFilter(k, filter));
     },
@@ -64,6 +81,30 @@ test("states advance and never go backwards", async () => {
 
   await advanceRow(store, ADDRESS, "gen-1", "spawn_confirmed");
   assert.equal((await readRow(store, ADDRESS))!.state, "spawn_confirmed");
+});
+
+test("a slower writer cannot put an older state back over a newer one", async () => {
+  // The read-then-write shape this forbids: a replay that read `dispatched`
+  // while the original was confirming would regress the row, and a later
+  // resolution would then re-send a start for a shell that already exists.
+  const store = memoryStore();
+  await advanceRow(store, ADDRESS, "gen-1", "issued");
+  await advanceRow(store, ADDRESS, "gen-1", "spawn_confirmed");
+
+  store.conflictOnce();
+  await advanceRow(store, ADDRESS, "gen-1", "dispatched");
+
+  assert.equal((await readRow(store, ADDRESS))!.state, "spawn_confirmed",
+    "the refused write is re-decided against what is actually there");
+});
+
+test("contention that never settles is raised, not silently dropped", async () => {
+  const store = memoryStore();
+  const alwaysStale: BgRowStore = { ...store, async write() { return false; } };
+  await assert.rejects(
+    () => advanceRow(alwaysStale, ADDRESS, "gen-1", "issued"),
+    /could not be advanced/,
+  );
 });
 
 test("a new sandbox generation restamps the row rather than inheriting the old state", async () => {

@@ -12,10 +12,12 @@ import { constantTimeEquals } from "@claw/utils";
 import { tools } from "./tools/index.js";
 import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
 import {
-  DEADLINE_HEADER, INTENT_HEADER, OWNER_HEADER, RUN_HEADER, UNOWNED,
+  DEADLINE_HEADER, INTENT_HEADER, NO_RUN, OWNER_HEADER, RUN_HEADER, UNOWNED,
   normalizeDeadline, normalizeIntent, normalizeOwner, normalizeRun, withCaller,
 } from "./runtime/owner-context.js";
-import { mintEpoch, processStartToken, stateRoot } from "./runtime/shell-records.js";
+import {
+  mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
+} from "./runtime/shell-records.js";
 import { MAX_TIMEOUT_SEC } from "./tools/shell/bash.js";
 import { BG_SHELL_ENABLED, INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
@@ -56,7 +58,51 @@ app.get("/health", async () => ({
   // environment is not visible from outside any other way.
   bgShellEnabled: BG_SHELL_ENABLED,
   bashMaxTimeoutSec: MAX_TIMEOUT_SEC,
+  // Whether this process files durable shell records, which is what decides
+  // how Brain addresses it: a process that files none partitions its shells by
+  // owner alone, and the run half of the address has to travel inside the id
+  // instead. Absent on every build predating the records, which is exactly the
+  // population that needs the other treatment.
+  bgShellRecords: readEpochMarker() !== null,
 }));
+
+/**
+ * What the records say about one shell, for a Brain resolving a possible replay.
+ *
+ * Read-only and starts nothing, so it is safe to ask before deciding whether a
+ * start is a first call. The three answers are kept apart deliberately: a
+ * determinate absence beneath a readable marker says no claim landed, while an
+ * unreadable subtree or a missing marker says nothing was observed at all, and
+ * only the first of those may lead to a start being sent.
+ */
+app.post<{ Body?: { owner?: unknown; run?: unknown; shell_id?: unknown } }>(
+  "/internal/shells/record",
+  async (req, reply) => {
+    const denied = authFailure(req);
+    if (denied) return reply.status(denied.status).send({ error: denied.error });
+
+    const raw = req.body?.owner;
+    const owner = normalizeOwner(raw);
+    if (owner === UNOWNED && raw !== UNOWNED) {
+      return reply.status(400).send({ error: "owner_required" });
+    }
+    const shellId = typeof req.body?.shell_id === "string" ? req.body.shell_id : "";
+    if (!shellId) return reply.status(400).send({ error: "shell_id_required" });
+
+    const marker = readEpochMarker() !== null;
+    const readable = subtreeReadable();
+    const run = normalizeRun(req.body?.run);
+    let present = false;
+    if (marker && readable) {
+      try {
+        present = readRecord(owner, run === NO_RUN ? null : run, shellId) !== null;
+      } catch {
+        return { marker, subtreeReadable: false, present: false };
+      }
+    }
+    return { marker, subtreeReadable: readable, present };
+  },
+);
 
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);

@@ -30,6 +30,18 @@ async function counted(clamped: "true" | "false"): Promise<number> {
   return metric?.values?.find((v) => v.labels.clamped === clamped)?.value ?? 0;
 }
 
+test("both label series read zero before anything has timed out", async () => {
+  // The guide's stop condition is a rate over two windows. An uninitialised
+  // series is absent from /metrics, and the read then fails rather than
+  // reporting the quiet window it is actually looking at.
+  const metric = (await registry.getMetricsAsJSON())
+    .find((m) => m.name === METRIC) as { values?: Array<{ labels: Record<string, string> }> };
+  assert.deepEqual(
+    metric!.values!.map((v) => v.labels.clamped).sort(), ["false", "true"],
+    "both combinations exist from startup",
+  );
+});
+
 test("a clamped foreground timeout is counted as one, and says it was clamped", async () => {
   const before = await counted("true");
   countForegroundTimeout({

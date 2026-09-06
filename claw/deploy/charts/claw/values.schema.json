@@ -14,6 +14,20 @@
             { "type": "boolean" },
             { "type": "string", "enum": ["true", "false", ""] }
           ]
+        },
+        "keepaliveTargetCeiling": {
+          "description": "Largest number of distinct keepalive ping targets one Brain replica may face. Required when backgroundShell is true; Brain refuses to start without it rather than substituting a number the refresh-gap relation was never proven at.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
+        "keepaliveReconcileReserve": {
+          "description": "Slots held back from ordinary admission so a target another replica created can be taken on before it is served. Required when backgroundShell is true, and must be below keepaliveTargetCeiling.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
         }
       }
     },

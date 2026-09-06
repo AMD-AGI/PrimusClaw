@@ -6,6 +6,14 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 import { metrics } from "../infra/metrics.js";
+import {
+  isShellAddressingCall, resolveStart, restorePublicShellId, runQualifiedShellId,
+  type RecordProbe,
+} from "../sandbox/bg-start.js";
+import {
+  advanceRow, readRow, type BgHandleAddress, type BgHandleRow, type BgRowStore,
+} from "../sandbox/bg-handle-rows.js";
+import { bgRowStore } from "../sandbox/bg-row-store.js";
 import { BG_SHELL_ENABLED, HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS } from "../config.js";
 import {
   isSandboxTool, MCP_DEADLINE_SLACK_MS, toolTakesTimeout, toolTimeoutCeilingSec,
@@ -224,6 +232,36 @@ export function explainHandsError(
 }
 
 /**
+ * Whether the sandbox at this url files durable shell records.
+ *
+ * Its own function, and replaceable, because it is a live HTTP read that every
+ * addressing decision depends on: a test that cannot choose which version it is
+ * talking to cannot exercise either side of the boundary.
+ */
+async function probeShellRecordsCapability(url: string): Promise<boolean> {
+  try {
+    const resp = await undiciFetch(handsEndpoint(url, "/health"), {
+      signal: AbortSignal.timeout(5_000),
+      dispatcher: HANDS_DISPATCHER,
+    } as Parameters<typeof undiciFetch>[1]);
+    const body = resp.ok ? await resp.json() as { bgShellRecords?: unknown } : {};
+    return body?.bgShellRecords === true;
+  } catch {
+    return false;
+  }
+}
+
+let readShellRecordsCapability = probeShellRecordsCapability;
+
+/** Swap the capability read; returns the call that puts the real one back. */
+export function bindShellRecordsCapabilityForTest(
+  fn: (url: string) => Promise<boolean>,
+): () => void {
+  readShellRecordsCapability = fn;
+  return () => { readShellRecordsCapability = probeShellRecordsCapability; };
+}
+
+/**
  * Count a foreground bash command the sandbox stopped at its granted second.
  *
  * Read off the result's own structured field rather than its prose: a clamped
@@ -311,6 +349,20 @@ export function callDeadlineMs(toolName: string, args: Record<string, unknown>):
 export class HandsClient {
   private client: Client;
   private connected = false;
+  /** Undefined until asked; see filesShellRecords. */
+  private recordsCapability: boolean | undefined;
+  /**
+   * The sandbox generation a dispatch is recorded against.
+   *
+   * The MCP url, which is the strongest token available at this boundary: it
+   * names one sandbox for its whole life and necessarily changes when one is
+   * replaced, which is the only property a generation is asked for. A weaker
+   * reading of it -- two creations coinciding -- would cost a `lost` answer its
+   * distinction, never a second execution.
+   */
+  private get generation(): string {
+    return this.url;
+  }
 
   /**
    * `owner` is the scope a background shell is addressable in: the DAG root for
@@ -364,18 +416,162 @@ export class HandsClient {
     logger.info({ url: this.url }, "hands.connected");
   }
 
+  /**
+   * Whether this sandbox files durable shell records, cached for the client's
+   * life.
+   *
+   * The answer decides how a shell is addressed, so it has to be established
+   * before the first background call rather than assumed. A sandbox that cannot
+   * be asked is treated as filing none, which is the more restrictive of the two
+   * -- it costs a run-qualified id a record-writing Hands would have accepted
+   * unqualified, and never the other way round.
+   */
+  private async filesShellRecords(): Promise<boolean> {
+    if (this.recordsCapability === undefined) {
+      // A read that fails answers the more restrictive of the two, wherever it
+      // fails: it costs a run-qualified id a record-writing Hands would have
+      // taken plain, never an address left unenforced.
+      this.recordsCapability = await readShellRecordsCapability(this.url).catch(() => false);
+    }
+    return this.recordsCapability;
+  }
+
+  /**
+   * The shell id to put on the wire, and the one to hand back to the model.
+   *
+   * Against a sandbox that partitions by owner scope and id alone, the run half
+   * of the address would go unenforced for as long as it answers -- two runs
+   * sharing an owner could read and terminate each other's shells, which has no
+   * mixed-version exemption. The boundary is folded into the id by a total
+   * injective transform, so two run identities can never present one wire id
+   * whatever the model names. The public id never changes: the transform is
+   * applied at this boundary and undone on the way back.
+   */
+  private async wireShellId(id: string): Promise<string> {
+    if (!this.run || await this.filesShellRecords()) return id;
+    return runQualifiedShellId(this.run, id);
+  }
+
+  /** Rewrite the `shell_id` argument for the wire, leaving everything else. */
+  private async wireArgs(
+    name: string, args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const id = args.shell_id;
+    if (!isShellAddressingCall(name, args) || typeof id !== "string" || !id) return args;
+    return { ...args, shell_id: await this.wireShellId(id) };
+  }
+
+  /**
+   * What the sandbox's own records say about one shell.
+   *
+   * Read-only and starts nothing on any version, so a Brain may ask before
+   * deciding whether a start is a first call. A sandbox that cannot be asked,
+   * or one that files no records, answers indeterminate -- which sends nothing.
+   */
+  private async probeShellRecord(shellId: string): Promise<RecordProbe> {
+    try {
+      const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/record"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ owner: this.owner, run: this.run, shell_id: shellId }),
+        signal: AbortSignal.timeout(10_000),
+        dispatcher: HANDS_DISPATCHER,
+      } as Parameters<typeof undiciFetch>[1]);
+      if (!resp.ok) return { kind: "indeterminate" };
+      const body = await resp.json() as {
+        marker?: boolean; subtreeReadable?: boolean; present?: boolean;
+      };
+      if (body?.present) return { kind: "record_present" };
+      if (body?.marker && body?.subtreeReadable) return { kind: "determinately_absent" };
+      return { kind: "indeterminate" };
+    } catch {
+      return { kind: "indeterminate" };
+    }
+  }
+
+  /**
+   * The address a background start is deduplicated under, or null where there
+   * is nothing to key one by.
+   *
+   * A start that names no id has no address before the sandbox answers, and a
+   * caller with no owner or run scope is out-of-band. Both are dispatched as
+   * they always were: there is no intent to deduplicate.
+   */
+  private startAddress(args: Record<string, unknown>): BgHandleAddress | null {
+    const shellId = args.shell_id;
+    if (!this.owner || !this.run || typeof shellId !== "string" || !shellId) return null;
+    return { ownerScope: this.owner, runIdentity: this.run, shellId };
+  }
+
+  /**
+   * Decide a background start against its reference row before sending it.
+   *
+   * The row records how far a previous dispatch of this same start got, and the
+   * two crash windows it separates lead opposite ways: a request that never
+   * reached the transport must be sent, and one that may have reached Hands must
+   * not be sent a second time. Returns the answer to give the caller, or null to
+   * go ahead and dispatch.
+   */
+  private async resolveBackgroundStart(
+    address: BgHandleAddress, store: BgRowStore,
+  ): Promise<string | null> {
+    let row: BgHandleRow | null = null;
+    let rowReadable = true;
+    try {
+      row = await readRow(store, address);
+    } catch (err) {
+      logger.warn({ err: String(err), shellId: address.shellId }, "bg_start.row_unreadable");
+      rowReadable = false;
+    }
+
+    const decision = await resolveStart({
+      row,
+      rowReadable,
+      currentGeneration: this.generation,
+      probe: () => this.probeShellRecord(address.shellId),
+    });
+
+    logger.info(
+      { shellId: address.shellId, action: decision.action, reported: decision.reported },
+      "bg_start.resolved",
+    );
+    if (decision.action === "resolve") {
+      return `Background shell ${address.shellId} was already started by this request; `
+        + `nothing was run a second time (${decision.reported}`
+        + `${decision.shellClass ? `, ${decision.shellClass}` : ""}). ${decision.reason}.`;
+    }
+    if (decision.action === "refuse") {
+      return `Error: whether background shell ${address.shellId} was started cannot be `
+        + `determined, so it was not started again. ${decision.reason}.`;
+    }
+    // A first call writes both states; a retransmission's row already carries
+    // them and re-writing is a no-op the advance recognises.
+    await advanceRow(store, address, this.generation, "issued");
+    await advanceRow(store, address, this.generation, "dispatched");
+    return null;
+  }
+
   async callTool(
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<string> {
     await this.connect();
+    const store = bgRowStore();
+    const address = name === "bash" && args.run_in_background === true
+      ? this.startAddress(args)
+      : null;
+    if (address && store) {
+      const settled = await this.resolveBackgroundStart(address, store);
+      if (settled !== null) return settled;
+    }
+    const wired = await this.wireArgs(name, args);
     // The deadline follows what the tool said it needs; see callDeadlineMs.
     // Without one an LLM-issued `bash {timeout: 330}` would block the Brain for
     // up to an hour if Hands went away mid-command, which is the deadlock this
     // fixed.
     const result = await this.client.callTool(
-      { name, arguments: args },
+      { name, arguments: wired },
       undefined,
       { timeout: callDeadlineMs(name, args), signal } as any,
     );
@@ -384,7 +580,15 @@ export class HandsClient {
       ?.filter((c) => c.type === "text" && c.text)
       .map((c) => c.text!)
       .join("\n");
-    return texts || "";
+    // Durable before the result reaches the model, so a crash after the spawn
+    // cannot leave a shell nothing attests to.
+    if (address && store && !(result as { isError?: boolean }).isError) {
+      await advanceRow(store, address, this.generation, "spawn_confirmed");
+    }
+    // The model is told the id it sent, never the qualified form: the wire
+    // shape is Brain's business, and an id the model cannot reproduce would be
+    // one it cannot poll with.
+    return restorePublicShellId(texts || "", wired.shell_id, args.shell_id);
   }
 
   /**
@@ -400,8 +604,9 @@ export class HandsClient {
     signal?: AbortSignal,
   ): Promise<{ text: string; isError: boolean; structured?: unknown }> {
     await this.connect();
+    const wired = await this.wireArgs(name, args);
     const result = await this.client.callTool(
-      { name, arguments: args },
+      { name, arguments: wired },
       undefined,
       { timeout: callDeadlineMs(name, args), signal } as any,
     );
@@ -411,7 +616,7 @@ export class HandsClient {
       .map((c) => c.text!)
       .join("\n");
     return {
-      text: texts || "",
+      text: restorePublicShellId(texts || "", wired.shell_id, args.shell_id),
       isError: !!(result as { isError?: boolean }).isError,
       structured: (result as { structuredContent?: unknown; structured?: unknown }).structuredContent
         ?? (result as { structured?: unknown }).structured,

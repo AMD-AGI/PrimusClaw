@@ -14,6 +14,7 @@
 import { LRUCache } from "lru-cache";
 import type { KV } from "nats";
 import { isTombstone } from "../tasks/lock.js";
+import { isRevisionConflict } from "@claw/utils";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
 import { migrateReservedSessionKeys, sessionIdFromHandsKey } from "./hands-key.js";
@@ -45,21 +46,43 @@ export async function migrateReservedKeys(kv: KV): Promise<void> {
       for await (const key of await kv.keys(filter)) out.push(key);
       return out;
     },
-    get: async (key) => {
+    read: async (key) => {
       const entry = await kv.get(key);
-      return entry ? sc.decode(entry.value) : null;
+      return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
     },
-    put: async (key, value) => { await kv.put(key, sc.encode(value)); },
-    delete: async (key) => { await kv.delete(key); },
-  }).catch((err) => {
-    // A scan that cannot run is not a scan that found nothing: reported rather
-    // than swallowed, since a retention minted afterwards could take a live
-    // session's key.
-    logger.error({ err: (err as Error)?.message }, "hands.reserved_key_scan_failed");
-    return null;
+    create: async (key, value) => {
+      try {
+        await kv.create(key, sc.encode(value));
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+    delete: async (key, expectedRevision) => {
+      try {
+        await kv.delete(key, { previousSeq: expectedRevision });
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
   });
-  if (result && (result.migrated.length || result.conflicted.length)) {
-    logger.warn(result, "hands.reserved_key_migration");
+
+  if (result.migrated.length) {
+    logger.warn({ migrated: result.migrated }, "hands.reserved_key_migration");
+  }
+  // A collision left standing is a live session's binding a retention can take,
+  // and the retention is what protects work the sandbox is holding. Refusing to
+  // start is the loud version of a failure whose quiet version is a reclaimed
+  // sandbox with a training run in it, hours later and attributed to nothing.
+  if (result.conflicted.length) {
+    throw new Error(
+      `refusing to start: ${result.conflicted.length} registry key(s) sit in the `
+      + `reserved retention namespace and could not be moved out `
+      + `(${result.conflicted.join(", ")}). Resolve them before restarting.`,
+    );
   }
 }
 

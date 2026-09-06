@@ -26,29 +26,48 @@ Tools assumed, all already required by this repository's own scripts: `bash` and
 set -o pipefail   # a jq that failed must abort, not print an empty census that reads as a fleet of none
 ```
 
+**The helpers are a file, not a paste.** Every decision below that has one
+right answer lives in `claw/deploy/rollout-lib.sh` and is exercised by
+`claw/packages/brain/test/rollout-lib.test.ts`. Source it once:
+
+```sh
+. claw/deploy/rollout-lib.sh
+```
+
+It provides `chart_dir`, `inventory_judge`, `inventory_rows`, `hands_base` and
+`deadline_verdict`, each returning `0` pass, `1` fail, `3` abort. **Return 3 is
+`ABORT` at every call site**: nothing could be read, which is never the same as
+a clean reading.
+
 **Brain.** `BRAIN=http://primus-claw-brain.<NS>.svc.cluster.local:8100`. Name and
 port are chart-fixed, so only the namespace is a placeholder, and it is reachable
 from inside the cluster.
 
-**Hands base URL.** The census reports `hands_url` ending in `/mcp`.
-`<HANDS_URL>/health` is not a valid URL; strip the suffix exactly as the code does:
+**The chart the deployment renders.** `chart_dir claw/deploy/values.<NS>.env`
+resolves the directory `render_chart` uses: `CLAW_CHART_DIR` is a supported
+override sourced from the values file, so a check pinned to the literal in-tree
+path can validate a chart the upgrade never deploys. A values file that exists
+and cannot be sourced **aborts** rather than falling back — the fallback is the
+same wrong answer arrived at quietly.
+
+**One census, and it fails closed.**
 
 ```sh
-hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
+inventory() { local raw; raw=$(curl -sf --max-time "$T_CURL" -H "$ADMIN" "https://$API_HOST/v1/internal/sandbox/status") || return 3
+  inventory_judge "$raw"; }
 ```
 
-**The chart the deployment renders.** Every `helm template` below renders from the
-directory `render_chart` uses, never a literal path. `CLAW_CHART_DIR` defaults to
-`claw/deploy/charts/claw` and the values file is sourced afterwards, so the values
-file overrides the default and a check pinned to the literal path can pass on a
-chart the upgrade never deploys:
+`inventory_judge` aborts on `{"ok":false}` at HTTP 200, which `curl -sf` cannot
+see; on a non-zero `unreadable`, which is a live sandbox every consumer would
+read as absent; and on an absent `dag_handles`, which is a build whose census
+cannot see a DAG sandbox at all. **A successful read that is empty is not an
+abort** — an empty fleet is the true answer on a low-traffic deployment, and
+nothing to drain is not nothing readable. `inventory_rows` is what every step
+iterates instead of `.sessions[]`, deduplicated on the `(sandbox_name,
+namespace)` pair a rollback deletes by.
 
-```sh
-chart_dir() { ( . claw/deploy/values.<NS>.env >/dev/null 2>&1; printf '%s\n' "${CLAW_CHART_DIR:-claw/deploy/charts/claw}" ); }
-```
-
-**One bounded read per sandbox**, so a single dropped packet is not recorded as a
-sandbox that failed to answer:
+**One bounded read per sandbox**, so a single dropped packet is not recorded as
+a sandbox that failed to answer:
 
 ```sh
 probe() { local a b; for a in $(seq 1 "$N_PROBE"); do
@@ -60,29 +79,31 @@ A non-zero return is `UNREACHABLE`, a reading in its own right — distinct from
 sandbox that answered without the field (`MISSING`) and from one that answered
 `false`.
 
-**One census, and it fails closed.** Every step that enumerates the fleet goes
-through these two, so none invents its own guard and none reads a failed census as
-a small one:
+**The per-sandbox and per-run helpers** the gates use are defined once here and
+referred to by name below:
 
 ```sh
-inventory() { local raw; raw=$(curl -sf --max-time "$T_CURL" -H "$ADMIN" "https://$API_HOST/v1/internal/sandbox/status") || return 3
-  printf '%s' "$raw" | jq -e '.ok == true and (.unreadable // error("no unreadable field")) == 0 and ((.dag_handles | type) == "array")' >/dev/null || return 3
-  printf '%s' "$raw"; }
-rows() { printf '%s' "$1" | jq -r '[ (.sessions[] | {sid: .session_id, name: .sandbox_name, ns: .namespace, url: .hands_url, wid: .workload_id}),
-    (.dag_handles[] | {sid: .dag_root_task_id, name: .sandbox_name, ns: .namespace, url: .hands_url, wid: .workload_id}) ]
-  | unique_by([.name, .ns]) | .[] | [.sid, .name, .ns, .url, .wid] | @tsv'; }
+# The Sandbox CR for a session, resolved BEFORE any wait: after reclamation the
+# status row is gone and nothing names it. Sets SBNAME and SBNS.
+sb() { local raw row; raw=$(inventory) || return 3
+  row=$(inventory_rows "$raw" | awk -v s="$1" -F'\t' '$1==s{print;exit}')
+  [ -n "$row" ] || { echo "FAIL: $1 is in no inventory row" >&2; return 1; }
+  SBNAME=$(printf '%s' "$row" | cut -f2); SBNS=$(printf '%s' "$row" | cut -f3); }
+# present|gone for the resolved CR, or return 2 when kubectl itself failed.
+cr() { local out; out=$(kubectl get sandbox -n "$SBNS" "$SBNAME" --ignore-not-found -o name 2>&1) || return 2
+  [ -n "$out" ] && echo present || echo gone; }
+# Submit one task, print its id, non-zero if it was not accepted.
+dispatch() { curl -sf -X POST "https://$API_HOST/v1/sessions/$SESSION_ID/tasks" -H "$USER" \
+    -H 'content-type: application/json' -d "$(jq -n --arg p "$1" '{prompt:$p}')" \
+  | jq -er 'select(.ok == true) | .task_id // empty'; }
+# Poll one task to terminal, printing the fields judged below; non-zero if it
+# never got there.
+settle() { local i b; for i in $(seq 1 "$N_POLL"); do
+    b=$(curl -sf --max-time "$T_CURL" -H "$USER" "https://$API_HOST/v1/tasks/$1") || { sleep "$I_POLL"; continue; }
+    printf '%s' "$b" | jq -e '.item.status | test("^(completed|failed|cancelled)$")' >/dev/null \
+      && { printf '%s' "$b" | jq -c '.item | {status, out: (.output // "")[0:400], by_tool: .tool_stats.by_tool}'; return 0; }
+    sleep "$I_POLL"; done; echo '{"status":"NOT_TERMINAL"}'; return 1; }
 ```
-
-Return 3 is `ABORT` at every call site, and three failures collapse into it
-deliberately: a KV scan answering `{"ok":false,…}` at HTTP 200, which `curl -sf`
-cannot see; a non-zero `unreadable`; and an absent `dag_handles`, which is a build
-whose census cannot see a DAG-handle sandbox at all.
-
-**A successful read that is empty is not an abort.** An empty fleet is the true
-answer on a low-traffic deployment, and nothing to drain is not nothing readable.
-`rows()` is what every step iterates instead of `.sessions[]`, deduplicated on the
-`(sandbox_name, namespace)` pair a rollback deletes by, because a DAG handle whose
-session key is stale or absent is a live sandbox nothing else here reaches.
 
 **Credentials.** `/v1/internal/*` takes the cluster-wide `AUTH_INTERNAL_TOKEN`
 (`ADMIN="Authorization: Bearer <INTERNAL_TOKEN>"`); `/v1/sessions*` and
@@ -96,7 +117,7 @@ per-sandbox fallback.
 | # | Prerequisite | Why |
 |---|---|---|
 | PRE-1 | The deployed build carries this change: both `/health` payloads expose `bgShellEnabled`. Verified by **P0** | Every gate reads it. A build without it cannot be gated by this guide at all |
-| PRE-2 | `BG_SHELL_ENABLED` and `BASH_MAX_TIMEOUT_SEC` are wired through `values.<NS>.env` | Otherwise the enablement is reverted by the next upgrade |
+| PRE-2 | `BG_SHELL_ENABLED`, `SANDBOX_KEEPALIVE_TARGET_CEILING`, `SANDBOX_KEEPALIVE_RECONCILE_RESERVE` and `BASH_MAX_TIMEOUT_SEC` are wired through `values.<NS>.env` | Otherwise the enablement is reverted by the next upgrade, and the two capacity settings are what Brain refuses to start without |
 | PRE-3 | The foreground ceiling `S` satisfies `S <= brain.terminationGracePeriodSeconds` | A rolling update must not hand a run over with a command still writing |
 | PRE-4 | If long foreground work must survive enablement, `brain.bashMaxTimeoutSec` is pinned first | Enablement otherwise moves the ceiling to 120s in the same step |
 | PRE-5 | Thresholds fixed and written down: `T_KILLED`, `T_STALE`, `N_PROBE`, `T_CURL`, `I_POLL`, `N_FLEET`, `I_FLEET` | A threshold chosen after the reading is not a threshold |
@@ -111,7 +132,7 @@ kubectl get pods -n "$NS" -l app=primus-claw,component=primus-claw-brain \
   -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.containerStatuses[0].imageID}{"\n"}{end}'
 curl -sf "$BRAIN/health" | jq '{brainVersion, gateable: has("bgShellEnabled")}'
 raw=$(inventory) || { echo 'CENSUS_FAILED'; exit 3; }
-rows "$raw" | while IFS=$'\t' read -r sid name ns url wid; do printf '%s\t' "$sid"
+inventory_rows "$raw" | while IFS=$'\t' read -r sid name ns url wid; do printf '%s\t' "$sid"
       if body=$(probe "$url"); then
         printf '%s' "$body" | jq -c '{handsGateable: has("bgShellEnabled"), bgShellEnabled, bashMaxTimeoutSec}' || exit 3
       else echo '{"handsGateable":"UNREACHABLE"}'; fi
@@ -129,7 +150,7 @@ rows "$raw" | while IFS=$'\t' read -r sid name ns url wid; do printf '%s\t' "$si
 **P1 — the chart default is off in the artifact being deployed.**
 
 ```sh
-helm template primus-claw "$(chart_dir)" -n "$NS" \
+helm template primus-claw "$(chart_dir claw/deploy/values.$NS.env)" -n "$NS" \
   --set secret.create=false --set ingress.enabled=false --set postgres.enabled=false \
   --show-only templates/brain-deployment.yaml | rg -A1 'name: BG_SHELL_ENABLED'
 ```
@@ -141,7 +162,7 @@ helm template primus-claw "$(chart_dir)" -n "$NS" \
 **P2 — the schema rejects a malformed value.**
 
 ```sh
-out=$(helm template primus-claw "$(chart_dir)" -n "$NS" \
+out=$(helm template primus-claw "$(chart_dir claw/deploy/values.$NS.env)" -n "$NS" \
   --set secret.create=false --set ingress.enabled=false --set postgres.enabled=false \
   --set-string features.backgroundShell=yes 2>&1); rc=$?
 printf '%s\n' "$out" | rg -m1 'features\.backgroundShell' || echo '(no message naming the key)'
@@ -149,16 +170,36 @@ echo "exit=$rc"
 ```
 
 - Expected: non-zero exit and a message naming `features.backgroundShell`.
-- P1 and P2 both render through `chart_dir()`, so what they assert about the
+- P1 and P2 both render through `chart_dir`, so what they assert about the
   default and the schema is asserted about the chart `upgrade.sh` will deploy
-  rather than about the in-tree copy. A check pinned to the literal path passes on
-  a chart the upgrade never touches.
+  rather than about the in-tree copy. A check pinned to the literal path passes
+  on a chart the upgrade never touches, and a values file that cannot be sourced
+  aborts here rather than quietly resolving to the default.
 
 ## 3. Enable
 
-1. Record the enablement where the next upgrade will read it:
-   `BG_SHELL_ENABLED="true"` in `claw/deploy/values.<NS>.env`, and
-   `BASH_MAX_TIMEOUT_SEC` if PRE-4 applies.
+1. Record the enablement where the next upgrade will read it, in
+   `claw/deploy/values.<NS>.env`:
+
+   ```sh
+   BG_SHELL_ENABLED="true"
+   # Both REQUIRED with the flag on. Brain refuses to start without them: the
+   # gap between two refreshes of one sandbox handle is derived from them, and a
+   # sandbox hosting a live background shell is reclaimed if that gap is wrong.
+   # The ceiling is the largest number of distinct ping targets one Brain
+   # replica may face -- size it to this deployment's real fleet with headroom,
+   # not to today's count. The reserve is how many of those slots are held back
+   # so a target another replica created can always be taken on before it is
+   # served; a few percent of the ceiling, never zero.
+   SANDBOX_KEEPALIVE_TARGET_CEILING="200"
+   SANDBOX_KEEPALIVE_RECONCILE_RESERVE="20"
+   # Only if PRE-4 applies.
+   BASH_MAX_TIMEOUT_SEC=""
+   ```
+
+   These render as `features.keepaliveTargetCeiling` and
+   `features.keepaliveReconcileReserve`; the chart ships both empty, which is
+   why they must be set in the same change that sets the flag and not after it.
 2. Run the deployment's usual upgrade entrypoint. It re-renders the Brain
    Deployment with both values.
 3. Confirm every Brain replica agrees:
@@ -198,31 +239,27 @@ else DEADLINE=$(kubectl get sandbox -n "$SBNS" "$SBNAME" -o jsonpath='{.spec.lif
 [ -n "$DEADLINE" ] || { echo 'FAIL: no absolute deadline on the object that carries it'; exit 1; }
 DEADLINE_EPOCH=$(date -d "$DEADLINE" +%s) || { echo 'FAIL: unparseable shutdownTime'; exit 1; }
 
+SEEN_LIVE=false
 for i in $(seq 1 "$N_FLEET"); do
   # Each refresh must SUCCEED. A dispatch that failed leaves the session idle,
   # and an idle session is reclaimed by a path that has nothing to do with the
   # absolute cap -- so a loop that ignores its own failures proves the wrong
   # thing about the CR that then disappears.
   tid=$(dispatch 'Run: echo alive') || { echo 'FAIL: activity dispatch failed; the session is no longer held busy'; exit 1; }
-  [ -n "$tid" ] || { echo 'FAIL: activity dispatch returned no task id'; exit 1; }
   settle "$tid" >/dev/null || { echo 'FAIL: activity task never reached terminal; the session is not being held busy'; exit 1; }
 
-  cr; rc=$?; [ "$rc" = 2 ] && exit 1
+  state=$(cr); rc=$?; [ "$rc" = 2 ] && { echo 'ABORT: kubectl could not answer'; exit 1; }
   now=$(date +%s)
-  if [ "$rc" = 0 ]; then
-    # Gone. Only acceptable at or after the deadline; before it, something else
-    # took the sandbox and this row has proved nothing about the absolute cap.
-    [ "$now" -ge "$DEADLINE_EPOCH" ] \
-      || { echo "FAIL: the CR disappeared at $(date -Iseconds) but its shutdownTime is $DEADLINE — reclaimed by something other than the absolute cap"; exit 1; }
-    break
-  fi
-  # Still present. Before the deadline that is correct and expected; the CR being
-  # live right up to it is half of what this gate has to show.
-  [ "$now" -lt "$DEADLINE_EPOCH" ] \
-    || { echo "FAIL: the CR outlived its own shutdownTime $DEADLINE"; exit 1; }
+  # Recorded, not inferred: without a look that found the CR present before the
+  # deadline, a first look finding it gone proves only that it is gone now.
+  [ "$state" = present ] && [ "$now" -lt "$DEADLINE_EPOCH" ] && SEEN_LIVE=true
+
+  deadline_verdict "$state" "$SEEN_LIVE" "$now" "$DEADLINE_EPOCH"; v=$?
+  [ "$v" = 0 ] && break
+  [ "$v" = 1 ] && exit 1
   sleep "$I_FLEET"
 done
-[ "$rc" = 0 ] || { echo "FAIL: the CR outlived its own shutdownTime $DEADLINE"; exit 1; }
+[ "$v" = 0 ] || { echo "FAIL: no verdict reached within $N_FLEET looks"; exit 1; }
 ```
 
 The three properties this gate needs, and which line carries each: every activity
@@ -259,6 +296,11 @@ timeouts() { curl -sf --max-time "$T_CURL" "$BRAIN/metrics" \
     | rg -o '[0-9.]+$' || { echo 'ABORT: no reading'; return 1; }; }
 ```
 
+Both label series are initialised at Brain startup, so a window in which nothing
+timed out reads `0` rather than producing no line at all — an absent series and
+a quiet window are the same text to a scraper, and only one of them is a
+reading. An `ABORT` here therefore means the metric is genuinely unreachable.
+
 A count of runs that ended in a killed state is **not** this signal and must not be
 substituted for it: a clamped command is answered as a tool result and its run goes
 on to complete normally, so the affected runs are indistinguishable from
@@ -280,7 +322,7 @@ Brain still holding the old value and boot enabled again.
 
 ```sh
 raw=$(inventory) || { echo 'ABORT: census unreadable; a failed read is not an empty fleet'; exit 3; }
-rows "$raw" > /tmp/claw-rollback-fleet.tsv    # may legitimately be empty
+inventory_rows "$raw" > /tmp/claw-rollback-fleet.tsv    # may legitimately be empty
 wc -l < /tmp/claw-rollback-fleet.tsv
 ```
 

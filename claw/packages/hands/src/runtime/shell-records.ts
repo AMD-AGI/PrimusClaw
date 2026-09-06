@@ -21,12 +21,13 @@
 
 import { randomUUID } from "node:crypto";
 import {
-  existsSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, renameSync,
-  rmSync, writeFileSync,
+  type Dirent,
+  existsSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync,
+  renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import {
-  ABSENT_RUN, type RunPart, componentsMatch, recordComponents,
+  ABSENT_RUN, NO_RUN_SEGMENT, type RunPart, componentsMatch, recordComponents,
 } from "./record-path.js";
 
 export type ShellRecordStatus = "exited" | "killed" | "failed";
@@ -251,6 +252,47 @@ export function resolveIntent(
     return readFileSync(intentPath(owner, asRunPart(run), intentKey), "utf8") || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Every record filed under one owner scope, across all of its run identities.
+ *
+ * Throws where the subtree exists and cannot be walked: an unreadable subtree
+ * is not an empty one, and a caller deciding whether a sandbox still holds live
+ * work must not read the first as the second.
+ */
+export function listRecordsForOwner(owner: string): ShellRecord[] {
+  const root = join(stateRoot(), SCOPES, ...ownerComponents(owner));
+  const out: ShellRecord[] = [];
+  walkRecords(root, out);
+  return out;
+}
+
+/** The owner's own path components, taken from a triple whose other parts are
+ *  fixed, so the chunking rule is applied in exactly one place. */
+function ownerComponents(owner: string): string[] {
+  const components = recordComponents(owner, ABSENT_RUN, "x");
+  return components.slice(0, components.indexOf(NO_RUN_SEGMENT));
+}
+
+function walkRecords(dir: string, out: ShellRecord[]): void {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkRecords(path, out);
+      continue;
+    }
+    try {
+      out.push(JSON.parse(readFileSync(path, "utf8")) as ShellRecord);
+    } catch { /* a torn or foreign file is not a record; the writer is atomic */ }
   }
 }
 

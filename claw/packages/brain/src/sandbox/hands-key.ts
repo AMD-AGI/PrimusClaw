@@ -63,12 +63,21 @@ export function isRetentionEntry(value: unknown): boolean {
     && (value as { protected?: unknown }).protected === true;
 }
 
-/** The store the scan needs, narrowed so a test can supply one. */
+/**
+ * The store the scan needs, narrowed so a test can supply one.
+ *
+ * Revision-aware, because a rolling upgrade runs this on several replicas at
+ * once against one bucket. A read-then-put would let two of them write the same
+ * destination and the loser's delete then remove a source whose value never
+ * landed anywhere; a delete not conditioned on what was read would remove an
+ * entry a live session rewrote in between.
+ */
 export interface HandsKeyStore {
   keys(filter: string): Promise<string[]>;
-  get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
-  delete(key: string): Promise<void>;
+  read(key: string): Promise<{ value: string; revision: number } | null>;
+  /** False where the key already exists. Never overwrites. */
+  create(key: string, value: string): Promise<boolean>;
+  delete(key: string, expectedRevision: number): Promise<boolean>;
 }
 
 export interface ReservedKeyMigration {
@@ -105,20 +114,30 @@ export async function migrateReservedSessionKeys(
     // to prevent. It is reported and left in place for operator repair, and so
     // is a destination already occupied -- two sessions cannot own one binding.
     try {
-      const raw = await store.get(key);
-      if (raw === null) {
+      const source = await store.read(key);
+      if (source === null) {
         result.conflicted.push(key);
         continue;
       }
-      if (isRetentionEntry(JSON.parse(raw))) continue;
+      if (isRetentionEntry(JSON.parse(source.value))) continue;
 
       const destination = handsSessionKey(key.slice(HANDS_KEY_PREFIX.length));
-      if (await store.get(destination) !== null) {
+      // Create, never put: a destination that already exists belongs to
+      // something else -- another replica's copy of this same migration, or a
+      // session that legitimately owns it -- and either way overwriting it
+      // loses a live binding.
+      if (!await store.create(destination, source.value)) {
         result.conflicted.push(key);
         continue;
       }
-      await store.put(destination, raw);
-      await store.delete(key);
+      // Conditioned on the revision the value came from, so a session that
+      // rewrote its own entry between the read and here keeps it. The copy
+      // stands either way; a source left behind is reported, never a silent
+      // divergence.
+      if (!await store.delete(key, source.revision)) {
+        result.conflicted.push(key);
+        continue;
+      }
       result.migrated.push(key);
     } catch {
       result.conflicted.push(key);

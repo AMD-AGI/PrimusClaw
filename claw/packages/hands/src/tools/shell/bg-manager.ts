@@ -28,6 +28,7 @@ import {
   attachRecord, claimRecord, currentEpoch, processStartToken, readRecord,
   recordOutcome, releaseOutput, resolveIntent, type ProcessIdentity,
 } from "../../runtime/shell-records.js";
+import { ownerLiveness } from "../../runtime/shell-liveness.js";
 import {
   type ManagedShell,
   type ManagedShellKind,
@@ -409,28 +410,45 @@ export async function shutdownAllShells(graceMs = 2000): Promise<number> {
 }
 
 /**
- * How many of `owner`'s background shells are still running.
+ * How much live background work `owner` still holds in this sandbox.
  *
- * The same predicate the reap uses, asked without reaping. Brain needs it when a
- * task reaches a terminal state: a background shell is meant to outlive the turn
- * that started it -- that is the whole point of `run_in_background` -- but the
- * sandbox is marked idle on every terminal task regardless, and the control
- * plane reclaims an idle sandbox 15 minutes later, taking the shell with it.
+ * Brain needs it when a task reaches a terminal state: a background shell is
+ * meant to outlive the turn that started it -- that is the whole point of
+ * `run_in_background` -- but the sandbox is marked idle on every terminal task
+ * regardless, and the control plane reclaims an idle sandbox about fifteen
+ * minutes later, taking the shell with it.
+ *
+ * Read from the durable records where this process files them, and from the
+ * in-process map only as one input to that. The map alone cannot answer after a
+ * restart: background children are detached precisely so they survive the
+ * request that started them, and they survive the process too, but the map that
+ * knew their identifiers died with it -- so a sandbox with a training run still
+ * writing would answer zero and be reclaimed out from under it. A process that
+ * files no records still answers from the map, which is what it did before.
  *
  * Scoped to the owner rather than the run because that is the key the keepalive
- * sweep can address: it walks `hands.<session>` entries and knows the session,
- * while the run is a per-task id it never sees. The owner is also the right
- * granularity for the question being asked -- "is anything still running in this
- * sandbox" -- which is about the pod, not about one task that used it.
+ * sweep can address, and because the question is about the pod rather than
+ * about one task that used it.
  *
- * Only `running` counts. An exited shell is one nobody is waiting on, and
- * counting it would hold a sandbox open for a process that ended hours ago.
+ * Only live work counts. A shell that has ended is one nobody is waiting on,
+ * and counting it would hold a sandbox open for a process that finished hours
+ * ago.
  */
 export function runningShellCount(owner: string): number {
   if (!owner) return 0;
-  return [...shells.values()].filter(
+  const inMemory = [...shells.values()].filter(
     (e) => e.owner === owner && e.shell.status === "running",
   ).length;
+  if (!filesRecords()) return inMemory;
+
+  const liveness = ownerLiveness(owner, (record) => {
+    const entry = shells.get(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id));
+    return entry?.shell.status === "running";
+  });
+  // An unreadable subtree is not a count of zero, and answering zero here is
+  // what files the sandbox idle. The in-memory view is what is left to go on.
+  if (!liveness.determinate) return inMemory;
+  return Math.max(inMemory, liveness.active);
 }
 
 /**

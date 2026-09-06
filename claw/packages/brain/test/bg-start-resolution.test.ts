@@ -26,13 +26,13 @@ import type { BgHandleRow } from "../src/sandbox/bg-handle-rows.js";
 const ADDRESS = { ownerScope: "sess", runIdentity: "ktsk_1", shellId: "bg-1" };
 const row = (state: BgHandleRow["state"], generation = "gen-1"): BgHandleRow =>
   ({ ...ADDRESS, generation, state });
-const probing = (kind: RecordProbe["kind"]) => () => ({ kind }) as RecordProbe;
-const never = () => {
+const probing = (kind: RecordProbe["kind"]) => async () => ({ kind }) as RecordProbe;
+const never = async (): Promise<RecordProbe> => {
   throw new Error("the sandbox must not be read on this branch");
 };
 
-test("a crash between the dispatched write and the handoff retransmits, not strands", () => {
-  const out = resolveStart({
+test("a crash between the dispatched write and the handoff retransmits, not strands", async () => {
+  const out = await resolveStart({
     row: row("dispatched"),
     rowReadable: true,
     currentGeneration: "gen-1",
@@ -46,10 +46,10 @@ test("a crash between the dispatched write and the handoff retransmits, not stra
   assert.match(out.reason, /no claim landed/);
 });
 
-test("the retransmission is safe because the sandbox arbitrates, not the read", () => {
+test("the retransmission is safe because the sandbox arbitrates, not the read", async () => {
   // A send that did land after all is answered by the exclusive create with the
   // existing shell, never with a second process.
-  const landed = resolveStart({
+  const landed = await resolveStart({
     row: row("dispatched"),
     rowReadable: true,
     currentGeneration: "gen-1",
@@ -59,7 +59,7 @@ test("the retransmission is safe because the sandbox arbitrates, not the read", 
   assert.equal(landed.reported, "deduplicated");
 });
 
-test("every gate that cannot answer sends nothing", () => {
+test("every gate that cannot answer sends nothing", async () => {
   const cases: Array<[string, Parameters<typeof resolveStart>[0]]> = [
     ["subtree or marker unreadable", {
       row: row("dispatched"), rowReadable: true, currentGeneration: "gen-1",
@@ -76,18 +76,18 @@ test("every gate that cannot answer sends nothing", () => {
     }],
   ];
   for (const [name, input] of cases) {
-    const out = resolveStart(input);
+    const out = await resolveStart(input);
     assert.equal(out.action, "refuse", name);
     assert.equal(out.reported, "unknown", name);
     assert.equal(out.shellClass, "unknown", name);
   }
 });
 
-test("a confirmed row is never retransmitted, whatever the sandbox says now", () => {
+test("a confirmed row is never retransmitted, whatever the sandbox says now", async () => {
   // The row attests a shell, so a record that is not there is record loss and
   // not a claim that never landed -- the one distinction a generation
   // comparison alone cannot make.
-  const lost = resolveStart({
+  const lost = await resolveStart({
     row: row("spawn_confirmed"), rowReadable: true, currentGeneration: "gen-1",
     probe: probing("determinately_absent"),
   });
@@ -95,7 +95,7 @@ test("a confirmed row is never retransmitted, whatever the sandbox says now", ()
   assert.equal(lost.reported, "deduplicated");
   assert.equal(lost.shellClass, "lost");
 
-  const replaced = resolveStart({
+  const replaced = await resolveStart({
     row: row("spawn_confirmed", "gen-0"), rowReadable: true, currentGeneration: "gen-1",
     probe: never,
   });
@@ -103,9 +103,9 @@ test("a confirmed row is never retransmitted, whatever the sandbox says now", ()
   assert.equal(replaced.shellClass, "lost", "no second process runs against a replaced sandbox");
 });
 
-test("a first call is dispatched, and asks the sandbox nothing", () => {
+test("a first call is dispatched, and asks the sandbox nothing", async () => {
   for (const r of [null, row("issued")]) {
-    const out = resolveStart({
+    const out = await resolveStart({
       row: r, rowReadable: true, currentGeneration: "gen-1", probe: never,
     });
     assert.equal(out.action, "dispatch");

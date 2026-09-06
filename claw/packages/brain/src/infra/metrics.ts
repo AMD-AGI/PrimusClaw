@@ -88,6 +88,13 @@ const bashForegroundTimeoutTotal = new Counter({
   labelNames: ["clamped"] as const,
   registers: [registry],
 });
+// Both label combinations exist from startup, so a rollout reading the rate
+// before any clamped timeout has happened reads zero rather than finding no
+// series at all -- an absent series and a quiet window are the same text to a
+// log scraper, and one of them is a stop condition with no reading.
+bashForegroundTimeoutTotal.inc({ clamped: "true" }, 0);
+bashForegroundTimeoutTotal.inc({ clamped: "false" }, 0);
+
 const handsBinaryDownloadTotal = new Counter({
   name: "claw_brain_hands_binary_download_total",
   help: "GET /internal/assets/hands-binary by outcome.",

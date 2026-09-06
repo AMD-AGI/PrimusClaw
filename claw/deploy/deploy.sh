@@ -656,8 +656,13 @@ for _key, _var in (
 # Not part of the loop above: that one writes into values["brain"], which the
 # builder created. There is no "features" key to write into, so an enablement
 # added to the loop would be dropped without a word.
-if env("BG_SHELL_ENABLED"):
-    values.setdefault("features", {})["backgroundShell"] = env("BG_SHELL_ENABLED")
+for _key, _var in (
+    ("backgroundShell", "BG_SHELL_ENABLED"),
+    ("keepaliveTargetCeiling", "SANDBOX_KEEPALIVE_TARGET_CEILING"),
+    ("keepaliveReconcileReserve", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE"),
+):
+    if env(_var):
+        values.setdefault("features", {})[_key] = env(_var)
 
 if sandbox_workload_namespace:
     values["secret"]["sandboxNamespace"] = sandbox_workload_namespace

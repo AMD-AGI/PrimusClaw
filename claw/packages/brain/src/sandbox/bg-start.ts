@@ -17,9 +17,7 @@
  */
 
 import { encodeKeyPart } from "./bg-key.js";
-import {
-  type BgHandleAddress, type BgHandleRow, type BgRowStore, readRow,
-} from "./bg-handle-rows.js";
+import type { BgHandleRow } from "./bg-handle-rows.js";
 
 /** What a read of the sandbox's own record subtree returned. */
 export type RecordProbe =
@@ -54,12 +52,12 @@ const DISPATCH: StartResolution = {
  * which is never guessed at. `probe` is consulted only on the branches that
  * need it, and it starts nothing on any Hands of any version.
  */
-export function resolveStart(input: {
+export async function resolveStart(input: {
   row: BgHandleRow | null;
   rowReadable: boolean;
   currentGeneration: string | null;
-  probe: () => RecordProbe;
-}): StartResolution {
+  probe: () => Promise<RecordProbe>;
+}): Promise<StartResolution> {
   const { row, rowReadable, currentGeneration, probe } = input;
 
   if (!rowReadable) {
@@ -86,7 +84,7 @@ export function resolveStart(input: {
       };
   }
 
-  const observed = probe();
+  const observed = await probe();
   if (row.state === "spawn_confirmed") {
     return observed.kind === "record_present"
       ? { action: "resolve", reported: "deduplicated", reason: "this intent already produced a shell" }
@@ -136,16 +134,24 @@ export function runQualifiedShellId(runIdentity: string, publicShellId: string):
   return `${encodeKeyPart(runIdentity)}.${encodeKeyPart(publicShellId)}`;
 }
 
+/** The calls whose `shell_id` names an existing shell, and a start that fixes one. */
+export function isShellAddressingCall(name: string, args: Record<string, unknown>): boolean {
+  if (name === "bash_output" || name === "kill_shell" || name === "wait") return true;
+  return name === "bash" && args.run_in_background === true;
+}
+
 /**
- * Whether a read, wait, or kill may be forwarded to such a sandbox at all.
+ * Put the model's own id back into a result that echoes the wire form.
  *
- * A shell with no reference row predates Brain's rows and has no recorded run
- * identity, so no wire form can carry a boundary for it and a verbatim
- * carve-out would let any run of one owner reach it. The row narrows what is
- * sent; it never authorises it, so the id-reuse hazard above is untouched.
+ * The qualified id exists between Brain and one sandbox and nowhere else. Left
+ * in the text, it becomes the id the model sends back -- and Brain would then
+ * qualify it a second time, addressing a shell that does not exist.
  */
-export async function mayAddressUnpartitioned(
-  store: BgRowStore, address: BgHandleAddress,
-): Promise<boolean> {
-  return (await readRow(store, address)) !== null;
+export function restorePublicShellId(
+  text: string, wireId: unknown, publicId: unknown,
+): string {
+  if (typeof wireId !== "string" || typeof publicId !== "string" || wireId === publicId) {
+    return text;
+  }
+  return text.split(wireId).join(publicId);
 }

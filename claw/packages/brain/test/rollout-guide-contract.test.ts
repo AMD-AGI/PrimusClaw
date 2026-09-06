@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The rollout guide's three executable claims, checked against the guide text.
+ * That the guide reaches for the executable helpers rather than restating them.
  *
- * These are content checks, not runtime behaviour: the guide is what an
- * operator runs, and each of the findings below was a step that would pass
- * while proving nothing. A prose document cannot be exercised, but it can be
- * held to naming the right thing.
+ * The decisions themselves are exercised in rollout-lib.test.ts, against
+ * `claw/deploy/rollout-lib.sh`. What is left here is the one thing that cannot
+ * be: whether the document an operator actually follows uses that file. A guide
+ * that pastes its own copy of `chart_dir` is a second implementation nothing
+ * runs, which is the shape every finding below started as.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -17,17 +18,35 @@ const GUIDE = readFileSync(
   new URL("../../../docs/background-shell-rollout.md", import.meta.url), "utf8",
 );
 
+test("the guide sources the helper library instead of restating it", () => {
+  assert.match(GUIDE, /\. claw\/deploy\/rollout-lib\.sh/);
+  for (const fn of ["chart_dir", "inventory_judge", "inventory_rows", "deadline_verdict"]) {
+    assert.ok(!new RegExp(`^${fn}\\(\\) \\{`, "m").test(GUIDE),
+      `${fn} must be used from the library, not redefined in prose`);
+  }
+});
+
 test("every helm render resolves the chart the upgrade actually deploys", () => {
   // A step pinned to the in-tree path passes on a chart CLAW_CHART_DIR points
   // somewhere else, which is the supported override the deploy scripts read.
-  assert.match(GUIDE, /chart_dir\(\) \{[^}]*CLAW_CHART_DIR/);
-  const renders = GUIDE.match(/helm template primus-claw [^\s]+/g) ?? [];
+  const renders = GUIDE.match(/helm template primus-claw [^\n]+/g) ?? [];
   assert.ok(renders.length >= 2, "P1 and P2 both render");
   for (const render of renders) {
-    assert.match(render, /helm template primus-claw "\$\(chart_dir\)"/, render);
+    assert.match(render, /helm template primus-claw "\$\(chart_dir [^)]+\)"/, render);
   }
   assert.ok(!/helm template[^\n]*claw\/deploy\/charts\/claw/.test(GUIDE),
     "no render may hard-code the default path");
+});
+
+test("the enablement step names every setting Brain refuses to start without", () => {
+  // Following the guide has to produce a Brain that starts. Both capacity
+  // settings are required with the flag on and the chart ships them empty.
+  const enable = GUIDE.slice(GUIDE.indexOf("## 3. Enable"), GUIDE.indexOf("## 4. Gates"));
+  for (const key of [
+    "BG_SHELL_ENABLED", "SANDBOX_KEEPALIVE_TARGET_CEILING", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE",
+  ]) {
+    assert.ok(enable.includes(key), `${key} must be set in the same change as the flag`);
+  }
 });
 
 test("the rollback runs at the empty-fleet boundary", () => {
@@ -36,7 +55,7 @@ test("the rollback runs at the empty-fleet boundary", () => {
   // exits non-zero on exactly that response, which aborted a rollback that had
   // nothing wrong with it.
   assert.match(GUIDE, /An empty file is a valid result and R2–R5\s*\n?\s*continue/);
-  assert.match(GUIDE, /A successful read that is empty is not an abort/);
+  assert.match(GUIDE, /A successful read that is empty is not an\s+abort/);
   assert.match(GUIDE, /An empty file means\s*\n?\s*nothing to recycle, which is not a failure/);
   assert.ok(!/jq -e '\.sessions\[\]/.test(GUIDE),
     "the inventory guard must not be a jq -e over the session array");
@@ -57,14 +76,17 @@ test("the absolute-lifetime gate cannot pass on idle reclamation", () => {
   assert.match(GUIDE, /activity dispatch failed; the session is no longer held busy/);
   assert.match(GUIDE, /the session is not being held busy/);
   assert.match(GUIDE, /DEADLINE_EPOCH=\$\(date -d "\$DEADLINE" \+%s\)/);
-  assert.match(GUIDE, /now" -ge "\$DEADLINE_EPOCH"/);
-  assert.match(GUIDE, /now" -lt "\$DEADLINE_EPOCH"/);
+  assert.match(GUIDE, /SEEN_LIVE=true/, "the live observation is recorded, not inferred");
+  assert.match(GUIDE, /deadline_verdict "\$state" "\$SEEN_LIVE"/);
   assert.ok(!/dispatch 'Run: echo alive' >\/dev\/null \|\| true/.test(GUIDE),
     "a loop that discards its own failed dispatches proves nothing about the cap");
 });
 
-test("the census both halves of the fleet, and refuses a partial read", () => {
-  assert.match(GUIDE, /\(\.unreadable \/\/ error\("no unreadable field"\)\) == 0/);
-  assert.match(GUIDE, /\(\.dag_handles \| type\) == "array"/);
-  assert.match(GUIDE, /rows \$?\(?"?\$?raw/, "every step iterates rows(), not .sessions[]");
+test("every gate's helpers are defined once, in the guide or the library", () => {
+  // `sb`, `cr`, `dispatch` and `settle` were used by the gates and defined
+  // nowhere, so a step could not be run as written.
+  for (const fn of ["sb", "cr", "dispatch", "settle", "probe", "inventory"]) {
+    assert.ok(new RegExp(`^${fn}\\(\\) \\{`, "m").test(GUIDE), `${fn} is undefined`);
+  }
+  assert.match(GUIDE, /inventory_rows/, "every step iterates the rows helper, not .sessions[]");
 });
