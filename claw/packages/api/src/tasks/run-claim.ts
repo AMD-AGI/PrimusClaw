@@ -11,7 +11,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import type { ExecuteRequest, RunLease } from "@claw/protocol";
+import type { ExecuteRequest, RunFailClaimReason, RunLease } from "@claw/protocol";
 import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
@@ -263,10 +263,7 @@ export async function releaseClaim(
  * `workspace_unbound` is a claimed run the gate cannot serialise: there is no
  * `callback_url` on a chat row, so `agent_done` would leave it preparing.
  */
-export type HeldClaimFailureReason =
-  | "session_deleted"
-  | "claim_abandoned"
-  | "workspace_unbound";
+export type HeldClaimFailureReason = RunFailClaimReason;
 
 const HELD_CLAIM_MESSAGE: Record<HeldClaimFailureReason, string> = {
   session_deleted: "the session this run belonged to was deleted",

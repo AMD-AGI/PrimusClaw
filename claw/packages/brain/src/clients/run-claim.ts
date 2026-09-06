@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, RunFailClaimReason, RunUnclaimReason } from "@claw/protocol";
 import pino from "pino";
 
 import { AUTH_INTERNAL_TOKEN, BRAIN_ID } from "../config.js";
@@ -65,7 +65,7 @@ export async function claimNextRun(): Promise<ClaimedRun | null> {
 export async function unclaimRun(
   taskId: string,
   claimCount?: number,
-  reason?: "lock_contention" | "retry" | "drain" | "hydrate_failed",
+  reason?: RunUnclaimReason,
 ): Promise<void> {
   await postHolderAction(taskId, "unclaim", "run.unclaim_failed", {
     ...claimExtra(claimCount), ...(reason ? { reason } : {}),
@@ -74,7 +74,7 @@ export async function unclaimRun(
 
 export async function failClaimedRun(
   taskId: string,
-  reason: "session_deleted" | "claim_abandoned" | "workspace_unbound" = "session_deleted",
+  reason: RunFailClaimReason = "session_deleted",
   claimCount?: number,
 ): Promise<void> {
   await postHolderAction(taskId, "fail-claim", "run.fail_claim_failed", {

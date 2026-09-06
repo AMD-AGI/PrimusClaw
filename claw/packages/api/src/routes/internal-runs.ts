@@ -9,6 +9,7 @@
  * only, so one run's lease cannot be used to take another.
  */
 
+import { RUN_UNCLAIM_REASONS, type RunUnclaimReason } from "@claw/protocol";
 import { constantTimeEquals } from "@claw/utils";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
@@ -40,12 +41,12 @@ function claimCountFrom(body: unknown): number | undefined {
 // "retry" is the honest default for a nak whose cause is not a lock -- a
 // retryable model error, an undelivered agent_done, a shutdown checkpoint.
 // Only "lock_contention" makes the poison guard report a busy workspace.
-const RELEASE_REASONS = new Set(["lock_contention", "retry", "drain", "hydrate_failed"]);
-function releaseReasonFrom(body: unknown): string | undefined {
+const RELEASE_REASONS = new Set<string>(RUN_UNCLAIM_REASONS);
+function releaseReasonFrom(body: unknown): RunUnclaimReason | undefined {
   const raw = body && typeof body === "object"
     ? (body as { reason?: unknown }).reason
     : undefined;
-  return typeof raw === "string" && RELEASE_REASONS.has(raw) ? raw : undefined;
+  return typeof raw === "string" && RELEASE_REASONS.has(raw) ? raw as RunUnclaimReason : undefined;
 }
 
 function brainIdFrom(body: unknown): string {
