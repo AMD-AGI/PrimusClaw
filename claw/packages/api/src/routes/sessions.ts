@@ -50,6 +50,8 @@ const logger = pino({ name: "sessions" });
 interface SessionCreateRefusal {
   statusCode: number;
   response: { ok: false; error: string; reason?: string };
+  /** Whether a retry under the same idempotency key replays this answer. */
+  replayable?: true;
 }
 
 /** The columns `POST /v1/sessions` writes, whichever path writes them. */
@@ -73,7 +75,8 @@ export interface NewSessionRow {
  * a witness cannot be reused for a different parent than the one authorised.
  */
 export interface ParentAuthorisation {
-  readonly parentSid: string;
+  /** The parent this witness authorises, or null when the create named none. */
+  readonly parentSid: string | null;
 }
 
 /**
@@ -91,9 +94,9 @@ export interface ParentAuthorisation {
 export async function insertSessionRow(
   q: StatementRunner,
   row: NewSessionRow,
-  parentAuth?: ParentAuthorisation,
+  parentAuth: ParentAuthorisation,
 ): Promise<void> {
-  if (row.parentSid && parentAuth?.parentSid !== row.parentSid) {
+  if (row.parentSid !== parentAuth.parentSid) {
     throw new Error("session.create.parent_not_authorised");
   }
   await q.query(
@@ -108,18 +111,23 @@ export async function insertSessionRow(
 }
 
 /**
- * Whether this caller may attach a child to `parentSid`.
+ * Whether this caller may attach the child to the parent it named.
  *
- * Every arm fails closed: an anonymous caller, a parent that does not exist,
- * one whose owner column is null, and one owned by somebody else are all
- * refusals. Returns the witness {@link insertSessionRow} demands, so a caller
- * cannot persist the link without having come through here.
+ * Called on every create, including one that names no parent, so nothing
+ * outside decides from the request body whether an authorisation happens.
+ * "No parent was named" is an answer this returns, not a reason to skip it:
+ * a caller that branched on the field first would be letting the value it is
+ * about to persist decide whether the value gets checked.
+ *
+ * Every other arm fails closed -- an anonymous caller, a parent that does not
+ * exist, one whose owner column is null, and one owned by somebody else.
  */
-export async function readParentAuthorisation(
+export async function resolveParentAuthorisation(
   q: StatementRunner,
-  parentSid: string,
+  parentSid: string | null,
   user: ReturnType<typeof getUser>,
 ): Promise<SessionCreateRefusal | ParentAuthorisation> {
+  if (!parentSid) return { parentSid: null };
   if (!user) {
     return { statusCode: 401, response: { ok: false, error: "authentication required" } };
   }
@@ -139,6 +147,28 @@ function isRefusal(
   result: SessionCreateRefusal | ParentAuthorisation,
 ): result is SessionCreateRefusal {
   return "statusCode" in result;
+}
+
+/**
+ * Create the session row, having resolved who its parent may be.
+ *
+ * The two shapes differ only in where the parent is read: a create carrying a
+ * first message grows a tree somebody may be racing, so its read, its tree
+ * decision and its INSERT are one locked transaction, while a create that
+ * writes no run needs no lock. Both reach the same write through the same
+ * resolver, and neither lets the request decide whether that resolver runs.
+ */
+async function createSessionRow(
+  row: NewSessionRow,
+  parentSid: string | null,
+  user: ReturnType<typeof getUser>,
+  admitTree: boolean,
+): Promise<SessionCreateRefusal | null> {
+  if (parentSid && admitTree) return admitParentedSessionCreate(parentSid, user, row);
+  const parentAuth = await resolveParentAuthorisation(db, parentSid, user);
+  if (isRefusal(parentAuth)) return parentAuth;
+  await insertSessionRow(db, row, parentAuth);
+  return null;
 }
 
 /**
@@ -163,7 +193,7 @@ export async function admitParentedSessionCreate(
     await client.query("BEGIN");
     try {
       await acquireAdmissionLock(client);
-      const parentAuth = await readParentAuthorisation(client, parentSid, user);
+      const parentAuth = await resolveParentAuthorisation(client, parentSid, user);
       if (isRefusal(parentAuth)) {
         await client.query("ROLLBACK");
         return parentAuth;
@@ -879,26 +909,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         };
         // A create with no parent grows no existing tree, and one with no
         // message writes no run, so only the two together take the lock.
-        if (parentSid && firstMessage) {
-          const refused = await admitParentedSessionCreate(parentSid, user, newRow);
-          if (refused) {
-            if (idemKey && idemLock) {
-              await saveIdempotencyBestEffort(
-                idemLock.client, userId, route, idemKey, refused.statusCode, refused.response,
-              );
-            }
-            return { statusCode: refused.statusCode, response: refused.response };
+        const refused = await createSessionRow(newRow, parentSid, user, Boolean(firstMessage));
+        if (refused) {
+          if (refused.replayable && idemKey && idemLock) {
+            await saveIdempotencyBestEffort(
+              idemLock.client, userId, route, idemKey, refused.statusCode, refused.response,
+            );
           }
-        } else {
-          let parentAuth: ParentAuthorisation | undefined;
-          if (parentSid) {
-            const result = await readParentAuthorisation(db, parentSid, user);
-            if (isRefusal(result)) {
-              return { statusCode: result.statusCode, response: result.response };
-            }
-            parentAuth = result;
-          }
-          await insertSessionRow(db, newRow, parentAuth);
+          return { statusCode: refused.statusCode, response: refused.response };
         }
 
         const dispMode = mode.replace(/-harness$/, "");

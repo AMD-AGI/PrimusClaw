@@ -5,12 +5,11 @@
  * Who may attach a child session to a parent.
  *
  * A child row is what grants visibility of a parent's tree, so writing one
- * without checking is a cross-tenant attachment. The check used to be a
- * precondition the two creation paths each remembered to run, which makes "did
- * we check?" a property of which branch ran and of a request field the branch
- * is about to persist. These pin the invariant at the write instead: a row
- * carrying a parent cannot be inserted without the witness the authorising read
- * issues, whichever path reaches it.
+ * without checking is a cross-tenant attachment. Authorisation is resolved on
+ * every create, including one that names no parent -- "none was named" is an
+ * answer the resolver gives rather than a reason to skip it -- and the write
+ * refuses any row whose parent the witness in hand does not name. These pin
+ * both halves: what the resolver answers, and what the write demands.
  */
 
 import test, { after, before, beforeEach } from "node:test";
@@ -18,7 +17,7 @@ import assert from "node:assert/strict";
 
 import { db } from "../src/infra/db.js";
 import {
-  insertSessionRow, readParentAuthorisation, type NewSessionRow,
+  insertSessionRow, resolveParentAuthorisation, type NewSessionRow,
 } from "../src/routes/sessions.js";
 import { startHarness, type Harness } from "./scenario-harness.js";
 
@@ -27,7 +26,7 @@ before(async () => { h = await startHarness(); });
 beforeEach(async () => { await h.reset(); });
 after(async () => { await h?.close(); });
 
-const OWNER = { userId: "u-owner", roles: [] } as unknown as Parameters<typeof readParentAuthorisation>[2];
+const OWNER = { userId: "u-owner", roles: [] } as unknown as Parameters<typeof resolveParentAuthorisation>[2];
 const INTRUDER = { userId: "u-intruder", roles: [] } as unknown as typeof OWNER;
 
 function childRow(parentSid: string | null): NewSessionRow {
@@ -53,7 +52,7 @@ async function seedParent(sessionId: string, ownerId: string | null): Promise<vo
 
 test("a parent somebody else owns is refused", async () => {
   await seedParent("s-parent", "u-owner");
-  const result = await readParentAuthorisation(db, "s-parent", INTRUDER);
+  const result = await resolveParentAuthorisation(db, "s-parent", INTRUDER);
   assert.deepEqual(result, {
     statusCode: 403,
     response: { ok: false, error: "parent_session_access_denied" },
@@ -61,7 +60,7 @@ test("a parent somebody else owns is refused", async () => {
 });
 
 test("a parent that does not exist is refused rather than treated as unowned", async () => {
-  const result = await readParentAuthorisation(db, "s-missing", INTRUDER);
+  const result = await resolveParentAuthorisation(db, "s-missing", INTRUDER);
   assert.equal((result as { statusCode?: number }).statusCode, 404);
 });
 
@@ -70,14 +69,14 @@ test("a parent whose owner column is null is refused, not open to everyone", asy
   // wrongly if it reads an absent owner as a match.
   await seedParent("s-orphan", null);
   assert.equal(
-    (await readParentAuthorisation(db, "s-orphan", INTRUDER) as { statusCode?: number }).statusCode,
+    (await resolveParentAuthorisation(db, "s-orphan", INTRUDER) as { statusCode?: number }).statusCode,
     403,
   );
 });
 
 test("an anonymous caller cannot claim a parent at all", async () => {
   await seedParent("s-parent", "u-owner");
-  const result = await readParentAuthorisation(db, "s-parent", null);
+  const result = await resolveParentAuthorisation(db, "s-parent", null);
   assert.deepEqual(result, {
     statusCode: 401,
     response: { ok: false, error: "authentication required" },
@@ -86,16 +85,24 @@ test("an anonymous caller cannot claim a parent at all", async () => {
 
 test("the owner gets a witness naming the parent it was issued for", async () => {
   await seedParent("s-parent", "u-owner");
-  assert.deepEqual(await readParentAuthorisation(db, "s-parent", OWNER), { parentSid: "s-parent" });
+  assert.deepEqual(await resolveParentAuthorisation(db, "s-parent", OWNER), { parentSid: "s-parent" });
 });
 
-test("a parented row cannot be written without a witness", async () => {
-  // This is the path the create route takes when the request carries no first
-  // message: the branch that decides whether to authorise reads the same field
-  // it is about to persist, so the write refuses unless the read actually ran.
+test("naming no parent is an answer the resolver gives, not a check it skips", async () => {
+  // The create route calls this unconditionally, so the absent-parent case has
+  // to come back as a witness the write will accept -- and it must not depend
+  // on there being a caller, because a create with no parent authorises nothing.
+  assert.deepEqual(await resolveParentAuthorisation(db, null, null), { parentSid: null });
+  assert.deepEqual(await resolveParentAuthorisation(db, null, OWNER), { parentSid: null });
+});
+
+test("a parented row cannot be written under a no-parent witness", async () => {
+  // The shape a create takes when it carries no first message. The write is
+  // what refuses: a witness saying nothing was authorised cannot stand in for
+  // one naming the parent about to be stored.
   await seedParent("s-parent", "u-owner");
   await assert.rejects(
-    () => insertSessionRow(db, childRow("s-parent")),
+    () => insertSessionRow(db, childRow("s-parent"), { parentSid: null }),
     /parent_not_authorised/,
   );
   assert.equal(
@@ -114,13 +121,13 @@ test("a witness for one parent does not authorise a different one", async () => 
   );
 });
 
-test("the authorised write goes through, and an unparented one needs no witness", async () => {
+test("the authorised write goes through, and so does an unparented one", async () => {
   await seedParent("s-parent", "u-owner");
   await insertSessionRow(db, childRow("s-parent"), { parentSid: "s-parent" });
   assert.equal(
     (await h.sql("SELECT 1 FROM claw_sessions WHERE parent_session_id = 's-parent'")).length, 1,
   );
-  await insertSessionRow(db, { ...childRow(null), sessionId: "s-root" });
+  await insertSessionRow(db, { ...childRow(null), sessionId: "s-root" }, { parentSid: null });
   assert.equal(
     (await h.sql("SELECT 1 FROM claw_sessions WHERE session_id = 's-root'")).length, 1,
   );
