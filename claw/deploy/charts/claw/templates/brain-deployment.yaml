@@ -246,6 +246,21 @@ spec:
           value: {{ .Values.features.keepaliveReconcileReserve | quote }}
         - name: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
           value: {{ .Values.features.keepaliveIdleDeadlineSec | quote }}
+        # Forwarded into every sandbox, and rendered only when set: an absent
+        # value is what makes Hands refuse to serve background shells, so a
+        # default here would answer for a deployment that had not decided.
+        {{- with .Values.features.childUidMin }}
+        - name: HANDS_CHILD_UID_MIN
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.features.childUidMax }}
+        - name: HANDS_CHILD_UID_MAX
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.features.childIsolation }}
+        - name: HANDS_CHILD_ISOLATION
+          value: {{ . | quote }}
+        {{- end }}
         # Read by brain and, until now, reachable only by editing the Deployment
         # by hand -- which the next helm upgrade would have undone. Each renders
         # empty when the value is absent, and each answers an empty value with

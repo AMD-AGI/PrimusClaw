@@ -14,6 +14,7 @@ import { randomBytes } from "node:crypto";
 import {
   isUserEnvKeyAllowed,
   isClawInternalEnv,
+  isHandsInternalEnv,
   isBashFuncInjection,
   USER_ENV_KEY_NAME_RE,
   USER_ENV_DENY_LIST,
@@ -38,6 +39,22 @@ test("isUserEnvKeyAllowed: rejects CLAW_* prefix wholesale", () => {
   assert.equal(isUserEnvKeyAllowed("CLAW_DEPLOY_ROOT"), false);
   assert.equal(isUserEnvKeyAllowed("CLAW_NEW_FUTURE_VAR"), false);
   assert.equal(isUserEnvKeyAllowed("CLAW_X"), false);
+});
+
+test("isUserEnvKeyAllowed: rejects HANDS_* prefix wholesale", () => {
+  // These configure the sandbox's tool server rather than what runs inside it.
+  // Session env has the highest precedence in the merge and Hands applies the
+  // file before it checks its own posture, so a request able to set
+  // HANDS_CHILD_ISOLATION would be choosing its own privilege boundary --
+  // a command sharing Hands' identity reads the sandbox credential out of the
+  // parent's environment and the shell records out of a subtree it owns.
+  assert.equal(isHandsInternalEnv("HANDS_CHILD_ISOLATION"), true);
+  for (const name of [
+    "HANDS_CHILD_ISOLATION", "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX",
+    "HANDS_STATE_DIR", "HANDS_ENV_FILE", "HANDS_SOMETHING_ADDED_LATER",
+  ]) {
+    assert.equal(isUserEnvKeyAllowed(name), false, `${name} should be denied`);
+  }
 });
 
 test("isUserEnvKeyAllowed: rejects BASH_FUNC_ prefix wholesale", () => {

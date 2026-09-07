@@ -661,6 +661,9 @@ for _key, _var in (
     ("keepaliveTargetCeiling", "SANDBOX_KEEPALIVE_TARGET_CEILING"),
     ("keepaliveReconcileReserve", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE"),
     ("keepaliveIdleDeadlineSec", "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC"),
+    ("childUidMin", "HANDS_CHILD_UID_MIN"),
+    ("childUidMax", "HANDS_CHILD_UID_MAX"),
+    ("childIsolation", "HANDS_CHILD_ISOLATION"),
 ):
     if env(_var):
         values.setdefault("features", {})[_key] = env(_var)

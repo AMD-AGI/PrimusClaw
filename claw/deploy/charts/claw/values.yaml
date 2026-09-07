@@ -619,6 +619,22 @@ features:
   # ceiling too large for the interval is rejected rather than discovered as a
   # reclaimed sandbox with work in it.
   keepaliveIdleDeadlineSec: ""
+  # What a model-issued command runs as inside the sandbox. Required whenever
+  # backgroundShell is true, and Hands refuses to start without one of them: a
+  # command running as Hands itself reads the sandbox credential out of the
+  # parent's environment and the records that address background shells out of
+  # a subtree its own identity owns.
+  #
+  # childUidMin/childUidMax declare the unprivileged range a sandbox allocates
+  # one identity from per (owner scope, run identity) pair. They need an image
+  # that runs Hands privileged enough to assume one and mounts /proc so one run
+  # cannot enumerate another's processes; a declared range the sandbox cannot
+  # honour refuses the command rather than running it unprotected.
+  # childIsolation: "unenforced" is the deployment stating that it is serving
+  # without that boundary, which every spawn then reports.
+  childUidMin: ""
+  childUidMax: ""
+  childIsolation: ""
   # Chat dispatch publishes a doorbell and injects credentials at claim time
   # instead of putting the full execute request on the shared durable. Off
   # until every Brain replica understands the doorbell: a mixed fleet must

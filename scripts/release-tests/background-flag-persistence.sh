@@ -2,8 +2,8 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-# The background-shell enablement and its ceiling pin must survive the upgrade
-# that follows the one that set them.
+# The background-shell enablement, its ceiling pin and the child-isolation
+# posture must survive the upgrade that follows the one that set them.
 #
 # Neither key had a path through the reference entrypoints: they were reachable
 # only by hand-passing --set to helm, and the next routine upgrade re-rendered
@@ -11,8 +11,9 @@
 # in direction and unsafe in behaviour -- a rollout gate that passed yesterday
 # measures a deployment with the feature off today, and nobody is told. A
 # reverted ceiling pin is worse: it widens the foreground ceiling under running
-# work. Kept separate from deploy-values-persistence.sh so the lifetime knobs
-# and these two stay independently attributable.
+# work, and a reverted posture leaves Hands refusing to start at all. Kept
+# separate from deploy-values-persistence.sh so the lifetime knobs and these
+# stay independently attributable.
 
 set -euo pipefail
 
@@ -83,12 +84,13 @@ values_capture="$tmp/helm-values.json"
 # through its own --show-only invocation, so "some render had it" is too weak a
 # claim: the values have to be on the command line that produces that manifest.
 assert_brain_render() {
-  local phase="$1" flag="$2" ceiling="$3" found=0
+  local phase="$1" flag="$2" ceiling="$3" posture="$4" found=0
   while read -r line; do
     case "$line" in
       *"--show-only templates/brain-deployment.yaml"*)
         found=1
-        for want in "features.backgroundShell=$flag" "brain.bashMaxTimeoutSec=$ceiling"; do
+        for want in "features.backgroundShell=$flag" "brain.bashMaxTimeoutSec=$ceiling" \
+                    "features.childIsolation=$posture"; do
           case "$line" in
             *"--set-string $want"*) ;;
             *) echo "$phase: brain render lost $want" >&2; exit 1 ;;
@@ -132,7 +134,7 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy-default.log" 2>&1 || { command cat "$tmp/deploy-default.log" >&2; exit 1; }
 
-for _key in BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC; do
+for _key in BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC HANDS_CHILD_ISOLATION; do
   grep -q "^${_key}=\"\"$" "$default_values_file" || {
     echo "a no-knob install left $_key out of the generated values file" >&2
     command cat "$default_values_file" >&2
@@ -160,6 +162,7 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
   TAG="release-test" S3_ACCESS_KEY="ak" S3_SECRET_KEY="sk" \
   BG_SHELL_ENABLED="true" \
   BASH_MAX_TIMEOUT_SEC="600" \
+  HANDS_CHILD_ISOLATION="unenforced" \
   bash "$repo_root/claw/deploy/deploy.sh" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy.log" 2>&1 || { command cat "$tmp/deploy.log" >&2; exit 1; }
@@ -170,9 +173,13 @@ with open(sys.argv[1], encoding="utf-8") as f:
     values = json.load(f)
 assert values["features"]["backgroundShell"] == "true", values.get("features")
 assert values["brain"]["bashMaxTimeoutSec"] == "600", values["brain"]
+# Without a values path of its own the posture is unsettable, and background
+# shells turned on by the line above would leave every Hands exiting at start.
+assert values["features"]["childIsolation"] == "unenforced", values["features"]
 PY
 
-for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="600"'; do
+for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="600"' \
+             'HANDS_CHILD_ISOLATION="unenforced"'; do
   grep -q "^${_pair}\$" "$values_file" || {
     echo "the install did not persist ${_pair%%=*}" >&2
     command cat "$values_file" >&2
@@ -190,7 +197,7 @@ env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
   bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --dry-run \
     >"$tmp/upgrade.log" 2>&1 || { command cat "$tmp/upgrade.log" >&2; exit 1; }
 
-assert_brain_render "upgrade with no env" "true" "600"
+assert_brain_render "upgrade with no env" "true" "600" "unenforced"
 
 # ── And the same upgrade against the no-knob install ──
 : >"$capture"
@@ -201,5 +208,6 @@ env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
 
 assert_brain_render_omits "no-knob upgrade" "features.backgroundShell"
 assert_brain_render_omits "no-knob upgrade" "brain.bashMaxTimeoutSec"
+assert_brain_render_omits "no-knob upgrade" "features.childIsolation"
 
 echo "background flag persistence: ok"
