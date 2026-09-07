@@ -23,6 +23,10 @@ import { latchRosterStale, markRosterStale, releaseAdmission } from "./admission
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
+import { instanceFromEntry } from "./container-probe.js";
+import { countLiveWork } from "./live-work-gate.js";
+import { releaseRetention, type RetentionStore } from "./retain-container.js";
+import { HANDS_STATE_DIR } from "./bootstrap.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -126,6 +130,65 @@ interface RegisteredSandbox {
 }
 
 const localRegistry = new Map<string, RegisteredSandbox>();
+
+
+/**
+ * One retained container's turn in the sweep.
+ *
+ * It is a target like any other -- pinged, its lifetime refreshed -- and it is
+ * never probed for a shell count: its key names no session, so the owner a
+ * probe would ask about owns nothing, and the zero that came back would file
+ * the container idle and reclaim the very work the retention protects.
+ *
+ * What ends a retention is the evidence that caused it reaching zero, read the
+ * same way it was taken. Without this the entry is permanent and the container
+ * never returns to the ordinary lifetime machinery.
+ *
+ * @returns false where the sweep could not complete this entry, which is not
+ * the same as an entry it completed and found nothing in.
+ */
+async function sweepRetention(
+  deps: KeepaliveDeps,
+  key: string,
+  entry: { value: Uint8Array; revision: number },
+  info: HandsKvEntry,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<boolean> {
+  const held = sandboxEntryFrom(info);
+  if (!held) {
+    logger.error({ key }, "keepalive.retention_unaddressable");
+    return false;
+  }
+  const sessionId = sessionIdFromHandsKey(key);
+  targets.set(key, { sessionId, entry: held });
+
+  const inst = instanceFromEntry(sessionId, info as never);
+  const live = inst
+    ? await countLiveWork(inst, HANDS_STATE_DIR)
+    : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
+  if (live.verdict === "clear") {
+    await releaseRetention(retentionStore(deps), held.sandboxName || held.workloadId || "");
+    return true;
+  }
+
+  try {
+    await deps.kv.update(key, entry.value, entry.revision);
+  } catch (err) {
+    // This bucket expires entries on its own, so a refresh that failed and was
+    // swallowed is a retained container that silently falls out of the sweep.
+    logger.error({ err: (err as Error)?.message, key }, "keepalive.retention_refresh_failed");
+    return false;
+  }
+  return true;
+}
+
+/** The two writes a retention needs, and nothing else in the bucket. */
+function retentionStore(deps: KeepaliveDeps): RetentionStore {
+  return {
+    put: (k, v) => deps.kv.put(k, sc.encode(v)),
+    delete: (k) => deps.kv.delete(k),
+  };
+}
 
 /**
  * The sandbox an entry names, or null where it names none this can address.
@@ -925,16 +988,7 @@ async function collectTargets(
         // running, idle and unobtainable answers -- never probed for a count,
         // never marked idle, never destroyed or evicted on a failed ping.
         if (isRetentionEntry(info)) {
-          const held = sandboxEntryFrom(info);
-          if (held) {
-            targets.set(key, { sessionId, entry: held });
-            // Its TTL is refreshed like any other target's; nothing else about
-            // it is read, and no branch below may reach it.
-            await deps.kv.update(key, e.value, e.revision).catch(() => {});
-          } else {
-            complete = false;
-            logger.error({ key }, "keepalive.retention_unaddressable");
-          }
+          if (!await sweepRetention(deps, key, e, info, targets)) complete = false;
           continue;
         }
         // Post-task idle reuse handle: keep it for reuse but never ping it, so

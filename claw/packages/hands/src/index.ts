@@ -9,6 +9,7 @@ import Fastify from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { constantTimeEquals, verifyScopeCredential, type CredentialScope } from "@claw/utils";
+import { RECLAIM_CAUSES, isReclaimCause, isReapGrace } from "@claw/protocol";
 import { tools } from "./tools/index.js";
 import {
   MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, REAP_GRACE_MS,
@@ -168,6 +169,16 @@ function sendScopeFailure(
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);
   if (denied) return reply.status(denied.status).send({ error: denied.error });
+  // Read before the transport is opened: a deadline that cannot be used is
+  // refused here rather than becoming the no-deadline fallback further down,
+  // which would retain a run's outcomes for the sandbox's life on a run that
+  // stated a bound.
+  let deadline: string | undefined;
+  try {
+    deadline = normalizeDeadline(req.headers[DEADLINE_HEADER]);
+  } catch (e) {
+    return reply.status(400).send({ error: "deadline_malformed", detail: (e as Error).message });
+  }
   // `enableJsonResponse: true` switches the streamable-HTTP server transport from
   // its default SSE streaming reply to a plain JSON reply: the POST /mcp handler
   // awaits all tool results, then returns a single `Content-Type: application/json`
@@ -191,7 +202,7 @@ app.all("/mcp", async (req, reply) => {
     {
       owner: normalizeOwner(req.headers[OWNER_HEADER]),
       run: normalizeRun(req.headers[RUN_HEADER]),
-      deadline: normalizeDeadline(req.headers[DEADLINE_HEADER]),
+      deadline,
     },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
@@ -244,11 +255,15 @@ app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req
   // Every action that ends background work carries why, and which operation it
   // belongs to. Refused rather than defaulted: a reclaim nobody can attribute is
   // indistinguishable afterwards from work that ended on its own.
-  for (const field of ["cause", "reclaim_op"] as const) {
-    const value = req.body?.[field];
-    if (typeof value !== "string" || !value) {
-      return reply.status(400).send({ error: "cause_required", field });
-    }
+  if (!isReclaimCause(req.body?.cause)) {
+    return reply.status(400).send({
+      error: "cause_required",
+      field: "cause",
+      accepted: RECLAIM_CAUSES,
+    });
+  }
+  if (typeof req.body?.reclaim_op !== "string" || !req.body.reclaim_op) {
+    return reply.status(400).send({ error: "reclaim_op_required", field: "reclaim_op" });
   }
   const grace = reapGrace(req.body?.grace_ms);
   if (grace === null) {
@@ -261,7 +276,7 @@ app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req
     });
   }
 
-  const report = await shutdownRunShells(run, grace);
+  const report = await shutdownRunShells(resolved.scope.owner, run, grace);
   app.log.info(
     {
       run,
@@ -280,8 +295,7 @@ app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req
 /** The effective grace, or null where the caller named one outside the domain. */
 function reapGrace(raw: unknown): number | null {
   if (raw === undefined) return REAP_GRACE_MS;
-  if (typeof raw !== "number" || !Number.isInteger(raw)) return null;
-  return raw >= MIN_REAP_GRACE_MS && raw <= MAX_REAP_GRACE_MS ? raw : null;
+  return isReapGrace(raw) ? raw : null;
 }
 
 /**

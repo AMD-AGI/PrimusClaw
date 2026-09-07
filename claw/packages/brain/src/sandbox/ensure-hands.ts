@@ -426,10 +426,15 @@ async function retainInsteadOfDestroying(
 ): Promise<void> {
   const generation = info.sandboxName || info.workloadId || "";
   if (!generation) {
-    // A binding naming no generation has no key a retention could take, and the
-    // sweep walks keys rather than values. Refusing to destroy is what is left.
+    // Returning here would leave the session bound to a container this path has
+    // decided not to destroy, and the caller then provisions a second and
+    // overwrites the binding -- so the protected work ends up in a container
+    // nothing names and no sweep pings. The turn fails instead.
     logger.error({ sessionId, verdict: answer.verdict }, "ensureHands.retention_unkeyable");
-    return;
+    throw new Error(
+      "the sandbox still holds background work and its binding names no generation "
+      + "to retain it under, so it was neither replaced nor released",
+    );
   }
   await reuseEffects.retainContainer({
     store: kv as never,

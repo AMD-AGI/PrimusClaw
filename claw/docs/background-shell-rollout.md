@@ -18,10 +18,13 @@ verifier that passes having learned nothing is worse than none.
 
 Tools assumed, all already required by this repository's own scripts: `bash` and
 `/bin/sh` with their builtins, `helm`, `kubectl`, `curl`, `jq`, `rg`, `sed`, `seq`,
-`sleep`, `sort`, `tr`, `wc`, and `date` for the one epoch-seconds comparison
-G7-d2 makes against a field of a Kubernetes object. Nothing else — in
-particular no `python3`, `awk`, `comm`, `cut` or `xargs`, so a step cannot come
-to depend on a tool a cluster-access host is not obliged to have.
+`sleep`, `sort`, `tr`, `wc`, `date` for the one epoch-seconds comparison G7-d2
+makes against a field of a Kubernetes object, and `od` plus `openssl` for the
+scoped credential below — there is no way to compute an HMAC or to escape a
+scope byte by byte without them, and a step that cannot mint the credential
+cannot reach the two routes that require it. Nothing else — in particular no
+`python3`, `awk`, `comm`, `cut` or `xargs`, so a step cannot come to depend on a
+tool a cluster-access host is not obliged to have.
 
 A step needing a credential Claw issues to no operator is marked
 **[needs TBD-7]**, and each such step says what happens without it: a step that
@@ -154,8 +157,31 @@ per-sandbox `AUTH_CLAW_TOKEN`. The scope it proves is the only scope answered:
 a request whose body names `owner` or `run` is refused `scope_not_in_body`
 rather than read, so no step below may put either in a body, and a reap
 additionally carries `cause` and `reclaim_op` so the termination is
-attributable afterwards. The sandbox token is not obtainable by an operator, so
-every step reaching these two routes is `[needs TBD-7]`.
+attributable afterwards, `cause` from the closed set `dag_node_terminal`,
+`run_cancelled`, `operator_kill_shell`, `sandbox_idle_reclaim`,
+`sandbox_absolute_deadline`, `sandbox_replaced`, `retry_pending_unregistered`,
+`session_cleanup` — anything else is refused with the accepted set named. The
+sandbox token is not obtainable by an operator, so every step reaching these two
+routes is `[needs TBD-7]`.
+
+Every step below mints its credential **per pair**, through `scope_cred <owner>
+<run>` (empty run for an owner-only scope). One credential hoisted out of a loop
+proves one pair and is refused for every other, which reads as a route failure
+rather than as the mistake it is:
+
+```sh
+# The scope the routes answer, for one pair. Needs the sandbox's own
+# AUTH_CLAW_TOKEN, which is why every caller of it is [needs TBD-7].
+scope_cred() { local owner="$1" run="$2" scope proof
+  scope="$(printf '%s' "$owner" | scope_encode)/$( [ -n "$run" ] && printf '%s' "$run" | scope_encode || printf '.norun')"
+  proof=$(printf '%s' "$scope" | openssl dgst -sha256 -hmac "$HANDS_TOKEN" -hex | sed 's/^.* //')
+  printf '%s.%s' "$scope" "$proof"; }
+# Per-byte escaping: anything outside [A-Za-z0-9_-] becomes ~XX, so the two
+# parts cannot span the separator and no two pairs encode alike.
+scope_encode() { od -An -tx1 -v | tr -s ' ' '\n' | sed '/^$/d' | while read -r b; do
+  c=$(printf "\\x$b"); case "$c" in [A-Za-z0-9_-]) printf '%s' "$c";;
+  *) printf '~%s' "$(printf '%s' "$b" | tr 'a-f' 'A-F')";; esac; done; }
+```
 
 **Hands' own log has no reader.** Hands' diagnostics go to `HANDS_LOG_PATH`,
 inside the Hands-owned state area (`$HANDS_STATE_DIR/hands.log`, under `/tmp`)
@@ -345,8 +371,8 @@ scope — is exercised and no shell is signalled.
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   "$(hands_base "$HANDS_URL")/internal/shells/reap" \
-  -H "Authorization: Bearer $SCOPE_OWNER_ONLY" -H 'content-type: application/json' \
-  -d '{"cause":"rollout-preflight","reclaim_op":"p5"}'
+  -H "Authorization: Bearer $(scope_cred "$SESSION_ID" "")" -H 'content-type: application/json' \
+  -d '{"cause":"session_cleanup","reclaim_op":"p5"}'
 ```
 
 - Expected: `400`. The absent-run bucket is the one set nothing may end by run,
@@ -917,7 +943,7 @@ it green.
 | OBS-3 | `shell.background.run_end_terminate` / `run_end_kill` | informational | Run-end reap is firing. SC-6 reads the reap route's own answer instead |
 | OBS-4 | `shell.background.shutdown_terminate` / `shutdown_kill`, `hands.shutdown` | informational | Sandbox teardown took background work with it. G7-d and R6 read the sandbox inventory instead |
 | OBS-5 | `keepalive.idle_handle_kept_background_work` | **gate** (G6, SC-4) | An idle sandbox was kept alive because work was running. Fault when the number of distinct `sandboxName`s held here and absent from `keepalive.idle_handle_expired` over the same window exceeds `T_ORPHAN`. The correlation is per **sandbox generation**: the session id these events also carry is a store key that outlives every sandbox written under it, so correlating on it would let a dead generation's reclamation excuse a live generation's orphan. Rising alone is not a fault — it rises with legitimate long work |
-| OBS-6 | `keepalive.background_work_answer_stale`, `background_work_check_failed`, `background_work_unknown_giving_up` | **gate** (G6, SC-5) | Probe health: the **sum of the three, as an absolute count per window**, never a ratio — an ordinary successful probe logs nothing at all, so there is nothing to divide by. All three are ways the probe failed to answer, and watching the first alone reads zero while every probe throws. Fault above `T_STALE`: probes are not landing inside the sweep and OBS-5 cannot be trusted. **A zero count is a pass**, printed and tested all the same |
+| OBS-6 | `keepalive.background_work_answer_stale`, `background_work_check_failed`, `background_work_unreconciled` | **gate** (G6, SC-5) | Probe health: the **sum of the three, as an absolute count per window**, never a ratio — an ordinary successful probe logs nothing at all, so there is nothing to divide by. All three are ways the probe failed to answer, and watching the first alone reads zero while every probe throws. The third fires where a run of unanswered probes has left a handle unreconciled; it never becomes an idle verdict, so a count here is work nobody could account for rather than work that ended. Fault above `T_STALE`: probes are not landing inside the sweep and OBS-5 cannot be trusted. **A zero count is a pass**, printed and tested all the same |
 | OBS-7 | The reap route's own `{stopped, escalated, surviving}` answer | **gate** (G5, R2) — the answer only | Every explicit reap with its outcome. The audit trail is kept caller-side, because the route's own log line is written where nothing can read it |
 | OBS-8 | Brain `/health` `bgShellEnabled` and `bashForegroundMaxSec`; Hands `/health` `bgShellEnabled` and `bashMaxTimeoutSec` | **gate** (G2, G3, G4, SC-2, SC-3, R4, R6) | Fleet-level and per-sandbox configuration state. Divergence across Brain pods outside a rollout is always a fault; a sandbox differing from Brain is the mixed window, which G4 closes by measurement |
 | OBS-9 | `.item.status`, `.item.output` and `.item.tool_stats.by_tool_ok` on the task API; the terminal facts on the run listing | **gate** (G5, G7, R8) | Per-run tool-call outcomes and terminal facts, written when the run ends and read back afterwards. The only tool-level evidence here that is neither streamed nor raced — and `by_tool_ok` rather than `by_tool`, because a call is counted before it runs and stays counted when it fails |
@@ -1050,18 +1076,21 @@ while IFS=$'\t' read -r sid name ns url wid; do
   for run in $RUN_IDS; do
     printf '%s %s\t' "$name" "$run"
     curl -sf -X POST --max-time "$T_CURL" "$(hands_base "$url")/internal/shells/reap" \
-      -H "Authorization: Bearer $SCOPE_CRED" -H 'content-type: application/json' \
-      -d "{\"cause\":\"rollback\",\"reclaim_op\":\"$RECLAIM_OP\"}" \
+      -H "Authorization: Bearer $(scope_cred "$sid" "$run")" -H 'content-type: application/json' \
+      -d "{\"cause\":\"sandbox_replaced\",\"reclaim_op\":\"$RECLAIM_OP\"}" \
       | jq -c '{stopped, escalated, surviving}' || echo '{"error":"unreachable"}'
   done
 done < /tmp/claw-rollback-fleet.tsv
 ```
 
-- `$SCOPE_CRED` is the credential proving `(owner, run)` for **that** sandbox:
-  the scope comes from the credential and a body naming either field is refused,
-  so one credential per sandbox and run is what this loop needs and why it is
-  `[needs TBD-7]`. `$RECLAIM_OP` names this rollback, so every termination it
-  causes is attributable afterwards.
+- `scope_cred <owner> <run>` mints the credential proving that one pair, and is
+  called **inside** the loop: the scope comes from the credential and a body
+  naming either field is refused, so a single credential hoisted out of the loop
+  addresses one pair and silently fails on every other — which is why this step
+  is `[needs TBD-7]`. `cause` is `sandbox_replaced`, from the closed vocabulary
+  the route accepts; a value outside it is refused with the accepted set named.
+  `$RECLAIM_OP` names this rollback, so every termination it causes is
+  attributable afterwards.
 - Expected: `surviving: 0` on every line. `{"stopped":0,"escalated":0,
   "surviving":0}` for a run that started nothing is normal and not an error.
 - Fail: `surviving` above zero, or a non-2xx → **SC-6**, and the cooperative path
@@ -1228,15 +1257,16 @@ while IFS=$'\t' read -r sid name ns url wid; do
   for owner in "$sid" $DAG_ROOT_IDS; do
     printf '%s %s\t' "$name" "$owner"
     curl -sf -X POST --max-time "$T_CURL" "$(hands_base "$url")/internal/shells/active" \
-      -H "Authorization: Bearer $SCOPE_CRED" -H 'content-type: application/json' -d '{}' \
+      -H "Authorization: Bearer $(scope_cred "$owner" "")" -H 'content-type: application/json' -d '{}' \
       | jq -r '.running' || echo NO_ANSWER
   done
 done < /tmp/claw-rollback-fleet.tsv
 ```
 
-- The owner is proved by the credential, so each owner in the loop needs its own:
-  the session id for an ordinary run, and the graph root for a node of one.
-  `$sid` alone misses the second. Shells started with no owner sit in a bucket of
+- The owner is proved by the credential, so each owner in the loop mints its own
+  through `scope_cred` — the session id for an ordinary run, the graph root for a
+  node of one. `$sid` alone misses the second, and one credential reused across
+  the loop addresses only the owner it was minted for. Shells started with no owner sit in a bucket of
   their own, so a `0` here is a negative result about one owner and not about the
   sandbox.
 - Expected: `0`.

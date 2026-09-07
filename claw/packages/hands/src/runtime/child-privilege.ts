@@ -4,30 +4,24 @@
 /**
  * What a process spawned on the model's behalf runs as, and what it can see.
  *
- * Children inherited Hands' own operating-system identity and its whole
- * environment, which put three things inside the model's reach: the internal
- * bearer token that authorises the routes ending other runs' work, the record
- * subtree and epoch marker every destroy gate reads, and -- because one sandbox
- * serves several runs under one identity -- the other runs' processes, listable
- * through the process filesystem and signallable by group.
- *
  * The boundary is a property of the spawn, in three parts: an unprivileged
  * identity of its own per *(owner scope, run identity)* pair, a process view
  * that cannot observe another pair's processes, and an environment built from
  * an allow-list rather than passed through. Foreground and background share
  * this one path, so neither is a way round the others.
  *
- * The environment binds unconditionally -- it needs nothing of the sandbox. The
- * identity and the process view are properties the sandbox has to provide, and
- * a sandbox declaring an identity range is declaring that it does: from there
- * a missing process view refuses the spawn rather than serving it under Hands'
- * identity. A sandbox that declares no range provides no such boundary and is
- * reported as unenforced on every spawn, which is what an operator reads to
- * know the isolation baseline has not reached this deployment yet.
+ * The environment binds unconditionally; it needs nothing of the sandbox. The
+ * other two are the sandbox's to provide, and declaring an identity range is
+ * declaring that it does -- from there a missing process view, or a process
+ * unable to assume an identity, refuses the spawn. A sandbox declaring no range
+ * is reported as unenforced on every spawn, which is what says the isolation
+ * baseline has not reached this deployment.
  */
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { APPLIED_ENV_KEYS } from "./env-file.js";
+import { stateRoot } from "./shell-records.js";
 
 /** Raised where the boundary cannot be placed. Never downgraded to a warning. */
 export class ChildPrivilegeUnavailable extends Error {}
@@ -52,18 +46,29 @@ let isolation: SandboxIsolation | null = null;
 /** Test-only. No production path sets this. */
 export function bindSandboxIsolation(next: SandboxIsolation | null): void {
   isolation = next;
-  allocated.clear();
-  nextIdentity = null;
+  allocated = null;
 }
 
 const PRODUCTION_ISOLATION: SandboxIsolation = {
   identityRange(): { min: number; max: number } | null {
-    // Assuming another identity needs the privilege to do so; without it the
-    // range is not one this process can allocate from.
-    if (process.getuid?.() !== 0) return null;
     const min = Number(process.env.HANDS_CHILD_UID_MIN);
     const max = Number(process.env.HANDS_CHILD_UID_MAX);
-    if (!Number.isInteger(min) || !Number.isInteger(max) || min <= 0 || max < min) return null;
+    if (process.env.HANDS_CHILD_UID_MIN === undefined
+      && process.env.HANDS_CHILD_UID_MAX === undefined) return null;
+    if (!Number.isInteger(min) || !Number.isInteger(max) || min <= 0 || max < min) {
+      throw new ChildPrivilegeUnavailable(
+        `HANDS_CHILD_UID_MIN/MAX name no usable identity range (${String(process.env.HANDS_CHILD_UID_MIN)}`
+        + `-${String(process.env.HANDS_CHILD_UID_MAX)})`,
+      );
+    }
+    // A declared range this process cannot assume from is a boundary the
+    // deployment asked for and the runtime cannot give. Falling back to Hands'
+    // own identity there is the silent unenforcement the declaration rules out.
+    if (process.getuid?.() !== 0) {
+      throw new ChildPrivilegeUnavailable(
+        "this sandbox declares a child identity range but does not run privileged enough to assume one",
+      );
+    }
     return { min, max };
   },
   partitionsProcessView(): boolean {
@@ -85,29 +90,52 @@ function sandboxIsolation(): SandboxIsolation {
   return isolation ?? PRODUCTION_ISOLATION;
 }
 
-const allocated = new Map<string, number>();
-let nextIdentity: number | null = null;
+const ALLOCATION_FILE = "child-identities.json";
+let allocated: Map<string, number> | null = null;
 
 /**
  * The identity this pair's processes run as, held for the sandbox's life.
  *
- * Allocated rather than hashed from the pair: a collision would share one
- * identity and one signal authority, which is the separation this exists for.
+ * Durable, not process-local: an in-memory table restarts the allocation and
+ * hands a live child's identity to a different pair. Allocated rather than
+ * hashed, since a hash collision would share one identity, and with it one
+ * signal authority, between two runs.
  */
 function identityFor(owner: string, run: string, range: { min: number; max: number }): number {
-  const key = `${owner} ${run}`;
-  const held = allocated.get(key);
+  const table = allocationTable();
+  const key = `${owner}\u0000${run}`;
+  const held = table.get(key);
   if (held !== undefined) return held;
 
-  nextIdentity ??= range.min;
-  if (nextIdentity > range.max) {
-    throw new ChildPrivilegeUnavailable(
-      `this sandbox has no unprivileged identity left for a new run (range ${range.min}-${range.max})`,
-    );
+  const taken = new Set(table.values());
+  for (let id = range.min; id <= range.max; id++) {
+    if (taken.has(id)) continue;
+    table.set(key, id);
+    persistAllocations(table);
+    return id;
   }
-  const id = nextIdentity++;
-  allocated.set(key, id);
-  return id;
+  throw new ChildPrivilegeUnavailable(
+    `this sandbox has no unprivileged identity left for a new run (range ${range.min}-${range.max})`,
+  );
+}
+
+function allocationTable(): Map<string, number> {
+  if (allocated) return allocated;
+  try {
+    const raw = JSON.parse(readFileSync(join(stateRoot(), ALLOCATION_FILE), "utf8")) as Record<string, number>;
+    allocated = new Map(Object.entries(raw).filter(([, v]) => Number.isInteger(v)));
+  } catch {
+    allocated = new Map();
+  }
+  return allocated;
+}
+
+function persistAllocations(table: Map<string, number>): void {
+  const dir = stateRoot();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const staged = join(dir, `${ALLOCATION_FILE}.staged`);
+  writeFileSync(staged, JSON.stringify(Object.fromEntries(table)), { mode: 0o600 });
+  renameSync(staged, join(dir, ALLOCATION_FILE));
 }
 
 /**
@@ -146,6 +174,10 @@ export function childEnvironment(): NodeJS.ProcessEnv {
  */
 export function resolveChildPrivilege(owner: string, run: string): ChildPrivilege {
   const sandbox = sandboxIsolation();
+  // A declared range this sandbox cannot honour throws from here rather than
+  // reading as no declaration: the two are opposite answers, and collapsing
+  // them serves the command under Hands' identity on a deployment that asked
+  // for the boundary.
   const range = sandbox.identityRange();
   if (!range) {
     reportUnenforced();

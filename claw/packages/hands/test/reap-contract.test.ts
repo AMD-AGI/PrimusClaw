@@ -58,15 +58,31 @@ after(async () => {
 });
 
 test("a reap missing its cause or its operation is refused, naming the field", async () => {
-  for (const field of ["cause", "reclaim_op"]) {
+  for (const [field, error] of [["cause", "cause_required"], ["reclaim_op", "reclaim_op_required"]]) {
     const body: Record<string, unknown> = { ...WELL_FORMED };
     delete body[field];
     const res = await reap(body);
     assert.equal(res.statusCode, 400, `a reap with no ${field} was served`);
-    assert.deepEqual(res.json(), { error: "cause_required", field });
+    assert.equal(res.json().error, error);
+    assert.equal(res.json().field, field);
   }
   // An empty value is no value: it names nothing and attributes nothing.
   assert.equal((await reap({ ...WELL_FORMED, cause: "" })).statusCode, 400);
+});
+
+test("a cause outside the closed vocabulary is refused, and the vocabulary is named", async () => {
+  // The client declares a closed set; a server taking any non-empty string
+  // leaves the two free to drift, and an attribution nothing recognises is
+  // indistinguishable at read time from one nobody wrote.
+  for (const cause of ["rollback", "because", "DAG_NODE_TERMINAL", 7]) {
+    const res = await reap({ ...WELL_FORMED, cause });
+    assert.equal(res.statusCode, 400, `cause=${JSON.stringify(cause)} was accepted`);
+    assert.equal(res.json().error, "cause_required");
+    assert.ok(Array.isArray(res.json().accepted), "the refusal names what would be accepted");
+  }
+  for (const cause of ["dag_node_terminal", "run_cancelled", "sandbox_replaced"]) {
+    assert.equal((await reap({ ...WELL_FORMED, cause })).statusCode, 200, cause);
+  }
 });
 
 test("a grace outside the domain is refused, never clamped", async () => {
@@ -117,7 +133,7 @@ test("a run that started nothing reports an empty set rather than refusing", asy
 test("a shell that ignores both signals is surviving, not stopped", async () => {
   // The failure this closes: the old answer was the size of the addressed set,
   // so a run could be reported finished over work that had not ended.
-  const report = await bg.shutdownRunShells("ktsk_absent", 250);
+  const report = await bg.shutdownRunShells(OWNER, "ktsk_absent", 250);
   assert.deepEqual(report, { stopped: 0, escalated: 0, surviving: 0, shells: [] });
 
   // A process that genuinely ignores SIGTERM, so the group is still alive when
@@ -129,7 +145,7 @@ test("a shell that ignores both signals is surviving, not stopped", async () => 
     "stubborn",
   );
   await new Promise((r) => setTimeout(r, 400));
-  const stubborn = await bg.shutdownRunShells("ktsk_stubborn", 250);
+  const stubborn = await bg.shutdownRunShells(OWNER, "ktsk_stubborn", 250);
   assert.equal(stubborn.shells.length, 1);
   // It ignored SIGTERM, so it took the escalation. SIGKILL cannot be trapped,
   // so it ends there -- which is `escalated` and never `stopped`.
@@ -140,13 +156,13 @@ test("a shell that ignores both signals is surviving, not stopped", async () => 
 
 test("a repeated reap addresses whatever is still there rather than reporting a stale zero", async () => {
   bg.spawnBackground(OWNER, "ktsk_repeat", "sleep 60", "first");
-  const first = await bg.shutdownRunShells("ktsk_repeat", 250);
+  const first = await bg.shutdownRunShells(OWNER, "ktsk_repeat", 250);
   assert.equal(first.shells.length, 1);
 
   // Nothing left, so the repeat is honest about that -- and a shell registered
   // since is addressed again rather than suppressed on the grounds that an
   // earlier call answered.
-  assert.equal((await bg.shutdownRunShells("ktsk_repeat", 250)).shells.length, 0);
+  assert.equal((await bg.shutdownRunShells(OWNER, "ktsk_repeat", 250)).shells.length, 0);
   bg.spawnBackground(OWNER, "ktsk_repeat", "sleep 60", "second");
-  assert.equal((await bg.shutdownRunShells("ktsk_repeat", 250)).shells.length, 1);
+  assert.equal((await bg.shutdownRunShells(OWNER, "ktsk_repeat", 250)).shells.length, 1);
 });

@@ -30,11 +30,11 @@ let restore: (() => void) | null = null;
 afterEach(() => { restore?.(); restore = null; });
 
 /** A sandbox whose exec answers with this stdout, or throws. */
-function sandboxAnswering(stdout: string | Error): void {
+function sandboxAnswering(stdout: string | Error, exitCode = 0): void {
   restore = bindContainerProbeEffects({
     exec: async () => {
       if (stdout instanceof Error) throw stdout;
-      return { stdout, stderr: "", exitCode: 0 } as never;
+      return { stdout, stderr: "", exitCode } as never;
     },
   });
 }
@@ -173,4 +173,34 @@ test("a committed outcome is not live work", async () => {
   const answer = await countLiveWork(INST, STATE_DIR);
   assert.equal(answer.classes.finished, 1);
   assert.equal(answer.verdict, "clear");
+});
+
+test("a read that did not finish is unknown, whatever its stdout held", async () => {
+  // A non-zero exit is a partial read: the stdout may carry a prefix of the
+  // records and nothing in it says which are missing, so counting it is
+  // counting an unknown fraction of the subtree.
+  sandboxAnswering(transcript({ marker: MARKER, records: [], pids: [7] }), 1);
+  const answer = await countLiveWork(INST, STATE_DIR);
+  assert.equal(answer.verdict, "unknown");
+  assert.equal(answer.reason, "exec_exit_1");
+});
+
+test("a value that parses but is not a record refuses the whole answer", async () => {
+  // Each of these is valid JSON and would classify from fields it does not
+  // have, which is a count taken over something nobody wrote as a record.
+  for (const junk of ["123", "null", '"a string"', "[]", '{"shell_id":"x"}']) {
+    sandboxAnswering(`MARKER ${JSON.stringify(MARKER)}\nSUBTREE ok\nRECORD ${junk}\nPROCS 7`);
+    assert.equal((await countLiveWork(INST, STATE_DIR)).verdict, "unknown", junk);
+    restore?.();
+    restore = null;
+  }
+});
+
+test("no readable process table is unknown, not an empty count", async () => {
+  // The process state is half the evidence every class turns on. A count taken
+  // without it is one taken with the deciding half missing.
+  sandboxAnswering(transcript({ marker: MARKER, records: [], pids: [] }));
+  const answer = await countLiveWork(INST, STATE_DIR);
+  assert.equal(answer.verdict, "unknown");
+  assert.equal(answer.reason, "process_table_unreadable");
 });

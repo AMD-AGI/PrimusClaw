@@ -13,10 +13,36 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { mintScopeCredential } from "@claw/utils";
 
 const GUIDE = readFileSync(
   new URL("../../../docs/background-shell-rollout.md", import.meta.url), "utf8",
 );
+const SECRET = "a-sandbox-token";
+
+test("the guide's credential helper mints exactly what the routes verify", async () => {
+  // The guide is the only place an operator gets the credential from, and the
+  // routes take their whole scope from it. A helper that drifted by one escaped
+  // byte reads as a route refusing a correct request, during a rollback.
+  const { execFileSync } = await import("node:child_process");
+  const helpers = [...GUIDE.matchAll(/```sh\n([\s\S]*?)```/g)]
+    .map((m) => m[1])
+    .find((b) => b.includes("scope_cred()"));
+  assert.ok(helpers, "the guide no longer defines scope_cred");
+
+  const pairs: Array<[string, string | null]> = [
+    ["sess-1", "ktsk_9"], ["sess-1", null], ["a/b", "c"], ["ünïcode", "рун"],
+  ];
+  const script = `set -e\nHANDS_TOKEN=${JSON.stringify(SECRET)}\n${helpers}\n`
+    + pairs.map(([o, r]) => `scope_cred ${JSON.stringify(o)} ${JSON.stringify(r ?? "")}; echo`).join("\n");
+  const minted = execFileSync("bash", ["-c", script], { encoding: "utf8" }).trim().split("\n");
+
+  assert.deepEqual(
+    minted,
+    pairs.map(([owner, run]) => mintScopeCredential({ owner, run }, SECRET)),
+    "the guide's helper and the credential the routes verify have diverged",
+  );
+});
 
 test("the guide sources the helper library instead of restating it", () => {
   assert.match(GUIDE, /\. claw\/deploy\/rollout-lib\.sh/);

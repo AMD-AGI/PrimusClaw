@@ -44,7 +44,9 @@ const TOKEN = "test-internal-token";
 const OWNER = "sess-parity";
 const RUN = "ktsk_parity";
 /** Why this reap is happening and which operation it belongs to, both required. */
-const ATTRIBUTED = { cause: "rollback", reclaim_op: "op-parity", grace_ms: MIN_REAP_GRACE_MS };
+// A cause from the closed vocabulary: the route refuses anything outside it, so
+// a rollback names the act it is performing rather than the procedure it is part of.
+const ATTRIBUTED = { cause: "sandbox_replaced", reclaim_op: "op-parity", grace_ms: MIN_REAP_GRACE_MS };
 
 const proving = (owner: string, run: string | null = null) => ({
   authorization: `Bearer ${mintScopeCredential({ owner, run }, TOKEN)}`,

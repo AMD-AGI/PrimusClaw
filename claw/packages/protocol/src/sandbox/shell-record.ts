@@ -47,3 +47,50 @@ export interface EpochMarker {
   epoch: string;
   bearer: ProcessIdentity;
 }
+
+/** Why background work was ended. A new path extends this, never bypasses it. */
+export const RECLAIM_CAUSES = [
+  "dag_node_terminal",
+  "run_cancelled",
+  "operator_kill_shell",
+  "sandbox_idle_reclaim",
+  "sandbox_absolute_deadline",
+  "sandbox_replaced",
+  "retry_pending_unregistered",
+  "session_cleanup",
+] as const;
+
+export type ReclaimCause = typeof RECLAIM_CAUSES[number];
+
+export function isReclaimCause(value: unknown): value is ReclaimCause {
+  return typeof value === "string" && (RECLAIM_CAUSES as readonly string[]).includes(value);
+}
+
+/** What one addressed shell reached once the escalation completed. */
+export type ReapOutcome = "stopped" | "escalated" | "surviving";
+
+export interface ReapedShell {
+  shell_id: string;
+  owner_scope: string;
+  run_identity: string;
+  outcome: ReapOutcome;
+  signalled_at: string;
+}
+
+/** Disjoint tallies of one outcome per addressed shell, never signal counts. */
+export interface ReapReport {
+  stopped: number;
+  escalated: number;
+  surviving: number;
+  shells: ReapedShell[];
+}
+
+/** The grace domain, stated once and enforced identically on both sides. */
+export const MIN_REAP_GRACE_MS = 250;
+export const MAX_REAP_GRACE_MS = 60_000;
+
+export function isReapGrace(value: unknown): value is number {
+  return Number.isInteger(value)
+    && (value as number) >= MIN_REAP_GRACE_MS
+    && (value as number) <= MAX_REAP_GRACE_MS;
+}

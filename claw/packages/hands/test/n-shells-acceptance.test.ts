@@ -84,7 +84,7 @@ test("a run ending takes all of its shells and leaves another run's", async () =
   bg.spawnBackground(OWNER, SIBLING_RUN, "sleep 60", "neighbour");
   await settle();
 
-  const report = await bg.shutdownRunShells(RUN, 250);
+  const report = await bg.shutdownRunShells(OWNER, RUN, 250);
   assert.equal(report.shells.length, 2, "a reap that takes one of two leaves work nobody will read");
   assert.deepEqual(
     report.shells.map((s) => s.shell_id).sort(),
@@ -128,33 +128,48 @@ test("holding one of a run's ids confers no reach to its siblings", async () => 
   for (const id of ["alpha", "beta", "gamma"]) bg.killShell(OWNER, RUN, id);
 });
 
-test("no caller-visible byte names another scope's work", async () => {
-  // Scanned whole rather than field by field, and for a token planted in the
-  // command: a leak through a field nobody thought to check reads the same as
-  // no leak at all under a per-field assertion.
-  const TOKEN = "planted-9q8w7e";
-  bg.spawnBackground(OWNER, RUN, `echo ${TOKEN}; sleep 60`, "secretive");
+test("no caller-visible byte names another scope's work, at N greater than one", async () => {
+  // Scanned whole rather than field by field, and for tokens planted in the
+  // commands: a leak through a field nobody thought to check reads the same as
+  // no leak at all under a per-field assertion. Two shells, because a scan over
+  // one cannot see a leak that names a sibling.
+  const TOKENS = ["planted-9q8w7e", "planted-4r5t6y"];
+  const started = [
+    bg.spawnBackground(OWNER, RUN, `echo ${TOKENS[0]}; sleep 60`, "secretive"),
+    bg.spawnBackground(OWNER, RUN, `echo ${TOKENS[1]}; sleep 60`, "secretive-monitor", "monitor"),
+  ];
   await settle();
-  const theirPid = String(bg.listRunningShells(OWNER).length > 0 ? process.pid : 0);
+
+  // The real process identities of the shells being hidden, not this runner's.
+  const theirPids = started.map((s) => String(s.shell!.pid));
+  assert.ok(theirPids.every((pid) => pid !== String(process.pid)),
+    "the fixture has to hide real spawned processes, not the test runner");
 
   const visible = [
-    JSON.stringify(bg.pollOutput("intruder", "intruder-run", "secretive")),
-    JSON.stringify(bg.killShell("intruder", "intruder-run", "secretive")),
-    JSON.stringify(bg.waitForShellExit("intruder", "intruder-run", "secretive", 10)),
-    JSON.stringify(bg.pollOutput("intruder", "intruder-run", "anything")),
+    ...["secretive", "secretive-monitor", "anything"].flatMap((id) => [
+      JSON.stringify(bg.pollOutput("intruder", "intruder-run", id)),
+      JSON.stringify(bg.killShell("intruder", "intruder-run", id)),
+      JSON.stringify(bg.waitForShellExit("intruder", "intruder-run", id, 10)),
+    ]),
   ].join("\n");
 
-  for (const forbidden of [TOKEN, OWNER, RUN, "secretive", "monitor", theirPid, "scopes/"]) {
-    assert.doesNotMatch(visible, new RegExp(forbidden.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-      `a caller-visible answer named ${forbidden}`);
+  const forbidden = [...TOKENS, ...theirPids, OWNER, RUN, "secretive", "monitor", "scopes/"];
+  for (const needle of forbidden) {
+    assert.doesNotMatch(visible, new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      `a caller-visible answer named ${needle}`);
   }
 
-  // The record subtree holds no raw command either -- only the digest.
-  const record = records.readRecord(OWNER, RUN, "secretive");
-  assert.ok(record);
-  assert.doesNotMatch(JSON.stringify(record), new RegExp(TOKEN));
-  assert.ok(record.command_digest.length > 0);
-  bg.killShell(OWNER, RUN, "secretive");
+  // The record subtree holds no raw command either -- only the digest, and the
+  // two siblings' digests differ.
+  const digests = ["secretive", "secretive-monitor"].map((id) => {
+    const record = records.readRecord(OWNER, RUN, id);
+    assert.ok(record, id);
+    for (const token of TOKENS) assert.doesNotMatch(JSON.stringify(record), new RegExp(token));
+    return record.command_digest;
+  });
+  assert.notEqual(digests[0], digests[1], "two commands digest to one value");
+
+  for (const id of ["secretive", "secretive-monitor"]) bg.killShell(OWNER, RUN, id);
 });
 
 test("concurrent starts under one run each get a record, and none is lost", async () => {

@@ -92,17 +92,30 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
+/** Raised where a deadline was sent and cannot be used. */
+export class MalformedDeadline extends Error {}
+
 /**
- * The deadline as an instant, or absent.
+ * The deadline as an instant, or absent where none was sent.
  *
- * Absent covers unparseable as well as missing: a malformed value is a value
- * nothing can be computed from, and reading it as anything else would fix a
- * retention window from a number nobody sent.
+ * A header that is present and unparseable is refused rather than treated as
+ * absent: absent means the run carries no deadline, which retains for the
+ * sandbox's life, and reading a malformed value as that silently substitutes
+ * one policy for the opposite one on a run that did state a bound.
  */
 export function normalizeDeadline(raw: unknown): string | undefined {
-  if (typeof raw !== "string") return undefined;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") {
+    throw new MalformedDeadline(`${DEADLINE_HEADER} is not a string, so it names no instant`);
+  }
   const trimmed = raw.trim();
-  return trimmed && Number.isFinite(Date.parse(trimmed)) ? trimmed : undefined;
+  if (!trimmed) return undefined;
+  if (!Number.isFinite(Date.parse(trimmed))) {
+    throw new MalformedDeadline(
+      `${DEADLINE_HEADER} is not a readable instant, so no retention window could be fixed from it`,
+    );
+  }
+  return trimmed;
 }
 
 

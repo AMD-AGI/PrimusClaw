@@ -163,6 +163,36 @@ export interface ShellVerdict {
   record: ShellRecord;
 }
 
+/**
+ * Whether this owner holds the id under some other run identity.
+ *
+ * Bounded to the caller's own owner scope: establishing the same about another
+ * owner would mean walking their subtree, which is the read the boundary exists
+ * to prevent. So an id held by a different owner is `unknown_id` here, and the
+ * distinction is only ever as good as one scope's own view.
+ */
+function heldUnderAnotherRun(owner: string, run: string | null, shellId: string): boolean {
+  try {
+    return listRecordsForOwner(owner).some(
+      (r) => r.shell_id === shellId && (r.run_identity ?? null) !== run,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Which absence this is, for the operator surface.
+ *
+ * Never for a caller: `callerVisibleClass` collapses both into one answer,
+ * because being able to tell an id that exists elsewhere from one that exists
+ * nowhere is the existence disclosure the shared refusal closes.
+ */
+export function absenceClass(owner: string, run: string | null, shellId: string): ShellClass {
+  if (!subtreeReadable()) return "unknown_id";
+  return heldUnderAnotherRun(owner, run, shellId) ? "wrong_scope" : "unknown_id";
+}
+
 /** Null where no record exists for the triple, which is not a class. */
 export function shellVerdict(
   owner: string,

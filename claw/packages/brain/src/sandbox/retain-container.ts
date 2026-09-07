@@ -6,12 +6,10 @@
  * bound to it.
  *
  * The session's binding is the container's only entry in the record the routing
- * and keepalive paths read, so deleting it retains the container in name only:
- * nothing could route a poll to it and no sweep would ping it, and it would be
- * reclaimed as idle with the work in it. The binding is therefore moved rather
- * than removed, into the same keyspace the sweep already walks, under the
- * reserved marker plus the sandbox generation in unpadded base32 -- inside the
- * key-value client's accepted set for every generation whatever bytes it holds.
+ * and keepalive paths read, so the binding is moved rather than removed: into
+ * the same keyspace the sweep already walks, under the reserved marker plus the
+ * sandbox generation in unpadded base32, which the key-value client accepts for
+ * every generation whatever bytes it holds.
  */
 
 import pino from "pino";
@@ -43,9 +41,8 @@ export interface RetentionRecord {
 /**
  * Move a session's binding into the retention namespace.
  *
- * The session key goes only after the retention key lands: a crash between the
- * two leaves the session pointing at a live container, which the next turn's
- * health check handles, while the reverse order leaves it named by nothing.
+ * The session key goes only after the retention key lands: the reverse order
+ * leaves the container named by nothing if the second write does not happen.
  */
 export async function retainContainer(input: {
   store: RetentionStore;

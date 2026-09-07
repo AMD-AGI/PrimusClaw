@@ -27,6 +27,8 @@ import { fileURLToPath } from "node:url";
 import { HandsClient } from "../src/clients/hands.js";
 
 const HANDS_DIST = fileURLToPath(new URL("../../hands/dist/index.js", import.meta.url));
+const CLIENT_DIST = fileURLToPath(new URL("../dist/clients/hands.js", import.meta.url));
+const RESULT_MARKER = "__recovery_answer__";
 const TOKEN = "restart-e2e-token";
 const OWNER = "sess-restart-e2e";
 const RUN = "ktsk_1";
@@ -44,8 +46,44 @@ const freePort = (): Promise<number> => new Promise((resolve) => {
   });
 });
 
-/** A Brain with nothing carried over from the one before it. */
+/** A Brain with nothing carried over from the one before it, in this process. */
 const freshBrain = () => new HandsClient(`http://127.0.0.1:${port}/mcp`, TOKEN, OWNER, RUN);
+
+/**
+ * The same, in a process of its own.
+ *
+ * Closing a client and building another leaves every module-level cache, every
+ * connection pool and the whole heap in place, so it cannot tell recovery from
+ * a client that simply reconnected. A separate process is what "Brain
+ * restarted" means: nothing survives but the sandbox and the ids.
+ */
+async function inSeparateBrain(body: string): Promise<string> {
+  const script = `
+    const { HandsClient } = await import(${JSON.stringify(CLIENT_DIST)});
+    const brain = new HandsClient(${JSON.stringify(`http://127.0.0.1:`)} + process.env.PORT + "/mcp",
+      ${JSON.stringify(TOKEN)}, ${JSON.stringify(OWNER)}, ${JSON.stringify(RUN)});
+    const out = [];
+    ${body}
+    await brain.close();
+    // Delimited: the client logs to stdout too, so the answer has to be
+    // findable in a stream it shares with them.
+    process.stdout.write(${JSON.stringify(RESULT_MARKER)} + JSON.stringify(out));
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, PORT: String(port) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const chunks: Buffer[] = [];
+  const errs: Buffer[] = [];
+  child.stdout.on("data", (c: Buffer) => chunks.push(c));
+  child.stderr.on("data", (c: Buffer) => errs.push(c));
+  const code = await new Promise<number>((r) => child.on("exit", (c) => r(c ?? 1)));
+  assert.equal(code, 0, `the separate Brain failed: ${Buffer.concat(errs).toString()}`);
+  const out = Buffer.concat(chunks).toString();
+  const at = out.lastIndexOf(RESULT_MARKER);
+  assert.ok(at >= 0, `the separate Brain produced no answer: ${out}`);
+  return out.slice(at + RESULT_MARKER.length);
+}
 
 /**
  * How many shells this sandbox has records for.
@@ -110,22 +148,22 @@ test("a fresh Brain reaches both of a run's shells by the ids in the transcript"
   const started = recordCount();
   assert.equal(started, 2, "the fixture has to start two shells for one run identity");
 
-  // Everything Brain-local goes. Only the ids survive, as a transcript would
-  // carry them.
+  // Everything Brain-local goes -- the process included. Only the ids survive,
+  // as a transcript would carry them.
   await first.close();
 
-  const recovered = freshBrain();
-  const primary = await recovered.callTool("bash_output", { shell_id: "primary" });
-  const monitor = await recovered.callTool("bash_output", { shell_id: "monitor" });
+  const answers = JSON.parse(await inSeparateBrain(`
+    out.push(await brain.callTool("bash_output", { shell_id: "primary" }));
+    out.push(await brain.callTool("bash_output", { shell_id: "monitor" }));
+  `)) as string[];
 
-  assert.match(primary, /primary-line/, "the pre-restart output is not readable");
-  assert.match(monitor, /monitor-line/, "the second shell was not recovered, only the first");
-  assert.doesNotMatch(primary, /monitor-line/, "the two resolved to one shell");
+  assert.match(answers[0], /primary-line/, "the pre-restart output is not readable");
+  assert.match(answers[1], /monitor-line/, "the second shell was not recovered, only the first");
+  assert.doesNotMatch(answers[0], /monitor-line/, "the two resolved to one shell");
 
   // Nothing was started to make that work: a recovery that respawns looks
   // identical from the outside and has run the command twice.
   assert.equal(recordCount(), started, "the recovery path started a shell");
-  await recovered.close();
 });
 
 test("the recovered shells are waitable and killable, and killing one leaves the other", async () => {
@@ -147,17 +185,17 @@ test("the recovered shells are waitable and killable, and killing one leaves the
   await brain.close();
 });
 
-test("a wait by a fresh Brain resolves on the original process's exit", async () => {
+test("a wait by a Brain in a new process resolves on the original process's exit", async () => {
   const brain = freshBrain();
   await brain.callTool("bash", {
     command: "sleep 1; exit 5", run_in_background: true, shell_id: "short",
   });
   await brain.close();
 
-  const recovered = freshBrain();
-  const text = await recovered.callTool("wait", { shell_id: "short", timeout_sec: 20 });
+  const [text] = JSON.parse(await inSeparateBrain(`
+    out.push(await brain.callTool("wait", { shell_id: "short", timeout_sec: 20 }));
+  `)) as string[];
   assert.match(text, /exit_code=5/, "the exit status came from the process that was already running");
-  await recovered.close();
 });
 
 test("an id that was never issued is refused, and starts nothing", async () => {

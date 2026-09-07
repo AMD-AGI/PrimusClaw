@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { WORKSPACE } from "../../config.js";
 import { resolveChildPrivilege } from "../../runtime/child-privilege.js";
@@ -228,6 +229,61 @@ export async function runForegroundShell(
       }, options.timeoutMs);
     }
   });
+}
+
+/**
+ * Whether anything in the shell's process group is still running.
+ *
+ * The leader's own exit status is not the answer: a descendant that stayed in
+ * the group outlives it, and reading the leader alone reports the group gone
+ * while a detached child still holds the sandbox's CPU.
+ *
+ * Signal 0 is not the answer either. A terminated leader whose parent has not
+ * yet collected it keeps a process-table entry, so the whole group answers
+ * deliverable for as long as that lasts -- which would report a shell that did
+ * stop as surviving. Membership is read from the process table instead, and a
+ * member in the terminated state is not a member that is running.
+ */
+export function processGroupAlive(shell: ManagedShell): boolean {
+  if (!shell.pid) return false;
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    // Unreadable is not empty: signal 0 is the coarser answer, and its bias is
+    // towards reporting the group alive, which is the safe direction here.
+    return groupSignalable(shell.pid);
+  }
+  for (const entry of entries) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const member = readProcessGroupState(pid);
+    if (member && member.pgrp === shell.pid && member.state !== "Z") return true;
+  }
+  return false;
+}
+
+function groupSignalable(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM is a group alive and not ours to signal, which is still alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The state letter and process-group of one entry, or null where unreadable. */
+function readProcessGroupState(pid: number): { state: string; pgrp: number } | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Fields after the command, which is parenthesised and may itself contain
+    // spaces: state is the first, process-group the third.
+    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { state: after[0], pgrp: Number(after[2]) };
+  } catch {
+    return null;
+  }
 }
 
 /** Terminate the full process group, falling back to the direct child PID. */

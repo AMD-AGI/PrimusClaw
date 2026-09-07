@@ -21,15 +21,21 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import {
+  MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, isReapGrace,
+  type ReapOutcome, type ReapReport, type ReapedShell,
+} from "@claw/protocol";
 import { BG_SHELL_ENABLED } from "../../config.js";
 import { NO_RUN, currentDeadline } from "../../runtime/owner-context.js";
 import { assertShellId } from "../../runtime/record-path.js";
 import {
   attachRecord, claimRecord, currentEpoch, processStartToken,
-  readRecord, recordOutcome, releaseOutput,
-  type ProcessIdentity, type ShellRecordStatus,
+  listRecordsForOwner, readRecord, recordOutcome, releaseOutput,
+  type ProcessIdentity, type ShellRecord, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
-import { outcomeExpired, ownerLiveness, shellVerdict } from "../../runtime/shell-liveness.js";
+import {
+  absenceClass, outcomeExpired, ownerLiveness, shellVerdict,
+} from "../../runtime/shell-liveness.js";
 import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
 import {
   type ManagedShell,
@@ -37,6 +43,7 @@ import {
   type ManagedShellStatus,
   logShellEvent,
   pollManagedOutput,
+  processGroupAlive,
   spawnManagedShell,
   terminateManagedProcess,
 } from "./process-runner.js";
@@ -46,20 +53,29 @@ const BG_SHELL_BUFFER_BYTES = parseInt(process.env.BG_SHELL_BUFFER_BYTES || "104
 /** Grace period between a background shell exiting and being removed from the
  *  registry. Lets the watchdog deliver the completion notification first. */
 const BG_SHELL_REAP_DELAY_MS = parseInt(process.env.BG_SHELL_REAP_DELAY_MS || "60000", 10);
+const DEFAULT_REAP_GRACE_MS = 2_000;
+
 /**
  * How long a reaped shell is given between the signal and the escalation.
  *
- * Brain decides and Hands executes: a caller may override it per request, and
- * this is the value that applies when none does. One knob, so a second
- * unexplained grace constant cannot drift away from it.
+ * Brain decides and Hands executes: a caller overrides it per request, and this
+ * is what applies when none does. A configured value outside the domain is
+ * refused at startup rather than substituted: substituting is the silent
+ * shortening the domain exists to forbid, and an operator who set a number has
+ * to learn it was not the one in force.
  */
-export const REAP_GRACE_MS = clampedGrace(process.env.BG_SHELL_REAP_GRACE_MS);
-export const MIN_REAP_GRACE_MS = 250;
-export const MAX_REAP_GRACE_MS = 60_000;
+export const REAP_GRACE_MS = configuredGrace(process.env.BG_SHELL_REAP_GRACE_MS);
 
-function clampedGrace(raw: string | undefined): number {
+function configuredGrace(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_REAP_GRACE_MS;
   const value = Number(raw);
-  return Number.isInteger(value) && value >= 250 && value <= 60_000 ? value : 2_000;
+  if (!isReapGrace(value)) {
+    throw new Error(
+      `BG_SHELL_REAP_GRACE_MS=${raw} is outside the accepted range `
+      + `[${MIN_REAP_GRACE_MS}, ${MAX_REAP_GRACE_MS}] of whole milliseconds`,
+    );
+  }
+  return value;
 }
 
 export type BgShellKind = Extract<ManagedShellKind, "background" | "monitor">;
@@ -266,6 +282,8 @@ export const UNKNOWN_SHELL_MESSAGE = "shell not found";
 /** What a verb resolved the caller's id to: a live entry, a record, or neither. */
 export interface ShellResolution {
   cls: ShellClass;
+  /** What the classifier actually produced, before the caller-visible collapse. */
+  operatorClass?: ShellClass;
   collectorLive: boolean;
   shell?: BgShell;
   status?: ShellRecordStatus;
@@ -276,6 +294,11 @@ export interface ShellResolution {
 const UNKNOWN_RESOLUTION: ShellResolution = {
   cls: "unknown", collectorLive: false, outputAvailable: false,
 };
+
+/** The same absence, carrying which one it was for the operator surface. */
+function absent(owner: string, run: string, id: string): ShellResolution {
+  return { ...UNKNOWN_RESOLUTION, operatorClass: absenceClass(owner, recordRun(run), id) };
+}
 
 /**
  * Resolve one id to a class, from the durable record first and the registry
@@ -290,7 +313,7 @@ const UNKNOWN_RESOLUTION: ShellResolution = {
 export function resolveShell(owner: string, run: string, id: string): ShellResolution {
   const shell = lookup(owner, run, id);
   if (!filesRecords()) {
-    if (!shell) return UNKNOWN_RESOLUTION;
+    if (!shell) return absent(owner, run, id);
     return {
       cls: shell.status === "running" ? "running" : "finished",
       collectorLive: false,
@@ -304,9 +327,10 @@ export function resolveShell(owner: string, run: string, id: string): ShellResol
   const verdict = shellVerdict(owner, recordRun(run), id, (record) => (
     shells.get(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id))?.shell.status === "running"
   ));
-  if (!verdict) return UNKNOWN_RESOLUTION;
+  if (!verdict) return absent(owner, run, id);
   return {
     cls: callerVisibleClass(verdict.cls),
+    operatorClass: verdict.cls,
     collectorLive: verdict.collectorLive,
     shell,
     status: verdict.record.status,
@@ -491,23 +515,8 @@ export function listRunningShells(owner: string): string[] {
   return runningShells().filter((e) => e.owner === owner).map((e) => e.shell.id);
 }
 
-/** What one addressed shell actually reached, once the escalation completed. */
-export type ReapOutcome = "stopped" | "escalated" | "surviving";
-
-export interface ReapedShell {
-  shell_id: string;
-  owner_scope: string;
-  run_identity: string;
-  outcome: ReapOutcome;
-  signalled_at: string;
-}
-
-export interface ReapReport {
-  stopped: number;
-  escalated: number;
-  surviving: number;
-  shells: ReapedShell[];
-}
+export type { ReapOutcome, ReapReport, ReapedShell };
+export { MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS };
 
 /**
  * SIGTERM a set of shells, wait out one shared grace window, SIGKILL what is
@@ -535,23 +544,26 @@ async function terminateShells(
 
   await sleepUnref(graceMs);
 
+  // The leader's exit status is not the group's liveness: a descendant that
+  // stayed in the group outlives it, and reading the leader alone reports the
+  // work gone while it is still holding the sandbox's CPU.
   const escalated: BgEntry[] = [];
   for (const entry of running) {
-    if (entry.shell.status === "running") {
+    if (processGroupAlive(entry.shell)) {
       terminateManagedProcess(entry.shell, "SIGKILL");
       logShellEvent(`shell.background.${reason}_kill`, entry.shell);
       escalated.push(entry);
     }
   }
-  // The escalated signal is not the same fact as the process being gone, and
-  // reporting it as one is how a reap came to answer `stopped` for a shell that
+  // The escalated signal is not the same fact as the group being gone, and
+  // reporting it as one is how a reap came to answer `stopped` over work that
   // ignored SIGKILL. Read again after a short settle, and say `surviving` where
   // termination is still not established.
   if (escalated.length > 0) await sleepUnref(Math.min(graceMs, 1_000));
 
   for (const entry of running) {
     const wasEscalated = escalated.includes(entry);
-    const outcome: ReapOutcome = entry.shell.status === "running"
+    const outcome: ReapOutcome = processGroupAlive(entry.shell)
       ? "surviving"
       : wasEscalated ? "escalated" : "stopped";
     report[outcome] += 1;
@@ -649,13 +661,75 @@ export function runningShellCount(owner: string): number | null {
  * A run that started nothing is not an error -- most runs never spawn a shell --
  * so this reports zero rather than refusing.
  */
-export async function shutdownRunShells(run: string, graceMs = REAP_GRACE_MS): Promise<ReapReport> {
+export async function shutdownRunShells(
+  owner: string, run: string, graceMs = REAP_GRACE_MS,
+): Promise<ReapReport> {
   // NO_RUN would otherwise match every shell spawned without a run header, which
-  // is precisely the set nothing is entitled to reap.
-  if (!run) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
-  return terminateShells(
-    runningShells().filter((e) => e.run === run),
-    graceMs,
-    "run_end",
-  );
+  // is precisely the set nothing is entitled to reap. The owner is required for
+  // the same reason: two owners may each hold a run of this id, and the
+  // credential proved one pair, not one half of it.
+  if (!run || !owner) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
+  return terminateShells(addressedByReap(owner, run), graceMs, "run_end");
+}
+
+/**
+ * Every shell of this pair a reap must address.
+ *
+ * The in-process registry alone cannot answer it: background children are
+ * detached so they survive the request, and they survive the process too, but
+ * the map that knew them died with it -- so after a restart a reap over live
+ * work reports an empty set and the work runs on unreachable. The durable
+ * records name what the map has forgotten, and a record whose process is still
+ * in the table is re-attached to a signalable entry here.
+ */
+function addressedByReap(owner: string, run: string): BgEntry[] {
+  const tracked = runningShells().filter((e) => e.owner === owner && e.run === run);
+  if (!filesRecords()) return tracked;
+
+  const seen = new Set(tracked.map((e) => e.shell.id));
+  const recovered: BgEntry[] = [];
+  let records: ShellRecord[];
+  try {
+    records = listRecordsForOwner(owner);
+  } catch {
+    // Unreadable is not empty. The tracked set is still addressed; what cannot
+    // be read is reported by the surviving count rather than silently dropped.
+    return tracked;
+  }
+  for (const record of records) {
+    if ((record.run_identity ?? NO_RUN) !== run || seen.has(record.shell_id)) continue;
+    if (record.status || !record.process_identity) continue;
+    if (processStartToken(record.process_identity.pid) !== record.process_identity.startToken) continue;
+    recovered.push({ owner, run, shell: untrackedShell(record) });
+  }
+  return [...tracked, ...recovered];
+}
+
+/**
+ * A signalable stand-in for a shell this process never started.
+ *
+ * Carries the identity and nothing else: there are no buffers to read and no
+ * exit event to await, which is exactly why its outcome is read from the
+ * process group rather than from a status field.
+ */
+function untrackedShell(record: ShellRecord): BgShell {
+  return {
+    id: record.shell_id,
+    kind: record.kind,
+    command: "",
+    pid: record.process_identity!.pid,
+    process: { pid: record.process_identity!.pid } as BgShell["process"],
+    status: "running",
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    stdoutBuf: [], stderrBuf: [],
+    stdoutBytes: 0, stderrBytes: 0,
+    stdoutReadOffset: 0, stderrReadOffset: 0,
+    stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+    truncated: false,
+    startedAt: Date.parse(record.spawned_at ?? record.claimed_at) || Date.now(),
+    lastOutputAt: Date.now(),
+    endedAt: null,
+  };
 }

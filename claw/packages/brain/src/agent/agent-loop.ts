@@ -857,14 +857,17 @@ class AgentLoopRunner {
    */
   private parkKeyFor(site: "approval" | "background_command"): string | undefined {
     const key = this.opts.parkKey;
+    // An unset depth is a top-level run, not a sub-agent: reading it as one
+    // silences the signal on exactly the loops that own their slot.
+    const ownsSlot = (this.opts.depth ?? 0) === 0;
     if (!key) {
-      if (this.opts.depth === 0) {
+      if (ownsSlot) {
         metrics.onParkKeyUnusable(site, "absent");
         logger.warn({ site, sessionId: this.sessionId }, "park.key_unavailable");
       }
       return undefined;
     }
-    if (this.opts.depth === 0 && !isTrackedRun(key)) {
+    if (ownsSlot && !isTrackedRun(key)) {
       metrics.onParkKeyUnusable(site, "untracked");
       logger.warn({ site, sessionId: this.sessionId, parkKey: key }, "park.key_untracked");
     }

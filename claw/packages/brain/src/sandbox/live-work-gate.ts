@@ -4,18 +4,12 @@
 /**
  * How much work a container still holds, read before anything destroys it.
  *
- * The old rule treated a restart refusal as licence to rebuild, asking nothing
- * about what was running: a fresh Hands has an empty registry, and empty read as
- * "destroying this is harmless" -- so a refusal on a pod with a training run in
- * it took the training run with it.
- *
- * The count comes from the durable records, over the same container-exec channel
- * the probe and the restart already use. Not an HTTP call to Hands: this runs on
- * exactly the path where Hands is what is down, so asking it would be circular.
- * And a record count is only as good as the population it covers, so the read
- * establishes first that the sandbox files records at all -- a process minting no
- * epoch marker is pre-scheme, its shells registry-only and invisible to any
- * count. Neither that nor an unreadable marker is a count of zero.
+ * Over the container-exec channel rather than by asking Hands: this runs on the
+ * path where Hands is what is down, so an HTTP call would be circular. A count
+ * is only as good as the population it covers, so the read establishes first
+ * that the sandbox files records at all -- a process minting no epoch marker
+ * keeps its shells in a registry no count can see. Neither that, nor an
+ * unreadable marker, nor a partial read is a count of zero.
  */
 
 import {
@@ -42,13 +36,11 @@ export interface LiveWorkAnswer {
 const EXEC_TIMEOUT = "20s";
 
 /**
- * Everything the classifier needs, gathered by one command inside the sandbox.
+ * Everything the classifier needs, in one command.
  *
- * One command rather than several: a container-exec round trip is the expensive
- * part, and a records read split across calls could see the subtree in two
- * different states. `HANDS_STATE_DIR` is where the records live; the marker sits
- * beside them at the root, so a missing marker and an unreadable subtree are
- * distinguishable in the output rather than collapsing into one absence.
+ * One rather than several: a read split across calls can see the subtree in two
+ * states. A missing marker and an unreadable subtree stay distinguishable in
+ * the output rather than collapsing into one absence.
  */
 function gatherCommand(stateDir: string): string {
   return `set -e; `
@@ -75,14 +67,18 @@ function parseGathered(stdout: string): GatheredState {
       const value = line.slice(8).trim();
       state.subtree = value === "ok" || value === "empty" || value === "missing" ? value : null;
     } else if (line.startsWith("RECORD ")) {
-      // A record that will not parse is not a record that is absent: it may be
-      // the live shell, and dropping it lets the count come back a determinate
-      // zero -- the empty-state inference this whole read exists to refuse.
+      // Dropping an unreadable record lets the count come back a determinate
+      // zero, which is the empty-state inference this read exists to refuse.
+      let parsed: unknown;
       try {
-        state.records.push(JSON.parse(line.slice(7)) as ShellRecord);
+        parsed = JSON.parse(line.slice(7));
       } catch {
         throw new Error("a shell record could not be read");
       }
+      // Parseable is not usable: a value that is not a record classifies from
+      // fields it does not have.
+      if (!isShellRecord(parsed)) throw new Error("a shell record is not a record");
+      state.records.push(parsed);
     } else if (line.startsWith("PROCS ")) {
       for (const entry of line.slice(6).trim().split(/\s+/)) {
         const pid = Number(entry);
@@ -93,19 +89,25 @@ function parseGathered(stdout: string): GatheredState {
   return state;
 }
 
+function isShellRecord(value: unknown): value is ShellRecord {
+  const r = value as Partial<ShellRecord> | null;
+  return !!r && typeof r === "object" && !Array.isArray(r)
+    && typeof r.owner_scope === "string"
+    && (typeof r.run_identity === "string" || r.run_identity === null)
+    && typeof r.shell_id === "string"
+    && typeof r.hands_epoch === "string";
+}
+
 /**
- * How fresh a record's epoch is, from what one exec read saw.
+ * How fresh a record's epoch is.
  *
  * Equality with the marker proves only that no newer Hands has started -- a
  * crashed one leaves its marker exactly as it wrote it -- so currency turns on
- * the marker's bearer still being in the process table. A bearer whose liveness
- * the read could not establish is neither current nor stale: reading it as stale
- * would convert unresolved live work into a class that unblocks a destroy.
+ * the bearer still being in the process table.
  */
 function freshness(record: ShellRecord, state: GatheredState): EpochFreshness {
   if (!state.marker) return "indeterminate";
   if (state.marker.epoch !== record.hands_epoch) return "stale";
-  if (state.livePids.size === 0) return "indeterminate";
   return bearerAlive(state.marker.bearer, state) ? "current" : "stale";
 }
 
@@ -114,11 +116,9 @@ function bearerAlive(bearer: ProcessIdentity | undefined, state: GatheredState):
 }
 
 /**
- * What one record classifies as over this channel.
- *
  * The in-process registry is not exec-visible, so a row this coarser view cannot
- * separate reads `unverified_running` rather than `inconsistent` -- no row moves
- * from blocking to non-blocking, which is the direction that matters.
+ * separate reads `unverified_running`: no row moves from blocking to
+ * non-blocking, which is the direction that matters.
  */
 function classifyOverExec(record: ShellRecord, state: GatheredState): ShellClass {
   return classifyShellRecord({
@@ -130,11 +130,11 @@ function classifyOverExec(record: ShellRecord, state: GatheredState): ShellClass
 }
 
 /**
- * The record-derived answer about one container, for a path about to destroy,
- * rebuild, evict, replace, or relaunch in it.
+ * The record-derived answer for a path about to destroy, rebuild, evict, replace
+ * or relaunch in this container.
  *
  * `unknown` and `protected` differ in what an operator is told, never in what
- * the caller may do: both forbid every destructive act. Only `clear` permits one.
+ * the caller may do: both forbid every destructive act, only `clear` permits one.
  */
 export async function countLiveWork(
   inst: SandboxInstance,
@@ -144,6 +144,11 @@ export async function countLiveWork(
   let stdout: string;
   try {
     const result = await execInSandbox(inst, gatherCommand(stateDir), EXEC_TIMEOUT, signal);
+    // A non-zero exit is a read that did not finish, over an unknown fraction
+    // of the subtree: nothing in its stdout says which records are missing.
+    if (result.exitCode !== 0) {
+      return { verdict: "unknown", classes: {}, reason: `exec_exit_${result.exitCode}` };
+    }
     stdout = result.stdout ?? "";
   } catch (e) {
     return { verdict: "unknown", classes: {}, reason: `exec_unanswered: ${(e as Error).message}` };
@@ -156,15 +161,18 @@ export async function countLiveWork(
     return { verdict: "unknown", classes: {}, reason: (e as Error).message };
   }
 
-  // A sandbox that files no records has shells this count cannot see, and one
-  // whose marker could not be read leaves the same question unanswered. Neither
-  // is zero: that is the empty-state inference a destroy must never act on.
+  // A sandbox filing no records has shells this cannot see; an unreadable
+  // marker leaves the same question unanswered. Neither is zero.
   if (!state.marker || state.subtree !== "ok") {
     return {
       verdict: "unknown",
       classes: {},
       reason: !state.marker ? "no_epoch_marker" : `subtree_${state.subtree ?? "unreadable"}`,
     };
+  }
+  // No process table is no evidence about any record in it.
+  if (state.livePids.size === 0) {
+    return { verdict: "unknown", classes: {}, reason: "process_table_unreadable" };
   }
 
   const classes: Partial<Record<ShellClass, number>> = {};

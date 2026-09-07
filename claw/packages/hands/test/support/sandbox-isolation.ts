@@ -4,11 +4,11 @@
 /**
  * A sandbox that can place a model-issued process under its own identity.
  *
- * Every spawn is refused where the sandbox cannot, which is the whole point of
- * the boundary and also the state a bare test process is in: no `hidepid` on
- * `/proc`, no configured identity range. So a fixture whose subject is
- * something else -- ownership, counts, waits -- says here that its sandbox
- * provides the boundary, exactly as a real one declares it.
+ * A bare test process declares no identity range, which is the disclosed state
+ * in which spawns proceed under Hands' own identity and say so. A fixture whose
+ * subject is something else -- ownership, counts, waits -- declares the boundary
+ * here instead, exactly as a real sandbox does, so what it asserts is asserted
+ * against the enforced path rather than the fallback.
  *
  * The range is real where the test process can allocate from one, so the
  * identity separation those tests assert is the genuine article rather than a
@@ -27,7 +27,7 @@ export function isolatingSandbox(): void {
   });
 }
 
-/** A sandbox that can provide neither half, so every spawn is refused. */
+/** A sandbox declaring no baseline: spawns proceed and report themselves. */
 export function unisolatedSandbox(): void {
   bindSandboxIsolation({
     identityRange: () => null,

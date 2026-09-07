@@ -28,6 +28,8 @@ export type ShellClass =
   | "finished"
   | "lost"
   | "inconsistent"
+  | "wrong_scope"
+  | "unknown_id"
   | "unknown";
 
 export type EpochFreshness = "current" | "stale" | "indeterminate";
@@ -78,7 +80,17 @@ export function classifyShellRecord(evidence: ShellEvidence): ShellClass {
   return "inconsistent";
 }
 
-/** What a caller is told. `inconsistent` is an operator fact, not a caller's. */
+/**
+ * Operator classes: produced for telemetry and for the gates, never returned.
+ *
+ * `wrong_scope` and `unknown_id` separate an id that exists under a scope the
+ * caller may not address from one that exists nowhere -- which an operator
+ * needs and a caller must not have, since differencing the two is exactly the
+ * existence disclosure the shared refusal exists to close.
+ */
+const OPERATOR_ONLY: readonly ShellClass[] = ["inconsistent", "wrong_scope", "unknown_id"];
+
+/** What a caller is told. Everything above collapses into one answer. */
 export function callerVisibleClass(cls: ShellClass): ShellClass {
-  return cls === "inconsistent" ? "unknown" : cls;
+  return OPERATOR_ONLY.includes(cls) ? "unknown" : cls;
 }

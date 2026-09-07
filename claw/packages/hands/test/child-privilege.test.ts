@@ -153,3 +153,42 @@ test("the start log names no command text", async () => {
   assert.ok(logged.length > 0, "the fixture produced no log to scan");
   assert.doesNotMatch(logged.join("\n"), /planted-token-9x8y7z/);
 });
+
+test("an identity assignment survives a restart of this process", async () => {
+  // Process-local allocation restarts the counter, so a live child's identity
+  // is handed to a different pair while its record still says otherwise. The
+  // table lives beside the records for exactly that reason.
+  privilege.bindSandboxIsolation({
+    identityRange: () => ({ min: 65500, max: 65533 }),
+    partitionsProcessView: () => true,
+  });
+  const first = privilege.resolveChildPrivilege("owner-a", "run-a").uid;
+  const second = privilege.resolveChildPrivilege("owner-b", "run-b").uid;
+
+  // Re-binding is this module's restart: every in-memory table is dropped.
+  privilege.bindSandboxIsolation({
+    identityRange: () => ({ min: 65500, max: 65533 }),
+    partitionsProcessView: () => true,
+  });
+  assert.equal(privilege.resolveChildPrivilege("owner-a", "run-a").uid, first,
+    "the pair's identity was reassigned across a restart");
+  assert.equal(privilege.resolveChildPrivilege("owner-b", "run-b").uid, second);
+  assert.notEqual(
+    privilege.resolveChildPrivilege("owner-c", "run-c").uid, first,
+    "a new pair took a live pair's identity",
+  );
+});
+
+test("a declared range this process cannot assume from refuses, rather than falling back", () => {
+  // Distinct from declaring nothing: a deployment that asked for the boundary
+  // and cannot have it must not be served under Hands' own identity, which is
+  // the silent unenforcement the declaration rules out.
+  privilege.bindSandboxIsolation({
+    identityRange: () => { throw new privilege.ChildPrivilegeUnavailable("not privileged enough"); },
+    partitionsProcessView: () => true,
+  });
+  assert.throws(
+    () => bg.spawnBackground("sess", "run", "sleep 60", "unprivileged"),
+    privilege.ChildPrivilegeUnavailable,
+  );
+});

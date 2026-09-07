@@ -29,7 +29,7 @@ process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "claw-retention-"));
 const records = await import("../src/runtime/shell-records.js");
 const liveness = await import("../src/runtime/shell-liveness.js");
 const bg = await import("../src/tools/shell/bg-manager.js");
-const { withCaller, DEADLINE_HEADER, normalizeDeadline } =
+const { withCaller, DEADLINE_HEADER, normalizeDeadline, MalformedDeadline } =
   await import("../src/runtime/owner-context.js");
 const { isolatingSandbox, releaseSandboxIsolation } =
   await import("./support/sandbox-isolation.js");
@@ -106,19 +106,25 @@ test("siblings share the expiry their run's deadline fixes, each from its own en
     "the early finisher is not aged out by its sibling ending");
 });
 
-test("a start with no deadline, or a malformed one, retains for the sandbox's life", async () => {
-  // The fallback is no expiry, never a substituted constant: a constant would
-  // age out a tombstone under a run still reading it.
-  assert.equal(normalizeDeadline("not-a-date"), undefined);
+test("a start with no deadline retains for the sandbox's life", async () => {
+  // The fallback for an absent deadline is no expiry, never a substituted
+  // constant: a constant would age out a tombstone under a run still reading it.
   assert.equal(normalizeDeadline(undefined), undefined);
+  assert.equal(normalizeDeadline(""), undefined);
 
   startUnder(undefined, "no-deadline");
-  startUnder("not-a-date", "bad-deadline");
   await settle(200);
 
   simulated += 24 * 365 * HOUR;
-  for (const id of ["no-deadline", "bad-deadline"]) {
-    assert.equal(bg.pollOutput(OWNER, RUN, id).structured.shell_class, "finished", id);
+  assert.equal(bg.pollOutput(OWNER, RUN, "no-deadline").structured.shell_class, "finished");
+});
+
+test("a deadline that was sent and cannot be read is refused, not read as absent", () => {
+  // Absent means the run states no bound, which retains forever. Reading a
+  // malformed value as that substitutes the opposite policy on a run that did
+  // state one, and nothing downstream could tell.
+  for (const raw of ["not-a-date", "2026-13-45T99:99:99Z", "   x   ", 12345, {}]) {
+    assert.throws(() => normalizeDeadline(raw), MalformedDeadline, JSON.stringify(raw));
   }
 });
 

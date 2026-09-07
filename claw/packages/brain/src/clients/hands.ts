@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { mintScopeCredential } from "@claw/utils";
+import type { ReapReport, ReapedShell, ReclaimCause } from "@claw/protocol";
 import { createHmac } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -313,38 +314,26 @@ export class HandsLivenessIndeterminate extends Error {}
 export const HANDS_LIVENESS_INDETERMINATE = "shell_liveness_indeterminate";
 
 /** What one dispatch answers with, whichever route asked. */
-/**
- * Why background work was ended. A closed vocabulary: a reclaim nobody can
- * attribute is indistinguishable afterwards from work that ended on its own.
- */
-export type ReclaimCause =
-  | "dag_node_terminal"
-  | "run_cancelled"
-  | "operator_kill_shell"
-  | "sandbox_idle_reclaim"
-  | "sandbox_absolute_deadline"
-  | "sandbox_replaced"
-  | "retry_pending_unregistered"
-  | "session_cleanup";
-
-export interface ReapedShell {
-  shell_id: string;
-  owner_scope: string;
-  run_identity: string;
-  outcome: "stopped" | "escalated" | "surviving";
-  signalled_at: string;
-}
-
-/** Disjoint tallies of one outcome per addressed shell, never signal counts. */
-export interface ReapReport {
-  stopped: number;
-  escalated: number;
-  surviving: number;
-  shells: ReapedShell[];
-}
+export type { ReclaimCause, ReapReport, ReapedShell };
 
 /** Transport and scheduling slack on top of the grace the caller asked for. */
 const REAP_TRANSPORT_OVERHEAD_MS = 15_000;
+
+function assertReapReport(body: unknown): ReapReport {
+  const r = body as Partial<ReapReport> | null;
+  const counts = [r?.stopped, r?.escalated, r?.surviving];
+  if (!r || !Array.isArray(r.shells) || counts.some((n) => !Number.isInteger(n) || (n as number) < 0)) {
+    throw new Error("hands_reap_failed: the sandbox's answer is not a reap report");
+  }
+  const [stopped, escalated, surviving] = counts as number[];
+  if (stopped + escalated + surviving !== r.shells.length) {
+    throw new Error(
+      `hands_reap_failed: counts ${stopped}/${escalated}/${surviving} do not partition `
+      + `${r.shells.length} addressed shells`,
+    );
+  }
+  return { stopped, escalated, surviving, shells: r.shells };
+}
 
 /** What a classification read answered, or the safe reading when it could not. */
 export interface ShellClassProbe {
@@ -1015,13 +1004,10 @@ export class HandsClient {
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
     if (!resp.ok) throw new Error(`hands_reap_failed: status=${resp.status}`);
-    const body = await resp.json() as Partial<ReapReport>;
-    return {
-      stopped: body?.stopped ?? 0,
-      escalated: body?.escalated ?? 0,
-      surviving: body?.surviving ?? 0,
-      shells: body?.shells ?? [],
-    };
+    // Never defaulted to zero. A malformed or truncated answer is a reap whose
+    // outcome nobody knows, and reading it as "nothing survived" is the same
+    // untruth the counts were reshaped to remove.
+    return assertReapReport(await resp.json().catch(() => null));
   }
 
   async listTools(): Promise<string[]> {

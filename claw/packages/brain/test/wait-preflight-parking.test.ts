@@ -115,12 +115,77 @@ async function runWait(
 }
 
 test("a wait on a running shell parks, and classifies before it routes", async () => {
-  const { router, classified, routed } = classifyingRouter("running");
-  const parkEvents = await runWait(router);
+  // Order matters as much as the fact: the slot is handed back before the call
+  // is entered, so a decision taken from the call's own answer is too late.
+  const order: string[] = [];
+  const router = {
+    classifyShell: async () => { order.push("classify"); return { shellClass: "running", collectorLive: false }; },
+    route: async () => { order.push("route"); return "waited"; },
+    setHands: () => {},
+  } as unknown as ToolRouter;
 
+  const parkEvents: string[] = [];
+  setParkHooks({
+    park: () => { order.push("park"); parkEvents.push("park"); return true; },
+    unpark: async () => { order.push("unpark"); parkEvents.push("unpark"); },
+  });
+  const opts: LoopOptions = {
+    model: "test-model", apiUrl: "http://localhost:0", apiKey: "test-key", maxTurns: 4,
+    router, onEvent: async () => {}, sessionId: "sess-1", userId: "user-1",
+    llmSession: scripted([
+      { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
+      { content: [textBlock("ok")], stopReason: "end_turn" },
+    ]),
+    runKey: "addressing-scope", parkKey: "gate-lock-key",
+  };
+  beginRun("gate-lock-key");
+  try {
+    await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
+  } finally {
+    endRun("gate-lock-key");
+    setParkHooks(null);
+  }
+
+  assert.deepEqual(order, ["classify", "park", "route", "unpark"],
+    "the class decides the park, and both happen before the routed call");
   assert.deepEqual(parkEvents, ["park", "unpark"]);
-  assert.deepEqual(classified, ["bg-1"], "the class is read once, for the named shell");
-  assert.deepEqual(routed, ["wait"], "and the wait is still one routed call");
+});
+
+test("the execution slot is observably free while the wait is parked", async () => {
+  // The whole purpose: a second run is admitted and executes while the first
+  // sits on its wait. A fixture that only counts park calls cannot see whether
+  // the slot actually went back.
+  let held = 1;
+  const observed: number[] = [];
+  const router = {
+    classifyShell: async () => ({ shellClass: "running", collectorLive: false }),
+    route: async () => { observed.push(held); return "waited"; },
+    setHands: () => {},
+  } as unknown as ToolRouter;
+
+  setParkHooks({
+    park: () => { held -= 1; return true; },
+    unpark: async (had: boolean) => { if (had) held += 1; },
+  });
+  const opts: LoopOptions = {
+    model: "test-model", apiUrl: "http://localhost:0", apiKey: "test-key", maxTurns: 4,
+    router, onEvent: async () => {}, sessionId: "sess-1", userId: "user-1",
+    llmSession: scripted([
+      { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
+      { content: [textBlock("ok")], stopReason: "end_turn" },
+    ]),
+    runKey: "addressing-scope", parkKey: "gate-lock-key",
+  };
+  beginRun("gate-lock-key");
+  try {
+    await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
+  } finally {
+    endRun("gate-lock-key");
+    setParkHooks(null);
+  }
+
+  assert.deepEqual(observed, [0], "the slot was still held while the wait was in progress");
+  assert.equal(held, 1, "and was reacquired exactly once on unpark");
 });
 
 test("every class that cannot block returns without touching the slot", async () => {
@@ -132,6 +197,48 @@ test("every class that cannot block returns without touching the slot", async ()
     assert.deepEqual(parkEvents, [], `${cls} released the execution slot`);
     assert.deepEqual(routed, ["wait"], `${cls} did not reach the tool`);
   }
+});
+
+test("a site that cannot park under a usable key says so rather than skipping", async () => {
+  // The defect was silent: no park, no log, no counter, and the slot held for
+  // the whole wait. The ledger helper cannot report it -- a missing entry is the
+  // legitimate sub-agent case there -- so the signal belongs at the site.
+  const { registry } = await import("../src/infra/metrics.js");
+  const counted = async (): Promise<number> => {
+    const m = (await registry.getMetricsAsJSON())
+      .find((x) => x.name === "claw_brain_park_key_unusable_total") as
+        { values?: Array<{ labels: Record<string, string>; value: number }> };
+    return (m?.values ?? []).reduce((n, v) => n + v.value, 0);
+  };
+
+  const before = await counted();
+  const { router } = classifyingRouter("running");
+  const parkEvents: string[] = [];
+  setParkHooks({
+    park: () => { parkEvents.push("park"); return true; },
+    unpark: async () => { parkEvents.push("unpark"); },
+  });
+  const opts: LoopOptions = {
+    model: "test-model", apiUrl: "http://localhost:0", apiKey: "test-key", maxTurns: 4,
+    router, onEvent: async () => {}, sessionId: "sess-1", userId: "user-1",
+    llmSession: scripted([
+      { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
+      { content: [textBlock("ok")], stopReason: "end_turn" },
+    ]),
+    runKey: "addressing-scope",
+    // Well-formed, and simply not the one the ledger was begun under.
+    parkKey: "not-the-ledgers-key",
+  };
+  beginRun("gate-lock-key");
+  try {
+    await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
+  } finally {
+    endRun("gate-lock-key");
+    setParkHooks(null);
+  }
+
+  assert.deepEqual(parkEvents, [], "the wrong key parks nothing, as the helper's contract says");
+  assert.ok(await counted() > before, "and the site that could not park recorded it");
 });
 
 test("ended_unreaped splits on the collector-live qualifier, not on the class", async () => {
