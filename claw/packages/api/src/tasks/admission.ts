@@ -196,8 +196,8 @@ export async function hardLimitAfterInsert(
   ask: AdmissionAsk,
   taskId?: string,
   client?: StatementRunner,
+  limits: AdmitLimits = envAdmitLimits(),
 ): Promise<AdmissionRejectReason | null> {
-  const limits = envAdmitLimits();
   if (limits.hardRuns <= 0 && limits.hardSandboxes <= 0 && limits.hardGpuNodes <= 0) {
     return null;
   }
@@ -299,10 +299,11 @@ export async function loadUsageAhead(
 export async function decideAdmission(
   ask: AdmissionAsk,
   client?: StatementRunner,
+  limits: AdmitLimits = envAdmitLimits(),
 ): Promise<AdmissionDecision> {
   let decision: AdmissionDecision;
   try {
-    decision = await decideAdmissionUncounted(ask, client);
+    decision = await decideAdmissionUncounted(ask, client, limits);
   } catch (err) {
     metrics.onAdmissionDecision(ask.origin, "error");
     throw err;
@@ -316,9 +317,9 @@ export async function decideAdmission(
 
 async function decideAdmissionUncounted(
   ask: AdmissionAsk,
-  client?: StatementRunner,
+  client: StatementRunner | undefined,
+  limits: AdmitLimits,
 ): Promise<AdmissionDecision> {
-  const limits = envAdmitLimits();
   const treeReject = treeCapReason(ask, limits);
   if (treeReject) return { kind: "reject", reason: treeReject };
 

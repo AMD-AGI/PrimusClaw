@@ -18,7 +18,7 @@ import {
 
 import {
   decideAdmission, envAdmitLimits, hardLimitAfterInsert, sessionTreeShape,
-  withOwnedAdmissionLock, type AdmissionAsk,
+  withOwnedAdmissionLock, type AdmissionAsk, type AdmitLimits,
 } from "./admission.js";
 import {
   clearDispatchReconcile, discardChatRunDispatch, failChatRunDispatch, openChatRun,
@@ -59,6 +59,8 @@ export interface HandOffInput {
   failRun?: typeof failChatRunDispatch;
   admit?: typeof decideAdmission;
   hardAfterInsert?: typeof hardLimitAfterInsert;
+  /** The ceilings to decide against, when they are not this process's own. */
+  limits?: AdmitLimits;
   discardRun?: typeof discardChatRunDispatch;
 }
 
@@ -197,7 +199,7 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   // commit order must be the same order, or two creates that each cleared the
   // pre-insert check are both admitted against one free slot.
   const opened = await withOwnedAdmissionLock(async (client) => {
-    const admission = await (input.admit ?? decideAdmission)(ask, client);
+    const admission = await (input.admit ?? decideAdmission)(ask, client, input.limits);
     if (admission.kind === "reject") return { admission } as const;
     return {
       admission,
@@ -223,7 +225,9 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   // publish below already guarded itself this way; this call did not.
   let hard: string | null;
   try {
-    hard = await (input.hardAfterInsert ?? hardLimitAfterInsert)(ask, run.taskId);
+    hard = await (input.hardAfterInsert ?? hardLimitAfterInsert)(
+      ask, run.taskId, undefined, input.limits,
+    );
   } catch (err) {
     const verdict = await (input.failRun ?? failChatRunDispatch)(
       run.taskId, String((err as Error)?.message ?? err),
