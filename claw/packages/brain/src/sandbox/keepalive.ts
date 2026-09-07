@@ -3,7 +3,7 @@
 
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
-import { applyRunEndedIdleFields } from "@claw/protocol";
+import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -427,19 +427,20 @@ export function registeredSandboxCount(sessionId: string): number {
  * can still reuse the pod via ensureHands within SANDBOX_IDLE_REUSE_MS
  * (collectTargets above skips pinging it and expires it after the window).
  *
- * Fire-and-forget. An entry that cannot be parsed is dropped; a KV error is
- * not, because the entry may be fine and it is the only record the idle sweeper
- * can find the session's GPU clusters through.
+ * The returned promise never rejects: a KV error resolves as `failed` rather
+ * than being thrown at a caller that does not await it. An entry that cannot
+ * be parsed is preserved, because it may be fine and it is the only record the
+ * idle sweeper can find the session's GPU clusters through.
  */
 export function markHandsIdle(
   kv: KV,
   sessionId: string,
   known: SandboxEntry | string,
-): void {
+): Promise<RunEndedParkResult> {
   const kvKey = `hands.${sessionId}`;
-  kv.get(kvKey)
-    .then(async (entry) => {
-      if (!entry) return; // no handle to keep; a fresh task will recreate one.
+  return kv.get(kvKey)
+    .then(async (entry): Promise<RunEndedParkResult> => {
+      if (!entry) return { outcome: "gone" };
       let info: HandsKvEntry;
       try {
         info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
@@ -450,14 +451,14 @@ export function markHandsIdle(
           { err: (err as Error)?.message || String(err), sessionId },
           "hands.mark_idle_unreadable",
         );
-        return;
+        return { outcome: "skipped", reason: "unreadable" };
       }
       // Only keep a READY handle that still points at the workload we ran on.
-      if (info.status !== "ready") return;
+      if (info.status !== "ready") return { outcome: "skipped", reason: "not_ready" };
       const sameTarget = typeof known === "string"
         ? !(known && info.workloadId && info.workloadId !== known)
         : sameRegisteredSandbox(known, info);
-      if (!sameTarget) return;
+      if (!sameTarget) return { outcome: "skipped", reason: "other_sandbox" };
 
       // The handle is going back into the idle pool, which is the moment its
       // background-work verdict starts being acted on -- so nothing concluded
@@ -474,14 +475,9 @@ export function markHandsIdle(
         namespace: info.namespace,
       }));
 
-      // The fields themselves live in @claw/protocol, because the API's reapers
-      // have to open an idle period on a handle whose worker died before it
-      // could reach this line, and two writers of one shape is how the sweep
-      // comes to disagree with itself. What each field is for is documented
-      // there; the short of it is that a new idle period gets a name
-      // (`idleEpoch` plus the revision, which two periods cannot share) and
-      // every verdict from the previous one is dropped rather than republished
-      // to the fleet at the moment the sweep starts acting on it.
+      // Shared with the API's reapers, which open an idle period on a handle
+      // whose worker died before it could reach this line; two writers of this
+      // shape is how the sweep comes to disagree with itself.
       applyRunEndedIdleFields(
         info as unknown as Record<string, unknown>,
         Date.now(),
@@ -494,19 +490,16 @@ export function markHandsIdle(
       // it expire -- so the deleted session's platformKey and workload id would
       // outlive it by 15 minutes.
       await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
+      return { outcome: "parked" };
     })
-    .catch((err) => {
+    .catch((err): RunEndedParkResult => {
       if (isRevisionConflict(err)) {
-        // Deleted or rewritten while we were deciding; whoever did it wins. In
-        // particular, do not fall through to the delete below -- that would
-        // remove an entry somebody else just wrote.
+        // Deleted or rewritten while we were deciding; whoever did it wins.
         logger.info({ sessionId }, "hands.mark_idle_superseded");
-        return;
+        return { outcome: "superseded" };
       }
-      // A transport failure may arrive after the CAS succeeded, and another
-      // writer may already own the key. An unconditional delete here could
-      // erase that sibling, so preserve the latest value.
       logger.warn({ err: err?.message || String(err), sessionId }, "hands.mark_idle_failed");
+      return { outcome: "failed", error: err };
     });
 }
 

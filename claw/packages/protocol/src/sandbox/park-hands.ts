@@ -102,11 +102,8 @@ export async function parkHandsHandle(
 /**
  * What parking a handle whose run has ended managed to do.
  *
- * Separate from `ParkOutcome` rather than a widening of it: this path has two
- * outcomes the deleted-session path cannot reach -- a handle that is already
- * idle, and one that now names a different sandbox -- and both are ordinary,
- * not failures. Widening the shared type would also make every existing
- * exhaustive switch over it wrong.
+ * Separate from `ParkOutcome` rather than a widening of it: widening the shared
+ * type would make every existing exhaustive switch over it wrong.
  */
 export type RunEndedParkOutcome = "parked" | "gone" | "skipped" | "superseded" | "failed";
 
@@ -121,28 +118,15 @@ export interface RunEndedParkResult {
 /**
  * Open a new idle period on a handle, in the one shape the sweep understands.
  *
- * Pulled out of Brain's `markHandsIdle` so the API can write the same thing.
- * The shape *is* the contract -- the idle sweep decides what to reclaim by
- * reading these fields, and the background-work verdict decides whether a
- * sandbox is still working by comparing its own stamps against them, so a
- * second writer that sets `keepalive` and `idleSince` but forgets the rest
- * publishes a verdict from the previous idle period as if it were about this
- * one.
+ * Shared with Brain's `markHandsIdle` because the shape *is* the contract: the
+ * sweep reclaims on `keepalive`/`idleSince`, while the background-work verdict
+ * is matched to a period by `idleEpoch`/`idleRev` -- so a writer that sets the
+ * first pair and forgets the rest republishes the previous period's verdict as
+ * if it were about this one. `idleRev` is the half two periods cannot share:
+ * the bucket takes one write per revision, while a clock reading can repeat.
  *
- *   - `keepalive: false` is what the sweep selects on, and what stops the
- *     fleet pinging a pod no run is using.
- *   - `idleSince` is where the reuse window is measured from.
- *   - `idleEpoch` names the period; a verdict carrying a different one is not
- *     about it. `idleRev` is the half two periods cannot share, since the
- *     bucket takes one write per revision while a clock reading can repeat.
- *   - the `bg*` verdict fields and `workSeenAt` are dropped, because work seen
- *     during the last period says nothing about this one.
- *
- * `token` and `handsUrl` are deliberately left in place -- unlike
- * `parkHandsHandle`, which is for a session that no longer exists. Here the
- * session is alive, the pod may still be reused by its next message, and the
- * background-work probe needs both to ask whether anything is still running
- * in it.
+ * `token` and `handsUrl` stay, unlike in `parkHandsHandle`: the session is
+ * still alive, and its background-work probe needs both.
  */
 export function applyRunEndedIdleFields(
   info: Record<string, unknown>,
@@ -165,29 +149,17 @@ export function applyRunEndedIdleFields(
 /**
  * Park the handle of a session whose last run ended with nobody left to finish it.
  *
- * Brain parks its own handle when a run reaches a terminal state in-process.
- * A run whose worker went away never reaches that code -- the process holding
- * it is gone -- so the handle keeps `keepalive` unset, every replica goes on
- * pinging the pod, the platform's idle GC never fires, and the sandbox lives
- * until the workload's own absolute deadline. This is the other end of that:
- * the reaper that closed the row is the one place that knows no worker is
- * coming back for it.
+ * A run whose worker went away never reaches Brain's in-process `markHandsIdle`,
+ * so the handle keeps `keepalive` set and the fleet pings the pod until the
+ * workload's absolute deadline; the reaper that closed the row is the one place
+ * that knows no worker is coming back for it.
  *
- * Three states are left alone, and each would be a live sandbox lost:
- *
- *   - a handle that is not `ready` belongs to an in-flight `ensureHands`, which
- *     will write its own entry;
- *   - a handle already `keepalive: false` is in the idle pool with a window
- *     running, and re-stamping `idleSince` would extend the life of the pod
- *     this exists to reclaim;
- *   - a handle naming a different workload than the run being closed has been
- *     taken over by a newer sandbox, and parking it would stop the fleet
- *     pinging a pod that is in use.
- *
- * `expectWorkloadId` is compared only when both sides have one, matching the
- * rule Brain's own `markHandsIdle` applies: a caller that cannot name the
- * workload has not learned that the handle points elsewhere, and a handle with
- * no workload id names nothing to disagree with.
+ * Three states are left alone, each of which would otherwise lose a live
+ * sandbox: one not `ready` belongs to an in-flight `ensureHands` that will
+ * write its own entry; one already `keepalive: false` has a reuse window that
+ * re-stamping `idleSince` would extend; one naming a different workload has
+ * been taken over by a newer sandbox. `expectWorkloadId` is compared only when
+ * both sides have one, matching `markHandsIdle`.
  */
 export async function parkHandsAfterRun(
   kv: RevisionedKv,

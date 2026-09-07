@@ -79,7 +79,7 @@ async function runFailing(facts: unknown): Promise<Seen> {
     reapPendingHands: note("reapPendingHands", undefined),
     fetchPlatformFacts: note("fetchPlatformFacts", facts),
     unregisterSandbox: ((..._a: unknown[]) => { seen.order.push("unregisterSandbox"); }) as never,
-    markHandsIdle: ((..._a: unknown[]) => { seen.order.push("markHandsIdle"); }) as never,
+    markHandsIdle: ((..._a: unknown[]) => { seen.order.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     syncWorkspaceToS3: note("syncWorkspaceToS3", {
       uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true,
     }),
@@ -240,7 +240,7 @@ async function runRecovering(after: "succeeds" | "fails" | "rebuild_fails"): Pro
     reapPendingHands: note("reapPendingHands", undefined),
     fetchPlatformFacts: note("fetchPlatformFacts", EVICTED),
     unregisterSandbox: ((..._a: unknown[]) => { seen.order.push("unregisterSandbox"); }) as never,
-    markHandsIdle: ((..._a: unknown[]) => { seen.order.push("markHandsIdle"); }) as never,
+    markHandsIdle: ((..._a: unknown[]) => { seen.order.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     syncWorkspaceToS3: note("syncWorkspaceToS3", {
       uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true,
     }),
