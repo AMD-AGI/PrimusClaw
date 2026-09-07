@@ -157,6 +157,25 @@ export async function readRunRows(
 }
 
 /**
+ * Drop one row whose start positively never reached the sandbox.
+ *
+ * Conditioned on the revision just read: a row rewritten between the read and
+ * this delete belongs to a dispatch that is happening now, and removing it
+ * would strand that one in place of the finished send it was meant to release.
+ *
+ * @returns false where no row was there to release.
+ */
+export async function releaseRow(
+  store: BgRowStore, address: BgHandleAddress,
+): Promise<boolean> {
+  const key = rowKey(address);
+  const entry = await store.read(key);
+  if (!entry) return false;
+  await store.delete(key, entry.revision);
+  return true;
+}
+
+/**
  * Drop a run identity's rows because the run is over.
  *
  * Issued only from paths that mean the run will not be picked up again -- never

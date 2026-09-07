@@ -1983,7 +1983,33 @@ class TaskRunner {
     }).catch(() => { /* a status event must not fail the run */ });
 
     await this.resolveResumeState(this.pendingResumeCkpt, created);
+    await this.reconcileBackgroundStarts();
     return this.hands;
+  }
+
+  /**
+   * Settle the background starts a previous attempt committed to and never
+   * confirmed, before this one issues anything.
+   *
+   * A crash between the durable dispatched write and the transport handoff
+   * leaves a commitment for a request that may never have gone out. Left to the
+   * dispatch path it is closed only if the model happens to re-emit that exact
+   * call; reconciled here it is closed either way, on the sandbox's own evidence
+   * rather than on what the resumed model asks for next.
+   *
+   * A failure is logged, not raised: nothing here is a precondition for running,
+   * and an unsettled row still answers every replay fail-closed.
+   */
+  private async reconcileBackgroundStarts(): Promise<void> {
+    if (!this.hands) return;
+    try {
+      await this.hands.reconcileOutstandingStarts();
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: this.sessionId, runId: this.runId },
+        "task.bg_starts_reconcile_failed",
+      );
+    }
   }
 
   /**

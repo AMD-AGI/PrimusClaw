@@ -14,7 +14,7 @@ import {
   runQualifiedShellId, type RecordProbe,
 } from "../sandbox/bg-start.js";
 import {
-  advanceRow, readRow, readRunRows, rowKey,
+  advanceRow, readRow, readRunRows, releaseRow, rowKey,
   type BgHandleAddress, type BgHandleRow, type BgRowStore,
 } from "../sandbox/bg-handle-rows.js";
 
@@ -424,22 +424,6 @@ export function derivedShellId(
 }
 
 /**
- * Which start this is, and the id it gets, decided before anything is sent.
- *
- * Two requirements that pull apart. The identity has to survive a crash without
- * depending on the model reproducing anything -- a provider tool-use id is not
- * sealed until the turn's checkpoint, which is written after the tool has
- * already run. And it has to be per *start*: two deliberate starts of one
- * command are two intents and must produce two shells.
- *
- * Both hold by allocating against this run's own durable rows. A row still
- * `issued` or `dispatched` for this command is a call that was sent and never
- * confirmed -- which is exactly what a replay is -- so the replay adopts its id
- * and its sequence. Anything already `spawn_confirmed` is a start that
- * finished, so the next call is a new intent and takes the next sequence. The
- * sequence is Brain's own, never the model's.
- */
-/**
  * Reconcile every start this run committed to and never confirmed.
  *
  * Called before a resumed run issues anything. A commitment whose call site
@@ -453,6 +437,16 @@ export async function outstandingStarts(
 ): Promise<BgHandleRow[]> {
   const rows = await readRunRows(store, owner, run);
   return rows.filter((row) => row.state !== "spawn_confirmed");
+}
+
+/** What reconciling a resumed run's unconfirmed starts settled, and how. */
+export interface OutstandingReconciliation {
+  /** Shells whose start did reach the sandbox; their rows now attest one. */
+  confirmed: string[];
+  /** Starts that demonstrably never landed; their commitment is released. */
+  released: string[];
+  /** Starts nothing could decide; their rows stand and still answer `unknown`. */
+  unresolved: string[];
 }
 
 export interface StartIdentity {
@@ -527,8 +521,17 @@ export async function allocateStartIdentity(
       }),
       null,
     );
-    if (!claimed) continue;
-    return { shellId, commandDigest, sequence, replayed: false };
+    if (claimed) return { shellId, commandDigest, sequence, replayed: false };
+    // The winner of that create may be this very call site, arriving twice at
+    // once. Advancing to the next sequence without looking mints a second shell
+    // for one intent and dispatches the command twice, which is the duplicate
+    // the row exists to prevent; the winning row is adopted instead.
+    const won = stepIdentity ? await readRow(store, address) : null;
+    if (won && won.stepIdentity === stepIdentity) {
+      return {
+        shellId: won.shellId, commandDigest, sequence: won.sequence ?? sequence, replayed: true,
+      };
+    }
   }
   throw new Error(
     `no background-shell sequence could be claimed for this run under contention`,
@@ -968,6 +971,74 @@ export class HandsClient {
     await advanceRow(store, address, this.generation, "issued", carry);
     await advanceRow(store, address, this.generation, "dispatched", carry);
     return null;
+  }
+
+  /**
+   * Settle every start this run committed to and never confirmed, before the
+   * resumed run issues anything.
+   *
+   * Without this the send window closes only if the model happens to re-emit
+   * the same call: a crash between the durable `dispatched` write and the
+   * transport handoff otherwise leaves the row outstanding for good, answering
+   * `unknown` to every later replay for work that never ran.
+   *
+   * The row carries a digest of the command and not the command, so a send that
+   * demonstrably never landed is finished by releasing its commitment rather
+   * than by re-sending it -- the call becomes the first call it always was, and
+   * Hands' exclusive create still arbitrates if it turns out one did land. Each
+   * gate is fail-closed: an indeterminate absence, a sandbox filing no records
+   * or a prior generation leaves the row exactly as it stands.
+   */
+  async reconcileOutstandingStarts(): Promise<OutstandingReconciliation> {
+    const settled: OutstandingReconciliation = { confirmed: [], released: [], unresolved: [] };
+    const store = bgRowStore();
+    if (!store || !this.owner || !this.run) return settled;
+
+    const sandboxFilesRecords = await this.filesShellRecords();
+    for (const row of await outstandingStarts(store, this.owner, this.run)) {
+      // `issued` says the request never reached the transport, so nothing ran
+      // and the row already reads as the first call it still is.
+      if (row.state !== "dispatched") continue;
+      try {
+        await this.settleOutstandingStart(store, row, sandboxFilesRecords, settled);
+      } catch (err) {
+        settled.unresolved.push(row.shellId);
+        logger.warn(
+          { err: String(err), shellId: row.shellId }, "bg_start.reconcile_failed",
+        );
+      }
+    }
+    if (settled.confirmed.length || settled.released.length || settled.unresolved.length) {
+      logger.info({ run: this.run, ...settled }, "bg_start.reconciled");
+    }
+    return settled;
+  }
+
+  private async settleOutstandingStart(
+    store: BgRowStore,
+    row: BgHandleRow,
+    sandboxFilesRecords: boolean,
+    settled: OutstandingReconciliation,
+  ): Promise<void> {
+    const address = { ownerScope: this.owner, runIdentity: this.run, shellId: row.shellId };
+    const decision = await resolveStart({
+      row,
+      rowReadable: true,
+      currentGeneration: this.generation,
+      sandboxFilesRecords,
+      probe: () => this.probeShellRecord(row.shellId),
+    });
+    if (decision.action === "resolve") {
+      await advanceRow(store, address, this.generation, "spawn_confirmed");
+      settled.confirmed.push(row.shellId);
+      return;
+    }
+    if (decision.action === "retransmit") {
+      await releaseRow(store, address);
+      settled.released.push(row.shellId);
+      return;
+    }
+    settled.unresolved.push(row.shellId);
   }
 
   async callTool(

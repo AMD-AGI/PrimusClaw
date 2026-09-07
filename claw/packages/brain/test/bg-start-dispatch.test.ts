@@ -480,3 +480,23 @@ test("a replica taking the run over adopts its predecessor's unfinished call", a
   await successor.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_taken_over"));
   assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1);
 });
+
+test("one call site arriving twice at once resolves to one shell, not two", async () => {
+  // The same tool use delivered to two replicas, or retried into a call that
+  // had not returned. Both scan before either has written a row, so both walk
+  // to sequence one and one of them loses the create -- and advancing past a
+  // create it lost mints a second id for one intent and runs the command twice.
+  const a = pod({ slowHandoff: true });
+  const b = pod({ slowHandoff: true });
+  const step = STEP("toolu_delivered_twice");
+
+  await Promise.all([
+    a.hands.callTool("bash", NO_ID_START, undefined, step),
+    b.hands.callTool("bash", NO_ID_START, undefined, step),
+  ]);
+
+  const ids = [...a.sent, ...b.sent].map((s) => s.shell_id);
+  assert.equal(ids.length, 2, "precondition: both calls really did reach the transport");
+  assert.equal(new Set(ids).size, 1, `two shells for one intent: ${JSON.stringify(ids)}`);
+  assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1, "one intent, one row");
+});
