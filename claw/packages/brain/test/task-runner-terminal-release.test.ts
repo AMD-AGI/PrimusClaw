@@ -175,7 +175,7 @@ function stubSideEffects(
     destroyHands: record("destroyHands", undefined),
     reapPendingHands: record("reapPendingHands", undefined),
     unregisterSandbox: ((..._a: unknown[]) => { safeCalls.push("unregisterSandbox"); }) as never,
-    markHandsIdle: ((..._a: unknown[]) => { safeCalls.push("markHandsIdle"); }) as never,
+    markHandsIdle: ((..._a: unknown[]) => { safeCalls.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     syncWorkspaceToS3: record("syncWorkspaceToS3", { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
     syncWorkspaceFromS3: record("syncWorkspaceFromS3", undefined),
     archiveRunToS3: record("archiveRunToS3", undefined),

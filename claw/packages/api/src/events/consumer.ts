@@ -32,8 +32,12 @@ import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dis
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { estimateTokens } from "../shared/tokens.js";
 import { metrics } from "../infra/metrics.js";
+import { publishSummaryIfCurrent } from "./summary.js";
+import { withCompletionLock } from "./completion-lock.js";
+import { recordCompletionTurns } from "./completion-turns.js";
+
+export { recordCompletionTurns } from "./completion-turns.js";
 
 const logger = pino({ name: "event-consumer" });
 
@@ -241,6 +245,47 @@ function listenForCleanupNotices(): void {
   });
 }
 
+async function processCompletionEvent(
+  sessionId: string,
+  event: Record<string, unknown>,
+  rowId: number,
+): Promise<boolean> {
+  const messageId = typeof event.message_id === "string" && event.message_id
+    ? event.message_id : null;
+  const outcome = await withCompletionLock(sessionId, async () => {
+    // Another delivery may have finished while this one was acquiring the lock.
+    const current = (await db.query(
+      "SELECT processed_at FROM claw_session_events WHERE id = $1 AND session_id = $2",
+      [rowId, sessionId],
+    )).rows[0];
+    if (!current || !("processed_at" in current)) throw new Error("completion event row is missing");
+    if (current.processed_at !== null) return;
+
+    // A sweeper completion describes a row it already terminalized; its task id
+    // is context for the turn, not a worker-generation fence.
+    const provenance = event.completion_source === "sweeper"
+      ? null
+      : await resolveChatRunProvenance(event);
+    const namesChatRow = provenance !== null && provenance !== "foreign";
+    const alreadyProcessed = await completionAlreadyProcessed(sessionId, messageId ?? "");
+    if (alreadyProcessed) {
+      const superseded = namesChatRow
+        && await completionAdmissibility(provenance, runClaimOf(event)) === "superseded";
+      if (!superseded && messageId && event.completion_source !== "sweeper") {
+        await recordCompletionTurns(sessionId, event, messageId);
+      }
+      logger.info(
+        { sessionId, rowId, messageId, superseded },
+        "exec_complete.skipped_already_processed",
+      );
+    } else {
+      await handleComplete(sessionId, event, rowId, provenance);
+    }
+    await db.query("UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1", [rowId]);
+  });
+  return outcome.ran;
+}
+
 /**
  * One delivery: refuse a deleted session before any write, otherwise persist.
  *
@@ -308,7 +353,6 @@ export async function consumeEventDelivery(msg: {
     // collide and silently drop legitimate events under ON CONFLICT DO NOTHING.
     const seq = (msg as any).seq ?? (msg as any).info?.streamSequence;
     const eventId = makeEventId(seq);
-    let needsProcessing = true;
     let rowId: number | null = null;
     try {
       const insertResult = await db.query(
@@ -318,16 +362,13 @@ export async function consumeEventDelivery(msg: {
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
         rowId = insertResult.rows[0].id;
-        needsProcessing = true; // newly inserted, never processed
       } else {
-        // Row exists from a prior attempt; check whether handleComplete finished.
         const existing = await db.query(
-          "SELECT id, processed_at FROM claw_session_events WHERE event_id = $1 AND session_id = $2",
+          "SELECT id FROM claw_session_events WHERE event_id = $1 AND session_id = $2",
           [eventId, sessionId],
         );
         if (existing.rowCount && existing.rows[0]) {
           rowId = existing.rows[0].id;
-          needsProcessing = existing.rows[0].processed_at === null;
         }
       }
     } catch (e: any) {
@@ -345,31 +386,11 @@ export async function consumeEventDelivery(msg: {
 
     // Handle completion — re-run on retry if the previous attempt didn't mark it done
     if (event.type === "exec_complete") {
-      const messageId = typeof event.message_id === "string" ? event.message_id : "";
       try {
-        // Two questions, because there are two ways the same completion arrives
-        // twice: this delivery was processed before (its own row says so), or
-        // the turn was published again and processed under a different row.
-        // The message-level gate must not reach an event that names a chat
-        // row: two generations of one turn share a message id, so the stale
-        // one's marked event would suppress the live one's. Row-level
-        // admissibility is what settles that case instead.
-        const provenance = await resolveChatRunProvenance(event);
-        const namesChatRow = provenance !== null && provenance !== "foreign";
-        const alreadyDone = !needsProcessing
-          || (!namesChatRow && await completionAlreadyProcessed(sessionId, messageId));
-        if (alreadyDone) {
-          logger.info({ sessionId, eventId, messageId }, "exec_complete.skipped_already_processed");
-        } else {
-          await handleComplete(sessionId, event, rowId, provenance);
-        }
-        // Marked either way: nothing is left for a retry of this row to do, and
-        // a row left NULL says the opposite to anything reading for pending work.
-        if (rowId !== null && needsProcessing) {
-          await db.query(
-            "UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1",
-            [rowId],
-          );
+        if (rowId === null) throw new Error("completion event has no durable row");
+        if (!await processCompletionEvent(sessionId, event, rowId)) {
+          msg.nak(1_000);
+          return;
         }
       } catch (e) {
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
@@ -445,82 +466,6 @@ async function handleStatusEvent(
       "status_event.applied",
     );
   }
-}
-
-/**
- * Write the conversation turns a finished run produced.
- *
- * Persisted whenever the run produced *anything* worth replaying — including
- * hard failures, because losing history on failure means the next user
- * message hits the LLM with an empty context and either re-does completed
- * work or hallucinates tool calls against "empty input". Fallback content
- * strings below cover the three cases where final_text is absent:
- *   - user interrupt   → "[Interrupted by user]"
- *   - agent_error      → "[Task failed: <reason>]"
- *   - everything else  → "" (legacy behavior, preserved for clean exits)
- * Reproduced by session 6a6d48d1: 88 turns completed, mid-stream RST on turn 83
- * → failed=true → 0 rows in claw_conversation_turns, all of the agent's work
- * invisible to the next turn.
- *
- * Written at most once per turn, whatever happens upstream. The caller skips a
- * completion it can see was handled before; this is the half of that which does
- * not depend on seeing it, and it is the half that matters, because these rows
- * are the conversation -- duplicated, the user reads their own message twice and
- * so does every prompt built from the history afterwards.
- */
-export async function recordCompletionTurns(
-  sessionId: string,
-  event: Record<string, unknown>,
-  messageId: string | null,
-): Promise<void> {
-  const { final_text, failed, prompt, interrupted, failure_reason } = event as any;
-  if (!final_text && !interrupted && !failed) return;
-
-  const lastIdx = (await db.query(
-    "SELECT COALESCE(MAX(turn_index), 0) as max FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL",
-    [sessionId],
-  )).rows[0].max;
-
-  // ON CONFLICT DO NOTHING is the backstop rather than the mechanism: the
-  // caller's check already skips a completion handled earlier, and this catches
-  // what that check cannot -- two deliveries of one turn handled at the same
-  // moment, neither able to see a processed_at the other has not written yet.
-  // Untargeted on purpose: the index it has to catch is partial, and naming it
-  // would mean repeating its predicate here for the two to stay in step.
-  if (prompt) {
-    await db.query(
-      "INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, token_count, message_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
-      [sessionId, lastIdx + 1, "user", prompt, estimateTokens(prompt), messageId],
-    );
-  }
-
-  // Extract tool calls from current run's events only
-  const lastCompleteId = (await db.query(
-    "SELECT id FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event = 'exec_complete' ORDER BY id DESC LIMIT 1 OFFSET 1",
-    [sessionId],
-  )).rows[0]?.id || 0;
-
-  const events = (await db.query(
-    "SELECT data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND id > $2 ORDER BY id",
-    [sessionId, lastCompleteId],
-  )).rows.map((r: any) => r.data);
-  const toolCalls = events.filter((e: any) => e.type === "toolUsed" && e.status === "start");
-  // Strip full_output from tool results before storing in conversation_turns —
-  // full_output (up to 50KB) is kept in claw_session_events for audit/tracing,
-  // but must NOT enter the LLM context window (built from conversation_turns).
-  const toolResults = events
-    .filter((e: any) => e.type === "toolUsed" && e.status === "success")
-    .map((e: any) => { const { full_output, ...rest } = e; return rest; });
-
-  // final_text fallback when interrupted/failed with no body — keep history
-  // intact so the next user turn has something to anchor against.
-  const assistantContent = final_text
-    || (interrupted ? "[Interrupted by user]" : "")
-    || (failed ? `[Task failed: ${failure_reason || "unknown"}]` : "");
-  await db.query(
-    "INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, tool_calls, tool_results, token_count, message_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
-    [sessionId, lastIdx + 2, "assistant", assistantContent, JSON.stringify(toolCalls), JSON.stringify(toolResults), estimateTokens(assistantContent), messageId],
-  );
 }
 
 /**
@@ -1188,11 +1133,12 @@ async function maybeSummarize(sessionId: string, userId: string): Promise<void> 
   }
 
   const toSummarize = (await db.query(
-    "SELECT role, content FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL AND turn_index < $2 ORDER BY turn_index",
+    "SELECT role, content, is_placeholder FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL AND turn_index < $2 ORDER BY turn_index",
     [sessionId, splitIdx],
   )).rows;
 
   if (!toSummarize.length) return;
+  const placeholderCount = toSummarize.filter((turn) => turn.is_placeholder).length;
 
   // LLM-powered summarization with fallback to concatenation
   let summary: string;
@@ -1211,12 +1157,10 @@ async function maybeSummarize(sessionId: string, userId: string): Promise<void> 
     summary = toSummarize.map((t: any) => `${t.role}: ${(t.content || "").slice(0, 300)}`).join("\n");
   }
 
-  await db.query(
-    `INSERT INTO claw_session_summaries (session_id, summary, summarized_up_to, token_count)
-     VALUES ($1,$2,$3,$4)
-     ON CONFLICT (session_id) DO UPDATE SET summary=$2, summarized_up_to=$3, token_count=$4, updated_at=NOW()`,
-    [sessionId, summary, splitIdx, estimateTokens(summary)],
-  );
+  if (!await publishSummaryIfCurrent(sessionId, summary, splitIdx, placeholderCount)) {
+    logger.info({ sessionId, splitIdx }, "summarize.publication_deferred");
+    return;
+  }
 
   logger.info({ sessionId, splitIdx, summaryLen: summary.length }, "summarized");
 }

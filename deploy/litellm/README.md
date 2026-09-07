@@ -14,7 +14,7 @@ software under its own license**, not part of PrimusClaw.
 |---|---|
 | [`Dockerfile`](Dockerfile) | Layers the auth hook and a UI base-path patch onto `ghcr.io/berriai/litellm` |
 | [`apim_key_hook.py`](apim_key_hook.py) | The hook: injects a per-virtual-key APIM subscription header, and opt-in Anthropic prompt caching |
-| [`charts/litellm/`](charts/litellm) | Helm chart — deployment, service, secret, optional ingress at `/llm-gateway` |
+| [`charts/litellm/`](charts/litellm) | Helm chart — deployment, service, secret, optional ingress and ServiceMonitor |
 | [`deploy.sh`](deploy.sh) | Installs the chart; also invoked by the whole-stack installer |
 | [`values.autorouting.example.yaml`](values.autorouting.example.yaml) | Example model list and complexity-based auto-routing config |
 
@@ -86,6 +86,31 @@ will not load; the API is unaffected.
 
 The base image is pinned by digest and floors at `v1.96.2`, which is the first
 release carrying Auto Router v2 and classifier context windows.
+
+## Scraping `/metrics`
+
+The proxy only emits `litellm_deployment_*` series when `prometheus` is in
+`litellm_settings.callbacks`. The ServiceMonitor then copies those process
+counters into the cluster TSDB so they survive pod restarts. Enabling the
+scrape object without the callback yields empty targets, not an error.
+
+`callbacks` in Helm **replaces** the chart default list, so keep the APIM hook
+entry when you add prometheus:
+
+```yaml
+litellmSettings:
+  callbacks:
+    - prometheus
+    - litellm.proxy.hooks.apim_key_hook.proxy_handler_instance
+serviceMonitor:
+  enabled: true
+```
+
+Leave `serviceMonitor.namespace` empty so the ServiceMonitor is created in the
+release namespace and can read `secrets.existingSecret` (key `master_key`).
+`bearerTokenSecret` is resolved in the ServiceMonitor's namespace, not the
+Service's. If a scrape operator requires the object elsewhere, copy or mint a
+Secret in that namespace and set `serviceMonitor.bearerTokenSecret.name`.
 
 ## Building the image
 

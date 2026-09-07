@@ -83,7 +83,7 @@ const sideEffects = {
   probeSandboxContainer: stub({ verdict: "dead", reason: "no_kv_entry" }),
   restartHandsInSandbox: stub({ ok: true, detail: "healthy" }),
   unregisterSandbox: (() => {}) as never,
-  markHandsIdle: (() => {}) as never,
+  markHandsIdle: (() => Promise.resolve({ outcome: "parked" })) as never,
   markRetryPending: stub(undefined),
   syncWorkspaceToS3: stub({ uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
   syncWorkspaceFromS3: stub(undefined),

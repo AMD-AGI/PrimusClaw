@@ -52,7 +52,7 @@ function stubDb(answers: Array<[RegExp, unknown]> = []): void {
 const LAST_INDEX: Array<[RegExp, unknown]> = [[/^SELECT COALESCE\(MAX\(turn_index\)/, [{ max: 4 }]]];
 
 const turnInserts = (): SeenQuery[] =>
-  seen.filter((q) => /^INSERT INTO claw_conversation_turns/.test(q.sql));
+  seen.filter((q) => /^(?:INSERT INTO claw_conversation_turns|WITH written AS)/.test(q.sql));
 
 test("a completion published a second time is recognised as the same one", async () => {
   stubDb([[/FROM claw_session_events/, [{ "?column?": 1 }]]]);
@@ -108,12 +108,13 @@ test("writing a turn that is already there is not an error", async () => {
   stubDb(LAST_INDEX);
   await recordCompletionTurns("s-1", { prompt: "hello", final_text: "hi" }, "msg-1");
 
-  for (const insert of turnInserts()) {
-    assert.match(insert.sql, /ON CONFLICT DO NOTHING$/);
-    assert.ok(!/ON CONFLICT \(/.test(insert.sql),
-      "untargeted, because the index it has to catch is partial and naming it "
-      + "here means repeating its predicate for the two to stay in step");
-  }
+  const [user, assistant] = turnInserts();
+  assert.match(user.sql, /ON CONFLICT DO NOTHING$/);
+  assert.match(assistant.sql,
+    /ON CONFLICT \(session_id, message_id, role\) WHERE message_id IS NOT NULL AND deleted_at IS NULL/);
+  assert.match(assistant.sql,
+    /WHERE claw_conversation_turns\.is_placeholder AND NOT EXCLUDED\.is_placeholder/);
+  assert.equal(assistant.params[8], false, "ordinary worker completions are immutable");
 });
 
 test("a caller that sends no message id writes turns that are not compared", async () => {

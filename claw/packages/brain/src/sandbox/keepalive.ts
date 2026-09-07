@@ -3,6 +3,7 @@
 
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
+import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -53,8 +54,105 @@ interface HandsKvEntry {
   /** False on a post-task idle reuse handle: kept for reuse but NOT pinged so
    *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
   keepalive?: boolean;
-  /** Epoch ms when the handle became idle; used to expire it after the window. */
+  /**
+   * Epoch ms when the handle became idle. All deployed writers stamp this field,
+   * so verdicts use it as the mixed-version idle-period witness.
+   */
   idleSince?: number;
+  /**
+   * Epoch ms when a sweep last acted on a `running` verdict. The reuse window
+   * starts at the later of this and `idleSince`.
+   */
+  workSeenAt?: number;
+  /**
+   * Identifies the idle period opened by `markHandsIdle`; unlike `idleSince`, it
+   * does not move while background work remains active.
+   */
+  idleEpoch?: number;
+  /**
+   * Revision on which the idle-opening write was conditioned. Together with
+   * `idleSince`, it uniquely witnesses an idle period even when timestamps
+   * collide. Backfilled by `collectTargets` for older entries.
+   */
+  idleRev?: number;
+  /**
+   * Per-call token used to confirm an idle write whose acknowledgement was lost.
+   * The sweep does not use it.
+   */
+  idleWriter?: string;
+  /**
+   * The last measured background-work answer, persisted so another replica can
+   * consume it.
+   */
+  bgCheckedAt?: number;
+  /** Shell count from that answer. 0 means the sandbox had nothing running. */
+  bgRunning?: number;
+  /**
+   * The `idleEpoch` under which the verdict was measured. `bgIdleSince` also has
+   * to match because an older binary can preserve both epoch fields across reuse.
+   */
+  bgEpoch?: number;
+  /**
+   * The value `idleSince` had when this verdict was measured.
+   *
+   * Kept as a witness rather than compared as a time, because the two numbers
+   * are written by different replicas off different clocks and a comparison
+   * between them cannot establish which event happened first. A replica whose
+   * clock runs a minute fast files a verdict stamped a minute into the future;
+   * the old binary that later takes the sandbox for a task and idles it again
+   * stamps `idleSince` off its own slower clock, and the verdict from BEFORE the
+   * task carries the LARGER number. Every ordering test between them then says
+   * the stale answer is the current one, and the handle is reclaimed with a
+   * background shell in it -- the same reclaim `bgEpoch` and the stamp were
+   * added to prevent, arriving through ordinary NTP-grade skew rather than
+   * through anything going wrong.
+   *
+   * Equality asks a question skew cannot answer wrongly. `idleSince` is opaque
+   * here: whether the value a re-idle wrote is larger or smaller than the one
+   * the verdict was measured under does not matter, only that it is a different
+   * value -- and it is, because every writer that opens an idle period stamps
+   * its own clock's reading of the moment it did so. Absent on verdicts written
+   * before this field existed, which are read as not witnessed at all.
+   */
+  bgIdleSince?: number;
+  /**
+   * The `idleRev` the entry carried when this verdict was measured.
+   *
+   * The half of the witness that cannot collide. `bgIdleSince` catches an idle
+   * period an OLD binary opened -- it rewrites `idleSince` and can write neither
+   * of these -- but two distinct periods can share an `idleSince` value, and
+   * when they do they share `idleEpoch` with it, so nothing else on the entry
+   * tells them apart. This one does: no two idle-opening writes to a key are
+   * conditioned on the same revision.
+   *
+   * Both must match for an `idle` verdict to be believed, because neither
+   * subsumes the other: an old binary carries this field across a task
+   * untouched, and a millisecond collision carries the other one across.
+   * Absent on verdicts written before this field existed, which are read as not
+   * witnessed at all.
+   */
+  bgIdleRev?: number;
+  /**
+   * The revision the write that published this verdict was conditioned on.
+   *
+   * Names the verdict itself, the way `idleRev` names an idle period and for the
+   * same reason: the bucket accepts one write per revision of a key and hands
+   * out a strictly greater one each time, so no two verdict-publishing writes
+   * can ever carry the same value. `bgCheckedAt` cannot do this on its own --
+   * it is a clock reading taken on whichever replica probed, and two replicas
+   * can read the same millisecond.
+   *
+   * Read by persistVerdict, to tell the verdict a probe went out under from one
+   * a different replica published while that probe was still in the air. Absent
+   * on verdicts written before this field existed, where the stamp beside it is
+   * the only half of the comparison available.
+   */
+  bgRev?: number;
+  /**
+   * Fleet-visible probe reservations, keyed by per-probe token. Reclaim waits
+   * while any unexpired reservation remains; each probe releases only its token.
+   */
+  bgProbes?: Record<string, number>;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -63,27 +161,14 @@ interface HandsKvEntry {
 
 interface KeepaliveDeps {
   kv: KV;
-  /**
-   * Test seam for the background-work probe, which is otherwise a live HTTP call
-   * to a Hands that does not exist under test -- so every probe would fail, and
-   * a failed probe answers `unknown`. That keeps the handle, which is the safe
-   * direction but only one of three branches: neither a confirmed `running` nor
-   * a confirmed `idle` could be reached without stubbing the call.
-   */
+  /** Test seam for the background-work probe. */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
-  /**
-   * Test seam for the ping-phase budget. The real one is derived from the
-   * record TTL and is minutes long, which no test can exhaust without sleeping
-   * for minutes -- so a test that wants to see the deferral path has to shorten
-   * it. Never set in production.
-   */
+  /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
-/** Module-level so the immediate sweep at startup is under the same guard as
- *  the interval's: the first one can outlast a whole period, and it used to be
- *  the one sweep nothing stopped the timer from starting a second copy of. */
+/** Guards both the startup sweep and interval sweeps from overlap. */
 let sweeping = false;
 const failCounts = new Map<string, number>();
 
@@ -102,6 +187,21 @@ function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
   return entry.provider === "agent-sandbox"
     ? `${sessionId}:agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`
     : `${sessionId}:safe:${entry.workloadId || ""}`;
+}
+
+/**
+ * The sandbox identity a KV entry names.
+ * A session key may point to different pods over time, so probe results are
+ * matched against this identity before being persisted.
+ */
+function entryIdentity(sessionId: string, info: HandsKvEntry): string {
+  return sandboxRegistryKey(sessionId, {
+    provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+    workloadId: info.workloadId,
+    sessionId: info.sessionId,
+    sandboxName: info.sandboxName,
+    namespace: info.namespace,
+  });
 }
 
 /** Drop orphaned READY sandboxes when a retryable attempt was never redelivered. */
@@ -163,12 +263,7 @@ async function shouldSkipExpiredRetry(
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
 export function registerSandbox(sessionId: string, entry: SandboxEntry): void {
   const key = sandboxRegistryKey(sessionId, entry);
-  // A task has taken this sandbox, so whatever the last sweep concluded about
-  // it is about the turn before. Reuse hands the same pod to the next task, so
-  // identity alone would carry an `idle` verdict across that boundary -- and a
-  // turn that leaves a background shell behind would be read as one that left
-  // nothing, up to the length of the cache TTL. The next idle decision is made
-  // from a fresh answer.
+  // A new task invalidates verdicts measured before it took the sandbox.
   forgetBackgroundWork(key);
   localRegistry.set(key, { sessionId, entry });
   logger.info({ sessionId, workloadId: entry.workloadId }, "keepalive.registered");
@@ -219,51 +314,59 @@ export function registeredSandboxCount(sessionId: string): number {
 }
 
 /**
+ * Resolve an unacknowledged idle update by matching its per-call writer token.
+ * A matching revision with another token means a concurrent park superseded it.
+ */
+async function idleWriteOutcome(
+  kv: KV,
+  kvKey: string,
+  witness: string,
+  revision: number,
+): Promise<"parked" | "superseded" | "unverified"> {
+  try {
+    const latest = await kv.get(kvKey);
+    if (!latest) return "unverified";
+    const info = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
+    if (info.idleWriter === witness) return "parked";
+    return info.idleRev === revision ? "superseded" : "unverified";
+  } catch {
+    return "unverified";
+  }
+}
+
+/**
  * Mark a READY `hands.<sid>` entry idle (keepalive:false) so it is kept as a
- * reuse handle but no longer pinged. Called by stopKeepaliveAfterTask instead
- * of deleting the entry outright, so the next message in the same session
- * can still reuse the pod via ensureHands within SANDBOX_IDLE_REUSE_MS
- * (collectTargets above skips pinging it and expires it after the window).
- *
- * Fire-and-forget. An entry that cannot be parsed is dropped; a KV error is
- * not, because the entry may be fine and it is the only record the idle sweeper
- * can find the session's GPU clusters through.
+ * reuse handle but no longer pinged. The promise reports failures rather than
+ * rejecting, and unreadable ownership entries are preserved.
  */
 export function markHandsIdle(
   kv: KV,
   sessionId: string,
   known: SandboxEntry | string,
-): void {
+): Promise<RunEndedParkResult> {
   const kvKey = `hands.${sessionId}`;
-  kv.get(kvKey)
-    .then(async (entry) => {
-      if (!entry) return; // no handle to keep; a fresh task will recreate one.
+  return kv.get(kvKey)
+    .then(async (entry): Promise<RunEndedParkResult> => {
+      if (!entry) return { outcome: "gone" };
       let info: HandsKvEntry;
       try {
         info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
       } catch (err) {
-        // Unreadable ownership data is not evidence that no live sandbox is
-        // referenced. Preserve it for operator repair and natural TTL expiry.
+        // Preserve unreadable ownership data for repair or natural TTL expiry.
         logger.warn(
           { err: (err as Error)?.message || String(err), sessionId },
           "hands.mark_idle_unreadable",
         );
-        return;
+        return { outcome: "skipped", reason: "unreadable" };
       }
       // Only keep a READY handle that still points at the workload we ran on.
-      if (info.status !== "ready") return;
+      if (info.status !== "ready") return { outcome: "skipped", reason: "not_ready" };
       const sameTarget = typeof known === "string"
         ? !(known && info.workloadId && info.workloadId !== known)
         : sameRegisteredSandbox(known, info);
-      if (!sameTarget) return;
+      if (!sameTarget) return { outcome: "skipped", reason: "other_sandbox" };
 
-      // The handle is going back into the idle pool, which is the moment its
-      // background-work verdict starts being acted on -- so nothing concluded
-      // while a task held it may carry over. A probe that ran mid-task and
-      // found no shells is the case that matters: the task may have started one
-      // afterwards, and an `idle` answer from before would suppress pinging for
-      // the rest of the cache TTL. registerSandbox invalidates on the way in;
-      // this is the way out, and without it the boundary is only half closed.
+      // Verdicts measured while the task held the sandbox cannot cross re-idling.
       forgetBackgroundWork(sandboxRegistryKey(sessionId, {
         provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
         workloadId: info.workloadId,
@@ -272,115 +375,100 @@ export function markHandsIdle(
         namespace: info.namespace,
       }));
 
-      info.keepalive = false;
-      info.idleSince = Date.now();
-      // Conditioned on the revision just read, because a session teardown can
-      // delete this entry between the read and the write. An unconditional put
-      // would resurrect the handle of a deleted session, and collectTargets
-      // then refreshes its TTL for the whole reuse window rather than letting
-      // it expire -- so the deleted session's platformKey and workload id would
-      // outlive it by 15 minutes.
-      await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
-    })
-    .catch((err) => {
-      if (isRevisionConflict(err)) {
-        // Deleted or rewritten while we were deciding; whoever did it wins. In
-        // particular, do not fall through to the delete below -- that would
-        // remove an entry somebody else just wrote.
-        logger.info({ sessionId }, "hands.mark_idle_superseded");
-        return;
+      // All run-ended parkers must open idle periods with the same field set.
+      applyRunEndedIdleFields(
+        info as unknown as Record<string, unknown>,
+        Date.now(),
+        entry.revision,
+      );
+      // Conditional update prevents resurrecting a concurrently deleted handle.
+      const witness = nextEntryToken();
+      info.idleWriter = witness;
+      try {
+        await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
+      } catch (err) {
+        if (isRevisionConflict(err)) throw err;
+        const landed = await idleWriteOutcome(kv, kvKey, witness, entry.revision);
+        if (landed === "unverified") throw err;
+        logger.info({ sessionId, landed }, "hands.mark_idle_ack_lost");
+        return { outcome: landed };
       }
-      // A transport failure may arrive after the CAS succeeded, and another
-      // writer may already own the key. An unconditional delete here could
-      // erase that sibling, so preserve the latest value.
+      return { outcome: "parked" };
+    })
+    .catch((err): RunEndedParkResult => {
+      if (isRevisionConflict(err)) {
+        // Deleted or rewritten while we were deciding; whoever did it wins.
+        logger.info({ sessionId }, "hands.mark_idle_superseded");
+        return { outcome: "superseded" };
+      }
       logger.warn({ err: err?.message || String(err), sessionId }, "hands.mark_idle_failed");
+      return { outcome: "failed", error: err };
     });
 }
 
 /**
  * What a probe of Hands' background-shell registry can tell us.
- *
- * Three states rather than a boolean, because "no work" and "could not ask" lead
- * to opposite decisions and only one of them is safe to guess at. A caller that
- * folds `unknown` into `idle` deletes the handle the moment a probe times out --
- * and over a job long enough to need this, at one probe a minute, a single blip
- * is close to certain.
+ * `unknown` must keep the sandbox; only a measured `idle` may permit reclaim.
  */
 type BackgroundWork = "running" | "idle" | "unknown";
 
-/**
- * Last probe answer per sandbox identity, so the sweep does not ask once per
- * handle per tick.
- *
- * The sweep has to know on every tick -- the answer decides whether the sandbox
- * is pinged, and an unpinged sandbox is reclaimed -- but the answer does not
- * change on that timescale. Without the cache each idle handle costs an HTTP
- * round trip inside the sweep's serial KV walk, so a handful of unreachable ones
- * push a tick past its own interval and the next one starts on top of it.
- *
- * The TTL is what an ended job costs: up to this long being pinged after the
- * last shell exited. That is the harmless direction, and it is why the entry is
- * not invalidated eagerly.
- */
+/** Local measured-verdict reuse interval. */
 const BG_PROBE_TTL_MS = 5 * 60_000;
 
 /**
- * Consecutive unanswered probes before a handle is treated as idle after all.
- *
- * `unknown` holds the handle, which is right for a blip and wrong forever: a
- * sandbox that has stopped answering entirely would otherwise be pinned until
- * its absolute deadline. Five ticks is long enough that no single failure
- * decides anything and short enough that a dead sandbox is not held for hours.
+ * Consecutive failures tolerated before inferring idle. A transient failure
+ * keeps the sandbox, while a permanently unreachable one is eventually released.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
+/**
+ * Shared verdict lifetime. It must outlive the interval between fleet sweeps of
+ * the same handle, while local probing still refreshes every BG_PROBE_TTL_MS.
+ */
+const BG_VERDICT_TTL_MS = 30 * 60_000;
 
 /**
- * How many probes may be in flight across the whole sweep.
- *
- * Per-session de-duplication is not a bound: on a cold start every idle handle
- * is uncached at once, so a replica with a few hundred of them opened a few
- * hundred sockets in the same tick -- times the number of replicas, against one
- * control plane. Reaching the limit skips the rest of the probes rather than
- * queueing them, because a skipped probe is not a lost one: the handle stays
- * `unknown`, which keeps it, and the next tick picks up where this one stopped.
- * A cold start spreads over a few ticks instead of arriving as a burst.
+ * Failed-probe streak lifetime. It must cover the interval until the same replica
+ * revisits an identity, which can span several fleet rotations.
+ */
+const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
+
+/**
+ * Local inferred-idle lifetime. It shares the streak horizon so the same replica
+ * can act on it, but `needsProbe` still retries at BG_PROBE_TTL_MS.
+ */
+const BG_GIVEUP_TTL_MS = BG_UNKNOWN_STREAK_TTL_MS;
+
+/**
+ * Fleet probe concurrency cap per replica. Deferred candidates remain `unknown`
+ * and are rotated into later sweeps.
  */
 const BG_PROBE_MAX_IN_FLIGHT = 8;
 
 /**
- * How many sandboxes are pinged at once.
- *
- * The ping fan-out was `Promise.all` over every target, which was survivable
- * while an idle handle was never a target. It is not any more: an uncached
- * handle answers `unknown`, and `unknown` is pinged -- so the same cold start
- * that floods the probes floods this too, and the two are the same connection
- * pool. Bounded rather than skipped, because unlike a probe a missed ping is
- * how a sandbox dies.
+ * Reservation deadline for a probe and its verdict write. It is shorter than
+ * the probe cadence so abandoned reservations cannot defer reclaim indefinitely.
+ */
+const BG_PROBE_RESERVE_MS = 60_000;
+
+/**
+ * Conditional-write retries for publishing a probe reservation. Exhaustion
+ * leaves the handle `unknown` and defers the probe to a later sweep.
+ */
+const BG_PROBE_RESERVE_ATTEMPTS = 8;
+
+/**
+ * Retry ceiling for a `running` verdict that loses conditional updates. Running
+ * must outlast concurrent idle writes, but a persistent store fault stays bounded.
+ */
+const BG_VERDICT_WRITE_ATTEMPTS = 64;
+
+/**
+ * Ping concurrency cap. Unlike probes, pings are queued rather than skipped.
  */
 const PING_MAX_IN_FLIGHT = 16;
 /**
- * How long the ping phase may run before it defers the rest to the next sweep.
- *
- * Renewing a record when it is queued gives it a full TTL from that moment,
- * which is not the same as guaranteeing its ping arrives inside one. Pings run
- * bounded and in turn and one can take its whole command timeout, so a fleet
- * large enough makes the queue itself longer than the TTL: with the default 16
- * at a time and a 15s ceiling per ping, the tail of ~320 targets is renewed and
- * then waits past its own expiry, and the sweep guard means no other sweep is
- * coming to renew it.
- *
- * Half the record's lifetime is the budget. Precisely, it is a cutoff on
- * *starting* a ping, not on the phase finishing: the deadline is tested as each
- * target is picked up, so up to PING_MAX_IN_FLIGHT pings already in progress run
- * past it, each bounded by its own command timeout. The phase can therefore
- * overrun the budget by roughly one ping's timeout, not by the length of the
- * remaining queue -- which is the property that matters, since the queue is what
- * grows with the fleet and the timeout does not.
- *
- * So a ping started this sweep began with the other half of the TTL to spare,
- * and anything not started keeps the renewal it already got and goes first next
- * time -- the cursor below is what makes deferral fair rather than starvation
- * for whoever sorts last.
+ * Cutoff for starting pings in one sweep. Deferred targets retain their renewed
+ * record and lead the next rotated sweep.
  */
 const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
 /** Where the last sweep stopped handing out pings. */
@@ -388,27 +476,41 @@ let pingCursor = 0;
 
 
 /** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
-const bgProbeCache = new Map<string, { at: number; state: BackgroundWork }>();
-const bgUnknownStreak = new Map<string, number>();
+const bgProbeCache = new Map<
+  string,
+  {
+    at: number; state: BackgroundWork; epoch?: number; idleSince?: number; idleRev?: number;
+    /** The give-up path inferred this verdict rather than measuring it. */
+    inferred?: boolean;
+    /**
+     * A later probe also failed, so reclaim may act on an aged inference instead
+     * of indefinitely deferring for another retry.
+     */
+    retested?: boolean;
+  }
+>();
+
+/** How long this particular cached answer may be reused. */
+function cachedVerdictTtlMs(cached: { inferred?: boolean }): number {
+  return cached.inferred ? BG_GIVEUP_TTL_MS : BG_PROBE_TTL_MS;
+}
+const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
 /**
- * Bumped whenever something makes an in-flight answer obsolete.
- *
- * Dropping the cached answer is not enough on its own: a probe already in the
- * air writes when it lands, and for a reused sandbox it lands on the very key
- * the next sweep reads. So the probe carries the generation it started under
- * and its result is discarded if that has moved -- which is what "a task took
- * this sandbox back" looks like from inside a promise that started before it.
+ * Bumped whenever an in-flight answer becomes obsolete. Probes discard results
+ * whose captured generation no longer matches.
  */
 const bgGeneration = new Map<string, number>();
 /** Where the last sweep stopped handing out probe slots. */
 let bgProbeCursor = 0;
 
-/** Drop the cached verdict for one sandbox identity, and invalidate any
- *  answer still in the air about it. */
+/**
+ * Drop the cached verdict for one sandbox identity, and invalidate any answer
+ * still in the air about it.
+ * Unknown streaks have their own lifetime and are cleared by success or age.
+ */
 function forgetBackgroundWork(identity: string): void {
   bgProbeCache.delete(identity);
-  bgUnknownStreak.delete(identity);
   bgGeneration.set(identity, (bgGeneration.get(identity) ?? 0) + 1);
 }
 
@@ -424,11 +526,7 @@ export function backgroundWorkStateSizesForTest(): {
   };
 }
 
-/**
- * Clear the probe bookkeeping. Exported for tests, which drive several sweeps
- * over one sandbox identity in one process and would otherwise read each
- * other's cached answers -- the cache being module state is the point of it.
- */
+/** Clear module-level probe bookkeeping for isolated tests. */
 export function resetBackgroundWorkStateForTest(): void {
   bgProbeCache.clear();
   bgUnknownStreak.clear();
@@ -437,87 +535,272 @@ export function resetBackgroundWorkStateForTest(): void {
   bgProbeCursor = 0;
 }
 
-/**
- * Whether an idle handle's sandbox still has background work running in it.
- *
- * `stopKeepaliveAfterTask` marks the handle idle on every terminal task, and an
- * idle handle is never pinged, so the control-plane GC reclaims the pod about
- * fifteen minutes later. That is right when the sandbox is only a warm cache for
- * the next message. It is wrong when the turn left something running: Claw's own
- * rule is that a `run_in_background` shell outlives the turn that started it --
- * "the user is still there, and a shell started this turn is expected to still
- * be running when they ask about it in the next one, which is the reason
- * background shells exist at all" -- and reclaiming the pod kills it anyway. The
- * two policies contradicted each other; this is the side that reads the fact.
- *
- * Asked with the session as the owner, which is the key Hands files shells under
- * for everything except a DAG node (there it is the DAG root, and a DAG node's
- * shells are reaped when it finishes, so there is nothing left to protect). Not
- * `runScope`: that is the run *lease* key, a workspace id under
- * RUN_GATE_KEY=workspace, and it would match no owner at all.
- *
- * A handle with no URL or token predates this and cannot be asked; it answers
- * idle, which is what the sweep did before the question existed.
- */
-function peekBackgroundWork(identity: string, info: HandsKvEntry): BackgroundWork {
-  if (!info.handsUrl || !info.token) return "idle";
-  const cached = bgProbeCache.get(identity);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return cached.state;
-  return "unknown";
+/** Age cached verdicts and unknown streaks by `ms` for reap tests. */
+export function ageBackgroundWorkCacheForTest(ms: number): void {
+  for (const [identity, cached] of bgProbeCache) {
+    bgProbeCache.set(identity, { ...cached, at: cached.at - ms });
+  }
+  for (const [identity, streak] of bgUnknownStreak) {
+    bgUnknownStreak.set(identity, { ...streak, at: streak.at - ms });
+  }
 }
 
 /**
- * Ask Hands in the background and remember the answer for the next sweep.
- *
- * Not awaited, which is the point. The sweep walks every KV handle in one
- * sequence and then pings from what it collected, so an awaited probe is in
- * front of every ping in the fleet: a handful of handles whose Hands takes its
- * five-second timeout to fail is a sweep that outlasts its own interval, and
- * the sandboxes that were answering fine get pinged late or not at all. Reading
- * the last answer costs nothing and is never more than one tick stale; the
- * refresh catches up behind it.
- *
- * Keyed by sandbox identity rather than by session, and that is not a detail.
- * A session outlives its sandbox: reuse hands the next task the same pod, a
- * failed reuse builds a new one, and a session-keyed answer would carry the old
- * pod's verdict onto the new one. It also settles the late-probe problem for
- * free -- a probe that started against the sandbox that has since been replaced
- * writes under the key it started with, which nothing reads any more, instead of
- * overwriting the new pod's state with an answer about a pod that is gone.
- *
- * Bounded across the whole sweep, not just per session. Skipping rather than
- * queueing when the limit is reached: the handle stays `unknown`, which keeps
- * and pings it, and the next tick continues down the list.
+ * Per-tick aggregate counters. They expose whether idle handles are progressing
+ * toward measured verdicts and reclaim without per-handle log volume.
  */
+interface TickStats {
+  /** Idle handles by background-work answer. */
+  bgRunning: number; bgUnknown: number; bgIdle: number;
+  /** Where those answers came from; see VerdictSource. */
+  fromMem: number; fromHandle: number; fromNone: number; fromNoHands: number;
+  /** What happened to the handles answered `idle`. */
+  expired: number; withinWindow: number; keptLocal: number; keptRunLease: number;
+  /** Reclaims deferred because a probe about the handle was still outstanding. */
+  keptProbe: number;
+  /** Probes this tick actually started; candidates over the cap are not counted. */
+  probes: number;
+}
+
+function newTickStats(): TickStats {
+  return {
+    bgRunning: 0, bgUnknown: 0, bgIdle: 0,
+    fromMem: 0, fromHandle: 0, fromNone: 0, fromNoHands: 0,
+    expired: 0, withinWindow: 0, keptLocal: 0, keptRunLease: 0, keptProbe: 0,
+    probes: 0,
+  };
+}
+
+/** Where a verdict came from, for the tick counters. */
+type VerdictSource = "mem" | "handle" | "none" | "no-hands";
+
+/**
+ * Whether a verdict is still about the idle period the handle is in now.
+ * Missing epochs are not a match; they remain `unknown` until backfilled and
+ * measured.
+ */
+function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): boolean {
+  return typeof verdictEpoch === "number" && verdictEpoch === info.idleEpoch;
+}
+
+/**
+ * Whether a verdict measured at `at`, under the stamp `witness`, can be about
+ * the idle period the handle is in now.
+ *
+ * During a rolling deployment, an older binary rewrites `idleSince` but carries
+ * the epoch fields unchanged. The timestamp witness therefore detects its idle
+ * periods even when the epochs still match.
+ *
+ * Idle verdicts require equality with both witnesses: timestamp equality avoids
+ * ordering clocks from different replicas, and revision equality prevents a
+ * same-millisecond ABA. Together they leave exactly one gap: an old binary re-idling
+ * onto the identical millisecond, which leaves an entry byte-identical to the
+ * one it found, and which therefore no rule reading the entry can detect. It
+ * closes when the old binary is gone, and nothing on the entry can close it
+ * sooner.
+ *
+ * `running` also accepts the older rule, `at` at or after the stamp. It is a
+ * weaker test and it is allowed to be, because the two ways it can be wrong are
+ * both safe: believing a stale `running` costs a ping the sandbox did not need,
+ * and disbelieving a current one costs a probe. Keeping it means the sweep that
+ * slides the stamp forward under a working sandbox does not have to re-witness
+ * the verdict it just acted on -- which would amount to relabelling an answer as
+ * being about a period it was not measured in -- and means a verdict written by
+ * the build before this field existed still keeps a busy sandbox pinged while it
+ * ages out. The `idle` branch, the only one that can delete anything, gets no
+ * such latitude.
+ *
+ * A rejected or incomplete witness reads as `unknown`, so the handle is kept and
+ * probed again.
+ */
+function measuredUnderThisIdlePeriod(
+  at: number | undefined,
+  witness: number | undefined,
+  witnessRev: number | undefined,
+  info: HandsKvEntry,
+  state: BackgroundWork,
+): boolean {
+  if (typeof info.idleSince !== "number") return false;
+  if (
+    typeof witness === "number" && witness === info.idleSince
+    && typeof witnessRev === "number" && witnessRev === info.idleRev
+  ) return true;
+  if (state !== "running") return false;
+  return typeof at === "number" && at >= info.idleSince;
+}
+
+/**
+ * The reuse window starts at the later of the idle-period opening and the last
+ * sweep that observed work.
+ */
+function reuseWindowStart(info: HandsKvEntry): number {
+  return Math.max(
+    typeof info.idleSince === "number" ? info.idleSince : 0,
+    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
+  );
+}
+
+/** This replica's own last answer, if it is fresh enough to reuse and still
+ *  about the idle period the handle is in. */
+function usableCachedVerdict(
+  identity: string,
+  info: HandsKvEntry,
+): { at: number; state: BackgroundWork; inferred?: boolean; retested?: boolean } | null {
+  const cached = bgProbeCache.get(identity);
+  if (!cached) return null;
+  if (Date.now() - cached.at >= cachedVerdictTtlMs(cached)) return null;
+  if (!sameIdlePeriod(cached.epoch, info)) return null;
+  // Another replica can reactivate the handle without bumping this process's generation.
+  if (!measuredUnderThisIdlePeriod(
+    cached.at, cached.idleSince, cached.idleRev, info, cached.state,
+  )) return null;
+  return cached;
+}
+
+/** The handle's own copy, which any replica can read, under the same two rules
+ *  and its own longer TTL. */
+function usableSharedVerdict(info: HandsKvEntry): { at: number; state: BackgroundWork } | null {
+  if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
+  if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
+  if (!sameIdlePeriod(info.bgEpoch, info)) return null;
+  const state: BackgroundWork = info.bgRunning > 0 ? "running" : "idle";
+  if (!measuredUnderThisIdlePeriod(
+    info.bgCheckedAt, info.bgIdleSince, info.bgIdleRev, info, state,
+  )) return null;
+  return { at: info.bgCheckedAt, state };
+}
+
+/**
+ * Whether an idle handle's sandbox still has background work running in it.
+ *
+ * Background shells are owned by the session, not `runScope`. Handles without
+ * probe credentials retain the legacy idle behavior.
+ */
+function peekBackgroundWork(
+  identity: string,
+  info: HandsKvEntry,
+): { state: BackgroundWork; source: VerdictSource; at?: number } {
+  if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
+  // An aged inference must survive one failed re-test before it can permit reclaim.
+  const local = usableCachedVerdict(identity, info);
+  const beingReasked = !!local?.inferred && !local.retested
+    && Date.now() - local.at >= BG_PROBE_TTL_MS;
+  const cached = beingReasked ? null : local;
+  const shared = usableSharedVerdict(info);
+  // Cross-replica timestamps are not ordered. `running` therefore wins any
+  // disagreement; when both say `running`, the later stamp only advances an anchor.
+  if (cached?.state === "running" && shared?.state === "running") {
+    return cached.at >= shared.at
+      ? { state: "running", source: "mem", at: cached.at }
+      : { state: "running", source: "handle", at: shared.at };
+  }
+  if (cached?.state === "running") return { state: "running", source: "mem", at: cached.at };
+  if (shared?.state === "running") return { state: "running", source: "handle", at: shared.at };
+  // Any remaining verdict is `idle`; the source matters only for stats.
+  if (cached) return { state: cached.state, source: "mem", at: cached.at };
+  if (shared) return { state: shared.state, source: "handle", at: shared.at };
+  return { state: "unknown", source: "none" };
+}
+
+/** Whether this sandbox identity needs a new background-work probe. */
 function needsProbe(identity: string, info: HandsKvEntry): boolean {
   if (!info.handsUrl || !info.token) return false;
-  const cached = bgProbeCache.get(identity);
+  // A verdict from another idle period cannot suppress a fresh probe.
+  const cached = usableCachedVerdict(identity, info);
+  // Inferred verdicts remain readable longer than they suppress probing.
   if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
   return !bgProbeInFlight.has(identity);
+}
+
+/**
+ * Fleet-unique token for probe reservations and idle-write acknowledgement.
+ */
+const entryTokenPrefix = Math.random().toString(36).slice(2, 10);
+let entryTokenSeq = 0;
+function nextEntryToken(): string {
+  entryTokenSeq += 1;
+  return `${entryTokenPrefix}${entryTokenSeq.toString(36)}`;
+}
+
+/**
+ * The reservations on an entry that have not timed out, pruned on the way past.
+ * Writers prune expired tokens whenever they touch the map.
+ */
+function liveProbeReservations(info: HandsKvEntry, now: number): Record<string, number> {
+  const live: Record<string, number> = {};
+  for (const [token, until] of Object.entries(info.bgProbes ?? {})) {
+    if (typeof until === "number" && until > now) live[token] = until;
+  }
+  return live;
+}
+
+/** Whether any replica is still waiting on an answer about this handle. */
+function probeOutstanding(info: HandsKvEntry): boolean {
+  return Object.keys(liveProbeReservations(info, Date.now())).length > 0;
+}
+
+/**
+ * Publish a probe reservation before dispatch. Conditional-write conflicts are
+ * retried, and the probe proceeds only after its token is visible on the same
+ * sandbox identity.
+ */
+async function reserveProbe(
+  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+): Promise<boolean> {
+  const key = `hands.${sessionId}`;
+  for (let attempt = 1; attempt <= BG_PROBE_RESERVE_ATTEMPTS; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e) return false;
+      const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(sessionId, info) !== identity) return false;
+      const now = Date.now();
+      const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
+      await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
+      return true;
+    } catch {
+      // Re-read before retrying because the entry revision may have moved.
+    }
+  }
+  return false;
+}
+
+/**
+ * Release this probe's reservation when it settles without disturbing other
+ * replicas' reservations. The deadline remains the failure backstop.
+ */
+async function releaseProbe(
+  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    const e = await deps.kv.get(key);
+    if (!e) return;
+    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(sessionId, info) !== identity) return;
+    if (!info.bgProbes || !(token in info.bgProbes)) return;
+    const bgProbes = liveProbeReservations(info, Date.now());
+    delete bgProbes[token];
+    const next: HandsKvEntry = { ...info, bgProbes };
+    if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+  } catch { /* best effort: the deadline is the backstop */ }
 }
 
 /**
  * Start up to BG_PROBE_MAX_IN_FLIGHT probes, resuming where the last sweep left
  * off.
  *
- * Rotating matters as much as the cap. Handing the slots to whichever
- * candidates the KV walk happened to yield first means a handful that always
- * time out keep the quota to themselves, and everything behind them waits
- * however many sweeps it takes for those to be given up on. The cursor makes
- * the wait bounded and roughly fair instead.
- *
- * Fire-and-forget on purpose: awaiting a probe puts it in front of every ping
- * in the fleet. The answer is for the next sweep, which is never more than one
- * tick away, and until it arrives the handle reads `unknown` -- kept and pinged,
- * the safe direction for a sweep whose job is to keep things alive.
+ * The rotating cursor prevents timeouts early in the list from monopolizing the
+ * cap. Probes run behind the sweep; pending answers leave handles `unknown`.
  */
 function dispatchProbes(
   deps: KeepaliveDeps,
   candidates: Array<{
     identity: string; sessionId: string; info: HandsKvEntry; generation: number;
   }>,
-): void {
-  if (candidates.length === 0) return;
+): number {
+  if (candidates.length === 0) return 0;
   const probe = deps.countActiveShells ?? countActiveShells;
   const start = bgProbeCursor % candidates.length;
 
@@ -526,24 +809,36 @@ function dispatchProbes(
     if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) break;
     const { identity, sessionId, info, generation } =
       candidates[(start + n) % candidates.length];
+    // Capture the complete idle-period witness used to validate the answer.
+    const epoch = info.idleEpoch;
+    const idleSinceAtStart = info.idleSince;
+    const idleRevAtStart = info.idleRev;
+    // Detect a competing verdict published while this probe is in flight.
+    const verdictAtStart = verdictWitness(info);
     if (bgProbeInFlight.has(identity)) continue;
 
-    // `generation` came from the scan that formed this candidate, not from
-    // here. Anything that invalidates the identity between the scan and the
-    // promise landing moves it, and the result is dropped on arrival rather
-    // than written over whatever replaced it. Checking again here would only
-    // save a probe, and no test can tell the two apart -- the guard that
-    // matters is the one at the landing.
+    // The scan-time generation invalidates results after any intervening reuse.
     bgProbeInFlight.add(identity);
     started += 1;
+    // The fleet-visible reservation must land before the probe is dispatched.
+    const token = nextEntryToken();
 
-    // True once anything has invalidated this identity since the candidate was
-    // formed. Called again after every suspension point below, not once at the
-    // top: each await is a window the generation can move in.
+    // Re-check after suspension points where another task can reuse the sandbox.
     const stale = () => (bgGeneration.get(identity) ?? 0) !== generation;
 
-    void probe(info.handsUrl!, info.token!, sessionId)
+    void reserveProbe(deps, sessionId, identity, token)
+      // Do not send an unreserved probe that another replica cannot see.
+      .then((reserved) => (
+        reserved ? probe(info.handsUrl!, info.token!, sessionId) : undefined
+      ))
       .then(async (running) => {
+        if (running === undefined) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId },
+            "keepalive.background_work_probe_unreserved",
+          );
+          return;
+        }
         if (stale()) {
           logger.info(
             { sessionId, workloadId: info.workloadId },
@@ -551,27 +846,11 @@ function dispatchProbes(
           );
           return;
         }
-        // A live registration outranks the count. `idle` is the only verdict
-        // that suppresses pinging, so it has to mean "nothing is holding this
-        // sandbox" -- and a task that took the pod while the probe was in the
-        // air is holding it, whatever the shell count said. Recording `idle`
-        // here would be believed for the whole TTL, including after the task
-        // ends and markHandsIdle puts the handle back in the idle pool with a
-        // background shell the probe never saw.
+        // A live registration or run lease prevents publishing an idle verdict.
         const held = localRegistry.has(identity)
           || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope).catch(() => false);
 
-        // Re-read, because the lease query is a suspension point and the check
-        // above was made before it. registerSandbox and markHandsIdle both bump
-        // the generation from outside this promise, so a task can take the pod
-        // while the query is outstanding -- and then the `idle` below would be
-        // filed about the previous occupant and believed for the whole cache
-        // TTL. That is the exact failure the generation exists to prevent,
-        // arriving one await later than the guard that was watching for it.
-        //
-        // Guarding the write rather than the question is the general rule here:
-        // any await added between these two points needs the check to stay
-        // immediately before the write, not wherever the await was introduced.
+        // The lease lookup can race with reuse, so validate again before writing.
         if (stale()) {
           logger.info(
             { sessionId, workloadId: info.workloadId },
@@ -587,8 +866,18 @@ function dispatchProbes(
           return;
         }
         const state: BackgroundWork = running > 0 ? "running" : "idle";
-        bgProbeCache.set(identity, { at: Date.now(), state });
+        // A newer shared timestamp would invalidate this probe's local cache.
+        const measuredAt = Date.now();
+        bgProbeCache.set(identity, {
+          at: measuredAt, state, epoch,
+          idleSince: idleSinceAtStart, idleRev: idleRevAtStart,
+        });
         bgUnknownStreak.delete(identity);
+        // Share measured answers; inferred idle remains local to this replica.
+        await persistVerdict(
+          deps, sessionId, identity, running, measuredAt,
+          epoch, idleSinceAtStart, idleRevAtStart, verdictAtStart,
+        );
         if (state === "running") {
           logger.info(
             { sessionId, workloadId: info.workloadId, running },
@@ -598,62 +887,181 @@ function dispatchProbes(
       })
       .catch((err) => {
         if (stale()) return;
-        const streak = (bgUnknownStreak.get(identity) ?? 0) + 1;
-        bgUnknownStreak.set(identity, streak);
+        const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
+        bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
         logger.warn(
           { err: (err as Error)?.message ?? err, sessionId, streak },
           "keepalive.background_work_check_failed",
         );
         if (streak > BG_UNKNOWN_TOLERANCE) {
-          bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
+          bgProbeCache.set(identity, {
+            at: Date.now(),
+            state: "idle",
+            epoch,
+            idleSince: idleSinceAtStart,
+            idleRev: idleRevAtStart,
+            // Local inference uses the longer give-up lifetime.
+            inferred: true,
+            // Reclaim requires a failed probe after the first inference.
+            retested: bgProbeCache.get(identity)?.inferred === true,
+          });
           logger.warn(
             { sessionId, workloadId: info.workloadId, streak },
             "keepalive.background_work_unknown_giving_up",
           );
         }
       })
-      .finally(() => { bgProbeInFlight.delete(identity); });
+      .finally(async () => {
+        bgProbeInFlight.delete(identity);
+        await releaseProbe(deps, sessionId, identity, token);
+      });
   }
   bgProbeCursor = start + started;
+  return started;
+}
+
+/**
+ * Identifies the verdict an entry carried. `rev` is unique per key; `at` keeps
+ * compatibility with verdicts written before `bgRev` existed.
+ */
+interface VerdictWitness {
+  rev?: number;
+  at?: number;
+}
+
+function verdictWitness(info: HandsKvEntry): VerdictWitness {
+  return { rev: info.bgRev, at: info.bgCheckedAt };
+}
+
+/** Whether the entry still carries the witnessed verdict, including no verdict. */
+function sameVerdict(witness: VerdictWitness, info: HandsKvEntry): boolean {
+  return witness.rev === info.bgRev && witness.at === info.bgCheckedAt;
+}
+
+/**
+ * Record a measured background-work answer onto the handle itself.
+ *
+ * Re-read the entry and require the same sandbox identity and idle-period
+ * witnesses. Concurrent `running` verdicts dominate `idle`; only `running`
+ * retries a lost conditional update so write arrival order cannot reverse that
+ * safety rule.
+ */
+async function persistVerdict(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  identity: string,
+  running: number,
+  measuredAt: number,
+  epoch: number | undefined,
+  idleSinceAtStart: number | undefined,
+  idleRevAtStart: number | undefined,
+  verdictAtStart: VerdictWitness,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    // Re-read all guards after contention; `idle` yields after one attempt.
+    let workloadId: string | undefined;
+    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const e = await deps.kv.get(key);
+      if (!e) return;
+      const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      workloadId = info.workloadId;
+      if (entryIdentity(sessionId, info) !== identity) {
+        // Never apply a verdict to a replacement sandbox under the same key.
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_substituted",
+        );
+        return;
+      }
+      // Epoch catches current writers, idleSince catches old writers, and idleRev
+      // prevents same-millisecond ABA. Values are matched, never clock-ordered.
+      if (
+        !sameIdlePeriod(epoch, info)
+        || info.idleSince !== idleSinceAtStart
+        || info.idleRev !== idleRevAtStart
+      ) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_reactivated",
+        );
+        return;
+      }
+      // Do not let an in-flight idle result replace a running verdict published
+      // after this probe started. The witness supports binaries without `bgRev`.
+      if (
+        running === 0
+        && usableSharedVerdict(info)?.state === "running"
+        && !sameVerdict(verdictAtStart, info)
+      ) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId },
+          "keepalive.background_work_answer_superseded",
+        );
+        return;
+      }
+      const next = sc.encode(JSON.stringify({
+        ...info,
+        bgCheckedAt: measuredAt,
+        bgRunning: running,
+        bgEpoch: epoch,
+        bgIdleSince: idleSinceAtStart,
+        bgIdleRev: idleRevAtStart,
+        // The conditioned-on revision uniquely names this verdict write.
+        bgRev: e.revision,
+      }));
+      try {
+        await deps.kv.update(key, next, e.revision);
+        return;
+      } catch {
+        // A running retry re-reads the entry and all guards on the next attempt.
+        logger.info(
+          { sessionId, workloadId, attempt },
+          "keepalive.background_work_answer_write_contended",
+        );
+      }
+    }
+    // Exhausted running retries are reported; an unconditional write could
+    // overwrite a newer reactivation or replacement.
+    if (running > 0) {
+      logger.warn(
+        { sessionId, workloadId, attempts },
+        "keepalive.background_work_answer_write_abandoned",
+      );
+    }
+  } catch {
+    // Missing verdicts read back as `unknown`, which keeps the sandbox.
+  }
 }
 
 /**
  * Move the idle clock forward on a handle whose sandbox is still working.
- *
- * `idleSince` is stamped once, when the task ended, and the reuse window is
- * measured from it. Left alone, a background job that outlasts the window means
- * the handle is already expired the moment the job finishes: the next sweep
- * deletes it, the next message in the session cannot reuse the pod, and whatever
- * the job wrote that has not been synced goes with it. Keeping the stamp at the
- * last moment work was seen gives the session the full window it would have had
- * if the job had never run.
- *
- * Conditional and best-effort, like every other write in this sweep: losing the
- * race means somebody else just wrote the entry, and their value is the newer
- * one.
+ * `idleSince` follows the measurement anchor; `workSeenAt` gives the reuse window
+ * a current local clock. The update is conditional and best-effort.
  */
 async function refreshIdleSince(
   deps: KeepaliveDeps,
   key: string,
   revision: number,
   info: HandsKvEntry,
+  seenAt: number,
 ): Promise<void> {
   try {
-    const next = sc.encode(JSON.stringify({ ...info, idleSince: Date.now() }));
+    // Keep the verdict anchor monotonic and no later than its measurement.
+    const idleSince = Math.max(
+      typeof info.idleSince === "number" ? info.idleSince : 0,
+      seenAt,
+    );
+    // The reuse clock reflects when this sweep acted on the running verdict.
+    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: Date.now() }));
     await deps.kv.update(key, next, revision);
+    // Keep the scan copy aligned for probes dispatched later in this tick.
+    info.idleSince = idleSince;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
-/**
- * Run `fn` over every item, at most `limit` at a time.
- *
- * `Promise.all` over the whole list was fine while an idle handle was never a
- * ping target. It is not any more: an uncached handle answers `unknown`, and
- * `unknown` is pinged, so a cold start turns every handle in the bucket into a
- * simultaneous request -- from each replica, into one connection pool and one
- * control plane. Bounded rather than skipped, because unlike a probe a missed
- * ping is how a sandbox dies.
- */
+/** Run `fn` over every item, at most `limit` at a time. */
 async function forEachWithLimit<T>(
   items: T[],
   limit: number,
@@ -677,6 +1085,7 @@ async function forEachWithLimit<T>(
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
+  stats: TickStats,
 ): Promise<Map<string, RegisteredSandbox>> {
   const targets = new Map<string, RegisteredSandbox>();
   const probeCandidates: Array<{
@@ -707,95 +1116,109 @@ async function collectTargets(
       try {
         const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
         if (info.status && info.status !== "ready") continue;
-        // Post-task idle reuse handle: keep it for reuse but never ping it, so
-        // the pod idles out via the control-plane GC (no extra cost). Refresh
-        // its TTL within the reuse window; expire it afterwards.
-        // An idle handle whose sandbox is still working is not idle. Three
-        // answers, because "no work" and "could not ask" are not the same
-        // question and only one of them is safe to act on:
-        //
-        //   running  ping it, and move the idle clock forward so the reuse
-        //            window starts when the work stops rather than when the
-        //            turn did
-        //   unknown  ping it and refresh the record's TTL, but leave the clock
-        //            alone -- a blip must not decide this, and without the TTL
-        //            write the bucket drops the entry on its own inside the
-        //            tolerance window (both are five minutes)
-        //   idle     the handle really is spare; the expiry below is unchanged
-        //
-        // Read, not asked: the probe runs behind the sweep and leaves its answer
-        // for the next one. Under the identity of the sandbox this entry names,
-        // so the answer cannot outlive the pod it was about.
-        const identity = sandboxRegistryKey(sessionId, {
-          provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
-          workloadId: info.workloadId,
-          sessionId: info.sessionId,
-          sandboxName: info.sandboxName,
-          namespace: info.namespace,
-        });
+        // Idle handles with running or unknown work are pinged; only confirmed
+        // idle handles may expire. Probes run behind the sweep by sandbox identity.
+        const identity = entryIdentity(sessionId, info);
         seenIdentities.add(identity);
-        const bgWork = info.keepalive === false
+        // Give an unstamped idle handle its epoch here, not only in
+        // markHandsIdle. Handles that idled before this shipped never pass
+        // through that function again until their session gets another message,
+        // and until they are stamped no verdict about them can be trusted (see
+        // sameIdlePeriod) -- so without this they would be re-probed on every
+        // sweep for as long as they exist, which is the cost of the strictness
+        // above paid forever rather than once.
+        //
+        // `idleSince` is the value, because that is when the period being
+        // stamped actually began; a fresh timestamp would name a period that
+        // starts in the middle of one. It rides along on whichever write this
+        // tick was already going to make, so it costs no extra round trip.
+        //
+        // `idleRev` is backfilled on the same terms and for the same reason --
+        // a handle with no revision half to its name can hold no witnessed
+        // `idle` verdict, so an unstamped one is re-probed every sweep until it
+        // is stamped. The value is the revision this tick's write is
+        // conditioned on, which is exactly what markHandsIdle records and is
+        // unique for the same reason: one write per revision.
+        let value = e.value;
+        if (info.keepalive === false
+          && (typeof info.idleEpoch !== "number" || typeof info.idleRev !== "number")) {
+          if (typeof info.idleEpoch !== "number") {
+            info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
+          }
+          if (typeof info.idleRev !== "number") info.idleRev = e.revision;
+          value = sc.encode(JSON.stringify(info));
+        }
+        const peeked = info.keepalive === false
           ? peekBackgroundWork(identity, info)
-          : "idle";
+          : { state: "idle" as BackgroundWork, source: null, at: undefined };
+        const bgWork = peeked.state;
+        if (info.keepalive === false) {
+          if (bgWork === "running") stats.bgRunning += 1;
+          else if (bgWork === "unknown") stats.bgUnknown += 1;
+          else stats.bgIdle += 1;
+          if (peeked.source === "mem") stats.fromMem += 1;
+          else if (peeked.source === "handle") stats.fromHandle += 1;
+          else if (peeked.source === "none") stats.fromNone += 1;
+          else if (peeked.source === "no-hands") stats.fromNoHands += 1;
+        }
         if (info.keepalive === false && needsProbe(identity, info)) {
-          // The generation is read here, not at dispatch. The candidate is a
-          // judgement about the handle as this scan found it -- idle, unprobed
-          // -- and dispatch happens after the whole walk, so a registerSandbox
-          // landing in between would bump the generation and then be read as
-          // the generation this candidate was formed under. The answer would
-          // survive a reuse it should have been discarded by.
+          // Capture generation during the scan so reuse before dispatch is visible.
           probeCandidates.push({
             identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0,
           });
         }
         if (info.keepalive === false && bgWork === "running") {
-          await refreshIdleSince(deps, key, e.revision, info);
+          await refreshIdleSince(deps, key, e.revision, info, peeked.at ?? Date.now());
         } else if (info.keepalive === false && bgWork === "unknown") {
-          await deps.kv.update(key, e.value, e.revision).catch(() => {});
+          await deps.kv.update(key, value, e.revision).catch(() => {});
         }
         if (info.keepalive === false && bgWork === "idle") {
-          const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-          const expired = Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
-          // A session this replica is actively running is not idle, whatever
-          // the entry says. The `local wins` short-circuit that used to guard
-          // the whole KV branch was removed so DAG siblings could each be
-          // pinged, and it took this delete's protection with it: a reuse that
-          // failed to clear the markers -- or an entry a sibling wrote while
-          // this one was mid-turn -- now reads as an expired handle, and the
-          // key naming the live workload goes out from under the run.
+          const expired = Date.now() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
+          // Local registrations and fleet run leases both block reclaim.
           if (expired && registeredSandboxCount(sessionId) > 0) {
-            // No TTL refresh needed here: a session this replica has registered
-            // is also a local ping target, and that path re-puts the entry at
-            // the revision it read. Refreshing again would be a second write
-            // per tick for the same effect.
+            // The local ping path refreshes this entry's TTL.
             logger.info(
               { sessionId, workloadId: info.workloadId },
               "keepalive.idle_handle_kept_locally_active",
             );
+            stats.keptLocal += 1;
             continue;
           }
           if (expired && await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
-            // The check above answers "is THIS replica running it", which the
-            // other replicas answer with zero for a session they are not
-            // running. The run lease is the fleet-wide form of the same
-            // question, and without it whichever replica sweeps first deletes
-            // the key naming a workload that is in use.
+            // The run lease protects work owned by another replica.
             logger.info(
               { sessionId, workloadId: info.workloadId },
               "keepalive.idle_handle_kept_run_in_flight",
             );
+            stats.keptRunLease += 1;
+            continue;
+          }
+          if (expired && probeOutstanding(info)) {
+            // Do not reclaim while a fleet-visible answer is still in flight.
+            // The reservation is released on completion or expires by deadline.
+            logger.info(
+              { sessionId, workloadId: info.workloadId },
+              "keepalive.idle_handle_kept_probe_outstanding",
+            );
+            stats.keptProbe += 1;
+            await deps.kv.update(key, value, e.revision).catch(() => {});
             continue;
           }
           if (expired) {
-            await deps.kv.delete(key, { previousSeq: e.revision }).catch(() => {});
-            logger.info({ sessionId, workloadId: info.workloadId }, "keepalive.idle_handle_expired");
+            // Report a reclaim only after the conditional delete succeeds.
+            await deps.kv.delete(key, { previousSeq: e.revision })
+              .then(() => {
+                stats.expired += 1;
+                logger.info(
+                  { sessionId, workloadId: info.workloadId },
+                  "keepalive.idle_handle_expired",
+                );
+              })
+              .catch(() => {});
           } else {
-            // Refresh the TTL only, no ping -- and conditionally, because an
-            // unconditional put bumps the revision that ensureHands is holding
-            // while it reactivates this very handle. Losing the race is the
-            // correct outcome: whoever won either refreshed the same TTL or
-            // took the handle out of idle, and neither wants this write.
-            await deps.kv.update(key, e.value, e.revision).catch(() => {});
+            stats.withinWindow += 1;
+            // Conditional TTL refresh must yield to concurrent reactivation.
+            await deps.kv.update(key, value, e.revision).catch(() => {});
           }
           continue;
         }
@@ -816,13 +1239,7 @@ async function collectTargets(
         };
         if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry)) continue;
 
-        // Renew the record here rather than after the ping it is waiting for.
-        // Pings run bounded and in turn, and one can take its whole command
-        // timeout plus transport slack, so a large enough fleet leaves the tail
-        // of the queue waiting longer than the bucket's own TTL: the handle would
-        // expire before its ping ever arrived, and the sweep guard means no other
-        // sweep is coming to renew it. The revision is already in hand, so this
-        // costs a write and no read.
+        // Renew before queueing so bounded ping concurrency cannot exhaust the TTL.
         await deps.kv.update(key, e.value, e.revision).catch(() => {});
 
         const targetKey = sandboxRegistryKey(sessionId, entry);
@@ -833,9 +1250,8 @@ async function collectTargets(
     logger.warn({ err }, "keepalive.kv_scan_failed");
   }
 
-  // After the walk, not during it: the cap is global and the cursor rotates, so
-  // who gets a slot has to be decided once the candidates are all known.
-  dispatchProbes(deps, probeCandidates);
+  // Dispatch after the full walk so the global cap and rotation are applied fairly.
+  stats.probes += dispatchProbes(deps, probeCandidates);
 
   return targets;
 }
@@ -844,13 +1260,7 @@ async function collectTargets(
  * Periodically exec a no-op inside every active sandbox to refresh the
  * SaFE Workload Manager's lastActivity timestamp, preventing idle GC.
  */
-/**
- * One sweep, exported so its decisions can be tested without an interval.
- *
- * The branch that matters most is the idle-handle expiry: it deletes the only
- * record of a live workload, and the `local wins` short-circuit that used to
- * protect it is gone.
- */
+/** One sweep, exported so its decisions can be tested without an interval. */
 export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void> {
   return tick(deps);
 }
@@ -930,51 +1340,46 @@ export function lastVerdictForTest(sessionId: string): { fails: number; gone: bo
 
 async function tick(deps: KeepaliveDeps): Promise<void> {
   const seenIdentities = new Set<string>();
-  const targets = await collectTargets(deps, seenIdentities);
+  const stats = newTickStats();
+  const targets = await collectTargets(deps, seenIdentities, stats);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
   }
-  // Same for the background-work bookkeeping, which is keyed by sandbox identity
-  // rather than by target: an identity the sweep no longer sees is one nothing
-  // will ask about again, and its cached answer would otherwise outlive the pod
-  // it was about.
-  // Keyed on what the sweep saw, not on what it decided to ping: an `idle`
-  // answer is exactly the case where the handle does not become a target, so
-  // reaping on targets threw away the answer at the end of every tick and asked
-  // again on the next one -- which is the load the cache exists to remove.
-  for (const identity of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
-    if (!seenIdentities.has(identity)) forgetBackgroundWork(identity);
+  // Reap by each verdict's lifetime; absence from one rotating sweep is not stale.
+  const now = Date.now();
+  for (const [identity, cached] of [...bgProbeCache.entries()]) {
+    const floor = now - Math.max(BG_VERDICT_TTL_MS, cachedVerdictTtlMs(cached));
+    if (cached.at < floor) forgetBackgroundWork(identity);
   }
-  // Generations outlive the two maps above on purpose -- a bumped generation is
-  // what discards an in-flight answer, so it has to survive the answer -- but
-  // only that long. forgetBackgroundWork writes an entry every time, including
-  // for identities it is forgetting, so a Brain that has seen a lot of
-  // sandboxes would keep one integer per sandbox it has ever seen, forever.
-  //
-  // With nothing in flight there is no token anyone still holds, so the entry
-  // can go entirely; a later probe under the same identity starts from 0 again
-  // with no stale answer able to match it. An identity still being probed keeps
-  // its entry and is collected on a later sweep.
+  // Failure streaks must also survive rotating sweeps and expire by age.
+  const streakFloor = Date.now() - BG_UNKNOWN_STREAK_TTL_MS;
+  for (const [identity, streak] of [...bgUnknownStreak.entries()]) {
+    if (streak.at < streakFloor) bgUnknownStreak.delete(identity);
+  }
+  // Keep generations through in-flight answers, then discard unseen identities.
   for (const identity of [...bgGeneration.keys()]) {
     if (!seenIdentities.has(identity) && !bgProbeInFlight.has(identity)) {
       bgGeneration.delete(identity);
     }
   }
 
-  if (!targets.size) return;
-
+  // Emit scan stats even when every target was reclaimed before the ping phase.
   const localCount = localRegistry.size;
   const kvOnlyCount = targets.size - localCount;
-  logger.info(
-    { total: targets.size, local: localCount, kvOnly: kvOnlyCount,
-      sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
-    "keepalive.tick_scan",
-  );
+  if (targets.size || seenIdentities.size) {
+    logger.info(
+      { total: targets.size, local: localCount, kvOnly: kvOnlyCount,
+        seen: seenIdentities.size, ...stats,
+        sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
+      "keepalive.tick_scan",
+    );
+  }
 
-  // Rotated, so a sweep that cannot finish does not always give up on the same
-  // tail. Ordering is otherwise insertion order, which is stable across sweeps.
+  if (!targets.size) return;
+
+  // Rotate deferred targets to the front of the next sweep.
   const ordered = [...targets.entries()];
   const pingStart = pingCursor % ordered.length;
   const rotated = ordered.slice(pingStart).concat(ordered.slice(0, pingStart));
@@ -984,9 +1389,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   const failures: KeepaliveFailure[] = [];
 
   await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
-    // Checked as each target is picked up, so this bounds when a ping may
-    // start, not when the phase ends: the pings already running continue past
-    // the deadline. See PING_PHASE_BUDGET_MS.
+    // The deadline bounds ping starts; already-running pings may finish after it.
     if (Date.now() >= pingDeadline) {
       deferred += 1;
       return;
@@ -1043,10 +1446,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
         );
         return;
       }
-      // Collected, not decided here: whether a `gone` may evict depends on how
-      // many OTHER targets reported gone in the same sweep -- more than one is
-      // more likely a shared control-plane fault than simultaneous loss -- and
-      // that is only knowable once the sweep has finished.
+      // Decide `gone` eviction after the sweep reveals any correlated failures.
       failures.push({
         targetKey, sessionId, entry, error: err,
         gone: err?.sandboxGone === true,
@@ -1054,10 +1454,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     }
   });
 
-  // Advance past what was actually pinged, so the deferred tail leads the next
-  // sweep. Reported rather than silent: a sweep that cannot cover the fleet
-  // inside half a TTL is a capacity signal, and the failure it precedes -- a
-  // handle expiring un-pinged -- looks like nothing at all from the outside.
+  // Advance by completed work so the deferred tail leads the next sweep.
   await handleKeepaliveFailures(failures, targets.size);
 
   pingCursor = (pingStart + pinged) % ordered.length;
@@ -1085,23 +1482,14 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
     "keepalive.start",
   );
   runGuardedSweep(deps);
-  // Guarded, because a sweep is not guaranteed to finish inside its interval:
-  // it walks every KV handle serially and can make a network call per idle one.
-  // Overlapping sweeps would double every write in here and race each other's
-  // conditional updates, and the symptom -- handles refreshed twice, others not
-  // at all -- would read as KV flakiness rather than as this.
+  // A sweep may outlast the interval, so interval invocations share the guard.
   timer = setInterval(() => runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
   timer.unref?.();
 }
 
 /**
  * One sweep, never two at once.
- *
- * A sweep is not guaranteed to finish inside its interval -- it walks every KV
- * handle in sequence and writes as it goes -- and overlapping sweeps double
- * every write and race each other's conditional updates. The symptom would be
- * handles refreshed twice and others not at all, which reads as KV flakiness
- * rather than as this.
+ * Overlap would duplicate writes and race conditional updates.
  */
 function runGuardedSweep(deps: KeepaliveDeps): void {
   if (sweeping) {
