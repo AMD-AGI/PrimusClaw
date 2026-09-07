@@ -470,6 +470,91 @@ async function readIdempotency(
   return { statusCode: row.status_code as number, response: row.response };
 }
 
+/**
+ * Put `run_id` back into a cached create response that was written before the
+ * field existed.
+ *
+ * The cache holds a verbatim `{status, response}` for 24h, so for a day after
+ * this deploys a replay can be answered out of an entry a handler wrote when
+ * `data.message.run_id` was not part of the contract. Returning that entry
+ * unchanged answers the replay with a shape the endpoint no longer promises --
+ * and to the caller it is indistinguishable from a create that started no run,
+ * which is the one thing this response is now supposed to settle.
+ *
+ * So the field is resolved rather than replayed: the id comes from the run row
+ * the cached message actually opened, looked up by the message id that is in
+ * the cached response. Nothing is minted here. A create that reached the cache
+ * with a dispatched message has a `claw_tasks` row, and that row's id is the
+ * answer; anything else would be a handle to a run nobody started, which is
+ * worse than the omission it replaces.
+ *
+ * Tenancy is already established by the read that produced the hit:
+ * `readIdempotency` matches on `user_id`, so the session named in the payload
+ * is the caller's own and this lookup cannot reach another tenant's row.
+ *
+ * Two cases leave the response alone on purpose:
+ *
+ * - Anything that is not a 200 create-with-message. Cached 429/503 errors, and
+ *   the no-message create whose `data` carries no `message` block at all, never
+ *   named a run and must not start.
+ * - A message id that resolves to no row. Deleting the session does not take
+ *   the row with it -- teardown cancels it in place, and `claw_tasks` is never
+ *   pruned -- so on a live database this is close to unreachable, and it is
+ *   kept for the entry old enough to have been written before chat turns had
+ *   rows at all. The queued path already establishes what this endpoint means
+ *   by a missing `run_id`: no run to name. Reporting that is honest; inventing
+ *   an id is not.
+ *
+ * Best-effort, like the save side: a lookup that throws leaves the replay
+ * answering exactly what it answered before this existed, because a backfill
+ * failing is not a reason to fail a create the client already completed once.
+ * The cost is that two replays of one key can differ in this field alone while
+ * a transient failure lasts -- the weaker promise, and the right one, because
+ * the alternative is failing a request whose work is already done.
+ */
+async function backfillCachedRunId(
+  client: QueryRunner,
+  hit: IdempotencyHit,
+): Promise<IdempotencyHit> {
+  if (hit.statusCode !== 200) return hit;
+  const response = hit.response as { data?: Record<string, unknown> } | null;
+  const data = response?.data;
+  if (!data || typeof data !== "object") return hit;
+  const message = data.message as Record<string, unknown> | undefined;
+  if (!message || typeof message !== "object") return hit;
+  if (message.run_id !== undefined && message.run_id !== null) return hit;
+  const sessionId = data.session_id;
+  const messageId = message.message_id;
+  if (typeof sessionId !== "string" || typeof messageId !== "string") return hit;
+
+  let runId: string | undefined;
+  try {
+    // One row is expected: a create mints `claw-<ms>` fresh per call
+    // (sessions/dispatch.ts), so the pair is unique on this path -- the rows
+    // that do share a `message_id` are the queued drain's `claw-pending-<id>`
+    // replays, which no create response names. The ordering is a determinism
+    // guard rather than a choice between candidates: whatever the database
+    // holds, every replay of this key gets the same answer.
+    // `idx_tasks_session` backs the scan, and a session holds few runs.
+    runId = (await client.query(
+      `SELECT task_id FROM claw_tasks
+        WHERE session_id = $1 AND origin = 'chat' AND metadata->>'message_id' = $2
+        ORDER BY created_at ASC, task_id ASC
+        LIMIT 1`,
+      [sessionId, messageId],
+    )).rows[0]?.task_id as string | undefined;
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "idempotency.run_id_backfill_failed");
+    return hit;
+  }
+  if (!runId) return hit;
+
+  return {
+    statusCode: hit.statusCode,
+    response: { ...response, data: { ...data, message: { ...message, run_id: runId } } },
+  };
+}
+
 async function saveIdempotency(
   client: QueryRunner,
   userId: string,
@@ -695,7 +780,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             // if it never publishes within the budget.
             for (let i = 0; i < IDEM_BUSY_POLL_TRIES; i++) {
               const busyHit = await readIdempotency(db, userId, route, idemKey);
-              if (busyHit) return { statusCode: busyHit.statusCode, response: busyHit.response };
+              if (busyHit) return await backfillCachedRunId(db, busyHit);
               await sleep(IDEM_BUSY_POLL_MS);
             }
             return {
@@ -709,7 +794,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           }
           const hit = await readIdempotency(idemLock.client, userId, route, idemKey);
           if (hit) {
-            return { statusCode: hit.statusCode, response: hit.response };
+            // Replayed, not re-run -- but a hit written before `run_id` existed
+            // is completed here rather than handed back a field short. See
+            // backfillCachedRunId.
+            return await backfillCachedRunId(idemLock.client, hit);
           }
         }
 
@@ -834,6 +922,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
+              // The run this message opened, which is the handle `/v1/runs`
+              // answers to. Saved with the rest of the response under the
+              // idempotency key, so a replayed create names the same run rather
+              // than sending the caller looking for a second one.
+              run_id: dispatch.runId,
             },
           },
         };
@@ -1164,6 +1257,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           ],
         );
         await client.query("COMMIT");
+        // No `run_id` here, and none invented. What this call accepted is a
+        // queued message; the run row is opened later by the drain, once the
+        // turn in front of it finishes. An id minted now would answer 404 on
+        // `/v1/runs` until then, and would name nothing at all if the replay is
+        // later refused a workspace or its admission. The caller polls the
+        // session until a run appears -- see docs/run-api.md.
         return { ok: true, session_id: sessionId, queued: true };
       }
       // Stash the snapshot for the immediate-dispatch path below — building
@@ -1224,6 +1323,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       session_id: sessionId,
       message_id: dispatch.messageId,
       accepted: true,
+      // Present exactly when this call opened a run row. The queued branch
+      // above returns before this and carries no id on purpose: that message is
+      // in `claw_pending_messages` and no run exists to name yet.
+      run_id: dispatch.runId,
     };
   });
 
