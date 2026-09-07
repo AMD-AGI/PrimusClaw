@@ -11,7 +11,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { constantTimeEquals, verifyScopeCredential, type CredentialScope } from "@claw/utils";
 import { tools } from "./tools/index.js";
 import {
-  shutdownAllShells, shutdownRunShells, runningShellCount, resolveShell,
+  MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, REAP_GRACE_MS,
+  resolveShell, runningShellCount, shutdownAllShells, shutdownRunShells,
 } from "./tools/shell/bg-manager.js";
 import {
   DEADLINE_HEADER, NO_RUN, OWNER_HEADER, RUN_HEADER,
@@ -240,10 +241,48 @@ app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req
   const run = resolved.scope.run;
   if (!run) return reply.status(400).send({ error: "run_required" });
 
-  const stopped = await shutdownRunShells(run);
-  app.log.info({ run, stopped }, "hands.reap_run_shells");
-  return { stopped };
+  // Every action that ends background work carries why, and which operation it
+  // belongs to. Refused rather than defaulted: a reclaim nobody can attribute is
+  // indistinguishable afterwards from work that ended on its own.
+  for (const field of ["cause", "reclaim_op"] as const) {
+    const value = req.body?.[field];
+    if (typeof value !== "string" || !value) {
+      return reply.status(400).send({ error: "cause_required", field });
+    }
+  }
+  const grace = reapGrace(req.body?.grace_ms);
+  if (grace === null) {
+    // Never clamped: a silently shortened grace destroys work about to flush,
+    // and a lengthened one stalls a terminal path.
+    return reply.status(400).send({
+      error: "grace_out_of_range",
+      field: "grace_ms",
+      accepted: `integer milliseconds in [${MIN_REAP_GRACE_MS}, ${MAX_REAP_GRACE_MS}]`,
+    });
+  }
+
+  const report = await shutdownRunShells(run, grace);
+  app.log.info(
+    {
+      run,
+      cause: req.body?.cause,
+      reclaimOp: req.body?.reclaim_op,
+      graceMs: grace,
+      stopped: report.stopped,
+      escalated: report.escalated,
+      surviving: report.surviving,
+    },
+    "hands.reap_run_shells",
+  );
+  return report;
 });
+
+/** The effective grace, or null where the caller named one outside the domain. */
+function reapGrace(raw: unknown): number | null {
+  if (raw === undefined) return REAP_GRACE_MS;
+  if (typeof raw !== "number" || !Number.isInteger(raw)) return null;
+  return raw >= MIN_REAP_GRACE_MS && raw <= MAX_REAP_GRACE_MS ? raw : null;
+}
 
 /**
  * Take the background shells down with us.

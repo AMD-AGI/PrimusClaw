@@ -52,11 +52,13 @@ test("the active-shells route answers with the feature off", async () => {
 });
 
 test("the reap route answers with the feature off", async () => {
-  const res = await post("/internal/shells/reap", proving("sess-off", "run-off"));
+  const res = await post("/internal/shells/reap", proving("sess-off", "run-off"), {
+    cause: "sandbox_replaced", reclaim_op: "rollback-1:sandbox_replaced",
+  });
 
   assert.equal(res.statusCode, 200,
     "the rollback's termination path is unreachable with the flag off");
-  assert.deepEqual(res.json(), { stopped: 0 });
+  assert.deepEqual(res.json(), { stopped: 0, escalated: 0, surviving: 0, shells: [] });
 });
 
 test("both routes still authenticate with the feature off", async () => {
@@ -79,7 +81,9 @@ test("both routes still bind their scope to the credential with the feature off"
 
   // A credential proving no run identity authorises no reap: that bucket holds
   // every shell started without one, which nothing may end by run.
-  const reap = await post("/internal/shells/reap", proving("sess-off"));
+  const reap = await post("/internal/shells/reap", proving("sess-off"), {
+    cause: "sandbox_replaced", reclaim_op: "rollback-1:sandbox_replaced",
+  });
   assert.equal(reap.statusCode, 400);
   assert.equal(reap.json().error, "run_required");
 

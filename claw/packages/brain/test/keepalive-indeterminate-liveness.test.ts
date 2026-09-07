@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * "The unanswered probe keeps the sandbox" has to stay true past five ticks.
+ * "The unanswered probe keeps the sandbox" has to stay true at every streak
+ * length.
  *
- * A probe that never arrives is a blip, and giving up on it eventually is
- * right: a sandbox that has stopped answering entirely would otherwise be
- * pinned to its absolute deadline. A sandbox that answers and says it cannot
- * read its own durable state is a different fact, and it does not become "idle"
- * by being repeated -- repeating it is precisely the sandbox whose records were
- * lost, which is where the orphaned work lives.
+ * Both shapes of unanswered probe -- one that never arrives, and one that
+ * arrives saying the sandbox cannot read its own durable state -- are the same
+ * fact for this decision: nobody established what is running there. Repeating
+ * either is not evidence of an empty sandbox; a sandbox whose records were lost
+ * is precisely where the orphaned work lives. What a long streak buys is a
+ * report an operator can act on, never a licence to reclaim.
  *
- * Driven over enough sweeps to pass the give-up threshold, because the bug is
- * what happens after it.
+ * Driven over enough sweeps to pass the reporting threshold several times, both
+ * because that is where the bug was and because the pod must still be there.
  */
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -94,13 +95,15 @@ test("a sandbox that says it cannot tell is never given up on", async () => {
       + "read my own records' into 'nothing is running here'");
 });
 
-test("a probe that simply never arrives is still given up on", async () => {
-  // The other half, and why the two are kept apart: a sandbox that has stopped
-  // answering entirely must not be pinned to its absolute deadline.
+test("a probe that simply never arrives is not given up on either", async () => {
+  // The two shapes were kept apart on the theory that a transport failure
+  // repeated long enough means an empty sandbox. It does not: it means nobody
+  // asked and got an answer, and reclaiming on it destroys whatever was running
+  // in exactly the sandbox least able to say so.
   await sweep(async () => { throw new Error("ETIMEDOUT"); });
 
-  assert.ok(!values.has(KEY),
-    "a transport blip repeated long enough is a sandbox nobody is using");
+  assert.ok(values.has(KEY),
+    "an unanswered probe was converted into an idle verdict by repetition");
 });
 
 test("a sandbox that answers with live work keeps its handle", async () => {

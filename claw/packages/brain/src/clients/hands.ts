@@ -35,7 +35,7 @@ export interface CallContext {
 }
 import { bgRowStore } from "../sandbox/bg-row-store.js";
 import {
-  BG_SHELL_ENABLED, BRAIN_CHECKPOINT_KEY, BRAIN_ID,
+  BG_SHELL_ENABLED, BG_SHELL_REAP_GRACE_MS, BRAIN_CHECKPOINT_KEY, BRAIN_ID,
   HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS,
 } from "../config.js";
 import {
@@ -313,6 +313,39 @@ export class HandsLivenessIndeterminate extends Error {}
 export const HANDS_LIVENESS_INDETERMINATE = "shell_liveness_indeterminate";
 
 /** What one dispatch answers with, whichever route asked. */
+/**
+ * Why background work was ended. A closed vocabulary: a reclaim nobody can
+ * attribute is indistinguishable afterwards from work that ended on its own.
+ */
+export type ReclaimCause =
+  | "dag_node_terminal"
+  | "run_cancelled"
+  | "operator_kill_shell"
+  | "sandbox_idle_reclaim"
+  | "sandbox_absolute_deadline"
+  | "sandbox_replaced"
+  | "retry_pending_unregistered"
+  | "session_cleanup";
+
+export interface ReapedShell {
+  shell_id: string;
+  owner_scope: string;
+  run_identity: string;
+  outcome: "stopped" | "escalated" | "surviving";
+  signalled_at: string;
+}
+
+/** Disjoint tallies of one outcome per addressed shell, never signal counts. */
+export interface ReapReport {
+  stopped: number;
+  escalated: number;
+  surviving: number;
+  shells: ReapedShell[];
+}
+
+/** Transport and scheduling slack on top of the grace the caller asked for. */
+const REAP_TRANSPORT_OVERHEAD_MS = 15_000;
+
 /** What a classification read answered, or the safe reading when it could not. */
 export interface ShellClassProbe {
   shellClass: string;
@@ -969,18 +1002,26 @@ export class HandsClient {
    * means this works when the MCP transport was never opened, which is the
    * common case for a run that ended without touching a sandbox.
    */
-  async reapShells(timeoutMs = 15_000): Promise<number> {
-    if (!this.run) return 0;
+  async reapShells(cause: ReclaimCause, reclaimOp: string, graceMs = BG_SHELL_REAP_GRACE_MS): Promise<ReapReport> {
+    if (!this.run) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
     const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
       method: "POST",
       headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
-      body: JSON.stringify({}),
-      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify({ cause, reclaim_op: reclaimOp, grace_ms: graceMs }),
+      // Derived from the grace rather than fixed beside it: a deadline chosen
+      // independently leaves the top of the grace domain unusable end to end,
+      // the client aborting before the escalation it asked for has reported.
+      signal: AbortSignal.timeout(graceMs + REAP_TRANSPORT_OVERHEAD_MS),
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
     if (!resp.ok) throw new Error(`hands_reap_failed: status=${resp.status}`);
-    const body = await resp.json() as { stopped?: number };
-    return body?.stopped ?? 0;
+    const body = await resp.json() as Partial<ReapReport>;
+    return {
+      stopped: body?.stopped ?? 0,
+      escalated: body?.escalated ?? 0,
+      surviving: body?.surviving ?? 0,
+      shells: body?.shells ?? [],
+    };
   }
 
   async listTools(): Promise<string[]> {

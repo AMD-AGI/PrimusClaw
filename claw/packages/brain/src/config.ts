@@ -1605,6 +1605,21 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
 export const BASH_FOREGROUND_DEFAULT_SEC = envInt("BASH_DEFAULT_TIMEOUT_SEC", 120);
 
 /**
+ * How long a reaped background shell is given between the signal and the
+ * escalation.
+ *
+ * Brain decides and the sandbox executes: this value is carried on every reap
+ * request rather than left to the sandbox's own default, so the client deadline
+ * -- which is derived from it -- and the grace the sandbox actually waits are
+ * the same number. Bounded because both ends of the range are failures: below
+ * the floor, work about to flush is destroyed; above the ceiling, a terminal
+ * path stalls behind a shell that will never leave.
+ */
+export const BG_SHELL_REAP_GRACE_MS = envInt(
+  "BG_SHELL_REAP_GRACE_MS", 2_000, { min: 250, max: 60_000 },
+);
+
+/**
  * The ceiling on one `wait` call, mirroring Hands' WAIT_MAX_SEC.
  *
  * Far longer than the foreground ceiling, and deliberately so: a wait is not

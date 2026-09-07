@@ -465,10 +465,10 @@ const BG_PROBE_TTL_MS = 5 * 60_000;
 /**
  * Consecutive unanswered probes before a handle is treated as idle after all.
  *
- * `unknown` holds the handle, which is right for a blip and wrong forever: a
- * sandbox that has stopped answering entirely would otherwise be pinned until
- * its absolute deadline. Five ticks is long enough that no single failure
- * decides anything and short enough that a dead sandbox is not held for hours.
+ * `unknown` holds the handle at every streak length: a sandbox nobody can read
+ * is not a sandbox with nothing in it, and only the second may release a
+ * container. Past this many ticks the handle is reported unreconciled, so an
+ * operator sees a sandbox pinned to its absolute deadline rather than a silence.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
 
@@ -799,10 +799,14 @@ function dispatchProbes(
           "keepalive.background_work_check_failed",
         );
         if (streak > BG_UNKNOWN_TOLERANCE) {
-          bgProbeCache.set(identity, { at: Date.now(), state: "idle" });
-          logger.warn(
+          // Reported, never converted. A run of unanswered probes is a sandbox
+          // nobody can read, which is not the same fact as a sandbox with
+          // nothing in it -- and only the second may release a container. The
+          // handle stays unreconciled until something answers or its absolute
+          // deadline ends it.
+          logger.error(
             { sessionId, workloadId: info.workloadId, streak },
-            "keepalive.background_work_unknown_giving_up",
+            "keepalive.background_work_unreconciled",
           );
         }
       })
@@ -833,7 +837,7 @@ async function refreshIdleSince(
   info: HandsKvEntry,
 ): Promise<void> {
   try {
-    const next = sc.encode(JSON.stringify({ ...info, idleSince: Date.now() }));
+    const next = sc.encode(JSON.stringify({ ...info, idleSince: (deps.now ?? Date.now)() }));
     await deps.kv.update(key, next, revision);
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
@@ -974,14 +978,16 @@ async function collectTargets(
             identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0,
           });
         }
-        if (info.keepalive === false && bgWork === "running") {
+        if (info.keepalive === false && (bgWork === "running" || bgWork === "unknown")) {
+          // An unknown resets the clock exactly as a running answer does. A TTL
+          // refresh alone leaves the clock running through the whole unanswered
+          // stretch, so one confirmed zero afterwards expires a handle whose
+          // idleness was never observed across the window it is expired on.
           await refreshIdleSince(deps, key, e.revision, info);
-        } else if (info.keepalive === false && bgWork === "unknown") {
-          await deps.kv.update(key, e.value, e.revision).catch(() => {});
         }
         if (info.keepalive === false && bgWork === "idle") {
           const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-          const expired = Date.now() - idleSince > SANDBOX_IDLE_REUSE_MS;
+          const expired = (deps.now ?? Date.now)() - idleSince > SANDBOX_IDLE_REUSE_MS;
           // A session this replica is actively running is not idle, whatever
           // the entry says. The `local wins` short-circuit that used to guard
           // the whole KV branch was removed so DAG siblings could each be

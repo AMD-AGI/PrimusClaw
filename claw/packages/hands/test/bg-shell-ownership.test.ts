@@ -143,7 +143,7 @@ test("a finished run takes its own shells and leaves its neighbour's", async () 
   const mine = spawnBackground(ALICE, RUN_1, "sleep 60", "mine").shell!;
   const sibling = spawnBackground(ALICE, RUN_2, "sleep 60", "sibling").shell!;
 
-  assert.equal(await shutdownRunShells(RUN_1, 200), 1);
+  assert.equal((await shutdownRunShells(RUN_1, 250)).shells.length, 1);
   assert.ok(await until(() => mine.status !== "running"));
   assert.equal(sibling.status, "running",
     "shells are reaped by run, so an unrelated run under the same owner survives");
@@ -154,7 +154,7 @@ test("a finished run takes its own shells and leaves its neighbour's", async () 
 test("reaping a run that started nothing is not an error", async () => {
   // Most runs never spawn a shell, and Brain reaps unconditionally at the end of
   // every one rather than tracking which ones did.
-  assert.equal(await shutdownRunShells("ktsk_never_spawned", 10), 0);
+  assert.equal((await shutdownRunShells("ktsk_never_spawned", 250)).shells.length, 0);
 });
 
 test("an unclaimed shell is not reaped by every run that ends", async () => {
@@ -163,7 +163,7 @@ test("an unclaimed shell is not reaped by every run that ends", async () => {
   // processes it never started.
   const orphan = spawnBackground(ALICE, "", "sleep 60", "orphan").shell!;
 
-  assert.equal(await shutdownRunShells("", 10), 0);
+  assert.equal((await shutdownRunShells("", 250)).shells.length, 0);
   assert.equal(orphan.status, "running", "only shutdown may take an unclaimed shell");
 
   killShell(ALICE, "", "orphan");
@@ -236,7 +236,7 @@ test("a reaped run stops counting, which is how a finished DAG node releases the
   spawnBackground(ALICE, RUN_2, "sleep 60", "survivor");
   assert.equal(runningShellCount(ALICE), 2);
 
-  assert.equal(await shutdownRunShells(RUN_1, 200), 1);
+  assert.equal((await shutdownRunShells(RUN_1, 250)).shells.length, 1);
   assert.ok(await until(() => mine.status !== "running"));
   assert.ok(await until(() => runningShellCount(ALICE) === 1),
     "the reaped run leaves the count, the sibling keeps the sandbox alive");

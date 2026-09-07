@@ -46,6 +46,21 @@ const BG_SHELL_BUFFER_BYTES = parseInt(process.env.BG_SHELL_BUFFER_BYTES || "104
 /** Grace period between a background shell exiting and being removed from the
  *  registry. Lets the watchdog deliver the completion notification first. */
 const BG_SHELL_REAP_DELAY_MS = parseInt(process.env.BG_SHELL_REAP_DELAY_MS || "60000", 10);
+/**
+ * How long a reaped shell is given between the signal and the escalation.
+ *
+ * Brain decides and Hands executes: a caller may override it per request, and
+ * this is the value that applies when none does. One knob, so a second
+ * unexplained grace constant cannot drift away from it.
+ */
+export const REAP_GRACE_MS = clampedGrace(process.env.BG_SHELL_REAP_GRACE_MS);
+export const MIN_REAP_GRACE_MS = 250;
+export const MAX_REAP_GRACE_MS = 60_000;
+
+function clampedGrace(raw: string | undefined): number {
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 250 && value <= 60_000 ? value : 2_000;
+}
 
 export type BgShellKind = Extract<ManagedShellKind, "background" | "monitor">;
 export type BgShellStatus = ManagedShellStatus;
@@ -476,38 +491,86 @@ export function listRunningShells(owner: string): string[] {
   return runningShells().filter((e) => e.owner === owner).map((e) => e.shell.id);
 }
 
+/** What one addressed shell actually reached, once the escalation completed. */
+export type ReapOutcome = "stopped" | "escalated" | "surviving";
+
+export interface ReapedShell {
+  shell_id: string;
+  owner_scope: string;
+  run_identity: string;
+  outcome: ReapOutcome;
+  signalled_at: string;
+}
+
+export interface ReapReport {
+  stopped: number;
+  escalated: number;
+  surviving: number;
+  shells: ReapedShell[];
+}
+
 /**
- * SIGTERM a set of shells, wait out the grace period, SIGKILL what is left.
+ * SIGTERM a set of shells, wait out one shared grace window, SIGKILL what is
+ * left, and report what each one actually reached.
  *
- * Resolves only after the escalation so a caller that is about to exit, or about
- * to report a run finished, knows the processes are actually gone rather than
- * merely asked to leave. `reason` names the log events so the two callers stay
- * distinguishable in the shell log.
+ * The counts are disjoint tallies of a per-shell outcome, not counts of what was
+ * signalled: a shell that ignored both signals is `surviving`, which is the
+ * honest answer and the one a caller about to report a run finished needs. One
+ * window for the whole set rather than a serial wait per shell, so a wide reap
+ * costs one grace rather than N.
  */
 async function terminateShells(
   running: BgEntry[],
   graceMs: number,
   reason: "shutdown" | "run_end",
-): Promise<number> {
-  if (running.length === 0) return 0;
+): Promise<ReapReport> {
+  const report: ReapReport = { stopped: 0, escalated: 0, surviving: 0, shells: [] };
+  if (running.length === 0) return report;
 
+  const signalledAt = new Date().toISOString();
   for (const { shell } of running) {
     terminateManagedProcess(shell, "SIGTERM");
     logShellEvent(`shell.background.${reason}_terminate`, shell);
   }
 
-  await new Promise<void>((resolve) => {
-    const t = setTimeout(resolve, graceMs);
-    t.unref?.();
-  });
+  await sleepUnref(graceMs);
 
-  for (const { shell } of running) {
-    if (shell.status === "running") {
-      terminateManagedProcess(shell, "SIGKILL");
-      logShellEvent(`shell.background.${reason}_kill`, shell);
+  const escalated: BgEntry[] = [];
+  for (const entry of running) {
+    if (entry.shell.status === "running") {
+      terminateManagedProcess(entry.shell, "SIGKILL");
+      logShellEvent(`shell.background.${reason}_kill`, entry.shell);
+      escalated.push(entry);
     }
   }
-  return running.length;
+  // The escalated signal is not the same fact as the process being gone, and
+  // reporting it as one is how a reap came to answer `stopped` for a shell that
+  // ignored SIGKILL. Read again after a short settle, and say `surviving` where
+  // termination is still not established.
+  if (escalated.length > 0) await sleepUnref(Math.min(graceMs, 1_000));
+
+  for (const entry of running) {
+    const wasEscalated = escalated.includes(entry);
+    const outcome: ReapOutcome = entry.shell.status === "running"
+      ? "surviving"
+      : wasEscalated ? "escalated" : "stopped";
+    report[outcome] += 1;
+    report.shells.push({
+      shell_id: entry.shell.id,
+      owner_scope: entry.owner,
+      run_identity: entry.run,
+      outcome,
+      signalled_at: signalledAt,
+    });
+  }
+  return report;
+}
+
+function sleepUnref(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
 }
 
 /**
@@ -524,8 +587,8 @@ async function terminateShells(
  * Resolves once the grace period has passed and stragglers have been SIGKILLed,
  * so the caller can exit knowing it did what it could.
  */
-export async function shutdownAllShells(graceMs = 2000): Promise<number> {
-  return terminateShells(runningShells(), graceMs, "shutdown");
+export async function shutdownAllShells(graceMs = REAP_GRACE_MS): Promise<number> {
+  return (await terminateShells(runningShells(), graceMs, "shutdown")).shells.length;
 }
 
 /**
@@ -586,10 +649,10 @@ export function runningShellCount(owner: string): number | null {
  * A run that started nothing is not an error -- most runs never spawn a shell --
  * so this reports zero rather than refusing.
  */
-export async function shutdownRunShells(run: string, graceMs = 2000): Promise<number> {
+export async function shutdownRunShells(run: string, graceMs = REAP_GRACE_MS): Promise<ReapReport> {
   // NO_RUN would otherwise match every shell spawned without a run header, which
   // is precisely the set nothing is entitled to reap.
-  if (!run) return 0;
+  if (!run) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
   return terminateShells(
     runningShells().filter((e) => e.run === run),
     graceMs,

@@ -628,12 +628,19 @@ test("a parked handle that expires gives its slot back", async () => {
   kv.seed("hands.sess-park", retained("wl-park"));
 
   // The background-work probe answers a tick behind, so the idle verdict this
-  // expiry depends on lands on a later sweep than the one that asks for it.
+  // expiry depends on lands on a later sweep than the one that asks for it --
+  // and the clock restarts at every answer that is not a confirmed zero, so the
+  // window has to pass after that verdict rather than before it.
+  let clock = Date.now();
   for (let i = 0; i < 3; i++) {
     await runKeepaliveTickForTest({
-      kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+      kv,
+      countActiveShells: async () => 0,
+      roster: { store: rosterStore(kv), config: CONFIG },
+      now: () => clock,
     });
     await new Promise((r) => setImmediate(r));
+    clock += 2 * 60 * 60 * 1000;
   }
 
   assert.ok(!values.has("hands.sess-park"), "the parked handle should have expired");

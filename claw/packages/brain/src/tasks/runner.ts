@@ -13,7 +13,7 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { NatsEmitter } from "../events/emitter.js";
-import { HandsClient, isHandsNetworkError } from "../clients/hands.js";
+import { HandsClient, isHandsNetworkError, type ReclaimCause } from "../clients/hands.js";
 import {
   syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
@@ -1816,21 +1816,42 @@ class TaskRunner {
    * and the release is the run's last chance to reach them, so the flag is set
    * where the answer came back rather than where the attempt was made.
    */
-  private async reapBackgroundShells(): Promise<void> {
+  private async reapBackgroundShells(cause?: ReclaimCause): Promise<void> {
+    // A DAG node's shells have nobody left to read them once the node reports;
+    // a conversation's are expected to outlive the turn, so its terminal state
+    // reclaims nothing. Cancellation is the exception on both: the run is over
+    // by the user's decision, whichever kind it is.
     const isDagNode = !!(this.request.dag_root_task_id || this.request.dag_node_id);
-    if (this.shellsReaped || !isDagNode || !this.hands) return;
+    const reason: ReclaimCause | null = cause ?? (isDagNode ? "dag_node_terminal" : null);
+    if (this.shellsReaped || !reason || !this.hands) return;
+    // Names the operation this reap belongs to, so every shell it ends is
+    // attributable to one decision rather than to a class of them.
+    const reclaimOp = `${this.request.task_id ?? this.sessionId}:${reason}`;
     try {
-      const stopped = await this.hands.reapShells();
+      const report = await this.hands.reapShells(reason, reclaimOp);
       this.shellsReaped = true;
-      if (stopped > 0) {
-        logger.info(
-          { sessionId: this.sessionId, taskId: this.request.task_id, stopped },
+      if (report.shells.length > 0) {
+        // `surviving` is the honest half: a shell that ignored both signals is
+        // still running, and reporting the addressed count as stopped is how a
+        // run came to be reported finished over work that had not ended.
+        const log = report.surviving > 0 ? logger.warn : logger.info;
+        log.call(
+          logger,
+          {
+            sessionId: this.sessionId,
+            taskId: this.request.task_id,
+            cause: reason,
+            reclaimOp,
+            stopped: report.stopped,
+            escalated: report.escalated,
+            surviving: report.surviving,
+          },
           "task.background_shells_reaped",
         );
       }
     } catch (e) {
       logger.warn(
-        { err: (e as Error)?.message ?? e, sessionId: this.sessionId, taskId: this.request.task_id },
+        { err: (e as Error)?.message ?? e, sessionId: this.sessionId, taskId: this.request.task_id, cause: reason },
         "task.background_shells_reap_failed",
       );
     }
@@ -2889,6 +2910,9 @@ class TaskRunner {
         runtimeSecrets(this.request, this.platformKey),
       ),
     );
+    // Cancellation ends the run whichever kind it is, so its shells go with it
+    // -- a conversation's survive its turns, never its cancellation.
+    await this.reapBackgroundShells("run_cancelled");
     await this.releaseAfterTerminal();
     await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
   }
