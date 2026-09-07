@@ -36,12 +36,15 @@ before(async () => {
 after(async () => { await harness?.stop(); });
 
 describe("promotion pages past a prefix that cannot fit", { skip }, () => {
-  test("a ready row behind two oversized ones is still promoted", async () => {
+  test("a ready row behind twenty oversized ones is still promoted", async () => {
     await harness.app.db.db.query("DELETE FROM claw_tasks");
     const q = await harness.connect();
     await seedRun(q, { taskId: "dep", sessionId: "s-drain", status: "completed" });
-    // Priority orders the page: the two that can never fit come first.
-    for (const [id, gpu, priority] of [["big-1", 99, 9], ["big-2", 99, 8], ["small", 1, 1]] as const) {
+    const candidates = [
+      ...Array.from({ length: 20 }, (_, i) => [`big-${i}`, 99, 100 - i] as const),
+      ["small", 1, 1] as const,
+    ];
+    for (const [id, gpu, priority] of candidates) {
       await q.query(
         `INSERT INTO claw_tasks
            (task_id, session_id, name, status, origin, executor, input, metadata, depends_on, priority, created_at)
@@ -122,5 +125,27 @@ describe("the soft ceiling declines to hand a queued row to a worker", { skip },
     const q = await harness.connect();
     await seedRun(q, { taskId: "waiting-2", sessionId: "s-drain", status: "queued" });
     assert.equal(await harness.app.admission.deferQueuedBySoftCeiling("waiting-2"), false);
+  });
+
+  test("a parked external run stays committed and is gated when it resumes", async () => {
+    await harness.app.db.db.query("DELETE FROM claw_tasks");
+    const q = await harness.connect();
+    await seedRun(q, {
+      taskId: "parked", sessionId: "s-drain", status: "waiting_external", sandbox: true,
+    });
+    await q.query(
+      "UPDATE claw_tasks SET metadata = jsonb_build_object('derived', jsonb_build_object('external_id', 'ext-1')) WHERE task_id = 'parked'",
+    );
+
+    const before = await harness.app.admission.loadUsage();
+    assert.deepEqual(
+      [before.runRoots, before.executingRoots, before.sandboxes, before.executingSandboxes],
+      [1, 0, 1, 0],
+    );
+
+    const { resumeFromExternal } = await import("../src/tasks/external-resolver.js");
+    assert.equal(await resumeFromExternal("ext-1"), 1);
+    await seedRun(q, { taskId: "running-3", sessionId: "s-drain", status: "running" });
+    assert.equal(await harness.app.admission.deferQueuedBySoftCeiling("parked"), true);
   });
 });

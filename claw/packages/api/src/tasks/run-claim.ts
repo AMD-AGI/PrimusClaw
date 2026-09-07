@@ -199,7 +199,8 @@ export async function claimNextRun(
   diag?: ClaimNextDiagnostics,
 ): Promise<ClaimedRun | null> {
   const skip: string[] = [];
-  for (let i = 0; i < CLAIM_NEXT_ATTEMPTS; i++) {
+  let failedAttempts = 0;
+  while (failedAttempts < CLAIM_NEXT_ATTEMPTS) {
     const taskId = await peekNextQueued(skip, doorbellSemantics);
     if (!taskId) {
       if (diag) diag.outcome = skip.length ? "all_skipped" : "empty";
@@ -219,11 +220,14 @@ export async function claimNextRun(
       logger.warn({ err, taskId, brainId }, "run.claim_next.skipped_after_error");
       diag?.skipped.push({ cause: "error" });
       skip.push(taskId);
+      failedAttempts++;
       continue;
     }
     if (typeof claimed === "string" || "kind" in claimed) {
-      diag?.skipped.push(skipCauseOf(claimed));
+      const cause = skipCauseOf(claimed);
+      diag?.skipped.push(cause);
       skip.push(taskId);
+      if (cause.cause !== "deferred") failedAttempts++;
       continue;
     }
     if (diag) diag.outcome = "claimed";
