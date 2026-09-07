@@ -27,8 +27,9 @@ import { registry } from "../src/infra/metrics.js";
 import type { UserInfo } from "../src/auth/models.js";
 import { registerSessionRoutes } from "../src/routes/sessions.js";
 import { registerAnthropicManagedAgentsRoutes } from "../src/routes/anthropic-managed-agents.js";
+import type { AdmissionDecision } from "../src/tasks/admission.js";
 import { startHarness, seedSession, type Harness } from "./scenario-harness.js";
-import { closedDoorbellBarrier } from "./doorbell-barrier-stub.js";
+import { closedDoorbellBarrier, openDoorbellBarrier } from "./doorbell-barrier-stub.js";
 
 const OWNER: UserInfo = {
   userId: "u-1", userName: "u-1", roles: ["default"], platformKey: "pk", virtualKey: "vk-u-1",
@@ -127,6 +128,30 @@ async function settledPublishFailure(): Promise<void> {
   };
 }
 
+async function managedEventWithAdmission(
+  decision: AdmissionDecision,
+): Promise<{ response: Awaited<ReturnType<FastifyInstance["inject"]>>; events: Record<string, unknown>[] }> {
+  const sessionDispatchPorts = await freshPorts();
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => decision;
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.publishTask = async () => 1;
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  const app = await appAs(registerAnthropicManagedAgentsRoutes);
+  try {
+    const response = await app.inject({
+      method: "POST", url: "/anthropic/v1/sessions/s1/events",
+      payload: { events: [{ type: "user.message", content: [{ type: "text", text: "hello" }] }] },
+    });
+    const events = await h.sql(
+      "SELECT event_id, event, data FROM claw_session_events ORDER BY id",
+    );
+    return { response, events };
+  } finally {
+    await app.close();
+  }
+}
+
 const createdOk = async (): Promise<number> => {
   const text = await registry.metrics();
   for (const line of text.split("\n")) {
@@ -205,6 +230,34 @@ test("the managed-agents event route answers 503 and keeps the gate too", async 
   } finally {
     await app.close();
   }
+});
+
+test("a managed-agent rejection records no event saying the turn started", async () => {
+  const { response, events } = await managedEventWithAdmission({
+    kind: "reject", reason: "runs_hard_limit",
+  });
+
+  assert.equal(response.statusCode, 429);
+  assert.deepEqual(events, []);
+  assert.equal((await sessionRows())[0].agent_status, "idle");
+});
+
+test("a managed-agent deferral records the message but not a running event", async () => {
+  const { response, events } = await managedEventWithAdmission({ kind: "queue", position: 1 });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(events.map((event) => event.event), ["UserMessage"]);
+});
+
+test("a managed-agent dispatch records one stable running event after admission", async () => {
+  const { response, events } = await managedEventWithAdmission({ kind: "admit" });
+
+  assert.equal(response.statusCode, 200);
+  const messageId = response.json().data[0].id as string;
+  const running = events.find((event) => event.event === "AnthropicSessionRunning");
+  assert.ok(running);
+  assert.equal(running.event_id, `claw-running-${messageId}`);
+  assert.equal((running.data as { message_id: string }).message_id, running.event_id);
 });
 
 test("the session an unknown publish keeps is counted as a creation", async () => {

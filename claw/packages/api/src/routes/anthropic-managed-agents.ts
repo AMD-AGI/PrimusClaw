@@ -1229,25 +1229,6 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       return reply.send({ data: [sentEvent] });
     }
 
-    // session.status_running (P1, design doc §7.1): no native Brain event
-    // exists for "turn started" — synthesize one at the same dispatch moment
-    // the DB flips to agent_status='running', persisted+published the same
-    // way dispatchTaskToBrain does for UserMessage so history replay and live
-    // tailing both see it through the one mapPrimusEventToAnthropic() path.
-    try {
-      const runningId = `claw-running-${Date.now()}`;
-      const runningEvt = { type: "AnthropicSessionRunning", message_id: runningId, data: {} };
-      await db.query(
-        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
-        [runningId, sessionId, "AnthropicSessionRunning", runningEvt],
-      );
-      const { sc: natsCodec, nc: natsConn } = await import("../infra/nats.js");
-      const { eventSubject } = await import("@claw/protocol");
-      natsConn.publish(`sse.${eventSubject(sessionId)}`, natsCodec.encode(JSON.stringify(runningEvt)));
-    } catch (err) {
-      logger.warn({ err, sessionId }, "anthropic.session_status_running.publish_failed");
-    }
-
     const dispatch = await dispatchTaskToBrain(
       {
         sessionId, userId, user,
@@ -1277,6 +1258,21 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     }
     if (dispatch.kind === "rejected") {
       return sendError(reply, 429, "rate_limit_error", dispatch.reason);
+    }
+    if (dispatch.kind === "dispatched") {
+      const runningId = `claw-running-${dispatch.messageId}`;
+      const runningEvt = { type: "AnthropicSessionRunning", message_id: runningId, data: {} };
+      try {
+        await db.query(
+          "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
+          [runningId, sessionId, "AnthropicSessionRunning", runningEvt],
+        );
+        const { sc: natsCodec, nc: natsConn } = await import("../infra/nats.js");
+        const { eventSubject } = await import("@claw/protocol");
+        natsConn.publish(`sse.${eventSubject(sessionId)}`, natsCodec.encode(JSON.stringify(runningEvt)));
+      } catch (err) {
+        logger.warn({ err, sessionId }, "anthropic.session_status_running.publish_failed");
+      }
     }
 
     return reply.send({ data: [{ ...sentEvent, id: dispatch.messageId }] });
