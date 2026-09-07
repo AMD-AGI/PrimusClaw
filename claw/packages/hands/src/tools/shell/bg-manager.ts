@@ -688,19 +688,6 @@ export function runningShellCount(owner: string): number | null {
   return Math.max(inMemory, liveness.active);
 }
 
-/**
- * Stop the shells one finished run started, leaving the rest of the owner alone.
- *
- * A batch node's dev server has no one left to read it once the node reports a
- * result, and the sandbox it is holding CPU in belongs to the whole workspace,
- * so the run that started it is the last party who can reasonably end it. A
- * conversation is the opposite case and is why this is by run and not by owner:
- * the user is still there between turns, and a shell they started in one turn is
- * expected to still be running in the next.
- *
- * A run that started nothing is not an error -- most runs never spawn a shell --
- * so this reports zero rather than refusing.
- */
 /** Raised where a reap could not establish what it was supposed to address. */
 export class UnreadableRecords extends Error {}
 

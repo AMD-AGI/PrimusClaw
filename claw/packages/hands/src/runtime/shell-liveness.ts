@@ -68,15 +68,6 @@ function readProcessState(pid: number): ProcessView {
 }
 
 /**
- * How fresh the epoch a record was written under is.
- *
- * Equality with the marker proves only that no newer Hands has started, so it
- * is necessary and not sufficient; currency turns on the marker's bearer being
- * observed alive. A bearer whose liveness cannot be established is neither
- * current nor stale, and reading it as stale would convert unresolved live work
- * into a class that unblocks a destroy.
- */
-/**
  * Whether a terminal outcome is still within the window its run's deadline
  * fixed.
  *

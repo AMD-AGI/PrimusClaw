@@ -138,14 +138,8 @@ async function mutate<T>(
 /**
  * Drop entries whose claiming replica stopped renewing them.
  *
- * A bound entry is released only where no handle record names its identity --
- * releasing a slot for a target still being pinged is exactly what carries the
- * fleet past the ceiling -- so the caller supplies that set, and there is no
- * default for it. Reaping used to happen inside every mutation with an empty
- * set, which meant an ordinary claim could delete a stale-but-still-named entry
- * moments before the sweep that would have adopted it. Only the sweep reaps,
- * and only with the set in hand. A provisional entry names no identity and
- * carries no such guard.
+ * Only the sweep may reap bound entries, using the complete set of identities
+ * still named by handle records. Provisional entries need no such guard.
  */
 function reap(roster: Roster, config: RosterConfig, now: number, named: Set<string>): Roster {
   const alive = roster.entries.filter((entry) => {

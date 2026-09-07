@@ -115,15 +115,6 @@ export async function registerDagHandle(
 }
 
 /**
- * Cross-replica validation for a token owned by a DAG sandbox handle.
- *
- * One value holds every handle for a DAG, keyed by handle name -- see
- * DagHandleMap.create, which writes `existing[handleName] = info`. So the token
- * is one level in, and reading it off the top of the value never matched
- * anything: the fallback that exists for a node whose token lives only in the
- * handle map, because a sibling owns `hands.<sessionId>`, always answered no.
- */
-/**
  * Every DAG handle currently registered, for the keepalive census.
  *
  * A DAG node's sandbox is reachable only through this map, so a sweep that

@@ -273,6 +273,7 @@ export function handsBaseEnv(
     + (envFile ? ` HANDS_ENV_FILE=${envFile}` : "");
 }
 
+// Do not default this list; absence is how Hands enforces a fail-closed posture.
 function childIsolationEnv(): string {
   return HANDS_CHILD_ISOLATION_ENV
     .filter((key) => process.env[key])
@@ -283,6 +284,7 @@ function childIsolationEnv(): string {
 // Kept outside the synced, user-writable workspace.
 export const HANDS_STATE_DIR = "/tmp/.claw-hands";
 
+// Shell ids and PIDs must stay outside the all-runs-writable, externally synced workspace.
 export const HANDS_LOG_PATH = `${HANDS_STATE_DIR}/hands.log`;
 
 /**

@@ -26,6 +26,7 @@ export function assertSessionIdKeyable(sessionId: string): void {
 }
 
 function isEncodedPart(part: string): boolean {
+  // Decode because shape matching alone would misclassify raw base32-like ids.
   if (!/^[A-Z2-7]+$/.test(part)) return false;
   try {
     return handsKeyNeedsRekey(decodeKeyPart(part));
@@ -34,6 +35,7 @@ function isEncodedPart(part: string): boolean {
   }
 }
 
+// Total and injective: session ids cannot collide with each other or retention keys.
 export function handsSessionKey(sessionId: string): string {
   assertSessionIdKeyable(sessionId);
   return HANDS_KEY_PREFIX
@@ -45,6 +47,7 @@ export function sessionIdFromHandsKey(key: string): string {
   return isEncodedSessionKey(key) ? decodeKeyPart(part.slice(REKEYED_MARKER.length)) : part;
 }
 
+// Inspect the written key; decoding first would misclassify re-keyed sessions.
 export function isReservedRetentionKey(key: string): boolean {
   return key.slice(HANDS_KEY_PREFIX.length).startsWith(RETAINED_PREFIX);
 }

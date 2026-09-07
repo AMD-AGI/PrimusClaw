@@ -163,11 +163,6 @@ export class ToolRouter {
   }
 
   /**
-   * The sandbox, opening one first if this run deferred it. Every path that
-   * reaches Hands goes through here, so a tool call is the thing that decides
-   * a sandbox is needed — no caller has to remember to ask for one.
-   */
-  /**
    * The class of a background shell, read without consuming its output.
    *
    * Exists so a caller can decide whether a `wait` on it can block before the

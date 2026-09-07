@@ -109,15 +109,6 @@ export interface HandsBinding {
 }
 
 /**
- * Read a session's binding, whichever key currently holds it.
- *
- * The canonical key first, then the key an unmigrated -- or an
- * old-replica-written -- entry sits under. Both have to be tried for the whole
- * length of a rolling upgrade: an old pod reads and writes the legacy name and
- * knows nothing of the other, so a new pod that looked only at the canonical
- * one would read a live session as having no sandbox and provision a second.
- */
-/**
  * Every key a session's binding can sit under, canonical first.
  *
  * Both can hold one at once for the length of a rolling upgrade, so a caller
