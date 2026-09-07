@@ -8,14 +8,16 @@ Usage:
   1. Create key: POST /key/generate {"metadata": {"apim_key": "xxx"}}
   2. Use key:    Authorization: Bearer sk-xxx (no extra_headers needed)
 
-Logs each completion with model and api_base so glm-5-3/infera is
-distinguishable from APIM Claude in proxy logs.
+Annotates the existing uvicorn access log with model and api_base so
+glm-5-3/infera is distinguishable from APIM Claude. Does not add a
+second log line per request.
 
 Prompt caching (Claude / Anthropic via LiteLLM):
   Send header ``x-auto-prompt-caching: true`` (HTTP header or ``extra_headers``).
   The hook injects Anthropic ``cache_control: {type: ephemeral}`` on tools and
   messages so repeat prefixes can show ``cache_read_input_tokens`` in usage.
 """
+import contextvars
 import logging
 import os
 from typing import Any, Mapping, Optional
@@ -25,6 +27,15 @@ from litellm.proxy.proxy_server import DualCache, UserAPIKeyAuth
 from litellm.types.utils import CallTypesLiteral
 
 logger = logging.getLogger("litellm.proxy.hooks.apim_key_hook")
+
+# Bound to the ASGI request task; uvicorn's access log runs on the same task
+# after the response, so the formatter can read these without an extra line.
+_access_model: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "apim_key_hook_access_model", default=""
+)
+_access_api_base: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "apim_key_hook_access_api_base", default=""
+)
 
 CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 # ``x-auto-prompt-caching: 1h`` asks for the hour-long entry instead of the
@@ -268,43 +279,49 @@ def _inject_cache_control_on_message(msg: dict, marker: dict) -> bool:
     return False
 
 
-def _upstream_route(kwargs: Mapping[str, Any]) -> tuple[str, str]:
+def _set_access_route(model: str, api_base: str = "") -> None:
+    """Stash routing fields for the uvicorn access line of this request."""
+    _access_model.set(str(model or "").strip())
+    _access_api_base.set(str(api_base or "").strip())
+
+
+def _route_from_call_kwargs(kwargs: Mapping[str, Any]) -> tuple[str, str]:
     """Requested model and upstream api_base from a callback kwargs dict."""
     params = kwargs.get("litellm_params")
     if not isinstance(params, Mapping):
         params = {}
     model = kwargs.get("model") or params.get("model") or ""
     api_base = params.get("api_base") or kwargs.get("api_base") or ""
-    return str(model or "-"), str(api_base or "-")
+    return str(model or ""), str(api_base or "")
 
 
-def _log_upstream(
-    outcome: str,
-    kwargs: Mapping[str, Any],
-    response_obj: Any = None,
-    start_time: Any = None,
-    end_time: Any = None,
-) -> None:
-    """One line so access logs can tell glm-5-3/infera from APIM Claude."""
-    model, api_base = _upstream_route(kwargs)
-    elapsed_ms = "-"
+def _install_access_log_patch() -> None:
+    """Append model/api_base onto uvicorn's existing access log line."""
     try:
-        if start_time is not None and end_time is not None:
-            elapsed_ms = f"{(end_time - start_time).total_seconds() * 1000:.0f}"
-    except Exception:
-        elapsed_ms = "-"
-    extra = ""
-    if outcome == "fail":
-        err = kwargs.get("exception") or response_obj
-        extra = f" err={type(err).__name__}" if err is not None else ""
-    logger.info(
-        "upstream %s model=%s api_base=%s elapsed_ms=%s%s",
-        outcome,
-        model,
-        api_base,
-        elapsed_ms,
-        extra,
-    )
+        import uvicorn.logging as uvlog
+    except ImportError:
+        return
+    formatter = getattr(uvlog, "AccessFormatter", None)
+    if formatter is None or getattr(formatter, "_apim_key_hook_patch", False):
+        return
+    orig = formatter.formatMessage
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        msg = orig(self, record)
+        model = _access_model.get()
+        if not model:
+            return msg
+        api_base = _access_api_base.get()
+        extra = f" model={model}"
+        if api_base:
+            extra += f" api_base={api_base}"
+        return msg + extra
+
+    formatter.formatMessage = formatMessage  # type: ignore[method-assign]
+    formatter._apim_key_hook_patch = True
+
+
+_install_access_log_patch()
 
 
 def _inject_anthropic_prompt_cache(data: dict, marker: dict) -> None:
@@ -366,6 +383,13 @@ class ApimKeyHook(CustomLogger):
         data: dict,
         call_type: CallTypesLiteral,
     ):
+        model = data.get("model") or ""
+        api_base = data.get("api_base") or ""
+        if not api_base:
+            meta = data.get("metadata") if isinstance(data.get("metadata"), Mapping) else {}
+            api_base = (meta or {}).get("api_base") or ""
+        _set_access_route(str(model), str(api_base or ""))
+
         metadata = user_api_key_dict.metadata or {}
         apim_key = metadata.get("apim_key")
         key_alias = getattr(user_api_key_dict, "key_alias", None) or "unknown"
@@ -413,16 +437,20 @@ class ApimKeyHook(CustomLogger):
         return data
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        _log_upstream("ok", kwargs, response_obj, start_time, end_time)
+        model, api_base = _route_from_call_kwargs(kwargs)
+        _set_access_route(model, api_base)
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        _log_upstream("fail", kwargs, response_obj, start_time, end_time)
+        model, api_base = _route_from_call_kwargs(kwargs)
+        _set_access_route(model, api_base)
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        _log_upstream("ok", kwargs, response_obj, start_time, end_time)
+        model, api_base = _route_from_call_kwargs(kwargs)
+        _set_access_route(model, api_base)
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        _log_upstream("fail", kwargs, response_obj, start_time, end_time)
+        model, api_base = _route_from_call_kwargs(kwargs)
+        _set_access_route(model, api_base)
 
 
 proxy_handler_instance = ApimKeyHook()
