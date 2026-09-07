@@ -2,18 +2,24 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A Brain restarts, the sandbox does not, and the work is still there.
+ * The half of Brain-restart recovery that lives in the sandbox.
  *
- * All Brain-local state goes: the client, its transport, whatever it knew about
- * which shells exist. What survives is the sandbox and the ids in the
- * transcript, and a fresh Brain has to reach the same processes by them --
- * poll, wait and kill each one, and start nothing on the way. Starting
- * something is the failure this exists to catch, because it looks like a
- * recovery and is a second execution of the command.
+ * **Scope, stated because the name could promise more:** this drives a real
+ * Hands process over a real port and a client in a process of its own, so
+ * nothing Brain-local -- transport, module state, heap -- carries across. What
+ * it does *not* do is start the Brain application: that needs NATS, Postgres
+ * and a task stream, and this tree has no harness that stands them up. So the
+ * restore of Brain's own durable task and run state is **not** covered here,
+ * and neither is the loop that would consume it.
  *
- * A real Hands process and a real port, because what is under test is exactly
- * the boundary a stand-in would replace. Two shells for one run identity, so a
- * recovery that reaches only the first cannot pass.
+ * What is covered is the property that restore depends on: after everything
+ * client-side is gone, the ids in the transcript are still sufficient to reach
+ * the same processes -- poll, wait and kill each one -- and nothing is started
+ * on the way. Starting something is the failure this exists to catch, because
+ * it looks like a recovery and is a second execution of the command.
+ *
+ * Two shells for one run identity, so a recovery reaching only the first
+ * cannot pass.
  */
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
@@ -46,7 +52,7 @@ const freePort = (): Promise<number> => new Promise((resolve) => {
   });
 });
 
-/** A Brain with nothing carried over from the one before it, in this process. */
+/** A client with nothing carried over from the one before it, in this process. */
 const freshBrain = () => new HandsClient(`http://127.0.0.1:${port}/mcp`, TOKEN, OWNER, RUN);
 
 /**
@@ -54,8 +60,8 @@ const freshBrain = () => new HandsClient(`http://127.0.0.1:${port}/mcp`, TOKEN, 
  *
  * Closing a client and building another leaves every module-level cache, every
  * connection pool and the whole heap in place, so it cannot tell recovery from
- * a client that simply reconnected. A separate process is what "Brain
- * restarted" means: nothing survives but the sandbox and the ids.
+ * a client that simply reconnected. A separate process removes all of that --
+ * which is the sandbox-facing half of a Brain restart, not the whole of one.
  */
 async function inSeparateBrain(body: string): Promise<string> {
   const script = `
@@ -136,7 +142,7 @@ after(async () => {
   }
 });
 
-test("a fresh Brain reaches both of a run's shells by the ids in the transcript", async () => {
+test("a client in a new process reaches both of a run's shells by the ids in the transcript", async () => {
   const first = freshBrain();
   await first.callTool("bash", {
     command: "echo primary-line; sleep 60", run_in_background: true, shell_id: "primary",
@@ -185,7 +191,7 @@ test("the recovered shells are waitable and killable, and killing one leaves the
   await brain.close();
 });
 
-test("a wait by a Brain in a new process resolves on the original process's exit", async () => {
+test("a wait from a new process resolves on the original process's exit", async () => {
   const brain = freshBrain();
   await brain.callTool("bash", {
     command: "sleep 1; exit 5", run_in_background: true, shell_id: "short",

@@ -424,26 +424,36 @@ async function retainInsteadOfDestroying(
   info: any,
   answer: LiveWorkAnswer,
 ): Promise<void> {
-  const generation = info.sandboxName || info.workloadId || "";
-  if (!generation) {
-    // Returning here would leave the session bound to a container this path has
-    // decided not to destroy, and the caller then provisions a second and
-    // overwrites the binding -- so the protected work ends up in a container
-    // nothing names and no sweep pings. The turn fails instead.
-    logger.error({ sessionId, verdict: answer.verdict }, "ensureHands.retention_unkeyable");
-    throw new Error(
-      "the sandbox still holds background work and its binding names no generation "
-      + "to retain it under, so it was neither replaced nor released",
-    );
-  }
   await reuseEffects.retainContainer({
     store: kv as never,
     sessionKey: handsSessionKey(sessionId),
-    generation,
+    generation: retentionGeneration(sessionId, info),
     binding: info,
     verdict: answer.verdict,
     detail: answer.reason,
   });
+}
+
+/**
+ * The key part a retention takes.
+ *
+ * The generation names the container, and a per-shell reference row carries the
+ * same value, which is what routes a later poll back to it. A binding carrying
+ * none still has to be retained -- releasing the claim without moving it leaves
+ * the work in a container the next acquisition's binding overwrites the name of
+ * -- so it takes a value derived from the session and the moment instead. The
+ * container stays swept, pinged and addressable; only the reference rows cannot
+ * resolve it, which is the part the missing generation already cost.
+ */
+function retentionGeneration(sessionId: string, info: any): string {
+  const named = info.sandboxName || info.workloadId || "";
+  if (named) return named;
+  const derived = `${sessionId}-${info.createdAt || new Date().toISOString()}`;
+  logger.error(
+    { sessionId, derived },
+    "ensureHands.retention_generation_derived",
+  );
+  return derived;
 }
 
 /**

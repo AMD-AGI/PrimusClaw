@@ -18,10 +18,10 @@
  * baseline has not reached this deployment.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APPLIED_ENV_KEYS } from "./env-file.js";
-import { stateRoot } from "./shell-records.js";
+import { currentEpoch, stateRoot } from "./shell-records.js";
 
 /** Raised where the boundary cannot be placed. Never downgraded to a warning. */
 export class ChildPrivilegeUnavailable extends Error {}
@@ -119,20 +119,64 @@ function identityFor(owner: string, run: string, range: { min: number; max: numb
   );
 }
 
+/**
+ * Whether an assignment made now can be read back after a restart.
+ *
+ * The table lives beside the durable records, in a state area the epoch mint
+ * creates before anything can be started -- fatally, if it cannot. A process
+ * that filed no epoch has no records either, so it has nothing to be consistent
+ * with across a restart and nothing to write beside.
+ */
+function allocationIsDurable(): boolean {
+  return currentEpoch() !== null && existsSync(stateRoot());
+}
+
+/**
+ * @throws ChildPrivilegeUnavailable where the table exists and cannot be used.
+ * A table read as empty after a failed read hands a live process's identity to
+ * another pair, which is the separation this file exists to keep.
+ */
 function allocationTable(): Map<string, number> {
   if (allocated) return allocated;
-  try {
-    const raw = JSON.parse(readFileSync(join(stateRoot(), ALLOCATION_FILE), "utf8")) as Record<string, number>;
-    allocated = new Map(Object.entries(raw).filter(([, v]) => Number.isInteger(v)));
-  } catch {
+  if (!allocationIsDurable()) {
     allocated = new Map();
+    return allocated;
   }
+  let raw: string;
+  try {
+    raw = readFileSync(join(stateRoot(), ALLOCATION_FILE), "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new ChildPrivilegeUnavailable(
+        `the child identity table could not be read (${(e as Error).message}), `
+        + "so an assignment now could take one a running process already holds",
+      );
+    }
+    allocated = new Map();
+    return allocated;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new ChildPrivilegeUnavailable(
+      `the child identity table is unreadable (${(e as Error).message})`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ChildPrivilegeUnavailable("the child identity table is not a table");
+  }
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (!entries.every(([, v]) => Number.isInteger(v))) {
+    throw new ChildPrivilegeUnavailable("the child identity table holds a value that is not an identity");
+  }
+  allocated = new Map(entries as Array<[string, number]>);
   return allocated;
 }
 
 function persistAllocations(table: Map<string, number>): void {
+  if (!allocationIsDurable()) return;
   const dir = stateRoot();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const staged = join(dir, `${ALLOCATION_FILE}.staged`);
   writeFileSync(staged, JSON.stringify(Object.fromEntries(table)), { mode: 0o600 });
   renameSync(staged, join(dir, ALLOCATION_FILE));
@@ -149,11 +193,37 @@ const WORKSPACE_FACING = [
   "PATH", "HOME", "SHELL", "TERM", "TZ", "LANG", "LC_ALL", "PWD", "USER", "LOGNAME",
 ];
 
+/**
+ * Names whose value is a path, or a list of them, the child will resolve
+ * programs and files through.
+ */
+const PATH_SHAPED = new Set(["PATH", "HOME", "SHELL", "PWD"]);
+
+/**
+ * Whether every entry is an absolute path with no traversal in it.
+ *
+ * A relative entry resolves against whatever directory the child happens to be
+ * in, and a traversal resolves outside the tree the deployment chose -- both of
+ * which decide which program a bare command name runs.
+ */
+function usablePathValue(value: string): boolean {
+  const entries = value.split(":").filter((e) => e.length > 0);
+  return entries.length > 0
+    && entries.every((e) => e.startsWith("/") && !e.split("/").includes(".."));
+}
+
 export function childEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of WORKSPACE_FACING) {
     const value = process.env[key];
-    if (value !== undefined) env[key] = value;
+    // Blank is unset here as everywhere else in this service's configuration.
+    if (!value) continue;
+    if (PATH_SHAPED.has(key) && !usablePathValue(value)) {
+      throw new ChildPrivilegeUnavailable(
+        `${key} is not a usable absolute path, so no child environment could be built from it`,
+      );
+    }
+    env[key] = value;
   }
   // The per-request environment Brain wrote for this session: the user's own
   // configuration and credentials for their own work, which is what a command

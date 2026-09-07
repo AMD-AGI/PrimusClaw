@@ -102,8 +102,8 @@ test("an unreadable subtree is unknown, and so is a missing one", async () => {
 });
 
 test("a record that will not parse refuses the whole answer", async () => {
-  // Dropping it lets the count come back a determinate zero, which is the
-  // sandbox being destroyed on the strength of a file nobody could read.
+  // Dropping it lets the count come back a determinate zero, which destroys the
+  // sandbox on the strength of a file nobody could read.
   sandboxAnswering(`MARKER ${JSON.stringify(MARKER)}\nSUBTREE ok\nRECORD {not json\nPROCS 7`);
   assert.equal((await countLiveWork(INST, STATE_DIR)).verdict, "unknown");
 });
@@ -167,7 +167,7 @@ test("a claim that never became a process protects, under any epoch", async () =
 test("a committed outcome is not live work", async () => {
   sandboxAnswering(transcript({
     marker: MARKER,
-    records: [running({ status: "exited", exit_code: 0 })],
+    records: [running({ status: "exited", exit_code: 0, ended_at: "2026-01-01T00:01:00.000Z" })],
     pids: [7],
   }));
   const answer = await countLiveWork(INST, STATE_DIR);
@@ -203,4 +203,27 @@ test("no readable process table is unknown, not an empty count", async () => {
   const answer = await countLiveWork(INST, STATE_DIR);
   assert.equal(answer.verdict, "unknown");
   assert.equal(answer.reason, "process_table_unreadable");
+});
+
+test("a record whose fields the classifier reads are not a record refuses the answer", async () => {
+  // The four addressing fields are not the whole of it: the class turns on
+  // `status`, so a value carrying an unrecognised one classifies `finished`,
+  // which is the single class that permits a destroy.
+  const malformed = [
+    running({ status: "invalid", ended_at: "2026-01-01T00:01:00.000Z" }),
+    running({ status: "exited" }),
+    running({ kind: "not-a-kind" }),
+    running({ claimed_at: "whenever" }),
+    running({ process_identity: { pid: "7", startToken: "t" } }),
+    running({ process_identity: { pid: 7 } }),
+    running({ exit_code: "0", status: "exited", ended_at: "2026-01-01T00:01:00.000Z" }),
+    running({ hands_epoch: "" }),
+  ];
+  for (const record of malformed) {
+    sandboxAnswering(transcript({ marker: MARKER, records: [record], pids: [7] }));
+    const answer = await countLiveWork(INST, STATE_DIR);
+    assert.equal(answer.verdict, "unknown", JSON.stringify(record).slice(0, 90));
+    restore?.();
+    restore = null;
+  }
 });

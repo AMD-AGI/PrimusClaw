@@ -579,10 +579,8 @@ test("a refused in-place restart releases the claim, and destroys only an empty 
 });
 
 test("a refusal over live work retains the container instead of replacing it", async () => {
-  // The failure this closes: a refusal was licence to rebuild, and a rebuild
-  // asked nothing about what was running. A fresh Hands reads an empty
-  // registry, and empty read as "destroying this is harmless" -- so a health
-  // check failing on a pod with a training run in it took the run with it.
+  // A fresh Hands reads an empty registry, so a rebuild that asks nothing about
+  // what is running reads empty as "destroying this is harmless".
   for (const verdict of ["protected", "unknown"] as const) {
     const { destroyed, retained } = stubEffects("alive", false, "env_not_reproducible", verdict);
     stubHealth("down");

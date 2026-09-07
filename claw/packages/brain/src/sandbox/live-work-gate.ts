@@ -89,13 +89,48 @@ function parseGathered(stdout: string): GatheredState {
   return state;
 }
 
+const OUTCOMES: readonly unknown[] = ["exited", "killed", "failed"];
+const KINDS: readonly unknown[] = ["background", "monitor"];
+
+const isInstant = (v: unknown): boolean => typeof v === "string" && Number.isFinite(Date.parse(v));
+const optional = (v: unknown, ok: (x: unknown) => boolean): boolean => v === undefined || ok(v);
+
+/**
+ * Whether this is a record, in every field the classifier reads.
+ *
+ * Checking the four addressing fields is not enough: the class turns on
+ * `status`, `process_identity` and the epoch, so a value carrying an
+ * unrecognised status classifies `finished` -- which is the one class that
+ * permits a destroy.
+ */
 function isShellRecord(value: unknown): value is ShellRecord {
   const r = value as Partial<ShellRecord> | null;
-  return !!r && typeof r === "object" && !Array.isArray(r)
-    && typeof r.owner_scope === "string"
+  if (!r || typeof r !== "object" || Array.isArray(r)) return false;
+  return typeof r.owner_scope === "string" && r.owner_scope.length > 0
     && (typeof r.run_identity === "string" || r.run_identity === null)
-    && typeof r.shell_id === "string"
-    && typeof r.hands_epoch === "string";
+    && typeof r.shell_id === "string" && r.shell_id.length > 0
+    && typeof r.hands_epoch === "string" && r.hands_epoch.length > 0
+    && typeof r.command_digest === "string"
+    && KINDS.includes(r.kind)
+    && isInstant(r.claimed_at)
+    && optional(r.status, (v) => OUTCOMES.includes(v))
+    && optional(r.process_identity, isProcessIdentity)
+    && optional(r.spawned_at, isInstant)
+    && optional(r.ended_at, isInstant)
+    && optional(r.deadline_at, isInstant)
+    && optional(r.retain_until, isInstant)
+    && optional(r.exit_code, (v) => v === null || Number.isInteger(v))
+    && optional(r.output_available, (v) => typeof v === "boolean")
+    // An outcome without its end, or an end without its outcome, is a record
+    // half-written by something that is not the writer.
+    && (r.status === undefined) === (r.ended_at === undefined);
+}
+
+function isProcessIdentity(value: unknown): boolean {
+  const id = value as { pid?: unknown; startToken?: unknown } | null;
+  return !!id && typeof id === "object"
+    && Number.isInteger(id.pid) && (id.pid as number) > 0
+    && typeof id.startToken === "string";
 }
 
 /**

@@ -319,19 +319,37 @@ export type { ReclaimCause, ReapReport, ReapedShell };
 /** Transport and scheduling slack on top of the grace the caller asked for. */
 const REAP_TRANSPORT_OVERHEAD_MS = 15_000;
 
+const REAP_OUTCOMES = ["stopped", "escalated", "surviving"] as const;
+
+/**
+ * The reap report, or an error.
+ *
+ * Each counter is checked against the entries actually carrying that outcome,
+ * not merely against how many entries there are: a report claiming one stopped
+ * beside a single entry marked surviving sums correctly and says the opposite
+ * of what happened.
+ */
 function assertReapReport(body: unknown): ReapReport {
   const r = body as Partial<ReapReport> | null;
-  const counts = [r?.stopped, r?.escalated, r?.surviving];
+  const counts = REAP_OUTCOMES.map((k) => r?.[k]);
   if (!r || !Array.isArray(r.shells) || counts.some((n) => !Number.isInteger(n) || (n as number) < 0)) {
     throw new Error("hands_reap_failed: the sandbox's answer is not a reap report");
   }
-  const [stopped, escalated, surviving] = counts as number[];
-  if (stopped + escalated + surviving !== r.shells.length) {
-    throw new Error(
-      `hands_reap_failed: counts ${stopped}/${escalated}/${surviving} do not partition `
-      + `${r.shells.length} addressed shells`,
-    );
+  for (const entry of r.shells) {
+    if (!entry || !REAP_OUTCOMES.includes(entry.outcome)) {
+      throw new Error("hands_reap_failed: an addressed shell carries no outcome from the vocabulary");
+    }
   }
+  for (const [i, outcome] of REAP_OUTCOMES.entries()) {
+    const carrying = r.shells.filter((e) => e.outcome === outcome).length;
+    if (carrying !== counts[i]) {
+      throw new Error(
+        `hands_reap_failed: ${counts[i]} reported ${outcome}, `
+        + `${carrying} addressed shells say so`,
+      );
+    }
+  }
+  const [stopped, escalated, surviving] = counts as number[];
   return { stopped, escalated, surviving, shells: r.shells };
 }
 
@@ -1004,6 +1022,7 @@ export class HandsClient {
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
     if (!resp.ok) throw new Error(`hands_reap_failed: status=${resp.status}`);
+
     // Never defaulted to zero. A malformed or truncated answer is a reap whose
     // outcome nobody knows, and reading it as "nothing survived" is the same
     // untruth the counts were reshaped to remove.

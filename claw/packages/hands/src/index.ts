@@ -13,6 +13,7 @@ import { RECLAIM_CAUSES, isReclaimCause, isReapGrace } from "@claw/protocol";
 import { tools } from "./tools/index.js";
 import {
   MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, REAP_GRACE_MS,
+  UnreadableRecords,
   resolveShell, runningShellCount, shutdownAllShells, shutdownRunShells,
 } from "./tools/shell/bg-manager.js";
 import {
@@ -276,7 +277,15 @@ app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req
     });
   }
 
-  const report = await shutdownRunShells(resolved.scope.owner, run, grace);
+  let report;
+  try {
+    report = await shutdownRunShells(resolved.scope.owner, run, grace);
+  } catch (e) {
+    if (!(e instanceof UnreadableRecords)) throw e;
+    // An all-clear this reap could not establish is the one answer a caller
+    // must not receive: it retires the run's shells on paper while they run on.
+    return reply.status(503).send({ error: "shell_records_unreadable", detail: (e as Error).message });
+  }
   app.log.info(
     {
       run,

@@ -335,6 +335,9 @@ test(`a Hands that is slow to read the file is waited for, not killed (${shell})
 });
 }
 
+/** Every metacharacter, backslash included: a partial list matches too much. */
+const escapeRegex = (s: string): string => s.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+
 test("the guard counts in the shell rather than through seq", () => {
   // Every image is probed now, not only the ones whose name we recognise, and
   // an image without coreutils has no `seq`: `for _ in $(seq N)` expands to an
@@ -347,16 +350,16 @@ test("the guard counts in the shell rather than through seq", () => {
     "a Hands that catches TERM still holds the port while it handles it");
   assert.doesNotMatch(cmd, /kill -9 --/,
     "dash rejects -- after a signal option, so SIGKILL names the group without it");
-  assert.match(cmd, new RegExp(`: > ${HANDS_LOG_PATH.replace(/[./]/g, "\\$&")} \\|\\|`),
+  assert.match(cmd, new RegExp(`: > ${escapeRegex(HANDS_LOG_PATH)} \\|\\|`),
     "the log truncate is a statement of its own so $! is the setsid process, not a helper shell");
-  assert.doesNotMatch(cmd, new RegExp(`: > ${HANDS_LOG_PATH.replace(/[./]/g, "\\$&")} &&`),
+  assert.doesNotMatch(cmd, new RegExp(`: > ${escapeRegex(HANDS_LOG_PATH)} &&`),
     "&& ... & is what made $! a bash subshell on images whose /bin/sh is bash");
   // Everything Hands writes about a shell names it, and the workspace is
   // writable by every run identity in the sandbox and synced out besides. The
   // log lives in the Hands-owned state area and its parent is created there
   // owner-only before anything writes it.
   assert.doesNotMatch(cmd, /\/workspace\/hands\.log/, "the log is not in the shared workspace");
-  assert.match(cmd, new RegExp(`mkdir -p ${HANDS_STATE_DIR.replace(/[./]/g, "\\$&")} && chmod 700`));
+  assert.match(cmd, new RegExp(`mkdir -p ${escapeRegex(HANDS_STATE_DIR)} && chmod 700`));
 });
 
 test("the production probe carries a bound", () => {

@@ -98,10 +98,11 @@ export class MalformedDeadline extends Error {}
 /**
  * The deadline as an instant, or absent where none was sent.
  *
- * A header that is present and unparseable is refused rather than treated as
- * absent: absent means the run carries no deadline, which retains for the
- * sandbox's life, and reading a malformed value as that silently substitutes
- * one policy for the opposite one on a run that did state a bound.
+ * Absent means the header was not sent, which is a run carrying no deadline and
+ * retains for the sandbox's life. A header that was sent and names no instant --
+ * blank included -- is refused rather than read as absent, since reading it as
+ * absent substitutes that policy for the opposite one on a run that did state a
+ * bound.
  */
 export function normalizeDeadline(raw: unknown): string | undefined {
   if (raw === undefined || raw === null) return undefined;
@@ -109,7 +110,6 @@ export function normalizeDeadline(raw: unknown): string | undefined {
     throw new MalformedDeadline(`${DEADLINE_HEADER} is not a string, so it names no instant`);
   }
   const trimmed = raw.trim();
-  if (!trimmed) return undefined;
   if (!Number.isFinite(Date.parse(trimmed))) {
     throw new MalformedDeadline(
       `${DEADLINE_HEADER} is not a readable instant, so no retention window could be fixed from it`,

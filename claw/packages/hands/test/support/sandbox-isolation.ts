@@ -7,22 +7,22 @@
  * A bare test process declares no identity range, which is the disclosed state
  * in which spawns proceed under Hands' own identity and say so. A fixture whose
  * subject is something else -- ownership, counts, waits -- declares the boundary
- * here instead, exactly as a real sandbox does, so what it asserts is asserted
- * against the enforced path rather than the fallback.
+ * here instead, exactly as a real sandbox does.
  *
- * The range is real where the test process can allocate from one, so the
- * identity separation those tests assert is the genuine article rather than a
- * stand-in. Elsewhere it is this process's own id, which spawns but separates
- * nothing -- and no test asserting separation uses that case.
+ * Only where this process can actually assume another identity, which is where
+ * it is privileged. Elsewhere the declaration would be one the runtime cannot
+ * honour, and honouring it is the whole contract: a declared range refuses the
+ * spawn rather than serving it under Hands' own. A fixture asserting the
+ * allocation itself binds its own range and never spawns.
  */
 import { bindSandboxIsolation } from "../../src/runtime/child-privilege.js";
 
 const UNPRIVILEGED_RANGE = { min: 65500, max: 65533 };
 
 export function isolatingSandbox(): void {
-  const uid = process.getuid?.() ?? 0;
+  const privileged = (process.getuid?.() ?? 0) === 0;
   bindSandboxIsolation({
-    identityRange: () => (uid === 0 ? UNPRIVILEGED_RANGE : { min: uid, max: uid }),
+    identityRange: () => (privileged ? UNPRIVILEGED_RANGE : null),
     partitionsProcessView: () => true,
   });
 }

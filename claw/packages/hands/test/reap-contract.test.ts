@@ -4,12 +4,12 @@
 /**
  * What a reap reports, and what it refuses to do without.
  *
- * The old answer was the size of the addressed set: a shell that ignored both
- * signals was counted `stopped`, so a run could be reported finished over work
- * that had not ended. The counts are now disjoint tallies of one outcome per
- * shell, read after the escalation rather than at the moment of signalling.
+ * The counts are disjoint tallies of one outcome per addressed shell, read
+ * after the escalation rather than at the moment of signalling: the size of the
+ * addressed set would report a shell that ignored both signals as stopped, and
+ * a run as finished over work that had not ended.
  *
- * And every reap says why. A reclaim nobody can attribute is indistinguishable
+ * Every reap also says why. A reclaim nobody can attribute is indistinguishable
  * afterwards from work that ended on its own, so a request missing its cause or
  * its operation is refused rather than defaulted -- and a grace outside the
  * stated domain is refused rather than clamped, a silently shortened one
@@ -131,8 +131,6 @@ test("a run that started nothing reports an empty set rather than refusing", asy
 });
 
 test("a shell that ignores both signals is surviving, not stopped", async () => {
-  // The failure this closes: the old answer was the size of the addressed set,
-  // so a run could be reported finished over work that had not ended.
   const report = await bg.shutdownRunShells(OWNER, "ktsk_absent", 250);
   assert.deepEqual(report, { stopped: 0, escalated: 0, surviving: 0, shells: [] });
 

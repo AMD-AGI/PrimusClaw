@@ -200,9 +200,9 @@ test("every class that cannot block returns without touching the slot", async ()
 });
 
 test("a site that cannot park under a usable key says so rather than skipping", async () => {
-  // The defect was silent: no park, no log, no counter, and the slot held for
-  // the whole wait. The ledger helper cannot report it -- a missing entry is the
-  // legitimate sub-agent case there -- so the signal belongs at the site.
+  // The ledger helper cannot report this: a missing entry is the legitimate
+  // sub-agent case there. Only the site knows it holds its own slot and can
+  // name the key it passed.
   const { registry } = await import("../src/infra/metrics.js");
   const counted = async (): Promise<number> => {
     const m = (await registry.getMetricsAsJSON())
@@ -278,9 +278,9 @@ test("a sandbox that cannot be classified reads as running, so the wait still pa
 });
 
 test("the park uses the ledger's key, not the run's addressing scope", async () => {
-  // The defect this closes: the two strings differ under the default gate
-  // configuration, so parking under the addressing scope missed the ledger and
-  // the slot was never handed back.
+  // The two strings differ under the default gate configuration, so a site
+  // passing the addressing scope misses the ledger and never hands the slot
+  // back.
   const { router } = classifyingRouter("running");
   const parked = await runWait(router, { parkKey: "gate-lock-key", runKey: "addressing-scope" });
   assert.deepEqual(parked, ["park", "unpark"]);

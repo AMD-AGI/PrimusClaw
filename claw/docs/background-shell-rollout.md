@@ -167,14 +167,26 @@ routes is `[needs TBD-7]`.
 Every step below mints its credential **per pair**, through `scope_cred <owner>
 <run>` (empty run for an owner-only scope). One credential hoisted out of a loop
 proves one pair and is refused for every other, which reads as a route failure
-rather than as the mistake it is:
+rather than as the mistake it is.
+
+The key is the **sandbox's own** `AUTH_CLAW_TOKEN`, not a fleet-wide one, so a
+loop over several sandboxes fetches the token for each row before minting
+anything for it. `hands_token` is that fetch, and it is what makes every caller
+of `scope_cred` `[needs TBD-7]`: Claw issues this secret to no operator, and the
+placeholder below states the shape rather than a supported retrieval:
 
 ```sh
-# The scope the routes answer, for one pair. Needs the sandbox's own
-# AUTH_CLAW_TOKEN, which is why every caller of it is [needs TBD-7].
-scope_cred() { local owner="$1" run="$2" scope proof
+# The sandbox's own internal token, for the sandbox named by this row.
+# [needs TBD-7] -- no supported operator path to it exists; substitute the one
+# your platform provides, and stop here if it has none.
+hands_token() { local name="$1" ns="$2"
+  kubectl get secret -n "$ns" "claw-sandbox-$name" -o jsonpath='{.data.AUTH_CLAW_TOKEN}' 2>/dev/null \
+    | { read -r b64; printf '%s' "$b64"; } | openssl base64 -d -A 2>/dev/null \
+    || { echo "no token for sandbox $name in $ns" >&2; return 1; }; }
+# The scope the routes answer, for one pair, under one sandbox's token.
+scope_cred() { local token="$1" owner="$2" run="$3" scope proof
   scope="$(printf '%s' "$owner" | scope_encode)/$( [ -n "$run" ] && printf '%s' "$run" | scope_encode || printf '.norun')"
-  proof=$(printf '%s' "$scope" | openssl dgst -sha256 -hmac "$HANDS_TOKEN" -hex | sed 's/^.* //')
+  proof=$(printf '%s' "$scope" | openssl dgst -sha256 -hmac "$token" -hex | sed 's/^.* //')
   printf '%s.%s' "$scope" "$proof"; }
 # Per-byte escaping: anything outside [A-Za-z0-9_-] becomes ~XX, so the two
 # parts cannot span the separator and no two pairs encode alike.
@@ -371,7 +383,8 @@ scope — is exercised and no shell is signalled.
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   "$(hands_base "$HANDS_URL")/internal/shells/reap" \
-  -H "Authorization: Bearer $(scope_cred "$SESSION_ID" "")" -H 'content-type: application/json' \
+  -H "Authorization: Bearer $(scope_cred "$(hands_token "$SB_NAME" "$SB_NS")" "$SESSION_ID" "")" \
+  -H 'content-type: application/json' \
   -d '{"cause":"session_cleanup","reclaim_op":"p5"}'
 ```
 
@@ -668,7 +681,7 @@ reclaimed=$(ev keepalive.idle_handle_expired) || { echo 'ABORT: the companion re
 orphan=$(jq -rn --arg k "$kept" --arg r "$reclaimed" \
   '(($k|split("\n"))-[""]) - (($r|split("\n"))-[""]) | length') || { echo 'ABORT: the set difference failed'; exit 1; }
 probe_fail=$(printf '%s\n' "$BRAIN_LOG" \
-  | jq -r 'select(.msg|test("^keepalive[.]background_work_(answer_stale|check_failed|unknown_giving_up)$"))|.msg' | wc -l) \
+  | jq -r 'select(.msg|test("^keepalive[.]background_work_(answer_stale|check_failed|unreconciled)$"))|.msg' | wc -l) \
   || { echo 'ABORT: the probe-failure read failed'; exit 1; }
 verdict=PASS
 printf 'OBS-5\tnever_reclaimed=%s\tceiling=%s\theld=%s\n' "$orphan" "$T_ORPHAN" "$(printf '%s\n' "$kept" | sed '/^$/d' | wc -l)"
@@ -1073,18 +1086,21 @@ R1's sandboxes once per run the operator knows.
 
 ```sh
 while IFS=$'\t' read -r sid name ns url wid; do
+  tok=$(hands_token "$name" "$ns") \
+    || { echo "$name SKIPPED_NO_TOKEN"; continue; }   # [needs TBD-7]
   for run in $RUN_IDS; do
     printf '%s %s\t' "$name" "$run"
     curl -sf -X POST --max-time "$T_CURL" "$(hands_base "$url")/internal/shells/reap" \
-      -H "Authorization: Bearer $(scope_cred "$sid" "$run")" -H 'content-type: application/json' \
+      -H "Authorization: Bearer $(scope_cred "$tok" "$sid" "$run")" -H 'content-type: application/json' \
       -d "{\"cause\":\"sandbox_replaced\",\"reclaim_op\":\"$RECLAIM_OP\"}" \
       | jq -c '{stopped, escalated, surviving}' || echo '{"error":"unreachable"}'
   done
 done < /tmp/claw-rollback-fleet.tsv
 ```
 
-- `scope_cred <owner> <run>` mints the credential proving that one pair, and is
-  called **inside** the loop: the scope comes from the credential and a body
+- `scope_cred <token> <owner> <run>` mints the credential proving that one pair,
+  under the token of the sandbox this row names, and both are fetched **inside**
+  the loop: the scope comes from the credential and a body
   naming either field is refused, so a single credential hoisted out of the loop
   addresses one pair and silently fails on every other — which is why this step
   is `[needs TBD-7]`. `cause` is `sandbox_replaced`, from the closed vocabulary
@@ -1254,17 +1270,19 @@ sandbox R1 recorded that R6 did not prove gone.
 ```sh
 while IFS=$'\t' read -r sid name ns url wid; do
   rg -qxF -- "$name"$'\t'"$ns" /tmp/claw-rollback-gone.tsv && continue   # R6 proved it gone
+  tok=$(hands_token "$name" "$ns") \
+    || { echo "$name SKIPPED_NO_TOKEN"; continue; }   # [needs TBD-7]
   for owner in "$sid" $DAG_ROOT_IDS; do
     printf '%s %s\t' "$name" "$owner"
     curl -sf -X POST --max-time "$T_CURL" "$(hands_base "$url")/internal/shells/active" \
-      -H "Authorization: Bearer $(scope_cred "$owner" "")" -H 'content-type: application/json' -d '{}' \
+      -H "Authorization: Bearer $(scope_cred "$tok" "$owner" "")" -H 'content-type: application/json' -d '{}' \
       | jq -r '.running' || echo NO_ANSWER
   done
 done < /tmp/claw-rollback-fleet.tsv
 ```
 
 - The owner is proved by the credential, so each owner in the loop mints its own
-  through `scope_cred` — the session id for an ordinary run, the graph root for a
+  through `scope_cred`, under this row's own sandbox token — the session id for an ordinary run, the graph root for a
   node of one. `$sid` alone misses the second, and one credential reused across
   the loop addresses only the owner it was minted for. Shells started with no owner sit in a bucket of
   their own, so a `0` here is a negative result about one owner and not about the

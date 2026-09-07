@@ -4,13 +4,11 @@
 /**
  * What a caller is told about a shell, and what it cannot learn from the answer.
  *
- * The three verbs used to answer from the in-process registry alone, which
- * knows a shell for one reap delay after it exits and nothing at all after a
- * restart. That collapsed six different fates into one sentence -- a shell that
- * finished and one that was never issued read the same, and both read as
- * "possibly lost after sandbox rebuild". The class is now taken from the
- * durable record and published as a field, and the one absence answer carries
- * nothing a caller could difference.
+ * The class comes from the durable record and is published as a field. The
+ * in-process registry cannot supply it: it knows a shell for one reap delay
+ * after it exits and nothing at all after a restart, so six different fates
+ * collapse into one sentence there. The single absence answer carries nothing a
+ * caller could difference.
  */
 import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -164,5 +162,52 @@ test("classifying a shell moves no read offset", async () => {
     assert.match(bg.pollOutput(OWNER, RUN, "offsets").text, /no new output/);
   } finally {
     bg.killShell(OWNER, RUN, "offsets");
+  }
+});
+
+test("the real classification read consumes nothing a poll would have returned", async () => {
+  // The production preflight is this call, not a stand-in: a classification
+  // that touched the ring buffer would delete output no later call can
+  // reproduce, and the wait that follows owes those bytes to its caller.
+  bg.spawnBackground(OWNER, RUN, "echo first-line; echo second-line; sleep 60", "owed");
+  try {
+    await settle(250);
+
+    // Ten real classification reads, the same call the wait preflight makes.
+    for (let i = 0; i < 10; i++) {
+      assert.equal(bg.resolveShell(OWNER, RUN, "owed").cls, "running");
+    }
+
+    // A poll issued after them returns exactly what a poll issued instead of
+    // them would have: every byte, once.
+    const afterClassifying = bg.pollOutput(OWNER, RUN, "owed").text;
+    assert.match(afterClassifying, /first-line/);
+    assert.match(afterClassifying, /second-line/);
+    assert.match(bg.pollOutput(OWNER, RUN, "owed").text, /no new output/);
+  } finally {
+    bg.killShell(OWNER, RUN, "owed");
+  }
+});
+
+test("a wait's own output is unaffected by having been classified first", async () => {
+  // The offsets the two paths leave have to agree: whichever the caller used,
+  // it has seen the same bytes and the next call continues after them.
+  bg.spawnBackground(OWNER, RUN, "echo shared-line; sleep 60", "plain");
+  bg.spawnBackground(OWNER, RUN, "echo shared-line; sleep 60", "preflighted");
+  try {
+    await settle(250);
+
+    bg.resolveShell(OWNER, RUN, "preflighted");
+    const withPreflight = bg.pollOutput(OWNER, RUN, "preflighted").text;
+    const without = bg.pollOutput(OWNER, RUN, "plain").text;
+
+    assert.equal(
+      withPreflight.replace(/preflighted/g, "S"),
+      without.replace(/plain/g, "S"),
+      "classifying first changed what the read returned",
+    );
+    assert.match(withPreflight, /shared-line/);
+  } finally {
+    for (const id of ["plain", "preflighted"]) bg.killShell(OWNER, RUN, id);
   }
 });

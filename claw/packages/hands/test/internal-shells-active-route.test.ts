@@ -68,10 +68,9 @@ test("the proved owner is answered with its own running count", async () => {
 });
 
 test("a body naming a scope is refused by name, never answered from", async () => {
-  // The regression this closes: the owner used to come from the body behind a
-  // token bound to no scope, so any holder could count another owner's shells.
-  // Refused rather than ignored -- a caller that believes it is addressing one
-  // scope must not be answered about a different one.
+  // Refused rather than ignored: a caller that believes it is addressing one
+  // scope must not be answered about a different one, and an owner read from
+  // the body behind a token bound to no scope is any holder's to choose.
   spawnBackground(UNOWNED, "ktsk_1", "sleep 60", "stray");
   try {
     for (const field of ["owner", "run"]) {

@@ -108,6 +108,12 @@ test("a spawned command cannot read the token out of its own environment", async
 });
 
 test("each run identity gets its own identity, and none of them is Hands'", () => {
+  // Its own range rather than the shared fixture's: this asserts the allocation
+  // and never spawns, so it holds wherever the suite runs.
+  privilege.bindSandboxIsolation({
+    identityRange: () => ({ min: 65500, max: 65533 }),
+    partitionsProcessView: () => true,
+  });
   const a = privilege.resolveChildPrivilege("owner-1", "run-a");
   const b = privilege.resolveChildPrivilege("owner-1", "run-b");
   const c = privilege.resolveChildPrivilege("owner-2", "run-a");
@@ -119,9 +125,7 @@ test("each run identity gets its own identity, and none of them is Hands'", () =
   // Held for the sandbox's life, so a run's second command joins its first.
   assert.equal(privilege.resolveChildPrivilege("owner-1", "run-a").uid, a.uid);
 
-  if (process.getuid?.() === 0) {
-    for (const p of [a, b, c]) assert.notEqual(p.uid, 0, "a child must not run as Hands");
-  }
+  for (const p of [a, b, c]) assert.notEqual(p.uid, 0, "a child must not run as Hands");
 });
 
 test("a sandbox out of identities refuses rather than reusing one", () => {

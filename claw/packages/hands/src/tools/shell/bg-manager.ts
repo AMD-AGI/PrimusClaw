@@ -661,6 +661,9 @@ export function runningShellCount(owner: string): number | null {
  * A run that started nothing is not an error -- most runs never spawn a shell --
  * so this reports zero rather than refusing.
  */
+/** Raised where a reap could not establish what it was supposed to address. */
+export class UnreadableRecords extends Error {}
+
 export async function shutdownRunShells(
   owner: string, run: string, graceMs = REAP_GRACE_MS,
 ): Promise<ReapReport> {
@@ -691,10 +694,14 @@ function addressedByReap(owner: string, run: string): BgEntry[] {
   let records: ShellRecord[];
   try {
     records = listRecordsForOwner(owner);
-  } catch {
-    // Unreadable is not empty. The tracked set is still addressed; what cannot
-    // be read is reported by the surviving count rather than silently dropped.
-    return tracked;
+  } catch (e) {
+    // Unreadable is not empty, and the in-process set alone is empty after a
+    // restart for reasons that say nothing about the sandbox. Reporting what it
+    // holds would be an all-clear over work nobody could enumerate.
+    throw new UnreadableRecords(
+      `the shell records for ${owner} could not be read (${(e as Error).message}), `
+      + "so what this run still holds could not be established",
+    );
   }
   for (const record of records) {
     if ((record.run_identity ?? NO_RUN) !== run || seen.has(record.shell_id)) continue;

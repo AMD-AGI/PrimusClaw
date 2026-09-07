@@ -33,8 +33,11 @@ test("the guide's credential helper mints exactly what the routes verify", async
   const pairs: Array<[string, string | null]> = [
     ["sess-1", "ktsk_9"], ["sess-1", null], ["a/b", "c"], ["ünïcode", "рун"],
   ];
-  const script = `set -e\nHANDS_TOKEN=${JSON.stringify(SECRET)}\n${helpers}\n`
-    + pairs.map(([o, r]) => `scope_cred ${JSON.stringify(o)} ${JSON.stringify(r ?? "")}; echo`).join("\n");
+  // The token is the sandbox's own and arrives per row, so it is the first
+  // argument rather than an ambient value.
+  const script = `set -e\n${helpers}\n`
+    + pairs.map(([o, r]) =>
+      `scope_cred ${JSON.stringify(SECRET)} ${JSON.stringify(o)} ${JSON.stringify(r ?? "")}; echo`).join("\n");
   const minted = execFileSync("bash", ["-c", script], { encoding: "utf8" }).trim().split("\n");
 
   assert.deepEqual(

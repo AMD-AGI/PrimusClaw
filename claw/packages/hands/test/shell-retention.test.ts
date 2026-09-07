@@ -109,8 +109,7 @@ test("siblings share the expiry their run's deadline fixes, each from its own en
 test("a start with no deadline retains for the sandbox's life", async () => {
   // The fallback for an absent deadline is no expiry, never a substituted
   // constant: a constant would age out a tombstone under a run still reading it.
-  assert.equal(normalizeDeadline(undefined), undefined);
-  assert.equal(normalizeDeadline(""), undefined);
+  assert.equal(normalizeDeadline(undefined), undefined, "no header is a run with no deadline");
 
   startUnder(undefined, "no-deadline");
   await settle(200);
@@ -123,7 +122,8 @@ test("a deadline that was sent and cannot be read is refused, not read as absent
   // Absent means the run states no bound, which retains forever. Reading a
   // malformed value as that substitutes the opposite policy on a run that did
   // state one, and nothing downstream could tell.
-  for (const raw of ["not-a-date", "2026-13-45T99:99:99Z", "   x   ", 12345, {}]) {
+  // Blank is in the list: it was sent, and it names no instant either.
+  for (const raw of ["", "   ", "not-a-date", "2026-13-45T99:99:99Z", "   x   ", 12345, {}]) {
     assert.throws(() => normalizeDeadline(raw), MalformedDeadline, JSON.stringify(raw));
   }
 });
