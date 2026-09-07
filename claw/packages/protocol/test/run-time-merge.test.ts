@@ -399,3 +399,106 @@ test("the attempt-record list is capped, and says how much it dropped", () => {
   assert.equal(e.attemptsDiscarded, 3, "a pathological retry loop loses detail, visibly");
   assert.equal(e.attempts[0].attemptId, "att-4", "the oldest goes first");
 });
+
+// ── §5: the endpoints a cross-domain duration names decide its correction ────
+
+/**
+ * One measured round trip: `offset = db - caller`, uncertainty `rtt / 2`.
+ *
+ * The caller's two readings are absolute, as `Date.now()` gives them; a
+ * relative pair would make every offset here the whole epoch and land every
+ * case in the excess-skew branch instead of the one under test.
+ */
+const offsetOf = (callerDomain: "brain" | "api" | "db", offsetMs: number, rttMs = 0) => ({
+  callerDomain,
+  sentAtMs: Date.parse(EPOCH),
+  dbAt: at(offsetMs + rttMs / 2),
+  receivedAtMs: Date.parse(EPOCH) + rttMs,
+});
+
+const crossWire = (basis: unknown) => decodeRunTimeReport({
+  key: "k", attemptId: "a", claimCount: 0, deliverySeq: 0, deliveryCount: 0, basis,
+});
+
+test("§5 a cross-domain basis its offset cannot relate is refused by name", () => {
+  // The offset relates one caller's clock to the database's, so it can only
+  // correct a duration with one endpoint on each. Accepted uncorrected, a
+  // pod-to-pod duration is exactly the domain mixing D1 is about -- and the
+  // arithmetic has no way to notice, because it never read the endpoints.
+  const podToPod = crossWire({
+    kind: "cross_domain", startDomain: "api", endDomain: "brain", offset: offsetOf("db", 0),
+  });
+  assert.equal(podToPod.ok, false, "no offset can convert api-to-brain into db time");
+  assert.match((podToPod as { rejected: string }).rejected, /basis\.startDomain\/endDomain/);
+
+  const wrongCaller = crossWire({
+    kind: "cross_domain", startDomain: "brain", endDomain: "db", offset: offsetOf("api", 0),
+  });
+  assert.equal(wrongCaller.ok, false, "the offset was measured against a third clock");
+  assert.match((wrongCaller as { rejected: string }).rejected, /callerDomain: expected brain/);
+
+  const sameTwice = crossWire({
+    kind: "cross_domain", startDomain: "brain", endDomain: "brain", offset: offsetOf("brain", 0),
+  });
+  assert.equal(sameTwice.ok, false, "one clock at both ends is same_domain, not a crossing");
+
+  for (const [startDomain, endDomain, caller] of [
+    ["brain", "db", "brain"], ["db", "brain", "brain"], ["api", "db", "api"],
+  ] as const) {
+    assert.equal(
+      crossWire({ kind: "cross_domain", startDomain, endDomain, offset: offsetOf(caller, 0) }).ok,
+      true, `${startDomain} -> ${endDomain} is one clock each side and must be admitted`,
+    );
+  }
+});
+
+test("§5 the offset is applied by direction, not always subtracted", () => {
+  // `offset = db - caller`. A duration that starts on the caller's clock and
+  // ends on the database's has the offset baked in and removes it; the opposite
+  // direction is short by it and adds it. One sign for both doubles the error.
+  const offset = offsetOf("brain", 300);
+  const covered = { cumulativeStateMs: { executing: 1_000 } };
+
+  const startOnCaller = mergeRunTimeReport(entry(), report({
+    ...covered,
+    basis: { kind: "cross_domain", startDomain: "brain", endDomain: "db", offset },
+  }), at(5_000));
+  const endOnCaller = mergeRunTimeReport(entry(), report({
+    ...covered,
+    basis: { kind: "cross_domain", startDomain: "db", endDomain: "brain", offset },
+  }), at(5_000));
+
+  assert.equal(startOnCaller.knownMsByState.executing, 700, "1000 measured, 300 of it offset");
+  assert.equal(endOnCaller.knownMsByState.executing, 1_300, "the same offset, the other way");
+});
+
+test("§5 a report refused for skew cannot come back as new coverage", () => {
+  // The refusal banks the interval as unknown and moves the anchor past it. If
+  // it left `coverageSeen` where it was, the same cumulative totals resent under
+  // a clean basis read as coverage nobody had presented -- so a later wall
+  // interval got classified by measurements taken before it started.
+  const wild = RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC * 1000 + 60_000;
+  const skewed = report({
+    cumulativeStateMs: { executing: 1_000 },
+    basis: {
+      kind: "cross_domain", startDomain: "brain", endDomain: "db", offset: offsetOf("brain", wild),
+    },
+  });
+
+  let e = mergeRunTimeReport(entry(), skewed, at(1_000));
+  assert.equal(e.accountingVerdict, "degraded_skew");
+  assert.equal(e.unknownMs, 1_000, "the interval it would have covered is unknown, not known");
+  assert.equal(knownOf(e), 0);
+
+  e = mergeRunTimeReport(e, report({ cumulativeStateMs: { executing: 1_000 } }), at(2_000));
+  assert.equal(knownOf(e), 0,
+    "resending the same totals presents no new coverage, whatever basis it arrives under");
+  assertIdentity(e, at(2_000));
+
+  // A genuinely larger total still banks the difference, so the refusal blocks
+  // re-reading old coverage rather than the attempt reporting again at all.
+  e = mergeRunTimeReport(e, report({ cumulativeStateMs: { executing: 1_600 } }), at(3_000));
+  assert.equal(e.knownMsByState.executing, 600);
+  assertIdentity(e, at(3_000));
+});
+

@@ -203,14 +203,25 @@ function basisAdmissible(basis: DurationBasis): boolean {
   return Math.abs(offsetMs) + uncertaintyMs <= RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC * 1000;
 }
 
-// A duration measured start-on-caller, end-on-database carries the offset, so
-// it comes back out; subtracting the uncertainty makes what is banked a lower
-// bound and leaves the shortfall visible as unbanked time.
+/**
+ * Which way the measured offset applies, from the endpoint the caller timed.
+ *
+ * `offset = db - caller`, so a duration that *starts* on the caller's clock has
+ * the offset baked into it and removes it, while one that *ends* there is short
+ * by it. Applying one sign to both directions doubles the error rather than
+ * removing it, which is why the endpoints are read rather than assumed.
+ */
+function offsetSign(basis: Extract<DurationBasis, { kind: "cross_domain" }>): -1 | 1 {
+  return basis.startDomain === basis.offset.callerDomain ? -1 : 1;
+}
+
+// Reduced by the uncertainty in both directions, so what is banked is a lower
+// bound and the shortfall stays visible as unbanked time.
 function admissibleValue(raw: number, basis: DurationBasis): number {
   const value = Math.max(Math.floor(raw), 0);
   if (basis.kind === "same_domain") return value;
   const { offsetMs, uncertaintyMs } = clockOffsetOf(basis.offset);
-  return Math.max(0, Math.floor(value - offsetMs - uncertaintyMs));
+  return Math.max(0, Math.floor(value + offsetSign(basis) * offsetMs - uncertaintyMs));
 }
 
 interface MergeAccumulator {
@@ -300,6 +311,34 @@ function withClampHistory(
 }
 
 /**
+ * What a report presented, whether or not any of it could be banked.
+ *
+ * Recorded in the reporter's own units rather than corrected ones: the point is
+ * that resending the same cumulative totals presents no new coverage, and a
+ * refused report has no correction anyone is entitled to apply to it.
+ */
+function seenAfterRefusal(seen: CoverageSeen, incoming: RunTimeReport): CoverageSeen {
+  const floorTo = (a: number | undefined, b: number | undefined): number =>
+    Math.max(a ?? 0, Math.max(Math.floor(b ?? 0), 0));
+  const stateMs = { ...seen.stateMs };
+  for (const state of RUN_TIME_KNOWN_STATES) {
+    const raw = incoming.cumulativeStateMs?.[state];
+    if (raw !== undefined) stateMs[state] = floorTo(stateMs[state], raw);
+  }
+  const reasonMs = { ...seen.reasonMs };
+  for (const reason of RUN_WAIT_REASONS) {
+    const raw = incoming.cumulativeReasonMs?.[reason];
+    if (raw !== undefined) reasonMs[reason] = floorTo(reasonMs[reason], raw);
+  }
+  return {
+    attemptId: incoming.attemptId,
+    stateMs,
+    reasonMs,
+    unknownMs: floorTo(seen.unknownMs, incoming.cumulativeUnknownMs),
+  };
+}
+
+/**
  * Bank what a report covers, up to the wall time that has actually elapsed.
  *
  * Pure and total: a value the budget cannot admit is clamped and recorded, and
@@ -326,14 +365,9 @@ export function mergeRunTimeReport(
       lastAcceptedInstantDb: plusMs(stored.lastAcceptedInstantDb, budget),
       accountingVerdict: "degraded_skew",
       clampedKeys: [],
+      coverageSeen: seenAfterRefusal(seen, incoming),
     };
   }
-
-  // A new attempt restarts its totals at zero, which is a reset rather than a
-  // regression. Only a report that already passed the row's attempt fence
-  // reaches here, so the reset can only move the entry forward.
-  const fresh = stored.coverageSeen.attemptId !== incoming.attemptId;
-  const seen = fresh ? emptyCoverage(incoming.attemptId) : stored.coverageSeen;
 
   const acc: MergeAccumulator = {
     remaining: budget,
@@ -553,6 +587,8 @@ function decodeBasis(raw: unknown): DurationBasis | string {
   if (!isClockDomain(offset.callerDomain)) {
     return `basis.offset.callerDomain: expected one of ${CLOCK_DOMAINS.join(", ")}`;
   }
+  const endpoints = crossDomainEndpoints(cross.startDomain, cross.endDomain, offset.callerDomain);
+  if (endpoints) return endpoints;
   return {
     kind: "cross_domain",
     startDomain: cross.startDomain,
@@ -564,6 +600,36 @@ function decodeBasis(raw: unknown): DurationBasis | string {
       receivedAtMs: offset.receivedAtMs,
     },
   };
+}
+
+/**
+ * Why a pair of endpoints cannot be related by one measured offset, if it cannot.
+ *
+ * The database is the accounting domain (§5), and a `ClockOffset` relates one
+ * caller's clock to it -- so a duration it can correct has exactly one endpoint
+ * on the database's clock and the other on the caller's. A pod-to-pod duration,
+ * or one whose offset was measured against a third clock, has no correction this
+ * type can express, and banking it uncorrected is the mixing D1 is about.
+ */
+function crossDomainEndpoints(
+  startDomain: ClockDomain,
+  endDomain: ClockDomain,
+  callerDomain: ClockDomain,
+): string | null {
+  if (startDomain === endDomain) {
+    return "basis.startDomain/endDomain: a cross_domain basis names two different"
+      + " clocks; use same_domain when both endpoints share one";
+  }
+  if (startDomain !== "db" && endDomain !== "db") {
+    return "basis.startDomain/endDomain: one endpoint must be db, the domain every"
+      + " banked duration is measured in";
+  }
+  const caller = startDomain === "db" ? endDomain : startDomain;
+  if (callerDomain !== caller) {
+    return `basis.offset.callerDomain: expected ${caller}, the non-db endpoint this`
+      + " offset has to relate to the database's clock";
+  }
+  return null;
 }
 
 // Refused by name rather than copied through: a string here reaches the
