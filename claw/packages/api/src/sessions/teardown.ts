@@ -591,6 +591,21 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       await query(
         `UPDATE claw_sessions
             SET deleted_at = COALESCE(deleted_at, NOW()),
+                -- The gate, made honest on the way out. A value of running
+                -- means a turn is executing, and the statement above has just
+                -- cancelled every non-terminal run this session had, so by this
+                -- line none is. Left alone it stays that way forever:
+                -- reapStuckSessions deliberately skips deleted rows (there is no
+                -- gate left to open), so nothing else ever corrects it. Harmless
+                -- to dispatch, which cannot reach a deleted session at all --
+                -- and misleading to everything else, which is how 130 rows on
+                -- this deployment came to read running with nothing running.
+                --
+                -- CASE rather than a plain assignment: failed and interrupted
+                -- say how the conversation ended, and that is worth keeping.
+                -- Only the claim that something is still going is false here.
+                agent_status = CASE WHEN agent_status = 'running'
+                                    THEN 'idle' ELSE agent_status END,
                 updated_at = NOW(),
                 cleanup_state = 'pending',
                 cleanup_attempts = 0,

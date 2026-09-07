@@ -90,7 +90,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     // makes a re-published completion write one turn instead of two, and
     // without it the insert that carries it fails outright, so a completion
     // that ran perfectly well loses its turn entirely.
-    columns: ["session_id", "turn_index", "role", "content", "message_id"],
+    columns: ["session_id", "turn_index", "role", "content", "message_id", "is_placeholder"],
   },
   {
     table: "claw_pending_messages",

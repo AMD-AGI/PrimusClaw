@@ -866,15 +866,17 @@ function dispatchProbes(
           return;
         }
         const state: BackgroundWork = running > 0 ? "running" : "idle";
+        // A newer shared timestamp would invalidate this probe's local cache.
+        const measuredAt = Date.now();
         bgProbeCache.set(identity, {
-          at: Date.now(), state, epoch,
+          at: measuredAt, state, epoch,
           idleSince: idleSinceAtStart, idleRev: idleRevAtStart,
         });
         bgUnknownStreak.delete(identity);
         // Share measured answers; inferred idle remains local to this replica.
         await persistVerdict(
-          deps, sessionId, identity, running, epoch, idleSinceAtStart, idleRevAtStart,
-          verdictAtStart,
+          deps, sessionId, identity, running, measuredAt,
+          epoch, idleSinceAtStart, idleRevAtStart, verdictAtStart,
         );
         if (state === "running") {
           logger.info(
@@ -949,6 +951,7 @@ async function persistVerdict(
   sessionId: string,
   identity: string,
   running: number,
+  measuredAt: number,
   epoch: number | undefined,
   idleSinceAtStart: number | undefined,
   idleRevAtStart: number | undefined,
@@ -1000,7 +1003,7 @@ async function persistVerdict(
       }
       const next = sc.encode(JSON.stringify({
         ...info,
-        bgCheckedAt: Date.now(),
+        bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,
         bgIdleSince: idleSinceAtStart,

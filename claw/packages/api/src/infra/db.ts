@@ -554,6 +554,9 @@ export async function initDb(): Promise<void> {
     // partial on it, because turns written before this column existed have no
     // message id and are not comparable to each other.
     await client.query("ALTER TABLE claw_conversation_turns ADD COLUMN IF NOT EXISTS message_id TEXT").catch(() => {});
+    await client.query(
+      "ALTER TABLE claw_conversation_turns ADD COLUMN IF NOT EXISTS is_placeholder BOOLEAN NOT NULL DEFAULT FALSE",
+    );
     // Not swallowed, unlike the indexes above: this one is a constraint, and the
     // `ON CONFLICT DO NOTHING` that depends on it silently degrades into an
     // ordinary insert without it -- which is the duplicate, back again, on a

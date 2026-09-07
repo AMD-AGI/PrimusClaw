@@ -670,13 +670,16 @@ test("a verdict an old binary carried across a task is not read as current", asy
   );
 });
 
-test("a working sandbox is not re-probed every tick by the stamp that protects it", async () => {
+test("a working sandbox is not re-probed every tick by the stamp that protects it", async (t) => {
   // The cost side of anchoring the verdict to `idleSince`. The `running` branch
   // also moves that stamp -- so if it moved it to `Date.now()` it would land
   // ahead of the answer that justified moving it, and invalidate it on the very
   // next sweep: a pod with a long-running job would fall back to `unknown` every
   // other tick and be re-probed for as long as the job ran. Anchoring the stamp
   // to the measurement instead makes re-reading the same verdict idempotent.
+  // Cache and KV writes may straddle milliseconds in production.
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now++);
   const k = fakeKv();
   stubPingableProvider();
   let probes = 0;
