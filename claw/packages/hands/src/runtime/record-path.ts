@@ -19,8 +19,7 @@
  * whole down directory levels instead.
  */
 
-/** Marker byte for an escape. Escaped itself, so decoding is unambiguous. */
-const ESCAPE = "~";
+import { ABSENT_RUN_SCOPE, encodeScopePart as encodePartLocal } from "@claw/utils";
 
 /** Longest component the encoder emits before chunking a part. */
 const CHUNK_BYTES = 200;
@@ -44,40 +43,17 @@ export const SHELL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * reserved location unreachable by a real run identity, and a hand-written
  * record naming the literal text rejectable by the ordinary re-encode check.
  */
-export const NO_RUN_SEGMENT = ".norun";
+export const NO_RUN_SEGMENT = ABSENT_RUN_SCOPE;
 
 /** A run identity that is absent rather than empty. */
 export const ABSENT_RUN = Symbol("absent-run");
 export type RunPart = string | typeof ABSENT_RUN;
 
-const UNRESERVED = /[A-Za-z0-9_-]/;
-
-/** Encode one part over its UTF-8 bytes. Injective by construction. */
-export function encodePart(part: string): string {
-  let out = "";
-  for (const byte of Buffer.from(part, "utf8")) {
-    const ch = String.fromCharCode(byte);
-    out += UNRESERVED.test(ch)
-      ? ch
-      : ESCAPE + byte.toString(16).toUpperCase().padStart(2, "0");
-  }
-  return out;
-}
-
-export function decodePart(encoded: string): string {
-  const bytes: number[] = [];
-  for (let i = 0; i < encoded.length; i++) {
-    if (encoded[i] !== ESCAPE) {
-      bytes.push(encoded.charCodeAt(i));
-      continue;
-    }
-    const hex = encoded.slice(i + 1, i + 3);
-    if (!/^[0-9A-F]{2}$/.test(hex)) throw new Error(`record path: malformed escape at ${i}`);
-    bytes.push(parseInt(hex, 16));
-    i += 2;
-  }
-  return Buffer.from(bytes).toString("utf8");
-}
+/**
+ * The same encoding the scope credential's proof is taken over, so a path and a
+ * credential cannot disagree about which pair they name.
+ */
+export { encodeScopePart as encodePart, decodeScopePart as decodePart } from "@claw/utils";
 
 /**
  * Split one encoded part into path components.
@@ -128,8 +104,8 @@ export function recordComponents(
   assertShellId(shellId);
   const run = runIdentity === ABSENT_RUN
     ? [NO_RUN_SEGMENT]
-    : (assertScopePart("run identity", runIdentity), chunk(encodePart(runIdentity)));
-  return [...chunk(encodePart(ownerScope)), ...run, ...chunk(encodePart(shellId))];
+    : (assertScopePart("run identity", runIdentity), chunk(encodePartLocal(runIdentity)));
+  return [...chunk(encodePartLocal(ownerScope)), ...run, ...chunk(encodePartLocal(shellId))];
 }
 
 /**

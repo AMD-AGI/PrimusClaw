@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { mintScopeCredential } from "@claw/utils";
 import { createHmac } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -312,6 +313,19 @@ export class HandsLivenessIndeterminate extends Error {}
 export const HANDS_LIVENESS_INDETERMINATE = "shell_liveness_indeterminate";
 
 /** What one dispatch answers with, whichever route asked. */
+/** What a classification read answered, or the safe reading when it could not. */
+export interface ShellClassProbe {
+  shellClass: string;
+  collectorLive: boolean;
+}
+
+/**
+ * A sandbox that cannot be asked reads as running: a run parked once too often
+ * loses its slot for one call, while one not parked when it should have been
+ * holds it for the whole wait timeout.
+ */
+const UNREADABLE_SHELL_CLASS: ShellClassProbe = { shellClass: "running", collectorLive: false };
+
 export interface DispatchOutcome {
   text: string;
   isError: boolean;
@@ -670,6 +684,45 @@ export class HandsClient {
   }
 
   /**
+   * The credential the internal routes take their scope from.
+   *
+   * Minted per call rather than held, because the run half changes with the
+   * client's own binding and a stale proof would name the wrong scope. The
+   * secret is the sandbox's internal token, which no model-issued process can
+   * read, so a proof reaching one authorises that scope and nothing else.
+   */
+  private scopedCredential(): string {
+    return mintScopeCredential({ owner: this.owner, run: this.run || null }, this.token);
+  }
+
+  /**
+   * The class of one shell, read without consuming a byte of its output.
+   *
+   * Asked before a `wait` is routed, so the decision to hand back the pod's
+   * execution slot is taken from evidence rather than from the tool's name. A
+   * sandbox that cannot answer is treated as running: parking a run that did
+   * not need to park costs a slot for one call, while failing to park one that
+   * did holds it for the whole wait timeout.
+   */
+  async classifyShell(shellId: string, timeoutMs = 10_000): Promise<ShellClassProbe> {
+    try {
+      const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/class"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+        body: JSON.stringify({ shell_id: await this.wireShellId(shellId) }),
+        signal: AbortSignal.timeout(timeoutMs),
+        dispatcher: HANDS_DISPATCHER,
+      } as Parameters<typeof undiciFetch>[1]);
+      if (!resp.ok) return UNREADABLE_SHELL_CLASS;
+      const body = await resp.json() as { shell_class?: unknown; collector_live?: unknown };
+      if (typeof body?.shell_class !== "string") return UNREADABLE_SHELL_CLASS;
+      return { shellClass: body.shell_class, collectorLive: body.collector_live === true };
+    } catch {
+      return UNREADABLE_SHELL_CLASS;
+    }
+  }
+
+  /**
    * What the sandbox's own records say about one shell.
    *
    * Read-only and starts nothing on any version, so a Brain may ask before
@@ -680,8 +733,8 @@ export class HandsClient {
     try {
       const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/record"), {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.token}`, "content-type": "application/json" },
-        body: JSON.stringify({ owner: this.owner, run: this.run, shell_id: shellId }),
+        headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+        body: JSON.stringify({ shell_id: shellId }),
         signal: AbortSignal.timeout(10_000),
         dispatcher: HANDS_DISPATCHER,
       } as Parameters<typeof undiciFetch>[1]);
@@ -907,8 +960,8 @@ export class HandsClient {
     if (!this.run) return 0;
     const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ run: this.run }),
+      headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+      body: JSON.stringify({}),
       signal: AbortSignal.timeout(timeoutMs),
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
@@ -1048,8 +1101,11 @@ export async function countActiveShells(
   if (!owner) throw new Error("hands_active_shells_failed: empty owner");
   const resp = await undiciFetch(handsEndpoint(url, "/internal/shells/active"), {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ owner }),
+    headers: {
+      Authorization: `Bearer ${mintScopeCredential({ owner, run: null }, token)}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({}),
     signal: AbortSignal.timeout(timeoutMs),
     dispatcher: HANDS_DISPATCHER,
   } as Parameters<typeof undiciFetch>[1]);

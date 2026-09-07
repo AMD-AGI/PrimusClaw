@@ -14,7 +14,11 @@ export const kill_shell = {
   description: "Terminate a background shell started with bash(run_in_background=true). Sends SIGTERM to the process group, then SIGKILL after 5s.",
   zodSchema: schema,
   execute: async (args: { shell_id: string }) => {
-    const text = killShell(currentOwner(), currentRun(), args.shell_id);
-    return { content: [{ type: "text" as const, text }] };
+    const answer = killShell(currentOwner(), currentRun(), args.shell_id);
+    return {
+      content: [{ type: "text" as const, text: answer.text }],
+      isError: answer.isError,
+      structuredContent: answer.structured,
+    };
   },
 };

@@ -20,6 +20,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
+import { mintScopeCredential } from "@claw/utils";
 
 process.env.WORKSPACE_PATH = tmpdir();
 delete process.env.BG_SHELL_ENABLED;
@@ -30,14 +31,17 @@ if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 const { app } = await import("../src/index.js");
 const { UNOWNED } = await import("../src/runtime/owner-context.js");
 
-const AUTH = { authorization: "Bearer test-internal-token" };
+const TOKEN = "test-internal-token";
+const proving = (owner: string, run: string | null = null) => ({
+  authorization: `Bearer ${mintScopeCredential({ owner, run }, TOKEN)}`,
+});
 
-function post(url: string, payload: unknown, headers: Record<string, string> = AUTH) {
+function post(url: string, headers: Record<string, string>, payload: unknown = {}) {
   return app.inject({ method: "POST", url, headers, payload: payload as object });
 }
 
 test("the active-shells route answers with the feature off", async () => {
-  const res = await post("/internal/shells/active", { owner: "sess-off" });
+  const res = await post("/internal/shells/active", proving("sess-off"));
 
   assert.equal(res.statusCode, 200,
     "the count the rollback polls to zero is unreachable with the flag off");
@@ -45,7 +49,7 @@ test("the active-shells route answers with the feature off", async () => {
 });
 
 test("the reap route answers with the feature off", async () => {
-  const res = await post("/internal/shells/reap", { run: "run-off" });
+  const res = await post("/internal/shells/reap", proving("sess-off", "run-off"));
 
   assert.equal(res.statusCode, 200,
     "the rollback's termination path is unreachable with the flag off");
@@ -54,25 +58,30 @@ test("the reap route answers with the feature off", async () => {
 
 test("both routes still authenticate with the feature off", async () => {
   for (const url of ["/internal/shells/active", "/internal/shells/reap"]) {
-    const res = await post(url, { owner: "sess-off", run: "run-off" }, {});
-    assert.equal(res.statusCode, 401, `${url} served an unauthenticated caller`);
+    assert.equal((await post(url, {})).statusCode, 401, `${url} served an unauthenticated caller`);
+    // The bare sandbox token names no scope, and the flag must not restore it
+    // as a way in: the rollback path keeps working, the boundary does not move.
+    assert.equal((await post(url, { authorization: `Bearer ${TOKEN}` })).statusCode, 401);
   }
 });
 
-test("both routes still validate their argument with the feature off", async () => {
-  // The flag must not soften the checks either: an owner that only reached the
-  // shared bucket by failing normalization would otherwise be answered with
-  // every caller's work, which is what keeps a drained sandbox alive.
-  const active = await post("/internal/shells/active", {});
-  assert.equal(active.statusCode, 400);
-  assert.equal(active.json().error, "owner_required");
+test("both routes still bind their scope to the credential with the feature off", async () => {
+  // The flag must not soften the boundary either: a body field naming a scope
+  // would otherwise let a rollback count and terminate somebody else's work.
+  for (const url of ["/internal/shells/active", "/internal/shells/reap"]) {
+    const res = await post(url, proving("sess-off", "run-off"), { owner: "sess-other" });
+    assert.equal(res.statusCode, 400, `${url} read a scope out of the body`);
+    assert.deepEqual(res.json(), { error: "scope_not_in_body", field: "owner" });
+  }
 
-  const reap = await post("/internal/shells/reap", {});
+  // A credential proving no run identity authorises no reap: that bucket holds
+  // every shell started without one, which nothing may end by run.
+  const reap = await post("/internal/shells/reap", proving("sess-off"));
   assert.equal(reap.statusCode, 400);
   assert.equal(reap.json().error, "run_required");
 
-  // A caller naming the bucket deliberately is asking a real question.
-  const named = await post("/internal/shells/active", { owner: UNOWNED });
+  // The shared bucket is an addressable scope like any other, by proving it.
+  const named = await post("/internal/shells/active", proving(UNOWNED));
   assert.equal(named.statusCode, 200);
 });
 

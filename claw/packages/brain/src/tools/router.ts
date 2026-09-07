@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { HandsClient } from "../clients/hands.js";
+import { HandsClient, type ShellClassProbe } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
@@ -167,6 +167,17 @@ export class ToolRouter {
    * reaches Hands goes through here, so a tool call is the thing that decides
    * a sandbox is needed — no caller has to remember to ask for one.
    */
+  /**
+   * The class of a background shell, read without consuming its output.
+   *
+   * Exists so a caller can decide whether a `wait` on it can block before the
+   * wait is routed. A sandbox that cannot be reached answers `running`, which
+   * is the reading that costs a slot for one call rather than for a timeout.
+   */
+  async classifyShell(shellId: string): Promise<ShellClassProbe> {
+    return (await this.requireHands()).classifyShell(shellId);
+  }
+
   private async requireHands(): Promise<HandsClient> {
     if (this.hands) return this.hands;
     if (!this.attachHands) throw new Error("No sandbox is attached to this run");
@@ -254,7 +265,7 @@ export class ToolRouter {
      * anticipate as a success. Anything that needs to know whether the work
      * happened reads this instead.
      */
-    outcome?: { isError: boolean },
+    outcome?: { isError: boolean; structured?: Record<string, unknown> },
     /** Replay-stable identity of this call site; sealed on the reference row. */
     ctx?: { stepIdentity?: string },
   ): Promise<string> {
@@ -362,7 +373,13 @@ export class ToolRouter {
       // the skill name still landed in skillsRead and polluted feedback / probation /
       // evolution stats with attribution to a skill that never actually loaded.
       const answered = await (await this.requireHands()).callToolFull(name, input, signal, ctx);
-      if (outcome) outcome.isError = answered.isError;
+      if (outcome) {
+        outcome.isError = answered.isError;
+        // The durable state of a shell is a field, not a sentence. Dropping it
+        // here left every read, wait and kill answerable only by matching the
+        // prose a later reword would change.
+        outcome.structured = answered.structured as Record<string, unknown> | undefined;
+      }
       const result = answered.text;
       if (name === "bash" && typeof input.command === "string") {
         this.trackSkillRead(input.command);

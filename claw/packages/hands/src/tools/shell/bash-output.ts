@@ -15,7 +15,11 @@ export const bash_output = {
   description: "Read incremental output from a background shell started with bash(run_in_background=true) in this same run. Returns only the bytes produced since the previous poll, plus the exit status once the shell has finished.",
   zodSchema: schema,
   execute: async (args: { shell_id: string; filter?: string }) => {
-    const text = pollOutput(currentOwner(), currentRun(), args.shell_id, args.filter);
-    return { content: [{ type: "text" as const, text }] };
+    const answer = pollOutput(currentOwner(), currentRun(), args.shell_id, args.filter);
+    return {
+      content: [{ type: "text" as const, text: answer.text }],
+      isError: answer.isError,
+      structuredContent: answer.structured,
+    };
   },
 };

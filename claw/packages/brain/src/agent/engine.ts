@@ -355,6 +355,7 @@ export class AgentEngine {
           hands: attached,
           attachHands: sandbox,
           runKey: request.dag_root_task_id || request.session_id,
+          parkKey: extras?.parkKey,
           platformMcpClients: mcpResult.clients,
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,

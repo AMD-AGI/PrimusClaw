@@ -5,21 +5,19 @@
  * The active-shells route as Brain actually reaches it.
  *
  * bg-shell-ownership covers the predicate underneath; this covers the layer
- * above, which is where the empty-owner question is really decided. The route
- * normalizes before it validates, and `normalizeOwner` substitutes the shared
- * `unowned` bucket for anything it cannot use -- so a `!owner` guard written
- * after it can never fire, and a malformed question would be answered with the
- * count of every caller that sent no owner header. Only a request driven
- * through the route shows that; calling the predicate cannot, because
- * normalization happens above it.
+ * above, which is where the scope question is really decided. The route takes
+ * the owner from the credential the caller presented and from nowhere else: a
+ * body field naming one is refused rather than read, so no holder of the
+ * sandbox token can count a scope it holds no proof for.
  *
- * Three layers have to agree on what an empty owner means. The Brain client
+ * Three layers have to agree on what an unproven scope means. The Brain client
  * refuses to ask, the predicate counts nothing, and this pins the one in the
  * middle: the route refuses to answer.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
+import { mintScopeCredential } from "@claw/utils";
 
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
@@ -34,10 +32,14 @@ const { spawnBackground, killShell, shutdownAllShells } =
   await import("../src/tools/shell/bg-manager.js");
 const { UNOWNED } = await import("../src/runtime/owner-context.js");
 
-const AUTH = { authorization: "Bearer test-internal-token" };
+const TOKEN = "test-internal-token";
 const SESSION = "sess-route";
 
-function ask(body: unknown, headers: Record<string, string> = AUTH) {
+const proving = (owner: string, run: string | null = null) => ({
+  authorization: `Bearer ${mintScopeCredential({ owner, run }, TOKEN)}`,
+});
+
+function ask(headers: Record<string, string>, body: unknown = {}) {
   return app.inject({
     method: "POST",
     url: "/internal/shells/active",
@@ -51,10 +53,10 @@ test.after(async () => {
   await app.close();
 });
 
-test("a real owner is answered with its own running count", async () => {
+test("the proved owner is answered with its own running count", async () => {
   spawnBackground(SESSION, "ktsk_1", "sleep 60", "srv");
   try {
-    const res = await ask({ owner: SESSION });
+    const res = await ask(proving(SESSION));
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
@@ -62,42 +64,27 @@ test("a real owner is answered with its own running count", async () => {
   }
 });
 
-test("an owner that did not survive normalization is refused, not answered from the shared bucket", async () => {
-  // The regression: every one of these normalizes to `unowned`, which is
-  // truthy, so a `!owner` guard let them through -- and the reply would then
-  // report somebody else's work, keeping a pod alive for a session that has
-  // nothing running in it.
+test("a body naming a scope is refused by name, never answered from", async () => {
+  // The regression this closes: the owner used to come from the body behind a
+  // token bound to no scope, so any holder could count another owner's shells.
+  // Refused rather than ignored -- a caller that believes it is addressing one
+  // scope must not be answered about a different one.
   spawnBackground(UNOWNED, "ktsk_1", "sleep 60", "stray");
   try {
-    // Every rejection `normalizeCallerKey` can make: not a string, blank,
-    // whitespace-only, over the length cap, and control characters -- the last
-    // being the one that matters, since the owner is a registry key prefix.
-    const unusable = [undefined, null, 123, "", "   ", "x".repeat(201), "sess\u0000forged"];
-    for (const owner of unusable) {
-      const res = await ask({ owner });
-      assert.equal(
-        res.statusCode,
-        400,
-        `owner=${JSON.stringify(owner)} must be refused, not answered with the unowned bucket`,
-      );
-      assert.deepEqual(res.json(), { error: "owner_required" });
+    for (const field of ["owner", "run"]) {
+      const res = await ask(proving(SESSION), { [field]: UNOWNED });
+      assert.equal(res.statusCode, 400, `a body ${field} must be refused`);
+      assert.deepEqual(res.json(), { error: "scope_not_in_body", field });
     }
-
-    // A body with no owner field at all asks the same unanswerable question.
-    const absent = await ask({});
-    assert.equal(absent.statusCode, 400);
-    assert.deepEqual(absent.json(), { error: "owner_required" });
   } finally {
     killShell(UNOWNED, "ktsk_1", "stray");
   }
 });
 
-test("naming the unowned bucket explicitly is a real question and is answered", async () => {
-  // Refusing this too would make the bucket unaddressable. Only values that
-  // landed there by failing normalization are rejected.
+test("the unowned bucket is addressable, by proving it like any other scope", async () => {
   spawnBackground(UNOWNED, "ktsk_1", "sleep 60", "explicit");
   try {
-    const res = await ask({ owner: UNOWNED });
+    const res = await ask(proving(UNOWNED));
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
@@ -105,10 +92,40 @@ test("naming the unowned bucket explicitly is a real question and is answered", 
   }
 });
 
-test("the route proves it is Brain before it counts anything", async () => {
-  const anonymous = await ask({ owner: SESSION }, {});
+test("a credential proving nothing counts nothing", async () => {
+  const anonymous = await ask({});
   assert.equal(anonymous.statusCode, 401, "an unauthenticated caller must not learn what is running");
+  assert.deepEqual(anonymous.json(), { error: "scope_credential_malformed" });
 
-  const wrong = await ask({ owner: SESSION }, { authorization: "Bearer nope" });
-  assert.equal(wrong.statusCode, 401);
+  // The bare sandbox token names no scope. It authenticated the old route and
+  // is exactly what must stop working here.
+  const bare = await ask({ authorization: `Bearer ${TOKEN}` });
+  assert.equal(bare.statusCode, 401);
+
+  // A well-formed scope with somebody else's proof, and a proof minted under a
+  // different secret: both are refused rather than read from.
+  const forged = await ask({ authorization: `Bearer ${SESSION}/.norun.${"0".repeat(64)}` });
+  assert.equal(forged.statusCode, 401);
+  assert.deepEqual(forged.json(), { error: "scope_proof_invalid" });
+
+  const otherSecret = await ask({
+    authorization: `Bearer ${mintScopeCredential({ owner: SESSION, run: null }, "another-token")}`,
+  });
+  assert.equal(otherSecret.statusCode, 401);
+});
+
+test("a proof for one owner cannot be presented for another", async () => {
+  // The pair's parts cannot span the separator, so no re-reading of one
+  // credential's bytes yields a different pair with the same proof.
+  spawnBackground("owner-x", "ktsk_1", "sleep 60", "x-shell");
+  try {
+    const own = await ask(proving("owner-x"));
+    assert.deepEqual(own.json(), { running: 1 });
+
+    const neighbour = await ask(proving("owner-y"));
+    assert.equal(neighbour.statusCode, 200);
+    assert.deepEqual(neighbour.json(), { running: 0 }, "another scope's work is not this scope's count");
+  } finally {
+    killShell("owner-x", "ktsk_1", "x-shell");
+  }
 });

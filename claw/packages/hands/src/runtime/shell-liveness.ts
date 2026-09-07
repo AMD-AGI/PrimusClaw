@@ -25,7 +25,7 @@ import {
 } from "./shell-classify.js";
 import {
   type ProcessIdentity, type ShellRecord, listRecordsForOwner, processStartToken,
-  readEpochMarker, subtreeReadable,
+  readEpochMarker, readRecord, subtreeReadable,
 } from "./shell-records.js";
 
 export interface OwnerLiveness {
@@ -44,7 +44,7 @@ export interface OwnerLiveness {
  * the start-time token is a non-match rather than a weaker match: the entry
  * belongs to some later process and says nothing about this shell.
  */
-function processView(identity: ProcessIdentity | undefined): ProcessView {
+export function processView(identity: ProcessIdentity | undefined): ProcessView {
   if (!identity) return "unreadable";
   if (!existsSync(`/proc/${identity.pid}`)) return "terminated";
   const token = processStartToken(identity.pid);
@@ -114,4 +114,46 @@ export function ownerLiveness(
     if (PROTECTED_CLASSES.includes(cls)) active += 1;
   }
   return { active, classes, determinate: true };
+}
+
+/**
+ * What one shell's record says about it, with the qualifier that decides
+ * whether waiting on it can still resolve.
+ *
+ * `collectorLive` is true only where this very process is the one owing the
+ * exit status: the epoch is current and the registry still holds the entry, so
+ * the exit event is pending delivery and the class resolves to `finished`
+ * without anybody re-asking. A grandchild re-parented away from Hands never
+ * reaches that state and is answered by evidence alone.
+ */
+export interface ShellVerdict {
+  cls: ShellClass;
+  collectorLive: boolean;
+  record: ShellRecord;
+}
+
+/** Null where no record exists for the triple, which is not a class. */
+export function shellVerdict(
+  owner: string,
+  run: string | null,
+  shellId: string,
+  registryHas: (record: ShellRecord) => boolean,
+): ShellVerdict | null {
+  if (!subtreeReadable()) return null;
+  let record: ShellRecord | null;
+  try {
+    record = readRecord(owner, run, shellId);
+  } catch {
+    return null;
+  }
+  if (!record) return null;
+
+  const epoch = epochFreshness(record.hands_epoch);
+  const cls = classifyShellRecord({
+    record,
+    epoch,
+    registry: registryHas(record) ? "running" : "absent",
+    process: processView(record.process_identity),
+  });
+  return { cls, collectorLive: cls === "ended_unreaped" && epoch === "current" && registryHas(record), record };
 }

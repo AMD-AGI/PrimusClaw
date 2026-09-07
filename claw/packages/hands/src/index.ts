@@ -8,11 +8,13 @@ import { APPLIED_ENV_KEYS } from "./runtime/env-file.js";
 import Fastify from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, verifyScopeCredential, type CredentialScope } from "@claw/utils";
 import { tools } from "./tools/index.js";
-import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
 import {
-  NO_RUN, OWNER_HEADER, RUN_HEADER, UNOWNED, normalizeOwner, normalizeRun, withCaller,
+  shutdownAllShells, shutdownRunShells, runningShellCount, resolveShell,
+} from "./tools/shell/bg-manager.js";
+import {
+  NO_RUN, OWNER_HEADER, RUN_HEADER, normalizeOwner, normalizeRun, withCaller,
 } from "./runtime/owner-context.js";
 import {
   mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
@@ -33,9 +35,41 @@ export const app = Fastify({ logger: true });
  */
 function authFailure(req: { headers: Record<string, unknown> }): { status: number; error: string } | null {
   if (!INTERNAL_TOKEN) return { status: 401, error: "auth_failed_missing_internal_token" };
-  const presented = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-  if (!constantTimeEquals(presented, INTERNAL_TOKEN)) return { status: 401, error: "unauthorized" };
+  if (!constantTimeEquals(presentedCredential(req), INTERNAL_TOKEN)) {
+    return { status: 401, error: "unauthorized" };
+  }
   return null;
+}
+
+function presentedCredential(req: { headers: Record<string, unknown> }): string {
+  return String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+}
+
+type ScopeFailure = { status: number; error: string; field?: string };
+
+/**
+ * Which scope this caller has proved, taken from the credential alone.
+ *
+ * The routes below used to read the owner from one body field and the run from
+ * another behind a token bound to no scope, so any holder could count another
+ * owner's shells or terminate another run's. A request still carrying either
+ * field is refused naming it rather than quietly ignored, because a caller that
+ * believes it is addressing a scope must not be answered about a different one.
+ */
+function callerScope(
+  req: { headers: Record<string, unknown>; body?: Record<string, unknown> },
+): { scope: CredentialScope } | { failure: ScopeFailure } {
+  for (const field of ["owner", "run"]) {
+    if (req.body && field in req.body) {
+      return { failure: { status: 400, error: "scope_not_in_body", field } };
+    }
+  }
+  if (!INTERNAL_TOKEN) {
+    return { failure: { status: 401, error: "auth_failed_missing_internal_token" } };
+  }
+  const verified = verifyScopeCredential(presentedCredential(req), INTERNAL_TOKEN);
+  if (!verified.ok) return { failure: { status: 401, error: verified.error } };
+  return { scope: verified.scope };
 }
 
 /** Create a fresh McpServer with all tools — one per request to avoid shared state. */
@@ -74,27 +108,21 @@ app.get("/health", async () => ({
  * unreadable subtree or a missing marker says nothing was observed at all, and
  * only the first of those may lead to a start being sent.
  */
-app.post<{ Body?: { owner?: unknown; run?: unknown; shell_id?: unknown } }>(
+app.post<{ Body?: Record<string, unknown> }>(
   "/internal/shells/record",
   async (req, reply) => {
-    const denied = authFailure(req);
-    if (denied) return reply.status(denied.status).send({ error: denied.error });
+    const resolved = callerScope(req);
+    if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
 
-    const raw = req.body?.owner;
-    const owner = normalizeOwner(raw);
-    if (owner === UNOWNED && raw !== UNOWNED) {
-      return reply.status(400).send({ error: "owner_required" });
-    }
     const shellId = typeof req.body?.shell_id === "string" ? req.body.shell_id : "";
     if (!shellId) return reply.status(400).send({ error: "shell_id_required" });
 
     const marker = readEpochMarker() !== null;
     const readable = subtreeReadable();
-    const run = normalizeRun(req.body?.run);
     let present = false;
     if (marker && readable) {
       try {
-        present = readRecord(owner, run === NO_RUN ? null : run, shellId) !== null;
+        present = readRecord(resolved.scope.owner, resolved.scope.run, shellId) !== null;
       } catch {
         return { marker, subtreeReadable: false, present: false };
       }
@@ -102,6 +130,38 @@ app.post<{ Body?: { owner?: unknown; run?: unknown; shell_id?: unknown } }>(
     return { marker, subtreeReadable: readable, present };
   },
 );
+
+/**
+ * The class of one shell, without touching a byte of its output.
+ *
+ * A caller deciding whether to block on a `wait` has to know first: parking a
+ * run for a shell that can never produce an exit event costs the pod's
+ * execution slot for the whole timeout. Separate from the poll for that reason
+ * -- the poll advances the read offset, and a preflight that consumed the
+ * bytes the wait owes its caller would be worse than no preflight at all.
+ */
+app.post<{ Body?: Record<string, unknown> }>(
+  "/internal/shells/class",
+  async (req, reply) => {
+    const resolved = callerScope(req);
+    if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
+
+    const shellId = typeof req.body?.shell_id === "string" ? req.body.shell_id : "";
+    if (!shellId) return reply.status(400).send({ error: "shell_id_required" });
+
+    const answer = resolveShell(resolved.scope.owner, resolved.scope.run ?? NO_RUN, shellId);
+    return { shell_class: answer.cls, collector_live: answer.collectorLive };
+  },
+);
+
+function sendScopeFailure(
+  reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+  failure: ScopeFailure,
+): unknown {
+  return reply.status(failure.status).send(
+    failure.field ? { error: failure.error, field: failure.field } : { error: failure.error },
+  );
+}
 
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);
@@ -143,26 +203,11 @@ app.all("/mcp", async (req, reply) => {
  * is: this is Brain's bookkeeping, not something the model should be able to ask
  * on its own behalf or about another caller.
  */
-app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, reply) => {
-  const denied = authFailure(req);
-  if (denied) return reply.status(denied.status).send({ error: denied.error });
+app.post<{ Body?: Record<string, unknown> }>("/internal/shells/active", async (req, reply) => {
+  const resolved = callerScope(req);
+  if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
 
-  // `!owner` would never fire: normalizeOwner substitutes the shared `unowned`
-  // bucket for everything it cannot use -- absent, blank, over-long, control
-  // characters -- and that string is truthy. Answering anyway is the part that
-  // matters: `unowned` holds the shells of every caller that sent no owner
-  // header, so a malformed question would be answered with somebody else's
-  // work, and a pod kept alive for a session that has nothing running in it.
-  //
-  // A caller naming the bucket explicitly is asking a real question and is
-  // answered; a value that only landed there by failing normalization is not.
-  const raw = req.body?.owner;
-  const owner = normalizeOwner(raw);
-  if (owner === UNOWNED && raw !== UNOWNED) {
-    return reply.status(400).send({ error: "owner_required" });
-  }
-
-  const running = runningShellCount(owner);
+  const running = runningShellCount(resolved.scope.owner);
   if (running === null) {
     // The durable state this process files could not be read, so how much work
     // is live is unknown. Answering zero here is what marks a sandbox full of
@@ -180,11 +225,14 @@ app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, 
  * the decision is Brain's: a batch node's shells go, a conversation's stay. Not
  * an MCP tool, so the model cannot invoke it on itself or on another run.
  */
-app.post<{ Body?: { run?: unknown } }>("/internal/shells/reap", async (req, reply) => {
-  const denied = authFailure(req);
-  if (denied) return reply.status(denied.status).send({ error: denied.error });
+app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req, reply) => {
+  const resolved = callerScope(req);
+  if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
 
-  const run = normalizeRun(req.body?.run);
+  // A credential proving no run identity authorises no reap: the absent-run
+  // bucket holds every shell started without one, which is precisely the set
+  // nothing is entitled to end by run.
+  const run = resolved.scope.run;
   if (!run) return reply.status(400).send({ error: "run_required" });
 
   const stopped = await shutdownRunShells(run);

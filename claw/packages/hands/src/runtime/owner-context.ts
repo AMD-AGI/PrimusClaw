@@ -93,4 +93,3 @@ export function currentOwner(): string {
 export function currentRun(): string {
   return store.getStore()?.run ?? NO_RUN;
 }
-

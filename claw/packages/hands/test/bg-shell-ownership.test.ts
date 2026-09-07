@@ -55,9 +55,9 @@ afterEach(async () => {
 
 test("one owner cannot read another owner's output", async () => {
   const shell = spawnBackground(ALICE, RUN_1, "echo secret; sleep 30").shell!;
-  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("secret")));
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).text.includes("secret")));
 
-  const seenByBob = pollOutput(BOB, RUN_1, shell.id);
+  const seenByBob = pollOutput(BOB, RUN_1, shell.id).text;
   assert.match(seenByBob, /not found/,
     "a sandbox handed to the next run must not come with the last run's output");
   assert.doesNotMatch(seenByBob, /secret/);
@@ -68,7 +68,7 @@ test("one owner cannot read another owner's output", async () => {
 test("one owner cannot kill another owner's shell", async () => {
   const shell = spawnBackground(ALICE, RUN_1, "sleep 30").shell!;
 
-  assert.match(killShell(BOB, RUN_1, shell.id), /not found/);
+  assert.match(killShell(BOB, RUN_1, shell.id).text, /not found/);
   assert.deepEqual(listRunningShells(ALICE), [shell.id],
     "the shell survives a kill it was never addressed by");
 
@@ -103,17 +103,17 @@ test("a shell started in one turn is still readable in the next", async () => {
   // Owner is the conversation (or the DAG), not one run in it: a server started
   // to be polled later would be useless if it vanished with that run.
   const shell = spawnBackground(ALICE, RUN_1, "echo up; sleep 30", "long-lived").shell!;
-  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("up")));
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).text.includes("up")));
 
-  assert.match(pollOutput(ALICE, RUN_1, "long-lived"), /Status: running/);
+  assert.match(pollOutput(ALICE, RUN_1, "long-lived").text, /Class: running/);
   killShell(ALICE, RUN_1, "long-lived");
 });
 
 test("polling returns only what is new since the last poll", async () => {
   const shell = spawnBackground(ALICE, RUN_1, "echo first; sleep 30").shell!;
-  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).includes("first")));
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, shell.id).text.includes("first")));
 
-  assert.match(pollOutput(ALICE, RUN_1, shell.id), /no new output/,
+  assert.match(pollOutput(ALICE, RUN_1, shell.id).text, /no new output/,
     "re-reading the same bytes would make the model believe the work repeated");
   killShell(ALICE, RUN_1, shell.id);
 });
@@ -270,14 +270,14 @@ test("a sibling run under one owner cannot read, wait on, or kill the other's sh
   // entitled to the other's work. The refusal discloses nothing about the other
   // party -- it is the same answer a never-issued id gets.
   const mine = spawnBackground(ALICE, RUN_1, "echo secret; sleep 30", "shared-name").shell!;
-  assert.ok(await until(() => pollOutput(ALICE, RUN_1, "shared-name").includes("secret")));
+  assert.ok(await until(() => pollOutput(ALICE, RUN_1, "shared-name").text.includes("secret")));
 
-  const seenBySibling = pollOutput(ALICE, RUN_2, "shared-name");
+  const seenBySibling = pollOutput(ALICE, RUN_2, "shared-name").text;
   assert.match(seenBySibling, /not found/);
   assert.doesNotMatch(seenBySibling, /secret/);
   assert.doesNotMatch(seenBySibling, new RegExp(RUN_1), "and names no other party");
 
-  assert.match(killShell(ALICE, RUN_2, "shared-name"), /not found/);
+  assert.match(killShell(ALICE, RUN_2, "shared-name").text, /not found/);
   assert.equal(mine.status, "running", "the shell survives a kill it was never addressed by");
 
   const refusedWait = waitForShellExit(ALICE, RUN_2, "shared-name", 50);
@@ -306,8 +306,8 @@ test("a shell filed under no run identity is addressable by no run identity", as
   // share one, which is the collision the run half exists to prevent.
   const orphan = spawnBackground(ALICE, "", "sleep 30", "no-run").shell!;
 
-  assert.match(pollOutput(ALICE, RUN_1, "no-run"), /not found/);
-  assert.match(pollOutput(ALICE, "", "no-run"), /Status: running/);
+  assert.match(pollOutput(ALICE, RUN_1, "no-run").text, /not found/);
+  assert.match(pollOutput(ALICE, "", "no-run").text, /Class: running/);
 
   killShell(ALICE, "", "no-run");
   assert.ok(await until(() => orphan.status !== "running"));

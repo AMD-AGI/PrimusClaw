@@ -170,6 +170,14 @@ export interface ExecuteExtras {
    * reach /workspace, and never for a turn the model answers on its own.
    */
   attachHands?: () => Promise<HandsClient>;
+  /**
+   * The key the run-phase ledger is keyed by, which is the run's gate/lock key
+   * and not its addressing scope. The two differ under the default gate
+   * configuration, and parking under the addressing scope missed the ledger
+   * silently -- no park, no log, no counter, and the execution slot held for
+   * the whole of every wait.
+   */
+  parkKey?: string;
 }
 
 export interface Engine {

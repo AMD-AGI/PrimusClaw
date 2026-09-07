@@ -30,7 +30,7 @@ import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
-import { whileWaiting } from "../tasks/run-phase.js";
+import { isTrackedRun, whileWaiting } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
@@ -229,6 +229,12 @@ export interface LoopOptions {
    * not tracked and the waits go uncounted.
    */
   runKey?: string;
+  /**
+   * Key the run-phase ledger is keyed by -- the run's gate/lock key, which is
+   * deliberately not its addressing scope. Parking under the wrong one misses
+   * the ledger silently and holds the execution slot for the whole wait.
+   */
+  parkKey?: string;
   /** Platform MCP clients (same map the parent is using), so sub-agents can
    *  reuse the parent's MCP connections without reconnecting. */
   platformMcpClients?: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
@@ -838,6 +844,48 @@ class AgentLoopRunner {
       filtered = filtered.filter((t) => PLAN_MODE_ALLOWLIST.has(t.name));
     }
     return filtered;
+  }
+
+  /**
+   * The key this site parks under, and the signal when it cannot be trusted.
+   *
+   * The ledger helper's own no-entry behaviour is left alone: a sub-agent runs
+   * inside its parent's slot and legitimately has no entry. The condition worth
+   * reporting is a site holding its own slot and passing a key the ledger does
+   * not know -- well-formed and simply the wrong one, which is how the slot came
+   * to be held for the whole of every wait with nothing recorded.
+   */
+  private parkKeyFor(site: "approval" | "background_command"): string | undefined {
+    const key = this.opts.parkKey;
+    if (!key) {
+      if (this.opts.depth === 0) {
+        metrics.onParkKeyUnusable(site, "absent");
+        logger.warn({ site, sessionId: this.sessionId }, "park.key_unavailable");
+      }
+      return undefined;
+    }
+    if (this.opts.depth === 0 && !isTrackedRun(key)) {
+      metrics.onParkKeyUnusable(site, "untracked");
+      logger.warn({ site, sessionId: this.sessionId, parkKey: key }, "park.key_untracked");
+    }
+    return key;
+  }
+
+  /**
+   * Whether a `wait` on this shell can block, from a non-consuming read.
+   *
+   * Only a class this sandbox still owes an exit event for can: `running`, and
+   * `ended_unreaped` inside the window where the collecting process is alive
+   * and the event is pending. Everything else -- finished, lost, unknown, a
+   * claim with no process, a shell whose state could not be read -- is already
+   * settled and is answered at once, so no slot is released for it.
+   */
+  private async waitCanBlock(input: Record<string, unknown>): Promise<boolean> {
+    const shellId = input.shell_id;
+    if (typeof shellId !== "string" || !shellId) return false;
+    const probe = await this.router.classifyShell(shellId);
+    return probe.shellClass === "running"
+      || (probe.shellClass === "ended_unreaped" && probe.collectorLive);
   }
 
   private async emitSandboxStatus(
@@ -1689,7 +1737,7 @@ class AgentLoopRunner {
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
       const hitlResult = this.opts.hitl.willAsk(toolName)
-        ? await whileWaiting(this.opts.runKey, "approval", decide)
+        ? await whileWaiting(this.parkKeyFor("approval"), "approval", decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
           const reason = `Error: ${hitlResult.reason}`;
@@ -1820,8 +1868,14 @@ class AgentLoopRunner {
       // before the dispatch, so a resumed run recognises its own retry of this
       // exact call rather than one that merely produced the same command.
       const stepCtx = { stepIdentity: toolId };
-      resultText = WAITING_TOOLS.has(toolName)
-        ? await whileWaiting(this.opts.runKey, "background_command", () =>
+      // Whether this call can block at all, decided before it is routed and
+      // from the shell's class rather than from the tool's name. Parking a run
+      // for a shell that can never produce an exit event hands the pod's
+      // execution slot away for nothing; the read is separate from the poll so
+      // it moves no output offset.
+      const parks = WAITING_TOOLS.has(toolName) && await this.waitCanBlock(finalInput);
+      resultText = parks
+        ? await whileWaiting(this.parkKeyFor("background_command"), "background_command", () =>
             this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
         : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
       toolOutcome = outcome;

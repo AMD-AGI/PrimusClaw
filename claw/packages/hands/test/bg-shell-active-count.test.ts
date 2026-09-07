@@ -52,7 +52,7 @@ test("a shell that has exited is still readable but no longer counts as work", a
 
   // Still in the registry -- this is the window the production delay keeps open,
   // and the reason counting registry entries rather than running ones is wrong.
-  assert.match(pollOutput(OWNER, RUN, "quick"), /done/,
+  assert.match(pollOutput(OWNER, RUN, "quick").text, /done/,
     "sanity: a finished shell is retained so its output survives into the next turn");
 
   assert.equal(runningShellCount(OWNER), 0,
@@ -64,7 +64,7 @@ test("an exited shell does not mask a running one, or inflate the count beside i
   const long = spawnBackground(OWNER, RUN, "sleep 60", "long2").shell!;
 
   assert.ok(await until(() => quick.status !== "running"));
-  assert.match(pollOutput(OWNER, RUN, "quick2"), /done/, "sanity: still retained");
+  assert.match(pollOutput(OWNER, RUN, "quick2").text, /done/, "sanity: still retained");
 
   assert.equal(runningShellCount(OWNER), 1,
     "exactly the running one: the exited neighbour is retained, not counted");

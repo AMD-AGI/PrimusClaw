@@ -26,9 +26,10 @@ import { NO_RUN } from "../../runtime/owner-context.js";
 import { assertShellId } from "../../runtime/record-path.js";
 import {
   attachRecord, claimRecord, currentEpoch, processStartToken,
-  recordOutcome, releaseOutput, type ProcessIdentity,
+  recordOutcome, releaseOutput, type ProcessIdentity, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
-import { ownerLiveness } from "../../runtime/shell-liveness.js";
+import { ownerLiveness, shellVerdict } from "../../runtime/shell-liveness.js";
+import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
 import {
   type ManagedShell,
   type ManagedShellKind,
@@ -223,37 +224,145 @@ function persistOutcome(owner: string, run: string, shell: BgShell): void {
   } catch { /* the record is gone with its sandbox */ }
 }
 
-/** Read new output from one of this run's shells since its last poll. */
-export function pollOutput(owner: string, run: string, id: string, filter?: string): string {
-  if (!BG_SHELL_ENABLED) return `Error: ${BG_SHELL_DISABLED_MESSAGE}`;
+/**
+ * The one answer a caller gets for an id that names nothing it may address.
+ *
+ * Carries no id and no reason. An id belonging to another owner scope, another
+ * run identity, another session, an expired tombstone and one never issued to
+ * anyone must all read the same, or differencing the answers tells a caller
+ * which absence it met.
+ */
+export const UNKNOWN_SHELL_MESSAGE = "shell not found";
+
+/** What a verb resolved the caller's id to: a live entry, a record, or neither. */
+export interface ShellResolution {
+  cls: ShellClass;
+  collectorLive: boolean;
+  shell?: BgShell;
+  status?: ShellRecordStatus;
+  exitCode?: number | null;
+  outputAvailable: boolean;
+}
+
+const UNKNOWN_RESOLUTION: ShellResolution = {
+  cls: "unknown", collectorLive: false, outputAvailable: false,
+};
+
+/**
+ * Resolve one id to a class, from the durable record first and the registry
+ * only as one of the classifier's inputs.
+ *
+ * The registry alone cannot answer: it drops an entry one reap delay after the
+ * exit, after which a shell whose outcome is durably committed would read as
+ * absent -- a `finished` shell answering the possibly-lost wording. A process
+ * that files no records has no record to read and keeps the registry-only
+ * behaviour it had before the scheme existed.
+ */
+export function resolveShell(owner: string, run: string, id: string): ShellResolution {
   const shell = lookup(owner, run, id);
-  // Another owner's shell reads as absent. Saying "not yours" would confirm it
-  // exists, and there is nothing the caller could do with that either way.
-  if (!shell) return `Error: shell ${id} not found (possibly lost after sandbox rebuild)`;
+  if (!filesRecords()) {
+    if (!shell) return UNKNOWN_RESOLUTION;
+    return {
+      cls: shell.status === "running" ? "running" : "finished",
+      collectorLive: false,
+      shell,
+      status: shell.status === "running" ? undefined : outcomeStatus(shell),
+      exitCode: shell.exitCode,
+      outputAvailable: true,
+    };
+  }
 
+  const verdict = shellVerdict(owner, recordRun(run), id, (record) => (
+    shells.get(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id))?.shell.status === "running"
+  ));
+  if (!verdict) return UNKNOWN_RESOLUTION;
+  return {
+    cls: callerVisibleClass(verdict.cls),
+    collectorLive: verdict.collectorLive,
+    shell,
+    status: verdict.record.status,
+    exitCode: verdict.record.exit_code ?? null,
+    outputAvailable: verdict.record.output_available === true && !!shell,
+  };
+}
+
+function outcomeStatus(shell: BgShell): ShellRecordStatus {
+  return shell.status === "killed" ? "killed" : shell.status === "exited" ? "exited" : "failed";
+}
+
+/** What a verb hands back: prose for a reader, the class for a program. */
+export interface ShellAnswer {
+  text: string;
+  isError: boolean;
+  structured: { shell_class: ShellClass } & Record<string, unknown>;
+}
+
+/** The refusal every verb gives for an id it may not address, byte for byte. */
+function unknownAnswer(): ShellAnswer {
+  return {
+    text: `Error: ${UNKNOWN_SHELL_MESSAGE}`,
+    isError: true,
+    structured: { shell_class: "unknown" },
+  };
+}
+
+function disabledAnswer(): ShellAnswer {
+  return {
+    text: `Error: ${BG_SHELL_DISABLED_MESSAGE}`,
+    isError: true,
+    structured: { shell_class: "unknown" },
+  };
+}
+
+/** Read new output from one of this run's shells since its last poll. */
+export function pollOutput(owner: string, run: string, id: string, filter?: string): ShellAnswer {
+  if (!BG_SHELL_ENABLED) return disabledAnswer();
+  const resolved = resolveShell(owner, run, id);
+  // Another owner's shell reads as absent, and so does a tombstone past its
+  // retention. Saying which would confirm the shell exists, and there is
+  // nothing the caller could do with that either way.
+  if (resolved.cls === "unknown") return unknownAnswer();
+
+  const structured = {
+    shell_class: resolved.cls,
+    shell_id: id,
+    output_available: resolved.outputAvailable,
+    ...(resolved.status ? { status: resolved.status, exit_code: resolved.exitCode ?? null } : {}),
+  };
+
+  const parts = [`Shell: ${id}`, `Class: ${resolved.cls}`];
+  if (!resolved.shell) {
+    // The record says what happened; the buffers went with the process that
+    // held them, so there is nothing left to read out of them.
+    parts.push(resolved.status ? `Outcome: ${resolved.status} (exit_code=${resolved.exitCode ?? "?"})` : "(no output retained)");
+    return { text: parts.join("\n"), isError: false, structured };
+  }
+
+  const shell = resolved.shell;
   const output = pollManagedOutput(shell, filter);
-
-  const statusLine = shell.status === "running"
-    ? "running"
-    : `${shell.status} (exit_code=${shell.exitCode ?? "?"})`;
-
-  const parts = [`Shell: ${id}`, `Status: ${statusLine}`];
+  if (resolved.status) parts.push(`Outcome: ${resolved.status} (exit_code=${resolved.exitCode ?? "?"})`);
   if (shell.truncated) parts.push(`Warning: output buffer overflow, ${shell.stdoutDroppedBytes + shell.stderrDroppedBytes} bytes dropped`);
   if (output.lostBytes > 0) parts.push(`Warning: ${output.lostBytes} unread bytes were dropped from the ring buffer`);
   if (output.stdout) parts.push(`New stdout (${output.stdout.length} chars):`, output.stdout);
   if (output.stderr) parts.push(`New stderr:`, output.stderr);
   if (!output.stdout && !output.stderr) parts.push("(no new output)");
 
-  return parts.join("\n");
+  return { text: parts.join("\n"), isError: false, structured };
 }
 
 /** Kill one of this run's background shells. SIGTERM first, SIGKILL after 5s. */
-export function killShell(owner: string, run: string, id: string): string {
-  if (!BG_SHELL_ENABLED) return `Error: ${BG_SHELL_DISABLED_MESSAGE}`;
-  const shell = lookup(owner, run, id);
-  if (!shell) return `Error: shell ${id} not found`;
-  if (shell.status !== "running") {
-    return `Shell ${id} already ${shell.status} (exit_code=${shell.exitCode})`;
+export function killShell(owner: string, run: string, id: string): ShellAnswer {
+  if (!BG_SHELL_ENABLED) return disabledAnswer();
+  const resolved = resolveShell(owner, run, id);
+  if (resolved.cls === "unknown") return unknownAnswer();
+
+  const structured = { shell_class: resolved.cls, shell_id: id };
+  const shell = resolved.shell;
+  if (!shell || shell.status !== "running") {
+    // Nothing this process can signal. The class already says why -- finished,
+    // ended and uncollected, lost with its epoch, or never spawned -- so the
+    // caller is told that rather than a synthesised success.
+    return { text: `Shell ${id} is ${resolved.cls}; nothing was signalled`, isError: false, structured };
   }
 
   terminateManagedProcess(shell, "SIGTERM");
@@ -266,7 +375,11 @@ export function killShell(owner: string, run: string, id: string): string {
     }
   }, 5000);
 
-  return `Shell ${id} terminating (SIGTERM sent to process group, SIGKILL in 5s if needed)`;
+  return {
+    text: `Shell ${id} terminating (SIGTERM sent to process group, SIGKILL in 5s if needed)`,
+    isError: false,
+    structured,
+  };
 }
 
 /**
@@ -285,11 +398,15 @@ export function waitForShellExit(
   run: string,
   id: string,
   timeoutMs: number,
-): Promise<BgShell | null> | { error: string } {
-  if (!BG_SHELL_ENABLED) return { error: BG_SHELL_DISABLED_MESSAGE };
-  const shell = lookup(owner, run, id);
-  if (!shell) return { error: `shell ${id} not found (possibly lost after sandbox rebuild)` };
-  if (shell.status !== "running") return Promise.resolve(shell);
+): Promise<BgShell | null> | ShellResolution {
+  if (!BG_SHELL_ENABLED) return UNKNOWN_RESOLUTION;
+  const resolved = resolveShell(owner, run, id);
+  const shell = resolved.shell;
+  // Only an entry this process still owes an exit event for can be waited on,
+  // which is exactly the collector-live window: `ended_unreaped` qualifies
+  // there and resolves to `finished` without a second call, while every other
+  // class is answered at once rather than sat on until the timeout.
+  if (!shell || shell.status !== "running") return resolved;
 
   return new Promise<BgShell | null>((resolve) => {
     let settled = false;

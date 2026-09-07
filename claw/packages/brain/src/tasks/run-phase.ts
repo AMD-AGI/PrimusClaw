@@ -67,6 +67,11 @@ export function beginRun(key: string): void {
   runs.set(key, { waitingOn: null, waitStartedAt: 0, waitedMs: 0, waits: 0 });
 }
 
+/** Whether the ledger holds this key. Read by a park site checking its own. */
+export function isTrackedRun(key: string): boolean {
+  return runs.has(key);
+}
+
 /** Stop tracking a run. Every beginRun needs exactly one endRun. */
 export function endRun(key: string): void {
   runs.delete(key);

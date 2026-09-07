@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { mintScopeCredential } from "@claw/utils";
 import { join } from "node:path";
 
 process.env.WORKSPACE_PATH = tmpdir();
@@ -176,8 +177,8 @@ test("the count Brain actually reads keeps a restarted sandbox's work", async ()
   const res = await app.inject({
     method: "POST",
     url: "/internal/shells/active",
-    headers: { authorization: "Bearer test-internal-token" },
-    payload: { owner: OWNER },
+    headers: { authorization: `Bearer ${mintScopeCredential({ owner: OWNER, run: null }, "test-internal-token")}` },
+    payload: {},
   });
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.json(), { running: 1 });
@@ -200,8 +201,8 @@ test("an unreadable subtree answers unknown, never zero", async () => {
   const res = await app.inject({
     method: "POST",
     url: "/internal/shells/active",
-    headers: { authorization: "Bearer test-internal-token" },
-    payload: { owner: OWNER },
+    headers: { authorization: `Bearer ${mintScopeCredential({ owner: OWNER, run: null }, "test-internal-token")}` },
+    payload: {},
   });
   assert.equal(res.statusCode, 503,
     "a status the caller turns into its own unanswered-probe case, which keeps "

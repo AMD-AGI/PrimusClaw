@@ -2186,6 +2186,7 @@ class TaskRunner {
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
+          parkKey: this.lockKey,
         });
       }
     } finally {

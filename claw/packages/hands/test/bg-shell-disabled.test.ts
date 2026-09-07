@@ -37,8 +37,8 @@ test("nothing is spawned when the feature is off", () => {
 });
 
 test("polling and killing refuse too, so a stale transcript gets an answer", () => {
-  assert.match(bg.pollOutput("someone", "run-1", "bg-1"), /disabled/);
-  assert.match(bg.killShell("someone", "run-1", "bg-1"), /disabled/);
+  assert.match(bg.pollOutput("someone", "run-1", "bg-1").text, /disabled/);
+  assert.match(bg.killShell("someone", "run-1", "bg-1").text, /disabled/);
 });
 
 test("the refusal tells the caller what to do instead", () => {

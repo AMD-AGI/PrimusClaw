@@ -25,6 +25,7 @@ process.env.BG_SHELL_REAP_DELAY_MS = "10";
 // Read after the env is set: the flag is resolved at module load.
 const { spawnBackground, waitForShellExit, shutdownAllShells } =
   await import("../src/tools/shell/bg-manager.js");
+type Resolution = Exclude<ReturnType<typeof waitForShellExit>, Promise<unknown>>;
 
 // Without this the run sits until the longest sleep below finishes on its own.
 after(() => shutdownAllShells(50));
@@ -52,14 +53,13 @@ test("a wait that runs out reports the shell is still going, and does not kill i
   assert.equal(result, null, "null is how the caller learns to say 'still running'");
 });
 
-test("waiting on a shell that already finished returns at once", async () => {
+test("waiting on a shell that already finished is answered by its class, not waited on", async () => {
   spawnBackground("owner-c", "run-c", "exit 0", "done");
   await promised(waitForShellExit("owner-c", "run-c", "done", 30_000));
 
-  const startedAt = Date.now();
-  const again = await promised(waitForShellExit("owner-c", "run-c", "done", 30_000));
-  assert.equal(again?.status, "exited");
-  assert.ok(Date.now() - startedAt < 100, "no second wait for an exit that already happened");
+  const again = waitForShellExit("owner-c", "run-c", "done", 30_000);
+  assert.ok(!(again instanceof Promise), "an exit that already happened is not waited for again");
+  assert.equal((again as Resolution).cls, "finished");
 });
 
 test("waiting in slices does not pile up listeners on the shell", async () => {
@@ -91,11 +91,23 @@ test("a wait cannot reach another owner's shell", async () => {
   const refused = waitForShellExit("owner-e", "run-e", "private", 100);
 
   assert.ok(!(refused instanceof Promise));
-  assert.match((refused as { error: string }).error, /not found/);
+  assert.equal((refused as Resolution).cls, "unknown");
 });
 
 test("an unknown shell is refused rather than waited on", async () => {
   const refused = waitForShellExit("owner-f", "run-f", "never-existed", 100);
   assert.ok(!(refused instanceof Promise));
-  assert.match((refused as { error: string }).error, /not found/);
+  assert.equal((refused as Resolution).cls, "unknown");
+});
+
+test("another scope's id and an id never issued are answered identically", async () => {
+  // The two answers are the whole of what a caller sees, so differencing them
+  // is the leak: an id belonging to somebody else must be indistinguishable
+  // from one that was never issued to anyone.
+  spawnBackground("owner-h", "run-h", "sleep 20", "someone-elses");
+  const foreign = waitForShellExit("owner-i", "run-i", "someone-elses", 100);
+  const absent = waitForShellExit("owner-i", "run-i", "never-issued", 100);
+
+  assert.ok(!(foreign instanceof Promise) && !(absent instanceof Promise));
+  assert.deepEqual(foreign, absent);
 });
