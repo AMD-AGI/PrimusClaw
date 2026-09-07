@@ -71,6 +71,11 @@ function settlementFrom(taskId: string, body: unknown): RunSettlement | undefine
   return { report: decoded.report, closeAttempt: true };
 }
 
+function releaseLeaseFrom(body: unknown): boolean {
+  return body !== null && typeof body === "object"
+    && (body as { release_lease?: unknown }).release_lease === true;
+}
+
 function brainIdFrom(body: unknown): string {
   const raw = body && typeof body === "object" ? (body as { brain_id?: unknown }).brain_id : undefined;
   return typeof raw === "string" && raw.trim() ? raw.trim() : "";
@@ -143,6 +148,7 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       const settled = await settleFinishedClaim(
         req.params.taskId, brainId, claimCountFrom(req.body),
         settlementFrom(req.params.taskId, req.body),
+        releaseLeaseFrom(req.body),
       );
       if (!settled) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };

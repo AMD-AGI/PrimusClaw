@@ -292,11 +292,22 @@ async function settleAndTransition(
 class StaleTransition extends Error {}
 
 /**
- * Close a finished holder's attempt record, leaving the row where it is.
+ * End a holder's attempt without moving the row between states.
  *
- * The chat path's success is the one attempt boundary with no transition of its
- * own: the row carries no `callback_url`, so no `agent_done` arrives, and the
- * completion event closes the row later without knowing which attempt ran it.
+ * Two boundaries reach here, and neither has a transition of its own. A claimed
+ * chat run that succeeded carries no `callback_url`, so no `agent_done` arrives
+ * and the completion event closes the row later knowing nothing about which
+ * attempt ran it. A fat delivery that naks for a retry has no release endpoint
+ * at all -- JetStream redelivers the same message -- so this is where its
+ * coverage and its record are settled.
+ *
+ * The attempt token is cleared either way: the attempt is over, and a heartbeat
+ * still in flight under it would otherwise renew a lease nobody is holding and
+ * open a second record beside the one just closed. `releaseLease` additionally
+ * drops the lease, which the fat retry needs and the completing run does not --
+ * a redelivery lands on whichever replica pulls it, and a live lease owned by
+ * another pod refuses its first renewal until the lease lapses.
+ *
  * Fenced like a release, because a holder whose claim has since been taken is
  * settling somebody else's attempt.
  */
@@ -305,6 +316,7 @@ export async function settleFinishedClaim(
   brainId: string,
   claimCount?: number,
   settlement?: RunSettlement,
+  releaseLease = false,
 ): Promise<boolean> {
   const settled: RunSettlement = { ...settlement, closeAttempt: true };
   try {
@@ -319,6 +331,15 @@ export async function settleFinishedClaim(
       if (held.rowCount === 0) throw new StaleTransition();
       const outcome = await settleRunTime(query, taskId, settled);
       if (!outcome.ok) throw new StaleTransition();
+      await query(
+        `UPDATE claw_tasks
+            SET attempt_id = NULL,
+                heartbeat_at = NULL,
+                lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
+                lease_expires_at = CASE WHEN $2 THEN NULL ELSE lease_expires_at END
+          WHERE task_id = $1`,
+        [taskId, releaseLease],
+      );
       return true;
     });
   } catch (err) {

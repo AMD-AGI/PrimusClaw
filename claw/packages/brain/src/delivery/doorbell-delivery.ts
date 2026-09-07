@@ -122,6 +122,16 @@ const inFlightReleases = new Set<Promise<unknown>>();
  * Each release is generation-guarded, so one that races a reclaim is refused
  * rather than pulling the row out from under whoever took it.
  */
+/**
+ * Every settle here is fire-and-forget -- JsMsg's verdicts return void -- so a
+ * shutdown that did not wait would exit past one still on the wire.
+ */
+function trackRelease(send: () => Promise<unknown>): Promise<unknown> {
+  const p: Promise<unknown> = send().finally(() => inFlightReleases.delete(p));
+  inFlightReleases.add(p);
+  return p;
+}
+
 export async function flushPendingRetries(
   release?: (taskId: string, claimCount?: number) => Promise<void>,
 ): Promise<number> {
@@ -150,11 +160,10 @@ export function claimedDoorbellMsg(
 ): JsMsg {
   const sleep = actions.sleep ?? defaultSleep;
   return {
-    // A chat row carries no `callback_url`, so a run that finishes cleanly
-    // issues no `agent_done`: this ack is the only boundary left to end the
-    // attempt on, and without it the record stays open with no instant on it.
+    // A chat row has no `callback_url`, so a clean finish issues no
+    // `agent_done`: this ack is the only boundary left to end the attempt on.
     ack() {
-      void actions.settle(taskId, claimCount, takeDeclaredReport(taskId));
+      void trackRelease(() => actions.settle(taskId, claimCount, takeDeclaredReport(taskId)));
     },
     nak(millis?: number) {
       const delayMs = typeof millis === "number" ? Math.max(0, millis) : 0;
@@ -188,9 +197,7 @@ async function settleRetry(
     if (fired) return;
     fired = true;
     pendingRetries.delete(taskId);
-    const p = retryLater(taskId, claimCount, reason, runTime);
-    inFlightReleases.add(p);
-    try { await p; } finally { inFlightReleases.delete(p); }
+    await trackRelease(() => retryLater(taskId, claimCount, reason, runTime));
   };
 
   if (delayMs > 0) {

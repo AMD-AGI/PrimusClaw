@@ -96,9 +96,11 @@ export async function settleClaimedRun(
   taskId: string,
   claimCount?: number,
   runTime?: RunTimeReport,
+  releaseLease = false,
 ): Promise<void> {
   await postHolderAction(taskId, "settle-attempt", "run.settle_attempt_failed", {
     ...claimExtra(claimCount), ...(runTime ? { run_time: runTime } : {}),
+    ...(releaseLease ? { release_lease: true } : {}),
   });
 }
 

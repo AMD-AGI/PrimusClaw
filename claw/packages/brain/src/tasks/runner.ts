@@ -65,6 +65,7 @@ import {
 import type { RunTimeReport } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
+import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
 import {
@@ -357,6 +358,7 @@ export interface TaskRunnerSideEffects {
   postAgentDone: typeof postAgentDone;
   postTaskRunning: typeof postTaskRunning;
   postRunLease: typeof postRunLease;
+  settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
   refreshTaskLock: typeof refreshTaskLock;
   releaseTaskLock: typeof releaseTaskLock;
@@ -384,6 +386,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postAgentDone,
   postTaskRunning,
   postRunLease,
+  settleRunAttempt: settleClaimedRun,
   runScript,
   refreshTaskLock,
   releaseTaskLock,
@@ -2787,8 +2790,7 @@ class TaskRunner {
       (Date.now() - sigtermStartedAt) / 1000,
       sigtermSyncResult,
     );
-    this.declareCoverage();
-    this.msg.nak(0);
+    await this.nakAfterAttempt(0);
   }
 
   // ── User interrupt (existing behavior) ─────────────────────────────
@@ -3010,8 +3012,7 @@ class TaskRunner {
       retryPendingDeadlineMs,
       retryPendingGraceSec: RETRY_PENDING_KEEPALIVE_GRACE_SEC,
     });
-    this.declareCoverage();
-    this.msg.nak(5000);
+    await this.nakAfterAttempt(5000);
   }
 
   private async handleFatalError(err: any): Promise<void> {
@@ -3196,8 +3197,7 @@ class TaskRunner {
         exhaustedLog,
       );
       await this.releaseAfterTerminal();
-      this.declareCoverage();
-      this.msg.nak(5_000);
+      await this.nakAfterAttempt(5_000);
     }
   }
 
@@ -3291,6 +3291,25 @@ class TaskRunner {
    */
   private declareCoverage(): void {
     declareFinalReport(this.request.task_id ?? "", this.coverageReport()?.runTime);
+  }
+
+  /**
+   * End this attempt, then ask for the redelivery that follows it.
+   *
+   * A claimed run's wrapper takes the declaration and settles the row from the
+   * delivery loop. A fat delivery's nak is a real JetStream nak that takes
+   * nothing, so its attempt is settled here instead: otherwise its coverage is
+   * never reported at all, and the row keeps this attempt's token and a live
+   * lease that refuses the redelivery's first heartbeat until it lapses.
+   */
+  private async nakAfterAttempt(delayMs: number): Promise<void> {
+    if (this.claimed) this.declareCoverage();
+    else if (this.request.task_id) {
+      await fx().settleRunAttempt(
+        this.request.task_id, this.attempt.claimCount, this.coverageReport()?.runTime, true,
+      );
+    }
+    this.msg.nak(delayMs);
   }
 
   /**
@@ -3540,7 +3559,7 @@ class TaskRunner {
         // The run finished; only the handoff failed, and the nak redelivers it.
         outcome = "retryable";
         await this.releaseAfterTerminal();
-        this.msg.nak(5_000);
+        await this.nakAfterAttempt(5_000);
       } else if (err instanceof SandboxProvisionTerminalError) {
         // Terminal sandbox-provisioning outcome (SaFE workload Failed/Stopped,
         // pod died before ready, workload gone, or status unreadable past the

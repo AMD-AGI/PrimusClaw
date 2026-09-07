@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The one terminal path that reports to nobody: a claimed run that succeeds.
+ * The attempt boundaries no callback passes through.
  *
- * Its row is a chat row, so it carries no `callback_url` and `postAgentDone`
- * returns without sending anything; its message is the claimed-doorbell wrapper,
- * whose ack used to be a no-op. Between the two, a run that finished cleanly
- * left its attempt record open with no instant on it, and only a reap or a
- * release -- neither of which happens to a healthy run -- would ever close one.
+ * Two of them. A claimed run that succeeds is a chat row, so `postAgentDone`
+ * sends nothing and the wrapper's ack used to be a no-op. A fat delivery that
+ * naks for a retry has no release endpoint at all -- JetStream simply redelivers
+ * -- and its declaration was left in a map only the claimed wrapper ever reads.
+ * Either way the attempt ended with its record open, its coverage unreported,
+ * and, on the fat path, the row still holding that attempt's token and lease.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -17,7 +18,10 @@ import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
 
 import type { Engine } from "../src/agent/index.js";
 import type { NatsEmitter } from "../src/events/emitter.js";
-import { claimedDoorbellMsg, declareFinalReport } from "../src/delivery/doorbell-delivery.js";
+import {
+  claimedDoorbellMsg, declareFinalReport, flushPendingRetries,
+} from "../src/delivery/doorbell-delivery.js";
+import { AgentDoneDeliveryError } from "../src/tasks/callback.js";
 import { bindTaskRunnerDeps, runHandleTask, type TaskRunnerSideEffects } from "../src/tasks/runner.js";
 import { activeAbort } from "../src/tasks/abort-registry.js";
 
@@ -26,7 +30,7 @@ const MESSAGE = "msg-claimed-ack";
 const CLAIM_COUNT = 3;
 
 /** A claimed chat run: a task row, and deliberately no `callback_url`. */
-function claimedRequest(taskId: string, lease = false): ExecuteRequest {
+function claimedRequest(taskId: string, lease = false, over: Partial<ExecuteRequest> = {}): ExecuteRequest {
   return {
     session_id: SESSION,
     message_id: MESSAGE,
@@ -35,6 +39,7 @@ function claimedRequest(taskId: string, lease = false): ExecuteRequest {
     platform_key: "pk",
     task_id: taskId,
     ...(lease ? { run_lease: { url: `http://api.test/v1/internal/tasks/${taskId}/lease`, token: "t" } } : {}),
+    ...over,
   } as ExecuteRequest;
 }
 
@@ -139,9 +144,10 @@ async function runClaimed(taskId: string, opts: { lease?: boolean; workMs?: numb
     msg, claimedRequest(taskId, opts.lease), SESSION, lockKey, MESSAGE, "u1", abortCtrl,
     { claimCount: CLAIM_COUNT },
   );
-  // The ack settles without awaiting; a turn of the loop is what the production
-  // caller gives it too, since nothing downstream of the ack depends on it.
-  await new Promise((r) => setTimeout(r, 0));
+  // The drain, not a timer: the ack's settle is fire-and-forget, and what makes
+  // it safe is that the shutdown path waits for it. A sleep here would pass just
+  // as well with nothing tracking it at all.
+  await flushPendingRetries();
   return { settled, retried, failed };
 }
 
@@ -189,4 +195,85 @@ test("the runner hands the ack what it measured, not only what a caller declared
   assert.equal(runTime.key, "ktsk-ack-measured", "banked against the run's own ledger entry");
   assert.ok((runTime.cumulativeStateMs?.executing ?? 0) > 0,
     "and the totals are the ones the run actually accrued");
+});
+
+test("a shutdown waits for a settle the ack has already sent", async () => {
+  // The verdicts JsMsg exposes return void, so the settle is fire-and-forget by
+  // construction. Nothing but the drain can keep a pod from exiting past one
+  // still on the wire, leaving the row holding an attempt nobody will close.
+  const settled: string[] = [];
+  let deliver: (() => void) | null = null;
+  const msg = claimedDoorbellMsg({ seq: 1, info: { deliveryCount: 1 } }, "ktsk-ackdrain", 1, {
+    retryLater: async () => {},
+    fail: async () => {},
+    settle: (taskId) => new Promise<void>((resolve) => {
+      deliver = () => { settled.push(taskId); resolve(); };
+    }),
+    sleep: async () => {},
+  });
+
+  msg.ack();
+  assert.deepEqual(settled, [], "still in flight");
+
+  let drained = false;
+  const drain = flushPendingRetries().then(() => { drained = true; });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(drained, false, "the drain must not walk away from a settle it can still wait for");
+
+  deliver!();
+  await drain;
+  assert.deepEqual(settled, ["ktsk-ackdrain"]);
+});
+
+test("a fat retry settles its attempt, since no release endpoint will", async () => {
+  // A fat delivery naks a real JetStream message: the wrapper that consumes a
+  // declaration is not in this path at all. Without the settle the coverage is
+  // dropped, the row keeps this attempt's token, and its lease refuses the
+  // redelivery's first heartbeat until it lapses on its own.
+  const attempts: Array<{ taskId: string; claimCount?: number; releaseLease?: boolean }> = [];
+  const kv = fakeKv();
+  const engine: Engine = { async execute() { return completed; } };
+  bindTaskRunnerDeps({
+    kv, kvCkpt: kv,
+    emitter: { async emit() {} } as unknown as NatsEmitter,
+    engine,
+    sideEffects: {
+      ...stubSideEffects(),
+      // The handoff this run cannot complete, which is what sends it back for a
+      // redelivery rather than to a terminal ack.
+      postAgentDone: (async () => { throw new AgentDoneDeliveryError("backend unavailable"); }) as never,
+      settleRunAttempt: (async (taskId: string, claimCount?: number, _r?: unknown, releaseLease?: boolean) => {
+        attempts.push({ taskId, claimCount, releaseLease });
+      }) as never,
+    },
+  });
+
+  const verdicts: string[] = [];
+  const msg = {
+    seq: 7,
+    info: { deliveryCount: 1 },
+    ack() { verdicts.push("ack"); },
+    nak(ms?: number) { verdicts.push(`nak:${ms ?? "none"}`); },
+    working() {},
+    term() { verdicts.push("term"); },
+  } as unknown as Parameters<typeof runHandleTask>[0];
+
+  const abortCtrl = new AbortController();
+  const lockKey = "lock.ktsk-fatretry";
+  activeAbort.set(lockKey, abortCtrl);
+  await runHandleTask(
+    msg,
+    claimedRequest("ktsk-fatretry", false, {
+      callback_url: "http://api.test/v1/internal/tasks",
+    } as Partial<ExecuteRequest>),
+    SESSION, lockKey, MESSAGE, "u1", abortCtrl,
+    null,
+  );
+
+  assert.deepEqual(verdicts, ["nak:5000"], "the redelivery was asked for");
+  assert.equal(attempts.length, 1, "and the attempt it is leaving behind was settled first");
+  assert.equal(attempts[0].taskId, "ktsk-fatretry");
+  assert.equal(attempts[0].claimCount, 0, "a fat delivery takes no claim; 0 is the row's value");
+  assert.equal(attempts[0].releaseLease, true,
+    "the lease goes with it, or the next delivery renews against this one");
 });
