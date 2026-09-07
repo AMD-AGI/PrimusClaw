@@ -195,22 +195,28 @@ export function spawnBackground(
     run,
   });
   shells.set(key, { owner, run, shell });
-  attachSpawned(owner, run, shell);
 
   // Auto-reap finished shells so the concurrency cap cannot be saturated by
   // long-lived monitor/background entries that already exited. The delay keeps
   // the final output pollable for one grace window after exit.
+  //
+  // Installed before the attachment, which can fail: a shell left with no exit
+  // handler is one whose outcome is never written and whose entry is never
+  // dropped, on top of whatever the attachment failure already cost.
   shell.process.once("exit", () => {
-    persistOutcome(owner, run, shell);
+    const durable = persistOutcome(owner, run, shell);
     const t = setTimeout(() => {
       const current = shells.get(key);
-      if (current && current.shell.status !== "running") {
+      // An outcome that never reached the record exists only in this entry, so
+      // dropping it is the loss itself rather than the tidy-up it is otherwise.
+      if (durable && current && current.shell.status !== "running") {
         shells.delete(key);
         if (filesRecords()) releaseOutput(owner, recordRun(run), shell.id);
       }
     }, BG_SHELL_REAP_DELAY_MS);
     t.unref?.();
   });
+  attachSpawned(owner, run, shell);
 
   return { shell, resolution: "first_call" };
 }
@@ -258,23 +264,49 @@ function commandSalt(): string {
   return salt;
 }
 
+/** Raised where a start ran but its durable phase could not be written. */
+export class ShellStartNotDurable extends Error {}
+
+/**
+ * @throws ShellStartNotDurable where the attachment could not be written. The
+ * process is running and its entry stands, so the caller can poll or terminate
+ * it under the same id; what it may not do is report the start as made, since
+ * the record stays claim-only and classifies as `spawn_indeterminate` for the
+ * rest of the sandbox's life.
+ */
 function attachSpawned(owner: string, run: string, shell: BgShell): void {
   if (!filesRecords() || !shell.pid) return;
   const identity: ProcessIdentity = { pid: shell.pid, startToken: processStartToken(shell.pid) };
   try {
     attachRecord(owner, recordRun(run), shell.id, identity);
-  } catch { /* the record is gone with its sandbox; the spawn still stands */ }
+  } catch (err) {
+    logShellEvent("shell.attachment_not_durable", shell, {
+      level: 50, err: (err as Error)?.message ?? String(err),
+    });
+    throw new ShellStartNotDurable(
+      `background shell ${shell.id} was started but its attachment could not be `
+      + `recorded (${(err as Error)?.message ?? String(err)}); it is running and can `
+      + "be polled or terminated under that id",
+    );
+  }
 }
 
-function persistOutcome(owner: string, run: string, shell: BgShell): void {
-  if (!filesRecords()) return;
+/** @returns false where the terminal outcome could not be made durable. */
+function persistOutcome(owner: string, run: string, shell: BgShell): boolean {
+  if (!filesRecords()) return true;
   try {
     recordOutcome(owner, recordRun(run), shell.id, {
       status: shell.status === "killed" ? "killed" : shell.status === "exited" ? "exited" : "failed",
       exitCode: shell.exitCode ?? null,
       signal: shell.signal ?? null,
     });
-  } catch { /* the record is gone with its sandbox */ }
+    return true;
+  } catch (err) {
+    logShellEvent("shell.outcome_not_durable", shell, {
+      level: 50, err: (err as Error)?.message ?? String(err),
+    });
+    return false;
+  }
 }
 
 /**
