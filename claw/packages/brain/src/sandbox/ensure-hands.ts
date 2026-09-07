@@ -56,7 +56,7 @@ import {
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
-import { readHandsEntry, type HandsBinding } from "./registry.js";
+import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
 import { admitSandbox, type AdmissionHold } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
 
@@ -425,7 +425,7 @@ async function retainInsteadOfDestroying(
   answer: LiveWorkAnswer,
 ): Promise<void> {
   await reuseEffects.retainContainer({
-    store: kv as never,
+    store: retentionStore(kv),
     sessionKey: handsSessionKey(sessionId),
     generation: retentionGeneration(sessionId, info),
     binding: info,

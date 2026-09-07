@@ -13,7 +13,9 @@
  */
 
 import pino from "pino";
-import { HANDS_KEY_PREFIX, RETAINED_PREFIX, encodeKeyPart } from "@claw/protocol";
+import {
+  HANDS_KEY_PREFIX, RETAINED_PREFIX, encodeKeyPart, isRetentionEntry,
+} from "@claw/protocol";
 import type { LiveWorkVerdict } from "./live-work-gate.js";
 
 const logger = pino({ name: "sandbox-retention" });
@@ -25,7 +27,11 @@ export function retentionKey(generation: string): string {
 
 /** Narrowed so this cannot reach anything else in the bucket. */
 export interface RetentionStore {
-  put(key: string, value: string): Promise<unknown>;
+  read(key: string): Promise<{ value: string; revision: number } | null>;
+  /** False where the key already holds something. Never overwrites. */
+  create(key: string, value: string): Promise<boolean>;
+  /** Overwrite, conditioned on the revision that value was read at. */
+  replace(key: string, value: string, expectedRevision: number): Promise<boolean>;
   delete(key: string): Promise<unknown>;
 }
 
@@ -38,11 +44,58 @@ export interface RetentionRecord {
   retainedAt: string;
 }
 
+/** Raised where a session binding occupies the key this retention needs. */
+export class RetentionKeyCollision extends Error {}
+
+/**
+ * Take the retention key, or refuse it to whatever already holds it.
+ *
+ * Created rather than written over. For the length of a rolling upgrade an old
+ * replica goes on writing the pre-migration key of a session whose id begins
+ * with the reserved marker, which is byte-for-byte a retention's key: an
+ * unconditional write there replaces a live session's binding with this record,
+ * and the sandbox that binding named is then reachable by nothing. A retention
+ * already under the key is this generation's own -- one generation names one
+ * sandbox -- so it is refreshed on the revision it was read at, that being the
+ * retention resuming after a crash between the two writes rather than a
+ * collision.
+ *
+ * @throws RetentionKeyCollision where a session binding holds the key, or where
+ * the refresh lost its revision.
+ */
+async function takeRetentionKey(
+  store: RetentionStore, key: string, value: string,
+): Promise<void> {
+  if (await store.create(key, value)) return;
+  const existing = await store.read(key);
+  if (existing === null) {
+    throw new RetentionKeyCollision(
+      `the retention key ${key} was taken and released again while this container `
+      + "was being retained",
+    );
+  }
+  if (!isRetentionEntry(JSON.parse(existing.value))) {
+    throw new RetentionKeyCollision(
+      `the retention key ${key} holds a session binding, which an old replica writes `
+      + "under this name for the length of a rolling upgrade; the container was left "
+      + "bound to its own session rather than overwriting one",
+    );
+  }
+  if (!await store.replace(key, value, existing.revision)) {
+    throw new RetentionKeyCollision(
+      `the retention key ${key} changed while this container was being retained`,
+    );
+  }
+}
+
 /**
  * Move a session's binding into the retention namespace.
  *
  * The session key goes only after the retention key lands: the reverse order
  * leaves the container named by nothing if the second write does not happen.
+ *
+ * @throws RetentionKeyCollision where a session binding holds the retention
+ * key. Nothing is written and the session keeps its binding.
  */
 export async function retainContainer(input: {
   store: RetentionStore;
@@ -60,7 +113,7 @@ export async function retainContainer(input: {
     detail: input.detail,
     retainedAt: new Date().toISOString(),
   };
-  await input.store.put(key, JSON.stringify(record));
+  await takeRetentionKey(input.store, key, JSON.stringify(record));
   await input.store.delete(input.sessionKey);
   logger.warn(
     { key, generation: input.generation, verdict: input.verdict, detail: input.detail },

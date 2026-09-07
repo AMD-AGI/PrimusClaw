@@ -20,6 +20,7 @@ import {
   assertRetentionSeparation, handsSessionKey, legacyHandsKey,
   migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
 } from "./hands-key.js";
+import type { RetentionStore } from "./retain-container.js";
 import { isRevisionConflict } from "@claw/utils";
 import pino from "pino";
 
@@ -88,6 +89,24 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
         throw err;
       }
     },
+  };
+}
+
+/**
+ * The two conditional writes and the two deletes a retention needs, and nothing
+ * else in the bucket.
+ *
+ * Built here rather than at each call site so the retention path and the sweep
+ * that releases it cannot come to disagree about what a write to the reserved
+ * key means.
+ */
+export function retentionStore(kv: KV): RetentionStore {
+  const reserved = reservedKeyStore(kv);
+  return {
+    read: reserved.read,
+    create: reserved.create,
+    replace: reserved.replace,
+    delete: (key) => kv.delete(key),
   };
 }
 

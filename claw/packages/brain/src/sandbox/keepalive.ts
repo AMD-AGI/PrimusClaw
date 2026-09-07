@@ -12,7 +12,8 @@ import {
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
 import {
-  handsEntryKeys, readHandsEntry, reconcileReservedKeys, sessionHasActiveRunLease,
+  handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
+  sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { listAllDagHandles } from "./handles.js";
@@ -25,7 +26,7 @@ import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 import { instanceFromEntry } from "./container-probe.js";
 import { countLiveWork } from "./live-work-gate.js";
-import { releaseRetention, type RetentionStore } from "./retain-container.js";
+import { releaseRetention } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -167,7 +168,7 @@ async function sweepRetention(
     ? await countLiveWork(inst, HANDS_STATE_DIR)
     : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
   if (live.verdict === "clear") {
-    await releaseRetention(retentionStore(deps), key);
+    await releaseRetention(retentionStore(deps.kv), key);
     return true;
   }
 
@@ -180,14 +181,6 @@ async function sweepRetention(
     return false;
   }
   return true;
-}
-
-/** The two writes a retention needs, and nothing else in the bucket. */
-function retentionStore(deps: KeepaliveDeps): RetentionStore {
-  return {
-    put: (k, v) => deps.kv.put(k, sc.encode(v)),
-    delete: (k) => deps.kv.delete(k),
-  };
 }
 
 /**
