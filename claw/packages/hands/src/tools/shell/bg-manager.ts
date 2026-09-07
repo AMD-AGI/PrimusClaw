@@ -164,7 +164,15 @@ export function spawnBackground(
 
   const id = shellId || `bg-${randomUUID().slice(0, 8)}`;
   const key = regKey(owner, run, id);
-  if (shells.has(key)) throw new Error(`Shell ${id} already exists`);
+  // An entry is a collision while its process is running. An exited one stays
+  // for a reap delay so its last output remains pollable, which is not the same
+  // fact: where records are filed the record decides, and refusing here would
+  // answer a replay inside that window with a collision instead of the
+  // resolution its record already fixes. A process filing no records has only
+  // the registry, so there any entry is the answer.
+  const registered = shells.get(key);
+  const collides = filesRecords() ? registered?.shell.status === "running" : !!registered;
+  if (collides) throw new Error(`Shell ${id} already exists`);
   // The claim is durable before anything is spawned, and its exclusive create
   // is the arbiter: a start that lost it never reaches a process.
   if (!claimShell(owner, run, id, command, kind)) {
