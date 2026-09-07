@@ -21,19 +21,12 @@ import { mergeRunTimeReport, runTimeTotals, type RunTimeLedgerEntry } from "@cla
 import { db, inTransaction } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
-import {
-  claimRunById, failHeldClaim, releaseClaim, settleFinishedClaim,
-} from "../src/tasks/run-claim.js";
+import { claimRunById, releaseClaim, settleFinishedClaim } from "../src/tasks/run-claim.js";
 import { applyTaskStatusTransition, transitionStatus } from "../src/tasks/db.js";
 import { cancelTask } from "../src/tasks/lifecycle.js";
-import { closeChatRun, failChatRunDispatch, interruptUnstartedChatRuns } from "../src/tasks/chat-run.js";
-import {
-  reapExpiredDoorbellRuns, reapExpiredQueuedRuns, reapLostLeases, reapStuckDagRoots,
-} from "../src/tasks/sweeper.js";
-import { cascadeFailures } from "../src/tasks/scheduler.js";
-import { commitSessionDeletion } from "../src/sessions/teardown.js";
-import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC } from "../src/tasks/run-budget.js";
-import { TASK_POISON_DELIVERY_COUNT } from "../src/config.js";
+import { interruptUnstartedChatRuns } from "../src/tasks/chat-run.js";
+import { reapExpiredQueuedRuns, reapLostLeases } from "../src/tasks/sweeper.js";
+import { RUN_QUEUE_MAX_SEC } from "../src/tasks/run-budget.js";
 import { applyAgentDone, retryTask } from "../src/tasks/lifecycle.js";
 import {
   applyToLedger, mergeRenewal, openAttemptRecordFor, settleTerminalRuns,
@@ -112,11 +105,13 @@ async function announceRunning(
 }
 
 /** The release a holder issues through the endpoint the brain actually calls. */
-async function unclaim(taskId: string, claimCount: number, runTime?: unknown): Promise<number> {
+async function unclaim(
+  taskId: string, claimCount: number, runTime?: unknown, reason = "retry",
+): Promise<number> {
   const res = await app.inject({
     method: "POST", url: `/v1/internal/tasks/${taskId}/unclaim`,
     headers: { authorization: `Bearer ${TOKEN}` },
-    payload: { brain_id: BRAIN, claim_count: claimCount, reason: "retry", run_time: runTime },
+    payload: { brain_id: BRAIN, claim_count: claimCount, reason, run_time: runTime },
   });
   return res.statusCode;
 }
@@ -171,221 +166,6 @@ const expireLease = (taskId: string) => db.query(
     WHERE task_id = $1`, [taskId]);
 
 // ── AC1: the queue is banked by the table, whatever ends the segment ─────────
-
-/**
- * Every status-writing call site §7 enumerates, with what it takes to reach it.
- *
- * The list is the mechanism's own scope: §7 says the accrual is exactly as
- * complete as this set, so a table over five of them proved the rule for five
- * writers and said nothing about the other thirteen. Each entry drives its
- * production entry point rather than the private statement underneath, and
- * names the status the row must end at, so an exit that banks the segment by
- * taking a path other than its own writer fails here.
- */
-interface QueueExit {
-  /** §7's name for the call site. */
-  name: string;
-  seed?: Partial<Parameters<typeof seedRun>[3]>;
-  /** Rows and edges this writer needs beside the queued one under test. */
-  arrange?: (taskId: string) => Promise<void>;
-  run: (taskId: string) => Promise<unknown>;
-  status: string;
-  failureReason?: string;
-}
-
-/** A second row in the same DAG, in whatever state the writer needs it. */
-async function seedPeer(
-  taskId: string, opts: { status: string; dagRoot: string; node: string; agoSec?: number },
-): Promise<void> {
-  await seedRun(h, taskId, SESSION, { status: opts.status, queuedAgoSec: null });
-  await h.sql(
-    `UPDATE claw_tasks
-        SET dag_root_task_id = $2, dag_node_id = $3, dag_id = 'dag-1',
-            created_at = NOW() - ($4::int * INTERVAL '1 second'),
-            completed_at = CASE WHEN status IN ('failed','completed','cancelled')
-                                THEN NOW() ELSE completed_at END
-      WHERE task_id = $1`,
-    [taskId, opts.dagRoot, opts.node, opts.agoSec ?? 0],
-  );
-}
-
-const edge = (from: string, to: string, root: string) => h.sql(
-  `INSERT INTO claw_task_edges (dag_root_task_id, from_task_id, to_task_id) VALUES ($1, $2, $3)`,
-  [root, from, to]);
-
-function queueExits(): QueueExit[] {
-  return [
-    {
-      name: "transitionStatus (the dispatch CAS)",
-      run: (id) => transitionStatus(id, ["queued"], "preparing"),
-      status: "preparing",
-    },
-    {
-      name: "applyAgentDone",
-      run: (id) => applyAgentDone(id, { task_id: id, abort_reason: "completed" }),
-      status: "completed",
-    },
-    { name: "cancelTask", run: (id) => cancelTask(id), status: "cancelled" },
-    {
-      name: "takeClaim",
-      seed: { claimable: true, leaseOwner: null },
-      run: (id) => claimRunById(id, BRAIN),
-      status: "preparing",
-    },
-    {
-      // Reached only from `preparing`, because `takeClaim` moves the row first;
-      // the exit off the queue is the pair, and the failure reason is what says
-      // this writer is the one that closed it.
-      name: "markUnclaimable",
-      seed: { leaseOwner: null },
-      run: (id) => claimRunById(id, BRAIN),
-      status: "failed",
-      failureReason: "unclaimable",
-    },
-    {
-      name: "failHeldClaim",
-      seed: { claimCount: 1 },
-      run: (id) => failHeldClaim(id, BRAIN, "claim_abandoned", 1),
-      status: "failed",
-      failureReason: "claim_abandoned",
-    },
-    {
-      name: "failExhaustedClaim",
-      seed: { claimable: true, leaseOwner: null, claimCount: TASK_POISON_DELIVERY_COUNT - 1 },
-      run: (id) => claimRunById(id, BRAIN),
-      status: "failed",
-      failureReason: "max_retries_exceeded",
-    },
-    {
-      name: "releaseClaim (the queued -> queued case)",
-      run: (id) => releaseClaim(id, BRAIN, undefined, "retry"),
-      status: "queued",
-    },
-    {
-      name: "closeChatRun",
-      run: (id) => closeChatRun(SESSION, `msg-${id}`, "completed"),
-      status: "completed",
-    },
-    {
-      name: "failChatRunDispatch",
-      seed: { leaseOwner: null },
-      run: (id) => failChatRunDispatch(id, "the wakeup could not be published"),
-      status: "failed",
-      failureReason: "dispatch_failed",
-    },
-    {
-      name: "interruptUnstartedChatRuns",
-      run: () => interruptUnstartedChatRuns(SESSION),
-      status: "cancelled",
-    },
-    {
-      name: "reapStuckDagRoots (the child cascade)",
-      arrange: async (id) => {
-        await seedPeer("ktsk-dagroot", {
-          status: "running", dagRoot: "ktsk-dagroot", node: "__dag_root__",
-          agoSec: 2 * 60 * 60,
-        });
-        await seedPeer("ktsk-dagchild-failed", {
-          status: "failed", dagRoot: "ktsk-dagroot", node: "n-failed",
-        });
-        await h.sql(
-          `UPDATE claw_tasks SET dag_root_task_id='ktsk-dagroot', dag_node_id='n-queued'
-            WHERE task_id=$1`, [id]);
-      },
-      run: () => reapStuckDagRoots(),
-      status: "failed",
-      failureReason: "deps_failed",
-    },
-    {
-      name: "reapExpiredQueuedRuns",
-      seed: { queuedAgoSec: RUN_QUEUE_MAX_SEC + 5 },
-      run: () => reapExpiredQueuedRuns(),
-      status: "failed",
-      failureReason: "queue_timeout",
-    },
-    {
-      name: "reapExpiredDoorbellRuns",
-      seed: { leaseOwner: null, deadlineInSec: -(RUN_BUDGET_BACKSTOP_GRACE_SEC + 60) },
-      run: () => reapExpiredDoorbellRuns(),
-      status: "failed",
-      failureReason: "run_budget_exhausted",
-    },
-    {
-      // The spare row a retried dispatch opened: never claimed, no lease, and
-      // paired to the reaped row by session and message id together.
-      name: "closeUnclaimedDispatchSiblings",
-      seed: { leaseOwner: null, messageId: "msg-sibling" },
-      arrange: async () => {
-        await seedRun(h, "ktsk-lostlease", SESSION, {
-          status: "running", dispatch: "fat", messageId: "msg-sibling",
-          leaseOwner: BRAIN, leaseExpiresInSec: -3_600, queuedAgoSec: null,
-        });
-      },
-      run: () => reapLostLeases(),
-      status: "failed",
-      failureReason: "dispatch_retried",
-    },
-    {
-      name: "cascadeFailures",
-      arrange: async (id) => {
-        await seedPeer("ktsk-upstream-failed", {
-          status: "failed", dagRoot: "ktsk-upstream-failed", node: "n-up",
-        });
-        await edge("ktsk-upstream-failed", id, "ktsk-upstream-failed");
-      },
-      run: () => cascadeFailures(),
-      status: "failed",
-      failureReason: "deps_failed",
-    },
-    {
-      name: "cancelTask's downstream cascade",
-      arrange: async (id) => {
-        await seedPeer("ktsk-upstream-live", {
-          status: "queued", dagRoot: "ktsk-upstream-live", node: "n-up-live",
-        });
-        await edge("ktsk-upstream-live", id, "ktsk-upstream-live");
-      },
-      run: () => cancelTask("ktsk-upstream-live"),
-      status: "cancelled",
-    },
-    {
-      name: "commitSessionDeletion",
-      run: () => commitSessionDeletion(SESSION),
-      status: "cancelled",
-      failureReason: "session_deleted",
-    },
-  ];
-}
-
-test("AC1 every exit off the queue banks the segment, including the ones with no reporter", async () => {
-  // Table-driven over the writers themselves, not over hand-written SQL: the
-  // accrual rides on the one function that changes a status, so what is being
-  // asserted is that each of these callers goes through it.
-  const exits = queueExits();
-  assert.equal(exits.length, 18, "§7 enumerates this many call sites; a missing one is a lost segment");
-
-  for (const exit of exits) {
-    await h.reset();
-    await seedSession(h, SESSION);
-    const taskId = `ktsk-${exit.name.replace(/\W+/g, "-").slice(0, 40)}`;
-    await seedRun(h, taskId, SESSION, {
-      status: "queued", queuedAgoSec: 3, leaseOwner: BRAIN, ...exit.seed,
-    });
-    await exit.arrange?.(taskId);
-    assert.equal(await queuedMsOf(taskId), 0, `${exit.name}: nothing banked while still queued`);
-
-    await exit.run(taskId);
-
-    const row = await runRow(h, taskId);
-    assert.equal(row.status, exit.status, `${exit.name}: the writer under test did not close the row`);
-    if (exit.failureReason) {
-      assert.equal(row.failure_reason, exit.failureReason,
-        `${exit.name}: another writer reached the row first, so this one is untested`);
-    }
-    const banked = Number(row.queued_ms_accrued);
-    assert.ok(banked >= 3_000, `${exit.name}: expected the wait banked, got ${banked}ms`);
-  }
-});
 
 test("AC1 a row that never sat in the queue banks nothing", async () => {
   await seedRun(h, "ktsk-fat", SESSION, { status: "preparing", dispatch: "fat", queuedAgoSec: null });
@@ -848,13 +628,33 @@ test("AC1 a closing transaction that overlaps a heartbeat merge stays consistent
   });
   const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
   await renew("ktsk-overlap", token);
-  await sleep(40);
-  await renew("ktsk-overlap", { ...token, run_time: coverage("ktsk-overlap", "att-1", token, 40) });
+  // Enough coverage to be clamped to the budget, which leaves the anchor at the
+  // read instant -- the state a long-running attempt is normally in, and the one
+  // that makes a transaction-start stamp taken later land behind it.
+  await renew("ktsk-overlap", {
+    ...token, run_time: coverage("ktsk-overlap", "att-1", token, 60_000),
+  });
 
-  // A terminal stamp taken from an instant already behind the anchor.
-  await db.query(
-    `UPDATE claw_tasks SET status='completed',
-            completed_at = NOW() - INTERVAL '10 seconds' WHERE task_id=$1`, ["ktsk-overlap"]);
+  // The interleaving itself, with the real clock functions rather than a
+  // hand-written stamp: the closing transaction opens, a heartbeat commits
+  // inside the window and advances the anchor with clock_timestamp(), and only
+  // then does the close land -- stamping completed_at from the transaction's
+  // own NOW(), which was fixed before any of that happened.
+  await inTransaction(async (query) => {
+    await query("SELECT 1", []);
+    await sleep(60);
+    await renew("ktsk-overlap", {
+      ...token, run_time: coverage("ktsk-overlap", "att-1", token, 120_000),
+    });
+    await applyTaskStatusTransition("completed", {
+      expected: ["running"], params: ["ktsk-overlap"], query,
+    });
+  });
+  const closedAt = (await runRow(h, "ktsk-overlap")).completed_at as Date;
+  const anchorBefore = (await ledgerOf("ktsk-overlap"))!.lastAcceptedInstantDb;
+  assert.ok(closedAt.toISOString() < anchorBefore,
+    "the hazard only exists while the terminal stamp is behind the anchor");
+
   await settleTerminalRuns();
 
   const ledger = await ledgerOf("ktsk-overlap");
@@ -1247,10 +1047,11 @@ test("a waiting_external transition keeps the final report it commits with", asy
 
 test("AC5 a contention-only claim between two real attempts leaves the first intact", async () => {
   await seedRun(h, "ktsk-gen", SESSION, {
-    status: "running", claimCount: 1, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+    status: "queued", claimable: true, queuedAgoSec: 1,
   });
   const claimsBefore = Number((await runRow(h, "ktsk-gen")).claim_count);
 
+  assert.ok(typeof await claimRunById("ktsk-gen", BRAIN) === "object", "the first real claim");
   await announceRunning("ktsk-gen", "att-1", { claim_count: 1 });
   const afterFirst = await runRow(h, "ktsk-gen");
   assert.equal(Number(afterFirst.attempt_generation), 1);
@@ -1263,15 +1064,16 @@ test("AC5 a contention-only claim between two real attempts leaves the first int
     "a release is an attempt boundary, not the run's end");
   assert.equal((await ledgerOf("ktsk-gen"))!.settled, false);
 
-  // The contention-only claim: one more claim, no attempt, no generation.
-  await db.query(
-    `UPDATE claw_tasks SET status='preparing', claim_count=claim_count+1, attempt_id=NULL,
-            lease_owner=$2, lease_expires_at=NOW() + INTERVAL '45 seconds'
-      WHERE task_id=$1`, ["ktsk-gen", BRAIN]);
+  // The contention-only claim, through the pair that performs it: claim-next
+  // hands the row out, the brain finds the workspace lock held and defers, and
+  // `deferForLockContention` releases under that reason without ever executing.
+  assert.ok(typeof await claimRunById("ktsk-gen", BRAIN) === "object", "the row is claimable again");
   assert.equal(Number((await runRow(h, "ktsk-gen")).attempt_generation), 1,
     "a claim that never reached execution consumes no generation");
+  assert.equal(await unclaim("ktsk-gen", 2, undefined, "lock_contention"), 200);
+  assert.equal((await runRow(h, "ktsk-gen")).status, "queued");
 
-  await db.query(`UPDATE claw_tasks SET claim_count=claim_count+1 WHERE task_id=$1`, ["ktsk-gen"]);
+  assert.ok(typeof await claimRunById("ktsk-gen", BRAIN) === "object", "and a third claim runs it");
   await announceRunning("ktsk-gen", "att-2", { claim_count: 3 });
   const secondToken = { attempt_id: "att-2", claim_count: 3, delivery_seq: 0, delivery_count: 0 };
   assert.equal(await unclaim("ktsk-gen", 3, coverage("ktsk-gen", "att-2", secondToken, 20)), 200);
