@@ -184,7 +184,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!canWriteSessionAsOperator(session.user_id, user)) {
       return reply.status(403).send({ ok: false, error: "access denied" });
     }
-    nc.publish(interruptSubject(sessionId));
+    try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort */ }
     await interruptSessionRuns(sessionId);
     return { ok: true };
   });
