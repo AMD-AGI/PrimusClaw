@@ -5,13 +5,14 @@ package router
 
 import (
 	"io"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 var httpClient = &http.Client{
@@ -42,7 +43,7 @@ func (s *Server) proxyToWM(c *gin.Context) {
 	r := c.Request
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
-		slog.Error("proxyToWM: failed to build request", "target", targetURL, "error", err)
+		log.Error("proxyToWM: failed to build request", "target", targetURL, "error", err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to build proxy request"})
 		return
 	}
@@ -61,7 +62,7 @@ func (s *Server) proxyToWM(c *gin.Context) {
 
 	resp, err := httpClient.Do(outReq)
 	if err != nil {
-		slog.Error("proxyToWM: upstream error", "target", targetURL, "error", err)
+		log.Error("proxyToWM: upstream error", "target", targetURL, "error", err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "workload manager unreachable: " + err.Error()})
 		return
 	}
@@ -101,7 +102,7 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	// Build outbound request
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
-		slog.Error("proxy: failed to build request", "target", targetURL, "error", err)
+		log.Error("proxy: failed to build request", "target", targetURL, "error", err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to build proxy request: " + err.Error()})
 		return
 	}
@@ -136,13 +137,13 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	// month. If that path is ever changed to keep serving, these turn a silent
 	// 401 storm from the sandbox into an explicit 503 from the Router.
 	if s.jwt == nil {
-		slog.Error("JWT: signer unavailable; refusing to proxy", "session_id", sessionID)
+		log.Error("JWT: signer unavailable; refusing to proxy", "session_id", sessionID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
 		return
 	}
 	token, err := s.jwt.GenerateToken(sessionID)
 	if err != nil {
-		slog.Error("JWT: failed to sign token; refusing to proxy", "error", err, "session_id", sessionID)
+		log.Error("JWT: failed to sign token; refusing to proxy", "error", err, "session_id", sessionID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
 		return
 	}
@@ -151,7 +152,7 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	// Execute upstream request
 	resp, err := httpClient.Do(outReq)
 	if err != nil {
-		slog.Error("proxy: upstream error", "target", targetURL, "error", err)
+		log.Error("proxy: upstream error", "target", targetURL, "error", err)
 		if strings.Contains(err.Error(), "connection refused") {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "sandbox unreachable"})
 		} else if strings.Contains(err.Error(), "timeout") {
@@ -181,7 +182,7 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		w.Header().Set(authStageHeader, authStageEnvD)
 		sandboxAuthRejections.WithLabelValues(authStageEnvD, strconv.Itoa(resp.StatusCode)).Inc()
-		slog.Error("proxy: sandbox refused the Router's own credential",
+		log.Error("proxy: sandbox refused the Router's own credential",
 			"status", resp.StatusCode,
 			"session_id", sessionID,
 			"target", targetURL,

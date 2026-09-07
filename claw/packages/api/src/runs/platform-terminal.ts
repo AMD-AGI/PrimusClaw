@@ -55,6 +55,18 @@ export interface TerminalFacts {
 
 export interface RunView {
   run_id: string;
+  /**
+   * The session the run belongs to, which is the key a dispatcher above Claw
+   * holds: `POST /v1/sessions` hands it back and every other read contract
+   * between the two systems is on it.
+   *
+   * Not a second name for `run_id`. A session owns many runs -- a DAG expands to
+   * a root plus a row per node, a batch to one of those per input, a chat to one
+   * per turn -- so this is the many side, and a caller reading a `?session_ids=`
+   * answer needs it to group the runs it got back under the sessions it asked
+   * about, and to see which of those sessions returned nothing.
+   */
+  session_id: string;
   phase: RunPhase;
   terminal: TerminalFacts | null;
   timestamps: {

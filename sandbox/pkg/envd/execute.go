@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // handleExecute handles POST /api/execute — synchronous command execution.
@@ -37,7 +37,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("sandbox.execute",
+	log.Info("sandbox.execute",
 		"sessionId", r.Header.Get("x-session-id"),
 		"timeout", req.Timeout,
 		"command", cmdlog.Preview(req.Command, 0),
@@ -124,7 +124,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("sandbox.execute",
+	log.Info("sandbox.execute",
 		"sessionId", r.Header.Get("x-session-id"),
 		"timeout", req.Timeout,
 		"command", cmdlog.Preview(req.Command, 0),

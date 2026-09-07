@@ -124,7 +124,7 @@ function stubSideEffects(over: Partial<TaskRunnerSideEffects> = {}) {
     probeSandboxContainer: record("probeSandboxContainer", { verdict: "dead", reason: "no_kv_entry" }),
     restartHandsInSandbox: record("restartHandsInSandbox", { ok: true, detail: "healthy" }),
     unregisterSandbox: ((..._a: unknown[]) => { calls.push("unregisterSandbox"); }) as never,
-    markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); }) as never,
+    markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     markRetryPending: record("markRetryPending", undefined),
     syncWorkspaceToS3: record("syncWorkspaceToS3", { uploaded: 1, totalFiles: 1, failedCount: 0, exhausted: false, empty: false }),
     syncWorkspaceFromS3: record("syncWorkspaceFromS3", undefined),

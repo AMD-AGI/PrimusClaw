@@ -114,8 +114,13 @@ CREATE TABLE claw_conversation_turns (
   -- (session_id, message_id, role)); the claim's rebuild reads the table, so
   -- the fixture must not be narrower than what production queries can see.
   message_id   TEXT,
+  is_placeholder BOOLEAN NOT NULL DEFAULT FALSE,
   deleted_at   TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX uq_turns_message_role
+  ON claw_conversation_turns(session_id, message_id, role)
+  WHERE message_id IS NOT NULL AND deleted_at IS NULL;
 
 CREATE TABLE claw_session_summaries (
   session_id       TEXT PRIMARY KEY,
@@ -209,6 +214,7 @@ export async function startHarness(): Promise<Harness> {
 
   const original = db.query;
   const originalConnect = db.pool.connect;
+  const originalLockConnect = db.lockPool.connect;
   const statements: string[] = [];
   const run = async (text: string, params?: unknown[]) => {
     statements.push(text.replace(/\s+/g, " ").trim());
@@ -235,6 +241,9 @@ export async function startHarness(): Promise<Harness> {
     release: () => {},
   })) as unknown as typeof db.pool.connect;
 
+  // PGlite has one backend; concurrency scenarios supply their own lock clients.
+  db.lockPool.connect = (async () => ({ query: db.query, release() {} })) as unknown as typeof db.lockPool.connect;
+
   return {
     /** Every statement this harness has run since the last reset. */
     statements,
@@ -249,6 +258,7 @@ export async function startHarness(): Promise<Harness> {
     async close() {
       db.query = original;
       db.pool.connect = originalConnect;
+      db.lockPool.connect = originalLockConnect;
       await pg.close();
     },
   };

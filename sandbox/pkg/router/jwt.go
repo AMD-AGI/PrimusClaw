@@ -20,7 +20,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -230,12 +231,12 @@ func (jm *JWTManager) EnsureJWTIdentity(ctx context.Context) error {
 				return fmt.Errorf("public and private keys do not match in secret %s/%s",
 					IdentityNamespace, IdentitySecretName)
 			}
-			klog.Infof("Loaded JWT identity from existing secret %s/%s", IdentityNamespace, IdentitySecretName)
+			log.Infof("Loaded JWT identity from existing secret %s/%s", IdentityNamespace, IdentitySecretName)
 			return nil
 		}
 		if !apierrors.IsNotFound(err) {
 			lastErr = fmt.Errorf("get identity secret: %w", err)
-			klog.Warningf("JWT identity read failed (attempt %d): %v", attempt, err)
+			log.Warnf("JWT identity read failed (attempt %d): %v", attempt, err)
 			continue
 		}
 
@@ -251,10 +252,10 @@ func (jm *JWTManager) EnsureJWTIdentity(ctx context.Context) error {
 			// another replica won the race, and the next attempt's Get adopts
 			// the winner's key instead of keeping ours.
 			lastErr = fmt.Errorf("create identity secret: %w", err)
-			klog.Warningf("JWT identity create failed (attempt %d): %v", attempt, err)
+			log.Warnf("JWT identity create failed (attempt %d): %v", attempt, err)
 			continue
 		}
-		klog.Infof("Created JWT identity secret %s/%s", IdentityNamespace, IdentitySecretName)
+		log.Infof("Created JWT identity secret %s/%s", IdentityNamespace, IdentitySecretName)
 		return nil
 	}
 }

@@ -21,6 +21,7 @@ import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
 import { applyTaskStatusTransition } from "./db.js";
+import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
 import { settleRunTime, type RunSettlement } from "./run-time-ledger.js";
@@ -637,6 +638,18 @@ async function failExhaustedClaim(row: ClawTaskRow, settlement?: RunSettlement):
     return false;
   }
   await releaseRunUse(row.task_id, false);
+  // And the sandbox, if this session has nothing else running. A run claimed to
+  // exhaustion is a run no worker ever finished, so nothing ever reached the
+  // line in Brain that puts `hands.<sid>` back in the idle pool -- and an
+  // unparked handle is not one the idle sweep ignores, it is one every replica
+  // pings once a tick, keeping the platform's lastActivity fresh and its GC
+  // away until the workload's own absolute deadline.
+  //
+  // Here as well as in the sweeper's gate release because this path is not a
+  // sweep and does not go through it: it closes the row itself and announces
+  // its own failure. Naming the three reapers and stopping there is how the
+  // guard came to sit on three of the four routes into this state.
+  await parkHandsOfSettledSessions([row.session_id]);
   await announceClaimFailure(
     row,
     failureReason,

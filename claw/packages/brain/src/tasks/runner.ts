@@ -51,7 +51,7 @@ import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
 import { probeSandboxContainer } from "../sandbox/container-probe.js";
 import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
-import type { PlatformFacts } from "@claw/protocol";
+import type { PlatformFacts, RunEndedParkOutcome } from "@claw/protocol";
 import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/container-probe.js";
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
@@ -837,6 +837,12 @@ async function maybeRunSandboxlessTask(
   }
   return true;
 }
+
+/**
+ * What the post-task park did, plus the case the shared type has no room for:
+ * a turn that never built a sandbox, so there was no handle to park.
+ */
+type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
 
 /**
  * Encapsulates one in-flight task execution (sandbox lifecycle, resume
@@ -1838,12 +1844,35 @@ class TaskRunner {
     } else if (this.handsWorkloadId) {
       fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId });
     }
+    void this.parkHandsForIdleReuse().then((outcome) => {
+      logger.info(
+        {
+          sessionId: this.sessionId,
+          workloadId: this.handsWorkloadId,
+          parked: outcome === "parked",
+          outcome,
+        },
+        "keepalive.stopped_after_task",
+      );
+    });
+  }
+
+  /**
+   * Put this run's handle back in the idle pool, reporting what the write did.
+   *
+   * Only the outcome says a park happened: under BRAIN_LAZY_SANDBOX a turn
+   * answered from context alone never built a sandbox, and `markHandsIdle`
+   * writes nothing for a handle that is gone, still provisioning, or now naming
+   * a different sandbox, and can lose its conditional write to a concurrent one.
+   */
+  private async parkHandsForIdleReuse(): Promise<PostTaskParkOutcome> {
     if (this.handsIdentity) {
-      fx().markHandsIdle(this.kv, this.sessionId, this.handsIdentity);
-    } else if (this.handsWorkloadId) {
-      fx().markHandsIdle(this.kv, this.sessionId, this.handsWorkloadId);
+      return (await fx().markHandsIdle(this.kv, this.sessionId, this.handsIdentity)).outcome;
     }
-    logger.info({ sessionId: this.sessionId, workloadId: this.handsWorkloadId }, "keepalive.stopped_after_task");
+    if (this.handsWorkloadId) {
+      return (await fx().markHandsIdle(this.kv, this.sessionId, this.handsWorkloadId)).outcome;
+    }
+    return "no_sandbox";
   }
 
   /**

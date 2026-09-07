@@ -57,6 +57,37 @@ var (
 	// the caller's credential never reaches EnvD. That one means Router and
 	// EnvD disagree about the signing key, i.e. every exec in the cluster is
 	// failing, and it is the signal worth alerting on.
+	// Readiness as a durable record, because the probe result is not one.
+	//
+	// A failing readiness probe removes this pod from every Service that selects
+	// it and is then thrown away: kubelet discards the response body, so the
+	// `reason` the handler carefully assembles reaches nobody. On 2026-09-06 the
+	// controlplane sat not-ready for 72 minutes, took the whole sandbox router
+	// down with it, and left no evidence of which check failed -- liveness is an
+	// unconditional 200 so nothing restarted, and by the time anyone looked the
+	// container log had rotated past the window.
+	//
+	// The gauge answers "was it ready" over any past window; the counter answers
+	// "which check, and how did it fail". Both survive in whatever scrapes them,
+	// which is the point: the state itself is transient.
+	routerReady = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "router_ready",
+			Help: "1 when the last readiness check passed, 0 when it failed. Mirrors what the readiness probe saw.",
+		},
+	)
+
+	// reason is a small closed set, never the raw error string: a Go network
+	// error carries the dialled address, and putting that in a label makes a new
+	// series per sandbox IP.
+	readinessFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "router_readiness_failures_total",
+			Help: "Readiness check failures by which check failed and how. check=store|workload_manager; reason=refused|timeout|status|error.",
+		},
+		[]string{"check", "reason"},
+	)
+
 	sandboxAuthRejections = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "router_sandbox_auth_rejections_total",

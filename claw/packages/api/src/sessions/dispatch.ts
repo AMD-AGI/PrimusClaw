@@ -79,8 +79,22 @@ export interface DispatchInput {
   topology?: EnvironmentTopology;
 }
 
+/**
+ * What a caller learns from a dispatch.
+ *
+ * Both successful kinds carry `runId`, and that is the point of the type: the
+ * row is what the turn *is*, and every path that leaves one behind knows its id
+ * by the time it returns. Only `queued` used to report it, so a caller told
+ * "dispatched" -- the ordinary case -- was handed a message id and left to guess
+ * which of a session's many rows was its own.
+ *
+ * Neither failing kind carries one, also deliberately. `rejected` may be refused
+ * before any row exists or after the one it opened was closed again, and
+ * `publish_failed` has had its row compensated; a run id on either would name a
+ * row that is not going to execute.
+ */
 export type DispatchResult =
-  | { kind: "dispatched"; messageId: string; sandboxImage: string | undefined }
+  | { kind: "dispatched"; messageId: string; sandboxImage: string | undefined; runId: string }
   | { kind: "queued"; messageId: string; sandboxImage: string | undefined; queuePosition: number; runId: string }
   | { kind: "rejected"; messageId: string; reason: string }
   | { kind: "publish_failed"; messageId: string; error: Error };
@@ -317,7 +331,7 @@ export async function dispatchTaskToBrain(
     subject = taskSubject();
     await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
-    return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage };
+    return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage, runId: run.taskId };
   } catch (err: any) {
     // Compensate before rolling back, and read the verdict. The order used to
     // be the other way round, which made the answer unusable: the rollback had
@@ -341,7 +355,10 @@ export async function dispatchTaskToBrain(
       );
       // The image the run is actually using is on the row the holder claimed;
       // this path never learns it, and the callers use it only for a log line.
-      return { kind: "dispatched", messageId, sandboxImage: undefined };
+      // The row's id it does know, and this branch reports a turn that is
+      // executing -- so the caller gets the same handle it would have got had
+      // the publish returned cleanly, rather than a success it cannot name.
+      return { kind: "dispatched", messageId, sandboxImage: undefined, runId: runTaskId };
     }
     try {
       await onPublishFailure();
@@ -406,5 +423,5 @@ async function dispatchByDoorbell(input: {
     { sessionId: input.sessionId, messageId: input.messageId, runTaskId: result.taskId, sandboxImage: sandboxImage || null },
     "message.dispatched",
   );
-  return { kind: "dispatched", messageId: input.messageId, sandboxImage };
+  return { kind: "dispatched", messageId: input.messageId, sandboxImage, runId: result.taskId };
 }
