@@ -34,15 +34,6 @@ export function bindHandsKv(kv: KV): void {
   _kv = kv;
 }
 
-/**
- * Move any session binding already sitting in the reserved retention namespace
- * out of it, at boot and before anything can mint a retention.
- *
- * Refusing to mint new colliding keys protects a fresh deployment and nothing
- * else: a session whose id already begins with the reserved marker is
- * indistinguishable from a retention by key shape, so the first retention under
- * a matching generation would write over a live session's binding.
- */
 function reservedKeyStore(kv: KV): HandsKeyStore {
   return {
     keys: async (filter) => {
@@ -167,6 +158,15 @@ export async function reconcileReservedKeys(kv: KV): Promise<void> {
   }
 }
 
+/**
+ * Move any session binding already sitting in the reserved retention namespace
+ * out of it, at boot and before anything can mint a retention.
+ *
+ * Refusing to mint new colliding keys protects a fresh deployment and nothing
+ * else: a session whose id already begins with the reserved marker is
+ * indistinguishable from a retention by key shape, so the first retention under
+ * a matching generation would write over a live session's binding.
+ */
 export async function assertReservedKeysFree(kv: KV): Promise<void> {
   const store = reservedKeyStore(kv);
   const moved = await migrateReservedSessionKeys(store);
