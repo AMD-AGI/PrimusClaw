@@ -10,6 +10,8 @@ export * from "./topology.js";
 export * from "./run-doorbell.js";
 export * from "./sandbox/base32.js";
 export * from "./sandbox/hands-key.js";
+export * from "./sandbox/shell-record.js";
+export * from "./sandbox/shell-classify.js";
 export {
   parkHandsHandle,
   type ParkOutcome,

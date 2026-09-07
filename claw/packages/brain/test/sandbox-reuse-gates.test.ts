@@ -107,14 +107,18 @@ function stubEffects(
   restartOk = true,
   /** When set, the restart refuses (never attempts) with this detail. */
   refusal?: string,
+  /** What the record-derived gate answers. Default: nothing left running. */
+  liveWork: "clear" | "protected" | "unknown" = "clear",
 ): {
   destroyed: string[];
   registered: Registration[];
   restartCalls: number[];
+  retained: string[];
 } {
   const destroyed: string[] = [];
   const registered: Registration[] = [];
   const restartCalls: number[] = [];
+  const retained: string[] = [];
   restoreEffects = bindSandboxReuseEffects({
     destroyHands: async (sessionId: string) => { destroyed.push(sessionId); },
     registerSandbox: ((sessionId: string, target: Record<string, unknown>) => {
@@ -126,8 +130,10 @@ function stubEffects(
       if (refusal) return { ok: false, detail: refusal, refused: true };
       return { ok: restartOk, detail: restartOk ? "healthy" : "started_but_unhealthy" };
     },
+    countLiveWork: async () => ({ verdict: liveWork, classes: {}, reason: liveWork }),
+    retainContainer: async (input) => { retained.push(input.generation); return "retained"; },
   });
-  return { destroyed, registered, restartCalls };
+  return { destroyed, registered, restartCalls, retained };
 }
 
 /** The session ids passed to `registerSandbox`, for the cases that only count. */
@@ -555,21 +561,62 @@ test("the SaFE handle records the namespace keepalive will poll", () => {
     "keepalive has to poll the namespace the request named");
 });
 
-test("a refused in-place restart falls back to rebuilding, it does not wedge the turn", async () => {
+test("a refused in-place restart releases the claim, and destroys only an empty container", async () => {
   // `restart_disabled` and `env_not_reproducible` mean this deployment will
-  // never repair this sandbox in place. Treating that as a failed repair kept
-  // the container and threw, so every later turn on the session threw the same
-  // way with no path back -- the operator who turned the kill switch off got a
-  // dead session rather than the replace-and-rebuild it used to do.
-  const { destroyed, restartCalls } = stubEffects("alive", false, "restart_disabled");
+  // never repair this sandbox in place, so the session's claim on it has to go
+  // or every later turn fails the same way. What happens to the container is a
+  // separate question, answered by what is still running in it.
+  const { destroyed, restartCalls, retained } = stubEffects("alive", false, "restart_disabled");
   stubHealth("down");
   const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
 
   const reused = await tryReuseSessionSandbox(a);
 
-  assert.equal(reused, null, "null is how this function asks the caller to rebuild");
+  assert.equal(reused, null, "null is how this function asks the caller to build a fresh one");
   assert.equal(restartCalls.length, 1, "the refusal still comes from the restart path");
-  assert.deepEqual(destroyed, ["s-1"], "the caller tears the old sandbox down before rebuilding");
+  assert.deepEqual(destroyed, ["s-1"], "nothing was running, so the container is the caller's to reap");
+  assert.deepEqual(retained, [], "and nothing was retained");
+});
+
+test("a refusal over live work retains the container instead of replacing it", async () => {
+  // The failure this closes: a refusal was licence to rebuild, and a rebuild
+  // asked nothing about what was running. A fresh Hands reads an empty
+  // registry, and empty read as "destroying this is harmless" -- so a health
+  // check failing on a pod with a training run in it took the run with it.
+  for (const verdict of ["protected", "unknown"] as const) {
+    const { destroyed, retained } = stubEffects("alive", false, "env_not_reproducible", verdict);
+    stubHealth("down");
+    const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+    const reused = await tryReuseSessionSandbox(a);
+
+    assert.equal(reused, null, `${verdict}: the caller still gets a fresh sandbox`);
+    assert.deepEqual(destroyed, [], `${verdict}: the live container was destroyed`);
+    assert.equal(retained.length, 1, `${verdict}: the binding was not moved into the retention namespace`);
+    restoreEffects?.();
+    restoreEffects = null;
+  }
+});
+
+test("an unanswerable gate keeps the container, exactly as a nonzero count does", async () => {
+  // The caller-visible outcome is one acquisition either way: the count decides
+  // which container it gets, never what it is told, so no response and no
+  // combination of responses is a function of what was found.
+  const held = stubEffects("alive", false, "env_not_reproducible", "unknown");
+  stubHealth("down");
+  const { a: unknownAttempt } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const unknownResult = await tryReuseSessionSandbox(unknownAttempt);
+  restoreEffects?.();
+  restoreEffects = null;
+
+  const busy = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a: protectedAttempt } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const protectedResult = await tryReuseSessionSandbox(protectedAttempt);
+
+  assert.deepEqual(unknownResult, protectedResult, "the two are indistinguishable to a caller");
+  assert.deepEqual(held.destroyed, []);
+  assert.deepEqual(busy.destroyed, []);
 });
 
 test("a restart that was attempted and failed still keeps the container", async () => {

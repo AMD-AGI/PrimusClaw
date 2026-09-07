@@ -22,7 +22,7 @@ import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } f
 import { latchRosterStale, markRosterStale, releaseAdmission } from "./admission.js";
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
-import { sessionIdFromHandsKey } from "./hands-key.js";
+import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -126,6 +126,30 @@ interface RegisteredSandbox {
 }
 
 const localRegistry = new Map<string, RegisteredSandbox>();
+
+/**
+ * The sandbox an entry names, or null where it names none this can address.
+ *
+ * safe-workload needs a workload id and platform key; agent-sandbox needs a
+ * session id. An entry short of either is not a sandbox with no work in it --
+ * it is one nothing can be sent to, which is a different answer.
+ */
+function sandboxEntryFrom(info: HandsKvEntry): SandboxEntry | null {
+  const provider = info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload";
+  const usable = provider === "agent-sandbox"
+    ? !!info.sessionId
+    : !!(info.workloadId && info.platformKey);
+  if (!usable) return null;
+  return {
+    provider,
+    workloadId: info.workloadId,
+    platformKey: info.platformKey,
+    sessionId: info.sessionId,
+    sandboxName: info.sandboxName,
+    namespace: info.namespace,
+    userId: info.userId,
+  };
+}
 
 /**
  * The identity of one ping target.
@@ -890,6 +914,25 @@ async function collectTargets(
       try {
         const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
         if (info.status && info.status !== "ready") continue;
+        // A retention names no session, so the owner scope a probe would ask
+        // about owns nothing: the probe would read zero, file the container
+        // idle, and reclaim the very work the retention exists to protect. It
+        // is pinged like any other target and is a case of its own beside the
+        // running, idle and unobtainable answers -- never probed for a count,
+        // never marked idle, never destroyed or evicted on a failed ping.
+        if (isRetentionEntry(info)) {
+          const held = sandboxEntryFrom(info);
+          if (held) {
+            targets.set(key, { sessionId, entry: held });
+            // Its TTL is refreshed like any other target's; nothing else about
+            // it is read, and no branch below may reach it.
+            await deps.kv.update(key, e.value, e.revision).catch(() => {});
+          } else {
+            complete = false;
+            logger.error({ key }, "keepalive.retention_unaddressable");
+          }
+          continue;
+        }
         // Post-task idle reuse handle: keep it for reuse but never ping it, so
         // the pod idles out via the control-plane GC (no extra cost). Refresh
         // its TTL within the reuse window; expire it afterwards.
@@ -1005,21 +1048,8 @@ async function collectTargets(
           }
           continue;
         }
-        const provider = info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload";
-        // safe-workload needs workloadId+platformKey; agent-sandbox needs sessionId.
-        const usable = provider === "agent-sandbox"
-          ? !!info.sessionId
-          : !!(info.workloadId && info.platformKey);
-        if (!usable) continue;
-        const entry: SandboxEntry = {
-          provider,
-          workloadId: info.workloadId,
-          platformKey: info.platformKey,
-          sessionId: info.sessionId,
-          sandboxName: info.sandboxName,
-          namespace: info.namespace,
-          userId: info.userId,
-        };
+        const entry = sandboxEntryFrom(info);
+        if (!entry) continue;
         if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry, key)) continue;
 
         // Renew the record here rather than after the ping it is waiting for.

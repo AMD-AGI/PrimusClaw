@@ -26,42 +26,14 @@ import {
   renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { EpochMarker, ProcessIdentity, ShellRecord, ShellRecordStatus } from "@claw/protocol";
 import {
   ABSENT_RUN, NO_RUN_SEGMENT, type RunPart, componentsMatch, recordComponents,
 } from "./record-path.js";
 
-export type ShellRecordStatus = "exited" | "killed" | "failed";
-
-export interface ProcessIdentity {
-  /** The operating-system process identifier. */
-  pid: number;
-  /**
-   * The kernel-supplied start-time token, paired with the identifier because
-   * the identifier alone is reusable after wraparound. A lookup matching the
-   * identifier and not the token is a non-match, never a weaker match.
-   */
-  startToken: string;
-}
-
-export interface ShellRecord {
-  owner_scope: string;
-  /** Null is the typed absence of N4.1.2a.3, distinct from every string. */
-  run_identity: string | null;
-  shell_id: string;
-  command_digest: string;
-  kind: "background" | "monitor";
-  claimed_at: string;
-  hands_epoch: string;
-  deadline_at?: string;
-  process_identity?: ProcessIdentity;
-  spawned_at?: string;
-  status?: ShellRecordStatus;
-  exit_code?: number | null;
-  signal?: string | null;
-  ended_at?: string;
-  output_available?: boolean;
-  retain_until?: string;
-}
+export type {
+  EpochMarker, ProcessIdentity, ShellRecord, ShellRecordStatus,
+} from "@claw/protocol";
 
 /** Where the subtree lives. Outside /workspace, and Hands-owned. */
 export function stateRoot(): string {
@@ -73,11 +45,6 @@ const SCOPES = "scopes";
  *  can collide with one. */
 const EPOCH_MARKER = "epoch.json";
 const STAGING = "staging";
-
-export interface EpochMarker {
-  epoch: string;
-  bearer: ProcessIdentity;
-}
 
 let mintedEpoch: EpochMarker | null = null;
 

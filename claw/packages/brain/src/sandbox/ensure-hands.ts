@@ -39,11 +39,14 @@ import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { lookupDagHandle, registerDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
-import { bootstrapHandsInSandbox, HANDS_LOG_PATH } from "./bootstrap.js";
+import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
+import { countLiveWork, type LiveWorkAnswer } from "./live-work-gate.js";
+import { retainContainer } from "./retain-container.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
 import { registerSandbox } from "./keepalive.js";
 import type { SandboxEntry } from "./keepalive.js";
 import {
+  instanceFromEntry,
   parseHandsProbeValue,
   probeSandboxContainer,
   sameHandsSandbox,
@@ -232,6 +235,8 @@ export interface SandboxReuseEffects {
     signal?: AbortSignal,
   ) => Promise<ContainerProbeOutcome>;
   restartHandsInSandbox: typeof restartHandsInSandbox;
+  countLiveWork: typeof countLiveWork;
+  retainContainer: typeof retainContainer;
 }
 
 export interface EnsureHandsOptions {
@@ -257,10 +262,11 @@ export interface EnsureHandsOptions {
 
 const realReuseEffects: SandboxReuseEffects = {
   destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
+  countLiveWork, retainContainer,
 };
 let reuseEffects: SandboxReuseEffects = realReuseEffects;
 
-/** Override the two effects above; returns the call that puts them back. */
+/** Override the effects above; returns the call that puts them back. */
 export function bindSandboxReuseEffects(
   overrides: Partial<SandboxReuseEffects>,
 ): () => void {
@@ -380,15 +386,15 @@ async function recoverUnhealthyReuse(
   if (!restarted.ok) {
     // A refusal is not a failed repair. It says this deployment will never
     // restart Hands in place here -- the kill switch is off, or the pooled
-    // pod's environment cannot be reproduced -- so keeping the container means
-    // every later turn on this session fails the same way with no way out.
-    // Returning null hands the caller back to the replace-and-rebuild path it
-    // used before the in-place restart existed, which is what the operator who
-    // turned the switch off asked for.
+    // pod's environment cannot be reproduced -- so every later turn on this
+    // session would fail the same way. The session's claim is released so the
+    // caller gets a working sandbox by the ordinary path; the container itself
+    // is not the caller's to destroy, and what decides its fate is what is
+    // still running in it.
     if (restarted.refused) {
       logger.warn(
         { sessionId, handsUrl: info.handsUrl, detail: restarted.detail },
-        "ensureHands.restart_refused_rebuilding",
+        "ensureHands.restart_refused",
       );
       return null;
     }
@@ -401,6 +407,58 @@ async function recoverUnhealthyReuse(
     "ensureHands.mcp_restarted_in_place",
   );
   return acceptExistingSandbox(kv, sessionId, info, identity, binding);
+}
+
+/**
+ * Release this session's claim on a container that still holds live work.
+ *
+ * Not a destroy and not a refusal: the caller goes on to the ordinary
+ * acquisition path and is handed a freshly provisioned sandbox, exactly as a
+ * rebuild would have handed it one. Nothing it can observe varies with what was
+ * found here -- the count decides which container it gets, never what it is
+ * told -- so the finding reaches operator telemetry alone.
+ */
+async function retainInsteadOfDestroying(
+  kv: ReuseAttempt["kv"],
+  sessionId: string,
+  info: any,
+  answer: LiveWorkAnswer,
+): Promise<void> {
+  const generation = info.sandboxName || info.workloadId || "";
+  if (!generation) {
+    // A binding naming no generation has no key a retention could take, and the
+    // sweep walks keys rather than values. Refusing to destroy is what is left.
+    logger.error({ sessionId, verdict: answer.verdict }, "ensureHands.retention_unkeyable");
+    return;
+  }
+  await reuseEffects.retainContainer({
+    store: kv as never,
+    sessionKey: handsSessionKey(sessionId),
+    generation,
+    binding: info,
+    verdict: answer.verdict,
+    detail: answer.reason,
+  });
+}
+
+/**
+ * Whether this container may be destroyed, replaced, rebuilt, or evicted.
+ *
+ * Read from the records over the exec channel before the act, never from the
+ * registry: a restarted Hands has an empty one for reasons that say nothing
+ * about the sandbox, and treating empty as evidence of no work is what took a
+ * training run down with a health-check failure.
+ */
+async function mayDestroy(
+  sessionId: string,
+  identity: SandboxEntry,
+  signal?: AbortSignal,
+): Promise<LiveWorkAnswer> {
+  const inst = instanceFromEntry(sessionId, identity as never);
+  if (!inst) {
+    return { verdict: "unknown", classes: {}, reason: "entry_unaddressable" };
+  }
+  return reuseEffects.countLiveWork(inst, HANDS_STATE_DIR, signal);
 }
 
 async function readReusableEntry(
@@ -538,10 +596,18 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     if (recovered) return recovered;
   }
 
-  // Reap the referenced workload (stop in SaFE + delete KV) before recreating.
-  // destroyHands reads workloadId + platformKey from the KV entry we just
-  // observed; if either is missing it will just delete KV.
-  await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+  // The container is only this caller's to destroy when nothing is left running
+  // in it. A restarted Hands has an empty registry for reasons that say nothing
+  // about the sandbox, so the answer comes from the durable records over the
+  // exec channel -- and an unanswerable read keeps the container exactly as a
+  // nonzero count does. Either way the caller goes on to build a fresh sandbox,
+  // so nothing it can observe varies with which of the three it met.
+  const live = await mayDestroy(sessionId, identity, signal);
+  if (live.verdict === "clear") {
+    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    return null;
+  }
+  await retainInsteadOfDestroying(kv, sessionId, info, live);
   return null;
 }
 
