@@ -219,22 +219,17 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
 /**
  * Bank a run's queue time on the row itself, as it leaves the queue.
  *
- * A trigger rather than a stamp in each statement that dequeues, because the
- * claim "every such statement was edited" rests on an enumeration being
- * complete and it is not: seventeen distinct UPDATEs can move a row off
- * `queued`, and one missed drops that run's whole wait. Reading OLD makes the
- * accrual fire on the exit itself, so a statement written later is covered on
- * the day it is written.
+ * Reading OLD makes the accrual fire on the exit rather than on a caller's
+ * memory of having stamped one, so a statement that dequeues a row banks its
+ * wait whether or not its author knew accounting existed.
  *
- * The second disjunct of the first arm closes the remaining hole: a
- * `queued -> queued` write that re-stamps `queued_at` (a requeue matching its
- * own row) banks the segment it is about to erase. The second arm makes entry
- * symmetrical, so a statement returning a row to the queue without re-stamping
- * cannot make the next segment start before the row was queued.
+ * The first arm's second disjunct covers a `queued -> queued` write that
+ * re-stamps `queued_at`, which would otherwise erase the segment it is closing.
+ * The second arm makes entry symmetrical.
  *
- * Nothing a scheduling predicate reads is touched: `started_at`,
- * `deadline_at` and `completed_at` are left alone, and `NOW()` here is the
- * transaction-start instant those statements already write.
+ * `clock_timestamp()`, not `NOW()`: a transaction that opened before the row
+ * was queued would otherwise measure a negative interval and bank nothing.
+ * `started_at`, `deadline_at` and `completed_at` are untouched.
  */
 async function ensureQueuedAccrualTrigger(client: pg.PoolClient): Promise<void> {
   await client.query(`
@@ -244,10 +239,10 @@ async function ensureQueuedAccrualTrigger(client: pg.PoolClient): Promise<void> 
          AND (NEW.status IS DISTINCT FROM 'queued'
               OR NEW.queued_at IS DISTINCT FROM OLD.queued_at) THEN
         NEW.queued_ms_accrued := OLD.queued_ms_accrued
-          + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - OLD.queued_at)) * 1000)::bigint;
+          + GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - OLD.queued_at)) * 1000)::bigint;
       END IF;
       IF NEW.status = 'queued' AND OLD.status IS DISTINCT FROM 'queued' THEN
-        NEW.queued_at := NOW();
+        NEW.queued_at := clock_timestamp();
       END IF;
       RETURN NEW;
     END;
@@ -966,6 +961,11 @@ export async function initDb(): Promise<void> {
     // --- Task DAG core tables (task-design.md §4, §6, §6.3) -----------------
     // Project rule: only base tables + indexes; no FKs / views / triggers /
     // procedures. Cross-row integrity is enforced in admission code instead.
+    //
+    // One exception, below: `claw_tasks_accrue_queued`. It enforces nothing
+    // across rows -- it measures one row's own queue segments -- and the
+    // alternative is an enumeration of every statement that can dequeue a row,
+    // which is a list that is wrong the first time somebody adds a statement.
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_task_dags (
@@ -1065,7 +1065,7 @@ export async function initDb(): Promise<void> {
         event_seq            BIGINT NOT NULL DEFAULT 0,
         claim_count          INT NOT NULL DEFAULT 0,
         created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        queued_at            TIMESTAMPTZ,
+        queued_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         started_at           TIMESTAMPTZ,
         deadline_at          TIMESTAMPTZ,
         completed_at         TIMESTAMPTZ
@@ -1175,6 +1175,20 @@ export async function initDb(): Promise<void> {
     // that moves the row: seventeen statements can take a row off `queued`,
     // and one left unedited would silently drop that run's whole wait.
     await addTaskCol("queued_ms_accrued", "BIGINT NOT NULL DEFAULT 0");
+    // Every queue predicate and the accrual below read `queued_at`, and a row
+    // could reach `queued` with none: the column predates them and the retry
+    // insert names it nowhere. A null there is not a run that waited no time,
+    // it is a run no reaper can see and no accrual can measure.
+    await client.query(
+      "ALTER TABLE claw_tasks ALTER COLUMN queued_at SET DEFAULT clock_timestamp()",
+    ).catch(() => {});
+    await client.query(
+      `UPDATE claw_tasks SET queued_at = COALESCE(created_at, clock_timestamp())
+        WHERE queued_at IS NULL`,
+    ).catch(() => {});
+    await client.query(
+      "ALTER TABLE claw_tasks ALTER COLUMN queued_at SET NOT NULL",
+    ).catch(() => {});
     await ensureQueuedAccrualTrigger(client);
     // What admission counts. It reads the fleet on every chat dispatch -- twice
     // when a ceiling is set -- and filters on the four occupying statuses,

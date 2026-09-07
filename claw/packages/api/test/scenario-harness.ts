@@ -89,6 +89,21 @@ CREATE TABLE claw_pending_messages (
 CREATE TABLE claw_tasks (
   task_id              TEXT PRIMARY KEY,
   session_id           TEXT NOT NULL,
+  -- The columns a retry clone names. Absent, retryTask fails on the column
+  -- list rather than on anything a scenario meant to assert.
+  parent_task_id       TEXT,
+  batch_id             TEXT,
+  dag_id               TEXT,
+  script               JSONB,
+  depends_on           TEXT[] NOT NULL DEFAULT '{}',
+  mode                 TEXT NOT NULL DEFAULT 'llm',
+  model                TEXT,
+  tools_allowlist      JSONB NOT NULL DEFAULT '[]'::jsonb,
+  skills               JSONB NOT NULL DEFAULT '[]'::jsonb,
+  rules_text           TEXT,
+  agent_hooks          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  backend_mcp_url      TEXT,
+  workspace_throwaway  BOOLEAN NOT NULL DEFAULT FALSE,
   dag_root_task_id     TEXT,
   dag_node_id          TEXT,
   plugin_id            BIGINT,
@@ -134,7 +149,7 @@ CREATE TABLE claw_tasks (
   ledger_version       INTEGER NOT NULL DEFAULT 0,
   queued_ms_accrued    BIGINT NOT NULL DEFAULT 0,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  queued_at            TIMESTAMPTZ,
+  queued_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   started_at           TIMESTAMPTZ,
   deadline_at          TIMESTAMPTZ,
   completed_at         TIMESTAMPTZ
@@ -149,10 +164,10 @@ BEGIN
      AND (NEW.status IS DISTINCT FROM 'queued'
           OR NEW.queued_at IS DISTINCT FROM OLD.queued_at) THEN
     NEW.queued_ms_accrued := OLD.queued_ms_accrued
-      + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - OLD.queued_at)) * 1000)::bigint;
+      + GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - OLD.queued_at)) * 1000)::bigint;
   END IF;
   IF NEW.status = 'queued' AND OLD.status IS DISTINCT FROM 'queued' THEN
-    NEW.queued_at := NOW();
+    NEW.queued_at := clock_timestamp();
   END IF;
   RETURN NEW;
 END;
@@ -386,7 +401,8 @@ export async function seedRun(
        $1, $2, 'chat', $3, $4, 'brain', $5::jsonb, $12::jsonb, $13,
        $6,
        CASE WHEN $7::int IS NULL THEN NULL ELSE NOW() + ($7::int * INTERVAL '1 second') END,
-       CASE WHEN $8::int IS NULL THEN NULL ELSE NOW() - ($8::int * INTERVAL '1 second') END,
+       CASE WHEN $8::int IS NULL THEN clock_timestamp()
+            ELSE clock_timestamp() - ($8::int * INTERVAL '1 second') END,
        CASE WHEN $9::int IS NULL THEN NULL ELSE NOW() - ($9::int * INTERVAL '1 second') END,
        CASE WHEN $10::int IS NULL THEN NULL ELSE NOW() + ($10::int * INTERVAL '1 second') END,
        $11

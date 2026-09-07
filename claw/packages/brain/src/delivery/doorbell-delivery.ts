@@ -11,6 +11,7 @@
  */
 
 import type { JsMsg } from "nats";
+import type { RunTimeReport } from "@claw/protocol";
 
 import { failClaimedRun, unclaimRun } from "../clients/run-claim.js";
 
@@ -30,8 +31,10 @@ const defaultSleep = (ms: number): Promise<void> =>
   });
 
 const defaultActions: ClaimedDeliveryActions = {
-  retryLater: (taskId, claimCount, reason) => unclaimRun(taskId, claimCount, reason ?? "retry"),
-  fail: (taskId, claimCount) => failClaimedRun(taskId, "claim_abandoned", claimCount),
+  retryLater: (taskId, claimCount, reason) =>
+    unclaimRun(taskId, claimCount, reason ?? "retry", takeDeclaredReport(taskId)),
+  fail: (taskId, claimCount) =>
+    failClaimedRun(taskId, "claim_abandoned", claimCount, takeDeclaredReport(taskId)),
 };
 
 /**
@@ -48,14 +51,35 @@ const defaultActions: ClaimedDeliveryActions = {
  */
 const declaredReasons = new Map<string, RetryReason>();
 
+/**
+ * The attempt's last word on its own time, waiting for the release that ends it.
+ *
+ * Travels the same way the reason does, and for the same reason: the release is
+ * issued from the delivery loop, which knows the task id and nothing about what
+ * the attempt did. Taken once, so a release that never arrives leaves nothing
+ * behind for the next attempt to send under its own token.
+ */
+const declaredReports = new Map<string, RunTimeReport>();
+
 export function declareRetryReason(taskId: string, reason: RetryReason): void {
   if (taskId) declaredReasons.set(taskId, reason);
+}
+
+/** State the coverage this attempt is releasing with, before it naks. */
+export function declareFinalReport(taskId: string, report: RunTimeReport | undefined): void {
+  if (taskId && report) declaredReports.set(taskId, report);
 }
 
 function takeDeclaredReason(taskId: string): RetryReason {
   const r = declaredReasons.get(taskId);
   declaredReasons.delete(taskId);
   return r ?? "retry";
+}
+
+function takeDeclaredReport(taskId: string): RunTimeReport | undefined {
+  const r = declaredReports.get(taskId);
+  declaredReports.delete(taskId);
+  return r;
 }
 
 /**

@@ -23,7 +23,8 @@ import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-bac
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import {
-  appendAttemptRecord, bankQueuedMs, interruptSubject, recoveryLossForAttempt,
+  appendAttemptRecord, bankQueuedMs, endAttemptRecord, interruptSubject,
+  noteAttemptRenewal, openAttemptRecord,
   type AttemptRecord,
 } from "@claw/protocol";
 import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../config.js";
@@ -620,8 +621,8 @@ export async function reapLostLeases(): Promise<number> {
         )
       RETURNING task_id, session_id, origin, lease_owner,
                 metadata->>'message_id' AS message_id,
-                sandbox_workload_id, attempt_id, attempt_generation,
-                started_at, heartbeat_at, clock_timestamp() AS detected_at`,
+                sandbox_workload_id, attempt_id,
+                heartbeat_at, clock_timestamp() AS detected_at`,
     [LEASE_LOST_GRACE_SEC],
   );
   if (!r.rowCount) return 0;
@@ -633,8 +634,6 @@ export async function reapLostLeases(): Promise<number> {
     message_id: string | null;
     sandbox_workload_id: string | null;
     attempt_id: string | null;
-    attempt_generation: number | null;
-    started_at: unknown;
     heartbeat_at: unknown;
     detected_at: unknown;
   }>;
@@ -1087,14 +1086,6 @@ export function stopSweeper(): void {
   }
 }
 
-/**
- * Record what a dead attempt lost, from the anchor its class actually has.
- *
- * `heartbeat_at` is useless for an attempt that never renewed: `takeClaim`
- * stamps it in the same UPDATE as `started_at`, so the difference is zero by
- * construction and reads as a clean death. That class is measured from
- * `started_at` instead, which is non-zero whenever real time elapsed.
- */
 /** A database instant as an ISO string, or null when the row carried none. */
 function instantOf(value: unknown): string | null {
   if (value instanceof Date) return value.toISOString();
@@ -1102,11 +1093,31 @@ function instantOf(value: unknown): string | null {
   return null;
 }
 
+/** No claim ever completed, so no anchor instant exists in any domain. */
+const slotlessRecord = (): AttemptRecord => ({
+  attemptId: null,
+  attemptGeneration: null,
+  startedAtDb: null,
+  renewed: false,
+  recoveryLoss: { computable: false, lossMs: null },
+});
+
+/**
+ * Close the record of an attempt whose worker went away.
+ *
+ * The anchor is the attempt's own start, from the record its allocation
+ * opened. The row's `started_at` cannot serve: `takeClaim` COALESCEs it, so
+ * after a redelivery it names the first attempt's start and would charge every
+ * later attempt with its predecessors' whole lifetimes. `heartbeat_at` cannot
+ * either, for an attempt that never renewed -- it is stamped in the same
+ * UPDATE as `started_at`, so the difference is zero by construction.
+ *
+ * An attempt with no open record never reached the allocating write, and is
+ * recorded as the class whose loss is explicitly not computable.
+ */
 async function recordDeadAttempt(row: {
   task_id: string;
   attempt_id: string | null;
-  attempt_generation: number | null;
-  started_at: unknown;
   heartbeat_at: unknown;
   detected_at: unknown;
 }): Promise<void> {
@@ -1115,38 +1126,26 @@ async function recordDeadAttempt(row: {
   // with no offset behind it, which this accounting does not do.
   const detectedAtDb = instantOf(row.detected_at);
   if (!detectedAtDb) return;
-  const startedAtDb = instantOf(row.started_at);
+  const attemptId = row.attempt_id;
   const heartbeatAtDb = instantOf(row.heartbeat_at) ?? undefined;
-  const renewed = !!heartbeatAtDb && !!startedAtDb && heartbeatAtDb > startedAtDb;
-  const record: AttemptRecord = {
-    attemptId: row.attempt_id,
-    attemptGeneration: row.attempt_generation,
-    startedAtDb,
-    endedAtDb: detectedAtDb,
-    ...(renewed ? { lastObservedHeartbeatAtDb: heartbeatAtDb } : {}),
-    renewed,
-    recoveryLoss: { computable: false, lossMs: null },
-  };
-  await appendRunAttempt(row.task_id, {
-    ...record,
-    recoveryLoss: recoveryLossForAttempt(record, detectedAtDb),
+  await applyToLedger(row.task_id, { key: row.task_id, source: "task_id" }, (read) => {
+    const banked = bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb);
+    const open = attemptId ? openAttemptRecord(banked, attemptId) : undefined;
+    if (!open || !attemptId) return appendAttemptRecord(banked, slotlessRecord());
+    const renewed = !!heartbeatAtDb && !!open.startedAtDb && heartbeatAtDb > open.startedAtDb;
+    const observed = renewed ? noteAttemptRenewal(banked, attemptId, heartbeatAtDb!) : banked;
+    return endAttemptRecord(observed, attemptId, detectedAtDb);
+  }).catch((err) => {
+    logger.warn({ taskId: row.task_id, err: (err as Error)?.message }, "sweeper.attempt_record_failed");
+    return null;
   });
 }
 
 /** A row dispatched but never claimed: no attempt id, no generation, no anchor. */
 async function recordSlotlessAttempt(taskId: string): Promise<void> {
-  await appendRunAttempt(taskId, {
-    attemptId: null,
-    attemptGeneration: null,
-    startedAtDb: null,
-    renewed: false,
-    recoveryLoss: { computable: false, lossMs: null },
-  });
-}
-
-async function appendRunAttempt(taskId: string, record: AttemptRecord): Promise<void> {
   await applyToLedger(taskId, { key: taskId, source: "task_id" }, (read) =>
-    appendAttemptRecord(bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb), record),
+    appendAttemptRecord(
+      bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb), slotlessRecord()),
   ).catch((err) => {
     logger.warn({ taskId, err: (err as Error)?.message }, "sweeper.attempt_record_failed");
     return null;

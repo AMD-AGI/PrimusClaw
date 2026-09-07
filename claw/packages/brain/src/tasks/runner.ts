@@ -64,6 +64,7 @@ import {
 } from "./callback.js";
 import type { RunTimeReport } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
+import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
 import {
@@ -890,6 +891,9 @@ class TaskRunner {
    * whether a run keeps its lease.
    */
   private readonly attempt: RunAttemptToken;
+
+  /** Whether this attempt has issued the identity-only report that opens it. */
+  private coverageOpened = false;
 
   /**
    * The scope those shells are addressable in: this DAG, or this conversation.
@@ -2782,6 +2786,7 @@ class TaskRunner {
       (Date.now() - sigtermStartedAt) / 1000,
       sigtermSyncResult,
     );
+    this.declareCoverage();
     this.msg.nak(0);
   }
 
@@ -3004,6 +3009,7 @@ class TaskRunner {
       retryPendingDeadlineMs,
       retryPendingGraceSec: RETRY_PENDING_KEEPALIVE_GRACE_SEC,
     });
+    this.declareCoverage();
     this.msg.nak(5000);
   }
 
@@ -3189,6 +3195,7 @@ class TaskRunner {
         exhaustedLog,
       );
       await this.releaseAfterTerminal();
+      this.declareCoverage();
       this.msg.nak(5_000);
     }
   }
@@ -3252,12 +3259,13 @@ class TaskRunner {
   /**
    * This attempt's coverage, or nothing when it has none to report yet.
    *
-   * The opening tick fires before any interval has closed, so it carries no
-   * covering field at all: a report that measured nothing must not advance the
-   * row's watermark, and the interval it spans stays visibly unbanked until a
-   * later report names it.
+   * The opening tick carries no covering field at all, whatever the clock has
+   * done between `beginRun` and it: a report that fires before this attempt has
+   * observed anything must not advance the row's watermark, and the interval it
+   * spans stays visibly unbanked until a later report names it.
    */
   private coverageReport(): { runTime: RunTimeReport } | null {
+    if (!this.coverageOpened) return null;
     const snapshot = runTimeOf(this.runIdentity.key);
     if (!snapshot) return null;
     const covered = Object.values(snapshot.stateMs).some((ms) => (ms ?? 0) > 0);
@@ -3278,6 +3286,17 @@ class TaskRunner {
     };
   }
 
+  /**
+   * Hand this attempt's coverage to the release that is about to be issued.
+   *
+   * The release goes out from the delivery loop, which has the task id and
+   * nothing else; without this the attempt ends with its record still open and
+   * its final interval unbanked.
+   */
+  private declareCoverage(): void {
+    declareFinalReport(this.request.task_id ?? "", this.coverageReport()?.runTime);
+  }
+
   private startLeaseHeartbeat(): ReturnType<typeof setInterval> | null {
     // Tracked whether or not there is anywhere to report it to. The ledger is
     // what hands the execution slot back during a wait, and a run dispatched
@@ -3286,6 +3305,12 @@ class TaskRunner {
     if (!this.request.run_lease?.url) return null;
     const tick = () => {
       const phase = phaseOf(this.runIdentity.key);
+      const coverage = this.coverageReport();
+      // Only from the second tick onward. The opening one fires before this
+      // attempt has observed anything, so it is identity-only by construction
+      // rather than because the clock happened not to advance between
+      // `beginRun` and the millisecond it read.
+      this.coverageOpened = true;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
@@ -3294,7 +3319,7 @@ class TaskRunner {
         waitedMs: phase.waitedMs,
         waits: phase.waits,
         attempt: this.attempt,
-        ...(this.coverageReport() ?? {}),
+        ...(coverage ?? {}),
       }).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
         // two workers driving one sandbox, or a run writing a workspace a

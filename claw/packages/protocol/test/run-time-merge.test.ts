@@ -278,6 +278,67 @@ test("AC2 a cross-domain payload with no offset is refused at the wire boundary"
   assert.match((decoded as { rejected: string }).rejected, /basis\.offset/);
 });
 
+test("AC2 a clock domain outside the closed set is refused, not carried through", () => {
+  // A basis naming a domain nothing accounts for would sit in the entry looking
+  // like a measurement, and a cross-domain one would bypass the skew rule
+  // entirely because no branch recognises it.
+  const wire = (basis: unknown) => decodeRunTimeReport({
+    key: "k", attemptId: "a", claimCount: 0, deliverySeq: 0, deliveryCount: 0, basis,
+  });
+  assert.equal(wire({ kind: "same_domain", domain: "wristwatch" }).ok, false);
+  assert.match((wire({ kind: "same_domain", domain: "wristwatch" }) as { rejected: string }).rejected,
+    /basis\.domain/);
+  assert.equal(wire({ kind: "cross_domain", startDomain: "brain", endDomain: "sundial",
+    offset: { callerDomain: "brain", sentAtMs: 0, dbAt: EPOCH, receivedAtMs: 1 } }).ok, false);
+  assert.equal(wire({ kind: "same_domain", domain: "brain" }).ok, true);
+});
+
+test("AC2 an unparseable offset instant is refused by name, not at the arithmetic", () => {
+  const decoded = decodeRunTimeReport({
+    key: "k", attemptId: "a", claimCount: 0, deliverySeq: 0, deliveryCount: 0,
+    basis: {
+      kind: "cross_domain", startDomain: "brain", endDomain: "db",
+      offset: { callerDomain: "brain", sentAtMs: 0, dbAt: "not-an-instant", receivedAtMs: 1 },
+    },
+  });
+  assert.equal(decoded.ok, false);
+  assert.match((decoded as { rejected: string }).rejected, /basis\.offset\.dbAt/);
+});
+
+test("AC2 a covered map is refused for an unknown key or a value that is not a duration", () => {
+  const wire = (over: Record<string, unknown>) => decodeRunTimeReport({
+    key: "k", attemptId: "a", claimCount: 0, deliverySeq: 0, deliveryCount: 0,
+    basis: { kind: "same_domain", domain: "brain" }, ...over,
+  });
+  // `unknown` is not a state key: §3 gives unattributable time one home, and a
+  // reporter reaches it through cumulativeUnknownMs alone.
+  assert.equal(wire({ cumulativeStateMs: { unknown: 5 } }).ok, false);
+  assert.equal(wire({ cumulativeStateMs: { napping: 5 } }).ok, false);
+  assert.equal(wire({ cumulativeReasonMs: { impatience: 5 } }).ok, false);
+  for (const bad of ["500", Number.NaN, Number.POSITIVE_INFINITY, -1, null]) {
+    const decoded = wire({ cumulativeStateMs: { executing: bad } });
+    assert.equal(decoded.ok, false, `executing: ${String(bad)} must be refused`);
+    assert.match((decoded as { rejected: string }).rejected, /cumulativeStateMs\.executing/);
+  }
+  assert.equal(wire({ cumulativeUnknownMs: "500" }).ok, false);
+  assert.equal(wire({ cumulativeStateMs: { executing: 500 } }).ok, true);
+});
+
+test("AC2 a value the decoder let through cannot reach the merge as a non-number", () => {
+  // The failure the type refuses to describe: a string state value reaches
+  // Date arithmetic and surfaces as a RangeError from a subtraction, three
+  // layers from the field that was wrong.
+  const decoded = decodeRunTimeReport({
+    key: "ktsk_1", attemptId: "att-1", claimCount: 0, deliverySeq: 0, deliveryCount: 0,
+    basis: { kind: "same_domain", domain: "brain" },
+    cumulativeStateMs: { executing: "500" },
+  });
+  assert.equal(decoded.ok, false);
+  const merged = mergeRunTimeReport(entry(), report({ cumulativeStateMs: { executing: 500 } }), at(1_000));
+  assert.ok(Number.isFinite(Date.parse(merged.lastAcceptedInstantDb)),
+    "and everything that does get through keeps the anchor a parseable instant");
+});
+
 test("AC2 an omitted attempt-token field is not read as a zero", () => {
   for (const missing of ["attemptId", "claimCount", "deliverySeq", "deliveryCount"]) {
     const body: Record<string, unknown> = {

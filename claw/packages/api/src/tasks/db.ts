@@ -210,7 +210,12 @@ export async function transitionStatus(
   const values: unknown[] = [next];
   let i = 2;
   for (const [k, v] of Object.entries(extra)) {
-    sets.push(`${k} = $${i++}`);
+    // `metadata` is merged rather than replaced: a caller building one from a
+    // snapshot taken before the transaction would otherwise write back over
+    // whatever else the same transaction has already put in the subtree.
+    sets.push(k === "metadata"
+      ? `metadata = COALESCE(metadata, '{}'::jsonb) || $${i++}::jsonb`
+      : `${k} = $${i++}`);
     values.push(v);
   }
   // `waiting_external` re-stamps for the same reason `queued` does: the column

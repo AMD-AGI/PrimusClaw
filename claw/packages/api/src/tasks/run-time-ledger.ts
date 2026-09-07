@@ -19,13 +19,13 @@
 import pino from "pino";
 
 import {
-  appendAttemptRecord,
   bankQueuedMs,
   isCoveringReport,
   mergeRunTimeReport,
+  beginAttemptRecord,
+  endAttemptRecord,
   newRunTimeLedgerEntry,
-  recoveryLossForAttempt,
-  type AttemptRecord,
+  noteAttemptRenewal,
   type RunIdentityRef,
   type RunTimeLedgerEntry,
   type RunTimeReportInput,
@@ -48,6 +48,12 @@ const READ_LEDGER_SQL = `
   SELECT metadata->'run_phase'->'ledger' AS ledger,
          ledger_version,
          status,
+         attempt_id,
+         attempt_generation,
+         claim_count,
+         delivery_seq,
+         delivery_count,
+         heartbeat_at,
          queued_at,
          completed_at,
          clock_timestamp() AS read_at,
@@ -62,6 +68,13 @@ export interface LedgerRow {
   entry: RunTimeLedgerEntry;
   ledgerVersion: number;
   status: string;
+  /** The attempt the row currently holds, read with the entry it would write. */
+  attemptId: string | null;
+  attemptGeneration: number;
+  claimCount: number;
+  deliverySeq: number;
+  deliveryCount: number;
+  heartbeatAtDb: string | null;
   readAtDb: string;
   completedAtDb: string | null;
   queuedTotalMs: number;
@@ -79,6 +92,12 @@ function readRow(row: Record<string, unknown> | undefined, identity: RunIdentity
     entry: stored ?? newRunTimeLedgerEntry(identity, queuedAtDb),
     ledgerVersion: Number(row.ledger_version ?? 0),
     status: String(row.status ?? ""),
+    attemptId: (row.attempt_id as string | null) ?? null,
+    attemptGeneration: Number(row.attempt_generation ?? 0),
+    claimCount: Number(row.claim_count ?? 0),
+    deliverySeq: Number(row.delivery_seq ?? 0),
+    deliveryCount: Number(row.delivery_count ?? 0),
+    heartbeatAtDb: row.heartbeat_at ? iso(row.heartbeat_at) : null,
     readAtDb,
     completedAtDb: row.completed_at ? iso(row.completed_at) : null,
     queuedTotalMs: Number(row.queued_total_ms ?? 0),
@@ -183,12 +202,86 @@ export async function bankQueuedTime(taskId: string): Promise<RunTimeLedgerEntry
     bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb));
 }
 
+/**
+ * Open this attempt's durable record, at the instant the row accepted it.
+ *
+ * The start instant is read from the database in the same statement as the
+ * entry, so it is the attempt's own: the row's `started_at` is COALESCEd
+ * across claims and names the first attempt's start for every later one.
+ *
+ * Idempotent, and refused outright once the row holds a different attempt, so
+ * an allocation that lands late cannot open a record for an attempt that has
+ * already been superseded.
+ */
+export async function openAttemptRecordFor(taskId: string, attemptId: string): Promise<void> {
+  await applyToLedger(taskId, { key: taskId, source: "task_id" }, (row) => {
+    if (row.attemptId !== attemptId) return row.entry;
+    return beginAttemptRecord(
+      bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb),
+      attemptId, row.attemptGeneration, row.readAtDb,
+    );
+  }).catch(() => null);
+}
+
+/**
+ * Bank a renewal's coverage against the attempt the row currently holds.
+ *
+ * One step, because all three things it does have to be decided against the
+ * same read: whether the row still holds this attempt, whether its record has
+ * been opened yet, and what its report may bank.
+ */
+export async function mergeRenewal(
+  taskId: string,
+  attemptId: string,
+  report: RunTimeReportInput | undefined,
+): Promise<"merged" | "stale" | "unavailable"> {
+  let stale = false;
+  const applied = await applyToLedger(taskId, { key: taskId, source: "task_id" }, (row) => {
+    // A release or a takeover between the fenced UPDATE and this read leaves
+    // the row holding somebody else's attempt; the coverage is not this
+    // ledger's any more.
+    if (row.attemptId !== attemptId) {
+      stale = true;
+      return row.entry;
+    }
+    const opened = beginAttemptRecord(
+      bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb),
+      attemptId, row.attemptGeneration, row.readAtDb,
+    );
+    const renewed = noteAttemptRenewal(opened, attemptId, row.heartbeatAtDb ?? row.readAtDb);
+    return report && reportIsCurrent(row, report)
+      ? mergeRunTimeReport(renewed, report, row.readAtDb)
+      : renewed;
+  }).catch(() => null);
+  if (stale) return "stale";
+  return applied ? "merged" : "unavailable";
+}
+
 /** What an attempt boundary settles, beyond moving the row's status. */
 export interface RunSettlement {
   /** The attempt's last word on its own time, if it sent one. */
   report?: RunTimeReportInput;
-  /** The attempt being closed; its recovery loss is computed here. */
-  attempt?: Omit<AttemptRecord, "recoveryLoss" | "endedAtDb">;
+  /** Close the open record for this attempt, and compute what it lost. */
+  closeAttemptId?: string;
+}
+
+/**
+ * Whether the row still holds the attempt a report was produced under.
+ *
+ * `lease_owner` cannot answer this and neither can status: a claim restores a
+ * row to `preparing` under the same pod name, and a redelivered fat attempt
+ * finds its predecessor's status unchanged. The token is what separates them,
+ * and it is read in the same statement that reads the entry the report would
+ * be banked into.
+ */
+export function reportIsCurrent(row: LedgerRow, report: RunTimeReportInput): boolean {
+  if (row.claimCount !== report.claimCount) return false;
+  if (row.deliverySeq !== report.deliverySeq || row.deliveryCount !== report.deliveryCount) {
+    return false;
+  }
+  // A null attempt id is a claim that has begun no attempt yet, which a report
+  // claiming to be from one cannot be reconciled with.
+  return row.attemptId === report.attemptId;
 }
 
 /**
@@ -198,30 +291,29 @@ export interface RunSettlement {
  * own transition have to commit together, or a superseded attempt's last report
  * lands in a ledger that no longer belongs to it.
  */
+export type SettleOutcome =
+  | { ok: true; entry: RunTimeLedgerEntry }
+  | { ok: false; reason: "missing" | "stale_attempt" };
+
 export async function settleRunTime(
   query: Querier,
   taskId: string,
   settlement: RunSettlement,
-): Promise<RunTimeLedgerEntry | null> {
+): Promise<SettleOutcome> {
   const identity = settlement.report
     ? { key: settlement.report.key, source: "task_id" as const }
     : { key: taskId, source: "task_id" as const };
   const row = await readLedgerForUpdate(query, taskId, identity);
-  if (!row) return null;
+  if (!row) return { ok: false, reason: "missing" };
+  if (settlement.report && !reportIsCurrent(row, settlement.report)) {
+    return { ok: false, reason: "stale_attempt" };
+  }
   const banked = bankReportAndQueue(row, settlement.report);
-  const closed = settlement.attempt
-    ? appendAttemptRecord(banked, {
-        ...settlement.attempt,
-        endedAtDb: row.readAtDb,
-        recoveryLoss: recoveryLossForAttempt(
-          { ...settlement.attempt, recoveryLoss: { computable: false, lossMs: null } },
-          row.readAtDb,
-        ),
-      })
+  const closed = settlement.closeAttemptId
+    ? endAttemptRecord(banked, settlement.closeAttemptId, row.readAtDb)
     : banked;
-  if (closed === row.entry) return row.entry;
-  await writeLedger(taskId, closed, row.ledgerVersion, query);
-  return closed;
+  if (closed !== row.entry) await writeLedger(taskId, closed, row.ledgerVersion, query);
+  return { ok: true, entry: closed };
 }
 
 /**
@@ -238,7 +330,6 @@ export async function settleTerminalRuns(limit = 200): Promise<number> {
     `SELECT task_id FROM claw_tasks
       WHERE completed_at IS NOT NULL
         AND COALESCE((metadata->'run_phase'->'ledger'->>'settled')::boolean, false) = false
-        AND metadata->'run_phase' IS NOT NULL
       ORDER BY completed_at DESC
       LIMIT $1`,
     [limit],

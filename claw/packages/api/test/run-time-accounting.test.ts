@@ -18,12 +18,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { mergeRunTimeReport, runTimeTotals, type RunTimeLedgerEntry } from "@claw/protocol";
-import { db } from "../src/infra/db.js";
+import { db, inTransaction } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
+import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
 import { releaseClaim } from "../src/tasks/run-claim.js";
 import { transitionStatus } from "../src/tasks/db.js";
-import { applyAgentDone } from "../src/tasks/lifecycle.js";
-import { applyToLedger, settleTerminalRuns } from "../src/tasks/run-time-ledger.js";
+import { applyAgentDone, retryTask } from "../src/tasks/lifecycle.js";
+import { applyToLedger, mergeRenewal, settleTerminalRuns } from "../src/tasks/run-time-ledger.js";
+import { reapLostLeases } from "../src/tasks/sweeper.js";
 import { startHarness, seedRun, seedSession, runRow, type Harness } from "./scenario-harness.js";
 
 const TOKEN = "cluster-internal-token";
@@ -39,6 +41,7 @@ before(async () => {
   h = await startHarness();
   app = Fastify();
   await registerInternalTaskRoutes(app);
+  await registerInternalRunRoutes(app);
   await app.ready();
 });
 
@@ -78,6 +81,32 @@ function coverage(taskId: string, attemptId: string, token: TokenFields, executi
   };
 }
 
+/** The running signal a brain sends when its attempt starts executing. */
+async function announceRunning(
+  taskId: string, attemptId: string, token: TokenFields = {},
+): Promise<number> {
+  const res = await app.inject({
+    method: "POST", url: `/v1/internal/tasks/${taskId}/event`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: {
+      type: "statusUpdate", agent_status: "running", brain_id: BRAIN,
+      attempt_id: attemptId, claim_count: token.claim_count ?? 0,
+      delivery_seq: token.delivery_seq ?? 0, delivery_count: token.delivery_count ?? 0,
+    },
+  });
+  return res.statusCode;
+}
+
+/** The release a holder issues through the endpoint the brain actually calls. */
+async function unclaim(taskId: string, claimCount: number, runTime?: unknown): Promise<number> {
+  const res = await app.inject({
+    method: "POST", url: `/v1/internal/tasks/${taskId}/unclaim`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: BRAIN, claim_count: claimCount, reason: "retry", run_time: runTime },
+  });
+  return res.statusCode;
+}
+
 async function ledgerOf(taskId: string): Promise<RunTimeLedgerEntry | null> {
   const rows = await h.sql(
     `SELECT metadata->'run_phase'->'ledger' AS ledger FROM claw_tasks WHERE task_id = $1`, [taskId]);
@@ -85,6 +114,11 @@ async function ledgerOf(taskId: string): Promise<RunTimeLedgerEntry | null> {
 }
 
 const queuedMsOf = async (taskId: string) => Number((await runRow(h, taskId)).queued_ms_accrued);
+
+/** Put the lease far enough in the past to clear the reaper's whole grace. */
+const expireLease = (taskId: string) => db.query(
+  `UPDATE claw_tasks SET lease_expires_at = clock_timestamp() - INTERVAL '1 day'
+    WHERE task_id = $1`, [taskId]);
 
 // ── AC1: the queue is banked by the table, whatever ends the segment ─────────
 
@@ -152,10 +186,10 @@ test("a run that timed out in the queue banks its wait, having never had an atte
   await db.query(
     `UPDATE claw_tasks SET status='failed', failure_reason='queue_timeout', completed_at=NOW()
       WHERE task_id=$1`, ["ktsk-qt"]);
-  // The entry does not exist yet either: nothing ever renewed this run's lease.
-  await db.query(
-    `UPDATE claw_tasks SET metadata = jsonb_set(metadata, '{run_phase}', '{}'::jsonb, true)
-      WHERE task_id=$1`, ["ktsk-qt"]);
+  // Nothing seeds `run_phase`: this run never had a reporter, so the subtree
+  // does not exist and the settle pass has to create the entry itself.
+  assert.equal(await ledgerOf("ktsk-qt"), null, "the fixture must not build the entry for it");
+  assert.ok(await queuedMsOf("ktsk-qt") >= 4_000, "the trigger banked the wait on the row");
 
   assert.equal(await settleTerminalRuns(), 1);
   const ledger = await ledgerOf("ktsk-qt");
@@ -184,6 +218,51 @@ test("AC1 the settle pass stops unbanked time growing and leaves the queue total
   assert.equal(second!.terminalAtDb, first!.terminalAtDb, "a settled entry is written once");
   assert.equal(second!.knownMsByState.queued, queuedAfterSettle,
     "the unreported tail is not relabelled as queue time");
+});
+
+test("a transaction that opened before the row was queued still banks the wait", async () => {
+  // The accrual is an accounting instant. Read at transaction start it would be
+  // earlier than a `queued_at` the row acquired afterwards, so a real wait
+  // subtracts to a negative number and floors to nothing.
+  await seedRun(h, "ktsk-skew", SESSION, { status: "preparing", queuedAgoSec: null });
+  const banked = await inTransaction(async (query) => {
+    // The transaction is open; only now does the row enter the queue, from
+    // another statement, and wait a measurable interval there.
+    await db.query(
+      `UPDATE claw_tasks SET status='queued', queued_at=clock_timestamp() WHERE task_id=$1`,
+      ["ktsk-skew"]);
+    await sleep(100);
+    await query(`UPDATE claw_tasks SET status='preparing' WHERE task_id=$1`, ["ktsk-skew"]);
+    const r = await query(`SELECT queued_ms_accrued FROM claw_tasks WHERE task_id=$1`, ["ktsk-skew"]);
+    return Number((r.rows[0] as { queued_ms_accrued: string }).queued_ms_accrued);
+  });
+  assert.ok(banked >= 80, `a 100ms wait must be banked, not floored to ${banked}ms`);
+});
+
+test("a retried run neither inherits the ledger it replaces nor its queue age", async () => {
+  await seedRun(h, "ktsk-orig", SESSION, {
+    status: "running", origin: "task", dispatch: "fat", leaseOwner: BRAIN,
+    leaseExpiresInSec: 45, queuedAgoSec: 4,
+  });
+  const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+  await renew("ktsk-orig", { ...token, run_time: coverage("ktsk-orig", "att-1", token, 300) });
+  await db.query(
+    `UPDATE claw_tasks SET status='failed', failure_reason='agent_error', completed_at=NOW()
+      WHERE task_id=$1`, ["ktsk-orig"]);
+  await settleTerminalRuns();
+  assert.ok((await ledgerOf("ktsk-orig"))!.settled, "the original ends settled");
+
+  const retried = await retryTask("ktsk-orig");
+  assert.equal(retried.ok, true);
+  const replacement = retried.new_task_id!;
+
+  assert.equal(await ledgerOf(replacement), null,
+    "a replacement carrying the other run's settled ledger is another run's accounting");
+  const row = await runRow(h, replacement);
+  assert.ok(row.queued_at, "and it is visible to every predicate that reads queued_at");
+  const queuedForMs = Date.now() - (row.queued_at as Date).getTime();
+  assert.ok(queuedForMs < 2_000,
+    `its wait starts now, not ${Math.round(queuedForMs / 1000)}s ago with the run it replaces`);
 });
 
 // ── AC4: the attempt-token fence ─────────────────────────────────────────────
@@ -307,10 +386,8 @@ test("AC4 a stale holder's release rolls its final report back with it", async (
   await renew("ktsk-stale", { ...token, run_time: coverage("ktsk-stale", "att-1", token, 50) });
   const before = await ledgerOf("ktsk-stale");
 
-  const released = await releaseClaim("ktsk-stale", BRAIN, 2, "stale", {
-    report: coverage("ktsk-stale", "att-1", token, 5_000) as never,
-  });
-  assert.equal(released, false, "the release's own fence matched no row");
+  const released = await unclaim("ktsk-stale", 2, coverage("ktsk-stale", "att-1", token, 5_000));
+  assert.equal(released, 409, "the release's own fence matched no row");
   const after = await ledgerOf("ktsk-stale");
   assert.deepEqual(after!.knownMsByState, before!.knownMsByState);
   assert.equal((await runRow(h, "ktsk-stale")).status, "running", "and the row did not move");
@@ -423,6 +500,140 @@ test("AC2 liveness is judged inside the database, never against a caller's clock
   }
 });
 
+test("AC4.11 the delivery pair advances as one value, never key by key", async () => {
+  // Two independent maxima store a pair no delivery ever presented, and the
+  // legitimate delivery that follows is then refused for travelling backwards.
+  await seedRun(h, "ktsk-pair", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await db.query(
+    `UPDATE claw_tasks SET delivery_seq=100, delivery_count=5, attempt_id='att-a'
+      WHERE task_id=$1`, ["ktsk-pair"]);
+  await expireLease("ktsk-pair");
+
+  const newer = { attempt_id: "att-b", claim_count: 0, delivery_seq: 101, delivery_count: 1 };
+  assert.equal((await renew("ktsk-pair", newer)).statusCode, 200, "(101,1) is strictly newer");
+  const row = await runRow(h, "ktsk-pair");
+  assert.equal(Number(row.delivery_seq), 101);
+  assert.equal(Number(row.delivery_count), 1,
+    "an independent maximum would store the hybrid (101,5), which no delivery presented");
+
+  assert.equal((await renew("ktsk-pair", newer)).statusCode, 200,
+    "and the same delivery's next renewal is not refused for travelling backwards");
+});
+
+test("AC4 a body whose nested report names another attempt is refused whole", async () => {
+  // The lease body carries two tokens and the UPDATE fences only one of them.
+  // A body that contradicts itself is a caller this endpoint does not
+  // understand, so none of its coverage is taken -- not even the half that
+  // would have matched.
+  await seedRun(h, "ktsk-nested", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-current", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+
+  const res = await renew("ktsk-nested", {
+    ...token,
+    run_time: { ...coverage("ktsk-nested", "att-stale", token, 5_000), attemptId: "att-stale" },
+  });
+
+  assert.equal(res.statusCode, 200, "the lease itself is the current attempt's and is renewed");
+  assert.equal(await ledgerOf("ktsk-nested"), null,
+    "a self-contradicting body is rejected at the boundary, before any ledger work");
+
+  // The same renewal, agreeing with itself, is taken in full.
+  await renew("ktsk-nested", { ...token, run_time: coverage("ktsk-nested", "att-current", token, 40) });
+  const after = await ledgerOf("ktsk-nested");
+  assert.equal(after!.coverageSeen.attemptId, "att-current");
+  assert.equal(after!.knownMsByState.executing, 40);
+});
+
+test("AC4 coverage is refused once the row has moved on between fence and merge", async () => {
+  await seedRun(h, "ktsk-race", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+  await renew("ktsk-race", token);
+  const before = await ledgerOf("ktsk-race");
+
+  // The takeover that lands between the fenced UPDATE and the merge that
+  // follows it: the merge has to read the row again, not trust the fence.
+  await db.query(`UPDATE claw_tasks SET attempt_id='att-2' WHERE task_id=$1`, ["ktsk-race"]);
+  const outcome = await mergeRenewal(
+    "ktsk-race", "att-1", coverage("ktsk-race", "att-1", token, 5_000) as never);
+
+  assert.equal(outcome, "stale");
+  assert.deepEqual((await ledgerOf("ktsk-race"))!.knownMsByState, before!.knownMsByState);
+});
+
+test("AC4 a renewal the database could not answer banks nothing", async () => {
+  await seedRun(h, "ktsk-dberr", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+  await renew("ktsk-dberr", token);
+  const before = await ledgerOf("ktsk-dberr");
+
+  const realQuery = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    if (/^\s*UPDATE claw_tasks\s+SET lease_owner/.test(text)) throw new Error("connection reset");
+    return realQuery(text, params);
+  }) as typeof db.query;
+  let res;
+  try {
+    res = await renew("ktsk-dberr", { ...token, run_time: coverage("ktsk-dberr", "att-1", token, 5_000) });
+  } finally {
+    db.query = realQuery;
+  }
+
+  assert.equal(res!.statusCode, 200, "a database hiccup is not evidence the run has ended");
+  assert.equal(res!.json().status, "unknown");
+  assert.deepEqual((await ledgerOf("ktsk-dberr"))!.knownMsByState, before!.knownMsByState,
+    "but the fence never ran, so nothing may be banked against it");
+});
+
+test("AC4 agent_done from a superseded attempt neither banks nor terminates", async () => {
+  await seedRun(h, "ktsk-done", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const current = { attempt_id: "att-current", claim_count: 0, delivery_seq: 2, delivery_count: 1 };
+  await renew("ktsk-done", { ...current, run_time: coverage("ktsk-done", "att-current", current, 100) });
+  const before = await ledgerOf("ktsk-done");
+
+  const stale = { attempt_id: "att-stale", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+  await applyAgentDone("ktsk-done", {
+    task_id: "ktsk-done", abort_reason: "completed",
+    run_time: coverage("ktsk-done", "att-stale", stale, 9_000),
+  });
+
+  assert.equal((await runRow(h, "ktsk-done")).status, "running",
+    "a superseded attempt must not end a run somebody else is executing");
+  assert.deepEqual((await ledgerOf("ktsk-done"))!.knownMsByState, before!.knownMsByState);
+});
+
+test("a waiting_external transition keeps the final report it commits with", async () => {
+  await seedRun(h, "ktsk-wx", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 1, delivery_count: 1 };
+  await renew("ktsk-wx", { ...token, run_time: coverage("ktsk-wx", "att-1", token, 10) });
+  await sleep(40);
+
+  await applyAgentDone("ktsk-wx", {
+    task_id: "ktsk-wx", abort_reason: "wait_external",
+    metadata: { external_id: "ext-1" },
+    run_time: coverage("ktsk-wx", "att-1", token, 30),
+  });
+
+  const row = await runRow(h, "ktsk-wx");
+  assert.equal(row.status, "waiting_external");
+  assert.equal((row.metadata as Record<string, Record<string, string>>).derived.external_id, "ext-1");
+  const ledger = await ledgerOf("ktsk-wx");
+  assert.ok(ledger, "the branch writes metadata wholesale; the ledger must survive it");
+  assert.equal(ledger!.knownMsByState.executing, 30,
+    "the merge committed in this transaction must not be overwritten by its own patch");
+});
+
 // ── AC5: a real attempt survives a contention-only claim ─────────────────────
 
 test("AC5 a contention-only claim between two real attempts leaves the first intact", async () => {
@@ -431,24 +642,14 @@ test("AC5 a contention-only claim between two real attempts leaves the first int
   });
   const claimsBefore = Number((await runRow(h, "ktsk-gen")).claim_count);
 
-  // Real attempt 1: the ownership write allocates its generation.
-  await app.inject({
-    method: "POST", url: "/v1/internal/tasks/ktsk-gen/event",
-    headers: { authorization: `Bearer ${TOKEN}` },
-    payload: {
-      type: "statusUpdate", agent_status: "running", brain_id: BRAIN,
-      attempt_id: "att-1", claim_count: 1, delivery_seq: 0, delivery_count: 0,
-    },
-  });
+  await announceRunning("ktsk-gen", "att-1", { claim_count: 1 });
   const afterFirst = await runRow(h, "ktsk-gen");
   assert.equal(Number(afterFirst.attempt_generation), 1);
+  assert.equal((await ledgerOf("ktsk-gen"))!.attempts.length, 1,
+    "the allocating write opens the attempt's record; nothing else has to");
 
-  await releaseClaim("ktsk-gen", BRAIN, 1, "handover", {
-    attempt: {
-      attemptId: "att-1", attemptGeneration: 1,
-      startedAtDb: new Date(Date.now() - 1_000).toISOString(), renewed: false,
-    },
-  });
+  const firstToken = { attempt_id: "att-1", claim_count: 1, delivery_seq: 0, delivery_count: 0 };
+  assert.equal(await unclaim("ktsk-gen", 1, coverage("ktsk-gen", "att-1", firstToken, 40)), 200);
   assert.equal((await runRow(h, "ktsk-gen")).completed_at, null,
     "a release is an attempt boundary, not the run's end");
   assert.equal((await ledgerOf("ktsk-gen"))!.settled, false);
@@ -461,22 +662,10 @@ test("AC5 a contention-only claim between two real attempts leaves the first int
   assert.equal(Number((await runRow(h, "ktsk-gen")).attempt_generation), 1,
     "a claim that never reached execution consumes no generation");
 
-  // Real attempt 2.
   await db.query(`UPDATE claw_tasks SET claim_count=claim_count+1 WHERE task_id=$1`, ["ktsk-gen"]);
-  await app.inject({
-    method: "POST", url: "/v1/internal/tasks/ktsk-gen/event",
-    headers: { authorization: `Bearer ${TOKEN}` },
-    payload: {
-      type: "statusUpdate", agent_status: "running", brain_id: BRAIN,
-      attempt_id: "att-2", claim_count: 3, delivery_seq: 0, delivery_count: 0,
-    },
-  });
-  await releaseClaim("ktsk-gen", BRAIN, 3, "done", {
-    attempt: {
-      attemptId: "att-2", attemptGeneration: 2,
-      startedAtDb: new Date(Date.now() - 500).toISOString(), renewed: false,
-    },
-  });
+  await announceRunning("ktsk-gen", "att-2", { claim_count: 3 });
+  const secondToken = { attempt_id: "att-2", claim_count: 3, delivery_seq: 0, delivery_count: 0 };
+  assert.equal(await unclaim("ktsk-gen", 3, coverage("ktsk-gen", "att-2", secondToken, 20)), 200);
 
   const row = await runRow(h, "ktsk-gen");
   const ledger = await ledgerOf("ktsk-gen");
@@ -484,23 +673,53 @@ test("AC5 a contention-only claim between two real attempts leaves the first int
   assert.equal(ledger!.attempts.length, 2, "the record is appended, never overwritten");
   assert.deepEqual(ledger!.attempts.map((a) => a.attemptId), ["att-1", "att-2"]);
   assert.equal(ledger!.attempts[0].attemptGeneration, 1, "the first record is untouched");
-  assert.ok(Number(row.claim_count) - claimsBefore > Number(row.attempt_generation) - 0 - 1,
+  assert.ok(ledger!.attempts.every((a) => a.endedAtDb), "and both were closed at their release");
+  assert.ok(Number(row.claim_count) - claimsBefore > Number(row.attempt_generation) - 1,
     "the contention claim shows only as a claim_count delta");
 });
 
 // ── AC6: recovery loss, per class, at a real boundary ────────────────────────
 
-test("AC6 an attempt closed at its release carries a computed loss", async () => {
-  await seedRun(h, "ktsk-loss", SESSION, {
-    status: "running", claimCount: 1, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+test("AC6 an attempt's loss is measured from its own start, not the run's", async () => {
+  // `takeClaim` COALESCEs `started_at`, so after a redelivery the column names
+  // attempt 1's start. Charging attempt 2 from there overstates its loss by
+  // every second its predecessors were alive.
+  // Fat dispatch, because the lost-lease reaper hands live doorbell rows to
+  // the requeue pass instead of closing them.
+  await seedRun(h, "ktsk-anchor", SESSION, {
+    status: "running", dispatch: "fat", claimCount: 1, leaseOwner: BRAIN,
+    leaseExpiresInSec: 45, queuedAgoSec: 1, startedAgoSec: 30,
   });
-  const startedAtDb = new Date(Date.now() - 2_000).toISOString();
-  await releaseClaim("ktsk-loss", BRAIN, 1, "handover", {
-    attempt: { attemptId: "att-1", attemptGeneration: 1, startedAtDb, renewed: false },
-  });
-  const record = (await ledgerOf("ktsk-loss"))!.attempts[0];
+  await announceRunning("ktsk-anchor", "att-1", { claim_count: 1 });
+  const firstToken = { attempt_id: "att-1", claim_count: 1, delivery_seq: 0, delivery_count: 0 };
+  await unclaim("ktsk-anchor", 1, coverage("ktsk-anchor", "att-1", firstToken, 10));
+
+  await db.query(
+    `UPDATE claw_tasks SET status='running', claim_count=2, attempt_id=NULL
+      WHERE task_id=$1`, ["ktsk-anchor"]);
+  await announceRunning("ktsk-anchor", "att-2", { claim_count: 2 });
+  const startedAt = Number((await runRow(h, "ktsk-anchor")).started_at instanceof Date
+    ? ((await runRow(h, "ktsk-anchor")).started_at as Date).getTime() : 0);
+  assert.ok(Date.now() - startedAt > 25_000, "the row's own started_at is attempt 1's");
+
+  await sleep(60);
+  await expireLease("ktsk-anchor");
+  assert.equal(await reapLostLeases(), 1);
+
+  const record = (await ledgerOf("ktsk-anchor"))!.attempts.find((a) => a.attemptId === "att-2")!;
   assert.equal(record.recoveryLoss.computable, true);
-  assert.ok((record.recoveryLoss.lossMs ?? 0) >= 2_000,
-    "measured from started_at, which is the anchor this class actually has");
-  assert.ok(record.endedAtDb, "and the boundary instant is recorded with it");
+  assert.ok((record.recoveryLoss.lossMs ?? 0) < 20_000,
+    `attempt 2 lived under a second; a loss of ${record.recoveryLoss.lossMs}ms is attempt 1's lifetime`);
+  assert.ok((record.recoveryLoss.lossMs ?? 0) >= 50, "and it is not zero either");
+});
+
+test("AC6 an attempt that never reached its allocating write is not computable", async () => {
+  await seedRun(h, "ktsk-slotless", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await expireLease("ktsk-slotless");
+  assert.equal(await reapLostLeases(), 1);
+  const record = (await ledgerOf("ktsk-slotless"))!.attempts[0];
+  assert.deepEqual(record.recoveryLoss, { computable: false, lossMs: null });
+  assert.notEqual(record.recoveryLoss.lossMs, 0, "an unknowable loss must not read as no loss");
 });

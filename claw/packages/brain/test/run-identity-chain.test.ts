@@ -120,7 +120,10 @@ function fakeKv(): KV {
   } as unknown as KV;
 }
 
-interface Renewal { phase: string; waitReason?: string; waitedMs: number; waits: number }
+interface Renewal {
+  phase: string; waitReason?: string; waitedMs: number; waits: number;
+  runTime?: { cumulativeStateMs?: Record<string, number> };
+}
 
 interface Scenario {
   /** How long the `wait` tool blocks for. */
@@ -330,6 +333,89 @@ test("T3.1 a top-level wait really does hand its slot to the gate", async () => 
   assert.equal(gate.inflight, 1, "and taken again afterwards");
   assert.equal(gate.parkedRuns, 0);
   gate.release();
+});
+
+test("AC3 the opening renewal carries no coverage, whatever the clock did", async () => {
+  // `beginRun` and the first tick are separate statements. Here the clock jumps
+  // between them, so the ledger genuinely holds elapsed `executing` time by the
+  // time the opening tick reads it -- which is the case a producer that decides
+  // from the totals gets wrong, and the one that decides structurally does not.
+  // A clock that advances on every read, so whatever pair of reads `beginRun`
+  // and the opening tick happen to make, some time has passed between them.
+  const realNow = Date.now;
+  let reads = 0;
+  Date.now = () => realNow.call(Date) + (reads++ * 2);
+  let run: ChainRun;
+  try {
+    run = await driveChain({ waitMs: 2_400 });
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.ok(run.renewals.length >= 2, `expected more than the opening tick: ${run.renewals.length}`);
+  assert.equal(run.renewals[0].runTime, undefined,
+    "the opening tick is identity-only: no covering field at all");
+  assert.ok(run.renewals.slice(1).some((r) => r.runTime?.cumulativeStateMs),
+    "and every later tick does carry the coverage it has measured");
+});
+
+test("T4.1 a chat turn with only a message id is counted end to end", async () => {
+  // The production fat-chat shape carries a lease; this is the one below it,
+  // and the point is that a run with no task row is still tracked -- resolution
+  // alone proves nothing about whether its waits reach an entry.
+  const events: string[] = [];
+  setParkHooks({
+    park: () => { events.push("park"); return true; },
+    unpark: async () => { events.push("unpark"); },
+  });
+  let during: RunPhaseReport | null = null;
+  const run = await driveChain({
+    waitMs: 40,
+    request: { task_id: undefined, run_lease: undefined },
+    messageId: "m-chat-only",
+    lease: false,
+    duringWait: (key) => { during = phaseOf(key as never); },
+  });
+
+  assert.equal(run.identityKey, "msg.m-chat-only", "the message tier, and no proxy");
+  assert.ok(during, "the entry exists while the wait is in flight");
+  assert.equal(during!.phase, "waiting");
+  assert.equal(run.afterWait!.waits, 1);
+  assert.ok(run.afterWait!.waitedMs > 0, "and the wait is counted, not merely resolvable");
+  assert.deepEqual(events, ["park", "unpark"], "a top-level run still lends its slot out");
+});
+
+test("T4.5 two same-millisecond fat-chat turns are timed and parked independently", async () => {
+  // Under the old message-id-only scheme both turns collapse onto one entry.
+  // Driven through the real chain, at depth 0, so the parking each one does is
+  // the top-level behaviour rather than the sub-agent's timing-only path.
+  const shared = "1730000000042";
+  const events: string[] = [];
+  setParkHooks({
+    park: () => { events.push("park"); return true; },
+    unpark: async () => { events.push("unpark"); },
+  });
+
+  const first = await driveChain({
+    waitMs: 30,
+    request: { task_id: undefined, run_lease: { url: `http://api.test/v1/internal/tasks/ktsk_p/lease`, token: "t" } },
+    messageId: shared,
+  });
+  const second = await driveChain({
+    waitMs: 30,
+    request: { task_id: undefined, run_lease: { url: `http://api.test/v1/internal/tasks/ktsk_q/lease`, token: "t" } },
+    messageId: shared,
+  });
+
+  assert.equal(first.identityKey, "ktsk_p");
+  assert.equal(second.identityKey, "ktsk_q");
+  assert.notEqual(first.identityKey, second.identityKey);
+  assert.notEqual(first.identityKey, shared);
+  assert.equal(first.afterWait!.waits, 1, "each run's wait lands on its own entry");
+  assert.equal(second.afterWait!.waits, 1);
+  assert.ok(first.afterWait!.waitedMs > 0 && second.afterWait!.waitedMs > 0);
+  assert.deepEqual(events, ["park", "unpark", "park", "unpark"],
+    "both are top-level runs, so both hand their slot back for the wait");
 });
 
 test("T5.5 the runner opens the ledger under the task id, not a proxy", async () => {

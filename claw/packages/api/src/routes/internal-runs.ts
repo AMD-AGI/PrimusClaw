@@ -13,9 +13,11 @@ import { constantTimeEquals } from "@claw/utils";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
 
+import { decodeRunTimeReport } from "@claw/protocol";
 import {
   claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim,
 } from "../tasks/run-claim.js";
+import type { RunSettlement } from "../tasks/run-time-ledger.js";
 
 const logger = pino({ name: "internal-runs" });
 
@@ -46,6 +48,26 @@ function releaseReasonFrom(body: unknown): string | undefined {
     ? (body as { reason?: unknown }).reason
     : undefined;
   return typeof raw === "string" && RELEASE_REASONS.has(raw) ? raw : undefined;
+}
+
+/**
+ * The attempt's last word on its own time, when the holder sends one.
+ *
+ * Refused rather than partially accepted: a report that does not decode is a
+ * caller this endpoint does not understand, and banking half of it would put
+ * numbers in the ledger that no attempt produced.
+ */
+function settlementFrom(taskId: string, body: unknown): RunSettlement | undefined {
+  const raw = body && typeof body === "object"
+    ? (body as { run_time?: unknown }).run_time
+    : undefined;
+  if (raw === undefined) return undefined;
+  const decoded = decodeRunTimeReport(raw);
+  if (!decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "run.release.run_time_rejected");
+    return undefined;
+  }
+  return { report: decoded.report, closeAttemptId: decoded.report.attemptId };
 }
 
 function brainIdFrom(body: unknown): string {
@@ -86,6 +108,7 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
       const released = await releaseClaim(
         req.params.taskId, brainId, claimCountFrom(req.body), releaseReasonFrom(req.body),
+        settlementFrom(req.params.taskId, req.body),
       );
       if (!released) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };
@@ -103,6 +126,7 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
         brainId,
         heldClaimReasonFrom(req.body),
         claimCountFrom(req.body),
+        settlementFrom(req.params.taskId, req.body),
       );
       if (!failed) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };

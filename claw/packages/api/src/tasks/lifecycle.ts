@@ -77,14 +77,32 @@ async function transitionWithFinalReport(
   const report = decoded?.ok ? decoded.report : undefined;
   if (!report) return transitionStatus(taskId, expected, next, patch);
   return inTransaction(async (query) => {
-    await settleRunTime(query, taskId, { report });
+    // The token decides the whole callback, not just its accounting. A report
+    // from an attempt the row has moved past is not merely uninteresting: the
+    // transition beside it would end a run somebody else is executing, and the
+    // status guard cannot tell the two apart once the row has been reclaimed
+    // under the same pod name.
+    const settled = await settleRunTime(query, taskId, {
+      report, closeAttemptId: report.attemptId,
+    });
+    if (!settled.ok) throw new StaleAttempt(settled.reason);
     const updated = await transitionStatus(taskId, expected, next, patch, query);
     if (!updated) throw new TerminalNoop();
     return updated;
   }).catch((err) => {
+    if (err instanceof StaleAttempt) {
+      logger.warn({ taskId, attemptId: report.attemptId, reason: err.reason },
+        "agent_done.superseded_attempt");
+      return null;
+    }
     if (err instanceof TerminalNoop) return null;
     throw err;
   });
+}
+
+/** The report speaks for an attempt the row no longer holds. */
+class StaleAttempt extends Error {
+  constructor(readonly reason: string) { super(reason); }
 }
 
 /** The terminal transition matched nothing, so its whole transaction is void. */
@@ -141,14 +159,15 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     if (!externalId) {
       logger.warn({ taskId }, "agent_done.wait_external_missing_id");
     }
-    const merged = {
-      ...(task.metadata ?? {}),
+    // Only the subtree this branch owns: the write is a shallow merge, so
+    // naming the whole document would put a pre-transaction snapshot back over
+    // the ledger the same transaction just merged.
+    patch.metadata = JSON.stringify({
       derived: {
         ...(task.metadata?.derived as Record<string, unknown> | undefined ?? {}),
         external_id: externalId,
       },
-    };
-    patch.metadata = JSON.stringify(merged);
+    });
   }
 
   // Use a CAS-safe transition so a duplicate callback can't override a
@@ -317,7 +336,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
         input, prompt, script, depends_on, priority,
         executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
         sandbox_spec, callback_url, backend_mcp_url,
-        status, metadata, workspace_throwaway)
+        status, metadata, workspace_throwaway, queued_at)
      SELECT $1, session_id, task_id, batch_id,
             dag_id, dag_node_id, dag_root_task_id, plugin_id, name,
             input, prompt, script, depends_on, priority,
@@ -329,10 +348,17 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             replace(callback_url,    task_id, $1),
             replace(backend_mcp_url, task_id, $1),
             CASE WHEN coalesce(array_length(depends_on,1),0) = 0 THEN 'queued' ELSE 'waiting_deps' END,
-            metadata,
+            -- The replacement is a different run: it must not inherit the
+            -- previous one's settled time ledger or the identity that ledger
+            -- was keyed under, which would credit this run with the other's
+            -- states and leave it marked terminal before it starts.
+            metadata - 'run_phase' - 'last_release' - 'retried_into',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
-            workspace_throwaway
+            workspace_throwaway,
+            -- Its wait starts now. Copying the original's stamp would age the
+            -- replacement into the queue-timeout reap the moment it is written.
+            clock_timestamp()
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );

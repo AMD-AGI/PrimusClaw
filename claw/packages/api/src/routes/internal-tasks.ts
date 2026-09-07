@@ -32,7 +32,7 @@ import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
 import { db } from "../infra/db.js";
 import { decodeRunTimeReport } from "@claw/protocol";
-import { applyToLedger, bankQueuedTime, bankReportAndQueue } from "../tasks/run-time-ledger.js";
+import { bankQueuedTime, mergeRenewal, openAttemptRecordFor } from "../tasks/run-time-ledger.js";
 
 const logger = pino({ name: "internal-tasks" });
 
@@ -172,13 +172,17 @@ async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<
                                       THEN attempt_generation + 1
                                       ELSE attempt_generation
                                     END,
-              delivery_seq        = GREATEST(delivery_seq, COALESCE($6::bigint, 0)),
-              delivery_count      = GREATEST(delivery_count, COALESCE($7::bigint, 0))
+              delivery_seq        = CASE WHEN (delivery_seq, delivery_count)
+                                              < ($6::bigint, $7::bigint)
+                                         THEN $6::bigint ELSE delivery_seq END,
+              delivery_count      = CASE WHEN (delivery_seq, delivery_count)
+                                              < ($6::bigint, $7::bigint)
+                                         THEN $7::bigint ELSE delivery_count END
         WHERE task_id = $1
           AND status = ANY($4::text[])`,
       [
         taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
-        attemptId ?? null, body.delivery_seq ?? null, body.delivery_count ?? null,
+        attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
       ],
     );
   } catch (err) {
@@ -190,6 +194,9 @@ async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<
   // Queue time is banked by difference from a total the table maintains, so
   // whichever observer gets here first banks it and the others bank zero.
   await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write above */ });
+  // The attempt's start instant, read from the database rather than taken from
+  // the row's `started_at`, which is COALESCEd across claims.
+  if (attemptId) await openAttemptRecordFor(taskId, attemptId);
 }
 
 interface RunLeaseBody {
@@ -316,11 +323,23 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
  *
  * @returns the row's status, or null when there is no active row to renew.
  */
+/**
+ * What the row said about a renewal.
+ *
+ * `unavailable` is kept apart from a status because it is not one: the fence
+ * never ran, so nothing may be banked against it, while the caller is still
+ * told it is live -- a database hiccup is not evidence that a run has ended.
+ */
+type RenewalOutcome =
+  | { kind: "accepted"; status: string }
+  | { kind: "refused" }
+  | { kind: "unavailable" };
+
 async function renewRunLease(
   taskId: string,
   body: RunLeaseBody,
   token: Extract<AttemptToken, { ok: true }>,
-): Promise<string | null> {
+): Promise<RenewalOutcome> {
   const leaseSec = leaseSecondsFromBody(body);
   noteLeaseDisagreement(taskId, leaseSec);
   const phase = body.phase === "waiting" ? "waiting" : "executing";
@@ -340,8 +359,12 @@ async function renewRunLease(
               attempt_generation = CASE WHEN attempt_id IS DISTINCT FROM $6
                                         THEN attempt_generation + 1
                                         ELSE attempt_generation END,
-              delivery_seq       = GREATEST(delivery_seq, $8::bigint),
-              delivery_count     = GREATEST(delivery_count, $9::bigint)
+              delivery_seq       = CASE WHEN (delivery_seq, delivery_count)
+                                             < ($8::bigint, $9::bigint)
+                                        THEN $8::bigint ELSE delivery_seq END,
+              delivery_count     = CASE WHEN (delivery_seq, delivery_count)
+                                             < ($8::bigint, $9::bigint)
+                                        THEN $9::bigint ELSE delivery_count END
         WHERE task_id = $1
           AND status = ANY($5::text[])
           AND (
@@ -377,41 +400,63 @@ async function renewRunLease(
         token.deliveryCount,
       ],
     );
-    return (r.rows[0] as { status?: string } | undefined)?.status ?? null;
+    const status = (r.rows[0] as { status?: string } | undefined)?.status;
+    return status ? { kind: "accepted", status } : { kind: "refused" };
   } catch (err) {
     logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_renew_failed");
-    // Reported as a live run: a database hiccup is not evidence that the run
-    // has ended, and answering 409 would tell a healthy worker to stand down.
-    return "unknown";
+    return { kind: "unavailable" };
   }
 }
 
 /**
- * Bank what this renewal covered, once the row has accepted the attempt.
+ * Bank what this renewal covered, against the attempt the row still holds.
  *
- * After the fence rather than inside it: a report from a superseded attempt
- * must contribute nothing at all, and the fence is what decides that. The
- * queued total is banked in the same step whether or not a report came with
- * it, because no worker can observe queue time.
+ * Two fences, because the UPDATE above cannot be one of them: it commits on
+ * its own, and a release or a takeover can land between it and this read. The
+ * nested report has to present the same token the row accepted -- a body may
+ * carry any two it likes -- and the row has to still hold that attempt when
+ * the entry is read.
  */
-async function mergeRenewalCoverage(taskId: string, body: RunLeaseBody): Promise<void> {
+async function mergeRenewalCoverage(
+  taskId: string,
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): Promise<void> {
   const decoded = body.run_time === undefined ? null : decodeRunTimeReport(body.run_time);
   if (decoded && !decoded.ok) {
     logger.warn({ taskId, rejected: decoded.rejected }, "run_lease.run_time_rejected");
     return;
   }
   const report = decoded?.report;
-  const identity = report
-    ? { key: report.key, source: "task_id" as const }
-    : { key: taskId, source: "task_id" as const };
+  if (report && !sameAttemptToken(report, token)) {
+    logger.warn(
+      { taskId, tokenAttemptId: token.attemptId, reportAttemptId: report.attemptId },
+      "run_lease.run_time_token_mismatch",
+    );
+    return;
+  }
   // Contained for the same reason the renewal's own UPDATE is: a run that is
   // otherwise fine must not be told to stand down because its accounting could
   // not be written.
-  await applyToLedger(taskId, identity, (row) => bankReportAndQueue(row, report))
+  const outcome = await mergeRenewal(taskId, token.attemptId, report)
     .catch((err) => {
       logger.warn({ taskId, err: (err as Error)?.message }, "run_lease.run_time_merge_failed");
-      return null;
+      return "unavailable" as const;
     });
+  if (outcome === "stale") {
+    logger.warn({ taskId, attemptId: token.attemptId }, "run_lease.run_time_superseded");
+  }
+}
+
+/** Whether a nested report speaks for the attempt the lease body presented. */
+function sameAttemptToken(
+  report: { attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number },
+  token: Extract<AttemptToken, { ok: true }>,
+): boolean {
+  return report.attemptId === token.attemptId
+    && report.claimCount === token.claimCount
+    && report.deliverySeq === token.deliverySeq
+    && report.deliveryCount === token.deliveryCount;
 }
 
 /**
@@ -553,11 +598,18 @@ async function buildBackendMcpCtxStub(
  * Mount path: `/v1/internal/tasks/:taskId/{agent_done,event,backend-mcp}`.
  */
 export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
-  // Brain → Backend: task finished (success / failure / wait_external).
+  registerAgentDoneRoute(app);
+  registerEventRoute(app);
+  registerLeaseRoute(app);
+  registerBackendMcpRoute(app);
+}
+
+/** Brain → Backend: task finished (success / failure / wait_external). */
+function registerAgentDoneRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: AgentDoneBody }>(
     "/v1/internal/tasks/:taskId/agent_done",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
       logger.info(
@@ -574,23 +626,17 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
-  // Brain → Backend: streaming events (assistantTextDelta / toolUse / ...).
+/** Brain → Backend: streaming events (assistantTextDelta / toolUse / ...). */
+function registerEventRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: TaskEventBody }>(
     "/v1/internal/tasks/:taskId/event",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
-      logger.debug(
-        { taskId, type: body.type ?? null },
-        "task.event.received",
-      );
-      // Brain reports that the sandbox is up and the engine has started. The
-      // dispatcher only ever got the row as far as `preparing`, so without
-      // this the row stays there until it goes terminal and `running` is a
-      // status nothing can be in.
-      //
+      logger.debug({ taskId, type: body.type ?? null }, "task.event.received");
       // CAS on `preparing` alone, which makes a duplicate or late-arriving
       // signal a no-op: a row that has since been cancelled, swept, or
       // finished must not be dragged back into running.
@@ -605,14 +651,18 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
-  // Brain → Backend: this run is still alive, and here is what it is doing.
-  //
-  // Kept apart from the two endpoints above because it says something much
-  // smaller than either: not that the run finished, not that its status
-  // changed, only that a worker was still there a moment ago. Nothing here
-  // moves a row between states or triggers scheduling, which is what makes it
-  // safe to call every few seconds for every run in the fleet.
+/**
+ * Brain → Backend: this run is still alive, and here is what it is doing.
+ *
+ * Kept apart from the two endpoints above because it says something much
+ * smaller than either: not that the run finished, not that its status changed,
+ * only that a worker was still there a moment ago. Nothing here moves a row
+ * between states or triggers scheduling, which is what makes it safe to call
+ * every few seconds for every run in the fleet.
+ */
+function registerLeaseRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: RunLeaseBody }>(
     "/v1/internal/tasks/:taskId/lease",
     { preHandler: internalTaskAuth("lease") },
@@ -629,36 +679,39 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
           ok: false, error: `attempt token incomplete: ${token.missing} is required`,
         });
       }
-      const status = await renewRunLease(taskId, body, token);
-      if (status) await mergeRenewalCoverage(taskId, body);
-      if (!status) {
-        // The row is terminal, gone, or held by another worker. Told rather
-        // than silently accepted, so a worker can find out it is running
-        // something nobody is waiting for -- and told which of the three it
-        // was, because "two workers on one run" and "this run was cancelled"
-        // ask the refused worker for opposite things. One must give its
-        // sandbox and its delivery back; the other must leave both alone,
-        // because they are the live worker's now.
-        const reason = await classifyLeaseRefusal(taskId, body.brain_id);
-        return reply.status(409).send({ ok: false, error: "run is not active", reason });
+      const outcome = await renewRunLease(taskId, body, token);
+      if (outcome.kind === "accepted") {
+        await mergeRenewalCoverage(taskId, body, token);
+        return { ok: true, status: outcome.status };
       }
-      return { ok: true, status };
+      // Nothing was banked: the fence never matched, so the coverage this body
+      // carries belongs to a ledger this caller may no longer write.
+      if (outcome.kind === "unavailable") return { ok: true, status: "unknown" };
+      // Told which of the three refusals it was, because "two workers on one
+      // run" and "this run was cancelled" ask the refused worker for opposite
+      // things: one must give its sandbox and its delivery back, the other
+      // must leave both alone, because they are the live worker's now.
+      const reason = await classifyLeaseRefusal(taskId, body.brain_id);
+      return reply.status(409).send({ ok: false, error: "run is not active", reason });
     },
   );
+}
 
-  // Brain → Backend: Backend-side MCP tool call (JSON-RPC 2.0).
-  // Supports `initialize`, `tools/list`, `tools/call` per task-design §8.2.
+/**
+ * Brain → Backend: Backend-side MCP tool call (JSON-RPC 2.0).
+ * Supports `initialize`, `tools/list`, `tools/call` per task-design §8.2.
+ */
+function registerBackendMcpRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: JsonRpcRequest }>(
     "/v1/internal/tasks/:taskId/backend-mcp",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = (req.body ?? {}) as JsonRpcRequest;
-      const response = await handleBackendMcpRequest(body, taskId, {
+      return handleBackendMcpRequest(body, taskId, {
         buildContext: () => buildBackendMcpCtxStub(req, taskId),
         logger,
       });
-      return response;
     },
   );
 }

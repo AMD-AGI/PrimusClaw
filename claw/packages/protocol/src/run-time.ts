@@ -488,40 +488,164 @@ export function appendAttemptRecord(
   };
 }
 
-/** Why a payload was refused, or the report it decoded to. */
-export type RunTimeReportDecoding =
-  | { readonly ok: true; readonly report: RunTimeReportInput }
-  | { readonly ok: false; readonly rejected: string };
+/** The record this attempt opened at its start, while it is still open. */
+export function openAttemptRecord(
+  entry: RunTimeLedgerEntry,
+  attemptId: string,
+): AttemptRecord | undefined {
+  return entry.attempts.find((a) => a.attemptId === attemptId && a.endedAtDb === undefined);
+}
+
+/**
+ * Open a record for an attempt that is beginning, once.
+ *
+ * The start instant it carries is this attempt's, which is what a per-attempt
+ * loss has to be measured from: the row's `started_at` is COALESCEd across
+ * claims, so after a redelivery it names the first attempt's start and would
+ * charge every later attempt with its predecessors' lifetimes.
+ */
+export function beginAttemptRecord(
+  entry: RunTimeLedgerEntry,
+  attemptId: string,
+  attemptGeneration: number,
+  startedAtDb: string,
+): RunTimeLedgerEntry {
+  if (openAttemptRecord(entry, attemptId)) return entry;
+  return appendAttemptRecord(entry, {
+    attemptId,
+    attemptGeneration,
+    startedAtDb,
+    renewed: false,
+    recoveryLoss: { computable: false, lossMs: null },
+  });
+}
+
+/** Note that this attempt's lease was renewed at least once. */
+export function noteAttemptRenewal(
+  entry: RunTimeLedgerEntry,
+  attemptId: string,
+  heartbeatAtDb: string,
+): RunTimeLedgerEntry {
+  const open = openAttemptRecord(entry, attemptId);
+  if (!open) return entry;
+  return {
+    ...entry,
+    attempts: entry.attempts.map((a) =>
+      a === open ? { ...a, renewed: true, lastObservedHeartbeatAtDb: heartbeatAtDb } : a),
+  };
+}
+
+/**
+ * Close this attempt's open record and compute what it lost, if anything.
+ *
+ * A boundary that finds no open record appends nothing: the attempt either
+ * never started or has already been closed, and inventing a record would put a
+ * second entry beside the one that describes it.
+ */
+export function endAttemptRecord(
+  entry: RunTimeLedgerEntry,
+  attemptId: string,
+  endedAtDb: string,
+): RunTimeLedgerEntry {
+  const open = openAttemptRecord(entry, attemptId);
+  if (!open) return entry;
+  const closed: AttemptRecord = {
+    ...open,
+    endedAtDb,
+    recoveryLoss: recoveryLossForAttempt(open, endedAtDb),
+  };
+  return { ...entry, attempts: entry.attempts.map((a) => (a === open ? closed : a)) };
+}
 
 const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
+const CLOCK_DOMAINS: readonly ClockDomain[] = ["brain", "api", "db"];
+
+const isClockDomain = (v: unknown): v is ClockDomain =>
+  typeof v === "string" && (CLOCK_DOMAINS as readonly string[]).includes(v);
+
+const isInstant = (v: unknown): v is string =>
+  typeof v === "string" && !Number.isNaN(Date.parse(v));
+
 function decodeBasis(raw: unknown): DurationBasis | string {
   const basis = raw as Partial<DurationBasis> | undefined;
-  if (!basis || typeof basis !== "object") return "basis: required, naming the clock every covered value was measured on";
+  if (!basis || typeof basis !== "object") {
+    return "basis: required, naming the clock every covered value was measured on";
+  }
   if (basis.kind === "same_domain") {
-    return typeof (basis as { domain?: unknown }).domain === "string"
-      ? { kind: "same_domain", domain: (basis as { domain: ClockDomain }).domain }
-      : "basis.domain: required for a same_domain basis";
+    const domain = (basis as { domain?: unknown }).domain;
+    return isClockDomain(domain)
+      ? { kind: "same_domain", domain }
+      : `basis.domain: expected one of ${CLOCK_DOMAINS.join(", ")}`;
   }
   if (basis.kind !== "cross_domain") return "basis.kind: expected one of same_domain, cross_domain";
   const cross = basis as Partial<Extract<DurationBasis, { kind: "cross_domain" }>>;
+  if (!isClockDomain(cross.startDomain) || !isClockDomain(cross.endDomain)) {
+    return `basis.startDomain/endDomain: expected one of ${CLOCK_DOMAINS.join(", ")}`;
+  }
   const offset = cross.offset;
   // A cross-domain duration without a measured offset is a number nobody can
-  // bound, so it is refused here rather than banked and quietly wrong.
-  if (!offset || !isFiniteNumber(offset.sentAtMs) || !isFiniteNumber(offset.receivedAtMs)
-      || typeof offset.dbAt !== "string") {
+  // bound, so it is refused rather than banked and quietly wrong.
+  if (!offset || typeof offset !== "object") {
     return "basis.offset: required for a cross_domain basis, as one measured round trip";
   }
-  if (typeof cross.startDomain !== "string" || typeof cross.endDomain !== "string") {
-    return "basis.startDomain/endDomain: required for a cross_domain basis";
+  if (!isFiniteNumber(offset.sentAtMs) || !isFiniteNumber(offset.receivedAtMs)) {
+    return "basis.offset.sentAtMs/receivedAtMs: required, and finite numbers";
+  }
+  // Parsed here rather than at the arithmetic: an unparseable instant reaches
+  // Date.parse as NaN and surfaces as a RangeError from a subtraction three
+  // layers away instead of as the field that was wrong.
+  if (!isInstant(offset.dbAt)) return "basis.offset.dbAt: required, and a parseable instant";
+  if (!isClockDomain(offset.callerDomain)) {
+    return `basis.offset.callerDomain: expected one of ${CLOCK_DOMAINS.join(", ")}`;
   }
   return {
     kind: "cross_domain",
     startDomain: cross.startDomain,
     endDomain: cross.endDomain,
-    offset,
+    offset: {
+      callerDomain: offset.callerDomain,
+      sentAtMs: offset.sentAtMs,
+      dbAt: offset.dbAt,
+      receivedAtMs: offset.receivedAtMs,
+    },
   };
 }
+
+/**
+ * A covered map, with every key checked against its closed vocabulary.
+ *
+ * An unrecognised key or a value that is not a finite, non-negative number is
+ * refused by name. Copying the map through instead would put a string where
+ * the merge does arithmetic, and let a key nothing accounts for sit in the
+ * stored entry looking like a state.
+ */
+function decodeCovered<K extends string>(
+  raw: unknown,
+  field: string,
+  allowed: readonly K[],
+): Partial<Record<K, number>> | string {
+  if (raw === undefined) return {};
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return `${field}: expected an object keyed by ${allowed.join(", ")}`;
+  }
+  const out: Partial<Record<K, number>> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!(allowed as readonly string[]).includes(key)) {
+      return `${field}.${key}: expected one of ${allowed.join(", ")}`;
+    }
+    if (!isFiniteNumber(value) || value < 0) {
+      return `${field}.${key}: expected a finite, non-negative number`;
+    }
+    out[key as K] = value;
+  }
+  return out;
+}
+
+/** Why a payload was refused, or the report it decoded to. */
+export type RunTimeReportDecoding =
+  | { readonly ok: true; readonly report: RunTimeReportInput }
+  | { readonly ok: false; readonly rejected: string };
 
 /**
  * Validate a reported reading of a run's time at the boundary it arrives on.
@@ -537,10 +661,21 @@ export function decodeRunTimeReport(raw: unknown): RunTimeReportDecoding {
     return { ok: false, rejected: "attemptId: required" };
   }
   for (const field of ["claimCount", "deliverySeq", "deliveryCount"] as const) {
-    if (!isFiniteNumber(body[field])) return { ok: false, rejected: `${field}: required, and a number` };
+    const value = body[field];
+    if (!isFiniteNumber(value) || value < 0) {
+      return { ok: false, rejected: `${field}: required, and a finite non-negative number` };
+    }
   }
   const basis = decodeBasis(body.basis);
   if (typeof basis === "string") return { ok: false, rejected: basis };
+  const stateMs = decodeCovered(body.cumulativeStateMs, "cumulativeStateMs", RUN_TIME_KNOWN_STATES);
+  if (typeof stateMs === "string") return { ok: false, rejected: stateMs };
+  const reasonMs = decodeCovered(body.cumulativeReasonMs, "cumulativeReasonMs", RUN_WAIT_REASONS);
+  if (typeof reasonMs === "string") return { ok: false, rejected: reasonMs };
+  if (body.cumulativeUnknownMs !== undefined
+      && (!isFiniteNumber(body.cumulativeUnknownMs) || body.cumulativeUnknownMs < 0)) {
+    return { ok: false, rejected: "cumulativeUnknownMs: expected a finite, non-negative number" };
+  }
   return {
     ok: true,
     report: {
@@ -550,9 +685,10 @@ export function decodeRunTimeReport(raw: unknown): RunTimeReportDecoding {
       deliverySeq: body.deliverySeq as number,
       deliveryCount: body.deliveryCount as number,
       basis,
-      ...(body.cumulativeStateMs ? { cumulativeStateMs: body.cumulativeStateMs } : {}),
-      ...(body.cumulativeReasonMs ? { cumulativeReasonMs: body.cumulativeReasonMs } : {}),
-      ...(isFiniteNumber(body.cumulativeUnknownMs) ? { cumulativeUnknownMs: body.cumulativeUnknownMs } : {}),
+      ...(body.cumulativeStateMs !== undefined ? { cumulativeStateMs: stateMs } : {}),
+      ...(body.cumulativeReasonMs !== undefined ? { cumulativeReasonMs: reasonMs } : {}),
+      ...(body.cumulativeUnknownMs !== undefined
+        ? { cumulativeUnknownMs: body.cumulativeUnknownMs } : {}),
     },
   };
 }

@@ -272,7 +272,11 @@ async function settleAndTransition(
   }
   try {
     return await inTransaction(async (query) => {
-      await settleRunTime(query, taskId, settlement);
+      // A report from an attempt the row has moved past is refused, and the
+      // release beside it goes with it: whoever holds the row now is entitled
+      // to it, and this caller is settling somebody else's run.
+      const settled = await settleRunTime(query, taskId, settlement);
+      if (!settled.ok) throw new StaleTransition();
       const r = await transition(query);
       if ((r.rowCount ?? 0) === 0) throw new StaleTransition();
       return true;

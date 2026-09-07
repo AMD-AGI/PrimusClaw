@@ -21,6 +21,7 @@ const run = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const srcRoot = path.join(here, "..", "src");
 const packageRoot = path.join(here, "..");
+const workspaceRoot = path.join(here, "..", "..");
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -35,6 +36,22 @@ const sources = sourceFiles(srcRoot).map((file) => ({
   text: readFileSync(file, "utf8"),
 }));
 
+/**
+ * Every workspace's product source.
+ *
+ * "Exactly one module may mint a key" is a claim about the tree, not about one
+ * package: a second cast in the API or in the protocol package would satisfy a
+ * guard that only ever read `brain/src` while making the claim false.
+ */
+const repoSources = readdirSync(workspaceRoot)
+  .map((pkg) => path.join(workspaceRoot, pkg, "src"))
+  .filter((dir) => { try { return statSync(dir).isDirectory(); } catch { return false; } })
+  .flatMap((dir) => sourceFiles(dir))
+  .map((file) => ({
+    file: path.relative(workspaceRoot, file),
+    text: readFileSync(file, "utf8"),
+  }));
+
 test("T5.1/T3.3 a proxy string, and an undecided wait mode, do not compile", async () => {
   // `tsc` over a file of @ts-expect-error lines: loosening the brand or giving
   // `mode` a default turns each of them into an unused expectation, which is
@@ -48,10 +65,18 @@ test("T5.1/T3.3 a proxy string, and an undecided wait mode, do not compile", asy
   assert.equal(`${stdout}${stderr}`.trim(), "");
 });
 
-test("T5.2 exactly one module can mint a ledger key", () => {
-  const minting = sources.filter((s) => /as RunIdentityKey\b/.test(s.text));
-  assert.deepEqual(minting.map((s) => s.file), ["tasks/run-identity.ts"],
+test("T5.2 exactly one module in the repository can mint a ledger key", () => {
+  assert.ok(repoSources.length > sources.length, "the scan must reach past this package");
+  const minting = repoSources.filter((s) => /as\s+RunIdentityKey\b/.test(s.text));
+  assert.deepEqual(minting.map((s) => s.file), ["brain/src/tasks/run-identity.ts"],
     "a second cast is a second identity for one run, which is the defect this replaces");
+});
+
+test("T5.2 no module outside the resolver declares a brand of its own", () => {
+  // Declaring the type a second time would let a package mint one without ever
+  // writing the cast this guard looks for.
+  const declaring = repoSources.filter((s) => /type RunIdentityKey\s*=/.test(s.text));
+  assert.deepEqual(declaring.map((s) => s.file), ["protocol/src/run-identity.ts"]);
 });
 
 test("T5.3 every ledger call site is handed an identity, never a proxy", () => {
