@@ -147,6 +147,7 @@ verify-lint:
 	@bash claw/scripts/lint-metrics-must-register.sh --self-test
 	@echo "==> lint: startup asserts the rollout config before listening"
 	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --all
+	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --self-test
 	@echo "==> lint: session-event redaction"
 	@bash claw/scripts/lint-session-events-must-redact.sh --all
 	@echo "==> lint: checkpoints are sealed, not redacted"
