@@ -27,7 +27,11 @@ import assert from "node:assert/strict";
 import { db } from "../src/infra/db.js";
 import { cancelTask } from "../src/tasks/lifecycle.js";
 
-interface SeenQuery { sql: string; params: unknown[] }
+interface SeenQuery {
+  sql: string;
+  params: unknown[];
+  rows?: Array<Record<string, unknown>>;
+}
 
 const originalQuery = db.query;
 after(() => { db.query = originalQuery; });
@@ -37,7 +41,8 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
   const seen: SeenQuery[] = [];
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    seen.push({ sql, params });
+    const query: SeenQuery = { sql, params };
+    seen.push(query);
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
       return params[0] === task.task_id ? { rows: [task], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
@@ -45,14 +50,15 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
       const metadata = task.metadata as Record<string, unknown> | undefined;
       const executing = params[2] as string[];
       const status = executing.includes(String(task.status)) ? params[3] : params[4];
+      query.rows = [{
+        ...task,
+        status,
+        prior_status: task.status,
+        prior_dispatch: metadata?.dispatch ?? null,
+        prior_queued_since: metadata?.queued_since ?? null,
+      }];
       return {
-        rows: [{
-          ...task,
-          status,
-          prior_status: task.status,
-          prior_dispatch: metadata?.dispatch ?? null,
-          prior_queued_since: metadata?.queued_since ?? null,
-        }],
+        rows: query.rows,
         rowCount: 1,
       };
     }
@@ -79,7 +85,7 @@ test("cancelling a running task hands it to Brain instead of closing it", async 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
   assert.ok(transition);
   assert.equal(
-    transition!.params[3],
+    transition!.rows?.[0]?.status,
     "cancelling",
     "a running row must not be marked terminal while Brain and its sandbox are still live",
   );
@@ -111,7 +117,7 @@ test("a queued task is closed outright, since nothing is executing yet", async (
   await cancelTask("t-mid");
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
-  assert.equal(transition!.params[4], "cancelled");
+  assert.equal(transition!.rows?.[0]?.status, "cancelled");
   assert.deepEqual(
     transition!.params[1],
     ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
@@ -131,7 +137,7 @@ test("a preparing task is handed to Brain too, because it may already be executi
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
   assert.equal(
-    transition!.params[3],
+    transition!.rows?.[0]?.status,
     "cancelling",
     "a preparing row may be executing, so it must wait for Brain to acknowledge",
   );
