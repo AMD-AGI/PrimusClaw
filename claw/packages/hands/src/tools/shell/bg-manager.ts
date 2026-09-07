@@ -120,7 +120,11 @@ export function spawnBackground(
   kind: BgShellKind = "background",
 ): BgStart {
   if (!BG_SHELL_ENABLED) throw new Error(BG_SHELL_DISABLED_MESSAGE);
-  if (shells.size >= BG_SHELL_MAX_CONCURRENT) {
+  // Running entries only. An exited shell stays in the registry for one reap
+  // delay so its final output is still pollable, and counting those against the
+  // cap let a sandbox that had finished every command refuse the next one for
+  // the length of that window.
+  if (runningShells().length >= BG_SHELL_MAX_CONCURRENT) {
     throw new Error(`Background shell limit reached (max ${BG_SHELL_MAX_CONCURRENT})`);
   }
   if (shellId) assertShellId(shellId);
@@ -314,11 +318,20 @@ export function waitForShellExit(
   });
 }
 
+/**
+ * The entries whose process is still running.
+ *
+ * An exited shell stays in the registry for one reap delay so its final output
+ * remains pollable, so registry membership is not liveness and every count that
+ * means "live work" has to go through here.
+ */
+function runningShells(): BgEntry[] {
+  return [...shells.values()].filter((e) => e.shell.status === "running");
+}
+
 /** Ids of `owner`'s live shells. Exists for tests and for shutdown logging. */
 export function listRunningShells(owner: string): string[] {
-  return [...shells.values()]
-    .filter((e) => e.owner === owner && e.shell.status === "running")
-    .map((e) => e.shell.id);
+  return runningShells().filter((e) => e.owner === owner).map((e) => e.shell.id);
 }
 
 /**
@@ -370,7 +383,7 @@ async function terminateShells(
  * so the caller can exit knowing it did what it could.
  */
 export async function shutdownAllShells(graceMs = 2000): Promise<number> {
-  return terminateShells([...shells.values()].filter((e) => e.shell.status === "running"), graceMs, "shutdown");
+  return terminateShells(runningShells(), graceMs, "shutdown");
 }
 
 /**
@@ -407,9 +420,7 @@ export async function shutdownAllShells(graceMs = 2000): Promise<number> {
  */
 export function runningShellCount(owner: string): number | null {
   if (!owner) return 0;
-  const inMemory = [...shells.values()].filter(
-    (e) => e.owner === owner && e.shell.status === "running",
-  ).length;
+  const inMemory = runningShells().filter((e) => e.owner === owner).length;
   if (!filesRecords()) return inMemory;
 
   const liveness = ownerLiveness(owner, (record) => {
@@ -438,7 +449,7 @@ export async function shutdownRunShells(run: string, graceMs = 2000): Promise<nu
   // is precisely the set nothing is entitled to reap.
   if (!run) return 0;
   return terminateShells(
-    [...shells.values()].filter((e) => e.run === run && e.shell.status === "running"),
+    runningShells().filter((e) => e.run === run),
     graceMs,
     "run_end",
   );
