@@ -59,7 +59,23 @@ CREATE TABLE claw_sessions (
   status         TEXT DEFAULT 'active',
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
-  deleted_at     TIMESTAMPTZ
+  deleted_at     TIMESTAMPTZ,
+  -- Added by an ALTER in db.ts rather than the CREATE, and written by
+  -- commitSessionDeletion in the same transaction that cancels the session's
+  -- runs: without them that whole transaction rolls back on an unknown column.
+  cleanup_state    TEXT,
+  cleanup_attempts INT NOT NULL DEFAULT 0,
+  cleanup_next_at  TIMESTAMPTZ,
+  cleanup_error    TEXT
+);
+
+-- Read by listDownstream, and by cancelTask's recursive cascade, to find the
+-- rows an upstream failure closes.
+CREATE TABLE claw_task_edges (
+  id                BIGSERIAL PRIMARY KEY,
+  dag_root_task_id  TEXT NOT NULL,
+  from_task_id      TEXT NOT NULL,
+  to_task_id        TEXT NOT NULL
 );
 
 CREATE TABLE claw_session_events (
@@ -157,6 +173,7 @@ CREATE TABLE claw_workspace_refs (
 
 const TABLES = [
   "claw_tasks",
+  "claw_task_edges",
   "claw_sessions",
   "claw_session_events",
   "claw_pending_messages",
