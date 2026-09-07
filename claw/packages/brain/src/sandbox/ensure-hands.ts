@@ -561,6 +561,11 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
  *
  * Re-read instead, and only refuse when the key has come to name a *different*
  * sandbox. Ownership is the thing worth protecting; the TTL bump is not.
+ *
+ * Returns false when the binding is gone rather than contended -- the idle
+ * sweep deleted it and released its admission slot while we were reactivating,
+ * so reusing this sandbox would put a ping target back on the fleet holding no
+ * slot and carry the target set past the ceiling.
  */
 async function clearIdleMarkers(
   kv: ReuseAttempt["kv"],
@@ -568,8 +573,8 @@ async function clearIdleMarkers(
   info: any,
   identity: SandboxEntry,
   binding: HandsBinding,
-): Promise<void> {
-  if (info.keepalive === undefined && info.idleSince == null) return;
+): Promise<boolean> {
+  if (info.keepalive === undefined && info.idleSince == null) return true;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
   // handle parked, and eligibleForClusterReclaim refuses any entry whose
   // keepalive is not false, so clearing it here would strip a session delete's
@@ -577,7 +582,7 @@ async function clearIdleMarkers(
   // path that runs when the entry is already parked at first read, was not.
   if (info.sessionDeleted === true) {
     logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
-    return;
+    return true;
   }
   delete info.keepalive;
   delete info.idleSince;
@@ -585,19 +590,23 @@ async function clearIdleMarkers(
   const payload = sc.encode(JSON.stringify(info));
   try {
     await kv.update(key, payload, binding.revision);
-    return;
+    return true;
   } catch (err) {
     // Only a lost race falls through to the re-read. A bucket that is actually
     // unavailable is not a race, and retrying it here would just fail twice --
     // the markers stay, and the sandbox is still reusable.
     if (!isRevisionConflict(err)) {
       logger.warn({ err: String(err), sessionId }, "ensureHands.idle_markers_not_cleared");
-      return;
+      return true;
     }
   }
   try {
     const latest = await kv.get(key);
-    if (!latest) return;
+    // Absent or tombstoned: the sweep won the race and took the slot with it.
+    if (!latest || isTombstone(latest)) {
+      logger.warn({ sessionId, key }, "ensureHands.reuse_record_deleted_under_us");
+      return false;
+    }
     // The markers are not part of the identity HandsProbeEntry describes, but
     // they live on the same value and this is the writer that removes them.
     const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
@@ -610,19 +619,20 @@ async function clearIdleMarkers(
     // it alone; the retry has to do the same deliberately.
     if (current.sessionDeleted === true) {
       logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
-      return;
+      return true;
     }
     if (!sameHandsSandbox(identity, current)) {
       // Someone else's sandbox now. Reusing ours is still correct -- it passed
       // its own health check under its own identity -- but its markers are not
       // ours to clear.
       logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
-      return;
+      return true;
     }
-    if (current.keepalive === undefined && current.idleSince == null) return;
+    if (current.keepalive === undefined && current.idleSince == null) return true;
     await kv.update(key, sc.encode(JSON.stringify({
       ...current, keepalive: undefined, idleSince: undefined,
     })), latest.revision);
+    return true;
   } catch (err) {
     // Left parked at worst: the ticker will not ping it, and the next request
     // reactivates it. Not a reason to refuse a sandbox that answered.
@@ -630,23 +640,30 @@ async function clearIdleMarkers(
       { err: String(err), sessionId },
       "ensureHands.idle_markers_not_cleared",
     );
+    return true;
   }
 }
 
-/** Keepalive and idle-marker bookkeeping shared by both paths that reuse. */
+/**
+ * Keepalive and idle-marker bookkeeping shared by both paths that reuse.
+ *
+ * Null when the binding was deleted under us, which is the caller's signal to
+ * provision instead of reuse: registering a sandbox whose record the sweep just
+ * removed re-adds a ping target the roster no longer holds a slot for.
+ */
 async function acceptExistingSandbox(
   kv: ReuseAttempt["kv"],
   sessionId: string,
   info: any,
   identity: SandboxEntry,
   binding: HandsBinding,
-): Promise<EnsureHandsResult> {
+): Promise<EnsureHandsResult | null> {
   // Reactivate a post-task idle reuse handle: clear the keepalive:false marker
   // so the ticker resumes owning it as an active session and
   // stopKeepaliveAfterTask re-marks it idle when this task ends. A handle with
   // no markers needs no write at all -- the entry that passed the gate is
   // already the entry we want.
-  await clearIdleMarkers(kv, sessionId, info, identity, binding);
+  if (!await clearIdleMarkers(kv, sessionId, info, identity, binding)) return null;
   reuseEffects.registerSandbox(sessionId, identity);
   return { handsUrl: info.handsUrl, created: false, token: info.token, identity };
 }
