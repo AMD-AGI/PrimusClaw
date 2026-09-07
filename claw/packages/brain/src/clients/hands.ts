@@ -517,6 +517,17 @@ export const OWNER_HEADER = "x-claw-owner";
 export const RUN_HEADER = "x-claw-run";
 
 /**
+ * Header carrying the run's own deadline, which fixes how long a shell's
+ * terminal outcome is kept.
+ *
+ * Stamped from the run's stamped deadline rather than derived from a constant:
+ * two runs given different deadlines get different windows, and lowering the
+ * constant later cannot shorten a window already fixed. Absent means no
+ * deadline, which retains for the sandbox's life.
+ */
+export const DEADLINE_HEADER = "x-claw-deadline";
+
+/**
  * A non-MCP Hands endpoint, given the MCP url the sandbox was created with.
  *
  * Hands is addressed by its `/mcp` url everywhere in Brain because that is the
@@ -601,6 +612,7 @@ export class HandsClient {
     private token: string,
     private owner: string = "",
     private run: string = "",
+    private deadlineAt: string = "",
   ) {
     this.client = new Client(
       { name: "brain", version: "1.0.0" },
@@ -624,6 +636,7 @@ export class HandsClient {
             Authorization: `Bearer ${this.token}`,
             ...(this.owner ? { [OWNER_HEADER]: this.owner } : {}),
             ...(this.run ? { [RUN_HEADER]: this.run } : {}),
+            ...(this.deadlineAt ? { [DEADLINE_HEADER]: this.deadlineAt } : {}),
           },
           // undici-only escape hatch: attach a long-lived Agent that disables
           // the 5-min headersTimeout / bodyTimeout. See HANDS_DISPATCHER doc

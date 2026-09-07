@@ -33,7 +33,7 @@ export interface StartResolution {
    * unfinished send finished rather than a second intent; the rest send nothing.
    */
   action: "dispatch" | "retransmit" | "resolve" | "refuse";
-  reported: "first_call" | "deduplicated" | "unknown";
+  reported: "first_call" | "deduplicated" | "unknown" | "retry_expired";
   /** The class the caller is told, where the answer carries one. */
   shellClass?: "lost" | "unknown";
   reason: string;

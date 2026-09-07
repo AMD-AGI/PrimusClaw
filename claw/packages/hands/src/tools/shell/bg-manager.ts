@@ -22,13 +22,14 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { BG_SHELL_ENABLED } from "../../config.js";
-import { NO_RUN } from "../../runtime/owner-context.js";
+import { NO_RUN, currentDeadline } from "../../runtime/owner-context.js";
 import { assertShellId } from "../../runtime/record-path.js";
 import {
   attachRecord, claimRecord, currentEpoch, processStartToken,
-  recordOutcome, releaseOutput, type ProcessIdentity, type ShellRecordStatus,
+  readRecord, recordOutcome, releaseOutput,
+  type ProcessIdentity, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
-import { ownerLiveness, shellVerdict } from "../../runtime/shell-liveness.js";
+import { outcomeExpired, ownerLiveness, shellVerdict } from "../../runtime/shell-liveness.js";
 import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
 import {
   type ManagedShell,
@@ -60,7 +61,7 @@ export const BG_SHELL_DISABLED_MESSAGE =
 export interface BgStart {
   shell?: BgShell;
   shellId?: string;
-  resolution: "first_call" | "deduplicated";
+  resolution: "first_call" | "deduplicated" | "retry_expired";
 }
 
 interface BgEntry {
@@ -136,6 +137,13 @@ export function spawnBackground(
   // The claim is durable before anything is spawned, and its exclusive create
   // is the arbiter: a start that lost it never reaches a process.
   if (!claimShell(owner, run, id, command, kind)) {
+    // A replay whose tombstone has aged out is not a first call: what happened
+    // is no longer knowable, and running the command a second time is the one
+    // answer the whole scheme exists to avoid. Reported as its own resolution
+    // rather than as a collision the caller might retry past.
+    if (expiredTombstone(owner, run, id)) {
+      return { shellId: id, resolution: "retry_expired" };
+    }
     throw new Error(`Shell ${id} already exists`);
   }
 
@@ -170,6 +178,7 @@ export function spawnBackground(
 
 function claimShell(
   owner: string, run: string, id: string, command: string, kind: BgShellKind,
+  deadline = currentDeadline(),
 ): boolean {
   if (!filesRecords()) return true;
   return claimRecord({
@@ -180,6 +189,9 @@ function claimShell(
     kind,
     claimed_at: new Date().toISOString(),
     hands_epoch: currentEpoch()!.epoch,
+    // Fixed here rather than at the outcome, so the window a tombstone is kept
+    // for comes from the run's own deadline and not from whenever it finished.
+    ...(deadline ? { deadline_at: deadline } : {}),
   });
 }
 
@@ -286,6 +298,17 @@ export function resolveShell(owner: string, run: string, id: string): ShellResol
     exitCode: verdict.record.exit_code ?? null,
     outputAvailable: verdict.record.output_available === true && !!shell,
   };
+}
+
+/** Whether the record blocking a claim is a terminal outcome past its window. */
+function expiredTombstone(owner: string, run: string, id: string): boolean {
+  if (!filesRecords()) return false;
+  try {
+    const record = readRecord(owner, recordRun(run), id);
+    return !!record && outcomeExpired(record);
+  } catch {
+    return false;
+  }
 }
 
 function outcomeStatus(shell: BgShell): ShellRecordStatus {

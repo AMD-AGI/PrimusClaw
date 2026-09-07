@@ -359,7 +359,9 @@ export interface TaskRunnerSideEffects {
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
-  makeHandsClient: (url: string, token: string, owner: string, run: string) => HandsClient;
+  makeHandsClient: (
+    url: string, token: string, owner: string, run: string, deadlineAt?: string,
+  ) => HandsClient;
 }
 
 const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
@@ -386,7 +388,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
-  makeHandsClient: (url, token, owner, run) => new HandsClient(url, token, owner, run),
+  makeHandsClient: (url, token, owner, run, deadlineAt) =>
+    new HandsClient(url, token, owner, run, deadlineAt),
 };
 
 let _deps: TaskRunnerDeps | null = null;
@@ -1343,7 +1346,9 @@ class TaskRunner {
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal },
     );
-    const newHands = fx().makeHandsClient(newUrl, newToken, this.handsOwner, this.runId);
+    const newHands = fx().makeHandsClient(
+      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at,
+    );
     // Fold the newest in-flight snapshot into the session prefix *before*
     // restoring from it. The session prefix only advances on a successful
     // terminal sync, so mid-run it holds the state from before this run
@@ -1479,7 +1484,7 @@ class TaskRunner {
   private replaceHandsClient(): HandsClient {
     this.hands?.close().catch(() => {});
     const fresh = fx().makeHandsClient(
-      this.handsUrl, this.handsToken, this.handsOwner, this.runId,
+      this.handsUrl, this.handsToken, this.handsOwner, this.runId, this.request.deadline_at,
     );
     this.hands = fresh;
     return fresh;
@@ -1941,7 +1946,9 @@ class TaskRunner {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
     });
-    this.hands = fx().makeHandsClient(handsUrl, handsToken, this.handsOwner, this.runId);
+    this.hands = fx().makeHandsClient(
+      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at,
+    );
     // ensureHands returns only after bootstrap and the health check, so this
     // is the first moment a sandbox can actually be used -- unlike the
     // provider's own `running`, which fires when the pod is scheduled. The

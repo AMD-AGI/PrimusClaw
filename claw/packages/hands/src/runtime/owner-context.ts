@@ -29,6 +29,17 @@ export const OWNER_HEADER = "x-claw-owner";
 /** Header Brain stamps with the id of the single run making the call. */
 export const RUN_HEADER = "x-claw-run";
 
+/**
+ * Header Brain stamps with the instant this run's own deadline falls.
+ *
+ * A shell's terminal outcome is kept until then, so a later turn of a run that
+ * takes days still reads what happened rather than an absence. Absent or
+ * malformed means no deadline, which retains for the sandbox's life -- never a
+ * substituted constant, which would age a tombstone out under a run still using
+ * it.
+ */
+export const DEADLINE_HEADER = "x-claw-deadline";
+
 
 /**
  * Owner used when the header is absent: an older Brain, a probe, a test, a
@@ -48,6 +59,7 @@ export const NO_RUN = "";
 interface CallerContext {
   owner: string;
   run: string;
+  deadline?: string;
 }
 
 const store = new AsyncLocalStorage<CallerContext>();
@@ -80,6 +92,19 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
+/**
+ * The deadline as an instant, or absent.
+ *
+ * Absent covers unparseable as well as missing: a malformed value is a value
+ * nothing can be computed from, and reading it as anything else would fix a
+ * retention window from a number nobody sent.
+ */
+export function normalizeDeadline(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed && Number.isFinite(Date.parse(trimmed)) ? trimmed : undefined;
+}
+
 
 
 export function withCaller<T>(ctx: CallerContext, fn: () => T): T {
@@ -92,4 +117,8 @@ export function currentOwner(): string {
 
 export function currentRun(): string {
   return store.getStore()?.run ?? NO_RUN;
+}
+
+export function currentDeadline(): string | undefined {
+  return store.getStore()?.deadline;
 }

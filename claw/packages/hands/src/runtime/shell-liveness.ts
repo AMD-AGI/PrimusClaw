@@ -73,6 +73,37 @@ function readProcessState(pid: number): ProcessView {
  * current nor stale, and reading it as stale would convert unresolved live work
  * into a class that unblocks a destroy.
  */
+/**
+ * The current instant, through a seam so a retention test can move hours
+ * without waiting them out. No production path sets it.
+ */
+let clock: (() => number) | null = null;
+
+/** Test-only. */
+export function bindClock(next: (() => number) | null): void {
+  clock = next;
+}
+
+export function nowMs(): number {
+  return clock ? clock() : Date.now();
+}
+
+/**
+ * Whether a terminal outcome is still within the window its run's deadline
+ * fixed.
+ *
+ * A record with no durable outcome has no expiry at all: a still-running shell
+ * held past any window its run gives still answers on its own evidence. A
+ * tombstone with no `retain_until` is kept for the sandbox's life, which is the
+ * fallback for a start that carried no deadline -- never a substituted
+ * constant, which would age out a run still reading it.
+ */
+export function outcomeExpired(record: ShellRecord): boolean {
+  if (!record.status || !record.retain_until) return false;
+  const until = Date.parse(record.retain_until);
+  return Number.isFinite(until) && nowMs() > until;
+}
+
 export function epochFreshness(recordEpoch: string): EpochFreshness {
   const marker = readEpochMarker();
   if (!marker) return "indeterminate";
@@ -146,7 +177,10 @@ export function shellVerdict(
   } catch {
     return null;
   }
-  if (!record) return null;
+  // A tombstone past its retention answers as an absence, byte for byte like
+  // an id never issued: the evidence is gone, and inventing an answer from a
+  // record nobody may rely on any more is worse than saying nothing.
+  if (!record || outcomeExpired(record)) return null;
 
   const epoch = epochFreshness(record.hands_epoch);
   const cls = classifyShellRecord({

@@ -14,7 +14,8 @@ import {
   shutdownAllShells, shutdownRunShells, runningShellCount, resolveShell,
 } from "./tools/shell/bg-manager.js";
 import {
-  NO_RUN, OWNER_HEADER, RUN_HEADER, normalizeOwner, normalizeRun, withCaller,
+  DEADLINE_HEADER, NO_RUN, OWNER_HEADER, RUN_HEADER,
+  normalizeDeadline, normalizeOwner, normalizeRun, withCaller,
 } from "./runtime/owner-context.js";
 import {
   mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
@@ -186,7 +187,11 @@ app.all("/mcp", async (req, reply) => {
   // handed it. An absent or malformed owner collapses to the shared `unowned`
   // bucket, and an absent run means no run will reap what this call starts.
   await withCaller(
-    { owner: normalizeOwner(req.headers[OWNER_HEADER]), run: normalizeRun(req.headers[RUN_HEADER]) },
+    {
+      owner: normalizeOwner(req.headers[OWNER_HEADER]),
+      run: normalizeRun(req.headers[RUN_HEADER]),
+      deadline: normalizeDeadline(req.headers[DEADLINE_HEADER]),
+    },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
 });

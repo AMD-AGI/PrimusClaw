@@ -77,6 +77,16 @@ export const bash = {
           args.background_kind ?? "background",
         );
         const id = start.shell?.id ?? start.shellId!;
+        if (start.resolution === "retry_expired") {
+          // The outcome this replay would have resolved against is past the
+          // window its run's deadline fixed, so what happened is no longer
+          // knowable. Running the command again is the one answer the scheme
+          // exists to avoid, so nothing was run and the caller is told why.
+          return {
+            content: [{ type: "text" as const, text: `Background shell ${id} was started earlier and its outcome is no longer retained, so nothing was run a second time.` }],
+            structuredContent: { shell_id: id, resolution: start.resolution, shell_class: "unknown" },
+          };
+        }
         const already = start.resolution === "deduplicated"
           ? " This start was already committed to, so nothing was run a second time."
           : "";
