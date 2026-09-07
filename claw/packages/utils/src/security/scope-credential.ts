@@ -2,19 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The credential a control plane presents on a sandbox's internal routes, and
- * the scope it carries.
- *
- * Those routes used to take the owner scope from one request field and the run
- * identity from another, behind a bearer token bound to no scope at all: any
- * holder could count another owner's shells or terminate another run's. The
- * scope now travels inside the credential and the request no longer states it,
- * so a caller cannot name a scope it holds no proof for.
- *
- * The proof is keyed by the sandbox's own internal token, which the control
- * plane minted at bootstrap. Nothing new is distributed, and a process spawned
- * on the model's behalf cannot obtain that key -- so a proof it somehow
- * acquires is a proof for one scope, never a key that mints them.
+ * Sandbox-internal credential carrying the owner and run scope it proves.
+ * The proof is keyed by the sandbox token, which model-issued processes cannot
+ * use to mint credentials for another scope.
  */
 
 import { createHmac } from "node:crypto";

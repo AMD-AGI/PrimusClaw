@@ -28,10 +28,10 @@ const SOURCE = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
 
 /** The `/health` payload as written, and nothing else that mentions the flag. */
 function healthPayload(): string {
-  const start = SOURCE.indexOf('app.get("/health"');
-  assert.notEqual(start, -1, "the /health route moved");
-  const end = SOURCE.indexOf("\n  }));", start);
-  assert.notEqual(end, -1, "the /health payload no longer ends where it began");
+  const start = SOURCE.indexOf("function healthSnapshot");
+  assert.notEqual(start, -1, "the /health payload builder moved");
+  const end = SOURCE.indexOf("\nasync function startHttpServer", start);
+  assert.notEqual(end, -1, "the /health payload builder no longer ends where expected");
   return SOURCE.slice(start, end);
 }
 

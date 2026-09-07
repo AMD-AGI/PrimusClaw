@@ -1025,16 +1025,7 @@ export const HANDS_BOOTSTRAP_START_TIMEOUT = env("HANDS_BOOTSTRAP_START_TIMEOUT"
  */
 export const HANDS_ENV_FILE_WAIT_SEC = envInt("HANDS_ENV_FILE_WAIT_SEC", 30, { min: 1 });
 
-/**
- * What the sandbox is told about the identity its model-issued processes run
- * as, forwarded verbatim.
- *
- * Hands' whole environment is the one a bootstrap writes, so a range declared
- * anywhere else reaches nothing. With background shells on, Hands refuses to
- * start unless one of these states a posture -- the range, or the
- * acknowledgement that there is no boundary -- so an unset pair is a sandbox
- * that does not come up rather than one quietly serving without it.
- */
+// Forwarded verbatim; bootstrap must not choose an isolation posture for the deployment.
 export const HANDS_CHILD_ISOLATION_ENV = [
   "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX", "HANDS_CHILD_ISOLATION",
 ] as const;
@@ -1112,40 +1103,12 @@ export const SANDBOX_KEEPALIVE_INTERVAL_SEC = envInt("SANDBOX_KEEPALIVE_INTERVAL
 // failures, so a transient control-plane outage cannot tear down a healthy
 // long-running sandbox. Default 0 (disabled).
 export const SANDBOX_KEEPALIVE_FAIL_LIMIT = envInt("SANDBOX_KEEPALIVE_FAIL_LIMIT", 0);
-/**
- * N_max: the largest number of distinct ping targets one sweeper may face.
- *
- * The deferral count a sweep accumulates is a function of this, and the gap
- * between two refreshes of one handle is a function of that count -- so a fleet
- * larger than the value this was proven at means a live background shell can
- * miss the idle reclaim it exists to hold off. It has no default: absent,
- * non-integer or non-positive refuses startup rather than being replaced by a
- * number nobody proved the relation at.
- */
+// N_max for the proven keepalive refresh-gap bound; invalid or absent refuses startup.
 export const SANDBOX_KEEPALIVE_TARGET_CEILING = env("SANDBOX_KEEPALIVE_TARGET_CEILING");
-/**
- * Slots held back from ordinary admission so reconciliation always has some.
- *
- * A target another replica created, or one recovered after a restart, must be
- * taken on before the sweep serves it, and refusing that on the ceiling would
- * leave it unpinged. Counted inside the ceiling, so the relation is unaffected.
- */
+// Counted inside the ceiling so recovered targets can be admitted before service.
 export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONCILE_RESERVE");
-/**
- * The shortest idle reclaim in force on this deployment, in seconds.
- *
- * Deployment-declared because Brain neither sends nor reads it on every
- * provider: the sweep's exec exists precisely to hold off a platform's own
- * inactivity reclaim, and reading an unnameable deadline as absent would
- * license any interval at all against a reclaim that still happens.
- */
+// Deployment-declared because not every provider exposes its idle deadline.
 export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC");
-/** Declared ceiling on one whole guarded sweep, in seconds. */
-// Default chosen to cover the ping phase's own worst case -- half the record
-// TTL as a budget, plus one ping's ceiling for whatever was already in flight
-// when it expired -- with room for the walk and the failure handling around it.
-// A value that does not cover it refuses startup rather than understating every
-// refresh gap derived from it.
 export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 300, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
@@ -1618,17 +1581,7 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
  */
 export const BASH_FOREGROUND_DEFAULT_SEC = envInt("BASH_DEFAULT_TIMEOUT_SEC", 120);
 
-/**
- * How long a reaped background shell is given between the signal and the
- * escalation.
- *
- * Brain decides and the sandbox executes: this value is carried on every reap
- * request rather than left to the sandbox's own default, so the client deadline
- * -- which is derived from it -- and the grace the sandbox actually waits are
- * the same number. Bounded because both ends of the range are failures: below
- * the floor, work about to flush is destroyed; above the ceiling, a terminal
- * path stalls behind a shell that will never leave.
- */
+// Shared with Hands so the reap grace and the client deadline cannot diverge.
 export const BG_SHELL_REAP_GRACE_MS = envInt(
   "BG_SHELL_REAP_GRACE_MS", 2_000, { min: 250, max: 60_000 },
 );

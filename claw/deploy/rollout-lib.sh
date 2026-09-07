@@ -2,21 +2,9 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-# The parts of claw/docs/background-shell-rollout.md a mistake in would be
-# invisible.
-#
-# The guide's gates are judgement calls an operator makes; these are the
-# decisions underneath them, which have exactly one right answer each and used
-# to be pasted into the guide as prose. Pasted, none of them could be run before
-# a rollout depended on it -- and each had a failure mode that reads as success:
-# a census that could not be read looking like a small fleet, a chart-path
-# lookup silently inspecting the wrong chart, a sandbox reclaimed by the idle
-# path recorded as its absolute deadline being enforced.
-#
-# Sourced by the guide's steps and exercised directly by
-# packages/brain/test/rollout-lib.test.ts.
+# Executable rollout decisions shared by the operator guide and its tests.
+# Read failures abort so they cannot be mistaken for a small or healthy fleet.
 
-# ── Exit codes, shared by every function here ────────────────────────────────
 # 0 pass, 1 fail (a real, judged failure), 3 abort (nothing could be read, which
 # is never the same as a clean reading).
 ROLLOUT_PASS=0
@@ -71,26 +59,19 @@ inventory_judge() {
   printf '%s' "$raw"
 }
 
-# Both halves of the fleet as tab-separated rows, deduplicated on the pair a
-# rollback deletes by. A DAG handle whose session key is stale or absent is a
-# live sandbox nothing else in the guide reaches.
+# Both halves of the fleet as tab-separated rows, deduplicated on the provider's
+# durable deletion identity.
 inventory_rows() {
   printf '%s' "$1" | jq -r '
     [ (.sessions[] | {sid: .session_id, name: .sandbox_name, ns: .namespace, url: .hands_url, wid: .workload_id}),
       (.dag_handles[] | {sid: .dag_root_task_id, name: .sandbox_name, ns: .namespace, url: .hands_url, wid: .workload_id}) ]
-    | unique_by([.name, .ns]) | .[] | [.sid, .name, .ns, .url, .wid] | @tsv'
+    | unique_by(if (.name // "") != "" then ["sandbox", .name, .ns] else ["workload", .wid, .ns] end)
+    | .[] | [.sid, .name, .ns, .url, .wid] | @tsv'
 }
 
 # The Hands base url for a recorded MCP url. `<HANDS_URL>/health` is not one.
 hands_base() { printf '%s\n' "$1" | sed -E 's#/mcp/?$##'; }
 
-# Whether one dispatched activity task actually did its job.
-#
-# `completed` only. A terminal state is not a successful one: a run that failed
-# or was cancelled left the session idle, and an idle session is reclaimed by a
-# path that has nothing to do with the absolute cap -- so a gate that accepts any
-# terminal state as a refresh proves the wrong thing about the CR that then
-# disappears.
 # Whether one dispatched activity task actually refreshed the sandbox.
 #
 # Every weaker signal is satisfiable without a command having run there. A

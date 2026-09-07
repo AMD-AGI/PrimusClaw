@@ -244,17 +244,6 @@ export interface ReconcileResult {
 }
 
 /**
- * Take on every target the roster does not already hold, before serving it.
- *
- * A target a sweep faces is never a confirmed-idle handle -- that one is neither
- * pinged nor a target -- so it is either working or unaccounted for, and its
- * refresh is this replica's business whichever replica created it. The ceiling
- * is held against ordinary admission, never against work already running: where
- * reconciliation exhausts the reserve it admits regardless, and the resulting
- * roster size above the ceiling is a declared capacity breach, reported as such.
- * Nothing is expired, reclaimed, evicted or terminated on account of it.
- */
-/**
  * Record that the roster is incomplete, for every replica reading it.
  *
  * Throws where the marker itself cannot be written. Swallowed, the roster goes

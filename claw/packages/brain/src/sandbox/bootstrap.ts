@@ -133,9 +133,7 @@ function launchCmd(
   // shell bash forks to run the list -- dash happens to exec-replace it
   // with the setsid process, bash does not, and the kill chain then hits
   // the helper while Hands keeps the port.
-  // Created owner-only before anything writes it: the directory is the
-  // boundary, and a log truncated into a world-readable parent is not inside
-  // one. Hands re-creates the same directory when it mints its epoch.
+  // The state directory is a cross-run boundary and must be private before log creation.
   return `mkdir -p ${dirOf(logPath)} && chmod 700 ${dirOf(logPath)} || { echo "cannot create ${dirOf(logPath)}" >&2; exit 1; }; `
     + `: > ${logPath} || { echo "cannot write ${logPath}" >&2; exit 1; }; `
     + `${baseEnv} setsid ${binPath} </dev/null >>${logPath} 2>&1 & `
@@ -275,13 +273,6 @@ export function handsBaseEnv(
     + (envFile ? ` HANDS_ENV_FILE=${envFile}` : "");
 }
 
-/**
- * The child-identity declaration, forwarded to the only environment Hands has.
- *
- * Nothing is defaulted here: an absent declaration is what makes Hands refuse
- * to serve background shells, and substituting one would be this path deciding
- * the isolation posture on the deployment's behalf.
- */
 function childIsolationEnv(): string {
   return HANDS_CHILD_ISOLATION_ENV
     .filter((key) => process.env[key])
@@ -289,30 +280,9 @@ function childIsolationEnv(): string {
     .join("");
 }
 
-/**
- * Where Hands files its background-shell records.
- *
- * Named rather than left to Hands' own default, for the same reason the env
- * file is: the default is a system path a sandbox image is not obliged to make
- * writable, and Hands refuses to start where it cannot create this -- correctly,
- * since a process serving shells it files no record of leaves every later
- * destroy gate reading an empty count as an empty sandbox. Under /tmp rather
- * than /workspace because the workspace is synced to S3 and to the shared
- * filesystem, and a sync must not be able to carry the records out or write
- * over them. Hands creates it owner-only.
- */
+// Kept outside the synced, user-writable workspace.
 export const HANDS_STATE_DIR = "/tmp/.claw-hands";
 
-/**
- * Where Hands' own diagnostics go.
- *
- * Inside the Hands-owned state area rather than the workspace. Everything Hands
- * writes about a shell names it -- the shell id, the operating-system process
- * identifier, the kind -- and the workspace is writable by every run identity
- * in the sandbox, so a log there hands one run's work to another by a path
- * neither the tool routes nor the scoped credential bound. It is also synced,
- * which would carry the same disclosure out.
- */
 export const HANDS_LOG_PATH = `${HANDS_STATE_DIR}/hands.log`;
 
 /**

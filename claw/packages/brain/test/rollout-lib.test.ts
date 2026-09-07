@@ -110,6 +110,24 @@ test("the rows a rollback iterates carry both halves of the fleet", () => {
   assert.deepEqual(names.sort(), ["sb-1", "sb-dag"]);
 });
 
+test("distinct SaFE workloads in one namespace are not collapsed", () => {
+  const body = census({
+    count: 3,
+    sessions: [
+      { session_id: "s1", namespace: "ns", hands_url: "http://wl-1/mcp", workload_id: "wl-1" },
+      { session_id: "s2", namespace: "ns", hands_url: "http://wl-2/mcp", workload_id: "wl-2" },
+    ],
+    dag_handles: [
+      { dag_root_task_id: "dag-1", namespace: "ns", hands_url: "http://wl-1/mcp", workload_id: "wl-1" },
+    ],
+  });
+  const result = callLib(`inventory_rows ${JSON.stringify(body)}`);
+  const rows = result.out.trim().split("\n").map((line) => line.split("\t"));
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(rows.map((row) => row[4]).sort(), ["wl-1", "wl-2"]);
+});
+
 test("hands_base strips the MCP suffix the census reports", () => {
   for (const [url, base] of [
     ["http://a:9100/mcp", "http://a:9100"],

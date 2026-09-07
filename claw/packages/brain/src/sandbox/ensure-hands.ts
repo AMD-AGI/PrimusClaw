@@ -25,6 +25,7 @@ import {
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
+import type { HandsHealthResult } from "./hands-health.js";
 import { destroyHands } from "./reaper.js";
 import {
   resolveSandboxAction,
@@ -357,6 +358,42 @@ function reuseIdentity(info: any): SandboxEntry {
   };
 }
 
+async function recoverOrRetainUnusableSandbox(
+  attempt: ReuseAttempt,
+  info: any,
+  identity: SandboxEntry,
+  binding: HandsBinding,
+  health: HandsHealthResult,
+  hasToken: boolean,
+): Promise<EnsureHandsResult | null> {
+  const { kv, sessionId, signal } = attempt;
+  logger.warn(
+    { sessionId, health: health.detail, hasToken },
+    health.ok ? "ensureHands.health_ok_but_unusable" : "ensureHands.health_check_failed",
+  );
+
+  // MCP liveness does not determine whether the container and its work may be destroyed.
+  if (!health.ok && hasToken) {
+    const recovered = await recoverUnhealthyReuse(
+      kv,
+      sessionId,
+      info,
+      identity,
+      binding,
+      signal,
+    );
+    if (recovered) return recovered;
+  }
+
+  const live = await mayDestroy(sessionId, identity, signal);
+  if (live.verdict === "clear") {
+    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    return null;
+  }
+  await retainInsteadOfDestroying(kv, sessionId, info, live);
+  return null;
+}
+
 async function recoverUnhealthyReuse(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -588,46 +625,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     );
     return acceptExistingSandbox(kv, sessionId, info, identity, binding);
   }
-  // Both ways of failing the gate, named apart: a sandbox that did not answer
-  // is a different operational story from one that answered and has no token to
-  // talk to it with.
-  logger.warn(
-    { sessionId, health: health.detail, hasToken },
-    health.ok ? "ensureHands.health_ok_but_unusable" : "ensureHands.health_check_failed",
-  );
-
-  // MCP 9100 is not the workload. Hands dying inside a running container is
-  // what the recovery path restarts in place, and tearing the pod down here
-  // takes the user's training run with it -- the same holder-kill the in-flight
-  // rebuild already refuses to perform. So only a data plane that says the
-  // sandbox is gone licenses the destroy below. A token is required for the
-  // container to be worth keeping: without one nothing can talk to Hands once
-  // it is back.
-  if (!health.ok && hasToken) {
-    const recovered = await recoverUnhealthyReuse(
-      kv,
-      sessionId,
-      info,
-      identity,
-      binding,
-      signal,
-    );
-    if (recovered) return recovered;
-  }
-
-  // The container is only this caller's to destroy when nothing is left running
-  // in it. A restarted Hands has an empty registry for reasons that say nothing
-  // about the sandbox, so the answer comes from the durable records over the
-  // exec channel -- and an unanswerable read keeps the container exactly as a
-  // nonzero count does. Either way the caller goes on to build a fresh sandbox,
-  // so nothing it can observe varies with which of the three it met.
-  const live = await mayDestroy(sessionId, identity, signal);
-  if (live.verdict === "clear") {
-    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
-    return null;
-  }
-  await retainInsteadOfDestroying(kv, sessionId, info, live);
-  return null;
+  return recoverOrRetainUnusableSandbox(a, info, identity, binding, health, hasToken);
 }
 
 /**

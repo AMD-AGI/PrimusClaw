@@ -96,8 +96,8 @@ read as absent; and on an absent `dag_handles`, which is a build whose census
 cannot see a DAG sandbox at all. **A successful read that is empty is not an
 abort** — an empty fleet is the true answer on a low-traffic deployment, and
 nothing to drain is not nothing readable. `inventory_rows` is what every step
-iterates instead of `.sessions[]`, deduplicated on the `(sandbox_name,
-namespace)` pair a rollback deletes by.
+iterates instead of `.sessions[]`, deduplicated on the provider-native deletion
+identity: sandbox name plus namespace, or workload id plus namespace.
 
 **One bounded read per sandbox**, so a single dropped packet is not recorded as
 a sandbox that failed to answer:

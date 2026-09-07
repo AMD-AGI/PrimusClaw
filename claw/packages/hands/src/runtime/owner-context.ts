@@ -31,17 +31,8 @@ export const OWNER_HEADER = "x-claw-owner";
 /** Header Brain stamps with the id of the single run making the call. */
 export const RUN_HEADER = "x-claw-run";
 
-/**
- * Header Brain stamps with the instant this run's own deadline falls.
- *
- * A shell's terminal outcome is kept until then, so a later turn of a run that
- * takes days still reads what happened rather than an absence. Absent or
- * malformed means no deadline, which retains for the sandbox's life -- never a
- * substituted constant, which would age a tombstone out under a run still using
- * it.
- */
+// Bounds result retention to the owning run; absent means the sandbox lifetime.
 export const DEADLINE_HEADER = "x-claw-deadline";
-
 
 /**
  * Owner used when the header is absent: an older Brain, a probe, a test, a
@@ -94,23 +85,13 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
-/**
- * The deadline as an instant, or absent.
- *
- * Normalised by substitution rather than repair: missing, malformed, or not a
- * future instant all become absent -- the named fallback, which retains for the
- * sandbox's life. Never partially parsed into a shorter window, since a window
- * shorter than the run that owns it ages a tombstone out while that run can
- * still ask about it, and an instant already past would fix one of zero length.
- */
+// Invalid values fail closed to the longer sandbox-lifetime retention window.
 export function normalizeDeadline(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
   const at = Date.parse(trimmed);
   return Number.isFinite(at) && at > nowMs() ? trimmed : undefined;
 }
-
-
 
 export function withCaller<T>(ctx: CallerContext, fn: () => T): T {
   return store.run(ctx, fn);

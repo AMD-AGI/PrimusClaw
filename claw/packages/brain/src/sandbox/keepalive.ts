@@ -1412,170 +1412,168 @@ export function lastVerdictForTest(identityPart: string): { fails: number; gone:
   return null;
 }
 
-async function tick(deps: KeepaliveDeps): Promise<void> {
-  const seenIdentities = new Set<string>();
+async function reconcileKeepaliveKeyspaces(kv: KV): Promise<void> {
   // Every sweep, not only at boot: an old replica writes the legacy key
   // throughout a rolling upgrade, after every new one has already scanned.
-  await reconcileReservedKeys(deps.kv).catch((err) => logger.error(
+  await reconcileReservedKeys(kv).catch((err) => logger.error(
     { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
   ));
   // After that migration and not before it: a pre-scheme replica's binding
   // sitting on a retention's key is moved to its canonical name there, which is
   // what frees the key this puts the retention back under.
-  await reassertRetentions(retentionStore(deps.kv)).catch((err) => logger.error(
+  await reassertRetentions(retentionStore(kv)).catch((err) => logger.error(
     { err: (err as Error)?.message }, "keepalive.retention_reassert_failed",
   ));
-  const census = await collectTargets(deps, seenIdentities);
-  const targets = census.targets;
-  const servable = await admitTargets(deps, targets, census.complete);
-  if (servable) dropUnadmitted(targets, servable);
+}
 
-  // Reap stale failCounts for sessions no longer tracked.
+function pruneSweepState(
+  targets: Map<string, RegisteredSandbox>,
+  seenIdentities: Set<string>,
+): void {
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
   }
-  // Same for the background-work bookkeeping, which is keyed by sandbox identity
-  // rather than by target: an identity the sweep no longer sees is one nothing
-  // will ask about again, and its cached answer would otherwise outlive the pod
-  // it was about.
-  // Keyed on what the sweep saw, not on what it decided to ping: an `idle`
-  // answer is exactly the case where the handle does not become a target, so
-  // reaping on targets threw away the answer at the end of every tick and asked
-  // again on the next one -- which is the load the cache exists to remove.
   for (const identity of [...bgProbeCache.keys(), ...bgUnknownStreak.keys()]) {
     if (!seenIdentities.has(identity)) forgetBackgroundWork(identity);
   }
-  // Generations outlive the two maps above on purpose -- a bumped generation is
-  // what discards an in-flight answer, so it has to survive the answer -- but
-  // only that long. forgetBackgroundWork writes an entry every time, including
-  // for identities it is forgetting, so a Brain that has seen a lot of
-  // sandboxes would keep one integer per sandbox it has ever seen, forever.
-  //
-  // With nothing in flight there is no token anyone still holds, so the entry
-  // can go entirely; a later probe under the same identity starts from 0 again
-  // with no stale answer able to match it. An identity still being probed keeps
-  // its entry and is collected on a later sweep.
   for (const identity of [...bgGeneration.keys()]) {
     if (!seenIdentities.has(identity) && !bgProbeInFlight.has(identity)) {
       bgGeneration.delete(identity);
     }
   }
+}
 
-  if (!targets.size) return;
-
-  const localCount = localRegistry.size;
-  const kvOnlyCount = targets.size - localCount;
-  logger.info(
-    { total: targets.size, local: localCount, kvOnly: kvOnlyCount,
-      sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
-    "keepalive.tick_scan",
-  );
-
-  // Rotated, so a sweep that cannot finish does not always give up on the same
-  // tail. Ordering is otherwise insertion order, which is stable across sweeps.
-  // Whatever the last sweep left unserved goes first, in the order it was
-  // deferred, and the rest follow. Resuming at a position -- or at one identity
-  // and falling back to the front when it has gone -- lets an arrival or a
-  // departure put an already-served target ahead of a waiting one, repeatedly,
-  // which is what makes the deferral count unbounded.
-  const ordered = [...targets.entries()];
+function orderedPingTargets(
+  targets: Map<string, RegisteredSandbox>,
+): Array<readonly [string, RegisteredSandbox]> {
+  // Deferred targets lead the next sweep so repeated budget exhaustion stays fair.
   const waiting = pingDeferred.filter((key) => targets.has(key));
   const waitingSet = new Set(waiting);
-  const rotated = [
+  return [
     ...waiting.map((key) => [key, targets.get(key)!] as const),
-    ...ordered.filter(([key]) => !waitingSet.has(key)),
+    ...[...targets.entries()].filter(([key]) => !waitingSet.has(key)),
   ];
+}
+
+async function pingSandbox(
+  deps: KeepaliveDeps,
+  targetKey: string,
+  target: RegisteredSandbox,
+): Promise<KeepaliveFailure | null> {
+  const { sessionId, entry } = target;
+  const isAgent = entry.provider === "agent-sandbox";
+  if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return null;
+
+  try {
+    if (isAgent) {
+      await getAgentSandboxProvider().get({
+        provider: "agent-sandbox",
+        id: entry.sessionId!,
+        sandboxName: entry.sandboxName ?? "",
+        namespace: entry.namespace ?? "",
+        handsBaseUrl: "",
+        userId: entry.userId,
+      });
+    } else {
+      await getSafeWorkloadProvider().exec({
+        provider: "safe-workload",
+        id: entry.workloadId!,
+        sandboxName: entry.workloadId!,
+        namespace: entry.namespace ?? "",
+        handsBaseUrl: "",
+        platformKey: entry.platformKey!,
+      }, "date -Iseconds > /tmp/keepalive_ts", "15s");
+    }
+    failCounts.delete(targetKey);
+    const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
+    if (existing) {
+      try {
+        const recorded = JSON.parse(existing.value) as HandsKvEntry;
+        if (sameRegisteredSandbox(entry, recorded)) {
+          await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+        }
+      } catch (err) {
+        logger.warn({ err, sessionId }, "keepalive.kv_refresh_failed");
+      }
+    }
+    logger.info(
+      { sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId },
+      "keepalive.ping",
+    );
+    return null;
+  } catch (error: any) {
+    if (error?.sandboxConfirmedRunning === true) {
+      failCounts.delete(targetKey);
+      logger.error(
+        { err: error?.message || String(error), sessionId, workloadId: entry.workloadId },
+        "keepalive.router_failed_for_running_sandbox",
+      );
+      return null;
+    }
+    return { targetKey, sessionId, entry, error, gone: error?.sandboxGone === true };
+  }
+}
+
+interface PingPhaseResult {
+  deferred: number;
+  deferredNow: string[];
+  failures: KeepaliveFailure[];
+  orderedCount: number;
+  pinged: number;
+}
+
+async function runPingPhase(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<PingPhaseResult> {
+  const ordered = orderedPingTargets(targets);
   const clock = deps.now ?? Date.now;
   const pingDeadline = clock() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
   let pinged = 0;
   let deferred = 0;
   const failures: KeepaliveFailure[] = [];
-
   const deferredNow: string[] = [];
-  await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
-    // Checked as each target is picked up, so this bounds when a ping may
-    // start, not when the phase ends: the pings already running continue past
-    // the deadline. See PING_PHASE_BUDGET_MS.
+  await forEachWithLimit(ordered, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
     if (clock() >= pingDeadline) {
       deferred += 1;
       deferredNow.push(targetKey);
       return;
     }
     pinged += 1;
-    const { sessionId, entry } = target;
-    const isAgent = entry.provider === "agent-sandbox";
-    if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return;
-
-    try {
-      if (isAgent) {
-        // agent-sandbox: GET /sessions/{id} refreshes lastActivity (design §16.6),
-        // preventing the sandbox's idle GC from reaping an active session.
-        await getAgentSandboxProvider().get({
-          provider: "agent-sandbox",
-          id: entry.sessionId!,
-          sandboxName: entry.sandboxName ?? "",
-          namespace: entry.namespace ?? "",
-          handsBaseUrl: "",
-          userId: entry.userId,
-        });
-      } else {
-        // safe-workload: exec a no-op to refresh SaFE Workload Manager lastActivity.
-        await getSafeWorkloadProvider().exec({
-          provider: "safe-workload",
-          id: entry.workloadId!,
-          sandboxName: entry.workloadId!,
-          namespace: entry.namespace ?? "",
-          handsBaseUrl: "",
-          platformKey: entry.platformKey!,
-        }, "date -Iseconds > /tmp/keepalive_ts", "15s");
-      }
-      failCounts.delete(targetKey);
-      // Refresh KV TTL so the entry survives across Brain restarts. Read-through
-      // and write back to the key it was found under: a binding an old replica
-      // still holds under the legacy name would otherwise never be refreshed,
-      // and the live sandbox's record would expire underneath it.
-      const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
-      if (existing) {
-        try {
-          const recorded = JSON.parse(existing.value) as HandsKvEntry;
-          if (sameRegisteredSandbox(entry, recorded)) {
-            await deps.kv.update(existing.key, existing.entry.value, existing.revision);
-          }
-        } catch (err) {
-          logger.warn({ err, sessionId }, "keepalive.kv_refresh_failed");
-        }
-      }
-      logger.info({ sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId }, "keepalive.ping");
-    } catch (err: any) {
-      if (err?.sandboxConfirmedRunning === true) {
-        failCounts.delete(targetKey);
-        logger.error(
-          { err: err?.message || String(err), sessionId, workloadId: entry.workloadId },
-          "keepalive.router_failed_for_running_sandbox",
-        );
-        return;
-      }
-      // Collected, not decided here: whether a `gone` may evict depends on how
-      // many OTHER targets reported gone in the same sweep -- more than one is
-      // more likely a shared control-plane fault than simultaneous loss -- and
-      // that is only knowable once the sweep has finished.
-      failures.push({
-        targetKey, sessionId, entry, error: err,
-        gone: err?.sandboxGone === true,
-      } satisfies KeepaliveFailure);
-    }
+    const failure = await pingSandbox(deps, targetKey, target);
+    if (failure) failures.push(failure);
   });
 
-  // Advance past what was actually pinged, so the deferred tail leads the next
-  // sweep. Reported rather than silent: a sweep that cannot cover the fleet
-  // inside half a TTL is a capacity signal, and the failure it precedes -- a
-  // handle expiring un-pinged -- looks like nothing at all from the outside.
-  await handleKeepaliveFailures(failures, targets.size, clock);
+  return { deferred, deferredNow, failures, orderedCount: ordered.length, pinged };
+}
 
-  pingDeferred = deferredNow;
-  if (deferred > 0) {
+async function tick(deps: KeepaliveDeps): Promise<void> {
+  const seenIdentities = new Set<string>();
+  await reconcileKeepaliveKeyspaces(deps.kv);
+  const census = await collectTargets(deps, seenIdentities);
+  const targets = census.targets;
+  const servable = await admitTargets(deps, targets, census.complete);
+  if (servable) dropUnadmitted(targets, servable);
+  pruneSweepState(targets, seenIdentities);
+
+  if (!targets.size) return;
+
+  const localCount = localRegistry.size;
+  logger.info(
+    { total: targets.size, local: localCount, kvOnly: targets.size - localCount,
+      sessions: [...new Set([...targets.values()].map((target) => target.sessionId))] },
+    "keepalive.tick_scan",
+  );
+
+  const clock = deps.now ?? Date.now;
+  const phase = await runPingPhase(deps, targets);
+
+  await handleKeepaliveFailures(phase.failures, targets.size, clock);
+
+  pingDeferred = phase.deferredNow;
+  if (phase.deferred > 0) {
     logger.warn(
-      { pinged, deferred, total: ordered.length,
+      { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
         budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
       "keepalive.ping_budget_exhausted",
     );

@@ -2,26 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The fleet census every rollout gate and every rollback step iterates.
- *
- * Two ways it used to lie, both of which read as a smaller fleet rather than as
- * a failed read -- which is the direction that matters, because a step that
- * drains "everything it can see" then stops early.
- *
- * A record it could not decode was skipped and the answer still said `ok`, so a
- * corrupt row dropped a live sandbox out of both the listing and the count. An
- * unreadable record now fails the whole read: the count of them is reported so
- * an operator knows what to repair, but the answer is not `ok` and no step may
- * proceed on it. A row that parses but carries no usable identity is the same
- * failure wearing valid JSON -- nothing can be pinged or deleted by it -- and is
- * counted the same way.
- *
- * And it enumerated session keys only. A DAG node resolves its sandbox through
- * the handle map instead -- deliberately, because every node of a DAG shares one
- * session id and the session key holds whichever sandbox last wrote it -- so a
- * live DAG sandbox is absent from the session listing, or present only as a
- * stale sibling. Those rows are the other half of the fleet and are returned
- * beside it, keyed by the name and namespace a rollback actually deletes by.
+ * Complete fleet census used by rollout and rollback operations.
+ * Any unreadable or unusable record fails the census instead of shrinking it;
+ * session bindings and DAG handles are both included.
  */
 
 import type { HandleInfo } from "@claw/protocol";

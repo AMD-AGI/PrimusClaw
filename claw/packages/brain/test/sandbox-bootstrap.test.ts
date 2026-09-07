@@ -407,9 +407,11 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
   // here would be this path deciding the isolation posture for the deployment.
   const kept = {
     HANDS_CHILD_UID_MIN: process.env.HANDS_CHILD_UID_MIN,
+    HANDS_CHILD_UID_MAX: process.env.HANDS_CHILD_UID_MAX,
     HANDS_CHILD_ISOLATION: process.env.HANDS_CHILD_ISOLATION,
   };
   delete process.env.HANDS_CHILD_UID_MIN;
+  delete process.env.HANDS_CHILD_UID_MAX;
   delete process.env.HANDS_CHILD_ISOLATION;
   try {
     assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_CHILD"),
@@ -425,6 +427,5 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    delete process.env.HANDS_CHILD_UID_MAX;
   }
 });
