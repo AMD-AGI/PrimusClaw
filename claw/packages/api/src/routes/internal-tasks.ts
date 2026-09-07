@@ -174,9 +174,13 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
               -- take ownership hands the run back to a superseded attempt while
               -- the pair still names the live one -- whose next heartbeat is
               -- then refused for presenting a token the row no longer holds.
+              -- The pair fence admits its own delivery, so a settle leaves the
+              -- attempt's last running event still able to pass it; the spent
+              -- token is what refuses that one, as it does a late heartbeat.
               attempt_id          = CASE
                                       WHEN (delivery_seq, delivery_count)
                                              <= ($6::bigint, $7::bigint)
+                                       AND $5 IS DISTINCT FROM settled_attempt_id
                                       THEN COALESCE($5, attempt_id)
                                       ELSE attempt_id
                                     END,
@@ -185,6 +189,7 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
                                        AND attempt_id IS DISTINCT FROM $5
                                        AND (delivery_seq, delivery_count)
                                              <= ($6::bigint, $7::bigint)
+                                       AND $5 IS DISTINCT FROM settled_attempt_id
                                       THEN attempt_generation + 1
                                       ELSE attempt_generation
                                     END,

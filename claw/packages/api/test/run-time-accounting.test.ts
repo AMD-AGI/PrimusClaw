@@ -895,6 +895,50 @@ test("a running event the row has already moved past takes no ownership", async 
     "the late duplicate opens no third record either");
 });
 
+test("a running event for an attempt that already settled takes no ownership back", async () => {
+  // The pair fence is `<=`, so it admits an attempt's own delivery -- which is
+  // what lets a first running event adopt on a row whose pair is still the
+  // default. A settle does not move the pair, so the same attempt's delayed
+  // running event still passed it: `attempt_id` came back and a generation was
+  // spent on a run that had durably closed, leaving every attempt after it
+  // numbered one too high.
+  await seedRun(h, "ktsk-settleown", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { claim_count: 0, delivery_seq: 4, delivery_count: 1 };
+  await announceRunning("ktsk-settleown", "att-1", token);
+  assert.equal(await settleAttempt("ktsk-settleown", 0, undefined, true), 200);
+
+  const settledFence = await fenceOf("ktsk-settleown");
+  assert.equal(settledFence.attempt_id, null);
+  assert.equal(settledFence.attempt_generation, 1);
+
+  await announceRunning("ktsk-settleown", "att-1", token);
+
+  assert.deepEqual(await fenceOf("ktsk-settleown"), settledFence,
+    "the settled attempt's own delivery restores neither the id nor a generation");
+  const attempts = (await ledgerOf("ktsk-settleown"))!.attempts;
+  assert.equal(attempts.length, 1, "and it opens no second record beside the closed one");
+  assert.ok(attempts[0].endedAtDb, "which stays closed");
+});
+
+test("a new attempt after a settle still adopts, at the generation after the settled one", async () => {
+  await seedRun(h, "ktsk-settlenext", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-settlenext", "att-1", { claim_count: 0, delivery_seq: 4, delivery_count: 1 });
+  assert.equal(await settleAttempt("ktsk-settlenext", 0, undefined, true), 200);
+
+  await announceRunning("ktsk-settlenext", "att-2", { claim_count: 0, delivery_seq: 5, delivery_count: 2 });
+
+  const fence = await fenceOf("ktsk-settlenext");
+  assert.equal(fence.attempt_id, "att-2", "the fence is about the attempt that ended, not the run");
+  assert.equal(fence.attempt_generation, 2, "and the settled attempt spent no generation of its own");
+  assert.deepEqual([fence.delivery_seq, fence.delivery_count], [5, 2]);
+  assert.deepEqual(
+    (await ledgerOf("ktsk-settlenext"))!.attempts.map((a) => a.attemptId), ["att-1", "att-2"]);
+});
+
 test("a new attempt closes the record the one before it left open", async () => {
   // The fat path's retry is a JetStream redelivery: no release endpoint runs, so
   // nothing closed the dying attempt's record. The next attempt's allocating
