@@ -7,7 +7,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -36,6 +35,7 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
@@ -65,7 +65,7 @@ func checkAuthPosture(cfg *router.Config) error {
 		return fmt.Errorf("authentication is disabled: set ENABLE_AUTH=true together with " +
 			"SAFE_API_URL, or acknowledge the risk explicitly with ALLOW_INSECURE_NO_AUTH=true")
 	}
-	slog.Warn("AUTHENTICATION IS DISABLED (ALLOW_INSECURE_NO_AUTH=true): any client that can " +
+	log.Warn("AUTHENTICATION IS DISABLED (ALLOW_INSECURE_NO_AUTH=true): any client that can " +
 		"reach the Router or Workload Manager can create sandboxes and execute code inside them. " +
 		"Never use this configuration outside an isolated development cluster.")
 	return nil
@@ -109,6 +109,13 @@ func main() {
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
 	flag.Parse()
 
+	// controller-runtime keeps zap here, deliberately: switching it to the
+	// shared handler changes the format of every line this binary emits, and
+	// whatever ingests those lines was not part of this change. envd, which
+	// has no such consumer, calls log.Install.
+	//
+	// This is about where records go. Escaping happens in logx before any
+	// logger is called, so it is unaffected -- see pkg/log.
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	if v := os.Getenv("AGENT_SANDBOX_NAMESPACE"); v != "" {
@@ -162,7 +169,7 @@ func main() {
 	wmCfg.SafeAPIURL = routerCfg.SafeAPIURL
 
 	if err := checkAuthPosture(&routerCfg); err != nil {
-		slog.Error("insecure configuration refused", "error", err)
+		log.Error("insecure configuration refused", "error", err)
 		os.Exit(1)
 	}
 
@@ -180,19 +187,19 @@ func main() {
 		LeaderElectionID:       "agent-sandbox-controlplane.agent-sandbox.io",
 	})
 	if err != nil {
-		slog.Error("unable to create manager", "error", err)
+		log.Error("unable to create manager", "error", err)
 		os.Exit(1)
 	}
 
 	st, err := store.NewFromEnv()
 	if err != nil {
-		slog.Error("failed to initialize store", "error", err)
+		log.Error("failed to initialize store", "error", err)
 		os.Exit(1)
 	}
 	defer st.Close()
 
 	if err := st.Ping(ctx); err != nil {
-		slog.Error("store ping failed", "error", err)
+		log.Error("store ping failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -202,13 +209,13 @@ func main() {
 		if rs, ok := st.(*store.RedisStore); ok {
 			auditStore = audit.NewRedisStore(rs.Client(), wmCfg.Audit.RetentionDays)
 		} else {
-			slog.Warn("audit logging requires Redis store; disabled in memory mode")
+			log.Warn("audit logging requires Redis store; disabled in memory mode")
 		}
 	}
 
 	clientset, err := kubernetes.NewForConfig(k8sCfg)
 	if err != nil {
-		slog.Error("failed to create K8s clientset", "error", err)
+		log.Error("failed to create K8s clientset", "error", err)
 		os.Exit(1)
 	}
 
@@ -216,13 +223,13 @@ func main() {
 
 	dynamicClient, err := dynamic.NewForConfig(k8sCfg)
 	if err != nil {
-		slog.Error("failed to create dynamic client", "error", err)
+		log.Error("failed to create dynamic client", "error", err)
 		os.Exit(1)
 	}
 	dynamicFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
 	crdInformers := workloadmanager.NewCRDInformers(dynamicFactory)
 	if err := crdInformers.RunAndWaitForCacheSync(ctx); err != nil {
-		slog.Error("CRD informer cache sync failed", "error", err)
+		log.Error("CRD informer cache sync failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -234,7 +241,7 @@ func main() {
 		Tracer: tracer,
 		Audit:  auditStore,
 	}).SetupWithManager(mgr); err != nil {
-		slog.Error("unable to setup Sandbox controller", "error", err)
+		log.Error("unable to setup Sandbox controller", "error", err)
 		os.Exit(1)
 	}
 
@@ -245,14 +252,14 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("sandboxclaim-controller"),
 			Tracer:   tracer,
 		}).SetupWithManager(mgr); err != nil {
-			slog.Error("unable to setup SandboxClaim controller", "error", err)
+			log.Error("unable to setup SandboxClaim controller", "error", err)
 			os.Exit(1)
 		}
 
 		if err := (&extensionscontrollers.SandboxWarmPoolReconciler{
 			Client: mgr.GetClient(),
 		}).SetupWithManager(mgr); err != nil {
-			slog.Error("unable to setup SandboxWarmPool controller", "error", err)
+			log.Error("unable to setup SandboxWarmPool controller", "error", err)
 			os.Exit(1)
 		}
 	}
@@ -261,7 +268,7 @@ func main() {
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		slog.Error("unable to setup CodeInterpreter controller", "error", err)
+		log.Error("unable to setup CodeInterpreter controller", "error", err)
 		os.Exit(1)
 	}
 
@@ -271,7 +278,7 @@ func main() {
 		Store:  st,
 	}
 	if err := wmSandboxReconciler.SetupWithManager(mgr); err != nil {
-		slog.Error("unable to setup session Sandbox controller", "error", err)
+		log.Error("unable to setup session Sandbox controller", "error", err)
 		os.Exit(1)
 	}
 
@@ -283,16 +290,16 @@ func main() {
 		Audit:          auditStore,
 		Recorder:       mgr.GetEventRecorderFor("sandbox-idle-gc"),
 	}).SetupWithManager(mgr); err != nil {
-		slog.Error("unable to setup idle GC controller", "error", err)
+		log.Error("unable to setup idle GC controller", "error", err)
 		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		slog.Error("unable to set up health check", "error", err)
+		log.Error("unable to set up health check", "error", err)
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		slog.Error("unable to set up ready check", "error", err)
+		log.Error("unable to set up ready check", "error", err)
 		os.Exit(1)
 	}
 
@@ -319,18 +326,18 @@ func main() {
 		// Registered against the cache the controllers already fill, so this costs
 		// no extra watch; without the index the lookup falls back to listing.
 		if err := workloadmanager.IndexSandboxesBySessionID(ctx, mgr.GetFieldIndexer()); err != nil {
-			slog.Warn("session-id index unavailable; recovery will list sandboxes instead", "error", err)
+			log.Warn("session-id index unavailable; recovery will list sandboxes instead", "error", err)
 		} else {
 			k8s.WithCachedReader(mgr.GetClient())
 		}
 		apiServer.WithK8s(k8s)
 	} else {
-		slog.Warn("K8s sandbox creator init failed; running in dev mode", "error", err)
+		log.Warn("K8s sandbox creator init failed; running in dev mode", "error", err)
 	}
 
 	routerServer, err := router.New(ctx, routerCfg, st, clientset)
 	if err != nil {
-		slog.Error("router init failed", "error", err)
+		log.Error("router init failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -348,19 +355,19 @@ func main() {
 
 	errCh := make(chan error, 3)
 	go func() {
-		slog.Info("router starting", "port", routerCfg.Port)
+		log.Info("router starting", "port", routerCfg.Port)
 		if err := routerServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
 			errCh <- fmt.Errorf("router: %w", err)
 		}
 	}()
 	go func() {
-		slog.Info("workload-manager API starting", "port", wmCfg.Port)
+		log.Info("workload-manager API starting", "port", wmCfg.Port)
 		if err := apiServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
 			errCh <- fmt.Errorf("workload-manager: %w", err)
 		}
 	}()
 	go func() {
-		slog.Info("controller manager starting", "metrics", metricsAddr, "probe", probeAddr)
+		log.Info("controller manager starting", "metrics", metricsAddr, "probe", probeAddr)
 		if err := mgr.Start(ctx); err != nil {
 			errCh <- fmt.Errorf("manager: %w", err)
 		}
@@ -368,9 +375,9 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		slog.Info("controlplane shutdown complete")
+		log.Info("controlplane shutdown complete")
 	case err := <-errCh:
-		slog.Error("controlplane exited with error", "error", err)
+		log.Error("controlplane exited with error", "error", err)
 		cancel()
 		os.Exit(1)
 	}

@@ -23,11 +23,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -92,7 +92,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	klog.V(2).Infof("SandboxReconciler: sandbox %s/%s is Running", sandbox.Namespace, sandbox.Name)
+	log.V(2).Infof("SandboxReconciler: sandbox %s/%s is Running", sandbox.Namespace, sandbox.Name)
 
 	// ── 1. Notify watcher (existing behavior) ────────────────────────────
 	r.mu.Lock()
@@ -105,16 +105,16 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if exists {
 		select {
 		case ch <- SandboxStatusUpdate{Sandbox: sandbox}:
-			klog.V(2).Infof("SandboxReconciler: notified waiter for %s/%s", sandbox.Namespace, sandbox.Name)
+			log.V(2).Infof("SandboxReconciler: notified waiter for %s/%s", sandbox.Namespace, sandbox.Name)
 		default:
-			klog.Warningf("SandboxReconciler: channel full or no receiver for %s/%s", sandbox.Namespace, sandbox.Name)
+			log.Warnf("SandboxReconciler: channel full or no receiver for %s/%s", sandbox.Namespace, sandbox.Name)
 		}
 	}
 
 	// ── 2. Auto-register session in Redis ────────────────────────────────
 	if r.Store != nil {
 		if err := r.ensureSessionRegistered(ctx, sandbox); err != nil {
-			klog.Warningf("SandboxReconciler: session auto-register failed for %s/%s: %v",
+			log.Warnf("SandboxReconciler: session auto-register failed for %s/%s: %v",
 				sandbox.Namespace, sandbox.Name, err)
 		}
 	}
@@ -190,7 +190,7 @@ func (r *SandboxReconciler) onSandboxDeleted(ctx context.Context, key types.Name
 	}
 	if info == nil || info.SandboxName != key.Name || info.Namespace != key.Namespace {
 		r.forgetSession(key)
-		klog.Infof("SandboxReconciler: session %s now points at another sandbox; leaving it alone", sessionID)
+		log.Infof("SandboxReconciler: session %s now points at another sandbox; leaving it alone", sessionID)
 		return nil
 	}
 
@@ -198,7 +198,7 @@ func (r *SandboxReconciler) onSandboxDeleted(ctx context.Context, key types.Name
 		return fmt.Errorf("deregister session %s of deleted sandbox %s: %w", sessionID, key, err)
 	}
 	r.forgetSession(key)
-	klog.Infof("SandboxReconciler: deregistered session %s for deleted sandbox %s", sessionID, key)
+	log.Infof("SandboxReconciler: deregistered session %s for deleted sandbox %s", sessionID, key)
 	return nil
 }
 
@@ -220,7 +220,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 	if sessionID == "" {
 		sessionID = generateSessionID()
 		needsPatch = true
-		klog.V(2).Infof("SandboxReconciler: generated session-id %s for %s/%s",
+		log.V(2).Infof("SandboxReconciler: generated session-id %s for %s/%s",
 			sessionID, sandbox.Namespace, sandbox.Name)
 	}
 
@@ -230,7 +230,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 
 	// Check if Redis already has this session (e.g. created via API path).
 	if _, err := r.Store.GetSandboxBySessionID(ctx, sessionID); err == nil {
-		klog.V(4).Infof("SandboxReconciler: session %s already registered, skipping", sessionID)
+		log.V(4).Infof("SandboxReconciler: session %s already registered, skipping", sessionID)
 		return nil
 	}
 
@@ -262,7 +262,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
 			return fmt.Errorf("patch sandbox defaults: %w", err)
 		}
-		klog.V(2).Infof("SandboxReconciler: patched defaults onto %s/%s (session=%s, shutdown=%v)",
+		log.V(2).Infof("SandboxReconciler: patched defaults onto %s/%s (session=%s, shutdown=%v)",
 			sandbox.Namespace, sandbox.Name, sessionID, defaultShutdown)
 	}
 
@@ -305,7 +305,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		return fmt.Errorf("store session: %w", err)
 	}
 
-	klog.Infof("SandboxReconciler: session %s registered for %s/%s (addr=%s)",
+	log.Infof("SandboxReconciler: session %s registered for %s/%s (addr=%s)",
 		sessionID, sandbox.Namespace, sandbox.Name, podAddr)
 	return nil
 }
@@ -341,7 +341,7 @@ func (r *SandboxReconciler) WatchSandboxOnce(_ context.Context, namespace, name 
 		r.watchers = make(map[types.NamespacedName]chan SandboxStatusUpdate)
 	}
 	r.watchers[key] = ch
-	klog.V(2).Infof("SandboxReconciler: registered watcher for %s/%s", namespace, name)
+	log.V(2).Infof("SandboxReconciler: registered watcher for %s/%s", namespace, name)
 	return ch
 }
 

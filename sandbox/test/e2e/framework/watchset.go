@@ -13,7 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/klog/v2"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // Subscription represents a subscription to events from a ResourceWatch.
@@ -254,7 +255,7 @@ func (rw *ResourceWatch) broadcast(event watch.Event) {
 			name = typedObject.GetName()
 			namespace = typedObject.GetNamespace()
 		} else {
-			klog.Warningf("broadcast: event object does not implement metav1.Object")
+			log.Warnf("broadcast: event object does not implement metav1.Object")
 		}
 	}
 

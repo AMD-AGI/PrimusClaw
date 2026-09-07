@@ -10,13 +10,13 @@
 package workloadmanager
 
 import (
-	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"sigs.k8s.io/agent-sandbox/pkg/api"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 )
 
@@ -25,23 +25,7 @@ const (
 	UserIDHeader = "userId"
 	// UserNameHeader is the header carrying the verified user name (SaFE camelCase convention).
 	UserNameHeader = "userName"
-
-	// maxLoggedValueLen caps a single request-derived value in a log record.
-	maxLoggedValueLen = 256
 )
-
-// forLog makes a request-derived value safe to place in a log record. Client IP
-// (X-Forwarded-For), user ID and request path are all caller-controlled bytes:
-// a newline in one of them forges a second, fully-formed log line, and an
-// unbounded one pushes real records out of a size-capped log.
-func forLog(v string) string {
-	if len(v) > maxLoggedValueLen {
-		v = v[:maxLoggedValueLen] + "...(truncated)"
-	}
-	v = strings.ReplaceAll(v, "\n", "\\n")
-	v = strings.ReplaceAll(v, "\r", "\\r")
-	return v
-}
 
 // safeAuthMiddleware verifies a SaFE cookie or API key on every /v1/ request.
 // Caller-supplied identity and role headers are overwritten only after the
@@ -58,9 +42,9 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 			userType, _ := c.Cookie("userType")
 			user, verifyErr := s.safeClient.VerifyCookie(c.Request.Context(), tokenCookie, userType)
 			if verifyErr != nil {
-				slog.Warn("WM: SaFE cookie verification failed",
+				log.Warn("WM: SaFE cookie verification failed",
 					"error", verifyErr,
-					"remote_addr", forLog(c.ClientIP()),
+					"remote_addr", c.ClientIP(),
 				)
 				c.JSON(http.StatusUnauthorized, gin.H{
 					"error": "cookie verification failed: invalid or expired credential",
@@ -102,9 +86,9 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 
 		user, err := s.safeClient.VerifyAPIKey(c.Request.Context(), token)
 		if err != nil {
-			slog.Warn("WM: SaFE API Key verification failed",
+			log.Warn("WM: SaFE API Key verification failed",
 				"error", err,
-				"remote_addr", forLog(c.ClientIP()),
+				"remote_addr", c.ClientIP(),
 			)
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "API key verification failed: " + err.Error(),
@@ -117,10 +101,10 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 		c.Request.Header.Set(api.SandboxApiKeyHeader, token)
 		setVerifiedUser(c, user)
 
-		slog.Debug("WM: SaFE auth OK",
-			"userId", forLog(user.UserID),
+		log.Debug("WM: SaFE auth OK",
+			"userId", user.UserID,
 			"role", resolveRoleFromSaFERoles(user.Roles),
-			"path", forLog(c.Request.URL.Path),
+			"path", c.Request.URL.Path,
 		)
 
 		c.Next()

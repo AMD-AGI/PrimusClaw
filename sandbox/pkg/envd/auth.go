@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +18,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -118,7 +119,7 @@ func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 		)
 
 		if err != nil || !token.Valid {
-			slog.Warn("JWT validation failed", "error", err)
+			log.Warn("JWT validation failed", "error", err)
 			http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
 			return
 		}
@@ -136,12 +137,12 @@ func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 		localSessionIDBytes, readErr := os.ReadFile(sessionIDFile)
 		localSessionID := strings.TrimSpace(string(localSessionIDBytes))
 		if readErr != nil || localSessionID == "" {
-			slog.Warn("Pod session identity unavailable", "error", readErr)
+			log.Warn("Pod session identity unavailable", "error", readErr)
 			http.Error(w, `{"error":"sandbox identity unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
 		if tokenSessionID == "" || tokenSessionID != localSessionID {
-			slog.Warn("JWT session binding failed")
+			log.Warn("JWT session binding failed")
 			http.Error(w, `{"error":"token is not valid for this sandbox"}`, http.StatusForbidden)
 			return
 		}
