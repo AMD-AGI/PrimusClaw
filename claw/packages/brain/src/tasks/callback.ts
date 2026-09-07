@@ -24,7 +24,6 @@ export class AgentDoneDeliveryError extends Error {
 
 interface AgentDoneBody {
   task_id?: string;
-  /** This attempt's final per-state totals; see {@link LeaseRenewal.runTime}. */
   run_time?: RunTimeReport;
   final_text?: string;
   captures?: Record<string, string>;
@@ -104,9 +103,8 @@ export async function postTaskRunning(
         // that never reports running has no sandbox to attribute anyway.
         brain_id: ownership.brainId || undefined,
         sandbox_workload_id: ownership.sandboxWorkloadId || undefined,
-        // The row allocates this attempt's generation from these, on a write
-        // that is already best-effort: accounting must never be a reason a run
-        // fails to execute, and the first renewal adopts the token if it is lost.
+        // Best-effort like the write around it: a lost allocation is adopted
+        // by the first renewal rather than costing the run its execution.
         attempt_id: ownership.attempt?.attemptId,
         claim_count: ownership.attempt?.claimCount,
         delivery_seq: ownership.attempt?.deliverySeq,
@@ -131,18 +129,14 @@ export async function postTaskRunning(
 }
 
 /**
- * Which attempt of a run is speaking. `lease_owner` cannot say -- it is the pod
- * name -- and neither half here can alone: a claim advances `claim_count`, a
- * fat redelivery advances the pair. Together they are monotone.
+ * Which attempt of a run is speaking. Neither half is monotone alone: a claim
+ * advances `claimCount`, a fat redelivery advances the delivery pair.
  */
 export interface RunAttemptToken {
   /** Minted by this attempt, so the row can fence a heartbeat that outlived it. */
   attemptId: string;
-  /** The row's own claim generation; 0 on the fat path, which takes no claim. */
   claimCount: number;
-  /** JetStream `msg.seq`; 0 on the doorbell path, which has no delivery. */
   deliverySeq: number;
-  /** JetStream `msg.info.deliveryCount`; 0 likewise. */
   deliveryCount: number;
 }
 
@@ -158,10 +152,7 @@ export interface LeaseRenewal {
   waits: number;
   /** Fences this renewal against the attempt the row currently holds. */
   attempt: RunAttemptToken;
-  /**
-   * This attempt's running per-state totals, or absent for a tick that closed
-   * no interval -- the opening one, which has nothing to report yet.
-   */
+  /** Absent for the opening tick, which has closed no interval to report. */
   runTime?: RunTimeReport;
 }
 
@@ -423,9 +414,8 @@ export async function postAgentDone(
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
-    // The attempt's last word on its own time, merged in the same transaction
-    // as the terminal transition: what a terminal path with no reporter leaves
-    // uncovered stays unbanked rather than being attributed to a state.
+    // Merged in the same transaction as the terminal transition; what no
+    // report covered stays unbanked rather than attributed to a state.
     run_time: runTime,
     ...platformFields(result),
   };

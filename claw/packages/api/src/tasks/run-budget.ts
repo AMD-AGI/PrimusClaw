@@ -120,9 +120,7 @@ export const RUN_BUDGET_DEFAULT_SEC: Record<RunScope, number> = {
  */
 export const RUN_BUDGET_BACKSTOP_GRACE_SEC = envSec("RUN_BUDGET_BACKSTOP_GRACE_SEC", 5 * 60);
 
-// Not derived from the grace above: the two carry the same number and mean
-// unrelated things. Re-exported so it cannot drift from the bound the merge
-// enforces.
+// The same number as the grace above and unrelated to it; never fold the two.
 export { RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC } from "@claw/protocol";
 
 /**

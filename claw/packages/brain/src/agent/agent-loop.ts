@@ -221,11 +221,7 @@ export interface LoopOptions {
   hands?: HandsClient | null;
   /** Opens the sandbox for a run that deferred it; see ToolRouter.attachHands. */
   attachHands?: () => Promise<HandsClient>;
-  /**
-   * Identity this run is tracked under while it waits on something external,
-   * so the time can be attributed to it (see tasks/run-phase.ts). Absent means
-   * the caller failed to thread it, which the ledger reports as a miss.
-   */
+  /** Identity this run is tracked under while it waits; see tasks/run-phase.ts. */
   runIdentity?: RunIdentity;
   /** Platform MCP clients (same map the parent is using), so sub-agents can
    *  reuse the parent's MCP connections without reconnecting. */
@@ -587,12 +583,8 @@ class AgentLoopRunner {
   private readonly userId?: string;
   private readonly sessionId?: string;
   private readonly depth: number;
-  /**
-   * A top-level run owns the pod's execution slot, so a wait can hand it back.
-   * A sub-agent runs inside the slot its parent already holds; parking there
-   * would return a slot this loop never acquired and admit work the pod did
-   * not intend to admit, so its waits are timed and nothing else.
-   */
+  /** A sub-agent runs inside the slot its parent holds, so its waits must not
+   *  park: that would hand back a slot this loop never acquired. */
   private readonly waitMode: WaitMode;
   private readonly rawMessageCount: number;
   private readonly session: LlmSession;
@@ -947,8 +939,6 @@ class AgentLoopRunner {
       await this.noteRecoveryExhausted(results, exhausted);
       return;
     }
-    // The run is repairing what it needs to keep executing, which is time it
-    // spends neither working nor waiting on anything outside itself.
     await whileRecovering(this.opts.runIdentity?.key, () => this.performSandboxRecovery(results));
   }
 

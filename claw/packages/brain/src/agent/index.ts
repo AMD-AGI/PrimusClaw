@@ -170,14 +170,7 @@ export interface ExecuteExtras {
    * reach /workspace, and never for a turn the model answers on its own.
    */
   attachHands?: () => Promise<HandsClient>;
-  /**
-   * Identity this run is tracked under in the phase ledger.
-   *
-   * Optional only because the whole interface is; the contract is that
-   * TaskRunner, the sole production producer, always sets it. Absence at this
-   * boundary is a wiring bug rather than a run without an identity, and the
-   * engine reports it as one instead of resolving a second time.
-   */
+  /** Optional only because this interface is: TaskRunner always sets it. */
   runIdentity?: RunIdentity;
 }
 
