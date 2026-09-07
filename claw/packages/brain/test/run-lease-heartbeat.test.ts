@@ -37,6 +37,7 @@ function fakeMsg() {
   return {
     verdicts,
     msg: {
+      seq: 7,
       info: { deliveryCount: 1 },
       ack() { verdicts.push("ack"); },
       nak(ms?: number) { verdicts.push(`nak:${ms ?? "none"}`); },
@@ -83,6 +84,12 @@ interface Renewal {
   phase: string;
   waitedMs: number;
   leaseSeconds: number;
+  attempt: {
+    attemptId: string;
+    claimCount: number;
+    deliverySeq: number;
+    deliveryCount: number;
+  };
 }
 
 async function runScenario(opts: {
@@ -159,6 +166,17 @@ test("a run with a lease claims it before it starts working", async () => {
   assert.ok(renewals.length >= 1, "the lease is taken up front");
   assert.equal(renewals[0].phase, "executing");
   assert.ok(renewals[0].leaseSeconds > 0);
+});
+
+test("B22 a fat-path renewal presents the row's non-null attempt token", async () => {
+  const { renewals } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+  });
+
+  assert.equal(renewals[0].attempt.claimCount, 0);
+  assert.equal(renewals[0].attempt.deliverySeq, 7);
+  assert.equal(renewals[0].attempt.deliveryCount, 1);
+  assert.ok(renewals[0].attempt.attemptId);
 });
 
 test("a run without a lease says nothing", async () => {
