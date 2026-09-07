@@ -121,6 +121,29 @@ test("a live session between messages still waits its idle window out", () => {
   );
 });
 
+test("recent background work extends the multi-node reclaim window", () => {
+  const now = Date.now();
+
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS,
+      workSeenAt: now,
+    }, now),
+    false,
+    "a current running verdict keeps the cluster while background work continues",
+  );
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
+      workSeenAt: now - MULTI_NODE_IDLE_RECLAIM_MS,
+    }, now),
+    true,
+    "the cluster is eligible once the whole reuse window has aged out",
+  );
+});
+
 test("a session with work in flight is never eligible, whatever else it says", () => {
   // keepalive is the only signal that no task is running, so no other field may
   // stand in for it -- including the deleted marker.

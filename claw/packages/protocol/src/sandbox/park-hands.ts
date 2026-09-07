@@ -98,3 +98,100 @@ export async function parkHandsHandle(
     return { outcome: "failed", error: err };
   }
 }
+
+/**
+ * What parking a handle whose run has ended managed to do.
+ *
+ * Separate from `ParkOutcome` rather than a widening of it: widening the shared
+ * type would make every existing exhaustive switch over it wrong.
+ */
+export type RunEndedParkOutcome = "parked" | "gone" | "skipped" | "superseded" | "failed";
+
+export interface RunEndedParkResult {
+  outcome: RunEndedParkOutcome;
+  /** Why nothing was written, when the outcome is "skipped". */
+  reason?: "not_ready" | "already_idle" | "other_sandbox" | "unreadable";
+  /** Present only when the outcome is "failed". */
+  error?: unknown;
+}
+
+/**
+ * Open a new idle period on a handle, in the one shape the sweep understands.
+ *
+ * Shared with Brain's `markHandsIdle` because the shape *is* the contract: the
+ * sweep reclaims on `keepalive`/`idleSince`, while the background-work verdict
+ * is matched to a period by `idleEpoch`/`idleRev` -- so a writer that sets the
+ * first pair and forgets the rest republishes the previous period's verdict as
+ * if it were about this one. `idleRev` is the half two periods cannot share:
+ * the bucket takes one write per revision, while a clock reading can repeat.
+ *
+ * `token` stays because the session is still alive and, unlike
+ * `parkHandsHandle`, this path must not revoke it. `handsUrl` stays in both
+ * paths; the background-work probe needs both values here.
+ */
+export function applyRunEndedIdleFields(
+  info: Record<string, unknown>,
+  now: number,
+  revision: number,
+): void {
+  info.keepalive = false;
+  info.idleSince = now;
+  info.idleEpoch = now;
+  info.idleRev = revision;
+  delete info.bgCheckedAt;
+  delete info.bgRunning;
+  delete info.bgEpoch;
+  delete info.bgIdleSince;
+  delete info.bgIdleRev;
+  delete info.bgRev;
+  delete info.workSeenAt;
+}
+
+/**
+ * Park the handle of a session whose last run ended with nobody left to finish it.
+ *
+ * A run whose worker went away never reaches Brain's in-process `markHandsIdle`,
+ * so the handle keeps `keepalive` set and the fleet pings the pod until the
+ * workload's absolute deadline; the reaper that closed the row is the one place
+ * that knows no worker is coming back for it.
+ *
+ * Three states are left alone, each of which would otherwise lose a live
+ * sandbox: one not `ready` belongs to an in-flight `ensureHands` that will
+ * write its own entry; one already `keepalive: false` has a reuse window that
+ * re-stamping `idleSince` would extend; one naming a different workload has
+ * been taken over by a newer sandbox. `expectWorkloadId` is compared only when
+ * both sides have one, matching `markHandsIdle`.
+ */
+export async function parkHandsAfterRun(
+  kv: RevisionedKv,
+  sessionId: string,
+  expectWorkloadId?: string | null,
+): Promise<RunEndedParkResult> {
+  const key = `hands.${sessionId}`;
+  try {
+    const entry = await kv.get(key);
+    if (!entry) return { outcome: "gone" };
+    let info: Record<string, unknown>;
+    try {
+      info = JSON.parse(new TextDecoder().decode(entry.value)) as Record<string, unknown>;
+    } catch {
+      // Unreadable ownership data is not evidence that no live sandbox is
+      // referenced; leave it for operator repair and the bucket's own TTL.
+      return { outcome: "skipped", reason: "unreadable" };
+    }
+    if (info.status !== "ready") return { outcome: "skipped", reason: "not_ready" };
+    if (info.keepalive === false) return { outcome: "skipped", reason: "already_idle" };
+    if (
+      expectWorkloadId && typeof info.workloadId === "string" && info.workloadId
+      && info.workloadId !== expectWorkloadId
+    ) {
+      return { outcome: "skipped", reason: "other_sandbox" };
+    }
+    applyRunEndedIdleFields(info, Date.now(), entry.revision);
+    await kv.update(key, new TextEncoder().encode(JSON.stringify(info)), entry.revision);
+    return { outcome: "parked" };
+  } catch (err) {
+    if (isRevisionConflict(err)) return { outcome: "superseded" };
+    return { outcome: "failed", error: err };
+  }
+}

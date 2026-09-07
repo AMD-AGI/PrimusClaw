@@ -815,8 +815,13 @@ export async function runSessionCleanup(
   const deadline = opts.budgetMs === undefined ? undefined : Date.now() + opts.budgetMs;
   const incomplete: string[] = [];
   let reachedFiles = false;
+  let started = false;
   for (const step of cleanupSteps(input, deadline)) {
-    if (pastDeadline(deadline)) {
+    // The budget bounds transitions between atomic steps. Always start the
+    // first one: a process can be descheduled after computing a short deadline,
+    // and skipping the tombstone would turn scheduler delay into an unsafe
+    // cleanup attempt that did no work at all.
+    if (started && pastDeadline(deadline)) {
       // Running out between steps is only worth retrying at once if the files
       // were reached. The five steps in front of them return true on a healthy
       // cluster without deleting anything, and the sweeper can hand a session
@@ -826,6 +831,7 @@ export async function runSessionCleanup(
       incomplete.push(reachedFiles ? BUDGET_EXHAUSTED : NO_PROGRESS);
       break;
     }
+    started = true;
     let outcome: StepOutcome = false;
     let failure: unknown;
     try {

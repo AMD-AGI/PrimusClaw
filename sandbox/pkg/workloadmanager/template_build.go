@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -17,6 +16,8 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // BuildPhase represents a single phase in the template build process.
@@ -482,7 +483,7 @@ func (c *K8sSandboxCreator) streamContainerLogsToChannel(ctx context.Context, po
 	})
 	logStream, err := logReq.Stream(ctx)
 	if err != nil {
-		slog.Debug("Failed to stream container logs", "pod", podName, "error", err)
+		log.Debug("Failed to stream container logs", "pod", podName, "error", err)
 		return
 	}
 	defer logStream.Close()

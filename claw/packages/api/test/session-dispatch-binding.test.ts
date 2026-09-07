@@ -20,6 +20,8 @@
  *   D5 a doorbell hard refusal rolls the session back and does not open a row
  *   D6 a doorbell soft queue returns a position and does not publish a wakeup
  *   D7 a doorbell whose wakeup cannot be published closes the queued row
+ *   D10 every success names the run row it opened
+ *   D11 no failure names a run row
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -335,4 +337,106 @@ test("D9 a compensation that could not run rolls back rather than guessing", asy
 
   assert.equal(result.kind, "publish_failed");
   assert.ok(rolledBack, "the session is handed back, which is the one thing still in reach");
+});
+
+// ── Which run the caller got ─────────────────────────────────────────────────
+//
+// A session owns many runs, so "dispatched" on its own does not tell a caller
+// which of them is the one it just asked for. Only the soft-queue branch used
+// to report the id, and it is the least common of the four; the ordinary
+// success handed back a message id and left the caller to guess from history.
+
+/** The run id under test, whichever path opens the row. */
+const OPENED = "ktsk_opened";
+
+/** A dispatch that gets as far as opening a row, on either path. */
+function readyToOpen(doorbell: boolean): void {
+  process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+  initUserEnvCrypto();
+  stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = doorbell;
+  sessionDispatchPorts.openChatRun =
+    (async () => ({ taskId: OPENED })) as typeof sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.publishTask = async () => {};
+}
+
+test("D10 the default path names the run row it opened", async () => {
+  readyToOpen(false);
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {
+    throw new Error("a dispatched turn must not roll back");
+  });
+
+  assert.equal(result.kind, "dispatched");
+  assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
+});
+
+test("D10b the doorbell path names the run row it opened", async () => {
+  readyToOpen(true);
+  sessionDispatchPorts.admit = async () => ({ kind: "admit" });
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {
+    throw new Error("a dispatched turn must not roll back");
+  });
+
+  assert.equal(result.kind, "dispatched");
+  assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
+});
+
+test("D10c a soft-queued run names its row", async () => {
+  readyToOpen(true);
+  sessionDispatchPorts.admit = async () => ({ kind: "queue", position: 2 });
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {
+    throw new Error("queued runs keep the session gate");
+  });
+
+  assert.equal(result.kind, "queued");
+  assert.equal(result.kind === "queued" ? result.runId : "", OPENED);
+});
+
+test("D10d a turn a worker already holds names the row the worker holds", async () => {
+  // The awkward success: the publish timed out, so this side never learnt it
+  // landed, but the compensation found the row claimed and declined. The turn
+  // is executing and the answer is `dispatched` -- with nothing to name it by,
+  // that is the one success a caller could not act on.
+  readyToOpen(false);
+  sessionDispatchPorts.publishTask = async () => { throw new Error("publish timed out"); };
+  sessionDispatchPorts.failChatRunDispatch =
+    (async () => "held") as typeof sessionDispatchPorts.failChatRunDispatch;
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {
+    throw new Error("a turn that is running must not roll back");
+  });
+
+  assert.equal(result.kind, "dispatched");
+  assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
+});
+
+test("D11 a refused turn names no run", async () => {
+  // There is no row to name: admission refused before one was opened. A run id
+  // here would send the caller polling a run that is never going to exist.
+  readyToOpen(true);
+  sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {});
+
+  assert.equal(result.kind, "rejected");
+  assert.ok(!("runId" in result), "a refusal must not hand back a run handle");
+});
+
+test("D11b a turn whose row was closed again names no run", async () => {
+  // The row existed and was compensated, which is the case a run id would be
+  // most misleading for: it names a row that is real, terminal, and was never
+  // the caller's turn running.
+  readyToOpen(false);
+  sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
+  sessionDispatchPorts.failChatRunDispatch =
+    (async () => "closed") as typeof sessionDispatchPorts.failChatRunDispatch;
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {});
+
+  assert.equal(result.kind, "publish_failed");
+  assert.ok(!("runId" in result), "nothing will execute it, so there is no run to poll");
 });

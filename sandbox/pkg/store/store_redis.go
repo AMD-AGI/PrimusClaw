@@ -8,10 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 const (
@@ -195,7 +196,7 @@ func (r *RedisStore) fetchInfos(ctx context.Context, sessionIDs []string) ([]*Sa
 		if err != nil {
 			skipped++
 			if skipped <= 3 {
-				slog.Warn("store: session expired or invalid", "id", id, "error", err)
+				log.Warn("store: session expired or invalid", "id", id, "error", err)
 			}
 			continue
 		}

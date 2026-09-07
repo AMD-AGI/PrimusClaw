@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/api"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
@@ -134,15 +134,15 @@ func New(cfg Config, st store.Store) *Server {
 	// Initialize SaFE API Key client (when auth is enabled)
 	if cfg.EnableAuth {
 		if cfg.SafeAPIURL == "" {
-			slog.Error("WM: --enable-auth requires --safe-api-url to be set")
+			log.Error("WM: --enable-auth requires --safe-api-url to be set")
 		} else {
 			s.safeClient = safe.NewClient(cfg.SafeAPIURL)
-			slog.Info("WM: SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
+			log.Info("WM: SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
 		}
 	}
 
 	if cfg.Inference.Enabled {
-		slog.Info("WM: unified inference gateway enabled",
+		log.Info("WM: unified inference gateway enabled",
 			"litellmEndpoint", cfg.Inference.LiteLLMEndpoint)
 	}
 
@@ -175,7 +175,7 @@ func (s *Server) emitAudit(ctx context.Context, event *audit.AuditEvent) {
 	}
 	audit.NormalizeEvent(event)
 	if err := s.auditStore.Store(ctx, event); err != nil {
-		slog.Warn("audit event store failed", "event_type", event.EventType,
+		log.Warn("audit event store failed", "event_type", event.EventType,
 			"session_id", event.SessionID, "error", err)
 	}
 }
@@ -199,7 +199,7 @@ func (s *Server) setupRoutes() {
 	// For requests proxied from Router (with X-User-Id header), the existing header is trusted.
 	if s.cfg.EnableAuth && s.safeClient != nil {
 		v1.Use(s.safeAuthMiddleware())
-		slog.Info("WM: SaFE API Key auth middleware enabled on /v1/ routes")
+		log.Info("WM: SaFE API Key auth middleware enabled on /v1/ routes")
 	}
 
 	// CodeInterpreter sandbox session endpoints (control plane)
@@ -258,7 +258,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("workload-manager listening", "port", s.cfg.Port)
+		log.Info("workload-manager listening", "port", s.cfg.Port)
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -278,11 +278,11 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) loggingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		slog.Info("request", "method", c.Request.Method, "path", c.Request.RequestURI,
+		log.Info("request", "method", c.Request.Method, "path", c.Request.RequestURI,
 			"clientIP", c.ClientIP(), "userAgent", c.Request.UserAgent(),
 			"userId", c.GetHeader(UserIDHeader), "userName", c.GetHeader(UserNameHeader))
 		c.Next()
-		slog.Info("response", "method", c.Request.Method, "path", c.Request.RequestURI,
+		log.Info("response", "method", c.Request.Method, "path", c.Request.RequestURI,
 			"status", c.Writer.Status(), "duration", time.Since(start))
 	}
 }
@@ -536,7 +536,7 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 		if createErr != nil {
 			// Rollback placeholder on failure
 			_ = s.store.DeleteSandboxBySessionID(c.Request.Context(), sessionID)
-			slog.Error("failed to create sandbox", "kind", kind, "name", req.Name, "error", createErr)
+			log.Error("failed to create sandbox", "kind", kind, "name", req.Name, "error", createErr)
 			if errors.Is(createErr, ErrTemplateNotFound) {
 				c.JSON(http.StatusNotFound, gin.H{
 					"error": fmt.Sprintf("%s %q not found in namespace %q", kind, req.Name, ns),
@@ -806,7 +806,7 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 		// This endpoint is polled every 60s per session, so a brief Redis blip
 		// would do that fleet-wide.
 		if !errors.Is(err, store.ErrNotFound) {
-			slog.Warn("session store unreadable; not rebuilding from the CR",
+			log.Warn("session store unreadable; not rebuilding from the CR",
 				"sessionId", sessionID, "error", err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session store unavailable"})
 			return
@@ -820,7 +820,7 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 		// same source the Router's recovery path uses.
 		recovered, recoverErr := s.recoverSessionRecord(c.Request.Context(), sessionID)
 		if recoverErr != nil {
-			slog.Warn("session lookup and recovery both failed",
+			log.Warn("session lookup and recovery both failed",
 				"sessionId", sessionID, "lookupError", err, "recoverError", recoverErr)
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
 			return
@@ -848,7 +848,7 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 	// reap sandboxes whose clients only poll the control plane.
 	now := time.Now()
 	if err := s.store.UpdateSessionLastActivity(c.Request.Context(), sessionID, now); err != nil {
-		slog.Warn("handleGetSandbox: failed to refresh last activity", "sessionId", sessionID, "error", err)
+		log.Warn("handleGetSandbox: failed to refresh last activity", "sessionId", sessionID, "error", err)
 	} else {
 		info.LastActivity = now
 	}
@@ -887,11 +887,11 @@ func (s *Server) recoverSessionRecord(ctx context.Context, sessionID string) (*s
 // a session that is demonstrably alive.
 func (s *Server) restoreRecoveredSession(ctx context.Context, info *store.SandboxInfo) {
 	if err := s.store.StoreSandbox(ctx, info); err != nil {
-		slog.Warn("recovered a session but could not re-store it",
+		log.Warn("recovered a session but could not re-store it",
 			"sessionId", info.SessionID, "sandbox", info.SandboxName, "error", err)
 		return
 	}
-	slog.Info("rebuilt a lost session record from the Sandbox annotations",
+	log.Info("rebuilt a lost session record from the Sandbox annotations",
 		"sessionId", info.SessionID, "sandbox", info.SandboxName)
 }
 
@@ -939,7 +939,7 @@ func (s *Server) handleRecoverSession(c *gin.Context) {
 	// Recover from K8s: find Sandbox with matching session-id annotation.
 	info, err := s.k8s.RecoverSessionFromK8s(c.Request.Context(), sessionID)
 	if err != nil {
-		slog.Warn("session recovery failed", "sessionId", sessionID, "error", err)
+		log.Warn("session recovery failed", "sessionId", sessionID, "error", err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found in store or K8s: " + err.Error()})
 		return
 	}
@@ -950,9 +950,9 @@ func (s *Server) handleRecoverSession(c *gin.Context) {
 
 	// Re-store recovered session in Redis (best-effort, Redis may still be down).
 	if storeErr := s.store.StoreSandbox(c.Request.Context(), info); storeErr != nil {
-		slog.Warn("failed to re-store recovered session in Redis", "sessionId", sessionID, "error", storeErr)
+		log.Warn("failed to re-store recovered session in Redis", "sessionId", sessionID, "error", storeErr)
 	} else {
-		slog.Info("session recovered from K8s and re-stored", "sessionId", sessionID, "sandbox", info.SandboxName)
+		log.Info("session recovered from K8s and re-stored", "sessionId", sessionID, "sandbox", info.SandboxName)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1041,7 +1041,7 @@ func (s *Server) gcOnce(ctx context.Context) {
 	// Idle timeout (sessionTimeout) is enforced per-sandbox by Agentd via K8s annotation.
 	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 100); err == nil {
 		for _, info := range expired {
-			slog.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)
+			log.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)
 			s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL)
 		}
 	}
@@ -1050,9 +1050,9 @@ func (s *Server) gcOnce(ctx context.Context) {
 	if s.auditStore != nil {
 		cutoff := now.AddDate(0, 0, -s.cfg.Audit.RetentionDays)
 		if deleted, err := s.auditStore.DeleteBefore(ctx, cutoff); err != nil {
-			slog.Warn("GC: audit cleanup failed", "error", err)
+			log.Warn("GC: audit cleanup failed", "error", err)
 		} else if deleted > 0 {
-			slog.Info("GC: cleaned up old audit events", "deleted", deleted)
+			log.Info("GC: cleaned up old audit events", "deleted", deleted)
 		}
 	}
 }
@@ -1077,7 +1077,7 @@ func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.Sandbo
 			err = s.k8s.DeleteSandbox(ctx, info)
 		}
 		if err != nil {
-			slog.Warn("GC: failed to delete K8s resource",
+			log.Warn("GC: failed to delete K8s resource",
 				"kind", info.Kind, "sandbox", info.SandboxName, "error", err)
 		}
 	}
@@ -1119,13 +1119,13 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 	public := req.Public
 	if public && !canWriteAll(c) {
 		public = false // silently downgrade
-		slog.Warn("non-admin tried to create public template, downgraded to private",
+		log.Warn("non-admin tried to create public template, downgraded to private",
 			"userId", currentUserID(c), "template", req.Name)
 	}
 
 	// If Dockerfile is provided, build image via kaniko and update fromImage.
 	if req.Dockerfile != "" && s.builder != nil {
-		slog.Info("building custom image from Dockerfile", "template", req.Name)
+		log.Info("building custom image from Dockerfile", "template", req.Name)
 		buildResult, buildErr := s.builder.Build(c.Request.Context(), req.Name, req.Dockerfile)
 		if buildErr != nil {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
@@ -1133,7 +1133,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 			})
 			return
 		}
-		slog.Info("image built", "template", req.Name, "image", buildResult.Image,
+		log.Info("image built", "template", req.Name, "image", buildResult.Image,
 			"cached", buildResult.Cached, "duration", buildResult.Duration)
 		req.Spec.Template.FromImage = buildResult.Image
 	}
@@ -1159,7 +1159,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 	}
 
 	if warmPoolSize > 0 {
-		slog.Info("Template has warmPoolSize > 0, waiting for first WarmPool Pod",
+		log.Info("Template has warmPoolSize > 0, waiting for first WarmPool Pod",
 			"template", req.Name, "warmPoolSize", warmPoolSize)
 
 		buildResult, buildErr := s.k8s.WatchTemplateBuild(
@@ -1186,7 +1186,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		}
 		// buildResult is nil — something went wrong with the watch itself
 		if buildErr != nil {
-			slog.Warn("Template build watch failed, returning template without build_log",
+			log.Warn("Template build watch failed, returning template without build_log",
 				"template", req.Name, "error", buildErr)
 		}
 	}
@@ -1244,7 +1244,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	public := req.Public
 	if public && !canWriteAll(c) {
 		public = false
-		slog.Warn("non-admin tried to create public template (stream), downgraded to private",
+		log.Warn("non-admin tried to create public template (stream), downgraded to private",
 			"userId", currentUserID(c), "template", req.Name)
 	}
 
@@ -1534,7 +1534,7 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 
 		rsaPub := GetCachedRSAPublicKey()
 		if rsaPub == nil {
-			slog.Warn("internalJWTMiddleware: Router public key not yet cached")
+			log.Warn("internalJWTMiddleware: Router public key not yet cached")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Router public key not available yet"})
 			c.Abort()
 			return
@@ -1548,7 +1548,7 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 		}, jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithLeeway(time.Minute))
 
 		if err != nil || !token.Valid {
-			slog.Warn("internalJWTMiddleware: JWT validation failed", "error", err)
+			log.Warn("internalJWTMiddleware: JWT validation failed", "error", err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired JWT"})
 			c.Abort()
 			return
@@ -1589,7 +1589,7 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 		if errors.Is(err, store.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		} else {
-			slog.Warn("handleInternalPolicy: store error", "sessionId", sessionID, "error", err)
+			log.Warn("handleInternalPolicy: store error", "sessionId", sessionID, "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
 		}
 		return
@@ -1706,7 +1706,7 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	}
 
 	policyUpdateTotal.WithLabelValues(sessionID).Inc()
-	slog.Info("policy updated", "sessionId", sessionID, "version", info.PolicyVersion)
+	log.Info("policy updated", "sessionId", sessionID, "version", info.PolicyVersion)
 
 	c.JSON(http.StatusOK, gin.H{
 		"sessionId":            info.SessionID,

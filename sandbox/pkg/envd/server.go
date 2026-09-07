@@ -8,13 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 )
 
@@ -227,24 +227,24 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.auditReporter != nil {
 			go s.auditReporter.Run(ctx)
 		}
-		slog.Info("egress: init phase — adding envd-proxy supplementary group")
+		log.Info("egress: init phase — adding envd-proxy supplementary group")
 		if err := egress.AddEnvDProxyGroup(); err != nil {
 			return fmt.Errorf("egress add proxy group: %w", err)
 		}
 
-		slog.Info("egress: configuring iptables REDIRECT rules")
+		log.Info("egress: configuring iptables REDIRECT rules")
 		if err := egress.SetupIPTables(); err != nil {
 			return fmt.Errorf("egress iptables setup: %w", err)
 		}
 
-		slog.Info("egress: dropping CAP_NET_ADMIN and CAP_NET_RAW")
+		log.Info("egress: dropping CAP_NET_ADMIN and CAP_NET_RAW")
 		if err := egress.DropNetCapabilities(); err != nil {
-			slog.Warn("egress: capability drop failed (non-fatal in dev)", "error", err)
+			log.Warn("egress: capability drop failed (non-fatal in dev)", "error", err)
 		}
 
 		go func() {
 			if err := s.egressProxy.Run(ctx); err != nil {
-				slog.Error("egress: proxy exited with error", "error", err)
+				log.Error("egress: proxy exited with error", "error", err)
 			}
 		}()
 
@@ -253,7 +253,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.policyEngine != nil {
 			go func() {
 				// Wait for first request to capture session ID and JWT
-				slog.Info("egress: policy syncer waiting for session ID from first request...")
+				log.Info("egress: policy syncer waiting for session ID from first request...")
 				s.inference.waitForReady()
 				sid := s.inference.getSessionID()
 				jwt := s.inference.getJWTToken()
@@ -261,10 +261,10 @@ func (s *Server) Run(ctx context.Context) error {
 				if sid != "" && wmURL != "" {
 					syncer := NewPolicySyncer(s.policyEngine, s.egressProxy.SSRFChecker(), wmURL, sid, jwt)
 					s.policySyncer = syncer
-					slog.Info("egress: starting policy syncer", "sessionId", sid)
+					log.Info("egress: starting policy syncer", "sessionId", sid)
 					syncer.Run(ctx)
 				} else {
-					slog.Warn("egress: policy syncer not started (no session ID or WM URL)")
+					log.Warn("egress: policy syncer not started (no session ID or WM URL)")
 				}
 			}()
 		}
@@ -293,14 +293,14 @@ func (s *Server) Run(ctx context.Context) error {
 		if drain <= 0 {
 			drain = defaultShutdownDrainTimeout
 		}
-		slog.Info("envd: shutdown signal received, draining", "timeout", drain)
+		log.Info("envd: shutdown signal received, draining", "timeout", drain)
 
 		// Armed before the first step that can block, so the bound covers the whole
 		// shutdown instead of just the drain. Exit 0: this is a signalled stop that
 		// ran out of time, not a failure, and the log line above says what happened.
 		budget := drain + shutdownHardExitGrace
 		hardExit := time.AfterFunc(budget, func() {
-			slog.Error("envd: shutdown exceeded its budget, exiting anyway", "budget", budget)
+			log.Error("envd: shutdown exceeded its budget, exiting anyway", "budget", budget)
 			os.Exit(0)
 		})
 		defer hardExit.Stop()
@@ -320,7 +320,7 @@ func (s *Server) Run(ctx context.Context) error {
 			// A request outlived the drain -- a long agent command, typically.
 			// Closing it is the point: the listeners are already gone, so
 			// waiting longer serves nobody and only keeps PID 1 alive.
-			slog.Warn("envd: drain timed out, closing remaining connections", "error", err)
+			log.Warn("envd: drain timed out, closing remaining connections", "error", err)
 			// Close's own error is dropped rather than returned: reaching the bound
 			// is a successful shutdown, already reported on the line above, while
 			// main treats any non-nil error here as a failure and exits 1. Close can

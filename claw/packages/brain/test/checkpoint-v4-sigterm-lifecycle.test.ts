@@ -117,7 +117,7 @@ function stubSideEffects(): SideEffects {
     reapPendingHands: record(undefined),
     probeSandboxContainer: record("dead"),
     unregisterSandbox: (() => {}) as never,
-    markHandsIdle: (() => {}) as never,
+    markHandsIdle: (() => Promise.resolve({ outcome: "parked" })) as never,
     markRetryPending: record(undefined),
     syncWorkspaceToS3: record(
       { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
