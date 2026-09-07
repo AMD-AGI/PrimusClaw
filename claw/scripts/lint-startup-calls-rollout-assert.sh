@@ -115,7 +115,9 @@ seed_missing_call() {
 }
 
 # Moves the call below the first line matching $2, which is how a real rollback
-# regression looks: still present, still in main(), just too late.
+# regression looks: still present, still in main(), just too late. $2 must spell
+# metacharacters as bracket expressions: awk applies escape processing to a -v
+# assignment, and gawk drops the backslash of \( before the regex is compiled.
 seed_call_below() {
   awk -v anchor="$2" '
     /^[[:space:]]*assertRolloutConfigAtStartup\(/ && !moved { call = $0; moved = 1; next }
@@ -160,10 +162,10 @@ if [ "$mode" = "self-test" ]; then
   seed_missing_call "$tmp/missing.ts"
   reject_or_die "$tmp/missing.ts" "the assertRolloutConfigAtStartup() call removed"
 
-  seed_call_below "$tmp/below-listen.ts" 'app\.listen\('
+  seed_call_below "$tmp/below-listen.ts" 'app[.]listen[(]'
   reject_or_die "$tmp/below-listen.ts" "assertRolloutConfigAtStartup() moved below app.listen()"
 
-  seed_call_below "$tmp/below-admission.ts" '^[[:space:]]*assertAdmissionSettings\('
+  seed_call_below "$tmp/below-admission.ts" '^[[:space:]]*assertAdmissionSettings[(]'
   reject_or_die "$tmp/below-admission.ts" \
     "assertRolloutConfigAtStartup() moved below assertAdmissionSettings()"
 
