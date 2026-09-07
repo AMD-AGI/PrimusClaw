@@ -79,3 +79,16 @@ generalSettings: {}
 # Skip deploy.sh interactive /models discovery when using a router entry —
 # that prompt overwrites modelList from LITELLM_VALUES_FILE.
 modelList: []
+
+# Prometheus Operator ServiceMonitor for LiteLLM /metrics. Off by default
+# because the monitoring.coreos.com CRDs may not be installed. The proxy
+# requires the master key on that path; the template reads it from
+# secrets.existingSecret (or the chart-rendered Secret).
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  labels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+  relabelings: []
+  metricRelabelings: []

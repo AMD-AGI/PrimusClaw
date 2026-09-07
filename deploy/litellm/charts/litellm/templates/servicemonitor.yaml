@@ -1,0 +1,56 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+Prometheus Operator ServiceMonitor for the LiteLLM /metrics endpoint.
+
+LiteLLM serves Prometheus counters only in-process. Without a scrape object
+those series vanish on every pod restart, and the cluster TSDB never sees
+requested_model / api_base labels. The VictoriaMetrics Operator's Prometheus
+converter turns this ServiceMonitor into a VMServiceScrape.
+
+The path is /metrics/ with the trailing slash: /metrics returns 307 and
+Prometheus scrapes do not follow that redirect.
+
+The endpoint requires the proxy master key. bearerTokenSecret reads it from
+the same Secret the Deployment already mounts, so the token is not copied
+into this object.
+*/ -}}
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  {{- with .Values.serviceMonitor.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics/
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      bearerTokenSecret:
+        name: {{ include "litellm.secretName" . }}
+        key: master_key
+      {{- with .Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
