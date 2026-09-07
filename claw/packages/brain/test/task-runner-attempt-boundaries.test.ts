@@ -1,16 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * The attempt boundaries no callback passes through.
- *
- * Two of them. A claimed run that succeeds is a chat row, so `postAgentDone`
- * sends nothing and the wrapper's ack used to be a no-op. A fat delivery that
- * naks for a retry has no release endpoint at all -- JetStream simply redelivers
- * -- and its declaration was left in a map only the claimed wrapper ever reads.
- * Either way the attempt ended with its record open, its coverage unreported,
- * and, on the fat path, the row still holding that attempt's token and lease.
- */
+/** Verifies settlement at claimed-run acknowledgements and fat-run retries. */
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { KV } from "nats";

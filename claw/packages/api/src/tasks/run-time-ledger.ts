@@ -43,12 +43,7 @@ const READ_LEDGER_SQL = `
          delivery_count,
          heartbeat_at,
          queued_at,
-         -- Where this run became accounting-eligible, not where its latest queue
-         -- segment opened: queued_at is re-stamped on every requeue, so an entry
-         -- created after two of them would be anchored past the wait the row has
-         -- already banked and could never admit it. (No backticks: this whole
-         -- statement is a template literal.)
-         queued_at - (queued_ms_accrued * INTERVAL '1 millisecond') AS epoch_at,
+         run_time_epoch_at AS epoch_at,
          completed_at,
          clock_timestamp() AS read_at,
          queued_ms_accrued + (CASE WHEN status = 'queued'
@@ -252,12 +247,6 @@ export interface RunSettlement {
   closeAttempt?: boolean;
 }
 
-/**
- * Whether the row still holds the attempt a report was produced under.
- *
- * `lease_owner` cannot say: a claim restores a row to `preparing` under the
- * same pod name. Read in the same statement as the entry it would be banked to.
- */
 /** The statuses a live attempt renews from; a release leaves all of them. */
 const RENEWABLE_STATUSES = new Set(["preparing", "running", "cancelling"]);
 
@@ -269,6 +258,7 @@ export function isTerminal(row: LedgerRow): boolean {
   return row.completedAtDb !== null || !LIVE_STATUSES.has(row.status);
 }
 
+/** The attempt token is read with the entry it would be banked to. */
 export function reportIsCurrent(row: LedgerRow, report: RunTimeReport): boolean {
   if (row.claimCount !== report.claimCount) return false;
   if (row.deliverySeq !== report.deliverySeq || row.deliveryCount !== report.deliveryCount) {
@@ -316,10 +306,8 @@ export async function settleRunTime(
  */
 export async function settleTerminalRuns(limit = 200): Promise<number> {
   let settled = 0;
-  // Oldest first, and looped rather than one page: ordering newest-first meant
-  // a burst larger than one page pushed the same recent rows in front of the
-  // older ones every sweep, and the rows behind them were never pinned at all
-  // -- so their unbanked time grew for as long as the burst lasted.
+  // Oldest-first paging prevents a sustained burst of newer terminal rows from
+  // starving entries whose unbanked time has already been growing longest.
   for (let page = 0; page < MAX_SETTLE_PAGES; page++) {
     const found = await settleTerminalPage(limit);
     settled += found.settled;

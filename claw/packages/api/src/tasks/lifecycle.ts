@@ -337,7 +337,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
         input, prompt, script, depends_on, priority,
         executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
         sandbox_spec, callback_url, backend_mcp_url,
-        status, metadata, workspace_throwaway, queued_at)
+        status, metadata, workspace_throwaway, queued_at, run_time_epoch_at)
      SELECT $1, session_id, task_id, batch_id,
             dag_id, dag_node_id, dag_root_task_id, plugin_id, name,
             input, prompt, script, depends_on, priority,
@@ -359,6 +359,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             workspace_throwaway,
             -- Its wait starts now. Copying the original's stamp would age the
             -- replacement into the queue-timeout reap the moment it is written.
+            clock_timestamp(),
             clock_timestamp()
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],

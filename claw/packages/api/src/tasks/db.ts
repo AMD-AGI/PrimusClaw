@@ -90,7 +90,8 @@ export async function insertTask(
        name, input, prompt, script, depends_on, priority,
        executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
        sandbox_spec, callback_url, backend_mcp_url, internal_token_hash,
-       status, metadata, origin, workspace_id, workspace_throwaway, queued_at, started_at, deadline_at
+       status, metadata, origin, workspace_id, workspace_throwaway,
+       queued_at, run_time_epoch_at, started_at, deadline_at
      ) VALUES (
        $1, $2, $3, $4,
        $5, $6, $7, $8,
@@ -98,6 +99,7 @@ export async function insertTask(
        $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21::jsonb,
        $22::jsonb, $23, $24, $25,
        $26, $27::jsonb, $28, $29, $32,
+       CASE WHEN $26::text IN ('queued','preparing') THEN clock_timestamp() END,
        CASE WHEN $26::text IN ('queued','preparing') THEN clock_timestamp() END,
        CASE WHEN $26::text = 'preparing' THEN NOW() END,
        CASE WHEN $26::text = 'preparing' THEN ${deadlineAtInsertSql({
@@ -246,7 +248,10 @@ export async function applyTaskStatusTransition(
     throw new Error(`applyTaskStatusTransition: refusing unknown status '${chosen}'`);
   }
   const statusSql = chosen ? `'${chosen}'` : (next as { sql: string }).sql;
-  const sets: string[] = [QUEUE_ACCRUAL_SQL];
+  const sets: string[] = [
+    QUEUE_ACCRUAL_SQL,
+    "run_time_epoch_at = COALESCE(run_time_epoch_at, queued_at, clock_timestamp())",
+  ];
   const values: unknown[] = [];
   let i = 1;
   for (const [k, v] of Object.entries(opts.extra ?? {})) {

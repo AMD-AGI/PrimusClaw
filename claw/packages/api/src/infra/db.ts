@@ -373,17 +373,20 @@ function runColumnsSql(out: string[]): void {
   // function that writes `status`, so the total is complete without any
   // caller knowing the accounting exists.
   col("queued_ms_accrued", "BIGINT NOT NULL DEFAULT 0");
-  // An insert that omits `queued_at` -- retryTask clones a failed row into a
-  // fresh queued one and copies no stamp -- would otherwise open its segment
-  // at NULL, which the accrual reads as no queue time at all. Not NOT NULL:
-  // a row opening straight at `preparing` never queued, and that NULL is the
-  // honest answer.
+  // Stable across requeues, unlike queued_at, so a late-created ledger keeps
+  // the instant at which this run first became eligible for accounting.
+  col("run_time_epoch_at", "TIMESTAMPTZ");
 }
 
+/** Backfill the timing anchors older rows did not carry. */
 function queueAccrualSql(out: string[]): void {
+  // A queued insert that omits queued_at must still open a measurable segment.
+  // It stays nullable because a row can begin outside the queue.
   out.push("ALTER TABLE claw_tasks ALTER COLUMN queued_at SET DEFAULT clock_timestamp()");
   out.push(`UPDATE claw_tasks SET queued_at = created_at
         WHERE queued_at IS NULL AND status = 'queued'`);
+  out.push(`UPDATE claw_tasks SET run_time_epoch_at = queued_at
+        WHERE run_time_epoch_at IS NULL AND queued_at IS NOT NULL`);
 }
 
 async function ensureConcurrentIndex(

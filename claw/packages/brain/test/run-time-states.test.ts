@@ -1,15 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * A run is in exactly one state at a time.
- *
- * The ledger used to carry two: executing, and waiting-on-a-reason. With eight
- * the single-slot guard has to keep meaning what it meant -- entering a state
- * closes the previous one -- because the totals are what the row's wall-time
- * identity is built from, and two states accumulating at once would put the
- * sum above the run's own clock.
- */
+/** Verifies that a run accumulates in exactly one time state at once. */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {

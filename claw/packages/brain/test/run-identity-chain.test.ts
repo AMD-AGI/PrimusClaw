@@ -1,16 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * One identity, from TaskRunner through AgentEngine into the agent loop.
- *
- * Every ledger test before this one supplied the same string literal on both
- * sides, so the production mismatch -- the runner opening the entry under the
- * workspace lock key while the loop looked it up under
- * `dag_root_task_id || session_id` -- failed nothing. These drive the real
- * chain with four deliberately different values in the four fields a proxy
- * could be taken from, so any key that is not the run's own misses.
- */
+/** Drives one identity through TaskRunner, AgentEngine, and the agent loop. */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import type { JsMsg, KV } from "nats";

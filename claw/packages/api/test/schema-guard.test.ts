@@ -107,6 +107,11 @@ test("keeps claim_count required, since takeClaim increments it on every claim",
   assert.ok(tasks?.columns.includes("claim_count"));
 });
 
+test("keeps the run-time epoch required, since requeues overwrite queued_at", () => {
+  const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
+  assert.ok(tasks?.columns.includes("run_time_epoch_at"));
+});
+
 test("names the throwaway-workspace column, which every task insert writes", () => {
   // Not a column only the tasks that set it touch: insertTask names it in the
   // INSERT for every run, so a database missing it fails run creation outright.

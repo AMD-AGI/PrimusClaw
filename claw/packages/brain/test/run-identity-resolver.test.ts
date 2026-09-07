@@ -1,15 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * Which run a wait is attributed to, decided once and from the request alone.
- *
- * The resolver is the only place a ledger key is made, so every property the
- * ledger depends on is a property of this function: it is total, it never
- * reaches for a proxy, and two runs that differ get two keys. The cases that
- * matter are the ones the old scheme lost -- a chat turn with no task row, and
- * two turns dispatched inside one millisecond.
- */
+/** Verifies total, proxy-free identity resolution and per-run uniqueness. */
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ExecuteRequest } from "@claw/protocol";
@@ -32,9 +24,10 @@ test("T4.1 a chat turn with only a message id is assigned an identity of its own
   assert.equal(resolution.leaseShapeMiss, false);
 });
 
-test("T4.3 every combination of the two fields resolves, and to one of three sources", () => {
+test("T4.3 every combination resolves to a tracked entry and one of three sources", async () => {
   // Totality is the property that removes the third outcome: a run whose waits
   // go uncounted because the resolver had nothing to say about it.
+  const { beginRun, endRun, phaseOf, whileWaiting } = await import("../src/tasks/run-phase.js");
   const taskIds = [undefined, "", "t-1"];
   const messageIds = [undefined, "", "m-1"];
   for (const task_id of taskIds) {
@@ -45,6 +38,10 @@ test("T4.3 every combination of the two fields resolves, and to one of three sou
       assert.ok(SOURCES.has(identity.source), `unknown source for ${task_id}/${message_id}`);
       const expected = task_id ? "task_id" : message_id ? "message_id" : "unknown";
       assert.equal(identity.source, expected, `${task_id}/${message_id}`);
+      beginRun(identity.key);
+      await whileWaiting(identity.key, "background_command", "timed", async () => {});
+      assert.equal(phaseOf(identity.key).waits, 1, `uncounted wait for ${task_id}/${message_id}`);
+      endRun(identity.key);
     }
   }
 });

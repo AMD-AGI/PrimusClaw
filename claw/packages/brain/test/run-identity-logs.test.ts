@@ -1,16 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * What the ledger says when it cannot find a run, and when a run cannot be
- * identified.
- *
- * Nothing logged any of this before: a lookup that missed returned `fn()` and
- * `phaseOf` answered `executing` / `waitedMs: 0`, byte-identical to a run that
- * genuinely never waited. Asserted from a child process, whose stdout the
- * fixture funnels through one writer so a line's position here is the order the
- * run produced it in.
- */
+/** Verifies identity degradation and ledger misses through emitted logs. */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";

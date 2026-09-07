@@ -181,8 +181,6 @@ const expireLease = (taskId: string) => db.query(
   `UPDATE claw_tasks SET lease_expires_at = clock_timestamp() - INTERVAL '1 day'
     WHERE task_id = $1`, [taskId]);
 
-// ── AC1: the queue is banked by the table, whatever ends the segment ─────────
-
 test("AC1 a row that never sat in the queue banks nothing", async () => {
   await seedRun(h, "ktsk-fat", SESSION, { status: "preparing", dispatch: "fat", queuedAgoSec: null });
   await transitionStatus("ktsk-fat", ["preparing"], "running");
@@ -222,6 +220,7 @@ test("AC1.10 a ledger opened after repeated requeues still admits every earlier 
   // thing to create a ledger entry may arrive after the run has already spent
   // most of its queue time in segments no entry existed to hold.
   await seedRun(h, "ktsk-rq", SESSION, { status: "queued", queuedAgoSec: null });
+  const epoch = ((await runRow(h, "ktsk-rq")).run_time_epoch_at as Date).toISOString();
   for (let i = 0; i < 3; i++) {
     await sleep(120);
     await transitionStatus("ktsk-rq", ["queued"], "preparing");
@@ -238,10 +237,22 @@ test("AC1.10 a ledger opened after repeated requeues still admits every earlier 
   const ledger = await ledgerOf("ktsk-rq");
   assert.equal(ledger!.knownMsByState.queued, total,
     "the entry's epoch has to reach back over the segments the row already banked");
+  assert.equal(ledger!.epochInstantDb, epoch, "requeue stamps do not move the run's epoch");
   assertIdentity(ledger!, await readInstant());
 });
 
-// ── AC1/B21: the queued interval reaches the ledger, generation or not ───────
+test("AC1 a ledger opened after queue exit keeps the run's first eligible instant", async () => {
+  await seedRun(h, "ktsk-epoch", SESSION, { status: "queued", queuedAgoSec: 2 });
+  const queuedAt = (await runRow(h, "ktsk-epoch")).queued_at as Date;
+  await transitionStatus("ktsk-epoch", ["queued"], "running");
+  const accrued = await queuedMsOf("ktsk-epoch");
+  await announceRunning("ktsk-epoch", "att-1");
+
+  const ledger = await ledgerOf("ktsk-epoch");
+  assert.ok(Math.abs(Date.parse(ledger!.epochInstantDb) - queuedAt.getTime()) < 20,
+    "closing the queue segment must not subtract that segment from its start a second time");
+  assert.equal(ledger!.knownMsByState.queued, accrued);
+});
 
 test("a run that timed out in the queue banks its wait, having never had an attempt", async () => {
   // The gap a report-driven ledger cannot close: a report needs an attempt id,
@@ -253,18 +264,21 @@ test("a run that timed out in the queue banks its wait, having never had an atte
   assert.equal(await reapExpiredQueuedRuns(), 1, "the reaper closes a run nobody claimed");
   // Nothing seeds `run_phase`: this run never had a reporter, so the subtree
   // does not exist and the settle pass has to create the entry itself.
-  assert.ok(await queuedMsOf("ktsk-qt") >= 4_000, "the reap banked the wait on the row");
+  const accrued = await queuedMsOf("ktsk-qt");
+  assert.ok(accrued >= 4_000, "the reap banked the wait on the row");
 
   assert.ok(await settleTerminalRuns() >= 1);
   const ledger = await ledgerOf("ktsk-qt");
   assert.ok(ledger, "the settle pass creates the entry a run with no reporter never got");
-  assert.ok(ledger!.knownMsByState.queued >= 4_000,
-    `queued must be a real, banked state; got ${ledger!.knownMsByState.queued}ms`);
+  assert.equal(ledger!.knownMsByState.queued, accrued,
+    "the settle observer banks the row's queued total exactly once");
   assert.equal(ledger!.watermarkMs, ledger!.knownMsByState.queued);
   assert.ok(ledger!.attempts.every((a) => a.attemptId === null),
     "no attempt was ever allocated for it");
   assert.equal(ledger!.settled, true);
   assert.ok(ledger!.terminalAtDb, "and its terminal instant is pinned");
+  assert.equal(await settleTerminalRuns(), 0, "a settled row is not selected again");
+  assert.deepEqual(await ledgerOf("ktsk-qt"), ledger);
 });
 
 test("B21 the settle pass creates the entry for a terminal row with no run_phase at all", async () => {
@@ -396,11 +410,15 @@ test("an insert that names no queued_at still opens its segment at the insert", 
      VALUES ('ktsk-nodefault', $1, 'chat', 'queued', 'chat', 'brain')`, [SESSION]);
   const row = await runRow(h, "ktsk-nodefault");
   assert.ok(row.queued_at, "an insert that omits the stamp must not open its segment at NULL");
+  const queuedAt = (row.queued_at as Date).toISOString();
 
   await sleep(120);
   await transitionStatus("ktsk-nodefault", ["queued"], "preparing");
   const banked = await queuedMsOf("ktsk-nodefault");
   assert.ok(banked >= 100, `the wait measures from the insert, got ${banked}ms`);
+  await announceRunning("ktsk-nodefault", "att-1");
+  assert.equal((await ledgerOf("ktsk-nodefault"))!.epochInstantDb, queuedAt,
+    "the first transition preserves the defaulted queue stamp as the epoch");
 });
 
 test("a row that never queued keeps the null the column is allowed to hold", async () => {
@@ -440,8 +458,6 @@ test("a retried run neither inherits the ledger it replaces nor its queue age", 
   assert.ok(queuedForMs < 2_000,
     `its wait starts now, not ${Math.round(queuedForMs / 1000)}s ago with the run it replaces`);
 });
-
-// ── AC4: the attempt-token fence ─────────────────────────────────────────────
 
 test("AC4 a heartbeat that outlived its attempt cannot revive the lease", async () => {
   await seedRun(h, "ktsk-late", SESSION, {
@@ -495,23 +511,31 @@ test("AC4 a renewal that omits a token field is rejected, not accepted unfenced"
   }
 });
 
-test("a fat-path attempt whose allocating write was lost still adopts and renews", async () => {
+test("B22 a fat-path attempt whose allocating write was lost still adopts and renews", async () => {
   // The fat path takes no claim, so its claim_count is the column's 0 default
   // on both sides. A fence that could not compare that would leave the
   // documented adoption arm unreachable for every fat run there is.
   await seedRun(h, "ktsk-fat1", SESSION, {
-    status: "running", dispatch: "fat", leaseOwner: null, leaseExpiresInSec: null, queuedAgoSec: 1,
+    status: "queued", dispatch: "fat", leaseOwner: null, leaseExpiresInSec: null, queuedAgoSec: 1,
   });
+  await applyTaskStatusTransition("running", { expected: ["queued"], params: ["ktsk-fat1"] });
+  const accrued = await queuedMsOf("ktsk-fat1");
+  assert.ok(accrued >= 900, "the status transition banked the queue before allocation was lost");
+  assert.equal(await ledgerOf("ktsk-fat1"), null, "the allocating observer did not land");
   const first = { attempt_id: "att-f1", claim_count: 0, delivery_seq: 9, delivery_count: 1 };
   assert.equal((await renew("ktsk-fat1", first)).statusCode, 200);
   let row = await runRow(h, "ktsk-fat1");
   assert.equal(row.attempt_id, "att-f1", "the first renewal establishes the token itself");
   assert.equal(Number(row.attempt_generation), 1, "and bumps the generation exactly once");
   assert.equal(Number(row.delivery_seq), 9);
+  assert.equal((await ledgerOf("ktsk-fat1"))!.knownMsByState.queued, accrued,
+    "the adopting renewal banks the queued interval the lost allocation did not");
 
   assert.equal((await renew("ktsk-fat1", first)).statusCode, 200, "and keeps renewing");
   assert.equal(Number((await runRow(h, "ktsk-fat1")).attempt_generation), 1,
     "the same attempt renewing adopts nothing and counts nothing");
+  assert.equal((await ledgerOf("ktsk-fat1"))!.knownMsByState.queued, accrued,
+    "the second observer cannot bank the same queue interval twice");
 
   // Its predecessor, still presenting the pair the row has moved past.
   const stale = { attempt_id: "att-f0", claim_count: 0, delivery_seq: 8, delivery_count: 1 };
@@ -534,6 +558,27 @@ test("a fat-path attempt whose allocating write was lost still adopts and renews
   assert.equal(Number(row.attempt_generation), 2);
 });
 
+test("AC1 the settle pass banks queued time when allocation and renewal both miss", async () => {
+  await seedRun(h, "ktsk-no-observer", SESSION, {
+    status: "queued", dispatch: "fat", leaseOwner: null, queuedAgoSec: 1,
+  });
+  await applyTaskStatusTransition("running", {
+    expected: ["queued"], params: ["ktsk-no-observer"],
+  });
+  const accrued = await queuedMsOf("ktsk-no-observer");
+  await applyTaskStatusTransition("failed", {
+    expected: ["running"], params: ["ktsk-no-observer"],
+  });
+
+  assert.equal(await ledgerOf("ktsk-no-observer"), null,
+    "neither the allocation nor a renewal created an entry");
+  assert.ok(await settleTerminalRuns() >= 1);
+  const ledger = await ledgerOf("ktsk-no-observer");
+  assert.equal(ledger!.knownMsByState.queued, accrued);
+  assert.equal(ledger!.watermarkMs, accrued);
+  assert.equal(ledger!.settled, true);
+});
+
 test("AC4 the final report and the terminal transition commit together", async () => {
   await seedRun(h, "ktsk-atomic", SESSION, {
     status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
@@ -552,6 +597,54 @@ test("AC4 the final report and the terminal transition commit together", async (
   const after = await ledgerOf("ktsk-atomic");
   assert.deepEqual(after!.knownMsByState, before!.knownMsByState,
     "neither the merge nor the transition may land on its own");
+});
+
+async function rejectTransitionAfterLedgerWrite(action: () => Promise<unknown>): Promise<void> {
+  const connect = db.pool.connect;
+  db.pool.connect = (async () => {
+    const client = await connect();
+    const query = client.query.bind(client);
+    let ledgerWritten = false;
+    client.query = (async (text: string, params?: unknown[]) => {
+      if (/SET metadata = jsonb_set/.test(text)) ledgerWritten = true;
+      if (ledgerWritten && /^\s*UPDATE claw_tasks SET status/.test(text)) {
+        throw new Error("injected transition failure");
+      }
+      return query(text, params);
+    }) as typeof client.query;
+    return client;
+  }) as typeof db.pool.connect;
+  try {
+    await assert.rejects(action, /injected transition failure/);
+  } finally {
+    db.pool.connect = connect;
+  }
+}
+
+test("AC4 a failure between final merge and transition rolls both paths back", async () => {
+  for (const kind of ["agent_done", "release"] as const) {
+    const taskId = `ktsk-rollback-${kind}`;
+    const claimCount = kind === "release" ? 1 : 0;
+    await seedRun(h, taskId, SESSION, {
+      status: "running", claimCount, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+    });
+    const token = { attempt_id: "att-1", claim_count: claimCount, delivery_seq: 0, delivery_count: 0 };
+    await announceRunning(taskId, "att-1", { claim_count: claimCount });
+    await renew(taskId, { ...token, run_time: coverage(taskId, "att-1", token, 20) });
+    const before = await ledgerOf(taskId);
+
+    await rejectTransitionAfterLedgerWrite(() => kind === "agent_done"
+      ? applyAgentDone(taskId, {
+          task_id: taskId, abort_reason: "completed",
+          run_time: coverage(taskId, "att-1", token, 200),
+        })
+      : releaseClaim(taskId, BRAIN, claimCount, "handover", {
+          report: coverage(taskId, "att-1", token, 200) as never,
+        }));
+
+    assert.equal((await runRow(h, taskId)).status, "running", `${kind}: the row did not move`);
+    assert.deepEqual(await ledgerOf(taskId), before, `${kind}: the final report did not commit alone`);
+  }
 });
 
 test("AC4 a stale holder's release rolls its final report back with it", async () => {
@@ -1168,8 +1261,6 @@ test("a waiting_external transition keeps the final report it commits with", asy
     "the merge committed in this transaction must not be overwritten by its own patch");
 });
 
-// ── AC5: a real attempt survives a contention-only claim ─────────────────────
-
 test("AC5 a contention-only claim between two real attempts leaves the first intact", async () => {
   await seedRun(h, "ktsk-gen", SESSION, {
     status: "queued", claimable: true, queuedAgoSec: 1,
@@ -1213,8 +1304,6 @@ test("AC5 a contention-only claim between two real attempts leaves the first int
   assert.ok(Number(row.claim_count) - claimsBefore > Number(row.attempt_generation) - 1,
     "the contention claim shows only as a claim_count delta");
 });
-
-// ── AC6: recovery loss, per class, at a real boundary ────────────────────────
 
 test("AC6 an attempt's loss is measured from its own start, not the run's", async () => {
   // `takeClaim` COALESCEs `started_at`, so after a redelivery the column names

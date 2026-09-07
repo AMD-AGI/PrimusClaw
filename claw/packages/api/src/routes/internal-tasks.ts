@@ -312,35 +312,6 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
 }
 
 /**
- * Renew a run's lease and record what it is doing.
- *
- * The lease is the row's own answer to "is anything still running this?", and
- * the answer it replaces was inferred from whether a queue message remained
- * unacknowledged -- which cannot separate a worker that died from one that is
- * slow, and takes the redelivery budget to conclude either. Renewed every few
- * seconds, an expired lease means the worker is gone, within the TTL.
- *
- * The phase is the other half, and the more interesting one: a run holds its
- * slot whether it is calling the model or waiting on a command that has an
- * hour left, and nothing has ever measured which. Accumulated on the row so
- * the ratio can be read per run and across the fleet.
- *
- * Only non-terminal rows are touched, so a late renewal for a run that has
- * already finished changes nothing and tells the caller so.
- *
- * The owner predicate is what makes the lease a fence rather than a timestamp.
- * Without it the row accepted a renewal from anyone: when two workers ended up
- * on one run -- a lock that expired under a worker that could not renew it, and
- * a redelivery that took it over -- both renewed this row, both were told they
- * were live, and nothing in the system could name which of them was. Whoever
- * holds an unexpired lease keeps it; anyone else is refused and stands down.
- * Expiry is what makes an honest takeover possible, so it has to be part of the
- * predicate: the resuming worker's first renewal names an owner that is not the
- * dead one, and only a lapsed lease lets it through.
- *
- * @returns the row's status, or null when there is no active row to renew.
- */
-/**
  * `unavailable` is not a status: the fence never ran, so nothing may be banked,
  * while the caller is still told it is live.
  */
@@ -349,6 +320,7 @@ type RenewalOutcome =
   | { kind: "refused" }
   | { kind: "unavailable" };
 
+/** Renew the lease and return whether its attempt fence was applied. */
 async function renewRunLease(
   taskId: string,
   body: RunLeaseBody,

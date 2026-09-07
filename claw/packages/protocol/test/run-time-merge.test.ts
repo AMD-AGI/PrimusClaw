@@ -400,8 +400,6 @@ test("the attempt-record list is capped, and says how much it dropped", () => {
   assert.equal(e.attempts[0].attemptId, "att-4", "the oldest goes first");
 });
 
-// ── §5: the endpoints a cross-domain duration names decide its correction ────
-
 /**
  * One measured round trip: `offset = db - caller`, uncertainty `rtt / 2`.
  *

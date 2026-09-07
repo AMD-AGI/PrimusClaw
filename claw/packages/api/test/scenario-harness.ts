@@ -327,6 +327,7 @@ export async function seedRun(
        lease_owner,
        lease_expires_at,
        queued_at,
+       run_time_epoch_at,
        started_at,
        deadline_at,
        claim_count
@@ -334,6 +335,8 @@ export async function seedRun(
        $1, $2, 'chat', $3, $4, 'brain', $5::jsonb, $12::jsonb, $13,
        $6,
        CASE WHEN $7::int IS NULL THEN NULL ELSE NOW() + ($7::int * INTERVAL '1 second') END,
+       CASE WHEN $8::int IS NULL THEN clock_timestamp()
+            ELSE clock_timestamp() - ($8::int * INTERVAL '1 second') END,
        CASE WHEN $8::int IS NULL THEN clock_timestamp()
             ELSE clock_timestamp() - ($8::int * INTERVAL '1 second') END,
        CASE WHEN $9::int IS NULL THEN NULL ELSE NOW() - ($9::int * INTERVAL '1 second') END,
