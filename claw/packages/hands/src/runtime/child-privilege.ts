@@ -39,13 +39,7 @@ export interface ChildPrivilege {
   env: NodeJS.ProcessEnv;
 }
 
-/**
- * What this sandbox can actually provide.
- *
- * Read through a seam so a test can assert both directions of the refusal.
- * Production binds nothing, and no production behaviour is conditional on
- * whether a test has.
- */
+/** Read through a seam so a test can assert both directions of the refusal. */
 export interface SandboxIsolation {
   /** The identity range this sandbox allocates model-issued processes from. */
   identityRange(): { min: number; max: number } | null;
@@ -97,9 +91,8 @@ let nextIdentity: number | null = null;
 /**
  * The identity this pair's processes run as, held for the sandbox's life.
  *
- * Allocated rather than derived from a hash of the pair: two pairs colliding on
- * a derived value would share one identity and one signal authority, which is
- * the separation this exists for. Exhausting the range refuses the spawn.
+ * Allocated rather than hashed from the pair: a collision would share one
+ * identity and one signal authority, which is the separation this exists for.
  */
 function identityFor(owner: string, run: string, range: { min: number; max: number }): number {
   const key = `${owner} ${run}`;
@@ -120,11 +113,9 @@ function identityFor(owner: string, run: string, range: { min: number; max: numb
 /**
  * Names a model-issued process may see, and nothing else.
  *
- * Built up from the workspace-facing configuration rather than filtered down
- * from this process's environment: a deny list is a promise to remember every
- * future secret, and the one that matters -- the internal bearer token -- is
- * set by the launch command, so it is present in every child by default under
- * any list that starts from the parent's environment.
+ * Built up rather than filtered down: a deny list is a promise to remember
+ * every future secret, and the token that matters is set by the launch command,
+ * so any list starting from the parent's environment carries it by default.
  */
 const WORKSPACE_FACING = [
   "PATH", "HOME", "SHELL", "TERM", "TZ", "LANG", "LC_ALL", "PWD", "USER", "LOGNAME",
@@ -174,12 +165,8 @@ export function resolveChildPrivilege(owner: string, run: string): ChildPrivileg
 }
 
 /**
- * Say so, every time, that this sandbox runs the model's commands under Hands'
- * own identity.
- *
- * Not a one-off warning at startup: an operator reading a shell log has to be
- * able to see which spawns were served without the boundary, and a count that
- * stops after the first says nothing about the rest.
+ * Say so on every spawn, not once at startup: an operator has to see which
+ * commands were served without the boundary, not merely that some were.
  */
 function reportUnenforced(): void {
   console.log(JSON.stringify({
