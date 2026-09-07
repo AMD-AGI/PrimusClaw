@@ -278,9 +278,9 @@ done
 
 ```sh
 rg -N '^CLAW_DEPLOY_MODE=' claw/deploy/values.$NS.env || echo '(absent: the kubernetes default)'
-curl -sf --max-time "$T_CURL" -H "$ADMIN" "https://$API_HOST/v1/internal/sandbox/status" \
-  | jq -er '{safe_api: (.config.SAFE_API_URL // "(not set)"),
-             safe_sandboxes: ([.sessions[] | select(.has_platform_key)] | length)}'
+raw=$(inventory) || { echo 'ABORT: census unreadable; PRE-7 has no answer'; exit 1; }
+printf '%s' "$raw" | jq -er '{safe_api: (.config.SAFE_API_URL // "(not set)"),
+                              safe_sandboxes: ([.sessions[] | select(.has_platform_key)] | length)}'
 ```
 
 - Expected: the first line absent or `CLAW_DEPLOY_MODE="kubernetes"`, **and**
@@ -433,6 +433,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 
    ```sh
    BG_SHELL_ENABLED="true"
+   # Hands refuses to start without a child UID range or this explicit posture.
+   # This acknowledgement does not isolate background-shell child processes.
+   HANDS_CHILD_ISOLATION="unenforced"
    # Both REQUIRED with the flag on. Brain refuses to start without them: the
    # gap between two refreshes of one sandbox handle is derived from them, and a
    # sandbox hosting a live background shell is reclaimed if that gap is wrong.

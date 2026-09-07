@@ -43,14 +43,6 @@ export function bindHandsKv(kv: KV): void {
  * indistinguishable from a retention by key shape, so the first retention under
  * a matching generation would write over a live session's binding.
  */
-/**
- * Refuse to serve where a session binding occupies a retention's key.
- *
- * At boot, before anything can be provisioned. Nothing is moved: old and new
- * replicas run together through an upgrade, and a key one side relocates is one
- * the other still reads under its old name -- two divergent bindings for one
- * session, which is worse than the collision it would have fixed.
- */
 function reservedKeyStore(kv: KV): HandsKeyStore {
   return {
     keys: async (filter) => {
@@ -113,17 +105,6 @@ export function retentionStore(kv: KV): RetentionStore & {
   };
 }
 
-/**
- * Move any session binding out of the retention namespace, then prove none is
- * left. At boot, before anything can be provisioned.
- *
- * The move is what B41 asks for and the check is what makes its failure loud:
- * a collision the migration could not resolve -- a destination something else
- * holds, an entry that cannot be read -- would leave a container retained under
- * that generation unable to keep its binding, and it would be reclaimed with
- * its work in it. There is no safe automatic repair for that, so the deployment
- * is refused with the keys named.
- */
 /**
  * The key a session's binding was found under, and the revision read from it.
  *

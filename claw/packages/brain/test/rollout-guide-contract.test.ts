@@ -67,12 +67,11 @@ test("every helm render resolves the chart the upgrade actually deploys", () => 
     "no render may hard-code the default path");
 });
 
-test("the enablement step names every setting Brain refuses to start without", () => {
-  // Following the guide has to produce a Brain that starts. Both capacity
-  // settings are required with the flag on and the chart ships them empty.
+test("the enablement step names every setting services refuse to start without", () => {
+  // Brain requires the capacity settings, while Hands requires an explicit child-isolation posture.
   const enable = GUIDE.slice(GUIDE.indexOf("## 3. Enable"), GUIDE.indexOf("## 4. Gates"));
   for (const key of [
-    "BG_SHELL_ENABLED", "SANDBOX_KEEPALIVE_TARGET_CEILING",
+    "BG_SHELL_ENABLED", "HANDS_CHILD_ISOLATION", "SANDBOX_KEEPALIVE_TARGET_CEILING",
     "SANDBOX_KEEPALIVE_RECONCILE_RESERVE", "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC",
   ]) {
     assert.ok(enable.includes(key), `${key} must be set in the same change as the flag`);
@@ -133,5 +132,13 @@ test("every gate's helpers are defined once, in the guide or the library", () =>
   for (const fn of ["sb", "cr", "dispatch", "settle", "probe", "inventory"]) {
     assert.ok(new RegExp(`^${fn}\\(\\) \\{`, "m").test(GUIDE), `${fn} is undefined`);
   }
-  assert.match(GUIDE, /inventory_rows/, "every step iterates the rows helper, not .sessions[]");
+  const directSessionBlocks = [...GUIDE.matchAll(/```sh\n([\s\S]*?)```/g)]
+    .map((match) => match[1])
+    .filter((block) => /\.sessions\[\]/.test(block));
+  assert.equal(directSessionBlocks.length, 1,
+    "fleet traversal must use inventory_rows rather than iterating .sessions[] directly");
+  assert.match(directSessionBlocks[0], /safe_sandboxes:/,
+    "the only direct session read is the SaFE preflight scalar");
+  assert.match(directSessionBlocks[0], /raw=\$\(inventory\)/,
+    "the SaFE preflight scalar must reject an unreadable inventory");
 });
