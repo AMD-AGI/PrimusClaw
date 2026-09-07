@@ -23,6 +23,9 @@ if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 const { app } = await import("../src/index.js");
 const { MAX_TIMEOUT_SEC } = await import("../src/tools/shell/bash.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 test("/health reports the feature on, and the tightened ceiling", async () => {
   const health = (await app.inject({ method: "GET", url: "/health" })).json();
 

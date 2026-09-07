@@ -144,6 +144,8 @@ export function spawnBackground(
     kind,
     bufferBytes: BG_SHELL_BUFFER_BYTES,
     unref: true,
+    owner,
+    run,
   });
   shells.set(key, { owner, run, shell });
   attachSpawned(owner, run, shell);

@@ -119,19 +119,25 @@ function envFileConsumedGuard(envFile: string, waitSec: number): string {
  * failure, and the download source once backgrounded the whole chain and so
  * reported success for a download that never finished.
  */
+const dirOf = (path: string): string => path.slice(0, path.lastIndexOf("/")) || "/";
+
 function launchCmd(
   baseEnv: string,
   binPath: string,
   envFile?: string,
   envWaitSec: number = HANDS_ENV_FILE_WAIT_SEC,
-  logPath: string = "/workspace/hands.log",
+  logPath: string = HANDS_LOG_PATH,
 ): string {
   // Truncate is a statement of its own, not `truncate && start &`. `&`
   // backgrounds a whole AND-OR list, so that form made `$!` the helper
   // shell bash forks to run the list -- dash happens to exec-replace it
   // with the setsid process, bash does not, and the kill chain then hits
   // the helper while Hands keeps the port.
-  return `: > ${logPath} || { echo "cannot write ${logPath}" >&2; exit 1; }; `
+  // Created owner-only before anything writes it: the directory is the
+  // boundary, and a log truncated into a world-readable parent is not inside
+  // one. Hands re-creates the same directory when it mints its epoch.
+  return `mkdir -p ${dirOf(logPath)} && chmod 700 ${dirOf(logPath)} || { echo "cannot create ${dirOf(logPath)}" >&2; exit 1; }; `
+    + `: > ${logPath} || { echo "cannot write ${logPath}" >&2; exit 1; }; `
     + `${baseEnv} setsid ${binPath} </dev/null >>${logPath} 2>&1 & `
     + `PID=$!; sleep 1; `
     + `if ! kill -0 $PID 2>/dev/null; then echo "hands-binary at ${binPath} crashed immediately" >&2; cat ${logPath} >&2; exit 1; fi; `
@@ -153,7 +159,7 @@ export function inImageStartCmd(
   timeoutSec: number = SELF_CHECK_TIMEOUT_SEC,
   envFile?: string,
   envWaitSec: number = HANDS_ENV_FILE_WAIT_SEC,
-  logPath: string = "/workspace/hands.log",
+  logPath: string = HANDS_LOG_PATH,
 ): string {
   // `--self-check` rather than a plain -x test, because every image is probed
   // now instead of only the ones whose name we recognised: the question is
@@ -186,7 +192,7 @@ function brainDownloadStartCmd(baseEnv: string, handsToken: string, envFile?: st
   // `curl && chmod && :>log && setsid bin & echo started_pid=$!` chain, so the
   // step ALWAYS reported success (the foreground `echo` exits 0) even when the
   // download never completed — Brain then waited out the whole /health poll on a
-  // /workspace/hands.log that was never created (the observed
+  // hands.log that was never created (the observed
   // `sandbox_health_failed` with "hands.log: No such file or directory"). Only
   // the final binary launch is backgrounded, then verified alive, mirroring
   // sharedStorageStartCmd.
@@ -280,6 +286,18 @@ export function handsBaseEnv(
  * over them. Hands creates it owner-only.
  */
 export const HANDS_STATE_DIR = "/tmp/.claw-hands";
+
+/**
+ * Where Hands' own diagnostics go.
+ *
+ * Inside the Hands-owned state area rather than the workspace. Everything Hands
+ * writes about a shell names it -- the shell id, the operating-system process
+ * identifier, the kind -- and the workspace is writable by every run identity
+ * in the sandbox, so a log there hands one run's work to another by a path
+ * neither the tool routes nor the scoped credential bound. It is also synced,
+ * which would carry the same disclosure out.
+ */
+export const HANDS_LOG_PATH = `${HANDS_STATE_DIR}/hands.log`;
 
 /**
  * Where the per-request environment is handed over.

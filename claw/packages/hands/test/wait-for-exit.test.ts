@@ -17,6 +17,10 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 
+import { isolatingSandbox } from "./support/sandbox-isolation.js";
+
+isolatingSandbox();
+
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 // Production keeps a finished shell readable for a minute after it exits. Here

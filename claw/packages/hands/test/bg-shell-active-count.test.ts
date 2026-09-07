@@ -20,6 +20,10 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 
+import { isolatingSandbox } from "./support/sandbox-isolation.js";
+
+isolatingSandbox();
+
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 // Long enough that an exited shell is still in the registry when it is counted.

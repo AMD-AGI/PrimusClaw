@@ -25,6 +25,9 @@ const { bash } = await import("../src/tools/shell/bash.js");
 const { bash_output } = await import("../src/tools/shell/bash-output.js");
 const { kill_shell } = await import("../src/tools/shell/kill-shell.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 /** The flag is off by default; leaving it unset must not leave it on. */
 test("the default is off", () => {
   assert.throws(() => bg.spawnBackground("someone", "run-1", "sleep 30"), /disabled/);

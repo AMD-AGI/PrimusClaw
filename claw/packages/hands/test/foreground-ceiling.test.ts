@@ -33,6 +33,9 @@ const CEILING_SEC = 2;
 process.env.BASH_MAX_TIMEOUT_SEC = String(CEILING_SEC);
 const { bash } = await import("../src/tools/shell/bash.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const textOf = (r: { content: Array<{ text: string }> }) => r.content[0].text;
 
 test("a command over the ceiling is cut at it, and told which limit it met", async () => {

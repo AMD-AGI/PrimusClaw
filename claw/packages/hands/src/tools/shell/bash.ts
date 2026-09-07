@@ -106,6 +106,8 @@ export const bash = {
     const result = await runForegroundShell(args.command, {
       timeoutMs,
       bufferBytes: MAX_OUTPUT_BYTES,
+      owner: currentOwner(),
+      run: currentRun(),
     });
 
     if (result.timedOut) {

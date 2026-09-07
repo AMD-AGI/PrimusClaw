@@ -39,7 +39,7 @@ import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { lookupDagHandle, registerDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
-import { bootstrapHandsInSandbox } from "./bootstrap.js";
+import { bootstrapHandsInSandbox, HANDS_LOG_PATH } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
 import { registerSandbox } from "./keepalive.js";
 import type { SandboxEntry } from "./keepalive.js";
@@ -984,7 +984,7 @@ async function provisionHands(
     // Pull hands.log tail to surface the real startup error.
     let logTail = "<unavailable>";
     try {
-      const tail = await getSafeWorkloadProvider().exec(inst, "tail -c 2000 /workspace/hands.log 2>&1 || true", "15s");
+      const tail = await getSafeWorkloadProvider().exec(inst, `tail -c 2000 ${HANDS_LOG_PATH} 2>&1 || true`, "15s");
       logTail = (tail.stdout || tail.stderr || "<empty>").slice(-1800);
     } catch { /* ignore */ }
     logger.error({ sessionId, workloadId, handsLog: logTail }, "hands.health_failed");
@@ -1369,7 +1369,7 @@ async function ensureHandsAgentSandbox(
     if (!handsHealthy) {
       let logTail = "<unavailable>";
       try {
-        const tail = await provider.exec(inst, "tail -c 2000 /workspace/hands.log 2>&1 || true", "15s");
+        const tail = await provider.exec(inst, `tail -c 2000 ${HANDS_LOG_PATH} 2>&1 || true`, "15s");
         logTail = (tail.stdout || tail.stderr || "<empty>").slice(-1800);
       } catch { /* ignore */ }
       logger.error({ sessionId, sandboxName: inst.sandboxName, handsLog: logTail }, "hands.health_failed");

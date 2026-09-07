@@ -31,6 +31,9 @@ if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 const { app } = await import("../src/index.js");
 const { UNOWNED } = await import("../src/runtime/owner-context.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const TOKEN = "test-internal-token";
 const proving = (owner: string, run: string | null = null) => ({
   authorization: `Bearer ${mintScopeCredential({ owner, run }, TOKEN)}`,

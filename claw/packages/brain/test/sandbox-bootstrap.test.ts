@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
+  HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
 import { CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL } from "../src/config.js";
@@ -346,10 +347,16 @@ test("the guard counts in the shell rather than through seq", () => {
     "a Hands that catches TERM still holds the port while it handles it");
   assert.doesNotMatch(cmd, /kill -9 --/,
     "dash rejects -- after a signal option, so SIGKILL names the group without it");
-  assert.match(cmd, /: > \/workspace\/hands\.log \|\|/,
+  assert.match(cmd, new RegExp(`: > ${HANDS_LOG_PATH.replace(/[./]/g, "\\$&")} \\|\\|`),
     "the log truncate is a statement of its own so $! is the setsid process, not a helper shell");
-  assert.doesNotMatch(cmd, /: > \/workspace\/hands\.log &&/,
+  assert.doesNotMatch(cmd, new RegExp(`: > ${HANDS_LOG_PATH.replace(/[./]/g, "\\$&")} &&`),
     "&& ... & is what made $! a bash subshell on images whose /bin/sh is bash");
+  // Everything Hands writes about a shell names it, and the workspace is
+  // writable by every run identity in the sandbox and synced out besides. The
+  // log lives in the Hands-owned state area and its parent is created there
+  // owner-only before anything writes it.
+  assert.doesNotMatch(cmd, /\/workspace\/hands\.log/, "the log is not in the shared workspace");
+  assert.match(cmd, new RegExp(`mkdir -p ${HANDS_STATE_DIR.replace(/[./]/g, "\\$&")} && chmod 700`));
 });
 
 test("the production probe carries a bound", () => {

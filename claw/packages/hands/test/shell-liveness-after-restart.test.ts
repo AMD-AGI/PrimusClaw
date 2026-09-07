@@ -33,6 +33,9 @@ const { ownerLiveness } = await import("../src/runtime/shell-liveness.js");
 const { runningShellCount } = await import("../src/tools/shell/bg-manager.js");
 const { app } = await import("../src/index.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const OWNER = "sess-restart";
 const RUN = "ktsk_1";
 const survivors: ChildProcess[] = [];

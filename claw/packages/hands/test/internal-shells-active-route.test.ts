@@ -32,6 +32,9 @@ const { spawnBackground, killShell, shutdownAllShells } =
   await import("../src/tools/shell/bg-manager.js");
 const { UNOWNED } = await import("../src/runtime/owner-context.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const TOKEN = "test-internal-token";
 const SESSION = "sess-route";
 

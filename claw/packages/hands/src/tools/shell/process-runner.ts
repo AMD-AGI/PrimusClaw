@@ -4,6 +4,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { WORKSPACE } from "../../config.js";
+import { resolveChildPrivilege } from "../../runtime/child-privilege.js";
 
 export type ManagedShellKind = "foreground" | "background" | "monitor";
 export type ManagedShellStatus = "running" | "exited" | "killed" | "timed_out" | "error";
@@ -48,6 +49,9 @@ interface SpawnManagedShellOptions {
   kind: ManagedShellKind;
   bufferBytes: number;
   unref?: boolean;
+  /** The pair the child runs as. Both forms supply it; neither may omit it. */
+  owner: string;
+  run: string;
 }
 
 interface RunForegroundOptions {
@@ -55,6 +59,8 @@ interface RunForegroundOptions {
   bufferBytes: number;
   terminateGraceMs?: number;
   forceResolveMs?: number;
+  owner: string;
+  run: string;
 }
 
 /** Write a compact structured lifecycle log to stdout. */
@@ -81,12 +87,20 @@ export function logShellEvent(event: string, shell: ManagedShell, extra: Record<
   }));
 }
 
-/** Spawn a managed shell as a detached process group. */
+/**
+ * Spawn a managed shell as a detached process group, under its run's own
+ * unprivileged identity and with an environment built from an allow-list.
+ *
+ * @throws ChildPrivilegeUnavailable where the sandbox declares an identity
+ * range and cannot partition the process view to go with it.
+ */
 export function spawnManagedShell(command: string, options: SpawnManagedShellOptions): ManagedShell {
   const id = options.id || `${options.kind}-${randomUUID().slice(0, 8)}`;
+  const privilege = resolveChildPrivilege(options.owner, options.run);
   const proc = spawn("/bin/sh", ["-c", command], {
     cwd: WORKSPACE,
-    env: process.env,
+    env: privilege.env,
+    ...(privilege.uid === undefined ? {} : { uid: privilege.uid, gid: privilege.gid }),
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -142,9 +156,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   });
 
   if (options.unref) proc.unref();
-  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell, {
-    command: command.slice(0, 500),
-  });
+  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell);
   return shell;
 }
 
@@ -156,6 +168,8 @@ export async function runForegroundShell(
   const shell = spawnManagedShell(command, {
     kind: "foreground",
     bufferBytes: options.bufferBytes,
+    owner: options.owner,
+    run: options.run,
   });
   const terminateGraceMs = options.terminateGraceMs ?? 5_000;
   const forceResolveMs = options.forceResolveMs ?? 10_000;

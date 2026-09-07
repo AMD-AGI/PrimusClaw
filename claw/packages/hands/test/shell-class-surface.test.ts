@@ -27,6 +27,9 @@ process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "claw-class-"));
 const records = await import("../src/runtime/shell-records.js");
 const bg = await import("../src/tools/shell/bg-manager.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const OWNER = "sess-class";
 const RUN = "ktsk_1";
 const strays: ChildProcess[] = [];
