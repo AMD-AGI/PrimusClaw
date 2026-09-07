@@ -399,3 +399,32 @@ test("a write that fails on a later source still removes the file", async (t) =>
   assert.match(r.cmds[r.cmds.length - 1]!, /^rm -f /,
     "the first write already placed the keys; throwing must not leave them");
 });
+
+test("the child-isolation declaration reaches the sandbox, and nothing is substituted", () => {
+  // Hands' whole environment is the one this builds, so a range declared
+  // anywhere else reaches nothing -- and with background shells on, Hands
+  // refuses to start unless one of these states a posture. A default supplied
+  // here would be this path deciding the isolation posture for the deployment.
+  const kept = {
+    HANDS_CHILD_UID_MIN: process.env.HANDS_CHILD_UID_MIN,
+    HANDS_CHILD_ISOLATION: process.env.HANDS_CHILD_ISOLATION,
+  };
+  delete process.env.HANDS_CHILD_UID_MIN;
+  delete process.env.HANDS_CHILD_ISOLATION;
+  try {
+    assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_CHILD"),
+      "an undeclared posture stays undeclared");
+
+    process.env.HANDS_CHILD_UID_MIN = "65500";
+    process.env.HANDS_CHILD_UID_MAX = "65533";
+    const env = handsBaseEnv(SESSION, PORT, TOKEN);
+    assert.match(env, /HANDS_CHILD_UID_MIN=65500/);
+    assert.match(env, /HANDS_CHILD_UID_MAX=65533/);
+  } finally {
+    for (const [key, value] of Object.entries(kept)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    delete process.env.HANDS_CHILD_UID_MAX;
+  }
+});

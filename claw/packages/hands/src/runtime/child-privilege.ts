@@ -236,6 +236,47 @@ export function childEnvironment(): NodeJS.ProcessEnv {
   return env;
 }
 
+/** What a deployment writes to say it is serving without the boundary. */
+export const ISOLATION_UNENFORCED = "unenforced";
+
+/**
+ * Refuse to serve background shells where nothing says whether the child
+ * boundary is placed.
+ *
+ * A child running as Hands itself reads `/proc/<parent>/environ`, so the sandbox
+ * credential its own environment withholds is one open file away; and it reads
+ * and writes the shell-record subtree, whose 0600/0700 modes separate it from
+ * nothing under that identity. Record integrity and the scoped credential are
+ * what a background shell's addressing and deduplication rest on, so silence
+ * here is refused: a deployment turning the feature on states either the
+ * identity range or, in `HANDS_CHILD_ISOLATION`, that it is serving without one.
+ *
+ * The acknowledgement is not the boundary and is not treated as one -- every
+ * spawn still reports itself unenforced -- but it is a decision somebody made
+ * rather than a default nobody saw.
+ *
+ * At startup and for the feature as a whole, not per start: every start would
+ * meet the same answer, and a process refusing each one in turn is a sandbox
+ * reporting itself healthy while nothing it offers works.
+ *
+ * @throws ChildPrivilegeUnavailable where the feature is on and neither is
+ * stated, or where a declared range cannot be used.
+ */
+export function assertChildBoundaryForBackgroundShells(bgShellEnabled: boolean): void {
+  if (!bgShellEnabled || sandboxIsolation().identityRange() !== null) return;
+  if (process.env.HANDS_CHILD_ISOLATION === ISOLATION_UNENFORCED) {
+    reportUnenforced();
+    return;
+  }
+  throw new ChildPrivilegeUnavailable(
+    "BG_SHELL_ENABLED is set and this sandbox states no child isolation: every "
+    + "background shell would run as Hands itself and could read the sandbox "
+    + "credential and the shell records that address it. Declare "
+    + "HANDS_CHILD_UID_MIN/MAX, or set "
+    + `HANDS_CHILD_ISOLATION=${ISOLATION_UNENFORCED} to serve without the boundary`,
+  );
+}
+
 /**
  * The identity, process view and environment for one pair's next spawn.
  *

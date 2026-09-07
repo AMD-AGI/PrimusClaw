@@ -1025,6 +1025,20 @@ export const HANDS_BOOTSTRAP_START_TIMEOUT = env("HANDS_BOOTSTRAP_START_TIMEOUT"
  */
 export const HANDS_ENV_FILE_WAIT_SEC = envInt("HANDS_ENV_FILE_WAIT_SEC", 30, { min: 1 });
 
+/**
+ * What the sandbox is told about the identity its model-issued processes run
+ * as, forwarded verbatim.
+ *
+ * Hands' whole environment is the one a bootstrap writes, so a range declared
+ * anywhere else reaches nothing. With background shells on, Hands refuses to
+ * start unless one of these states a posture -- the range, or the
+ * acknowledgement that there is no boundary -- so an unset pair is a sandbox
+ * that does not come up rather than one quietly serving without it.
+ */
+export const HANDS_CHILD_ISOLATION_ENV = [
+  "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX", "HANDS_CHILD_ISOLATION",
+] as const;
+
 // --- Server ---
 export const EXECUTOR_HOST = env("EXECUTOR_HOST", "0.0.0.0");
 export const EXECUTOR_PORT = envInt("EXECUTOR_PORT", 8100);

@@ -23,6 +23,7 @@ import {
 import {
   mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
 } from "./runtime/shell-records.js";
+import { assertChildBoundaryForBackgroundShells } from "./runtime/child-privilege.js";
 import { MAX_TIMEOUT_SEC } from "./tools/shell/bash.js";
 import { BG_SHELL_ENABLED, INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
@@ -322,6 +323,12 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 if (process.argv.includes("--self-check")) {
   process.stdout.write(`hands self-check ok (${tools.length} tools)\n`);
 } else {
+  try {
+    assertChildBoundaryForBackgroundShells(BG_SHELL_ENABLED);
+  } catch (e) {
+    app.log.fatal({ err: (e as Error).message }, "hands.child_boundary_unenforced");
+    process.exit(1);
+  }
   // Minted before anything can be started, and fatal when it cannot be: the
   // marker is what says this process files durable records, and a Hands
   // serving shells it files no record of would leave every later destroy gate

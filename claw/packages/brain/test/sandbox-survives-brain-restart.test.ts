@@ -114,6 +114,10 @@ before(async () => {
       MCP_PORT: String(port),
       AUTH_CLAW_TOKEN: TOKEN,
       BG_SHELL_ENABLED: "true",
+      // The boundary needs an identity this host can assume and a process view
+      // it can partition, neither of which a test runner has. Stated rather
+      // than left unset, because unset is what Hands refuses to start on.
+      HANDS_CHILD_ISOLATION: "unenforced",
       // Long enough that nothing under test is reaped out of the registry
       // mid-fixture, which would make a recovery look like a loss.
       BG_SHELL_REAP_DELAY_MS: "600000",

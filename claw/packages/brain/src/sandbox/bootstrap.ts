@@ -22,7 +22,7 @@ import pino from "pino";
 import {
   CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL, LOCAL_MODE_HANDS_BINARY,
   HANDS_BOOTSTRAP_START_TIMEOUT, BG_SHELL_ENABLED, BG_SHELL_REAP_GRACE_MS, BASH_FOREGROUND_DEFAULT_SEC,
-  WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC,
+  WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC, HANDS_CHILD_ISOLATION_ENV,
 } from "../config.js";
 import { toolTimeoutCeilingSec } from "../tools/hands.js";
 
@@ -271,7 +271,22 @@ export function handsBaseEnv(
     + `WAIT_DEFAULT_SEC=${WAIT_DEFAULT_SEC} `
     + `BG_SHELL_REAP_GRACE_MS=${BG_SHELL_REAP_GRACE_MS} `
     + `HANDS_STATE_DIR=${HANDS_STATE_DIR}`
+    + childIsolationEnv()
     + (envFile ? ` HANDS_ENV_FILE=${envFile}` : "");
+}
+
+/**
+ * The child-identity declaration, forwarded to the only environment Hands has.
+ *
+ * Nothing is defaulted here: an absent declaration is what makes Hands refuse
+ * to serve background shells, and substituting one would be this path deciding
+ * the isolation posture on the deployment's behalf.
+ */
+function childIsolationEnv(): string {
+  return HANDS_CHILD_ISOLATION_ENV
+    .filter((key) => process.env[key])
+    .map((key) => ` ${key}=${process.env[key]}`)
+    .join("");
 }
 
 /**

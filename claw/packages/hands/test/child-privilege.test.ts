@@ -196,3 +196,43 @@ test("a declared range this process cannot assume from refuses, rather than fall
     privilege.ChildPrivilegeUnavailable,
   );
 });
+
+test("background shells refuse to start where nothing states the isolation posture", async () => {
+  // The record subtree and the sandbox credential are what a background shell's
+  // addressing and deduplication rest on, and a child running as Hands itself
+  // reads both -- the credential out of the parent's environment, the records
+  // out of a subtree its own identity owns. Silence about the boundary is
+  // refused so that serving without one is a decision somebody took.
+  const previous = process.env.HANDS_CHILD_ISOLATION;
+  delete process.env.HANDS_CHILD_ISOLATION;
+  unisolatedSandbox();
+  try {
+    assert.throws(
+      () => privilege.assertChildBoundaryForBackgroundShells(true),
+      privilege.ChildPrivilegeUnavailable,
+    );
+    assert.doesNotThrow(
+      () => privilege.assertChildBoundaryForBackgroundShells(false),
+      "a deployment that is not serving background shells is not asked",
+    );
+
+    process.env.HANDS_CHILD_ISOLATION = privilege.ISOLATION_UNENFORCED;
+    assert.doesNotThrow(
+      () => privilege.assertChildBoundaryForBackgroundShells(true),
+      "the acknowledgement is not the boundary, but it is a stated posture",
+    );
+
+    delete process.env.HANDS_CHILD_ISOLATION;
+    privilege.bindSandboxIsolation({
+      identityRange: () => ({ min: 65500, max: 65533 }),
+      partitionsProcessView: () => true,
+    });
+    assert.doesNotThrow(
+      () => privilege.assertChildBoundaryForBackgroundShells(true),
+      "and a declared identity range is the boundary itself",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.HANDS_CHILD_ISOLATION;
+    else process.env.HANDS_CHILD_ISOLATION = previous;
+  }
+});
