@@ -28,7 +28,9 @@ import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 import { instanceFromEntry } from "./container-probe.js";
 import { countLiveWork } from "./live-work-gate.js";
-import { releaseRetention } from "./retain-container.js";
+import {
+  ledgerKeyForRetention, reassertRetentions, releaseRetention,
+} from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -170,7 +172,7 @@ async function sweepRetention(
     ? await countLiveWork(inst, HANDS_STATE_DIR)
     : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
   if (live.verdict === "clear") {
-    await releaseRetention(retentionStore(deps.kv), key);
+    await releaseRetention(retentionStore(deps.kv), key, ledgerKeyForRetention(key));
     return true;
   }
 
@@ -1409,6 +1411,12 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   // throughout a rolling upgrade, after every new one has already scanned.
   await reconcileReservedKeys(deps.kv).catch((err) => logger.error(
     { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
+  ));
+  // After that migration and not before it: a pre-scheme replica's binding
+  // sitting on a retention's key is moved to its canonical name there, which is
+  // what frees the key this puts the retention back under.
+  await reassertRetentions(retentionStore(deps.kv)).catch((err) => logger.error(
+    { err: (err as Error)?.message }, "keepalive.retention_reassert_failed",
   ));
   const census = await collectTargets(deps, seenIdentities);
   const targets = census.targets;

@@ -100,9 +100,12 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
  * that releases it cannot come to disagree about what a write to the reserved
  * key means.
  */
-export function retentionStore(kv: KV): RetentionStore {
+export function retentionStore(kv: KV): RetentionStore & {
+  keys(filter: string): Promise<string[]>;
+} {
   const reserved = reservedKeyStore(kv);
   return {
+    keys: reserved.keys,
     read: reserved.read,
     create: reserved.create,
     replace: reserved.replace,
