@@ -883,6 +883,54 @@ test("a settle from a holder the row has moved past is refused", async () => {
     "the live attempt's record is left exactly as it was");
 });
 
+test("a heartbeat racing the settle cannot open a second record for one attempt", async () => {
+  // The settle closes the record and clears the token, but a heartbeat already
+  // on the wire still presents that token. `beginAttemptRecord` only looked for
+  // an *open* record, so it appended a second one beside the closed one and the
+  // attempt appeared twice, once for ever.
+  await seedRun(h, "ktsk-ackrace", SESSION, {
+    status: "running", claimCount: 2, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 2, delivery_seq: 0, delivery_count: 0 };
+  await announceRunning("ktsk-ackrace", "att-1", token);
+  assert.equal(await settleAttempt("ktsk-ackrace", 2), 200);
+  const closedAt = (await ledgerOf("ktsk-ackrace"))!.attempts[0].endedAtDb;
+  assert.ok(closedAt, "the settle closed the record");
+
+  await renew("ktsk-ackrace", token);
+
+  const attempts = (await ledgerOf("ktsk-ackrace"))!.attempts;
+  assert.equal(attempts.length, 1, "one attempt has one record, whatever arrives after it");
+  assert.equal(attempts[0].endedAtDb, closedAt, "and it stays closed at the instant it ended");
+});
+
+test("a new attempt closes the record the one before it left open", async () => {
+  // The fat path's retry is a JetStream redelivery: no release endpoint runs, so
+  // nothing closed the dying attempt's record. The next attempt's allocating
+  // write is the boundary that knows the previous one is over.
+  await seedRun(h, "ktsk-fatgen", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-fatgen", "att-1", { delivery_seq: 1, delivery_count: 1 });
+  assert.equal((await ledgerOf("ktsk-fatgen"))!.attempts.filter((a) => !a.endedAtDb).length, 1);
+
+  await announceRunning("ktsk-fatgen", "att-2", { delivery_seq: 2, delivery_count: 2 });
+  const mid = (await ledgerOf("ktsk-fatgen"))!.attempts;
+  assert.equal(mid.length, 2);
+  assert.ok(mid[0].endedAtDb, "the superseded attempt is closed, not left open for ever");
+  assert.equal(mid.filter((a) => !a.endedAtDb).length, 1, "and only the live one stays open");
+
+  const token = { attempt_id: "att-2", claim_count: 0, delivery_seq: 2, delivery_count: 2 };
+  await applyAgentDone("ktsk-fatgen", {
+    task_id: "ktsk-fatgen", abort_reason: "completed",
+    run_time: coverage("ktsk-fatgen", "att-2", token, 30),
+  } as Parameters<typeof applyAgentDone>[1]);
+
+  const done = (await ledgerOf("ktsk-fatgen"))!.attempts;
+  assert.equal(done.length, 2);
+  assert.ok(done.every((a) => a.endedAtDb), "a completed run leaves no attempt still running");
+});
+
 test("a running event for a row that has been released opens no attempt record", async () => {
   // Not terminal -- the row is back on the queue for somebody else -- so the
   // terminal guard cannot help. What refuses it is the ownership write itself

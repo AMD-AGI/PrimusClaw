@@ -514,14 +514,37 @@ export function beginAttemptRecord(
   attemptGeneration: number,
   startedAtDb: string,
 ): RunTimeLedgerEntry {
-  if (openAttemptRecord(entry, attemptId)) return entry;
-  return appendAttemptRecord(entry, {
+  // An attempt id is minted once, so a second record under it is a duplicate
+  // event rather than a second attempt -- including one already closed, which
+  // an open-record check alone cannot see.
+  if (entry.attempts.some((a) => a.attemptId === attemptId)) return entry;
+  return appendAttemptRecord(closeOpenAttemptRecords(entry, startedAtDb), {
     attemptId,
     attemptGeneration,
     startedAtDb,
     renewed: false,
     recoveryLoss: { computable: false, lossMs: null },
   });
+}
+
+/**
+ * Close every record still open, at the instant something superseded them.
+ *
+ * The row hands its attempt token to one attempt at a time, so a record left
+ * open when the next attempt begins is one nothing else will ever close: the
+ * boundary that would have closed it is the release or failure that never came.
+ */
+export function closeOpenAttemptRecords(
+  entry: RunTimeLedgerEntry,
+  endedAtDb: string,
+): RunTimeLedgerEntry {
+  if (!entry.attempts.some((a) => a.endedAtDb === undefined)) return entry;
+  return {
+    ...entry,
+    attempts: entry.attempts.map((a) => (a.endedAtDb === undefined
+      ? { ...a, endedAtDb, recoveryLoss: recoveryLossForAttempt(a, endedAtDb) }
+      : a)),
+  };
 }
 
 /** Note that this attempt's lease was renewed at least once. */
