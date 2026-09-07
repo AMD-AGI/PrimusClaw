@@ -178,45 +178,6 @@ const BUDGET_SECONDS_SQL = `NULLIF(
   0
 )`;
 
-/**
- * Wind a row's clocks back when it goes back on the queue.
- *
- * Both stamps are written with COALESCE -- `started_at = COALESCE(started_at,
- * NOW())` beside {@link DEADLINE_STAMP_SQL} -- so that a status re-entry or a
- * redelivery cannot hand one run two budgets. That is the right rule for a run
- * resuming, and the wrong one for a run starting over: the second claim
- * inherits the first attempt's `started_at` and `deadline_at`, so whatever the
- * row spent waiting between the two is charged to its execution budget, and a
- * row requeued late enough arrives already past a deadline nobody spent.
- *
- * `queued_at` is the same argument from the other side. It is what
- * `reapExpiredQueuedRuns` judges the wait by, and leaving it at the first
- * enqueue means a requeue is measured from a queue the row already left. When
- * `RUN_QUEUE_MAX_SEC` and `RUN_BUDGET_CHAT_SEC` were both two hours -- which
- * they were by default until this change raised the chat budget -- and with the
- * requeue pass running earlier in the same tick than the queue reaper, a single
- * recoverable worker loss was closed as `queue_timeout` on the spot. Resetting
- * `queued_at` is what fixes that, so the reset is not conditional on the two
- * ever being equal again: any deployment that configures a chat budget near the
- * queue ceiling brings the collision back with it.
- *
- * `deadline_at` is deliberately NOT cleared, and that is the line between the
- * two stamps. `started_at` is per attempt -- it answers "has this try shown
- * signs of life", and the stale reaper's legacy arm measures from it, so it
- * has to follow the attempt. `deadline_at` is per turn: it is the only
- * absolute bound on how long one chat turn may occupy the fleet. Clearing it
- * handed every requeue a fresh budget, and with the claim ceiling at 22 that
- * turned a two-hour cap into a forty-four-hour one. A row that outlives its
- * deadline is not owed another; it is owed a terminal state, which is
- * `reapExpiredDoorbellRuns`'s job.
- *
- * The cost is queue position: `peekNextQueued` orders by `queued_at ASC`, so a
- * requeued row sorts behind rows that arrived while it was executing rather
- * than ahead of them. The stamp itself is written by the one function that
- * changes a status, so the segment it opens is banked rather than erased.
- */
-export const RUN_REQUEUE_RESET_SQL = "started_at = NULL";
-
 const DEADLINE_STAMP_SQL = `deadline_at = COALESCE(
   deadline_at,
   NOW() + (${BUDGET_SECONDS_SQL} * INTERVAL '1 second')

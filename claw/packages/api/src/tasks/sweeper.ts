@@ -536,11 +536,11 @@ async function announceRunFailure(
  * row archived as retries-exhausted, with nothing recorded about why.
  *
  * Not `reapExpiredQueuedRuns`, which is the tempting second backstop and is not
- * one. It judges the wait from `queued_at`, and `RUN_REQUEUE_RESET_SQL` stamps
- * a fresh `queued_at` on every requeue, so a row going round that loop never
- * accumulates `RUN_QUEUE_MAX_SEC` of queue time and this reaper never matches
- * it. Turning the budget off does not hand the backstop to the queue ceiling;
- * it leaves exactly one, counted in claims rather than in time.
+ * one. It judges the wait from `queued_at`, and `applyTaskStatusTransition`
+ * stamps a fresh `queued_at` on every requeue, so a row going round that loop
+ * never accumulates `RUN_QUEUE_MAX_SEC` of queue time and this reaper never
+ * matches it. Turning the budget off does not hand the backstop to the queue
+ * ceiling; it leaves exactly one, counted in claims rather than in time.
  *
  * Which is not merely untidy. The row keeps its slice of the admission count,
  * so a tenant's ceiling erodes one abandoned turn at a time, and it keeps the
