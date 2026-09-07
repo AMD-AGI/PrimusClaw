@@ -81,12 +81,20 @@ generalSettings: {}
 modelList: []
 
 # Prometheus Operator ServiceMonitor for LiteLLM /metrics. Off by default
-# because the monitoring.coreos.com CRDs may not be installed. The proxy
-# requires the master key on that path; the template reads it from
-# secrets.existingSecret (or the chart-rendered Secret).
+# because the monitoring.coreos.com CRDs may not be installed, and because
+# scrape is useless until litellmSettings.callbacks includes prometheus.
+# See deploy/litellm/README.md for a values snippet that keeps the APIM hook.
+#
+# bearerTokenSecret is resolved in the ServiceMonitor namespace. Leave
+# namespace empty (the release namespace) to reuse secrets.existingSecret.
+# Setting namespace to another namespace requires bearerTokenSecret.name
+# naming a Secret that already exists there.
 serviceMonitor:
   enabled: false
   namespace: ""
+  bearerTokenSecret:
+    name: ""
+    key: master_key
   labels: {}
   interval: 30s
   scrapeTimeout: 10s
