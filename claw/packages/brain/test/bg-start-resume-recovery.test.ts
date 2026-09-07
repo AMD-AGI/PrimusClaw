@@ -13,7 +13,9 @@
  * to every later replay for work that never ran.
  *
  * Driven through the run itself rather than by calling the reconciler, because
- * a reconciler nothing calls is exactly the defect.
+ * a reconciler nothing calls is exactly the defect -- and the run that most
+ * needs it is the one that opens no sandbox at all, since a redelivery with no
+ * checkpoint provisions one only if some tool asks.
  */
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -149,9 +151,25 @@ test("a commitment under a replaced sandbox is left exactly as it stands", async
   assert.equal((await readRow(bgRowStore()!, ORPHAN))?.state, "dispatched");
 });
 
-test("the resumed run reconciles when it attaches, with the model issuing nothing", async () => {
-  // The wiring, end to end: the row is settled by the run picking the sandbox
-  // back up, not by the model happening to re-emit the call that left it.
+test("a resumed run that opens no sandbox still settles its predecessor's send", async () => {
+  // The ordinary redelivery: no checkpoint, and a turn that calls no tool, so
+  // nothing ever attaches. Reconciling at the attach reaches this run never,
+  // and its predecessor's commitment is the one nothing else will settle.
+  await seedOrphanedDispatch(GENERATION);
+  let rowDuringRun: unknown = "not read";
+  let attached = false;
+
+  await runResumedTask(async () => {
+    rowDuringRun = await readRow(bgRowStore()!, ORPHAN);
+    return runResult();
+  }, { onAttach: () => { attached = true; } });
+
+  assert.equal(attached, false, "precondition: this run opened no sandbox");
+  assert.equal(rowDuringRun, null,
+    "the predecessor's unfinished send is settled before the run issues anything");
+});
+
+test("the resumed run reconciles when it attaches too", async () => {
   await seedOrphanedDispatch(GENERATION);
   let rowDuringRun: unknown = "not read";
 
@@ -161,21 +179,72 @@ test("the resumed run reconciles when it attaches, with the model issuing nothin
     return runResult();
   });
 
-  assert.equal(rowDuringRun, null,
-    "the predecessor's unfinished send is settled before the run issues anything");
+  assert.equal(rowDuringRun, null);
 });
 
-/** Enough of a task run to reach the sandbox attach, and nothing beyond it. */
+test("the model is told the call did not go through, not left to find out", async () => {
+  // Releasing the commitment is what stops the request being stranded; on its
+  // own it is a deletion nothing hears about, and the call simply never happens
+  // unless the same tool use is re-emitted by chance.
+  await seedOrphanedDispatch(GENERATION);
+  let restored: Array<{ role: string; content: unknown }> = [];
+
+  await runResumedTask(async (extras) => {
+    restored = (extras!.resumeCheckpoint?.messages ?? []) as typeof restored;
+    return runResult();
+  }, { checkpoint: true });
+
+  const notices = restored.filter(
+    (m) => m.role === "user" && String(m.content).startsWith("[system-notice]:"),
+  );
+  assert.equal(notices.length, 1, JSON.stringify(restored));
+  assert.match(String(notices[0].content), /never started/);
+  assert.match(String(notices[0].content), new RegExp(ORPHAN.shellId));
+});
+
+test("an undecidable start is reported as undecidable, never as one that did not run", async () => {
+  // The two readings lead opposite ways: re-issuing what demonstrably never ran
+  // is correct, and re-issuing what may have run is the duplicate execution the
+  // whole scheme exists to avoid.
+  recordAnswer = { marker: false, subtreeReadable: false, present: false };
+  await seedOrphanedDispatch(GENERATION);
+  let restored: Array<{ role: string; content: unknown }> = [];
+
+  await runResumedTask(async (extras) => {
+    restored = (extras!.resumeCheckpoint?.messages ?? []) as typeof restored;
+    return runResult();
+  }, { checkpoint: true });
+
+  const notice = restored.find(
+    (m) => m.role === "user" && String(m.content).startsWith("[system-notice]:"),
+  );
+  assert.match(String(notice?.content), /cannot be determined/);
+  assert.doesNotMatch(String(notice?.content), /never started/);
+});
+
+/** Enough of a task run to reach the engine, with the sandbox left to the run. */
 async function runResumedTask(
   behaviour: (extras: ExecuteExtras | undefined) => Promise<ExecuteResult>,
+  opts: { onAttach?: () => void; checkpoint?: boolean } = {},
 ): Promise<void> {
   const msg = {
     info: { deliveryCount: 2 },
     ack() {}, nak() {}, working() {}, term() {},
   } as unknown as JsMsg;
-  const kv = emptyKv();
+  // The binding the predecessor left behind. Reconciliation resolves against
+  // the generation the rows name, which is this one -- provisioning a fresh
+  // sandbox instead would answer every outstanding row unknown by construction.
+  const kv = emptyKv({
+    [`hands.${SESSION}`]: JSON.stringify({ status: "ready", handsUrl: URL, token: "tok" }),
+  });
+  const kvCkpt = emptyKv(opts.checkpoint
+    ? { [`task-ckpt.${SESSION}.${MESSAGE}`]: seededCheckpoint() }
+    : {});
   const sideEffects = {
-    ensureHands: (async () => ({ handsUrl: URL, created: false, token: "tok" })) as never,
+    ensureHands: (async () => {
+      opts.onAttach?.();
+      return { handsUrl: URL, created: false, token: "tok" };
+    }) as never,
     destroyHands: (async () => {}) as never,
     reapPendingHands: (async () => {}) as never,
     unregisterSandbox: (() => {}) as never,
@@ -202,7 +271,7 @@ async function runResumedTask(
     async execute(_req, _onEvent, _signal, _hands, extras) { return behaviour(extras); },
   };
   bindTaskRunnerDeps({
-    kv, kvCkpt: emptyKv(),
+    kv, kvCkpt,
     emitter: { async emit() {} } as unknown as NatsEmitter,
     engine, sideEffects,
   });
@@ -217,8 +286,10 @@ async function runResumedTask(
   );
 }
 
-function emptyKv(): KV {
-  const store = new Map<string, Uint8Array>();
+function emptyKv(seed: Record<string, string> = {}): KV {
+  const store = new Map<string, Uint8Array>(
+    Object.entries(seed).map(([k, v]) => [k, new TextEncoder().encode(v)]),
+  );
   return {
     async get(key: string) {
       const value = store.get(key);
@@ -241,4 +312,29 @@ function runResult(): ExecuteResult {
     toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
     elapsedMs: 1,
   } as ExecuteResult;
+}
+
+/** A v3 checkpoint, so the run restores a conversation a notice can reach. */
+function seededCheckpoint(): string {
+  return JSON.stringify({
+    version: 3,
+    session_id: SESSION,
+    message_id: MESSAGE,
+    brain_id: "brain-1",
+    brain_version: "test",
+    checkpointed_at: Date.now(),
+    turns_completed: 1,
+    has_workspace_sync: false,
+    messages: [{ role: "user", content: "start the training run" }],
+    usage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0, turns: 1 },
+    text_parts: [],
+    error_count: 0,
+    tool_calls_by_name: {},
+    total_tool_calls: 0,
+    elapsed_ms_before: 1,
+    setup_commands: [],
+    plan_mode: false,
+    todo_state: [],
+    rebuilds_used: 0,
+  });
 }

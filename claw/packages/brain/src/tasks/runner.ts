@@ -13,7 +13,10 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { NatsEmitter } from "../events/emitter.js";
-import { HandsClient, isHandsNetworkError, type ReclaimCause } from "../clients/hands.js";
+import {
+  HandsClient, isHandsNetworkError,
+  type OutstandingReconciliation, type ReclaimCause,
+} from "../clients/hands.js";
 import {
   syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
@@ -26,7 +29,7 @@ import { isRetryable } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
-import { classifyResumeOutcome } from "./resume-outcome.js";
+import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
 import {
   sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
   decodeAeadKey,
@@ -1983,7 +1986,6 @@ class TaskRunner {
     }).catch(() => { /* a status event must not fail the run */ });
 
     await this.resolveResumeState(this.pendingResumeCkpt, created);
-    await this.reconcileBackgroundStarts();
     return this.hands;
   }
 
@@ -1994,22 +1996,74 @@ class TaskRunner {
    * A crash between the durable dispatched write and the transport handoff
    * leaves a commitment for a request that may never have gone out. Left to the
    * dispatch path it is closed only if the model happens to re-emit that exact
-   * call; reconciled here it is closed either way, on the sandbox's own evidence
-   * rather than on what the resumed model asks for next.
+   * call; and left to the sandbox attach it is not reached at all by the run
+   * that most needs it -- a redelivery with no checkpoint, which opens a sandbox
+   * only if some tool asks for one.
    *
    * A failure is logged, not raised: nothing here is a precondition for running,
    * and an unsettled row still answers every replay fail-closed.
    */
   private async reconcileBackgroundStarts(): Promise<void> {
-    if (!this.hands) return;
+    // Not gated on the feature flag: rows written before it was turned off are
+    // still commitments, and nothing else would ever settle them.
+    if (this.msg.info.deliveryCount <= 1 && !this.pendingResumeCkpt) return;
     try {
-      await this.hands.reconcileOutstandingStarts();
+      const client = await this.reconcilingClient();
+      if (!client) return;
+      this.reportOutstandingStarts(await client.reconcileOutstandingStarts());
     } catch (err) {
       logger.warn(
         { err, sessionId: this.sessionId, runId: this.runId },
         "task.bg_starts_reconcile_failed",
       );
     }
+  }
+
+  /**
+   * The client to reconcile against, without provisioning one.
+   *
+   * A run that has not attached is not a run with no sandbox: the binding of
+   * the one its predecessor used is still in the registry, and it is the
+   * generation the outstanding rows name. Provisioning here instead would open
+   * a pod for a turn that may never need one, and against a *new* generation,
+   * which resolves every outstanding row to unknown by construction.
+   */
+  private async reconcilingClient(): Promise<HandsClient | null> {
+    if (this.hands) return this.hands;
+    const entry = await readHandsEntry(this.kv, this.sessionId).catch(() => null);
+    if (!entry) return null;
+    const info = JSON.parse(entry.value) as { handsUrl?: unknown; token?: unknown };
+    if (typeof info.handsUrl !== "string" || !info.handsUrl) return null;
+    // Not closed afterwards: the reconciliation reads two plain HTTP routes and
+    // never opens the MCP transport, so there is nothing holding a connection.
+    return fx().makeHandsClient(
+      info.handsUrl, typeof info.token === "string" ? info.token : "",
+      this.handsOwner, this.runId, this.request.deadline_at,
+    );
+  }
+
+  /**
+   * Tell the resumed conversation which of its background starts did not
+   * finish, so the model can decide rather than discover.
+   *
+   * Releasing a commitment on positive evidence that nothing ran is what stops
+   * the request being stranded, but on its own it is a deletion the model never
+   * hears about: the call simply never happens unless the same tool use is
+   * re-emitted by chance.
+   */
+  private reportOutstandingStarts(settled: OutstandingReconciliation): void {
+    if (!settled.released.length && !settled.unresolved.length) return;
+    logger.warn(
+      { sessionId: this.sessionId, runId: this.runId, ...settled },
+      "task.bg_starts_unfinished",
+    );
+    const hint = buildOutstandingStartHint(settled);
+    if (!hint || !this.resumeCheckpoint) return;
+    const already = this.resumeCheckpoint.messages.some(
+      (m) => m.role === "user" && m.content === hint.content,
+    );
+    if (already) return;
+    this.resumeCheckpoint.messages = [...this.resumeCheckpoint.messages, hint];
   }
 
   /**
@@ -2149,11 +2203,11 @@ class TaskRunner {
       this.resumeMode, ckpt, isPartialAssistantTail, this.msg.info.deliveryCount,
     );
     if (resumeOutcome.hint && this.resumeCheckpoint) {
+      // By content, not by the prefix: other notices share it -- an unfinished
+      // background start says so through the same channel -- and matching the
+      // prefix would let one of those suppress this one on the next resume.
       const alreadyInjected = this.resumeCheckpoint.messages.some(
-        (m) =>
-          m.role === "user"
-          && typeof m.content === "string"
-          && m.content.startsWith("[system-notice]:"),
+        (m) => m.role === "user" && m.content === resumeOutcome.hint!.content,
       );
       if (!alreadyInjected) {
         this.resumeCheckpoint.messages = [
@@ -3412,6 +3466,10 @@ class TaskRunner {
       } else {
         await this.startWithoutSandbox();
       }
+      // Both paths, and before the engine: a redelivery that opens no sandbox
+      // is exactly the run whose predecessor's unconfirmed start nothing else
+      // would ever settle.
+      await this.reconcileBackgroundStarts();
 
       const result = await this.executeEngine();
 
