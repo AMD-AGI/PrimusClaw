@@ -11,16 +11,19 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
 	"sigs.k8s.io/agent-sandbox/pkg/envd"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 func main() {
+	// One handler for slog, klog and controller-runtime.
+	log.Install()
+
 	cfg := envd.DefaultConfig()
 
 	flag.IntVar(&cfg.Port, "port", cfg.Port, "HTTP listen port")
@@ -39,31 +42,31 @@ func main() {
 
 	// Ensure workspace exists
 	if err := os.MkdirAll(cfg.Workspace, 0755); err != nil {
-		slog.Error("failed to create workspace", "path", cfg.Workspace, "error", err)
+		log.Error("failed to create workspace", "path", cfg.Workspace, "error", err)
 		os.Exit(1)
 	}
 
 	srv, err := envd.New(cfg)
 	if err != nil {
-		slog.Error("failed to initialize envd", "error", err)
+		log.Error("failed to initialize envd", "error", err)
 		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	slog.Info("envd starting",
+	log.Info("envd starting",
 		"port", cfg.Port,
 		"workspace", cfg.Workspace,
 		"egressEnabled", cfg.EgressEnabled)
 
 	if err := srv.Run(ctx); err != nil {
 		if err.Error() != "http: Server closed" {
-			slog.Error("envd exited with error", "error", err)
+			log.Error("envd exited with error", "error", err)
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	}
 
-	slog.Info("envd shutdown complete")
+	log.Info("envd shutdown complete")
 }

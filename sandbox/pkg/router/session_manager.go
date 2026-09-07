@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"k8s.io/klog/v2"
 
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -79,7 +79,7 @@ func NewSessionManager(st store.Store, wmURL string) (SessionManager, error) {
 	}
 	t2, err := http2.ConfigureTransports(transport)
 	if err != nil {
-		klog.Warningf("failed to configure HTTP/2 transport for SessionManager: %v", err)
+		log.Warnf("failed to configure HTTP/2 transport for SessionManager: %v", err)
 	} else {
 		t2.ReadIdleTimeout = 30 * time.Second
 		t2.PingTimeout = 15 * time.Second
@@ -119,7 +119,7 @@ func (m *defaultSessionManager) GetSandboxBySession(
 	//
 	// In both cases, try to recover from K8s via the WM recovery endpoint.
 	// The WM lists Sandbox CRs by session-id annotation, which survives Redis restarts.
-	klog.Warningf("store lookup failed for session %q (err: %v), attempting K8s recovery via WM", sessionID, err)
+	log.Warnf("store lookup failed for session %q (err: %v), attempting K8s recovery via WM", sessionID, err)
 
 	recovered, recoverErr := m.recoverSessionFromWM(ctx, sessionID)
 	if recoverErr != nil {
@@ -131,7 +131,7 @@ func (m *defaultSessionManager) GetSandboxBySession(
 		return nil, fmt.Errorf("store lookup failed: %w (K8s recovery also failed: %v)", err, recoverErr)
 	}
 
-	klog.Infof("session %q recovered from K8s (sandbox: %s/%s)", sessionID, recovered.Namespace, recovered.SandboxName)
+	log.Infof("session %q recovered from K8s (sandbox: %s/%s)", sessionID, recovered.Namespace, recovered.SandboxName)
 	return recovered, nil
 }
 

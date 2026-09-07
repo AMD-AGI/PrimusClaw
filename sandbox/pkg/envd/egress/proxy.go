@@ -7,10 +7,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // PolicyEvaluator is the extension point for OPA policy evaluation (Phase 4).
@@ -106,7 +107,7 @@ func (p *TransparentProxy) Run(ctx context.Context) error {
 		return fmt.Errorf("listen %s: %w", p.cfg.ListenAddr, err)
 	}
 	p.listener = ln
-	slog.Info("egress: transparent proxy listening", "addr", p.cfg.ListenAddr)
+	log.Info("egress: transparent proxy listening", "addr", p.cfg.ListenAddr)
 
 	go func() {
 		<-ctx.Done()
@@ -125,7 +126,7 @@ func (p *TransparentProxy) Run(ctx context.Context) error {
 			if stopped {
 				return nil
 			}
-			slog.Warn("egress: accept error", "error", err)
+			log.Warn("egress: accept error", "error", err)
 			continue
 		}
 		go p.handleConn(ctx, conn)
@@ -138,7 +139,7 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 	// Step 1: Get the original destination via SO_ORIGINAL_DST.
 	origIP, origPort, err := GetOriginalDst(clientConn)
 	if err != nil {
-		slog.Warn("egress: SO_ORIGINAL_DST failed, dropping connection",
+		log.Warn("egress: SO_ORIGINAL_DST failed, dropping connection",
 			"error", err, "remote", clientConn.RemoteAddr())
 		return
 	}
@@ -146,7 +147,7 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 	// Step 2: SSRF check on the original destination IP.
 	chk := p.ssrf.Check(origIP)
 	if chk.Blocked {
-		slog.Warn("egress: blocked by SSRF check",
+		log.Warn("egress: blocked by SSRF check",
 			"ip", origIP, "port", origPort,
 			"reason", chk.Reason, "cidr", chk.CIDR)
 		p.reportDecision(DecisionEvent{
@@ -175,7 +176,7 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 	if domain != "" {
 		addr, err := p.resolver.ResolveAndDial(ctx, domain, origPort)
 		if err != nil {
-			slog.Warn("egress: DNS resolve/validate failed",
+			log.Warn("egress: DNS resolve/validate failed",
 				"domain", domain, "error", err)
 			p.reportDecision(DecisionEvent{
 				Action:     "deny",
@@ -209,7 +210,7 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 		IsTLS:        peek.IsTLS,
 	})
 	if decision.Action == "deny" {
-		slog.Warn("egress: denied by policy",
+		log.Warn("egress: denied by policy",
 			"domain", domain, "ip", origIP, "reason", decision.Reason)
 		p.reportDecision(DecisionEvent{
 			Action:     decision.Action,
@@ -224,7 +225,7 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 		return
 	}
 	if decision.Action == "audit" {
-		slog.Info("egress: audit (would deny)",
+		log.Info("egress: audit (would deny)",
 			"domain", domain, "ip", origIP, "reason", decision.Reason)
 		p.reportDecision(DecisionEvent{
 			Action:     decision.Action,
@@ -241,13 +242,13 @@ func (p *TransparentProxy) handleConn(ctx context.Context, clientConn net.Conn) 
 	// Step 6: Dial the upstream using the verified IP.
 	upstream, err := net.DialTimeout("tcp", dialAddr, p.cfg.DialTimeout)
 	if err != nil {
-		slog.Warn("egress: dial upstream failed",
+		log.Warn("egress: dial upstream failed",
 			"addr", dialAddr, "error", err)
 		return
 	}
 	defer upstream.Close()
 
-	slog.Debug("egress: forwarding",
+	log.Debug("egress: forwarding",
 		"domain", domain, "dial", dialAddr, "tls", peek.IsTLS)
 
 	// Step 7: Bidirectional copy with idle timeout.

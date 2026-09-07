@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -18,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // Config holds builder configuration.
@@ -82,7 +83,7 @@ func (b *Builder) Build(ctx context.Context, templateName, dockerfile string) (*
 	hash := contentHash(dockerfile)
 
 	if image, ok := b.cache.Get(ctx, hash); ok {
-		slog.Info("builder: cache hit", "template", templateName, "hash", hash[:12], "image", image)
+		log.Info("builder: cache hit", "template", templateName, "hash", hash[:12], "image", image)
 		return &BuildResult{Image: image, Cached: true, Hash: hash}, nil
 	}
 
@@ -94,7 +95,7 @@ func (b *Builder) Build(ctx context.Context, templateName, dockerfile string) (*
 		return nil, fmt.Errorf("create build pod: %w", err)
 	}
 
-	slog.Info("builder: build started", "template", templateName, "pod", pod.Name, "image", image)
+	log.Info("builder: build started", "template", templateName, "pod", pod.Name, "image", image)
 
 	if err := b.waitForPod(ctx, pod.Namespace, pod.Name); err != nil {
 		return nil, fmt.Errorf("build failed: %w", err)
@@ -103,7 +104,7 @@ func (b *Builder) Build(ctx context.Context, templateName, dockerfile string) (*
 	duration := time.Since(start)
 
 	if err := b.cache.Set(ctx, hash, image, 30*24*time.Hour); err != nil {
-		slog.Warn("builder: cache set failed", "error", err)
+		log.Warn("builder: cache set failed", "error", err)
 	}
 
 	return &BuildResult{Image: image, Duration: duration, Hash: hash}, nil

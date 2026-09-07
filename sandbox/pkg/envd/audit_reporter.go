@@ -9,12 +9,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
 
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 type internalAuditRequest struct {
@@ -45,7 +45,7 @@ func (r *egressAuditReporter) ReportDecision(event egress.DecisionEvent) {
 	select {
 	case r.queue <- event:
 	default:
-		slog.Warn("egress audit queue full, dropping event", "stage", event.Stage, "action", event.Action)
+		log.Warn("egress audit queue full, dropping event", "stage", event.Stage, "action", event.Action)
 	}
 }
 
@@ -105,12 +105,12 @@ func (r *egressAuditReporter) send(ctx context.Context, event egress.DecisionEve
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		slog.Debug("egress audit upload failed", "error", err)
+		log.Debug("egress audit upload failed", "error", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		slog.Debug("egress audit upload returned non-2xx", "status", resp.StatusCode)
+		log.Debug("egress audit upload returned non-2xx", "status", resp.StatusCode)
 	}
 }
