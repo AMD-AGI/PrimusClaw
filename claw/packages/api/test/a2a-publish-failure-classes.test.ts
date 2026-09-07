@@ -6,10 +6,11 @@
  *
  * A `PubAck` that never arrives does not mean the bytes never arrived. Only a
  * refusal that proves the message was never stored -- `NoResponders` -- lets the
- * request undo its own writes; a timeout, a closed or draining connection and
- * any unrecognised code leave the execution possibly live, so the row moves to
- * `cancelling` and the session is left exactly as the send wrote it. Deleting
- * the accounting for work that may be running is bounded by nothing.
+ * request undo its own writes; a timeout, a closed or draining connection, any
+ * unrecognised code and anything that is not a `NatsError` at all leave the
+ * execution possibly live, so the row moves to `cancelling` and the session is
+ * left exactly as the send wrote it. Deleting the accounting for work that may
+ * be running is bounded by nothing.
  *
  * This file is also the NATS seam: `js` and `nc` are module bindings `initNats`
  * assigns, so a resolve hook points `routes/a2a.ts` at this module's exports
@@ -79,12 +80,22 @@ const TASK_SUBJECT = "tasks.execute";
 const EXISTING = "a2a-parented";
 const PARENT = "a2a-parent";
 
-/** The classes §4.14 calls ambiguous: the row is cancelled, never deleted. */
-const CANCEL_CLASSES: Array<[label: string, err: NatsError]> = [
+/**
+ * The classes §4.14 calls ambiguous: the row is cancelled, never deleted.
+ *
+ * The last three are not `NatsError`s. Nothing promises that a publish only
+ * ever rejects with one -- a codec, an interceptor or a client upgrade can
+ * raise anything -- and an error class this code cannot read says nothing
+ * about whether the stream stored the message.
+ */
+const CANCEL_CLASSES: Array<[label: string, err: unknown]> = [
   ["Timeout", new NatsError("TIMEOUT", ErrorCode.Timeout)],
   ["ConnectionClosed", new NatsError("CONNECTION_CLOSED", ErrorCode.ConnectionClosed)],
   ["ConnectionDraining", new NatsError("CONNECTION_DRAINING", ErrorCode.ConnectionDraining)],
   ["an unrecognised code", new NatsError("BOOM", "NOT_A_REAL_NATS_CODE")],
+  ["a plain Error", new Error("socket hang up")],
+  ["a TypeError from the client", new TypeError("payload is not a Uint8Array")],
+  ["a thrown non-Error", "publish exploded"],
 ];
 
 describe("an ambiguous A2A publish failure cancels the row and deletes nothing", { skip }, () => {
@@ -167,7 +178,7 @@ describe("an ambiguous A2A publish failure cancels the row and deletes nothing",
     );
   };
 
-  const arrangeParented = async (err: NatsError) => {
+  const arrangeParented = async (err: unknown) => {
     await clear();
     await seedParented();
     publishFailure = { subject: TASK_SUBJECT, err };

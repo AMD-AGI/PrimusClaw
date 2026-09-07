@@ -3,6 +3,7 @@
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { db, MarketplaceDb, type StatementRunner } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
 import { getUser } from "../auth/middleware.js";
@@ -512,7 +513,7 @@ async function admitAndOpenA2ASend(
   auth: A2AAuthContext,
   spec: A2ARunSpec,
 ): Promise<A2AEntry> {
-  return await withOwnedAdmissionLock(async (client) => {
+  return await countingCreatedSession(withOwnedAdmissionLock(async (client) => {
     const ask = await a2aAdmissionAsk(message.taskId ?? null, spec, client);
     const decision = await decideAdmission(ask, client);
     if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
@@ -529,7 +530,21 @@ async function admitAndOpenA2ASend(
     await attachA2AParent(target.taskId, auth, spec, client);
     const taskId = await openA2ARun(target, text, auth, spec);
     return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
-  });
+  }));
+}
+
+/**
+ * Count a session this send minted, once its transaction has committed.
+ *
+ * Inside the lock the insert is still provisional -- a throw before the commit
+ * rolls it back -- so counting there would name sessions no row backs.
+ */
+async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntry> {
+  const settled = await entry;
+  const created = (settled.kind === "opened" || settled.kind === "duplicate")
+    && settled.target.created;
+  if (created) metrics.onSessionCreated("ok");
+  return settled;
 }
 
 /**
@@ -602,16 +617,15 @@ async function publishA2AExecuteTask(
  * Codes that prove the bytes never reached JetStream.
  *
  * Everything else -- a timeout, a closed or draining connection, an unknown
- * code -- is ambiguous: the message may be on the stream with only the `PubAck`
- * lost, so the row is cancelled rather than deleted. Deleting the accounting for
- * work that may be running is bounded by nothing; holding it is bounded by the
- * budget.
+ * code, an error that is not a `NatsError` at all -- is ambiguous: the message
+ * may be on the stream with only the `PubAck` lost, so the row is cancelled
+ * rather than deleted. Deleting the accounting for work that may be running is
+ * bounded by nothing; holding it is bounded by the budget.
  */
 const PRE_DELIVERY_ERROR_CODES = new Set<string>([ErrorCode.NoResponders]);
 
 function publishWasPreDelivery(err: unknown): boolean {
-  if (!(err instanceof NatsError)) return true;
-  return PRE_DELIVERY_ERROR_CODES.has(err.code);
+  return err instanceof NatsError && PRE_DELIVERY_ERROR_CODES.has(err.code);
 }
 
 /**
@@ -1537,7 +1551,7 @@ async function admitLegacyInvoke(
   text: string,
   spec: A2ARunSpec,
 ): Promise<A2AEntry> {
-  return await withOwnedAdmissionLock(async (client) => {
+  return await countingCreatedSession(withOwnedAdmissionLock(async (client) => {
     const decision = await decideAdmission(await a2aAdmissionAsk(null, spec, client), client);
     if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
     if (decision.kind === "queue") return { kind: "deferred" };
@@ -1548,5 +1562,5 @@ async function admitLegacyInvoke(
     );
     const taskId = await openA2ARun(target, text, LEGACY_INVOKE_AUTH, spec);
     return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
-  });
+  }));
 }

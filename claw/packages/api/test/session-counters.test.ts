@@ -10,8 +10,11 @@
  * routes reach it on exactly the outcomes they claim: a committed row books
  * `ok`, a request that never wrote one books nothing, and every failure past
  * the point of no return books `error` rather than disappearing into a 5xx.
- * Deletion has two endpoints over one implementation, so both are driven: an
- * accounting only one of them reaches under-reports without ever failing.
+ * Creation and deletion each have several endpoints over one table, so each is
+ * driven: an accounting only one of them reaches under-reports without ever
+ * failing. The workbench and A2A paths need an authenticated caller and a
+ * server, so they are driven in `workbench-session-counter.test.ts` and
+ * `a2a-session-counter.test.ts`.
  *
  * Both routes are driven over a real Fastify with the real handlers, because
  * the whole question is which exit runs which call, and a helper called
@@ -339,3 +342,63 @@ test("two creates and two deletes move each series by exactly two", async () => 
   }
   assert.equal(deleted.ok, 2);
 });
+
+// The Anthropic surface writes `claw_sessions` itself rather than calling the
+// standard create, so a counter only the standard route increments reads as a
+// quiet fleet while this path runs.
+test("the Anthropic session create books one session creation as ok", async () => {
+  createHarness();
+  const app = await ownedApp(registerAnthropicManagedAgentsRoutes);
+  try {
+    const { ok, error, res } = await outcomes(CREATED, () => app.inject({
+      method: "POST",
+      url: "/anthropic/v1/sessions",
+      payload: { agent: "agent_default", environment_id: "env_default", title: "t" },
+    }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(JSON.parse(res.body).type, "session");
+    assert.equal(ok, 1);
+    assert.equal(error, 0);
+    assert.ok(dbStub!.ran(/^INSERT INTO claw_sessions/));
+  } finally {
+    await app.close();
+  }
+});
+
+test("an Anthropic create whose insert throws books an error", async () => {
+  createHarness(true);
+  const app = await ownedApp(registerAnthropicManagedAgentsRoutes);
+  try {
+    const { ok, error } = await outcomes(CREATED, () => app.inject({
+      method: "POST",
+      url: "/anthropic/v1/sessions",
+      payload: { agent: "agent_default", environment_id: "env_default" },
+    }));
+    assert.equal(error, 1);
+    assert.equal(ok, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test("an Anthropic create refused before its insert books neither outcome", async () => {
+  createHarness();
+  const app = await ownedApp(registerAnthropicManagedAgentsRoutes);
+  try {
+    const { ok, error, res } = await outcomes(CREATED, () => app.inject({
+      method: "POST",
+      url: "/anthropic/v1/sessions",
+      payload: { agent: "agent_default" },
+    }));
+    assert.equal(res.statusCode, 400);
+    assert.equal(ok, 0);
+    assert.equal(error, 0);
+    assert.equal(dbStub!.ran(/^INSERT INTO claw_sessions/), false);
+  } finally {
+    await app.close();
+  }
+});
+
+// The insert runs on the transaction a refusal rolls back, so counting at the
+// statement would name a session the request left no row for.
+

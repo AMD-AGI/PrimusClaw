@@ -21,6 +21,7 @@ export type AdmissionModules = {
   chatRun: typeof import("../../src/tasks/chat-run.js");
   dagExpander: typeof import("../../src/tasks/dag-expander.js");
   lifecycle: typeof import("../../src/tasks/lifecycle.js");
+  runClaim: typeof import("../../src/tasks/run-claim.js");
   sessions: typeof import("../../src/routes/sessions.js");
   scheduler: typeof import("../../src/tasks/scheduler.js");
   db: typeof import("../../src/infra/db.js");
@@ -51,6 +52,7 @@ export async function startAdmissionCluster(
       chatRun: await import("../../src/tasks/chat-run.js"),
       dagExpander: await import("../../src/tasks/dag-expander.js"),
       lifecycle: await import("../../src/tasks/lifecycle.js"),
+      runClaim: await import("../../src/tasks/run-claim.js"),
       sessions: await import("../../src/routes/sessions.js"),
       scheduler: await import("../../src/tasks/scheduler.js"),
       db: await import("../../src/infra/db.js"),

@@ -1149,7 +1149,6 @@ const UNCLAIM_REASONS = [
   { what: "a retry", body: { reason: "retry" }, label: "retry" },
   { what: "a drain", body: { reason: "drain" }, label: "drain" },
   { what: "a failed hydrate", body: { reason: "hydrate_failed" }, label: "hydrate_failed" },
-  { what: "a reason nobody defined", body: { reason: "nonsense" }, label: "unspecified" },
   { what: "no reason at all", body: {}, label: "unspecified" },
 ] as const;
 
@@ -1172,6 +1171,32 @@ for (const c of UNCLAIM_REASONS) {
     }
   });
 }
+
+// `unspecified` labels a body that named no reason. A body that names it, or
+// anything else outside the protocol set, is refused before any counter moves:
+// a label invented from a malformed request measures the client, not the fleet.
+test("an unclaim citing a reason nobody defined moves no counter at all", async () => {
+  const stub = stubClaims({ releaseRows: 1 });
+  try {
+    let res: Awaited<ReturnType<typeof post>> | undefined;
+    const moved = await delta(
+      async () => {
+        res = await post("/v1/internal/tasks/ktsk_1/unclaim", {
+          brain_id: "brain-7", reason: "nonsense",
+        });
+      },
+      [
+        { name: UNCLAIM, labels: { reason: "unspecified", outcome: "accepted" } },
+        { name: UNCLAIM, labels: { reason: "unspecified", outcome: "error" } },
+      ],
+    );
+    assert.equal(res?.statusCode, 400);
+    assert.equal(res?.json().error, "reason_invalid");
+    assert.deepEqual(moved, [0, 0]);
+  } finally {
+    stub.restore();
+  }
+});
 
 const GUARDED_WRITES = [
   {

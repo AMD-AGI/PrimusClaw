@@ -295,7 +295,8 @@ test("unspecified is a metric label value and not a protocol reason", () => {
 
 test("every protocol fail-claim reason is accepted by heldClaimReasonFrom", () => {
   for (const reason of RUN_FAIL_CLAIM_REASONS) {
-    const resolved: RunFailClaimReason = heldClaimReasonFrom({ reason });
+    const resolved: RunFailClaimReason | "invalid" = heldClaimReasonFrom({ reason });
+    assert.notEqual(resolved, "invalid");
     assert.equal(resolved, reason);
   }
   const labels: readonly string[] = FAIL_CLAIM_REASONS;

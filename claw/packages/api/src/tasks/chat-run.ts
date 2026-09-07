@@ -1055,13 +1055,10 @@ export async function failChatRunDispatch(
   const message = reason.slice(0, 2000);
   const observed = opts.observedReceipt === undefined ? null : JSON.stringify(opts.observedReceipt);
   try {
-    // Only while no durable holder evidence exists. This used to be an
-    // unguarded transition on the grounds that a dispatch which failed had
-    // never executed -- true when the row's only route to a worker was the
-    // message this function is compensating for. The doorbell path added a
-    // second route that does not wait for it: `peekNextQueued` matches the row
-    // the instant `insertTask` commits, so claim-next can be running the turn
-    // by the time any later step fails. A holder settles its own row.
+    // Only while no durable holder evidence exists: `peekNextQueued` matches
+    // the row the instant `insertTask` commits, so claim-next can be running
+    // the turn by the time the dispatch this compensates for fails. A holder
+    // settles its own row.
     const r = await db.query(
       `WITH prior AS (SELECT status FROM claw_tasks WHERE task_id = $1)
        UPDATE claw_tasks

@@ -33,6 +33,7 @@ import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { interruptSessionRuns } from "../tasks/chat-run.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { createSessionSubscriptionReady, sanitizeSessionEvent } from "../events/store.js";
+import { metrics } from "../infra/metrics.js";
 import { nc } from "../infra/nats.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import { interruptSubject } from "@claw/protocol";
@@ -794,17 +795,23 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       },
     };
 
-    await db.query(
-      `INSERT INTO claw_sessions
-       (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, created_at, updated_at)
-       VALUES ($1, $2, $3, 'claw', 'idle', 'agent_default', '', 'active', $4::jsonb, NOW(), NOW())`,
-      [
-        sessionId,
-        (title || "Anthropic session").slice(0, 255),
-        userId,
-        JSON.stringify({ primus_anthropic_compat: primusAnthropicCompat }),
-      ],
-    );
+    try {
+      await db.query(
+        `INSERT INTO claw_sessions
+         (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, created_at, updated_at)
+         VALUES ($1, $2, $3, 'claw', 'idle', 'agent_default', '', 'active', $4::jsonb, NOW(), NOW())`,
+        [
+          sessionId,
+          (title || "Anthropic session").slice(0, 255),
+          userId,
+          JSON.stringify({ primus_anthropic_compat: primusAnthropicCompat }),
+        ],
+      );
+    } catch (err) {
+      metrics.onSessionCreated("error");
+      throw err;
+    }
+    metrics.onSessionCreated("ok");
 
     return reply.send({
       id: sessionId,

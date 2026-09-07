@@ -103,7 +103,8 @@ async function seedHolderAndSpare(h: Harness, explicitFat: boolean): Promise<voi
   await armAttempted(h, "spare");
 }
 
-export function registerReconcileOffCases(harness: () => Harness): void {
+/** Rows the durable receipt cannot answer for, which the reaper must leave open. */
+function registerOrphanReapCases(harness: () => Harness): void {
   for (const [shape, explicitFat] of [["legacy", false], ["explicitly fat", true]] as const) {
     test(`an aged ${shape} orphan the durable cannot answer for is left open`, async () => {
       const h = harness();
@@ -164,7 +165,10 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     });
     assert.equal((await runRow(h, "outstanding")).status, "preparing");
   });
+}
 
+/** A Stop against a row nobody holds, which still goes through the handshake. */
+function registerStopHandshakeCases(harness: () => Harness): void {
   for (const [shape, explicitFat] of [["legacy", false], ["explicitly fat", true]] as const) {
     test(`a Stop on a ${shape} row nobody holds parks it at cancelling`, async () => {
       const h = harness();
@@ -199,7 +203,10 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     await cancelTask("fat");
     assert.equal((await runRow(h, "fat")).status, "cancelling");
   });
+}
 
+/** What a holder's own completion does to the unheld sibling of its turn. */
+function registerSiblingClosureCases(harness: () => Harness): void {
   for (const [shape, explicitFat] of [["legacy", false], ["explicitly fat", true]] as const) {
     test(`a holder's own completion leaves its unheld ${shape} sibling open`, async () => {
       const h = harness();
@@ -229,7 +236,10 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
     assert.equal((await runRow(h, "spare")).status, "preparing");
   });
+}
 
+/** The three publish outcomes: acknowledgement lost, refused, and raced by a Stop. */
+function registerPublishOutcomeCases(harness: () => Harness): void {
   test("a publish whose acknowledgement was lost leaves the row open and armed", async () => {
     const h = harness();
     const { publishCertainlyFailed } = await import("../src/infra/nats.js");
@@ -303,7 +313,10 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     assert.equal(receipt?.state, "terminal");
     assert.equal(receipt?.failure_reason, "cancelled_before_dispatch_confirmed");
   });
+}
 
+/** The finalizer against a receipt that is already terminal. */
+function registerFinalizerReceiptCases(harness: () => Harness): void {
   test("the finalizer adopts an already-terminal receipt with the switch off", async () => {
     const h = harness();
     const { finalizeDispatchCompensations } = await import("../src/tasks/sweeper.js");
@@ -345,7 +358,10 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     assert.equal(await auditRefusedCompensations(), 1);
     assert.deepEqual(await runRow(h, "t1"), before);
   });
+}
 
+/** Doorbell rows reaching the same passes the fat path does. */
+function registerDoorbellRowCases(harness: () => Harness): void {
   test("a leased doorbell row still takes the handshake", async () => {
     const h = harness();
     const { cancelTask } = await import("../src/tasks/lifecycle.js");
@@ -417,4 +433,13 @@ export function registerReconcileOffCases(harness: () => Harness): void {
     await closeChatRun("s1", "m-1", "completed", undefined, { taskId: "held" });
     assert.equal((await runRow(h, "spare")).failure_reason, "duplicate_dispatch_row");
   });
+}
+
+export function registerReconcileOffCases(harness: () => Harness): void {
+  registerOrphanReapCases(harness);
+  registerStopHandshakeCases(harness);
+  registerSiblingClosureCases(harness);
+  registerPublishOutcomeCases(harness);
+  registerFinalizerReceiptCases(harness);
+  registerDoorbellRowCases(harness);
 }

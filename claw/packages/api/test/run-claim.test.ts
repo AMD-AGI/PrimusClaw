@@ -227,11 +227,14 @@ test("failing a held claim is a no-op for a brain that does not hold it", async 
   assert.equal(await failHeldClaim("ktsk_1", "brain-other"), false);
 });
 
-test("fail-claim body reasons other than the held-claim set stay session_deleted", () => {
+test("fail-claim body reasons outside the held-claim set are refused, absence is not", () => {
   assert.equal(heldClaimReasonFrom({ brain_id: "b", reason: "claim_abandoned" }), "claim_abandoned");
   assert.equal(heldClaimReasonFrom({ reason: "workspace_unbound" }), "workspace_unbound");
   assert.equal(heldClaimReasonFrom({ brain_id: "b" }), "session_deleted");
-  assert.equal(heldClaimReasonFrom({ reason: "agent_error" }), "session_deleted");
+  assert.equal(heldClaimReasonFrom({ reason: "agent_error" }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: "" }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: null }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: 7 }), "invalid");
 });
 
 test("claim-next skips an unclaimable row and takes the next chat run", async () => {

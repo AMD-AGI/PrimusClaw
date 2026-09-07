@@ -64,7 +64,9 @@ nothing is reporting -- see *Why the expressions look like this*.
 3. Prometheus reaches the API `/metrics` endpoint of every replica, and P1
    below passes.
 4. Every run-creating path is routed through admission, so a ceiling means what
-   it says. Coverage of the non-chat origins is `TBD(00b)`.
+   it says. All four origins reach `decideAdmission`: `chat` from the session
+   create, `a2a` from both send paths, and `dag_node` and `task` from the DAG
+   expander.
 
 ## Applying a value
 
@@ -617,12 +619,12 @@ rows are Stage 3's three, with `$k` one higher than before the stage and
 (sum(increase(claw_api_admission_rejected_total{namespace="$ns", service=~"(primus-)?claw-api", pod=~"primus-claw-api-.*", reason!="tree_depth_exceeded"}[$w])) or vector(0)) == bool 0
 ```
 
-**The positive rejection is the gate, not a formality.** Until a producer
-populates the tree node count and depth on the admission ask -- `TBD(00b)` --
-both ceilings admit everything, which looks exactly like a ceiling real traffic
-never approaches. Requiring the `k + 1` create to increment the counter is what
-tells the two apart, and until that producer lands Stage 3T fails at its first
-boundary probe, which is the correct outcome.
+**The positive rejection is the gate, not a formality.** A ceiling that admits
+everything looks exactly like a ceiling real traffic never approaches, and only
+the `k + 1` create incrementing the counter tells the two apart. The dimensions
+are produced on every ask -- `sessionTreeShape` for `chat` and `a2a`, `dagShape`
+for the expander -- so a stage that reports no rejection has found a gap in that
+production, not a quiet fleet.
 
 ## Stop conditions
 
@@ -848,5 +850,3 @@ unclaim reason is still rejected. A non-trivial rate means version skew.
 - Production ceiling values, replica counts or any other capacity figure.
 - A soak duration per stage.
 - Dashboard panels, alert rules or an SLO artefact.
-- The producer for the tree dimensions (`TBD(00b)`), without which Stage 3T
-  fails at its first boundary probe.

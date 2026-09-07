@@ -32,6 +32,7 @@ import {
   sessionCredentialPatch,
 } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { workbenchRegistry } from "./registry.js";
@@ -51,12 +52,19 @@ interface CreateRunBody {
   [key: string]: unknown;
 }
 
+/**
+ * The caller's session, or a fresh hidden one for this run.
+ *
+ * `created` is reported rather than counted here: the insert runs on the
+ * transaction a later refusal rolls back, so only the committing caller knows
+ * whether a session outlived the request.
+ */
 async function ensureSession(
   workbench: WorkbenchDef,
   user: UserInfo,
   body: Record<string, unknown>,
   client: PoolClient,
-): Promise<string> {
+): Promise<{ sessionId: string; created: boolean }> {
   assertSessionCredentialsForDispatch(
     (body.session_id as string | undefined) ?? "new workbench session",
     user,
@@ -86,7 +94,7 @@ async function ensureSession(
           WHERE session_id = $1`,
         [provided, JSON.stringify(runConfigPatch)],
       );
-      return provided;
+      return { sessionId: provided, created: false };
     }
   }
   const sid = (await import("node:crypto")).randomUUID();
@@ -115,7 +123,7 @@ async function ensureSession(
       }),
     ],
   );
-  return sid;
+  return { sessionId: sid, created: true };
 }
 
 /** The wording every gated creation surface uses, so one refusal reads the same everywhere. */
@@ -303,9 +311,9 @@ async function submitWorkbenchRun(
   run: WorkbenchRunSubmission,
 ): Promise<{ commit: boolean; value: unknown }> {
   const { reply } = run;
-  let sessionId: string;
+  let session: { sessionId: string; created: boolean };
   try {
-    sessionId = await ensureSession(run.workbench, run.user, run.body, client);
+    session = await ensureSession(run.workbench, run.user, run.body, client);
   } catch (e) {
     if ((e as Error)?.message === "session_access_denied") {
       await reply.status(403).send({ ok: false, error: "session_access_denied" });
@@ -317,6 +325,7 @@ async function submitWorkbenchRun(
     }
     throw e;
   }
+  const { sessionId } = session;
 
   const result = await expandDag({
     session_id: sessionId,
@@ -339,6 +348,7 @@ async function submitWorkbenchRun(
     },
     "workbench.run.created",
   );
+  if (session.created) metrics.onSessionCreated("ok");
   return {
     commit: true,
     value: { ok: true, run_id: result.dag_root_task_id, session_id: sessionId },

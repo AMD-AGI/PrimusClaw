@@ -89,7 +89,7 @@ describe("usage totals and roots read as one snapshot", { skip }, () => {
     const { admission } = harness.app;
     const limits = admission.envAdmitLimits();
 
-    // The pre-fix shape, written out: the root set read first, the totals read
+    // Two statements rather than one: the root set read first, the totals read
     // after the finish commits.
     const rootsFirst = await harness.app.db.db.query(
       `SELECT COALESCE(dag_root_task_id, task_id) AS root FROM claw_tasks

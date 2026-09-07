@@ -261,7 +261,27 @@ test("fail-claim can mark an unbound claimed run as workspace_unbound", async ()
   assert.equal(reason, "workspace_unbound");
 });
 
-test("fail-claim ignores an unknown reason and keeps session_deleted", async () => {
+// A reason the API does not know is a holder asking for something this build
+// cannot do. Defaulting it to `session_deleted` would close the row for good
+// on a guess, so the request is refused and no statement runs.
+test("fail-claim refuses an unknown reason instead of defaulting it", async () => {
+  let touched = false;
+  db.query = (async () => {
+    touched = true;
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/fail-claim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", reason: "not_a_reason" },
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, "reason_invalid");
+  assert.equal(touched, false, "a refused body reaches no statement");
+});
+
+test("fail-claim still defaults an absent reason to session_deleted", async () => {
   let reason: unknown;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
@@ -275,10 +295,99 @@ test("fail-claim ignores an unknown reason and keeps session_deleted", async () 
     method: "POST",
     url: "/v1/internal/tasks/ktsk_1/fail-claim",
     headers: { authorization: `Bearer ${TOKEN}` },
-    payload: { brain_id: "brain-7", reason: "not_a_reason" },
+    payload: { brain_id: "brain-7" },
   });
   assert.equal(res.statusCode, 200);
   assert.equal(reason, "session_deleted");
+});
+
+// The generation fence is `($3::int IS NULL OR claim_count = $3)`, so a
+// malformed count coerced to absent releases whatever generation the row is
+// on -- including a turn a later holder is running.
+for (const [label, claimCount] of [
+  ["a string", "malformed"],
+  ["a fraction", 1.9],
+  ["a negative", -1],
+  ["null", null],
+  ["NaN", Number.NaN],
+] as const) {
+  for (const route of ["unclaim", "fail-claim"] as const) {
+    test(`${route} refuses ${label} claim_count rather than dropping the fence`, async () => {
+      let touched = false;
+      db.query = (async () => {
+        touched = true;
+        return { rows: [], rowCount: 0 };
+      }) as typeof db.query;
+      const res = await app.inject({
+        method: "POST",
+        url: `/v1/internal/tasks/ktsk_1/${route}`,
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: { brain_id: "brain-7", claim_count: claimCount },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.json().error, "claim_count_invalid");
+      assert.equal(touched, false, "a refused body reaches no statement");
+    });
+  }
+}
+
+test("unclaim passes an integer claim_count through to the fence", async () => {
+  let seen: unknown;
+  db.query = (async (text: string, params: unknown[] = []) => {
+    if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+      seen = params[2];
+      return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/unclaim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", claim_count: 3, reason: "retry" },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(seen, 3);
+});
+
+// `unspecified` is a metric label for a body that named no reason. A body that
+// names it is a client inventing a protocol value, which is version skew.
+for (const reason of ["unspecified", "not_a_reason", "", 7, null] as const) {
+  test(`unclaim refuses ${JSON.stringify(reason)} as a reason`, async () => {
+    let touched = false;
+    db.query = (async () => {
+      touched = true;
+      return { rows: [], rowCount: 0 };
+    }) as typeof db.query;
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/internal/tasks/ktsk_1/unclaim",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { brain_id: "brain-7", reason },
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, "reason_invalid");
+    assert.equal(touched, false, "a refused body reaches no statement");
+  });
+}
+
+test("unclaim with no reason is accepted and writes no last_release", async () => {
+  let seen: unknown = "unset";
+  db.query = (async (text: string, params: unknown[] = []) => {
+    if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+      seen = params[3];
+      return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/unclaim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7" },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(seen, null, "absence stays absent rather than becoming a reason");
 });
 
 test("fail-claim rejects a run lease token", async () => {

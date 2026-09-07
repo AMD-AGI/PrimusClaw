@@ -17,7 +17,9 @@ import pino from "pino";
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
-import { deferQueuedBySoftCeiling } from "./admission.js";
+import {
+  anySoftCeilingSet, deferQueuedBySoftCeiling, envAdmitLimits, withOwnedAdmissionLock,
+} from "./admission.js";
 import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
@@ -111,18 +113,42 @@ export async function countIncompatibleDoorbellRuns(version: number): Promise<nu
   return Number((r.rows[0] as { n?: number } | undefined)?.n ?? 0);
 }
 
+/**
+ * Read the soft-ceiling usage and take the row under one hold of the lock.
+ *
+ * The two must be the same transaction. Reading first and claiming afterwards
+ * lets two connections holding one queued row each both count the fleet under
+ * a ceiling of one and both claim it, and no CAS refuses them: they contend
+ * for headroom, not for a row. Committing between the read and the claim has
+ * the same effect, because the lock goes with the commit while the row this
+ * claim adds to the executing set arrives after it.
+ *
+ * A caller supplying its own querier owns the transaction, and the lock with
+ * it. Without a soft ceiling there is no usage to read and no lock to take.
+ */
+async function takeUnderSoftCeiling(
+  taskId: string,
+  brainId: string,
+  doorbellSemantics: number,
+  q: Querier | undefined,
+): Promise<ClawTaskRow | "missing" | "busy" | "deferred"> {
+  const gated = async (on: Querier) => {
+    if (await deferQueuedBySoftCeiling(taskId, on)) return "deferred" as const;
+    return await takeClaimOrBusy(taskId, brainId, doorbellSemantics, on);
+  };
+  if (q) return await gated(q);
+  if (!anySoftCeilingSet(envAdmitLimits())) return await gated(db);
+  return await withOwnedAdmissionLock(gated);
+}
+
 export async function claimRunById(
   taskId: string,
   brainId: string,
   doorbellSemantics = 1,
-  q: Querier = db,
+  q?: Querier,
 ): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim> {
-  // Only a `queued` row: CLAIMABLE also admits `preparing`, which is already
-  // counted as executing, so re-claiming one after an unclaim adds nothing to
-  // the executing set and must not be refused.
-  if (await deferQueuedBySoftCeiling(taskId)) return "deferred";
-  const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, q);
-  if (taken === "missing" || taken === "busy") return taken;
+  const taken = await takeUnderSoftCeiling(taskId, brainId, doorbellSemantics, q);
+  if (taken === "missing" || taken === "busy" || taken === "deferred") return taken;
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
     const closed = await failExhaustedClaim(taken);
     if (!closed) {
@@ -379,11 +405,20 @@ const HELD_CLAIM_MESSAGE: Record<HeldClaimFailureReason, string> = {
 
 const HELD_CLAIM_REASONS = new Set<string>(Object.keys(HELD_CLAIM_MESSAGE));
 
-export function heldClaimReasonFrom(body: unknown): HeldClaimFailureReason {
+/**
+ * Why the holder is closing the row, when it says so.
+ *
+ * Absence stays the historical default. A value that is present and
+ * unrecognised is refused rather than defaulted: the three reasons ask
+ * opposite things of the sandbox and the delivery, and a fail is terminal, so
+ * guessing one for a caller that meant another cannot be taken back.
+ */
+export function heldClaimReasonFrom(body: unknown): HeldClaimFailureReason | "invalid" {
   const raw = body && typeof body === "object" ? (body as { reason?: unknown }).reason : undefined;
+  if (raw === undefined) return "session_deleted";
   return typeof raw === "string" && HELD_CLAIM_REASONS.has(raw)
     ? raw as HeldClaimFailureReason
-    : "session_deleted";
+    : "invalid";
 }
 
 /**

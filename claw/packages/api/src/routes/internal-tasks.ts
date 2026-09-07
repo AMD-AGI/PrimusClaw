@@ -714,7 +714,7 @@ async function buildBackendMcpCtxStub(
  *
  * Mount path: `/v1/internal/tasks/:taskId/{agent_done,event,backend-mcp}`.
  */
-export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
+function registerAgentDoneRoute(app: FastifyInstance): void {
   // Brain → Backend: task finished (success / failure / wait_external).
   app.post<{ Params: { taskId: string }; Body: AgentDoneBody }>(
     "/v1/internal/tasks/:taskId/agent_done",
@@ -736,7 +736,9 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
+function registerTaskEventRoute(app: FastifyInstance): void {
   // Brain → Backend: streaming events (assistantTextDelta / toolUse / ...).
   app.post<{ Params: { taskId: string }; Body: TaskEventBody }>(
     "/v1/internal/tasks/:taskId/event",
@@ -767,7 +769,9 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
+function registerRunLeaseRoute(app: FastifyInstance): void {
   // Brain → Backend: this run is still alive, and here is what it is doing.
   //
   // Kept apart from the two endpoints above because it says something much
@@ -818,7 +822,9 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
         : { ok: true, status: grant.status, claim_count: grant.claimCount };
     },
   );
+}
 
+function registerBackendMcpRoute(app: FastifyInstance): void {
   // Brain → Backend: Backend-side MCP tool call (JSON-RPC 2.0).
   // Supports `initialize`, `tools/list`, `tools/call` per task-design §8.2.
   app.post<{ Params: { taskId: string }; Body: JsonRpcRequest }>(
@@ -834,4 +840,11 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return response;
     },
   );
+}
+
+export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
+  registerAgentDoneRoute(app);
+  registerTaskEventRoute(app);
+  registerRunLeaseRoute(app);
+  registerBackendMcpRoute(app);
 }

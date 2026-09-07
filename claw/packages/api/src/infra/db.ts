@@ -168,8 +168,9 @@ export const RUN_CLAIM_FENCE_LOCK_ID = 8_264_179_233_002;
 
 /**
  * The fence conjunct `takeClaim` carries in its UPDATE's WHERE clause. Inside
- * the statement because the claim path opens no transaction of its own, so a
- * lock taken by a preceding one would be released before the UPDATE it fences.
+ * the statement because the claim path opens a transaction only when a soft
+ * ceiling is set, and without one a lock taken by a preceding statement would
+ * be released before the UPDATE it fences.
  */
 export const RUN_CLAIM_FENCE_SQL =
   `pg_advisory_xact_lock_shared(${RUN_CLAIM_FENCE_LOCK_ID}) IS NOT NULL`;

@@ -14,7 +14,12 @@
  *
  * `initNats` is never called here, so `js.publish` throws: that is the publish
  * failure under test, and it is also why every admitted send in this file ends
- * in the compensation path.
+ * in the compensation path. The throw is not a `NatsError`, so it is a failure
+ * that proves nothing about whether the stream stored the message -- the
+ * compensation therefore cancels the counted row rather than deleting it, and
+ * leaves the session as the send wrote it. Which failures may delete instead is
+ * `a2a-publish-failure-classes.test.ts`; what matters here is that the row is
+ * settled at all rather than left `preparing` until its deadline.
  */
 
 import assert from "node:assert/strict";
@@ -96,19 +101,21 @@ describe("an A2A send is charged what it resolved, and strands nothing", { skip 
     );
   });
 
-  test("a failed publish erases the row and the session the send created", async () => {
+  test("a failed publish settles the row the send created, rather than stranding it", async () => {
     await clear();
     const res = await send({ messageId: "m-strand", role: "user", parts: [{ text: "hello" }] });
     assert.equal(res.statusCode, 200);
     assert.equal(errorOf(res.body), "Failed to create task");
 
     const rows = await harness.app.db.db.query("SELECT status FROM claw_tasks");
-    assert.equal(rows.rowCount, 0, "no counted row holds capacity for work that never left");
-    const sessions = await harness.app.db.db.query("SELECT 1 FROM claw_sessions WHERE user_id = 'a2a'");
-    assert.equal(sessions.rowCount, 0, "the session this request inserted goes with it");
+    assert.equal(rows.rowCount, 1, "an ambiguous failure keeps the accounting for possible work");
+    assert.equal(
+      (rows.rows[0] as { status: string }).status, "cancelling",
+      "settled, not left preparing until its deadline",
+    );
   });
 
-  test("a failed publish to an existing target restores what the send wrote", async () => {
+  test("a failed publish to an existing target keeps that target", async () => {
     await clear();
     await harness.app.db.db.query(
       `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id)
@@ -122,13 +129,17 @@ describe("an A2A send is charged what it resolved, and strands nothing", { skip 
     assert.equal(errorOf(res.body), "Failed to create task");
 
     const rows = await harness.app.db.db.query("SELECT status FROM claw_tasks");
-    assert.equal(rows.rowCount, 0, "the counted row is erased, not left preparing");
+    assert.equal(rows.rowCount, 1);
+    assert.equal(
+      (rows.rows[0] as { status: string }).status, "cancelling",
+      "the counted row is settled, not left preparing",
+    );
     const session = (await harness.app.db.db.query(
       "SELECT agent_status, context_id FROM claw_sessions WHERE session_id = 'a2a-live'",
     )).rows[0] as { agent_status: string; context_id: string };
     assert.equal(
-      session.agent_status, "input_required",
-      "a target that already existed is restored, never deleted",
+      session.agent_status, "pending",
+      "a target that already existed keeps the send's write; it is never deleted",
     );
     assert.equal(session.context_id, "ctx-keep");
   });
@@ -152,11 +163,15 @@ describe("an A2A send is charged what it resolved, and strands nothing", { skip 
   test("a legacy invoke inside the ceiling opens a counted row", async () => {
     await clear();
     const res = await app.inject({ method: "POST", url: "/invoke", payload: { question: "hello" } });
-    // The publish then fails, so the compensation erases both again -- what
-    // this asserts is that the path is admitted rather than refused.
+    // The publish then fails, so the row is compensated -- what this asserts is
+    // that the path is admitted rather than refused.
     assert.equal(res.statusCode, 500);
     assert.equal((JSON.parse(res.body) as { error: string }).error, "Failed to process request");
-    const rows = await harness.app.db.db.query("SELECT 1 FROM claw_tasks");
-    assert.equal(rows.rowCount, 0, "and its counted row is compensated, not stranded");
+    const rows = await harness.app.db.db.query("SELECT status FROM claw_tasks");
+    assert.equal(rows.rowCount, 1, "the send was admitted and opened its row");
+    assert.equal(
+      (rows.rows[0] as { status: string }).status, "cancelling",
+      "and that row is compensated, not stranded",
+    );
   });
 });
