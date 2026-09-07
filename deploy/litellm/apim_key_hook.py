@@ -8,6 +8,9 @@ Usage:
   1. Create key: POST /key/generate {"metadata": {"apim_key": "xxx"}}
   2. Use key:    Authorization: Bearer sk-xxx (no extra_headers needed)
 
+Logs each completion with model and api_base so glm-5-3/infera is
+distinguishable from APIM Claude in proxy logs.
+
 Prompt caching (Claude / Anthropic via LiteLLM):
   Send header ``x-auto-prompt-caching: true`` (HTTP header or ``extra_headers``).
   The hook injects Anthropic ``cache_control: {type: ephemeral}`` on tools and
@@ -265,6 +268,45 @@ def _inject_cache_control_on_message(msg: dict, marker: dict) -> bool:
     return False
 
 
+def _upstream_route(kwargs: Mapping[str, Any]) -> tuple[str, str]:
+    """Requested model and upstream api_base from a callback kwargs dict."""
+    params = kwargs.get("litellm_params")
+    if not isinstance(params, Mapping):
+        params = {}
+    model = kwargs.get("model") or params.get("model") or ""
+    api_base = params.get("api_base") or kwargs.get("api_base") or ""
+    return str(model or "-"), str(api_base or "-")
+
+
+def _log_upstream(
+    outcome: str,
+    kwargs: Mapping[str, Any],
+    response_obj: Any = None,
+    start_time: Any = None,
+    end_time: Any = None,
+) -> None:
+    """One line so access logs can tell glm-5-3/infera from APIM Claude."""
+    model, api_base = _upstream_route(kwargs)
+    elapsed_ms = "-"
+    try:
+        if start_time is not None and end_time is not None:
+            elapsed_ms = f"{(end_time - start_time).total_seconds() * 1000:.0f}"
+    except Exception:
+        elapsed_ms = "-"
+    extra = ""
+    if outcome == "fail":
+        err = kwargs.get("exception") or response_obj
+        extra = f" err={type(err).__name__}" if err is not None else ""
+    logger.info(
+        "upstream %s model=%s api_base=%s elapsed_ms=%s%s",
+        outcome,
+        model,
+        api_base,
+        elapsed_ms,
+        extra,
+    )
+
+
 def _inject_anthropic_prompt_cache(data: dict, marker: dict) -> None:
     """
     Add ephemeral cache breakpoints for Claude: last eligible tool and the
@@ -369,6 +411,18 @@ class ApimKeyHook(CustomLogger):
             _strip_auto_cache_request_header(data)
 
         return data
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        _log_upstream("ok", kwargs, response_obj, start_time, end_time)
+
+    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        _log_upstream("fail", kwargs, response_obj, start_time, end_time)
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        _log_upstream("ok", kwargs, response_obj, start_time, end_time)
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        _log_upstream("fail", kwargs, response_obj, start_time, end_time)
 
 
 proxy_handler_instance = ApimKeyHook()
