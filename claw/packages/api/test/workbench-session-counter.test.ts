@@ -9,10 +9,11 @@
  * itself rather than calling the standard create, so a counter only that route
  * increments reads as a quiet fleet while this path runs.
  *
- * The insert runs on the transaction an admission refusal rolls back, so the
- * count belongs to the committing caller rather than to the statement: both
- * outcomes are driven here, because "counted a session that was rolled back"
- * and "counted nothing" are different bugs.
+ * The insert runs on the transaction an admission refusal rolls back -- and a
+ * `COMMIT` can fail on its own -- so the count belongs after the commit rather
+ * than to the statement or to the decision to commit. All three outcomes are
+ * driven here, because "counted a session that was rolled back" and "counted
+ * nothing" are different bugs.
  *
  * `APP_ENV` and `CLAW_DEPLOY_MODE` are read once when `config.ts` loads, so
  * they are set before the dynamic imports: the run route authenticates through
@@ -68,12 +69,14 @@ const PLUGIN_ROW = {
 };
 
 let registry: typeof import("../src/infra/metrics.js")["registry"];
+let db: typeof import("../src/infra/db.js")["db"];
 let app: FastifyInstance;
 let dbStub: DbStub | null = null;
 
 before(async () => {
   stubDb = (await import("./support/db-stub.js")).stubDb;
   registry = (await import("../src/infra/metrics.js")).registry;
+  db = (await import("../src/infra/db.js")).db;
   const { workbenchRegistry } = await import("../src/workbenches/registry.js");
   const { registerWorkbenchRunRoutes } = await import("../src/workbenches/routes.js");
   workbenchRegistry.register({
@@ -93,6 +96,33 @@ before(async () => {
 
 after(async () => { await app?.close(); });
 afterEach(() => { dbStub?.restore(); dbStub = null; });
+
+/**
+ * The stub with its `COMMIT` failing, everything before it succeeding.
+ *
+ * The row is written and the run is decided; only the statement that would make
+ * any of it durable fails. A count taken on the way to the commit survives that
+ * and names a session no row backs.
+ */
+function seedReadsWithFailingCommit(): void {
+  seedReads();
+  const real = dbStub!;
+  const inner = db.pool.connect;
+  db.pool.connect = (async () => {
+    const client = await (inner as () => Promise<{ query: (t: string, p?: unknown[]) => unknown }>)();
+    const clientQuery = client.query;
+    client.query = async (text: string, params?: unknown[]) => {
+      const result = await clientQuery.call(client, text, params);
+      // Recorded before it fails, so the test can tell "the commit failed" from
+      // "the run never reached one".
+      if (/^COMMIT/.test(text.trim())) throw new Error("could not serialize access");
+      return result;
+    };
+    return client;
+  }) as typeof db.pool.connect;
+  const restore = real.restore.bind(real);
+  real.restore = () => { db.pool.connect = inner; restore(); };
+}
 
 /** Every read a run makes before its insert, answered with one row. */
 function seedReads(dag: Record<string, unknown> = DAG_ROW): void {
@@ -171,5 +201,18 @@ test("a run refused by the tree ceiling books nothing, though it did insert", as
   assert.ok(dbStub!.ran(/^INSERT INTO claw_sessions/), "the row was written");
   assert.ok(dbStub!.ran(/^ROLLBACK/), "and the transaction rolled it back");
   assert.equal(ok, 0);
+  assert.equal(error, 0);
+});
+
+// A commit is not a formality: it can fail on serialization, on a lost
+// connection, or on a constraint deferred to it. Counting before it confirms
+// reports a session the database never kept.
+test("a run whose commit fails books nothing, though it wrote and decided", async () => {
+  seedReadsWithFailingCommit();
+  const { ok, error, res } = await moved(() => postRun({ prompt: "go" }));
+  assert.equal(res.statusCode, 500, res.body);
+  assert.ok(dbStub!.ran(/^INSERT INTO claw_sessions/), "the row was written");
+  assert.ok(dbStub!.ran(/^COMMIT/), "and the commit was reached");
+  assert.equal(ok, 0, "but nothing durable came of it");
   assert.equal(error, 0);
 });

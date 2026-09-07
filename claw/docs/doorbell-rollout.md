@@ -822,17 +822,17 @@ domains are closed enumerations.
 
 | Label | Values |
 |---|---|
-| `origin` | `chat`, `task`, `dag_node` |
+| `origin` | `chat`, `task`, `dag_node`, `a2a` |
 | `decision` | `admit`, `queue`, `reject`, `error` |
 | `reason` (rejected) | `runs_hard_limit`, `sandboxes_hard_limit`, `gpu_nodes_hard_limit`, `tree_nodes_exceeded`, `tree_depth_exceeded` |
 | `stage` | `pre_insert`, `post_insert` |
 | `dimension` | `soft_runs`, `hard_runs`, `soft_sandboxes`, `hard_sandboxes`, `soft_gpu_nodes`, `hard_gpu_nodes`, `tree_max_nodes`, `tree_max_depth` |
 | `path` | `chat`, `pending` |
-| `outcome` (dispatch) | `dispatched`, `queued`, `rejected`, `open_failed`, `error` |
+| `outcome` (dispatch) | `dispatched`, `queued`, `rejected`, `publish_unknown`, `open_failed`, `error` |
 | `cause` (held) | `hard_limit_exceeded`, `hard_limit_recheck_threw`, `doorbell_publish_failed` |
 | `mode` | `by_id`, `next` |
-| `outcome` (claim) | `claimed`, `empty`, `all_skipped`, `retry_limit`, `missing`, `busy`, `unclaimable`, `exhausted`, `error` |
-| `cause` (claim skip) | `raced`, `unclaimable`, `exhausted`, `error` |
+| `outcome` (claim) | `claimed`, `empty`, `all_skipped`, `retry_limit`, `missing`, `busy`, `unclaimable`, `deferred`, `exhausted`, `error` |
+| `cause` (claim skip) | `raced`, `unclaimable`, `deferred`, `exhausted`, `error` |
 | `reason` (exhausted) | `lock_contention_exhausted`, `max_retries_exceeded` |
 | `reason` (unclaim) | `lock_contention`, `retry`, `drain`, `hydrate_failed`, `unspecified` |
 | `reason` (fail-claim) | `session_deleted`, `claim_abandoned`, `workspace_unbound` |

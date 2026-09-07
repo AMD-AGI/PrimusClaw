@@ -995,6 +995,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           },
         );
         if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
+          // An unknown verdict runs no rollback -- see `dispatchTaskToBrain` --
+          // so the session outlives this 503 and is a creation like any other.
+          // A settled failure deleted its row, and counting that would report a
+          // session nothing backs.
+          if (dispatch.kind === "publish_unknown") metrics.onSessionCreated("ok");
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
           return { statusCode: 503, response: errResp };

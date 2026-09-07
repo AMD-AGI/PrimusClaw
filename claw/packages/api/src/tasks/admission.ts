@@ -511,22 +511,37 @@ export async function acquireAdmissionLock(client: StatementRunner): Promise<voi
 }
 
 /**
+ * Hold an effect back until the transaction that justifies it has committed.
+ *
+ * A metric is not a database write: nothing rolls one back. Recorded inside the
+ * transaction it survives a failed `COMMIT` and reports work the fleet never
+ * did -- a claimed queue exit for a row still sitting at `queued`, a created
+ * session for a row that was rolled back.
+ */
+export type AfterCommit = (effect: () => void) => void;
+
+/** For a caller with no transaction of its own: there is nothing to wait for. */
+export const runImmediately: AfterCommit = (effect) => effect();
+
+/**
  * Run `fn` inside a transaction holding the admission lock, and commit.
  *
  * The commit releases the lock, so no path can leak it. On an unmetered fleet
  * no transaction is opened at all and `fn` runs on the pool.
  */
 export async function withOwnedAdmissionLock<T>(
-  fn: (client: StatementRunner) => Promise<T>,
+  fn: (client: StatementRunner, afterCommit: AfterCommit) => Promise<T>,
 ): Promise<T> {
-  if (!anyAdmissionCeilingSet(envAdmitLimits())) return await fn(db);
+  if (!anyAdmissionCeilingSet(envAdmitLimits())) return await fn(db, runImmediately);
   const client = await db.pool.connect();
+  const effects: Array<() => void> = [];
   try {
     await client.query("BEGIN");
     try {
       await acquireAdmissionLock(client);
-      const result = await fn(client);
+      const result = await fn(client, (effect) => effects.push(effect));
       await client.query("COMMIT");
+      for (const effect of effects) effect();
       return result;
     } catch (err) {
       await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
@@ -546,14 +561,16 @@ export async function withOwnedAdmissionLock<T>(
  * run, and only a transaction does that. `commit: false` rolls all of it back.
  */
 export async function withAdmissionTransaction<T>(
-  fn: (client: PoolClient) => Promise<{ commit: boolean; value: T }>,
+  fn: (client: PoolClient, afterCommit: AfterCommit) => Promise<{ commit: boolean; value: T }>,
 ): Promise<T> {
   const client = await db.pool.connect();
+  const effects: Array<() => void> = [];
   try {
     await client.query("BEGIN");
     await acquireAdmissionLock(client);
-    const { commit, value } = await fn(client);
+    const { commit, value } = await fn(client, (effect) => effects.push(effect));
     await client.query(commit ? "COMMIT" : "ROLLBACK");
+    if (commit) for (const effect of effects) effect();
     return value;
   } catch (err) {
     await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });

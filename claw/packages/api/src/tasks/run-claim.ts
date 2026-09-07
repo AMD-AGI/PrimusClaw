@@ -18,7 +18,8 @@ import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
 import {
-  anySoftCeilingSet, deferQueuedBySoftCeiling, envAdmitLimits, withOwnedAdmissionLock,
+  anySoftCeilingSet, deferQueuedBySoftCeiling, envAdmitLimits, runImmediately,
+  withOwnedAdmissionLock, type AfterCommit,
 } from "./admission.js";
 import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
@@ -113,6 +114,9 @@ export async function countIncompatibleDoorbellRuns(version: number): Promise<nu
   return Number((r.rows[0] as { n?: number } | undefined)?.n ?? 0);
 }
 
+/** A row `takeClaim` matched, carrying the prior state only that statement sees. */
+type TakenRow = ClawTaskRow & { prior_status?: string; queued_since?: string | null };
+
 /**
  * Read the soft-ceiling usage and take the row under one hold of the lock.
  *
@@ -125,19 +129,28 @@ export async function countIncompatibleDoorbellRuns(version: number): Promise<nu
  *
  * A caller supplying its own querier owns the transaction, and the lock with
  * it. Without a soft ceiling there is no usage to read and no lock to take.
+ *
+ * The queue exit is recorded through `afterCommit` for the same reason the
+ * claim is inside the lock: a `COMMIT` that fails leaves the row at `queued`,
+ * and a metric already emitted cannot be taken back.
  */
 async function takeUnderSoftCeiling(
   taskId: string,
   brainId: string,
   doorbellSemantics: number,
   q: Querier | undefined,
-): Promise<ClawTaskRow | "missing" | "busy" | "deferred"> {
-  const gated = async (on: Querier) => {
+): Promise<TakenRow | "missing" | "busy" | "deferred"> {
+  const gated = async (on: Querier, afterCommit: AfterCommit) => {
     if (await deferQueuedBySoftCeiling(taskId, on)) return "deferred" as const;
-    return await takeClaimOrBusy(taskId, brainId, doorbellSemantics, on);
+    const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, on);
+    if (typeof taken !== "string" && taken.prior_status === "queued") {
+      const since = taken.queued_since ?? null;
+      afterCommit(() => metrics.observeQueueExit("chat", since, "claimed"));
+    }
+    return taken;
   };
-  if (q) return await gated(q);
-  if (!anySoftCeilingSet(envAdmitLimits())) return await gated(db);
+  if (q) return await gated(q, runImmediately);
+  if (!anySoftCeilingSet(envAdmitLimits())) return await gated(db, runImmediately);
   return await withOwnedAdmissionLock(gated);
 }
 
@@ -481,7 +494,7 @@ async function takeClaim(
   brainId: string,
   doorbellSemantics: number,
   q: Querier,
-): Promise<ClawTaskRow | "missing" | "busy"> {
+): Promise<TakenRow | "missing" | "busy"> {
   const token = randomBytes(32).toString("hex");
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
@@ -532,10 +545,7 @@ async function takeClaim(
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }
-  const row = r.rows[0] as ClawTaskRow & { prior_status?: string; queued_since?: string | null };
-  if (row.prior_status === "queued") {
-    metrics.observeQueueExit("chat", row.queued_since ?? null, "claimed");
-  }
+  const row = r.rows[0] as TakenRow;
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }
@@ -554,7 +564,7 @@ async function takeClaimOrBusy(
   brainId: string,
   doorbellSemantics: number,
   q: Querier,
-): Promise<ClawTaskRow | "missing" | "busy"> {
+): Promise<TakenRow | "missing" | "busy"> {
   try {
     return await takeClaim(taskId, brainId, doorbellSemantics, q);
   } catch (err) {

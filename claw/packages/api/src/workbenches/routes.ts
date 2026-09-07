@@ -38,7 +38,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { workbenchRegistry } from "./registry.js";
 import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
-import { withAdmissionTransaction } from "../tasks/admission.js";
+import { withAdmissionTransaction, type AfterCommit } from "../tasks/admission.js";
 import {
   expandDag, isCreateRefusal, isTopologyRefusal, type CreateRefusal,
 } from "../tasks/dag-expander.js";
@@ -56,8 +56,8 @@ interface CreateRunBody {
  * The caller's session, or a fresh hidden one for this run.
  *
  * `created` is reported rather than counted here: the insert runs on the
- * transaction a later refusal rolls back, so only the committing caller knows
- * whether a session outlived the request.
+ * transaction a later refusal -- or a failing `COMMIT` -- undoes, so only the
+ * transaction itself knows whether a session outlived the request.
  */
 async function ensureSession(
   workbench: WorkbenchDef,
@@ -288,9 +288,9 @@ export async function registerWorkbenchRunRoutes(app: FastifyInstance): Promise<
       // leave it behind: it runs on the transaction the refusal rolls back,
       // whose first statement is the admission lock.
       return await withAdmissionTransaction<unknown>(
-        (client) => submitWorkbenchRun(client, {
+        (client, afterCommit) => submitWorkbenchRun(client, {
           workbench: d, user, body, reply, dagRow, plugin, input: inputWithEnv,
-        }),
+        }, afterCommit),
       );
     },
   );
@@ -309,6 +309,7 @@ interface WorkbenchRunSubmission {
 async function submitWorkbenchRun(
   client: PoolClient,
   run: WorkbenchRunSubmission,
+  afterCommit: AfterCommit,
 ): Promise<{ commit: boolean; value: unknown }> {
   const { reply } = run;
   let session: { sessionId: string; created: boolean };
@@ -348,7 +349,7 @@ async function submitWorkbenchRun(
     },
     "workbench.run.created",
   );
-  if (session.created) metrics.onSessionCreated("ok");
+  if (session.created) afterCommit(() => metrics.onSessionCreated("ok"));
   return {
     commit: true,
     value: { ok: true, run_id: result.dag_root_task_id, session_id: sessionId },

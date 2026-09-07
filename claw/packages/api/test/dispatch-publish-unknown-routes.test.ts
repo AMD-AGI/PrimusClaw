@@ -12,6 +12,10 @@
  * executes with nothing to report to. Every caller of `dispatchTaskToBrain` is
  * driven here, because the branch is written once per caller and a caller added
  * without it fails only in production.
+ *
+ * The session a create keeps this way is a created session, and is counted as
+ * one. The status code is the wrong thing to book the counter on: it is the
+ * same 503 the settled failure answers, and that one deletes its row.
  */
 
 import test, { after, before, beforeEach } from "node:test";
@@ -19,6 +23,7 @@ import assert from "node:assert/strict";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { db } from "../src/infra/db.js";
+import { registry } from "../src/infra/metrics.js";
 import type { UserInfo } from "../src/auth/models.js";
 import { registerSessionRoutes } from "../src/routes/sessions.js";
 import { registerAnthropicManagedAgentsRoutes } from "../src/routes/anthropic-managed-agents.js";
@@ -30,11 +35,26 @@ const OWNER: UserInfo = {
 };
 
 let h: Harness;
-let restorePorts: (() => void) | null = null;
+let pristinePorts: Record<string, unknown> | null = null;
 let originalConnect: typeof db.pool.connect;
+
+/**
+ * Start every case from the ports as the module defined them.
+ *
+ * Snapshotting inside each helper captured whatever the previous case had
+ * already replaced, so a later case inherited its `openChatRun` and got its
+ * verdict rather than the one it arranged.
+ */
+async function freshPorts(): Promise<typeof import("../src/sessions/dispatch.js")["sessionDispatchPorts"]> {
+  const { sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
+  pristinePorts ??= { ...sessionDispatchPorts };
+  Object.assign(sessionDispatchPorts, pristinePorts);
+  return sessionDispatchPorts;
+}
 
 before(async () => {
   h = await startHarness();
+  await freshPorts();
   originalConnect = db.pool.connect;
   // The message routes do their gate flip in a transaction on their own
   // connection, which a `db.query` substitution never sees.
@@ -47,7 +67,7 @@ before(async () => {
 beforeEach(async () => { await h.reset(); });
 
 after(async () => {
-  restorePorts?.();
+  if (pristinePorts) await freshPorts();
   db.pool.connect = originalConnect;
   await h?.close();
 });
@@ -60,9 +80,7 @@ after(async () => {
  * replica says nothing about the row can be established from here.
  */
 async function unknownPublishOutcome(): Promise<void> {
-  const { sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
-  const original = { ...sessionDispatchPorts };
-  restorePorts = () => Object.assign(sessionDispatchPorts, original);
+  const sessionDispatchPorts = await freshPorts();
   const realOpen = sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.publishSse = () => {};
@@ -98,6 +116,31 @@ async function appAs(
 async function sessionRows(): Promise<Record<string, unknown>[]> {
   return await h.sql("SELECT session_id, agent_status, agent_gate_message_id FROM claw_sessions");
 }
+
+/** A publish that fails for good, so the rollback deletes what the create wrote. */
+async function settledPublishFailure(): Promise<void> {
+  const sessionDispatchPorts = await freshPorts();
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.publishTask = async () => {
+    throw Object.assign(new Error("no responders"), { code: "503" });
+  };
+}
+
+const createdOk = async (): Promise<number> => {
+  const text = await registry.metrics();
+  for (const line of text.split("\n")) {
+    if (line.startsWith("claw_api_session_created_total{") && line.includes('outcome="ok"')) {
+      return Number(line.slice(line.lastIndexOf(" ") + 1));
+    }
+  }
+  return 0;
+};
+
+const createWithMessage = (app: FastifyInstance) => app.inject({
+  method: "POST", url: "/v1/sessions",
+  payload: { name: "s", message: { content: "hello" } },
+});
 
 test("a create whose publish outcome is unknown answers 503 and keeps the session", async () => {
   await unknownPublishOutcome();
@@ -159,6 +202,38 @@ test("the managed-agents event route answers 503 and keeps the gate too", async 
     const row = (await sessionRows())[0];
     assert.equal(row.agent_status, "running");
     assert.notEqual(row.agent_gate_message_id, null);
+  } finally {
+    await app.close();
+  }
+});
+
+test("the session an unknown publish keeps is counted as a creation", async () => {
+  await unknownPublishOutcome();
+  const app = await appAs(registerSessionRoutes);
+  try {
+    const before = await createdOk();
+    const res = await createWithMessage(app);
+    const moved = await createdOk() - before;
+
+    assert.equal(res.statusCode, 503);
+    assert.equal((await sessionRows()).length, 1, "the row is still there");
+    assert.equal(moved, 1, "and the counter names it, though the answer was a 503");
+  } finally {
+    await app.close();
+  }
+});
+
+test("the session a settled publish failure deletes is counted as nothing", async () => {
+  await settledPublishFailure();
+  const app = await appAs(registerSessionRoutes);
+  try {
+    const before = await createdOk();
+    const res = await createWithMessage(app);
+    const moved = await createdOk() - before;
+
+    assert.equal(res.statusCode, 503);
+    assert.equal((await sessionRows()).length, 0, "the rollback took the row back");
+    assert.equal(moved, 0, "so there is no creation to count");
   } finally {
     await app.close();
   }
