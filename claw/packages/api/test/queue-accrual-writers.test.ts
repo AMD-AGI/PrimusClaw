@@ -23,7 +23,6 @@
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { db } from "../src/infra/db.js";
 import { TASK_POISON_DELIVERY_COUNT } from "../src/config.js";
 import { applyTaskStatusTransition } from "../src/tasks/db.js";
 import { dispatchTask } from "../src/tasks/dispatcher.js";

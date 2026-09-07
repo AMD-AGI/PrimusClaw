@@ -21,10 +21,9 @@ import { mergeRunTimeReport, runTimeTotals, type RunTimeLedgerEntry } from "@cla
 import { db, inTransaction } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
-import { claimRunById, releaseClaim, settleFinishedClaim } from "../src/tasks/run-claim.js";
+import { claimRunById, releaseClaim } from "../src/tasks/run-claim.js";
 import { applyTaskStatusTransition, transitionStatus } from "../src/tasks/db.js";
 import { cancelTask } from "../src/tasks/lifecycle.js";
-import { interruptUnstartedChatRuns } from "../src/tasks/chat-run.js";
 import { reapExpiredQueuedRuns, reapLostLeases } from "../src/tasks/sweeper.js";
 import { RUN_QUEUE_MAX_SEC } from "../src/tasks/run-budget.js";
 import { applyAgentDone, retryTask } from "../src/tasks/lifecycle.js";
