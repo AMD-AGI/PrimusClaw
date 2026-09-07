@@ -27,9 +27,9 @@ import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
 } from "../config.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import type { ExecuteRequest, ExecuteResult, EventCallback, RunIdentity } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
-import { untheadedRunIdentity } from "../tasks/run-identity.js";
+import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
 

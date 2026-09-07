@@ -76,7 +76,16 @@ test("T5.2 no module outside the resolver declares a brand of its own", () => {
   // Declaring the type a second time would let a package mint one without ever
   // writing the cast this guard looks for.
   const declaring = repoSources.filter((s) => /type RunIdentityKey\s*=/.test(s.text));
-  assert.deepEqual(declaring.map((s) => s.file), ["protocol/src/run-identity.ts"]);
+  assert.deepEqual(declaring.map((s) => s.file), ["brain/src/tasks/run-identity.ts"]);
+});
+
+test("T5.2 nothing outside Brain names the branded key at all", () => {
+  // The declaration living in Brain is what keeps the brand out of the wire and
+  // storage types: a protocol or API module that could name it could hold one.
+  const naming = repoSources
+    .filter((s) => !s.file.startsWith("brain/"))
+    .filter((s) => /\bRunIdentityKey\b/.test(s.text));
+  assert.deepEqual(naming.map((s) => s.file), []);
 });
 
 test("T5.3 every ledger call site is handed an identity, never a proxy", () => {

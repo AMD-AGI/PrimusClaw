@@ -18,11 +18,12 @@
 import {
   REASON_STATE,
   RUN_TIME_KNOWN_STATES,
-  type RunIdentityKey,
   type RunTimeKnownState,
   type RunWaitReason,
 } from "@claw/protocol";
 import pino from "pino";
+
+import type { RunIdentityKey } from "./run-identity.js";
 
 const logger = pino({ name: "run-phase" });
 

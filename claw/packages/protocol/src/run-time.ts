@@ -11,7 +11,7 @@
  * Everything is in the database's clock domain: a pod-measured duration enters
  * only as a claim against a budget the database sized.
  */
-import type { RunIdentityKey, RunIdentityRef } from "./run-identity.js";
+import type { RunIdentityRef } from "./run-identity.js";
 import type { RunWaitReason } from "./types.js";
 
 export type RunTimeState =
@@ -69,7 +69,7 @@ export const RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC = 300;
 
 /** Covered values are running totals for `attemptId`, never deltas. */
 export interface RunTimeReport {
-  readonly key: RunIdentityKey;
+  readonly key: string;
   readonly attemptId: string;
   /** Attempt token; the row's true value, which is 0 on the fat path. */
   readonly claimCount: number;
@@ -83,12 +83,6 @@ export interface RunTimeReport {
   /** The only way a reporter can add to `unknownMs`. */
   readonly cumulativeUnknownMs?: number;
 }
-
-/**
- * A report as it comes back off the wire, where the branded key cannot be
- * reconstructed. Every {@link RunTimeReport} is assignable to this.
- */
-export type RunTimeReportInput = Omit<RunTimeReport, "key"> & { readonly key: string };
 
 /** What the entry has already been shown by the attempt it names. */
 export interface CoverageSeen {
@@ -196,7 +190,7 @@ export function clockOffsetOf(offset: ClockOffset): {
 }
 
 /** Whether a report closes any interval at all, or only re-asserts a state. */
-export function isCoveringReport(report: RunTimeReportInput): boolean {
+export function isCoveringReport(report: RunTimeReport): boolean {
   return report.cumulativeStateMs !== undefined
     || report.cumulativeReasonMs !== undefined
     || report.cumulativeUnknownMs !== undefined;
@@ -316,7 +310,7 @@ function withClampHistory(
  */
 export function mergeRunTimeReport(
   stored: RunTimeLedgerEntry,
-  incoming: RunTimeReportInput,
+  incoming: RunTimeReport,
   readAtDb: string,
 ): RunTimeLedgerEntry {
   if (!isCoveringReport(incoming)) return stored;
@@ -598,7 +592,7 @@ function decodeCovered<K extends string>(
 
 /** Why a payload was refused, or the report it decoded to. */
 export type RunTimeReportDecoding =
-  | { readonly ok: true; readonly report: RunTimeReportInput }
+  | { readonly ok: true; readonly report: RunTimeReport }
   | { readonly ok: false; readonly rejected: string };
 
 /**
@@ -608,7 +602,7 @@ export type RunTimeReportDecoding =
  * accepting it unfenced reopens the race a late heartbeat wins.
  */
 export function decodeRunTimeReport(raw: unknown): RunTimeReportDecoding {
-  const body = raw as Partial<RunTimeReportInput> | undefined;
+  const body = raw as Partial<RunTimeReport> | undefined;
   if (!body || typeof body !== "object") return { ok: false, rejected: "run_time: expected an object" };
   if (typeof body.key !== "string" || !body.key) return { ok: false, rejected: "key: required" };
   if (typeof body.attemptId !== "string" || !body.attemptId) {

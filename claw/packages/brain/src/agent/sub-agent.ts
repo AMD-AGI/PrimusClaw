@@ -5,7 +5,8 @@ import { agentLoop } from "./agent-loop.js";
 import { ToolRouter, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { Message, ToolSchema, EventCallback, RunIdentity } from "@claw/protocol";
+import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 

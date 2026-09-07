@@ -23,7 +23,8 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "./index.js";
-import type { Message, ToolSchema, TokenUsage, EventCallback, RunIdentity } from "@claw/protocol";
+import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";

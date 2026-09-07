@@ -29,7 +29,7 @@ import {
   runTimeTotals,
   type AttemptRecord,
   type RunTimeLedgerEntry,
-  type RunTimeReportInput,
+  type RunTimeReport,
 } from "../src/run-time.js";
 
 const EPOCH = "2026-01-01T00:00:00.000Z";
@@ -38,7 +38,7 @@ const IDENTITY = { key: "ktsk_1", source: "task_id" as const };
 
 const entry = (): RunTimeLedgerEntry => newRunTimeLedgerEntry(IDENTITY, EPOCH);
 
-function report(over: Partial<RunTimeReportInput> = {}): RunTimeReportInput {
+function report(over: Partial<RunTimeReport> = {}): RunTimeReport {
   return {
     key: "ktsk_1",
     attemptId: "att-1",

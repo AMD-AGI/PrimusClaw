@@ -4,9 +4,17 @@
 /**
  * The only place a ledger key is made. Pure: no clock, no I/O, no logger.
  */
-import type { ExecuteRequest, RunIdentity, RunIdentityKey } from "@claw/protocol";
+import type { ExecuteRequest, RunIdentitySource } from "@claw/protocol";
 
-export type { RunIdentity, RunIdentityKey, RunIdentitySource } from "@claw/protocol";
+export type { RunIdentitySource } from "@claw/protocol";
+
+/** Nominal. Only this module may mint one. */
+export type RunIdentityKey = string & { readonly __runIdentity: unique symbol };
+
+export interface RunIdentity {
+  readonly key: RunIdentityKey;
+  readonly source: RunIdentitySource;
+}
 
 export interface RunIdentityResolution {
   readonly identity: RunIdentity;

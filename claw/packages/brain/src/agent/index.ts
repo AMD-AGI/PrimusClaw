@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest, ExecuteResult, EventCallback, RunIdentity, TokenUsage, Message } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, EventCallback, TokenUsage, Message } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import type { HandsClient } from "../clients/hands.js";
 import pino from "pino";
 

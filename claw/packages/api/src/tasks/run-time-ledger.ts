@@ -21,7 +21,7 @@ import {
   noteAttemptRenewal,
   type RunIdentityRef,
   type RunTimeLedgerEntry,
-  type RunTimeReportInput,
+  type RunTimeReport,
 } from "@claw/protocol";
 import { db, type Querier } from "../infra/db.js";
 
@@ -165,7 +165,7 @@ export async function applyToLedger(
 // The queued total comes from the row, not the report: no worker observes the
 // queue, and a run that timed out in it never allocated an attempt to report
 // under. Banking by difference needs no flag to be once-only.
-export function bankReportAndQueue(row: LedgerRow, report?: RunTimeReportInput): RunTimeLedgerEntry {
+export function bankReportAndQueue(row: LedgerRow, report?: RunTimeReport): RunTimeLedgerEntry {
   const queued = bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb);
   if (!report || !isCoveringReport(report)) return queued;
   return mergeRunTimeReport(queued, report, row.readAtDb);
@@ -206,7 +206,7 @@ export async function openAttemptRecordFor(taskId: string, attemptId: string): P
 export async function mergeRenewal(
   taskId: string,
   attemptId: string,
-  report: RunTimeReportInput | undefined,
+  report: RunTimeReport | undefined,
 ): Promise<"merged" | "stale" | "unavailable"> {
   let stale = false;
   const applied = await applyToLedger(taskId, { key: taskId, source: "task_id" }, (row) => {
@@ -235,7 +235,7 @@ export async function mergeRenewal(
 /** What an attempt boundary settles, beyond moving the row's status. */
 export interface RunSettlement {
   /** The attempt's last word on its own time, if it sent one. */
-  report?: RunTimeReportInput;
+  report?: RunTimeReport;
   /**
    * Close the attempt's open record and compute what it lost.
    *
@@ -263,7 +263,7 @@ export function isTerminal(row: LedgerRow): boolean {
   return row.completedAtDb !== null || !LIVE_STATUSES.has(row.status);
 }
 
-export function reportIsCurrent(row: LedgerRow, report: RunTimeReportInput): boolean {
+export function reportIsCurrent(row: LedgerRow, report: RunTimeReport): boolean {
   if (row.claimCount !== report.claimCount) return false;
   if (row.deliverySeq !== report.deliverySeq || row.deliveryCount !== report.deliveryCount) {
     return false;
