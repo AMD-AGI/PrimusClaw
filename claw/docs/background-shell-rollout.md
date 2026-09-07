@@ -179,10 +179,14 @@ placeholder below states the shape rather than a supported retrieval:
 # The sandbox's own internal token, for the sandbox named by this row.
 # [needs TBD-7] -- no supported operator path to it exists; substitute the one
 # your platform provides, and stop here if it has none.
-hands_token() { local name="$1" ns="$2"
-  kubectl get secret -n "$ns" "claw-sandbox-$name" -o jsonpath='{.data.AUTH_CLAW_TOKEN}' 2>/dev/null \
-    | { read -r b64; printf '%s' "$b64"; } | openssl base64 -d -A 2>/dev/null \
-    || { echo "no token for sandbox $name in $ns" >&2; return 1; }; }
+hands_token() { local name="$1" ns="$2" tok
+  tok=$(kubectl get secret -n "$ns" "claw-sandbox-$name" -o jsonpath='{.data.AUTH_CLAW_TOKEN}' 2>/dev/null \
+    | { read -r b64; printf '%s' "$b64"; } | openssl base64 -d -A 2>/dev/null) \
+    || { echo "no token for sandbox $name in $ns" >&2; return 1; }
+  # Empty is not a token. Returning one lets a caller mint a proof over nothing,
+  # which every route answers 401 -- a refusal that looks like the step working.
+  [ -n "$tok" ] || { echo "empty token for sandbox $name in $ns" >&2; return 1; }
+  printf '%s' "$tok"; }
 # The scope the routes answer, for one pair, under one sandbox's token.
 scope_cred() { local token="$1" owner="$2" run="$3" scope proof
   scope="$(printf '%s' "$owner" | scope_encode)/$( [ -n "$run" ] && printf '%s' "$run" | scope_encode || printf '.norun')"
@@ -392,15 +396,21 @@ while IFS=$'\t' read -r sid name ns url wid; do
 done <<<"$(inventory_rows "$raw")"
 [ -n "$HANDS_URL" ] || { echo 'FAIL: no inventory row for the session; P5 measured nothing'; exit 1; }
 
+# Into its own variable, and stop on an absent one: minting over an empty token
+# turns this into a 401 the step would read as its expected refusal.
+TOK=$(hands_token "$SBNAME" "$SBNS") \
+  || { echo 'FAIL: no sandbox token; P5 is unexecutable here'; exit 1; }   # [needs TBD-7]
+
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   "$(hands_base "$HANDS_URL")/internal/shells/reap" \
-  -H "Authorization: Bearer $(scope_cred "$(hands_token "$SBNAME" "$SBNS")" "$SESSION_ID" "")" \
+  -H "Authorization: Bearer $(scope_cred "$TOK" "$SESSION_ID" "")" \
   -H 'content-type: application/json' \
   -d '{"cause":"session_cleanup","reclaim_op":"p5"}'
 ```
 
 - Expected: `400`. The absent-run bucket is the one set nothing may end by run,
-  so the refusal proves the path works.
+  so the refusal proves the path works. A `401` here is a credential fault, not
+  this check passing: the token stop above is what keeps the two apart.
 - Fail: `401` → the credential is wrong or minted from the wrong secret, and R2
   would fail during rollback, when there is no time left to discover it. `404` →
   the route is not deployed; fall through to the substitute below.

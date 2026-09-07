@@ -4,30 +4,15 @@
 /**
  * The half of Brain-restart recovery that lives in the sandbox.
  *
- * **Scope, stated because the name could promise more.** This drives a real
- * Hands process over a real port and a client in a process of its own, so
- * nothing Brain-local -- transport, module state, heap -- carries across. It
- * does **not** start the Brain application, so the restore of Brain's own
- * durable task and run state is not covered here, and neither is the loop that
- * would consume it.
+ * Covered: after every client-side thing is gone -- transport, module state,
+ * heap, the process itself -- the ids in the transcript are still sufficient to
+ * reach the same processes, poll, wait and kill each one, and nothing is
+ * started on the way. A recovery that respawns looks identical from the outside
+ * and is a second execution of the command, which is the failure this catches.
  *
- * That gap is not an oversight, and it is not closable from a unit test in this
- * repository. `brain/src/index.ts` reaches a listening state only after
- * `emitter.init(NATS_URL)`, `nc.jetstream()` and `nc.jetstreamManager()`
- * (`index.ts:512-516`), so a Brain process needs a live NATS with JetStream
- * before it will start at all. This tree ships no `nats-server` binary and no
- * harness that stands one up -- the two `config-nats-replicas` tests assert
- * configuration values and never connect -- and the workflow running these
- * tests declares no `services:`, so a test written against a real broker would
- * fail in CI rather than cover anything. Closing it needs an integration
- * harness that owns a broker and a database, which is a larger change than the
- * one this file belongs to.
- *
- * What is covered is the property that restore depends on: after everything
- * client-side is gone, the ids in the transcript are still sufficient to reach
- * the same processes -- poll, wait and kill each one -- and nothing is started
- * on the way. Starting something is the failure this exists to catch, because
- * it looks like a recovery and is a second execution of the command.
+ * Not covered: the Brain application is never started, so the restore of its
+ * own durable task and run state, and the loop that consumes it, are outside
+ * this file.
  *
  * Two shells for one run identity, so a recovery reaching only the first
  * cannot pass.
