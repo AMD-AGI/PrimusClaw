@@ -59,6 +59,14 @@ test("a doorbell with no semantics field is treated as version 1 and claimed", a
   assert.deepEqual(r.urls.length, 1, "a version-1 doorbell is claimed normally");
 });
 
+test("every declared semantics version through this binary's version is claimed", async () => {
+  for (let semantics = 1; semantics <= DOORBELL_SEMANTICS_VERSION; semantics++) {
+    const r = await deliver(doorbellPayload({ semantics }));
+    assert.equal(r.urls.length, 1, `version ${semantics} must remain compatible`);
+    assert.deepEqual(r.verdicts, ["ack"]);
+  }
+});
+
 test("every malformed present value is declined, never read as compatible", async () => {
   // `semantics ?? 1` would accept each of these as "not greater than mine".
   for (const semantics of ["2", null, 0, -1, 1.5, Number.NaN, DOORBELL_SEMANTICS_MAX + 1]) {

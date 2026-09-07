@@ -107,6 +107,14 @@ test("keeps claim_count required, since takeClaim increments it on every claim",
   assert.ok(tasks?.columns.includes("claim_count"));
 });
 
+test("names the session gate owner column before a request tries to write it", () => {
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_sessions", "agent_gate_message_id"]]),
+  );
+  assert.deepEqual(problems, ["claw_sessions is missing column(s): agent_gate_message_id"]);
+});
+
 test("names the throwaway-workspace column, which every task insert writes", () => {
   // Not a column only the tasks that set it touch: insertTask names it in the
   // INSERT for every run, so a database missing it fails run creation outright.
