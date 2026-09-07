@@ -98,7 +98,7 @@ export async function insertTask(
        $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21::jsonb,
        $22::jsonb, $23, $24, $25,
        $26, $27::jsonb, $28, $29, $32,
-       CASE WHEN $26::text IN ('queued','preparing') THEN NOW() END,
+       CASE WHEN $26::text IN ('queued','preparing') THEN clock_timestamp() END,
        CASE WHEN $26::text = 'preparing' THEN NOW() END,
        CASE WHEN $26::text = 'preparing' THEN ${deadlineAtInsertSql({
          metadataParam: 27, originParam: 28, dagRootParam: 7, chatParam: 30, dagParam: 31,

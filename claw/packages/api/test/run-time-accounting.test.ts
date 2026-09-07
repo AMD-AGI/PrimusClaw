@@ -127,6 +127,23 @@ async function ledgerOf(taskId: string): Promise<RunTimeLedgerEntry | null> {
 
 const queuedMsOf = async (taskId: string) => Number((await runRow(h, taskId)).queued_ms_accrued);
 
+/** The database's own clock, for an assertion that must not use the pod's. */
+async function readInstant(): Promise<string> {
+  const rows = await h.sql("SELECT clock_timestamp() AS now");
+  return (rows[0].now as Date).toISOString();
+}
+
+/** wall = known + unknown + unbanked, measured from the entry's own epoch. */
+function assertIdentity(entry: RunTimeLedgerEntry, readAtDb: string): void {
+  const totals = runTimeTotals(entry, readAtDb);
+  const end = entry.terminalAtDb ?? readAtDb;
+  assert.equal(
+    totals.knownMs + totals.unknownMs + totals.unbankedMs,
+    Date.parse(end) - Date.parse(entry.epochInstantDb),
+    "every millisecond between the epoch and the end is in exactly one of the three terms",
+  );
+}
+
 /** The whole subtree, not the ledger inside it: the two are absent separately. */
 async function runPhaseOf(taskId: string): Promise<unknown> {
   const rows = await h.sql(
@@ -390,6 +407,40 @@ test("AC1 three queue segments are banked as their sum, and no more", async () =
 
   const banked = await queuedMsOf("ktsk-3seg");
   assert.ok(banked >= 2_400 && banked < 8_000, `expected the three waits summed, got ${banked}ms`);
+
+  // The column is only half the claim. What the run is accounted by is the
+  // ledger, and an entry created after the last requeue is anchored at that
+  // requeue -- so the segments before it have no budget to be admitted under.
+  await announceRunning("ktsk-3seg", "att-1");
+  const ledger = await ledgerOf("ktsk-3seg");
+  assert.equal(ledger!.knownMsByState.queued, banked,
+    "every segment the row banked has to reach the ledger, not just the newest");
+  assertIdentity(ledger!, (await readInstant()));
+});
+
+test("AC1.10 a ledger opened after repeated requeues still admits every earlier segment", async () => {
+  // The dispatcher requeues on a workspace-bind failure, and can do it several
+  // times before anything allocates an attempt or renews a lease -- so the first
+  // thing to create a ledger entry may arrive after the run has already spent
+  // most of its queue time in segments no entry existed to hold.
+  await seedRun(h, "ktsk-rq", SESSION, { status: "queued", queuedAgoSec: null });
+  for (let i = 0; i < 3; i++) {
+    await sleep(120);
+    await transitionStatus("ktsk-rq", ["queued"], "preparing");
+    await transitionStatus("ktsk-rq", ["preparing"], "queued");
+  }
+  assert.equal(await ledgerOf("ktsk-rq"), null, "nothing has created an entry yet");
+  const accrued = await queuedMsOf("ktsk-rq");
+  assert.ok(accrued >= 340, `three waits should be banked on the row, got ${accrued}ms`);
+
+  await transitionStatus("ktsk-rq", ["queued"], "preparing");
+  const total = await queuedMsOf("ktsk-rq");
+  await announceRunning("ktsk-rq", "att-1");
+
+  const ledger = await ledgerOf("ktsk-rq");
+  assert.equal(ledger!.knownMsByState.queued, total,
+    "the entry's epoch has to reach back over the segments the row already banked");
+  assertIdentity(ledger!, await readInstant());
 });
 
 // ── AC1/B21: the queued interval reaches the ledger, generation or not ───────

@@ -43,6 +43,12 @@ const READ_LEDGER_SQL = `
          delivery_count,
          heartbeat_at,
          queued_at,
+         -- Where this run became accounting-eligible, not where its latest queue
+         -- segment opened: queued_at is re-stamped on every requeue, so an entry
+         -- created after two of them would be anchored past the wait the row has
+         -- already banked and could never admit it. (No backticks: this whole
+         -- statement is a template literal.)
+         queued_at - (queued_ms_accrued * INTERVAL '1 millisecond') AS epoch_at,
          completed_at,
          clock_timestamp() AS read_at,
          queued_ms_accrued + (CASE WHEN status = 'queued'
@@ -78,10 +84,10 @@ function readRow(row: Record<string, unknown> | undefined, identity: RunIdentity
   // supply it has no ledger to compute, and inventing one would put an
   // unparseable anchor into the entry rather than failing here.
   if (Number.isNaN(Date.parse(readAtDb))) return null;
-  const queuedAtDb = row.queued_at ? iso(row.queued_at) : readAtDb;
+  const epochAtDb = row.epoch_at ? iso(row.epoch_at) : readAtDb;
   const stored = row.ledger as RunTimeLedgerEntry | null;
   return {
-    entry: stored ?? newRunTimeLedgerEntry(identity, queuedAtDb),
+    entry: stored ?? newRunTimeLedgerEntry(identity, epochAtDb),
     ledgerVersion: Number(row.ledger_version ?? 0),
     status: String(row.status ?? ""),
     attemptId: (row.attempt_id as string | null) ?? null,
