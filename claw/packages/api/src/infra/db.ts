@@ -356,27 +356,28 @@ function runColumnsSql(out: string[]): void {
   // and is empty for an OOM -- which is the ending exit code 137 alone cannot
   // tell from an eviction or a deliberate stop.
   col("platform_container_reason", "TEXT");
-  // Content cannot say whether a read happened: an empty pod message is a
-  // valid answer. These fields separate a conclusive read from a transient
-  // failure and keep multiple API replicas from fetching the same workload.
+  // Content cannot say whether a read happened -- an empty pod message is a
+  // valid answer -- and these also keep two replicas off the same workload.
   col("platform_facts_resolved_at", "TIMESTAMPTZ");
   col("platform_facts_next_retry_at", "TIMESTAMPTZ");
   col("platform_facts_attempts", "INT NOT NULL DEFAULT 0");
-  // Declared by a task whose workspace is throwaway -- it has already delivered
-  // its output somewhere else, so uploading the tree afterwards copies it a
-  // second time to a prefix nobody reads. Default false: with the shared-disk
-  // sync off by default, S3 is the only durable copy of a workspace.
+  // A task that has already delivered its output elsewhere: uploading the tree
+  // afterwards copies it again to a prefix nobody reads. Default false, because
+  // with the shared-disk sync off S3 is the only durable copy of a workspace.
   col("workspace_throwaway", "BOOLEAN NOT NULL DEFAULT FALSE");
   // How many times a doorbell run has been claimed. The poison delivery
   // budget for fat messages; without it a crash-looping chat run is
   // reclaimed until deadline_at.
   col("claim_count", "INT NOT NULL DEFAULT 0");
-  // Which attempt is executing under the present claim, and how many real
-  // attempts this run has had. `claim_count` cannot answer the second: a
-  // claim deferred for lock contention returns before execution and would
-  // otherwise be indistinguishable from an attempt that ran.
+  // Which attempt is executing, and how many real ones this run has had.
+  // `claim_count` cannot answer the second: a claim deferred for lock contention
+  // returns before execution and would look like an attempt that ran.
   col("attempt_id", "TEXT");
   col("attempt_generation", "INTEGER NOT NULL DEFAULT 0");
+  // The last attempt settled on this row. `attempt_id` is cleared when one
+  // ends, and a cleared column reads exactly like a run no attempt ever opened,
+  // which is what the lease route's adoption arm is for.
+  col("settled_attempt_id", "TEXT");
   // The fat path's per-delivery discriminator, from JetStream. A fat row
   // takes no claim, so this pair is the only value on it that advances when
   // a redelivery supersedes the attempt before it.

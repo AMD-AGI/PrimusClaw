@@ -322,7 +322,7 @@ export async function settleFinishedClaim(
   try {
     return await inTransaction(async (query) => {
       const held = await query(
-        `SELECT 1 FROM claw_tasks
+        `SELECT attempt_id FROM claw_tasks
           WHERE task_id = $1 AND lease_owner = $2
             AND ($3::int IS NULL OR claim_count = $3)
           FOR UPDATE`,
@@ -331,14 +331,17 @@ export async function settleFinishedClaim(
       if (held.rowCount === 0) throw new StaleTransition();
       const outcome = await settleRunTime(query, taskId, settled);
       if (!outcome.ok) throw new StaleTransition();
+      const closed = settlement?.report?.attemptId
+        ?? (held.rows[0] as { attempt_id: string | null }).attempt_id;
       await query(
         `UPDATE claw_tasks
             SET attempt_id = NULL,
                 heartbeat_at = NULL,
+                settled_attempt_id = COALESCE($3, settled_attempt_id),
                 lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
                 lease_expires_at = CASE WHEN $2 THEN NULL ELSE lease_expires_at END
           WHERE task_id = $1`,
-        [taskId, releaseLease],
+        [taskId, releaseLease, closed],
       );
       return true;
     });

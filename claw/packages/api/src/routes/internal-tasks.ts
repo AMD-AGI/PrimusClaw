@@ -384,6 +384,12 @@ async function renewRunLease(
           )
           AND claim_count = $7
           AND (delivery_seq, delivery_count) <= ($8::bigint, $9::bigint)
+          -- A settled attempt's token is spent. Clearing attempt_id is what stops
+          -- a late heartbeat renewing under it, but a cleared column reads just
+          -- like a run no attempt ever opened, which is the adoption arm's
+          -- legitimate target -- so the id itself is remembered. (No backticks:
+          -- this statement is a template literal.)
+          AND $6 IS DISTINCT FROM settled_attempt_id
           AND (
                 attempt_id = $6
              OR attempt_id IS NULL

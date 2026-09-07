@@ -150,12 +150,15 @@ async function runPhaseOf(taskId: string): Promise<unknown> {
 
 /** The settle a holder issues on its ack, through the endpoint it POSTs to. */
 async function settleAttempt(
-  taskId: string, claimCount: number, runTime?: unknown,
+  taskId: string, claimCount: number, runTime?: unknown, releaseLease = false,
 ): Promise<number> {
   const res = await app.inject({
     method: "POST", url: `/v1/internal/tasks/${taskId}/settle-attempt`,
     headers: { authorization: `Bearer ${TOKEN}` },
-    payload: { brain_id: BRAIN, claim_count: claimCount, run_time: runTime },
+    payload: {
+      brain_id: BRAIN, claim_count: claimCount, run_time: runTime,
+      ...(releaseLease ? { release_lease: true } : {}),
+    },
   });
   return res.statusCode;
 }
@@ -806,25 +809,59 @@ test("a settle from a holder the row has moved past is refused", async () => {
     "the live attempt's record is left exactly as it was");
 });
 
-test("a heartbeat racing the settle cannot open a second record for one attempt", async () => {
-  // The settle closes the record and clears the token, but a heartbeat already
-  // on the wire still presents that token. `beginAttemptRecord` only looked for
-  // an *open* record, so it appended a second one beside the closed one and the
-  // attempt appeared twice, once for ever.
+test("a heartbeat arriving after the settle is refused, not adopted", async () => {
+  // Clearing `attempt_id` is what stops a late heartbeat renewing under the
+  // token it presents -- but a cleared column reads exactly like a run no
+  // attempt has ever opened, which is the adoption arm's legitimate target. So
+  // the heartbeat was accepted and put the attempt back: id, heartbeat and
+  // lease restored on a row whose attempt had already durably closed.
   await seedRun(h, "ktsk-ackrace", SESSION, {
     status: "running", claimCount: 2, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
   });
   const token = { attempt_id: "att-1", claim_count: 2, delivery_seq: 0, delivery_count: 0 };
   await announceRunning("ktsk-ackrace", "att-1", token);
   assert.equal(await settleAttempt("ktsk-ackrace", 2), 200);
+
   const closedAt = (await ledgerOf("ktsk-ackrace"))!.attempts[0].endedAtDb;
   assert.ok(closedAt, "the settle closed the record");
+  const settledFence = await fenceOf("ktsk-ackrace");
+  assert.equal(settledFence.attempt_id, null);
+  assert.equal(settledFence.heartbeat_at, null);
 
-  await renew("ktsk-ackrace", token);
+  const late = await renew("ktsk-ackrace", token);
 
+  assert.equal(late.statusCode, 409, "the token this heartbeat carries was spent by the settle");
+  assert.deepEqual(await fenceOf("ktsk-ackrace"), settledFence,
+    "and nothing it presented may put the attempt, its heartbeat or its lease back");
   const attempts = (await ledgerOf("ktsk-ackrace"))!.attempts;
   assert.equal(attempts.length, 1, "one attempt has one record, whatever arrives after it");
   assert.equal(attempts[0].endedAtDb, closedAt, "and it stays closed at the instant it ended");
+});
+
+test("a fat retry's own delivery cannot re-adopt the attempt it just settled", async () => {
+  // The same arm, reached with the pair unchanged: a fat retry settles and gives
+  // the lease back, so every column the adoption arm reads says "free" -- and
+  // the heartbeat still in flight from the attempt that just ended presents a
+  // delivery the row has not moved past.
+  await seedRun(h, "ktsk-fatlate", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 0, delivery_seq: 4, delivery_count: 1 };
+  await announceRunning("ktsk-fatlate", "att-1", token);
+  assert.equal(await settleAttempt("ktsk-fatlate", 0, undefined, true), 200);
+
+  const settledFence = await fenceOf("ktsk-fatlate");
+  assert.equal(settledFence.lease_expires_at, null, "the retry gave the lease back");
+
+  assert.equal((await renew("ktsk-fatlate", token)).statusCode, 409);
+  assert.deepEqual(await fenceOf("ktsk-fatlate"), settledFence,
+    "a settled attempt does not come back because its own lease is gone");
+
+  // The redelivery that follows carries a new attempt, and must still be able
+  // to adopt: the fence is about the attempt that ended, not about the run.
+  const next = { attempt_id: "att-2", claim_count: 0, delivery_seq: 5, delivery_count: 2 };
+  assert.equal((await renew("ktsk-fatlate", next)).statusCode, 200);
+  assert.equal((await fenceOf("ktsk-fatlate")).attempt_id, "att-2");
 });
 
 test("a running event the row has already moved past takes no ownership", async () => {

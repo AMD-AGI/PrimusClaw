@@ -74,8 +74,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "origin", "workspace_id", "lease_owner", "lease_expires_at", "heartbeat_at", "event_seq",
       "claim_count", "sandbox_workload_id",
       // Every renewal in the fleet reads these; half-applied refuses them all.
-      "attempt_id", "attempt_generation", "delivery_seq", "delivery_count",
-      "ledger_version", "queued_ms_accrued",
+      "attempt_id", "attempt_generation", "settled_attempt_id", "delivery_seq",
+      "delivery_count", "ledger_version", "queued_ms_accrued",
       // Named on every task insert, so a database that lost it takes down the
       // creation of every run rather than just the ones that set it. The ALTER
       // that adds it discards its own error like the rest of setup, which is
