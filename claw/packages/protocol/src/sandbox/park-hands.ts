@@ -125,8 +125,9 @@ export interface RunEndedParkResult {
  * if it were about this one. `idleRev` is the half two periods cannot share:
  * the bucket takes one write per revision, while a clock reading can repeat.
  *
- * `token` and `handsUrl` stay, unlike in `parkHandsHandle`: the session is
- * still alive, and its background-work probe needs both.
+ * `token` stays because the session is still alive and, unlike
+ * `parkHandsHandle`, this path must not revoke it. `handsUrl` stays in both
+ * paths; the background-work probe needs both values here.
  */
 export function applyRunEndedIdleFields(
   info: Record<string, unknown>,

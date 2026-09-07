@@ -293,8 +293,8 @@ test("a write whose acknowledgement is lost is reported as the park it was", asy
 });
 
 test("two callers racing one revision at one millisecond report distinct outcomes", async () => {
-  // The reviewer's race, run through the real markHandsIdle twice against one
-  // bucket. Both read revision 7 and both stamp the same millisecond, so they
+  // Two concurrent markHandsIdle calls race against one bucket revision. Both
+  // read revision 7 and both stamp the same millisecond, so they
   // compose identical bytes but for the witness. One wins the CAS; the loser's
   // conflict reply is lost in transit and surfaces as a transport error, which
   // is the path that re-reads. Neither the revision nor the payload can tell
