@@ -183,14 +183,6 @@ export function armedReceipt(publish: DispatchPublishState): DispatchCompensatio
   return { version: 1, state: "armed", publish };
 }
 
-/** The receipt a close writes, carrying the same two values the row columns get. */
-export function terminalReceipt(
-  failureReason: string | null,
-  errorMessage: string | null,
-): DispatchCompensationRecord {
-  return { version: 1, state: "terminal", failure_reason: failureReason, error_message: errorMessage };
-}
-
 /** What a receipt on the row turned out to be. Only `valid` may be acted on. */
 export type CompensationParse =
   | { kind: "absent" }

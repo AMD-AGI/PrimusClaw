@@ -242,21 +242,6 @@ export function requeueSojournSql(inner: string): string {
   return `jsonb_set(${inner}, '{queued_since}', to_jsonb(NOW()::text))`;
 }
 
-/**
- * The status a row carried before the statement that is now updating it.
- *
- * `RETURNING` reports the new status, and whether a write was a queue exit is
- * only answerable against the old one. Read through a correlated subquery
- * rather than a `FROM` join so that the unqualified `status` references the
- * statement already has stay unambiguous.
- */
-export function priorStatusCte(scope: string): string {
-  return `prior AS (SELECT task_id, status FROM claw_tasks WHERE ${scope})`;
-}
-
-export const PRIOR_STATUS_SQL =
-  `(SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id) AS prior_status`;
-
 /** How many of these rows were leaving the queue, as opposed to execution. */
 export function queuedExits(rows: unknown[]): number {
   return rows.filter((row) => (row as { prior_status?: string }).prior_status === "queued").length;
