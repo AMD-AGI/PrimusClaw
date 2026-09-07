@@ -45,7 +45,7 @@ export const sessionDispatchPorts = {
   recordPublishState,
   recordDispatchSeq,
   noteRefusedPublish,
-  doorbellDispatch: beginDoorbellDispatch as typeof beginDoorbellDispatch | boolean,
+  doorbellDispatch: beginDoorbellDispatch,
   admit: decideAdmission,
   publishSse(sessionId: string, payload: string): void {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
@@ -54,12 +54,6 @@ export const sessionDispatchPorts = {
     return (await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined)).seq;
   },
 };
-
-function beginSessionDoorbellDispatch(): { release: () => void } | null {
-  const gate = sessionDispatchPorts.doorbellDispatch;
-  if (typeof gate === "function") return gate();
-  return gate ? { release() {} } : null;
-}
 
 const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
 
@@ -291,7 +285,7 @@ export async function dispatchTaskToBrain(
     task.files_workspace_id = filesWorkspaceId;
     task.files_workspace_required = true;
 
-    const doorbellToken = beginSessionDoorbellDispatch();
+    const doorbellToken = sessionDispatchPorts.doorbellDispatch();
     if (doorbellToken) {
       try {
         const result = await dispatchByDoorbell({

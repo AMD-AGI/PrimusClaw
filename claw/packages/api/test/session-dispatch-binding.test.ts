@@ -358,7 +358,7 @@ function readyToOpen(doorbell: boolean): void {
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = doorbell;
+  sessionDispatchPorts.doorbellDispatch = doorbell ? openDoorbellBarrier : closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun =
     (async () => ({ taskId: OPENED })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.recordPublishState = async () => {};

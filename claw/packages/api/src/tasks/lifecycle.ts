@@ -240,20 +240,6 @@ export async function cancelTask(
     return { ok: true, cancelled: r.rowCount ?? 0, interrupt_key: task.task_id };
   }
 
-  // `preparing` counts as executing, not as pending. The dispatcher sets it at
-  // the moment it publishes the execution message, so by the time anyone can
-  // cancel such a row Brain may well have picked it up, built a sandbox and
-  // started burning compute -- exactly the case the comment below says must
-  // not be closed straight in the database. Treating it as pending was safe
-  // only while `running` was reachable, and it never was: nothing moved rows
-  // out of `preparing`, so every executing task took the wrong branch here.
-  //
-  // The remaining ambiguity is a row published but not yet consumed, which has
-  // nothing to acknowledge the cancellation. That one sits in `cancelling`
-  // until the sweeper closes it, which is what the sweeper's `cancelling`
-  // branch is for.
-  // A chat row nothing holds has nobody to acknowledge the handshake, so the
-  // `cancelling` branch below would park it until a sweeper tick.
   if ((task.status === "preparing" || task.status === "running")
       && task.origin === "chat" && await cancelUnheldFatRun(task.task_id)) {
     return { ok: true, cancelled: 1, interrupt_key: task.session_id ?? undefined };
@@ -267,29 +253,8 @@ export async function cancelTask(
     metrics.observeQueueExit("chat", updated.prior_queued_since, "cancelled");
   }
   if (updated && task.dag_root_task_id) {
-    // A cancelled dependency can never satisfy downstream readiness. Close its
-    // entire transitive tail so the virtual root can eventually aggregate.
-    //
-    // The status list deliberately stops short of the executing states, and
-    // that is not an oversight in two separate ways:
-    //
-    //   - It cannot matter. `promoteReadyTasks` only leaves `waiting_deps` when
-    //     EVERY dep is `completed`, and the row we just cancelled is not, so no
-    //     transitive downstream can have started. `queued` / `waiting_external`
-    //     are in the list defensively, not because the graph can reach them
-    //     from here. `preparing` used to be listed for the same defensive
-    //     reason and no longer is: it means the row may already be executing,
-    //     so closing one here would be the mistake described below. If the
-    //     invariant above is ever broken, leaving such a row for the sweeper is
-    //     slower but not wrong, whereas closing it under a live run is wrong.
-    //   - It would be wrong anyway. A row that is executing owns a Brain run and
-    //     a sandbox, and marking it `cancelled` straight in the database stops
-    //     neither: the work keeps burning a GPU and a late `agent_done` would
-    //     write over the terminal state. Execution is stopped by going through
-    //     `cancelling` and waiting for Brain to acknowledge, which is exactly
-    //     what the single-task transition above does. The DAG-root branch may
-    //     list `running` because it pairs the UPDATE with `stopAllHandlesForDag`
-    //     plus an interrupt publish; this recursive tail has no such pairing.
+    // Executing rows own a live Brain run and sandbox, so they must transition
+    // through `cancelling` rather than be closed directly in the database.
     await db.query(
       `WITH RECURSIVE downstream(task_id) AS (
          SELECT to_task_id FROM claw_task_edges WHERE from_task_id = $1
