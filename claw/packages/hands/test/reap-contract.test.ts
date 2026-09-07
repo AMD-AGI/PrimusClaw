@@ -139,7 +139,9 @@ test("a shell that ignores both signals is surviving, not stopped", async () => 
   // `escalated`, and reporting it as `stopped` is the failure this pins.
   bg.spawnBackground(
     OWNER, "ktsk_stubborn",
-    `exec ${JSON.stringify(process.execPath)} -e "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"`,
+    // `trap ''` sets the disposition to ignore, and an ignored signal survives
+    // the exec into `sleep`, so the group is still alive when the grace ends.
+    "trap '' TERM; sleep 1000",
     "stubborn",
   );
   await new Promise((r) => setTimeout(r, 400));

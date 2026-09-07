@@ -21,6 +21,7 @@ import {
 } from "../src/sandbox/retain-container.js";
 import { handsSessionKey, legacyHandsKey, RETAINED_PREFIX } from "../src/sandbox/hands-key.js";
 import { encodeKeyPart } from "@claw/protocol";
+import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
 /** The generation whose retention key is also this session's pre-migration one. */
 const GENERATION = "sb-generation-1";
@@ -54,8 +55,7 @@ function memoryStore(seed: Record<string, string> = {}): RetentionStore & {
     },
     async delete(key) { map.delete(key); },
     async keys(filter: string) {
-      const re = new RegExp(`^${filter.replace(/[.]/g, "\\.").replace(/\*/g, "[^.]+")}$`);
-      return [...map.keys()].filter((k) => re.test(k));
+      return [...map.keys()].filter((k) => matchesKvFilter(k, filter));
     },
   };
 }

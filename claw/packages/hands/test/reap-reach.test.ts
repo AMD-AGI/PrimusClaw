@@ -97,8 +97,10 @@ test("a descendant left in the group is reported, not counted as stopped", async
   // so what is under test is group membership rather than an inherited pipe.
   bg.spawnBackground(
     OWNER, "ktsk_leftover",
-    `${JSON.stringify(process.execPath)} -e "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"`
-    + " >/dev/null 2>&1 </dev/null & sleep 60",
+    // `trap ''` sets the disposition to ignore, and an ignored signal survives
+    // the exec into `sleep`, so the whole subshell outlives the SIGTERM the
+    // leader dies on.
+    "(trap '' TERM; sleep 60) >/dev/null 2>&1 </dev/null & sleep 60",
     "leader-with-descendant",
   );
   await new Promise((r) => setTimeout(r, 400));

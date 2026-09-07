@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";
 
 import {
-  registerSandbox, resetBackgroundWorkStateForTest, runKeepaliveTickForTest, unregisterSandbox,
+  resetBackgroundWorkStateForTest, runKeepaliveTickForTest, unregisterSandbox,
 } from "../src/sandbox/keepalive.js";
 import {
   SandboxCapacityRefused, admitSandbox, assertFleetCensused, bindAdmission,
