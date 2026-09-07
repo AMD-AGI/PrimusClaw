@@ -21,7 +21,7 @@
  * `internalTaskAuth`.
  */
 import { createHash } from "node:crypto";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, PG_INT4_MAX } from "@claw/utils";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import pino from "pino";
 import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/index.js";
@@ -264,8 +264,13 @@ function runPhaseJson(body: RunLeaseBody): string {
 function runClaimFromBody(body: RunLeaseBody): number | null {
   if (body.run_claim === undefined || body.run_claim === null) return null;
   const parsed = Number(body.run_claim);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new LeaseBodyError("run_claim must be a non-negative integer");
+  // Bounded by the `claim_count` column, not just by sign: a larger integer
+  // reaches the fence's `$6::int` and Postgres raises 22003, so a malformed
+  // body would be answered as a server fault with no fence applied.
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > PG_INT4_MAX) {
+    throw new LeaseBodyError(
+      `run_claim must be an integer between 0 and ${PG_INT4_MAX}`,
+    );
   }
   return parsed;
 }

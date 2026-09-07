@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The creation surfaces that used to count against a ceiling without consulting
- * one: `expandDag`, `createSingleTask` and `retryTask`.
+ * Every surface that creates a counted run asks the ceiling first: `expandDag`,
+ * `createSingleTask` and `retryTask`.
  *
  * Each assertion is that the refusal writes nothing. A gate that refuses after
  * the insert is not a gate -- the row is already committed, already counted,

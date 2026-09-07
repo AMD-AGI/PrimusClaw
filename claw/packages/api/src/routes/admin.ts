@@ -4,8 +4,8 @@
 import type { FastifyInstance } from "fastify";
 import { nc, kv, sc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
-import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
-import { interruptSessionRuns } from "../tasks/chat-run.js";
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import { stopSessionRuns } from "../tasks/chat-run.js";
 import { countIncompatibleDoorbellRuns } from "../tasks/run-claim.js";
 import {
   DOORBELL_SEMANTICS_KEY, doorbellGateOpen, doorbellInFlight, doorbellLatch,
@@ -14,7 +14,6 @@ import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
 
-/** The bucket's current value for a key, or null when it has none or cannot be read. */
 async function readKvString(key: string): Promise<string | null> {
   try {
     const entry = await kv.get(key);
@@ -44,16 +43,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, key, value: minVersion, previous };
   });
 
-  /**
-   * Assert that every Brain able to consume from the task durable implements
-   * doorbell semantics at least this version.
-   *
-   * Separate from the min-version key and sharing nothing with it: that one
-   * names a deployment tag and answers "am I the current pod?", this one names
-   * a contract version and answers "may the API speak it?". Conflating them
-   * would make the drain signal and the capability signal impossible to move
-   * independently, which is exactly what a canary needs to do.
-   */
+  // Not the min-version key: that names a deployment tag, this a contract version.
   app.post("/v1/internal/brain/doorbell-semantics", { preHandler: internalAuth }, async (req, reply) => {
     const body = (req.body || {}) as Record<string, unknown>;
     const semantics = body.semantics;
@@ -63,8 +53,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         error: "semantics must be an integer of at least 1",
       });
     }
-    // An API cannot be told the fleet supports a contract the API itself does
-    // not implement: the value would be stored and no reader could act on it.
+    // A stored floor above this binary's own version has no reader that can act on it.
     if (semantics > DOORBELL_SEMANTICS_VERSION) {
       return reply.status(400).send({
         ok: false,
@@ -80,14 +69,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, key: DOORBELL_SEMANTICS_KEY, value: semantics, previous };
   });
 
-  /**
-   * Revoke the floor fleet-wide, with no rollout and no restart.
-   *
-   * The gate closing is not on its own proof that nothing more is coming: a
-   * dispatch that read the gate open before this landed may still be on its way
-   * to the stream. The caller must poll every pod for a zero in-flight count
-   * too before changing fleet membership.
-   */
+  // The gate closing does not prove nothing more is coming; poll in-flight too.
   app.delete("/v1/internal/brain/doorbell-semantics", { preHandler: internalAuth }, async (req) => {
     const previous = await readKvString(DOORBELL_SEMANTICS_KEY);
     await kv.delete(DOORBELL_SEMANTICS_KEY);
@@ -95,15 +77,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, key: DOORBELL_SEMANTICS_KEY, previous };
   });
 
-  /**
-   * What a rollback must read from every pod before an incompatible binary may
-   * bind the durable: the gate, what is still in flight, and how many runs an
-   * incoming binary at `version` could not execute.
-   *
-   * The last one counts every non-terminal state rather than only `queued`,
-   * because a claimed row is not queued and can become queued again the moment
-   * the last compatible replica drains.
-   */
+  // Every non-terminal state: a claimed row becomes queued again on the drain.
   app.get<{ Querystring: { version?: string } }>(
     "/v1/internal/brain/doorbell-gate",
     { preHandler: internalAuth },
@@ -184,8 +158,12 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!canWriteSessionAsOperator(session.user_id, user)) {
       return reply.status(403).send({ ok: false, error: "access denied" });
     }
-    try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort */ }
-    await interruptSessionRuns(sessionId);
+    // A caller told `ok` for a Stop that reached neither half never retries it.
+    try {
+      await stopSessionRuns(sessionId);
+    } catch {
+      return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+    }
     return { ok: true };
   });
 

@@ -17,6 +17,7 @@ import {
 import { openChatRun } from "../tasks/chat-run.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
+import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
@@ -232,22 +233,10 @@ interface SendTarget {
   taskId: string;
   contextId: string;
   created: boolean;
-  /**
-   * The values {@link TOUCHED_TARGET_COLUMNS} held before this send wrote them.
-   *
-   * Only for an existing target: a rollback restores them rather than deleting
-   * a session the caller has been using.
-   */
   preImage?: Record<string, unknown>;
 }
 
-/**
- * The columns a send writes on a target that already exists.
- *
- * The pre-image SELECT and the rollback UPDATE are both generated from this
- * list, so a column added to the update below must be added here or the
- * rollback silently stops restoring it.
- */
+// The pre-image SELECT and the rollback UPDATE are generated from this list.
 const TOUCHED_TARGET_COLUMNS = ["agent_status", "context_id", "updated_at"] as const;
 
 function hasUnsupportedPushConfig(configuration: SendMessageRequest["configuration"]): boolean {
@@ -321,14 +310,6 @@ interface A2AAuthContext {
 }
 
 
-/**
- * The one resolved definition of an A2A execution.
- *
- * Built before anything is written, so the admission ask, the counted row and
- * the publish payload all derive from the same value and cannot disagree about
- * what the execution will hold. Deriving the ask from raw metadata instead read
- * a sandbox the request had not asked for as none, and never saw a GPU node.
- */
 interface A2ARunSpec {
   messageId: string;
   sandboxImage?: string;
@@ -363,8 +344,7 @@ async function resolveA2ARunSpec(
     }
   }
 
-  // Sandbox image / resources resolution chain (mirrors routes/sessions.ts):
-  // metadata (request body) > plugin row > default workload row.
+  // Resolution order, as in routes/sessions.ts: metadata > plugin > default.
   const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
   const defaultRes = asJsonObject(defaultResourceRow?.resource) || {};
   const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
@@ -386,14 +366,8 @@ async function resolveA2ARunSpec(
   };
 }
 
-/**
- * What an A2A send asks the fleet for, before anything is written.
- *
- * A send is a tree of one as a *run* root and not as a session tree: the
- * parent attachment builds a team tree of any depth, so a request naming a
- * parent is decided on the prospective shape -- one node and one level past it
- * -- and one naming an existing target on that target's own shape.
- */
+// One *run* root, but not one session tree: a parented request is decided on
+// the prospective shape, because the attachment builds a tree of any depth.
 async function a2aAdmissionAsk(
   targetSessionId: string | null,
   spec: A2ARunSpec,
@@ -422,23 +396,21 @@ async function a2aAdmissionAsk(
 }
 
 /**
- * Open the counted run row for one A2A execution.
+ * On the admission lock's own transaction, so the row cannot outlive the session
+ * write it references.
  *
- * The identity of an execution is the pair `(session_id, message_id)`, held by
- * `idx_tasks_a2a_execution`: without it a resend of one pair observes the
- * single row the aggregate collapsed it to, clears the ceiling, and executes
- * indefinitely while being counted once.
- *
- * @returns null when the pair already has its execution, so nothing is
- *   published and the request answers with that task's state.
+ * @returns null when `idx_tasks_a2a_execution` already holds this
+ *   `(session_id, message_id)` pair, so the resend executes nothing.
  */
 async function openA2ARun(
   target: SendTarget,
   text: string,
   auth: A2AAuthContext,
   spec: A2ARunSpec,
+  client: PoolClient,
 ): Promise<string | null> {
   const run = await openChatRun({
+    client,
     dispatch: "fat",
     origin: "a2a",
     sessionId: target.taskId,
@@ -462,11 +434,7 @@ async function openA2ARun(
   return run.taskId;
 }
 
-/**
- * A deferral has no identity a client could poll, so it is an explicit
- * retryable error rather than a task at `SUBMITTED`. Distinct from a refusal,
- * so an operator can tell a full fleet from an over-ceiling request.
- */
+// A deferral has no identity a client could poll, so it is a retryable error.
 function makeAdmissionDeferredError(rpcId: string | number): JsonRpcErrorResponse {
   return makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "admission_deferred", [
     makeA2AErrorDetail("admission_deferred", { retry_after_seconds: A2A_DEFER_RETRY_SECONDS }),
@@ -482,10 +450,8 @@ function makeAdmissionRejectedError(
   ]);
 }
 
-/** How long a deferred A2A caller is told to wait. One scheduler tick is too eager. */
 const A2A_DEFER_RETRY_SECONDS = 5;
 
-/** What one admitted-and-materialised send left behind, or why it left nothing. */
 type A2AEntry =
   | { kind: "opened"; target: SendTarget; taskId: string }
   | { kind: "duplicate"; target: SendTarget }
@@ -493,18 +459,8 @@ type A2AEntry =
   | { kind: "deferred" }
   | { kind: "error"; error: JsonRpcResponse };
 
-/**
- * Decide and materialise one send under a single hold of the admission lock.
- *
- * The tree shape, the decision, the session write and the parent attachment all
- * run on the locked transaction, so two concurrent children of one parent cannot
- * both pass a stale shape and both be admitted.
- *
- * The counted row is written last, and deliberately not on that transaction:
- * `openChatRun` binds the pool, so it commits as it is written. Nothing after it
- * can fail before the lock transaction commits, which is what keeps the pair
- * from separating.
- */
+// The session, the parent attachment and the counted row that references them
+// commit together, or a refusal, a throw or a failed `COMMIT` leaves none.
 async function admitAndOpenA2ASend(
   message: Message,
   text: string,
@@ -528,17 +484,12 @@ async function admitAndOpenA2ASend(
       };
     }
     await attachA2AParent(target.taskId, auth, spec, client);
-    const taskId = await openA2ARun(target, text, auth, spec);
+    const taskId = await openA2ARun(target, text, auth, spec, client);
     return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
   }));
 }
 
-/**
- * Count a session this send minted, once its transaction has committed.
- *
- * Inside the lock the insert is still provisional -- a throw before the commit
- * rolls it back -- so counting there would name sessions no row backs.
- */
+// Counted after the commit: inside the lock the insert is still provisional.
 async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntry> {
   const settled = await entry;
   const created = (settled.kind === "opened" || settled.kind === "duplicate")
@@ -547,13 +498,8 @@ async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntr
   return settled;
 }
 
-/**
- * Attach the request's parent link, once the caller is shown to own the parent.
- *
- * Inside the admission lock and before the counted row: a throw here must leave
- * no row behind, and the tree ceiling was decided against the shape this write
- * produces.
- */
+// On the lock's transaction and before the counted row: the tree ceiling was
+// decided against the shape this write produces.
 async function attachA2AParent(
   taskId: string,
   auth: A2AAuthContext,
@@ -613,27 +559,15 @@ async function publishA2AExecuteTask(
   await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
 }
 
-/**
- * Codes that prove the bytes never reached JetStream.
- *
- * Everything else -- a timeout, a closed or draining connection, an unknown
- * code, an error that is not a `NatsError` at all -- is ambiguous: the message
- * may be on the stream with only the `PubAck` lost, so the row is cancelled
- * rather than deleted. Deleting the accounting for work that may be running is
- * bounded by nothing; holding it is bounded by the budget.
- */
+// Codes that prove the bytes never reached JetStream. Everything else may be on
+// the stream with only the `PubAck` lost, so its row is cancelled, not deleted.
 const PRE_DELIVERY_ERROR_CODES = new Set<string>([ErrorCode.NoResponders]);
 
 function publishWasPreDelivery(err: unknown): boolean {
   return err instanceof NatsError && PRE_DELIVERY_ERROR_CODES.has(err.code);
 }
 
-/**
- * Settle the counted row and the session a failed publish left behind.
- *
- * Without it the row holds its slice of every ceiling until its deadline, which
- * is the stranding this compensation exists to prevent.
- */
+// Without this the row holds its slice of every ceiling until its deadline.
 async function rollbackA2AAdmission(
   target: SendTarget,
   taskId: string,
@@ -942,9 +876,8 @@ async function handleCancelTask(
     "UPDATE claw_sessions SET agent_status = 'cancelled', updated_at = NOW() WHERE session_id = $1",
     [params.id],
   );
-  // `cancelling` rather than a terminal state: the execution may be live off
-  // JetStream with no lease to prove it, and the state is in both counted sets,
-  // so the slot is held exactly as long as the work is.
+  // `cancelling`, not terminal: the execution may be live off JetStream with no
+  // lease to prove it, and this state is in both counted sets.
   await db.query(
     `UPDATE claw_tasks SET status = 'cancelling'
       WHERE session_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')`,
@@ -1150,10 +1083,8 @@ async function handleSendStreamingMessage(
     reply.status(500).send(makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to create task"));
     return;
   }
-  // Answered over the ordinary JSON-RPC reply, before any subscription or SSE
-  // header: suppressing only the publish leaves a socket that never receives an
-  // event and never closes, and opening the stream to write one deferral event
-  // and close it reads to an SSE client as a completed task.
+  // Before any SSE header: a stream opened to carry one deferral event reads to
+  // an SSE client as a completed task.
   if (entry.kind === "rejected") {
     reply.send(makeAdmissionRejectedError(rpcId, entry.reason));
     return;
@@ -1197,7 +1128,6 @@ async function handleSendStreamingMessage(
   await pumpA2AStream(sub, reply, rpcId, target, keepalive);
 }
 
-/** The stream's opening frame and its keepalive, armed together with the close handler. */
 function openA2AStream(
   reply: FastifyReply,
   rpcId: string | number,
@@ -1480,7 +1410,6 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   });
 }
 
-/** The identity a legacy invoke executes under: it carries no authenticated caller. */
 const LEGACY_INVOKE_AUTH: A2AAuthContext = {
   userId: "a2a", roles: [], platformKey: "", virtualKey: "",
 };
@@ -1501,9 +1430,7 @@ async function handleLegacyInvoke(
     return { success: false, error: "question is required" };
   }
 
-  // This path declares nothing: no sandbox image, no topology and no parent, so
-  // the spec that reaches the ask and the row is the empty one rather than the
-  // resolved chain a `message/send` gets.
+  // This path declares nothing, so the spec is the empty one.
   const spec: A2ARunSpec = { messageId: randomUUID() };
   const target: SendTarget = { taskId: `a2a-${randomUUID()}`, contextId: "", created: true };
 
@@ -1545,7 +1472,6 @@ async function handleLegacyInvoke(
   };
 }
 
-/** The legacy path's half of {@link admitAndOpenA2ASend}: it mints its own session. */
 async function admitLegacyInvoke(
   target: SendTarget,
   text: string,
@@ -1560,7 +1486,7 @@ async function admitLegacyInvoke(
        VALUES ($1, $2, $3, $4, $5)`,
       [target.taskId, text.slice(0, 80), "a2a", "claw", "pending"],
     );
-    const taskId = await openA2ARun(target, text, LEGACY_INVOKE_AUTH, spec);
+    const taskId = await openA2ARun(target, text, LEGACY_INVOKE_AUTH, spec, client);
     return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
   }));
 }

@@ -11,9 +11,9 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
-  forceIdleAfterInterrupt, interruptSessionRuns, releaseSessionGateForTurn, takeSessionGate,
+  forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
-import { nc, kv } from "../infra/nats.js";
+import { kv } from "../infra/nats.js";
 import { getUser } from "../auth/middleware.js";
 import {
   canAccessSession,
@@ -25,7 +25,7 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import {
-  interruptSubject, isUserEnvKeyAllowed,
+  isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
 } from "@claw/protocol";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
@@ -47,7 +47,6 @@ import pino from "pino"
 
 const logger = pino({ name: "sessions" });
 
-/** What the create route answers with, when it cannot write the session row. */
 interface SessionCreateRefusal {
   statusCode: number;
   response: { ok: false; error: string; reason?: string };
@@ -55,7 +54,6 @@ interface SessionCreateRefusal {
   replayable?: true;
 }
 
-/** The columns `POST /v1/sessions` writes, whichever path writes them. */
 export interface NewSessionRow {
   sessionId: string;
   name: string;
@@ -68,13 +66,8 @@ export interface NewSessionRow {
   role: string;
 }
 
-/**
- * Proof that the caller may attach a child to a parent, issued by the read
- * that checked it.
- *
- * A value rather than a boolean, and carrying the parent it was issued for, so
- * a witness cannot be reused for a different parent than the one authorised.
- */
+// A value rather than a boolean, carrying the parent it was issued for, so a
+// witness cannot be reused for a parent other than the one authorised.
 export interface ParentAuthorisation {
   /** The parent this witness authorises, or null when the create named none. */
   readonly parentSid: string | null;
@@ -83,14 +76,9 @@ export interface ParentAuthorisation {
 /**
  * Write the session row, refusing to record a parent nobody authorised.
  *
- * The guard is here rather than only at the call sites because "did we check?"
- * must not be a property of which branch ran. Both creation paths derive that
- * answer from the same request field they are about to persist, so a third path
- * -- or a reordering of an existing one -- could write a parent link having
- * evaluated no authorisation at all, and nothing downstream would notice: a
- * child row is what grants visibility of a parent's tree. Requiring the witness
- * at the write makes the check structural, and its absence a crash rather than
- * a silent cross-tenant attachment.
+ * The witness is required at the write, not only at the call sites: a child row
+ * is what grants visibility of a parent's tree, so a path that wrote the link
+ * having checked nothing would attach across tenants silently.
  */
 export async function insertSessionRow(
   q: StatementRunner,
@@ -114,14 +102,9 @@ export async function insertSessionRow(
 /**
  * Whether this caller may attach the child to the parent it named.
  *
- * Called on every create, including one that names no parent, so nothing
- * outside decides from the request body whether an authorisation happens.
- * "No parent was named" is an answer this returns, not a reason to skip it:
- * a caller that branched on the field first would be letting the value it is
- * about to persist decide whether the value gets checked.
- *
- * Every other arm fails closed -- an anonymous caller, a parent that does not
- * exist, one whose owner column is null, and one owned by somebody else.
+ * Called on every create, so the request body never decides whether an
+ * authorisation happens: "no parent was named" is an answer this returns.
+ * Every other arm fails closed.
  */
 export async function resolveParentAuthorisation(
   q: StatementRunner,
@@ -143,22 +126,14 @@ export async function resolveParentAuthorisation(
   return { parentSid };
 }
 
-/** Whether a parent read answered with a refusal rather than a witness. */
 function isRefusal(
   result: SessionCreateRefusal | ParentAuthorisation,
 ): result is SessionCreateRefusal {
   return "statusCode" in result;
 }
 
-/**
- * Create the session row, having resolved who its parent may be.
- *
- * The two shapes differ only in where the parent is read: a create carrying a
- * first message grows a tree somebody may be racing, so its read, its tree
- * decision and its INSERT are one locked transaction, while a create that
- * writes no run needs no lock. Both reach the same write through the same
- * resolver, and neither lets the request decide whether that resolver runs.
- */
+// The two shapes differ only in where the parent is read: a create carrying a
+// first message grows a tree somebody may be racing, so it takes the lock.
 async function createSessionRow(
   row: NewSessionRow,
   parentSid: string | null,
@@ -173,16 +148,10 @@ async function createSessionRow(
 }
 
 /**
- * Write a child session that carries a first message, under the admission lock.
- *
  * The parent read, the tree decision and the INSERT are one transaction whose
- * first statement is the lock: with the INSERT outside it, two message-bearing
- * child creates both commit before either admission runs, and each then reads a
- * tree the other has already grown -- both admitted while one slot remained, or
- * both refused while one was free.
- *
- * The shape is prospective, this child not being a node yet, and both bounds
- * are checked because a write that adds no level still adds a node.
+ * first statement is the lock: outside it two child creates each read a tree the
+ * other has already grown. The shape is prospective, and both bounds are checked
+ * because a write that adds no level still adds a node.
  */
 export async function admitParentedSessionCreate(
   parentSid: string,
@@ -995,10 +964,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           },
         );
         if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
-          // An unknown verdict runs no rollback -- see `dispatchTaskToBrain` --
-          // so the session outlives this 503 and is a creation like any other.
-          // A settled failure deleted its row, and counting that would report a
-          // session nothing backs.
+          // An unknown verdict runs no rollback, so the session outlives this 503.
+          // A settled failure deleted its row; counting it would name no session.
           if (dispatch.kind === "publish_unknown") metrics.onSessionCreated("ok");
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
@@ -1257,8 +1224,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!canWriteSessionAsOperator(row.user_id, user)) {
         return reply.status(403).send({ ok: false, error: "access denied" });
       }
-      try { nc.publish(interruptSubject(sessionId)); } catch { /* ignore publish errors */ }
-      await interruptSessionRuns(sessionId);
+      // The forced-idle timer below would hand back a gate nothing cancelled.
+      try {
+        await stopSessionRuns(sessionId);
+      } catch {
+        return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+      }
       // If Brain is running, set a timeout to force idle if exec_complete
       // doesn't arrive within 30s (e.g. Brain stuck in a2a_call HTTP fetch).
       if (row.agent_status === "running") {
@@ -1299,8 +1270,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // onto claw_pending_messages directly and leaves this map empty.
     let capturedUserEnvSnapshot: Record<string, string> = {};
 
-    // Minted before the gate is taken rather than by the dispatch below, so the
-    // marker naming the gate's owner and the turn it names are one string.
+    // Minted before the gate is taken, so marker and turn are one string.
     const turnMessageId = newChatMessageId();
 
     // Transaction: lock row → check status → queue or dispatch

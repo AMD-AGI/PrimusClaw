@@ -68,12 +68,15 @@ test("a definite non-delivery is a durable row fact, not a process-local one", a
   );
 });
 
-test("a receipt a holder disarmed is not resurrected by a late publish write", async () => {
+test("a receipt a holder disarmed is not resurrected, and the writer is told", async () => {
   const { recordPublishState } = await import("../src/tasks/chat-run.js");
   await seedSession(h, "s1");
   await seedRun(h, "t1", "s1", { status: "running", dispatch: "fat" });
 
-  await recordPublishState("t1", "attempted");
+  await assert.rejects(
+    recordPublishState("t1", "attempted"),
+    "a caller about to publish must learn its receipt did not take",
+  );
   assert.equal(
     (await receipt("t1")).dispatch_compensation, undefined,
     "a row with no armed receipt has a holder, and a publish write must not give it one",

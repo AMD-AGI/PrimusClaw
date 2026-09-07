@@ -20,7 +20,7 @@ import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import {
-  failChatRunDispatch, openChatRun, recordDispatchSeq, recordPublishState,
+  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
 } from "../tasks/chat-run.js";
 import { metrics } from "../infra/metrics.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
@@ -82,13 +82,7 @@ export interface DispatchInput {
   mcpServers: Record<string, Record<string, unknown>> | undefined;
   capturedUserEnvSnapshot: Record<string, string>;
   capturedSessionEnv: Record<string, string>;
-  /**
-   * The id this turn was already announced under.
-   *
-   * Supplied by a caller that took the session gate before dispatching, so the
-   * gate's owner marker and the turn it names are the same string. Minted here
-   * for callers that take no gate of their own.
-   */
+  /** Supplied by a caller that took the gate, so marker and turn are one string. */
   messageId?: string;
   /**
    * The environment this run declares it needs (node count, per-node shape,
@@ -104,12 +98,8 @@ export type DispatchResult =
   | { kind: "rejected"; messageId: string; reason: string }
   | { kind: "publish_failed"; messageId: string; error: Error }
   /**
-   * The compensation could not establish what happened to the row.
-   *
-   * Distinct from `publish_failed`, which follows a committed terminal verdict
-   * and has already run its cleanup. Here nothing is settled: the caller must
-   * not idle or delete the session, because the row may still be claimable and
-   * about to run. Reconciliation owns the state until it reaches a verdict.
+   * Nothing is settled: unlike `publish_failed` no cleanup has run, and the row
+   * may still be claimable, so the caller must not idle or delete the session.
    */
   | { kind: "publish_unknown"; messageId: string; error: Error };
 
@@ -127,7 +117,6 @@ export type DispatchResult =
  * last: the rollback cannot take back an event that has already been published
  * to subscribers.
  */
-/** The id one chat turn is known by, everywhere from the gate marker to the row. */
 export function newChatMessageId(): string {
   return `claw-${Date.now()}`;
 }
@@ -301,25 +290,10 @@ export async function dispatchTaskToBrain(
           rememberTaskId: (taskId) => { runTaskId = taskId; },
         });
         if (result.kind === "rejected") {
-          // The delete is the whole rollback, and it is enough. A refused turn
-          // was reported as leaving an unanswered UserMessage on any open
-          // stream, which would need the live push above to have reached a
-          // reader -- and it does not. `publishSse` writes to
-          // `sse.events.<sessionId>` on core NATS, and that subject has two
-          // publishers in this repository and no subscriber at all: both SSE
-          // routes read the JetStream `events.<sessionId>` subject through
-          // `createSessionSubscription`, which only `publishEvent` feeds.
-          //
-          // So nothing is announced here on purpose. Publishing the refusal
-          // through `publishEvent` instead would reach readers and also persist,
-          // leaving an assistant reply in history beside the UserMessage this
-          // statement just removed -- worse than the silence. Verified against
-          // the cluster: a rejected create leaves no session event, no task row,
-          // no conversation turn, and an idle session.
-          //
-          // The dead `sse.` channel is a real defect, but a wider one than this
-          // branch: it is also why a client already connected never sees its own
-          // UserMessage until it reconnects and replays history.
+          // The delete is the whole rollback. Nothing is announced on purpose:
+          // `publishSse` writes to a core-NATS subject no SSE route subscribes
+          // to, and announcing through `publishEvent` instead would persist an
+          // assistant reply beside the UserMessage this statement removes.
           await db.query(
             "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
             [messageId, sessionId],
@@ -354,9 +328,8 @@ export async function dispatchTaskToBrain(
     task.run_lease = run.lease;
 
     subject = taskSubject();
-    // Durable before the call it describes: a crash between the two leaves a
-    // row that correctly says a message may exist, where the reverse order
-    // leaves one that denies a message already on the stream.
+    // A gate, not a note: an unrecorded `attempted` leaves a row denying a
+    // message already on the stream, so a throw here must stop the publish.
     await recordPublishState(run.taskId, "attempted");
     const seq = await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
     await recordDispatchSeq(run.taskId, seq);
@@ -373,7 +346,7 @@ export async function dispatchTaskToBrain(
     // path reads this same verdict; leaving the default path deaf to it is the
     // asymmetry, not a different problem.
     if (runTaskId && publishCertainlyFailed(err)) {
-      await recordPublishState(runTaskId, "refused");
+      await noteRefusedPublish(runTaskId);
     }
     const verdict = await sessionDispatchPorts.failChatRunDispatch(
       runTaskId, String(err?.message ?? err),
@@ -426,8 +399,8 @@ async function dispatchByDoorbell(input: {
   const result = await handOffAssembledRun({
     ...handOff,
     path: "chat",
-    // The third argument is the dedup id. Dropping it here left every live
-    // chat doorbell with no duplicate-window protection at all.
+    // The third argument is the dedup id; without it the doorbell has no
+    // duplicate-window protection.
     publish: (subject, payload, msgId) =>
       sessionDispatchPorts.publishTask(subject, payload, msgId),
     openRun: sessionDispatchPorts.openChatRun,

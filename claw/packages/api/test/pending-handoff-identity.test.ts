@@ -64,22 +64,71 @@ async function recordedId(id: number): Promise<string | null> {
   return (rows[0]?.dispatch_task_id as string | null) ?? null;
 }
 
-test("the identity is decided once and every later drain reads the same one", async () => {
-  const mod = await import("../src/tasks/pending-dispatch.js");
-  const reserve = (mod as unknown as {
-    __test__?: { reserveDispatchTaskId(id: unknown): Promise<string> };
-  }).__test__?.reserveDispatchTaskId;
-  if (!reserve) {
-    // Reserved through the drain rather than exported; the drain-level cases
-    // below are what actually pin the behaviour.
-    return;
+const DRAIN = {
+  sessionId: "s1", userId: "u-1", messageId: "claw-1", prompt: "hi", workspaceId: "kws_1",
+  task: { session_id: "s1", prompt: "hi" } as Record<string, unknown>,
+};
+
+test("the queue row names the run before that run's turn goes out", async () => {
+  // The record has to be durable before the publish, or a drain that dies in
+  // between comes back with nothing to recognise its own hand-off by.
+  const { dispatchPendingMessage, pendingDispatchPorts } =
+    await import("../src/tasks/pending-dispatch.js");
+  const published: unknown[] = [];
+  const restore = stubPorts(pendingDispatchPorts, published);
+  const publish = pendingDispatchPorts.publish;
+  let recordedWhenPublished: string | null = null;
+  pendingDispatchPorts.publish = (async (...args: [string, string, string]) => {
+    recordedWhenPublished = await recordedId(42);
+    return publish(...args);
+  }) as typeof pendingDispatchPorts.publish;
+  try {
+    await seedSession(h, "s1", { agentStatus: "idle" });
+    await seedPending(42);
+
+    const result = await dispatchPendingMessage({ ...DRAIN, pendingId: 42 });
+
+    assert.equal(published.length, 1);
+    assert.equal(
+      recordedWhenPublished, result.runId,
+      "the queue row named this run before anything was sent for it",
+    );
+  } finally {
+    restore();
   }
-  await seedSession(h, "s1");
-  await seedPending(42);
-  const first = await reserve(42);
-  const second = await reserve(42);
-  assert.equal(first, second);
-  assert.equal(await recordedId(42), first);
+});
+
+test("a drain that resumes after another has published opens no second run", async () => {
+  // The pending selection takes no lock, so a drain can resume after another
+  // has published this message and deleted its queue row. Answering that with a
+  // fresh id is a second turn on the stream under an identity nothing recorded,
+  // and no active-state index can stop it once the first row is terminal.
+  const { dispatchPendingMessage, pendingDispatchPorts } =
+    await import("../src/tasks/pending-dispatch.js");
+  const published: unknown[] = [];
+  const restore = stubPorts(pendingDispatchPorts, published);
+  try {
+    await seedSession(h, "s1", { agentStatus: "idle" });
+    await seedPending(42);
+    const first = await dispatchPendingMessage({ ...DRAIN, pendingId: 42 });
+    assert.equal(published.length, 1);
+    assert.equal(
+      (await h.sql("SELECT 1 FROM claw_pending_messages WHERE id = 42")).length, 0,
+      "the drain that published deleted the row it had handed off",
+    );
+
+    const resumed = await dispatchPendingMessage({ ...DRAIN, pendingId: 42 });
+
+    assert.equal(resumed.runId, null, "the resumed drain has nothing left to hand off");
+    assert.equal(published.length, 1, "and publishes nothing");
+    const rows = await h.sql("SELECT task_id FROM claw_tasks WHERE session_id = 's1'");
+    assert.deepEqual(
+      rows.map((row) => row.task_id), [first.runId],
+      "the only run is the one the first drain opened",
+    );
+  } finally {
+    restore();
+  }
 });
 
 test("a retry whose recorded run is still open publishes nothing and clears the queue", async () => {

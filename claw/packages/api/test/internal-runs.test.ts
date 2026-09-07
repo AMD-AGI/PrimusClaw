@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 
+import { PG_INT4_MAX } from "@claw/utils";
+
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { db } from "../src/infra/db.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
@@ -303,13 +305,17 @@ test("fail-claim still defaults an absent reason to session_deleted", async () =
 
 // The generation fence is `($3::int IS NULL OR claim_count = $3)`, so a
 // malformed count coerced to absent releases whatever generation the row is
-// on -- including a turn a later holder is running.
+// on -- including a turn a later holder is running. One past the column's own
+// range is the same class: it reached the statement and Postgres answered
+// `22003`, which the route reported as a 500.
 for (const [label, claimCount] of [
   ["a string", "malformed"],
   ["a fraction", 1.9],
   ["a negative", -1],
   ["null", null],
   ["NaN", Number.NaN],
+  ["one past int4", PG_INT4_MAX + 1],
+  ["Number.MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
 ] as const) {
   for (const route of ["unclaim", "fail-claim"] as const) {
     test(`${route} refuses ${label} claim_count rather than dropping the fence`, async () => {
@@ -329,6 +335,27 @@ for (const [label, claimCount] of [
       assert.equal(touched, false, "a refused body reaches no statement");
     });
   }
+}
+
+for (const route of ["unclaim", "fail-claim"] as const) {
+  test(`${route} accepts the largest generation the column can hold`, async () => {
+    let seen: unknown;
+    db.query = (async (text: string, params: unknown[] = []) => {
+      if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+        seen = params.find((p) => p === PG_INT4_MAX);
+        return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }) as typeof db.query;
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/internal/tasks/ktsk_1/${route}`,
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { brain_id: "brain-7", claim_count: PG_INT4_MAX },
+    });
+    assert.equal(res.statusCode, 200);
+    assert.equal(seen, PG_INT4_MAX, "the boundary itself is a generation, not a malformed body");
+  });
 }
 
 test("unclaim passes an integer claim_count through to the fence", async () => {

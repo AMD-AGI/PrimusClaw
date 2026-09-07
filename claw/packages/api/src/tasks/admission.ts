@@ -4,11 +4,9 @@
 /**
  * Whether a new run may start, wait, or must be refused.
  *
- * Fleet-wide, not a per-tenant quota: `claw_tasks` carries no owner column.
- * Only the run dimension is keyed by run-tree root; sandboxes count per row and
- * GPU nodes sum per row, so a 20-node DAG is one run root and up to twenty
- * sandbox units. A dimension whose ceiling is zero is not enforced. Soft means
- * the row sits at `queued` for claim-next; hard means the create is rejected.
+ * Fleet-wide, not per tenant: `claw_tasks` carries no owner column. Only runs
+ * are keyed by run-tree root; sandboxes and GPU nodes count per row. A zero
+ * ceiling is not enforced; soft queues the row, hard rejects the create.
  */
 
 import pino from "pino";
@@ -32,21 +30,13 @@ import type { ClawTaskRow } from "./types.js";
 
 const logger = pino({ name: "admission" });
 
-// `waiting_external` is committed: the row keeps its sandbox while parked --
-// nothing stops handles outside a terminal transition -- so a hard ceiling that
-// cannot see it is metering capacity the fleet has already spent.
+// `waiting_external` is committed: a parked row keeps its sandbox, so a ceiling
+// that cannot see it meters capacity the fleet has already spent.
 const OCCUPYING = [
   "queued", "preparing", "running", "cancelling", "waiting_external",
 ] as const;
 const EXECUTING = ["preparing", "running", "cancelling"] as const;
 
-/**
- * Every refusal this module can produce.
- *
- * Declared here rather than beside the metric that labels it: the value never
- * crosses a process boundary, and a metrics-owned enum would let admission
- * invent a sixth reason that fails only at the label call.
- */
 export const ADMISSION_REJECT_REASONS = [
   "runs_hard_limit",
   "sandboxes_hard_limit",
@@ -64,17 +54,15 @@ export type AdmissionDecision =
 
 export interface AdmissionAsk {
   origin: "chat" | "task" | "dag_node" | "a2a";
-  /** 1 when this ask introduces a run-tree root not already counted, else 0. */
   newRunRoots: 0 | 1;
   sandboxes: number;
   gpuNodes: number;
-  /** Logged only, so `admission.rejected` names the tree. No query reads it. */
   treeRootId?: string | null;
   treeNodeCount?: number;
   treeDepth?: number;
 }
 
-/** A refusal a caller answers with, rather than throws: `BadRequestError` has no status here. */
+/** A refusal a caller answers with, rather than throws. */
 export interface AdmissionRefusal {
   admitted: false;
   reason: string;
@@ -90,10 +78,8 @@ export interface AdmissionRefusal {
  * "wait", and making a run wait behind rows that are themselves waiting is how
  * a queue stops draining.
  *
- * `waiting_external` is in the committed set and not in the executing one: a
- * parked run still holds its sandbox, and is not running. `waiting_deps` is in
- * neither -- such a row has no sandbox and no start, and counting it would make
- * one 100-node DAG refuse the whole fleet at creation.
+ * `waiting_external` is committed but not executing; `waiting_deps` is neither,
+ * or one 100-node DAG would refuse the whole fleet at creation.
  *
  * `runRoots` / `executingRoots` were already this pair. Sandboxes and GPU
  * nodes only had the executing half, which is what made the post-insert hard
@@ -208,9 +194,8 @@ export async function hardLimitAfterInsert(
   // the excess. Counting only the rows that were there first makes the
   // decision this row's own -- the ones inside the ceiling keep it, the ones
   // past it are shed.
-  // Not counted as a decision: this function does not make an admission
-  // decision, it vetoes one. A rising share of refusals landing here rather
-  // than pre-insert is the observable form of creates racing for the last slot.
+  // A veto, not a decision. A rising share of refusals landing here rather than
+  // pre-insert is what creates racing for the last slot looks like.
   const reason = taskId
     ? firstAheadRefusal(await loadUsageAhead(taskId, client), ask, limits)
     : hardExceededByUsage(await loadUsage(client), ask, limits);
@@ -289,12 +274,9 @@ export async function loadUsageAhead(
 }
 
 /**
- * Count every terminal answer of the decision below, including the throws.
- *
- * `loadUsage` and `queueLength` are unguarded queries, so without an error
- * value a partial outage would delete failed creates from the denominator of
- * every rollout ratio while the successful ones kept counting -- and the fleet
- * would read healthier the worse it got.
+ * Count every terminal answer of the decision below, throws included: without an
+ * error value a partial outage drops failed creates from every rollout ratio's
+ * denominator, and the fleet reads healthier the worse it gets.
  */
 export async function decideAdmission(
   ask: AdmissionAsk,
@@ -361,7 +343,6 @@ function treeCapReason(ask: AdmissionAsk, limits: AdmitLimits): AdmissionRejectR
   return null;
 }
 
-/** The first hard dimension this ask would exceed, or null. */
 export function hardOverflow(
   usage: AdmissionUsage,
   ask: AdmissionAsk,
@@ -377,7 +358,6 @@ export function hardOverflow(
   return null;
 }
 
-/** Whether this ask would push the executing set past a soft ceiling. */
 export function softOverflow(
   usage: AdmissionUsage,
   ask: AdmissionAsk,
@@ -398,11 +378,7 @@ function overLimit(limit: number, next: number): boolean {
   return limit > 0 && next > limit;
 }
 
-/**
- * Deliberately narrower than the population the decision was made against:
- * only queued doorbell chat rows, which is what a chat caller's queue position
- * means. It reaches `sessions/dispatch.ts` and stops; no route reads it.
- */
+/** Narrower than the decision's population on purpose: a chat caller's own position. */
 async function queueLength(client?: StatementRunner): Promise<number> {
   const r = await (client ?? db).query(
     `SELECT COUNT(*)::int AS n FROM claw_tasks
@@ -414,20 +390,14 @@ async function queueLength(client?: StatementRunner): Promise<number> {
   return Number(r.rows[0]?.n ?? 0);
 }
 
-// A row holding, or committed to holding, a sandbox.
 const SANDBOX_ROW_SQL = `sandbox_spec IS NOT NULL AND sandbox_spec::text <> '"none"'
              OR COALESCE(metadata->>'sandbox_image','') <> ''`;
 
 /**
- * A row's GPU demand, clamped rather than cast.
- *
- * `claw_tasks.input` is not all ours -- the task API writes a caller's JSON in
- * verbatim -- so the type guard counts what is countable and ignores the rest.
- * `1e30` passes that guard and overflows `int4`, which aborts the whole
- * aggregate and refuses every later admission on a fleet that never metered
- * GPUs; `numeric` and a capped sum keep the total expressible. `COALESCE`
- * around the `SUM` because `LEAST` ignores NULL and would read an empty row set
- * as the cap rather than as zero.
+ * `claw_tasks.input` holds caller JSON verbatim, so `1e30` passes the type guard
+ * and overflows `int4`, aborting the aggregate and refusing every later
+ * admission. `COALESCE` around the `SUM` because `LEAST` ignores NULL and would
+ * read an empty set as the cap.
  */
 function gpuSumSql(statusParam: string): string {
   return `LEAST(COALESCE(SUM(
@@ -479,60 +449,49 @@ export async function loadUsage(client?: StatementRunner): Promise<AdmissionUsag
 }
 
 /**
- * Fleet-wide serialisation of the decide-then-write critical section.
- *
- * Same namespace as the schema and claim-fence ids in `infra/db.ts`; never
- * reuse it. A ceiling concurrent entrants can exceed is not a ceiling: the
- * ordinal recheck sheds the excess only when both racers see each other, which
- * commit order inverting creation order defeats.
+ * Fleet-wide serialisation of the decide-then-write critical section. Shares a
+ * namespace with the ids in `infra/db.ts`; never reuse it. The ordinal recheck
+ * sheds excess only when both racers see each other, which commit order
+ * inverting creation order defeats.
  */
 export const ADMISSION_LOCK_KEY = 8_264_179_233_003;
 
-/** Whether any dimension at all is metered, tree ceilings included. */
 export function anyAdmissionCeilingSet(limits: AdmitLimits): boolean {
   return anyCeilingSet(limits) || limits.treeMaxNodes > 0 || limits.treeMaxDepth > 0;
 }
 
-/** The `soft*` half of {@link anyCeilingSet}, so a hard-only fleet does no drain query. */
+/** The `soft*` half, so a hard-only fleet does no drain query. */
 export function anySoftCeilingSet(limits: AdmitLimits): boolean {
   return limits.softRuns > 0 || limits.softSandboxes > 0 || limits.softGpuNodes > 0;
 }
 
 /**
- * Take the admission lock on a transaction the caller owns.
- *
- * Must be the caller's first statement after `BEGIN`: every path taking both
- * this and a `claw_sessions` row lock takes this one first, or two requests
- * holding one each deadlock. Re-entrant, and a no-op on an unmetered fleet.
+ * Take the admission lock on a transaction the caller owns. Must be the first
+ * statement after `BEGIN`: every path taking both this and a `claw_sessions`
+ * row lock takes this one first, or two requests holding one each deadlock.
  */
 export async function acquireAdmissionLock(client: StatementRunner): Promise<void> {
   if (!anyAdmissionCeilingSet(envAdmitLimits())) return;
   await client.query("SELECT pg_advisory_xact_lock($1)", [ADMISSION_LOCK_KEY]);
 }
 
-/**
- * Hold an effect back until the transaction that justifies it has committed.
- *
- * A metric is not a database write: nothing rolls one back. Recorded inside the
- * transaction it survives a failed `COMMIT` and reports work the fleet never
- * did -- a claimed queue exit for a row still sitting at `queued`, a created
- * session for a row that was rolled back.
- */
+// Nothing rolls a metric back, so one emitted inside a transaction that then
+// fails reports work the fleet never did.
 export type AfterCommit = (effect: () => void) => void;
 
-/** For a caller with no transaction of its own: there is nothing to wait for. */
 export const runImmediately: AfterCommit = (effect) => effect();
 
 /**
  * Run `fn` inside a transaction holding the admission lock, and commit.
  *
- * The commit releases the lock, so no path can leak it. On an unmetered fleet
- * no transaction is opened at all and `fn` runs on the pool.
+ * The transaction is opened whether or not a ceiling is metered: callers write
+ * a session and the row that references it under this hold, and atomicity
+ * between the two cannot depend on how the fleet is configured. Only the
+ * advisory lock is conditional -- an unmetered fleet serialises no decision.
  */
 export async function withOwnedAdmissionLock<T>(
-  fn: (client: StatementRunner, afterCommit: AfterCommit) => Promise<T>,
+  fn: (client: PoolClient, afterCommit: AfterCommit) => Promise<T>,
 ): Promise<T> {
-  if (!anyAdmissionCeilingSet(envAdmitLimits())) return await fn(db, runImmediately);
   const client = await db.pool.connect();
   const effects: Array<() => void> = [];
   try {
@@ -552,14 +511,8 @@ export async function withOwnedAdmissionLock<T>(
   }
 }
 
-/**
- * One transaction for an endpoint's preparation and its create, lock first.
- *
- * Unlike {@link withOwnedAdmissionLock} the transaction is opened whether or
- * not a ceiling is set: the preparation these endpoints perform -- a credential
- * stamp, a session insert -- must be undone by the same refusal that writes no
- * run, and only a transaction does that. `commit: false` rolls all of it back.
- */
+// Unlike {@link withOwnedAdmissionLock} the caller decides the outcome:
+// `commit: false` rolls the preparation back with the refusal.
 export async function withAdmissionTransaction<T>(
   fn: (client: PoolClient, afterCommit: AfterCommit) => Promise<{ commit: boolean; value: T }>,
 ): Promise<T> {
@@ -580,7 +533,6 @@ export async function withAdmissionTransaction<T>(
   }
 }
 
-/** {@link loadUsage}'s totals plus the run-tree roots of one counted set. */
 export interface UsageWithRoots {
   usage: AdmissionUsage;
   roots: Set<string>;
@@ -589,12 +541,10 @@ export interface UsageWithRoots {
 /**
  * Totals and root set from a single statement, and therefore a single snapshot.
  *
- * Two statements on one connection still take two READ COMMITTED snapshots, so
- * a root committing its terminal transition between them yields a reduced total
- * against a root set that still lists it -- and a queued sibling then reads
- * `newRunRoots = 0` for a root that is no longer executing, promoting two roots
- * where the ceiling allowed one. The advisory lock does not cover it: a run
- * finishing takes no admission lock.
+ * Two statements take two READ COMMITTED snapshots, so a root that commits its
+ * terminal transition between them leaves a reduced total against a root set
+ * that still lists it, and two roots are promoted where one was allowed. The
+ * advisory lock does not cover it: a run finishing takes no admission lock.
  */
 export async function loadUsageWithRoots(
   scope: "occupying" | "executing",
@@ -628,9 +578,7 @@ export async function loadUsageWithRoots(
 }
 
 /**
- * Derive an ask from a persisted row.
- *
- * @param executingRoots the roots already counted in the set being drained; a
+ * @param countedRoots the roots already counted in the set being drained; a
  *   candidate whose root is in it adds none.
  */
 export function askFromRow(row: ClawTaskRow, countedRoots: Set<string>): AdmissionAsk {
@@ -650,9 +598,8 @@ function rowWantsSandbox(row: ClawTaskRow): boolean {
   return String(row.metadata?.sandbox_image ?? "") !== "";
 }
 
-// The `jsonb_typeof(...) = 'number'` guard the SQL applies, in TypeScript: a
-// row carrying `{"topology":{"nodes":"x"}}` is not countable, and reading it as
-// one here would let an ask disagree with the aggregate it is compared against.
+// The SQL's `jsonb_typeof(...) = 'number'` guard, in TypeScript: an ask that
+// counts what the aggregate does not is an ask compared against nothing.
 function rowGpuNodes(row: ClawTaskRow): number {
   const topology = (row.input as { topology?: { nodes?: unknown } } | null)?.topology;
   const nodes = topology?.nodes;
@@ -661,12 +608,9 @@ function rowGpuNodes(row: ClawTaskRow): number {
 }
 
 /**
- * Fold an accepted candidate's demand into the running snapshot.
- *
- * `usage` is consumption, so an acceptance *increases* it; without this a batch
- * of candidates each individually under the ceiling is dispatched collectively
- * over it. Adding the root is what makes two siblings promoted in one batch
- * count once.
+ * Fold an accepted candidate's demand into the running snapshot: without it a
+ * batch each of whose rows fits is dispatched collectively over the ceiling.
+ * Adding the root is what makes two siblings in one batch count once.
  */
 export function chargeAccepted(
   usage: AdmissionUsage,
@@ -696,10 +640,9 @@ export interface FillOptions<T> {
 /**
  * Page candidates in priority order until `want` fit or a page comes back short.
  *
- * It does **not** stop on a saturated dimension: demand is optional per
+ * Deliberately does not stop on a saturated dimension: demand is optional per
  * dimension, so a row asking for no sandbox fits a fleet with no sandbox
- * headroom. A pre-limited window instead re-reads a blocked prefix every pass
- * and never examines the admissible rows behind it.
+ * headroom, and a pre-limited window would never reach it.
  */
 export async function fillWithinCeiling<T>(opts: FillOptions<T>): Promise<T[]> {
   const accepted: T[] = [];
@@ -718,11 +661,9 @@ export async function fillWithinCeiling<T>(opts: FillOptions<T>): Promise<T[]> {
 }
 
 /**
- * Reserve accepted rows on the locked connection, dropping those that moved.
- *
- * The reservation must run on the transaction that counted the headroom:
- * committing first releases the lock before the CAS, and issuing the CAS on a
- * second connection blocks on rows this transaction holds.
+ * Reserve accepted rows on the transaction that counted the headroom: a commit
+ * first releases the lock before the CAS, and a second connection blocks on the
+ * rows this one holds.
  */
 export async function reserveForExecution<T>(
   client: StatementRunner,
@@ -739,11 +680,8 @@ export async function reserveForExecution<T>(
 
 /**
  * Whether the soft ceiling declines to hand this row to a worker right now.
- *
- * Only a row at `queued` is gated: `CLAIMABLE` also admits `preparing`, which
- * is already inside `EXECUTING`, so re-claiming it after an unclaim adds
- * nothing and blocking it would strand work a holder gave back. Never a
- * refusal -- the row stays `queued` and the caller comes back.
+ * Only a `queued` row is gated: `preparing` is already inside `EXECUTING`, so
+ * blocking a re-claim would strand work a holder gave back.
  */
 export async function deferQueuedBySoftCeiling(
   taskId: string,
@@ -769,11 +707,8 @@ export interface SessionTreeShape {
 }
 
 /**
- * Walk a session's tree structurally: every live session, no join to tasks.
- *
- * Counting active task rows instead would not bound the tree at all -- a node
- * is a session, and a caller could grow one past its ceiling invisibly by
- * letting each child fall idle before creating the next.
+ * Walk a session's tree structurally. Counting active task rows would bound
+ * nothing: a caller grows past the ceiling by idling each child in turn.
  */
 export async function sessionTreeShape(
   sessionId: string,

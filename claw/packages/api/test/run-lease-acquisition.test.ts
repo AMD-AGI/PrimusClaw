@@ -130,7 +130,7 @@ beforeEach(async () => {
   await observer.query("TRUNCATE claw_tasks");
 });
 
-describe("the first lease on a fat row", () => {
+describe("acceptance of a fat row nobody holds", () => {
   it_("acceptance of a pristine row writes the holder and the generation", async () => {
     await seed({
       taskId: "t-1",
@@ -163,6 +163,17 @@ describe("the first lease on a fat row", () => {
     assert.deepEqual(metadata.dispatch_compensation, { version: 9, state: "armed" });
   });
 
+  it_("a legacy row with no dispatch marker accepts like a fat one", async () => {
+    await seed({ taskId: "t-1", dispatch: null });
+
+    const res = await accept("t-1", "brain-7");
+
+    assert.equal(res.body.claim_count, 1);
+    assert.equal((await taskRow("t-1")).lease_owner, "brain-7");
+  });
+});
+
+describe("acceptance refused on a row that is already spoken for", () => {
   for (const undefinedTarget of [
     { name: "owner with no expiry", row: { leaseOwner: "brain-9", leaseIn: null } },
     { name: "expiry with no owner", row: { leaseOwner: null, leaseIn: 60 } },
@@ -183,6 +194,9 @@ describe("the first lease on a fat row", () => {
     });
   }
 
+});
+
+describe("a lapsed lease, and the first lease a Brain that predates acceptance takes", () => {
   it_("a fully lapsed fenced lease is takeable by a caller that declares acceptance", async () => {
     await seed({
       taskId: "t-1", leaseOwner: "brain-9", leaseIn: -30, fenced: true, claimCount: 1,
@@ -243,14 +257,6 @@ describe("the first lease on a fat row", () => {
     assert.equal((await taskRow("t-1")).lease_owner, "brain-9");
   });
 
-  it_("a legacy row with no dispatch marker accepts like a fat one", async () => {
-    await seed({ taskId: "t-1", dispatch: null });
-
-    const res = await accept("t-1", "brain-7");
-
-    assert.equal(res.body.claim_count, 1);
-    assert.equal((await taskRow("t-1")).lease_owner, "brain-7");
-  });
 });
 
 describe("renewal", () => {

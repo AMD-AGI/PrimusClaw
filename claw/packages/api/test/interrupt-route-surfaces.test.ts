@@ -11,7 +11,8 @@
  * the unit test green and the row wedged. Each case here injects the real
  * endpoint against the real schema and reads back the rows and the response.
  * NATS is down throughout, which is the state in which the durable half matters
- * most.
+ * most -- and the last group takes that half away too, because a Stop that
+ * reached neither half must not be answered as one that did.
  */
 
 import "./reconcile-on-env.js";
@@ -23,7 +24,9 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { UserInfo } from "../src/auth/models.js";
 import { registerAdminRoutes } from "../src/routes/admin.js";
 import { registerAnthropicManagedAgentsRoutes } from "../src/routes/anthropic-managed-agents.js";
+import { db } from "../src/infra/db.js";
 import { registry } from "../src/infra/metrics.js";
+import { chatRunPorts } from "../src/tasks/chat-run.js";
 import {
   startHarness, seedSession, seedRun, runRow, sessionRow, type Harness,
 } from "./scenario-harness.js";
@@ -239,6 +242,102 @@ test("a user.interrupt for someone else's session changes nothing", async () => 
   } finally {
     await app.close();
   }
+});
+
+/**
+ * Make the durable half of a Stop fail the way an unreachable database does.
+ *
+ * @returns a restore function; a substitution left in place would make every
+ *   later case fail for this case's reason.
+ */
+function breakDurableStop(): () => void {
+  const query = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    if (/UPDATE claw_tasks/.test(text)) throw new Error("connection terminated");
+    return query(text, params);
+  }) as typeof db.query;
+  return () => { db.query = query; };
+}
+
+/** A wire half that works, so only the durable half is missing. */
+function healthyInterruptPublisher(): () => void {
+  const publish = chatRunPorts.publishInterrupt;
+  chatRunPorts.publishInterrupt = () => { /* delivered */ };
+  return () => { chatRunPorts.publishInterrupt = publish; };
+}
+
+for (const [half, arrange] of [
+  ["the durable half fails while NATS is healthy", () => {
+    const wire = healthyInterruptPublisher();
+    const durable = breakDurableStop();
+    return () => { durable(); wire(); };
+  }],
+  ["both halves fail", () => breakDurableStop()],
+] as Array<[string, () => () => void]>) {
+  test(`the admin interrupt endpoint refuses to answer ok when ${half}`, async () => {
+    await seedSession(h, "s1");
+    await gateWaiter("s1", "gate-waiter", "m-1");
+    const restore = arrange();
+    const app = await appAs(registerAdminRoutes);
+    try {
+      const res = await app.inject({ method: "POST", url: ADMIN_INTERRUPT("s1") });
+
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.json(), { ok: false, error: "interrupt_not_recorded" });
+    } finally {
+      restore();
+      await app.close();
+    }
+    assert.equal(
+      (await runRow(h, "gate-waiter")).status, "preparing",
+      "the row really was not cancelled, which is what the refusal reports",
+    );
+  });
+
+  test(`the Anthropic interrupt event refuses to answer ok when ${half}`, async () => {
+    await seedSession(h, "s1");
+    await gateWaiter("s1", "gate-waiter", "m-1");
+    const restore = arrange();
+    const app = await appAs(registerAnthropicManagedAgentsRoutes);
+    try {
+      const res = await app.inject({
+        method: "POST", url: ANTHROPIC_EVENTS("s1"),
+        payload: { events: [{ type: "user.interrupt" }] },
+      });
+
+      assert.equal(res.statusCode, 503);
+      assert.equal((res.json() as { type: string }).type, "error");
+    } finally {
+      restore();
+      await app.close();
+    }
+    assert.equal((await runRow(h, "gate-waiter")).status, "preparing");
+  });
+}
+
+test("an archive whose cancellation fails keeps the queued delivery it would have dropped", async () => {
+  await seedSession(h, "s1");
+  await gateWaiter("s1", "gate-waiter", "m-1");
+  await h.sql(
+    "INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, $2, $3)",
+    ["s1", "u-1", "queued turn"],
+  );
+  const restore = breakDurableStop();
+  const app = await appAs(registerAnthropicManagedAgentsRoutes);
+  try {
+    assert.equal((await app.inject({ method: "POST", url: ANTHROPIC_ARCHIVE("s1") })).statusCode, 503);
+  } finally {
+    restore();
+    await app.close();
+  }
+  assert.equal(
+    Number((await h.sql(
+      "SELECT count(*)::int AS n FROM claw_pending_messages WHERE session_id = $1", ["s1"],
+    ))[0].n),
+    1,
+    "a run left live keeps its delivery, or a worker takes an archived session with none",
+  );
+  assert.notEqual((await sessionRow(h, "s1")).status, "archived");
 });
 
 test("the Anthropic archive endpoint settles the fat row before it drops the queued delivery", async () => {

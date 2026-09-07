@@ -30,13 +30,11 @@ import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { interruptSessionRuns } from "../tasks/chat-run.js";
+import { stopSessionRuns } from "../tasks/chat-run.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { createSessionSubscriptionReady, sanitizeSessionEvent } from "../events/store.js";
 import { metrics } from "../infra/metrics.js";
-import { nc } from "../infra/nats.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
-import { interruptSubject } from "@claw/protocol";
 import pino from "pino";
 
 const logger = pino({ name: "anthropic-managed-agents" });
@@ -953,8 +951,13 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     )).rows[0];
     if (!existing || existing.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
 
-    try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort */ }
-    await interruptSessionRuns(sessionId);
+    // Ordered, and fatal if it fails: dropping the queue behind a run that was
+    // not cancelled hands a live worker an archived session with no delivery.
+    try {
+      await stopSessionRuns(sessionId);
+    } catch {
+      return sendError(reply, 503, "api_error", "the session's runs could not be cancelled");
+    }
     await db.query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
     await db.query("UPDATE claw_sessions SET status = 'archived', updated_at = NOW() WHERE session_id = $1", [sessionId]);
     const updated = (await db.query("SELECT * FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0];
@@ -1111,8 +1114,11 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
         [sessionId],
       )).rows[0];
       if (!row || row.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
-      try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort, mirrors routes/sessions.ts */ }
-      await interruptSessionRuns(sessionId);
+      try {
+        await stopSessionRuns(sessionId);
+      } catch {
+        return sendError(reply, 503, "api_error", "the session's runs could not be cancelled");
+      }
       const evt = { id: `evt_${Date.now()}`, type: "user.interrupt", processed_at: new Date().toISOString() };
       return reply.send({ data: [evt] });
     }

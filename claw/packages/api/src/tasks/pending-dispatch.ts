@@ -42,7 +42,8 @@ import { db } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import {
-  failChatRunDispatch, openChatRun, recordDispatchSeq, recordPublishState, takeSessionGate,
+  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
+  takeSessionGate,
 } from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
 import { newTaskId } from "./ids.js";
@@ -538,13 +539,12 @@ export async function dispatchPendingMessage(
     // redelivery that will find no message on the stream and nothing to
     // resolve it with.
     const payload = JSON.stringify(task);
+    // A gate, not a note: an unrecorded `attempted` leaves a row denying a
+    // message already on the stream, so a throw here must stop the publish.
+    await recordPublishState(run.taskId, "attempted");
     // Published under the queued row's id, so a drain that reaches this line
     // twice puts one task on the stream rather than two.
     publishAttempted = true;
-    // Durable before the call it describes, for the reason the immediate path
-    // records it: the reverse order leaves a row denying a message that is
-    // already on the stream.
-    await recordPublishState(run.taskId, "attempted");
     const seq = await pendingDispatchPorts.publish(
       subject, payload, doorbellDedupId(sessionId, input.messageId),
     );
@@ -552,12 +552,11 @@ export async function dispatchPendingMessage(
   } catch (err) {
     // `certain` says whether the run row was torn down, which is the difference
     // between "this turn has not started" and "this turn may be running
-    // already" when someone reads this line afterwards. The one step above the
-    // publish is certain by construction: a payload that would not serialise
-    // never reached the stream, and leaving its row open would leave one nobody
-    // closes.
+    // already" when someone reads this line afterwards. Every step above the
+    // publish is certain by construction: neither a payload that would not
+    // serialise nor a receipt that would not commit ever reached the stream.
     const certain = !publishAttempted || publishCertainlyFailed(err);
-    if (certain) await recordPublishState(run.taskId, "refused");
+    if (certain) await noteRefusedPublish(run.taskId);
     logger.error(
       { err, sessionId, pendingId: input.pendingId, certain },
       "pending.publish_failed",
@@ -593,9 +592,17 @@ export async function dispatchPendingMessage(
  * The run id this queued message is handed off under, decided once.
  *
  * Compare-and-set rather than a plain write, so concurrent drains of one queue
- * row converge on the same id instead of each minting its own.
+ * row converge on the same id instead of each minting its own. This statement
+ * is the only serialisation point they share: the selection that found the row
+ * takes no lock, so a second drainer can resume after the first has published
+ * and deleted it.
+ *
+ * @returns null when no queue row matched, which means the message was handed
+ *   off and its row deleted while this drainer was assembling. Answering with
+ *   the fresh candidate instead let that drainer publish a second turn under an
+ *   identity nothing had recorded.
  */
-async function reserveDispatchTaskId(pendingId: unknown): Promise<string> {
+async function reserveDispatchTaskId(pendingId: unknown): Promise<string | null> {
   const candidate = newTaskId();
   const r = await db.query(
     `UPDATE claw_pending_messages
@@ -604,8 +611,7 @@ async function reserveDispatchTaskId(pendingId: unknown): Promise<string> {
       RETURNING dispatch_task_id`,
     [pendingId, candidate],
   );
-  const stored = (r.rows[0] as { dispatch_task_id?: string } | undefined)?.dispatch_task_id;
-  return stored ?? candidate;
+  return (r.rows[0] as { dispatch_task_id?: string } | undefined)?.dispatch_task_id ?? null;
 }
 
 /**
@@ -632,11 +638,28 @@ async function recordedHandoffState(
     : "consumed";
 }
 
+/**
+ * Stand down: the queue row this drain was assembling is already gone.
+ *
+ * Whoever deleted it published the turn, so there is nothing left to hand off
+ * and nothing to compensate -- the one thing this drainer must not do is open a
+ * run of its own.
+ */
+function handedOffElsewhere(input: PendingDispatchInput): PendingDispatchResult {
+  forgetUncountedAttempts(input.pendingId);
+  logger.info(
+    { sessionId: input.sessionId, pendingId: input.pendingId },
+    "pending.handoff_row_gone",
+  );
+  return { runId: null };
+}
+
 async function finishPendingDoorbell(
   input: PendingDispatchInput,
   task: Record<string, unknown>,
 ): Promise<PendingDispatchResult> {
   let handoffId = await reserveDispatchTaskId(input.pendingId);
+  if (!handoffId) return handedOffElsewhere(input);
   const recorded = await recordedHandoffState(handoffId);
   if (recorded === "retryable") {
     // Terminal as a failed dispatch with no claim ever taken proves nothing
@@ -647,6 +670,7 @@ async function finishPendingDoorbell(
       [input.pendingId, handoffId],
     );
     handoffId = await reserveDispatchTaskId(input.pendingId);
+    if (!handoffId) return handedOffElsewhere(input);
   }
   if (recorded === "open" || recorded === "consumed") {
     // The recorded run already owns this message. Publishing again would be a

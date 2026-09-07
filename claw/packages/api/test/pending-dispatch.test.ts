@@ -143,6 +143,13 @@ function harness(opts: {
         ? { rows: [], rowCount: 0 }
         : { rows: [{ bind_attempts: opts.bindAttempts }], rowCount: 1 };
     }
+    if (/SET dispatch_task_id = COALESCE/.test(text)) {
+      // A queue row that is present and carries no identity yet. No row back
+      // means another drain has taken the message, which is a different case.
+      rec.calls.push("reserve-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 };
+    }
     const isDelete = /DELETE/.test(text);
     const step = /dispatch_compensation/.test(text)
       ? "arm-publish"

@@ -36,11 +36,12 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import pino from "pino";
-import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
 import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
 import { db } from "../infra/db.js";
+import { nc } from "../infra/nats.js";
 import { metrics, type QueueEntryCause } from "../infra/metrics.js";
 import { newTaskId } from "./ids.js";
 import { insertTask } from "./db.js";
@@ -51,9 +52,15 @@ import { publishEvent } from "../events/store.js";
 
 const logger = pino({ name: "chat-run" });
 
-/** Injection seam for the terminal events an interrupt has to announce. */
+/**
+ * Injection seam for the wire effects a Stop has to make.
+ *
+ * `nc` is a live binding on a frozen module namespace, so a test can only
+ * substitute the call through an object like this one.
+ */
 export const chatRunPorts = {
   publishSessionEvent: publishEvent,
+  publishInterrupt: (subject: string): void => { nc.publish(subject); },
 };
 
 // Same default the DAG expander uses: the API talking to itself, which works
@@ -135,24 +142,44 @@ export async function clearDispatchReconcile(
  *
  * CASed on the state it replaces, so a receipt a holder disarmed in between is
  * not resurrected.
+ *
+ * @throws when the receipt is not durable -- the statement failed, or it matched
+ *   no armed row. A publisher must let that throw stop it: a row still reading
+ *   `not_attempted` while its message is on the stream is exactly what
+ *   {@link NO_DELIVERY_IN_FLIGHT_SQL} destroys a live run on.
  */
 export async function recordPublishState(
   taskId: string,
   publish: DispatchPublishState,
 ): Promise<void> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              metadata, '{dispatch_compensation,publish}', to_jsonb($2::text)
+            )
+      WHERE task_id = $1
+        AND metadata->'dispatch_compensation'->>'version' = '1'
+        AND metadata->'dispatch_compensation'->>'state' = 'armed'`,
+    [taskId, publish],
+  );
+  if ((r.rowCount ?? 0) === 0) {
+    throw new Error(`chat_run.publish_state_unrecorded: ${taskId} is not armed for ${publish}`);
+  }
+}
+
+/**
+ * The compensation's own receipt write, which may not replace the failure it
+ * compensates.
+ *
+ * Unlike the pre-publish write this one cannot fail open: the state it leaves
+ * behind on failure is `attempted`, the ambiguous value every guard already
+ * treats as a possible delivery.
+ */
+export async function noteRefusedPublish(taskId: string): Promise<void> {
   try {
-    await db.query(
-      `UPDATE claw_tasks
-          SET metadata = jsonb_set(
-                metadata, '{dispatch_compensation,publish}', to_jsonb($2::text)
-              )
-        WHERE task_id = $1
-          AND metadata->'dispatch_compensation'->>'version' = '1'
-          AND metadata->'dispatch_compensation'->>'state' = 'armed'`,
-      [taskId, publish],
-    );
+    await recordPublishState(taskId, "refused");
   } catch (err) {
-    logger.warn({ err, taskId, publish }, "chat_run.publish_state_write_failed");
+    logger.warn({ err, taskId }, "chat_run.publish_state_write_failed");
   }
 }
 
@@ -565,6 +592,11 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
       } : {}),
     };
   } catch (err) {
+    // A caller that supplied a transaction has writes riding on this one: the
+    // failed statement has already aborted it, so a null return would report a
+    // duplicate while its `COMMIT` silently discarded the session this row
+    // names.
+    if (input.client) throw err;
     logger.warn(
       { err, sessionId: input.sessionId, messageId: input.messageId },
       "chat_run.open_failed",
@@ -1211,8 +1243,11 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
       }
     }
   } catch (err) {
+    // Zero is "there was nothing to cancel", which is what a Stop reports
+    // success on. A failed statement knows neither, so it must be the caller's
+    // to answer.
     logger.warn({ err, sessionId }, "chat_run.interrupt_unstarted_failed");
-    return 0;
+    throw err;
   }
   if (!rows.length) return 0;
   for (const row of rows) {
@@ -1263,6 +1298,24 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
 export async function interruptSessionRuns(sessionId: string): Promise<number> {
   const cancelled = await interruptUnstartedChatRuns(sessionId);
   return cancelled + await cancelUnheldFatRuns(sessionId);
+}
+
+/**
+ * Both halves of a Stop: the wire interrupt, then the durable cancellation.
+ *
+ * The wire half reaches only a worker already subscribed, so its failure alone
+ * is survivable. The durable half is what makes a Stop stick, and a caller told
+ * `ok` for one that threw would never retry it, so that failure is rethrown.
+ *
+ * @returns how many runs the durable half settled.
+ */
+export async function stopSessionRuns(sessionId: string): Promise<number> {
+  try {
+    chatRunPorts.publishInterrupt(interruptSubject(sessionId));
+  } catch (err) {
+    logger.warn({ err, sessionId }, "chat_run.interrupt_publish_failed");
+  }
+  return await interruptSessionRuns(sessionId);
 }
 
 /**
@@ -1332,7 +1385,7 @@ async function cancelUnheldFat(scope: string, scopeValue: string): Promise<numbe
     return terminal.length;
   } catch (err) {
     logger.warn({ err, scope: scopeValue }, "chat_run.cancel_unheld_fat_failed");
-    return 0;
+    throw err;
   }
 }
 

@@ -69,8 +69,9 @@ test("a run whose reference was already released still lets go of the write side
 });
 
 test("a claim recorded with no reference behind it is still found", async () => {
-  // The other order: the acquire failed and the claim was taken anyway, which
-  // is the state the fixed takeRunRef stops being created and this clears.
+  // The other order: a writer claim with no reference behind it. The release
+  // has to key on the claim as well, or that workspace stays claimed for the
+  // rest of its retention with nothing left to find it by.
   await seedWorkspace("kws_a", { writerRunId: "t1" });
 
   assert.equal(await releaseRunUseStrict("t1", false), "released");

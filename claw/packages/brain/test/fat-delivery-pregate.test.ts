@@ -222,6 +222,9 @@ describe("the pre-gate lease", () => {
     }
   });
 
+});
+
+describe("the pre-gate lease refusing a delivery", () => {
   for (const [name, answer] of [
     ["a timeout or network failure", { kind: "unresolved" } as LeaseAnswer],
     ["a 5xx or unparseable body", { kind: "unresolved" } as LeaseAnswer],

@@ -13,7 +13,7 @@ import {
   DOORBELL_SEMANTICS_MAX, RUN_FAIL_CLAIM_REASONS, RUN_UNCLAIM_REASONS,
   type RunUnclaimReason,
 } from "@claw/protocol";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, PG_INT4_MAX } from "@claw/utils";
 import { metrics } from "../infra/metrics.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
@@ -42,30 +42,27 @@ function fieldOf(body: unknown, field: string): unknown {
 /**
  * The claim generation the caller believes it holds, when it reports one.
  *
- * Absent is a holder too old to report one, and the fence then admits any
- * generation. A malformed value is not that: coercing it to absent drops the
- * fence for a request that meant to carry it, and a stale release then
- * requeues a row somebody else is running.
+ * Absence disables the fence, so a malformed value coerced to it would let a
+ * stale release requeue a row somebody else is running. The upper bound is the
+ * `claim_count` column's domain: a larger integer raises `22003` at the
+ * statement, which the route would report as a server fault.
  */
 function claimCountFrom(body: unknown): number | undefined | "invalid" {
   const raw = fieldOf(body, "claim_count");
   if (raw === undefined) return undefined;
-  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : "invalid";
+  const usable = typeof raw === "number" && Number.isInteger(raw)
+    && raw >= 0 && raw <= PG_INT4_MAX;
+  return usable ? raw as number : "invalid";
 }
 
 const CLAIM_COUNT_INVALID = {
   ok: false,
   error: "claim_count_invalid",
-  message: "claim_count must be a non-negative integer, or absent",
+  message: `claim_count must be an integer between 0 and ${PG_INT4_MAX}, or absent`,
 } as const;
 
-/**
- * Why the holder is giving the row back, when it says. Read by the poison guard.
- *
- * Only `lock_contention` makes that guard report a busy workspace, so a
- * misspelling that fell through to absent would be recorded as an ordinary
- * retry and the archive would name the wrong cause.
- */
+// Read by the poison guard: only `lock_contention` makes it report a busy
+// workspace, so a misspelling fell through to absent names the wrong cause.
 const RELEASE_REASONS = new Set<string>(RUN_UNCLAIM_REASONS);
 function releaseReasonFrom(body: unknown): RunUnclaimReason | undefined | "invalid" {
   const raw = fieldOf(body, "reason");
@@ -87,14 +84,8 @@ const FAIL_CLAIM_REASON_INVALID = {
   message: `reason must be one of ${RUN_FAIL_CLAIM_REASONS.join(", ")}, or absent`,
 } as const;
 
-/**
- * The delivery-semantics contract the caller implements.
- *
- * Absence is a defined value, not an implicit default: a rolling deploy serves
- * clients that predate the field, and version 1 is precisely what such a
- * binary implements. A value that is present and malformed is refused instead,
- * because silence from an old client is information and corruption is not.
- */
+// Absence is a defined value, not a default: a client predating the field
+// implements exactly version 1. A malformed value is refused instead.
 function doorbellSemanticsFrom(body: unknown): number | "invalid" {
   const raw = fieldOf(body, "doorbell_semantics");
   if (raw === undefined) return 1;
@@ -115,12 +106,8 @@ function brainIdFrom(body: unknown): string {
   return typeof raw === "string" && raw.trim() ? raw.trim() : "";
 }
 
-/**
- * The claim outcomes that are not a claimed run, mapped to their HTTP answer.
- *
- * Keyed by the union rather than by `string`, so a new refusal is a compile
- * error here instead of an undefined lookup at the one exit that reports it.
- */
+// Keyed by the union rather than by `string`, so a new refusal is a compile
+// error here rather than an undefined lookup at the exit that reports it.
 type ClaimRefusal = Extract<Awaited<ReturnType<typeof claimRunById>>, string>;
 
 const CLAIM_REFUSALS: Record<ClaimRefusal, { status: number; error: string }> = {
@@ -233,10 +220,8 @@ function registerClaimNextRoute(app: FastifyInstance): void {
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
       const semantics = doorbellSemanticsFrom(req.body);
       if (semantics === "invalid") return reply.status(400).send(SEMANTICS_INVALID);
-      // The loop swallows its skips, so the counts an operator needs -- how
-      // often the queue was empty versus occupied by rows this pod could not
-      // take -- come back on a plain struct rather than through a metrics
-      // import in the claim core.
+      // The loop swallows its skips, so the counts come back on a plain struct
+      // rather than through a metrics import in the claim core.
       const diag: ClaimNextDiagnostics = { skipped: [], outcome: "empty" };
       let claimed: ClaimedRun | null;
       try {

@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { DEFAULT_RUN_LEASE_TTL_MS } from "@claw/protocol";
+import { PG_INT4_MAX } from "@claw/utils";
 import { db } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 
@@ -289,6 +290,45 @@ test("a blank brain_id is refused before anything is written", async () => {
 
   assert.equal(res.statusCode, 400);
   assert.equal(seen.some((q) => /UPDATE claw_tasks/.test(q.sql)), false);
+});
+
+// The fence binds the quoted generation as `$6::int`, so a value past the
+// column's range reaches the statement and Postgres answers `22003` -- a
+// malformed body reported as a server fault, with no fence applied.
+for (const [label, runClaim] of [
+  ["one past int4", PG_INT4_MAX + 1],
+  ["Number.MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
+  ["a negative", -1],
+] as const) {
+  test(`a run_claim of ${label} is refused before anything is written`, async () => {
+    updateRows = [{ status: "running" }];
+    stubDb();
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/internal/tasks/t-1/lease",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { brain_id: "brain-7", lease_seconds: 45, run_claim: runClaim },
+    });
+
+    assert.equal(res.statusCode, 400);
+    assert.equal(seen.some((q) => /UPDATE claw_tasks/.test(q.sql)), false);
+  });
+}
+
+test("the largest generation the column can hold is a generation, not a bad body", async () => {
+  updateRows = [{ status: "running", claim_count: PG_INT4_MAX }];
+  stubDb();
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/t-1/lease",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", lease_seconds: 45, run_claim: PG_INT4_MAX },
+  });
+
+  assert.equal(res.statusCode, 200);
+  const update = seen.find((q) => /UPDATE claw_tasks/.test(q.sql));
+  assert.ok(update, "the renewal reached its statement");
+  assert.ok(update.params.includes(PG_INT4_MAX), "and carried the quoted generation into the fence");
 });
 
 test("a database failure is retryable rather than a lease", async () => {

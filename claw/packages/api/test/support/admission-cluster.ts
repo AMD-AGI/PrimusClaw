@@ -80,6 +80,37 @@ export async function startAdmissionCluster(
   };
 }
 
+/**
+ * Make the next `COMMIT` on a checked-out connection fail, having rolled back.
+ *
+ * A commit reported as failed whose writes survive is not a commit failure, so
+ * the transaction is discarded before the caller is told. Only the argument-less
+ * form is wrapped: `pool.query` reaches the same method with a callback, and a
+ * wrapper that swallowed it would hang every statement in the process.
+ *
+ * @returns a restore function; call it before asserting on anything.
+ */
+export function failNextCommit(pool: pg.Pool): () => void {
+  const connect = pool.connect.bind(pool) as (...args: unknown[]) => unknown;
+  let armed = true;
+  (pool as { connect: unknown }).connect = (...args: unknown[]) => {
+    if (args.length) return connect(...args);
+    return (connect() as Promise<pg.PoolClient>).then((client) => {
+      const query = client.query.bind(client) as (...a: unknown[]) => unknown;
+      (client as { query: unknown }).query = (text: unknown, ...rest: unknown[]) => {
+        if (armed && text === "COMMIT") {
+          armed = false;
+          return (query("ROLLBACK") as Promise<unknown>)
+            .then(() => { throw new Error("forced commit failure"); });
+        }
+        return query(text, ...rest);
+      };
+      return client;
+    });
+  };
+  return () => { (pool as { connect: unknown }).connect = connect; };
+}
+
 /** Seed one `executor='brain'` row directly, bypassing every gate under test. */
 export async function seedRun(
   q: pg.Client,

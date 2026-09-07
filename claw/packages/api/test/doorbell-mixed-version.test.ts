@@ -90,6 +90,9 @@ function stubDb(): SeenQuery[] {
     seen.push({ sql, params });
     if (BIND_LOOKUP.test(sql)) return boundWorkspace();
     if (/^INSERT INTO claw_tasks/.test(sql)) return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    // The receipt write CASes on the armed row the insert above just wrote, and
+    // a publisher whose receipt matches nothing refuses to publish at all.
+    if (/dispatch_compensation,publish/.test(sql)) return { rows: [], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   return seen;
@@ -337,7 +340,13 @@ test("the same flip on the pending-message drain behaves identically", async () 
       published.push({ subject, payload, msgId });
       return published.length;
     }) as typeof pendingDispatchPorts.publish;
-    db.query = (async () => ({ rows: [], rowCount: 1 })) as typeof db.query;
+    // The queue row is present and carries no identity yet, which is what this
+    // drain's hand-off reservation reads out of its own RETURNING.
+    db.query = (async (text: string, params: unknown[] = []) => (
+      /SET dispatch_task_id = COALESCE/.test(text)
+        ? { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 }
+        : { rows: [], rowCount: 1 }
+    )) as typeof db.query;
     await dispatchPendingMessage({
       sessionId: "s-1", pendingId: 42, userId: "u-1", messageId: "claw-1700000000000",
       prompt: "carry on", workspaceId: "kws_1",

@@ -98,136 +98,137 @@ const CANCEL_CLASSES: Array<[label: string, err: unknown]> = [
   ["a thrown non-Error", "publish exploded"],
 ];
 
-describe("an ambiguous A2A publish failure cancels the row and deletes nothing", { skip }, () => {
-  let harness: AdmissionCluster;
-  let app: FastifyInstance;
+interface Ctx {
+  harness: AdmissionCluster;
+  app: FastifyInstance;
+}
 
-  before(async () => {
-    harness = await startAdmissionCluster({ ADMIT_HARD_RUNS: "8" });
-    const a2a = await import("../src/routes/a2a.js");
-    app = Fastify();
-    app.addHook("onRequest", async (req) => { (req as unknown as { user: unknown }).user = CALLER; });
-    await a2a.registerA2ARoutes(app);
-    await app.ready();
-  });
-  after(async () => {
-    await app?.close();
-    await harness?.stop();
-  });
+const rpc = (ctx: Ctx, method: string, params: unknown) => ctx.app.inject({
+  method: "POST",
+  url: "/a2a",
+  headers: { "a2a-version": "1.0" },
+  payload: { jsonrpc: "2.0", id: 1, method, params },
+});
 
-  const rpc = (method: string, params: unknown) => app.inject({
-    method: "POST",
-    url: "/a2a",
-    headers: { "a2a-version": "1.0" },
-    payload: { jsonrpc: "2.0", id: 1, method, params },
-  });
+const send = (ctx: Ctx, message: unknown) =>
+  rpc(ctx, "SendMessage", { message, configuration: { returnImmediately: true } });
 
-  const send = (message: unknown) =>
-    rpc("SendMessage", { message, configuration: { returnImmediately: true } });
+const streamSend = (ctx: Ctx, message: unknown) => rpc(ctx, "SendStreamingMessage", { message });
 
-  const streamSend = (message: unknown) => rpc("SendStreamingMessage", { message });
+const invoke = (ctx: Ctx) =>
+  ctx.app.inject({ method: "POST", url: "/invoke", payload: { question: "hello" } });
 
-  const invoke = () => app.inject({ method: "POST", url: "/invoke", payload: { question: "hello" } });
+const errorOf = (raw: string) => (JSON.parse(raw) as { error?: { message?: string } }).error?.message;
 
-  const errorOf = (raw: string) => (JSON.parse(raw) as { error?: { message?: string } }).error?.message;
+const query = (ctx: Ctx, sql: string, params: unknown[] = []) =>
+  ctx.harness.app.db.db.query(sql, params);
 
-  const query = (sql: string, params: unknown[] = []) => harness.app.db.db.query(sql, params);
+const clear = async (ctx: Ctx) => {
+  await query(ctx, "DELETE FROM claw_tasks");
+  await query(ctx, "DELETE FROM claw_workspace_refs");
+  await query(ctx, "DELETE FROM claw_sessions WHERE user_id = 'a2a'");
+  published.length = 0;
+  publishFailure = null;
+};
 
-  const clear = async () => {
-    await query("DELETE FROM claw_tasks");
-    await query("DELETE FROM claw_workspace_refs");
-    await query("DELETE FROM claw_sessions WHERE user_id = 'a2a'");
-    published.length = 0;
-    publishFailure = null;
-  };
+const rowFor = async (ctx: Ctx, sessionId: string) => (await query(
+  ctx,
+  `SELECT task_id, status, origin, metadata->>'message_id' AS message_id
+     FROM claw_tasks WHERE session_id = $1`,
+  [sessionId],
+)).rows[0] as { task_id: string; status: string; origin: string; message_id: string } | undefined;
 
-  const rowFor = async (sessionId: string) => (await query(
-    `SELECT task_id, status, origin, metadata->>'message_id' AS message_id
-       FROM claw_tasks WHERE session_id = $1`,
-    [sessionId],
-  )).rows[0] as { task_id: string; status: string; origin: string; message_id: string } | undefined;
+const sessionFor = async (ctx: Ctx, sessionId: string) => (await query(
+  ctx,
+  `SELECT agent_status, context_id, parent_session_id, team_role
+     FROM claw_sessions WHERE session_id = $1`,
+  [sessionId],
+)).rows[0] as {
+  agent_status: string; context_id: string;
+  parent_session_id: string | null; team_role: string | null;
+} | undefined;
 
-  const sessionFor = async (sessionId: string) => (await query(
-    `SELECT agent_status, context_id, parent_session_id, team_role
-       FROM claw_sessions WHERE session_id = $1`,
-    [sessionId],
-  )).rows[0] as {
-    agent_status: string; context_id: string;
-    parent_session_id: string | null; team_role: string | null;
-  } | undefined;
+const heldRefs = async (ctx: Ctx, sessionId: string, taskId: string) => (await query(
+  ctx,
+  `SELECT ref_kind, ref_id FROM claw_workspace_refs
+    WHERE released_at IS NULL
+      AND ((ref_kind = 'session' AND ref_id = $1) OR (ref_kind = 'run' AND ref_id = $2))`,
+  [sessionId, taskId],
+)).rows as Array<{ ref_kind: string; ref_id: string }>;
 
-  const heldRefs = async (sessionId: string, taskId: string) => (await query(
-    `SELECT ref_kind, ref_id FROM claw_workspace_refs
-      WHERE released_at IS NULL
-        AND ((ref_kind = 'session' AND ref_id = $1) OR (ref_kind = 'run' AND ref_id = $2))`,
-    [sessionId, taskId],
-  )).rows as Array<{ ref_kind: string; ref_id: string }>;
+/** A caller-owned target that already has a parent and a team role to lose. */
+const arrangeParented = async (ctx: Ctx, err: unknown) => {
+  await clear(ctx);
+  await query(
+    ctx,
+    `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status)
+     VALUES ($1,'parent','a2a','claw','idle')`,
+    [PARENT],
+  );
+  await query(
+    ctx,
+    `INSERT INTO claw_sessions
+       (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id,
+        parent_session_id, team_role)
+     VALUES ($1,'parented','a2a','claw','input_required','ctx-keep',$2,$3,'researcher')`,
+    [EXISTING, `user:${CALLER.userId}`, PARENT],
+  );
+  publishFailure = { subject: TASK_SUBJECT, err };
+};
 
-  const seedParented = async () => {
-    await query(
-      `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status)
-       VALUES ($1,'parent','a2a','claw','idle')`,
-      [PARENT],
-    );
-    await query(
-      `INSERT INTO claw_sessions
-         (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id,
-          parent_session_id, team_role)
-       VALUES ($1,'parented','a2a','claw','input_required','ctx-keep',$2,$3,'researcher')`,
-      [EXISTING, `user:${CALLER.userId}`, PARENT],
-    );
-  };
+const assertCancelled = async (ctx: Ctx, sessionId: string, taskId: string) => {
+  assert.deepEqual(await heldRefs(ctx, sessionId, taskId), [], "no workspace reference is left held");
+  assert.equal(publishedTo(TASK_SUBJECT).length, 0, "the execute publish is the one that failed");
+  const cancels = publishedTo(`tasks.${sessionId}.cancel`);
+  assert.equal(cancels.length, 1, "a possibly-live execution is told to stop");
+  assert.deepEqual(JSON.parse(cancels[0].payload), { type: "cancel", session_id: sessionId });
+};
 
-  const arrangeParented = async (err: unknown) => {
-    await clear();
-    await seedParented();
-    publishFailure = { subject: TASK_SUBJECT, err };
-  };
+const assertParentedTargetKept = async (ctx: Ctx, messageId: string) => {
+  const row = await rowFor(ctx, EXISTING);
+  assert.ok(row, "the counted row is not deleted");
+  assert.equal(row.status, "cancelling", "cancelling, not cancelled and not left preparing");
+  assert.equal(row.origin, "a2a");
+  assert.equal(row.message_id, messageId, "the execution identity survives");
 
-  const assertCancelled = async (sessionId: string, taskId: string) => {
-    assert.deepEqual(await heldRefs(sessionId, taskId), [], "no workspace reference is left held");
-    assert.equal(publishedTo(TASK_SUBJECT).length, 0, "the execute publish is the one that failed");
-    const cancels = publishedTo(`tasks.${sessionId}.cancel`);
-    assert.equal(cancels.length, 1, "a possibly-live execution is told to stop");
-    assert.deepEqual(JSON.parse(cancels[0].payload), { type: "cancel", session_id: sessionId });
-  };
+  const session = await sessionFor(ctx, EXISTING);
+  assert.ok(session, "the session is not deleted");
+  assert.equal(session.agent_status, "pending", "the send's own write stands; nothing is restored");
+  assert.equal(session.context_id, "ctx-keep");
+  assert.equal(session.parent_session_id, PARENT, "a non-null parent link survives");
+  assert.equal(session.team_role, "researcher");
 
-  const assertParentedTargetKept = async (messageId: string) => {
-    const row = await rowFor(EXISTING);
-    assert.ok(row, "the counted row is not deleted");
-    assert.equal(row.status, "cancelling", "cancelling, not cancelled and not left preparing");
-    assert.equal(row.origin, "a2a");
-    assert.equal(row.message_id, messageId, "the execution identity survives");
+  await assertCancelled(ctx, EXISTING, row.task_id);
+};
 
-    const session = await sessionFor(EXISTING);
-    assert.ok(session, "the session is not deleted");
-    assert.equal(session.agent_status, "pending", "the send's own write stands; nothing is restored");
-    assert.equal(session.context_id, "ctx-keep");
-    assert.equal(session.parent_session_id, PARENT, "a non-null parent link survives");
-    assert.equal(session.team_role, "researcher");
-
-    await assertCancelled(EXISTING, row.task_id);
-  };
-
+/** `message/send`: the JSON-RPC reply carries the failure and the target survives. */
+function registerSendCases(ctx: () => Ctx): void {
   for (const [label, err] of CANCEL_CLASSES) {
     test(`${label} on message/send leaves the row cancelling and the parented session untouched`, async () => {
-      await arrangeParented(err);
+      const c = ctx();
+      await arrangeParented(c, err);
       const messageId = `m-send-${label}`;
 
-      const res = await send({ messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING });
+      const res = await send(c, { messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING });
 
       assert.equal(res.statusCode, 200);
       assert.equal(errorOf(res.body), "Failed to create task");
-      await assertParentedTargetKept(messageId);
+      await assertParentedTargetKept(c, messageId);
     });
   }
+}
 
+/** `message/stream`: the same compensation, answered without opening an SSE stream. */
+function registerStreamCases(ctx: () => Ctx): void {
   for (const [label, err] of CANCEL_CLASSES) {
     test(`${label} on message/stream cancels the row without opening a stream`, async () => {
-      await arrangeParented(err);
+      const c = ctx();
+      await arrangeParented(c, err);
       const messageId = `m-stream-${label}`;
 
-      const res = await streamSend({ messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING });
+      const res = await streamSend(
+        c, { messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING },
+      );
 
       assert.equal(res.statusCode, 500);
       assert.equal(errorOf(res.body), "Failed to create task");
@@ -235,63 +236,96 @@ describe("an ambiguous A2A publish failure cancels the row and deletes nothing",
         res.headers["content-type"]?.toString().includes("text/event-stream"), false,
         "the failure is answered over the ordinary JSON-RPC reply",
       );
-      await assertParentedTargetKept(messageId);
+      await assertParentedTargetKept(c, messageId);
     });
   }
+}
 
+/** The legacy entry, whose target is a session the request itself minted. */
+function registerLegacyInvokeCases(ctx: () => Ctx): void {
   for (const [label, err] of CANCEL_CLASSES) {
     test(`${label} on legacy invoke cancels the row and keeps the session it minted`, async () => {
-      await clear();
+      const c = ctx();
+      await clear(c);
       publishFailure = { subject: TASK_SUBJECT, err };
 
-      const res = await invoke();
+      const res = await invoke(c);
 
       assert.equal(res.statusCode, 500);
       assert.deepEqual(JSON.parse(res.body), { success: false, error: "Failed to process request" });
 
-      const rows = await query("SELECT session_id, task_id, status, origin FROM claw_tasks");
+      const rows = await query(c, "SELECT session_id, task_id, status, origin FROM claw_tasks");
       assert.equal(rows.rowCount, 1, "the counted row is not deleted");
       const row = rows.rows[0] as { session_id: string; task_id: string; status: string; origin: string };
       assert.equal(row.status, "cancelling");
       assert.equal(row.origin, "a2a");
 
-      const session = await sessionFor(row.session_id);
+      const session = await sessionFor(c, row.session_id);
       assert.ok(session, "the session the request minted is not deleted");
       assert.equal(session.agent_status, "pending");
 
-      await assertCancelled(row.session_id, row.task_id);
+      await assertCancelled(c, row.session_id, row.task_id);
     });
   }
+}
 
+/** The one refusal that proves nothing was stored, and may therefore delete. */
+function registerNoRespondersCases(ctx: () => Ctx): void {
   test("NoResponders on message/send deletes the row and restores the parented target", async () => {
-    await arrangeParented(new NatsError("no responders", ErrorCode.NoResponders));
+    const c = ctx();
+    await arrangeParented(c, new NatsError("no responders", ErrorCode.NoResponders));
     const messageId = "m-send-noresponders";
 
-    const res = await send({ messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING });
+    const res = await send(c, { messageId, role: "user", parts: [{ text: "hello" }], taskId: EXISTING });
 
     assert.equal(res.statusCode, 200);
     assert.equal(errorOf(res.body), "Failed to create task");
-    assert.equal(await rowFor(EXISTING), undefined, "a refusal that stored nothing undoes the row");
+    assert.equal(await rowFor(c, EXISTING), undefined, "a refusal that stored nothing undoes the row");
 
-    const session = await sessionFor(EXISTING);
+    const session = await sessionFor(c, EXISTING);
     assert.ok(session, "an existing target is restored, never deleted");
     assert.equal(session.agent_status, "input_required", "the pre-image is written back");
     assert.equal(session.context_id, "ctx-keep");
     assert.equal(session.parent_session_id, PARENT);
     assert.equal(session.team_role, "researcher");
-    assert.deepEqual(await heldRefs(EXISTING, ""), []);
+    assert.deepEqual(await heldRefs(c, EXISTING, ""), []);
     assert.equal(publishedTo(`tasks.${EXISTING}.cancel`).length, 0, "nothing is running to cancel");
   });
 
   test("NoResponders on legacy invoke deletes the session the request minted", async () => {
-    await clear();
-    publishFailure = { subject: TASK_SUBJECT, err: new NatsError("no responders", ErrorCode.NoResponders) };
+    const c = ctx();
+    await clear(c);
+    publishFailure = {
+      subject: TASK_SUBJECT, err: new NatsError("no responders", ErrorCode.NoResponders),
+    };
 
-    const res = await invoke();
+    const res = await invoke(c);
 
     assert.equal(res.statusCode, 500);
-    assert.equal((await query("SELECT 1 FROM claw_tasks")).rowCount, 0);
-    assert.equal((await query("SELECT 1 FROM claw_sessions WHERE user_id = 'a2a'")).rowCount, 0);
+    assert.equal((await query(c, "SELECT 1 FROM claw_tasks")).rowCount, 0);
+    assert.equal((await query(c, "SELECT 1 FROM claw_sessions WHERE user_id = 'a2a'")).rowCount, 0);
     assert.equal(published.length, 0, "the delete branch publishes no cancel");
   });
+}
+
+describe("an ambiguous A2A publish failure cancels the row and deletes nothing", { skip }, () => {
+  const ctx = {} as Ctx;
+
+  before(async () => {
+    ctx.harness = await startAdmissionCluster({ ADMIT_HARD_RUNS: "8" });
+    const a2a = await import("../src/routes/a2a.js");
+    ctx.app = Fastify();
+    ctx.app.addHook("onRequest", async (req) => { (req as unknown as { user: unknown }).user = CALLER; });
+    await a2a.registerA2ARoutes(ctx.app);
+    await ctx.app.ready();
+  });
+  after(async () => {
+    await ctx.app?.close();
+    await ctx.harness?.stop();
+  });
+
+  registerSendCases(() => ctx);
+  registerStreamCases(() => ctx);
+  registerLegacyInvokeCases(() => ctx);
+  registerNoRespondersCases(() => ctx);
 });

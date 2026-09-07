@@ -33,10 +33,9 @@ import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
 import type { ClawTaskRow } from "./types.js";
 
 /**
- * Anything that can run a statement: the pool, a pooled client, or a bare
- * `pg.Client`. The claim path takes one so a test can drive the production
- * statement inside its own transaction; replacing the `db` singleton instead
- * puts both transactions on one connection, which is no interleaving at all.
+ * Anything that can run a statement. The claim path takes one so a caller can
+ * drive it inside a transaction of its own; substituting the `db` singleton
+ * instead puts both transactions on one connection, which is no interleaving.
  */
 export interface Querier {
   query(text: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
@@ -95,13 +94,9 @@ export interface ClaimedRun {
  * Doorbell rows an incoming Brain at `version` could not run, in any
  * non-terminal state.
  *
- * The queued count alone is not the rollback precondition it looks like. A
- * successful claim moves the row to `preparing` and writes a lease, and the
- * Brain acks the doorbell immediately, so every queued-row check can read zero
- * while the run is still executing -- and a post-claim nak is an HTTP unclaim,
- * and a draining pod releases every row it was holding, so such a row becomes
- * queued again exactly when the last compatible replica goes away. A check
- * taken before those rows existed proved nothing.
+ * Counting only the queued ones reads zero while such a run is executing, and
+ * a draining pod puts its rows back exactly when the last compatible replica
+ * goes away -- so a queued-only precondition clears a rollback that is unsafe.
  */
 export async function countIncompatibleDoorbellRuns(version: number): Promise<number> {
   const r = await db.query(
@@ -120,19 +115,12 @@ type TakenRow = ClawTaskRow & { prior_status?: string; queued_since?: string | n
 /**
  * Read the soft-ceiling usage and take the row under one hold of the lock.
  *
- * The two must be the same transaction. Reading first and claiming afterwards
- * lets two connections holding one queued row each both count the fleet under
- * a ceiling of one and both claim it, and no CAS refuses them: they contend
- * for headroom, not for a row. Committing between the read and the claim has
- * the same effect, because the lock goes with the commit while the row this
- * claim adds to the executing set arrives after it.
- *
- * A caller supplying its own querier owns the transaction, and the lock with
- * it. Without a soft ceiling there is no usage to read and no lock to take.
- *
- * The queue exit is recorded through `afterCommit` for the same reason the
- * claim is inside the lock: a `COMMIT` that fails leaves the row at `queued`,
- * and a metric already emitted cannot be taken back.
+ * Both must be in one transaction: two connections each holding a different
+ * queued row contend for headroom rather than for a row, so no CAS refuses
+ * them and both claim under a ceiling of one. A caller supplying its own
+ * querier owns that transaction; without a soft ceiling there is no lock to
+ * take. The queue exit rides `afterCommit` because a failed `COMMIT` leaves the
+ * row at `queued` and an emitted metric cannot be taken back.
  */
 async function takeUnderSoftCeiling(
   taskId: string,
@@ -194,25 +182,12 @@ export async function claimRunById(
 
 const CLAIM_NEXT_ATTEMPTS = 8;
 
-/**
- * Why one candidate was passed over.
- *
- * A discriminated union rather than an optional field, so the exhaustion
- * reason is required exactly when the cause is `exhausted`: an optional field
- * would compile with it dropped, and the pull loop's poison would then be
- * unreportable.
- */
+/** A union, so the exhaustion reason is required exactly when the cause is `exhausted`. */
 export type ClaimNextSkip =
   | { cause: "exhausted"; exhaustion: "lock_contention_exhausted" | "max_retries_exceeded" }
   | { cause: "raced" | "unclaimable" | "error" | "deferred" };
 
-/**
- * What a claim-next call did besides answering.
- *
- * "No row" has three meanings and collapsing them is what makes a stalled
- * queue look idle: nothing was there, everything there was passed over, or the
- * attempt budget ran out.
- */
+/** "No row" has three meanings, and collapsing them makes a stalled queue look idle. */
 export interface ClaimNextDiagnostics {
   skipped: ClaimNextSkip[];
   outcome: "claimed" | "empty" | "all_skipped" | "retry_limit";
@@ -259,12 +234,9 @@ export async function claimNextRun(
 }
 
 /**
- * A skipped candidate's cause, split by what it says about the queue.
- *
- * `missing` and `busy` are both the queue moving under this pod -- a second
- * one won the row a microsecond earlier, or it closed meanwhile -- so they
- * share one value. Only the other two are properties of the candidate itself,
- * and only those can mean a queue that is stuck.
+ * `missing` and `busy` are both the queue moving under this pod, so they share
+ * one value; only the others are properties of the candidate, and only those
+ * can mean a queue that is stuck.
  */
 function skipCauseOf(
   claimed: "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim,
@@ -277,10 +249,9 @@ function skipCauseOf(
 }
 
 /**
- * A doorbell row records the contract it requires; a caller that implements
- * less is never offered it. Filtered server-side rather than claimed and
- * released, which would burn a `claim_count` increment on every poll of every
- * pod. A row with no key is the version-1 row it actually is.
+ * A caller that implements less than the row requires is never offered it.
+ * Filtered server-side: claiming and releasing instead would burn a
+ * `claim_count` increment on every poll of every pod.
  */
 const SEMANTICS_FITS_SQL =
   "COALESCE((metadata->>'doorbell_semantics')::int, 1) <= $SEM::int";
@@ -419,12 +390,9 @@ const HELD_CLAIM_MESSAGE: Record<HeldClaimFailureReason, string> = {
 const HELD_CLAIM_REASONS = new Set<string>(Object.keys(HELD_CLAIM_MESSAGE));
 
 /**
- * Why the holder is closing the row, when it says so.
- *
- * Absence stays the historical default. A value that is present and
- * unrecognised is refused rather than defaulted: the three reasons ask
- * opposite things of the sandbox and the delivery, and a fail is terminal, so
- * guessing one for a caller that meant another cannot be taken back.
+ * Why the holder is closing the row, when it says so. Absence keeps the
+ * historical default; a present-but-unrecognised value is refused, because the
+ * three reasons ask opposite things and a fail is terminal.
  */
 export function heldClaimReasonFrom(body: unknown): HeldClaimFailureReason | "invalid" {
   const raw = body && typeof body === "object" ? (body as { reason?: unknown }).reason : undefined;
@@ -499,9 +467,8 @@ async function takeClaim(
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
-  // The prior status is captured here because RETURNING gives the new one, and
-  // this is the only place that knows whether the claim was a queue exit: the
-  // outcomes below it are all produced after this statement already matched.
+  // RETURNING gives the new status, and this is the only place that can still
+  // tell whether the claim was a queue exit.
   const r = await q.query(
     `WITH prior AS (
        SELECT task_id, status, metadata->>'queued_since' AS queued_since
@@ -551,13 +518,9 @@ async function takeClaim(
 }
 
 /**
- * The sibling `NOT EXISTS` is a pre-check, not the guarantee.
- *
- * Under READ COMMITTED two transitions of siblings sharing one turn can each
- * see the other still `queued` and both commit, so the unique index is what
- * actually refuses the second. It surfaces as a unique violation rather than a
- * zero-row CAS, and the loser is in exactly the state `busy` describes:
- * somebody else holds the turn.
+ * The sibling `NOT EXISTS` is a pre-check, not the guarantee: under READ
+ * COMMITTED both siblings of one turn can see the other still `queued`, so the
+ * unique index refuses the second, as a violation rather than a zero-row CAS.
  */
 async function takeClaimOrBusy(
   taskId: string,
