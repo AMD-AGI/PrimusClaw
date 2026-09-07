@@ -502,3 +502,24 @@ test("§5 a report refused for skew cannot come back as new coverage", () => {
   assertIdentity(e, at(3_000));
 });
 
+test("§4 nothing is banked after the instant the run ended", () => {
+  // The settle pass pins `terminalAtDb` and the row stops accruing wall time. A
+  // report still in flight then arrives with a later read instant, and without a
+  // cap it banks the delay it was late by -- time that is not in `wall` at all.
+  const settled: RunTimeLedgerEntry = {
+    ...mergeRunTimeReport(entry(), report({ cumulativeStateMs: { executing: 20 } }), at(20)),
+    terminalAtDb: at(20),
+    settled: true,
+  };
+  assert.equal(knownOf(settled), 20);
+
+  const late = mergeRunTimeReport(settled, report({
+    attemptId: "att-1", cumulativeStateMs: { executing: 500 },
+  }), at(200));
+  assert.equal(knownOf(late), 20, "the run ended at 20ms; there is no later interval to cover");
+  assertIdentity(late, at(200));
+
+  const lateQueue = bankQueuedMs(settled, 900, at(200));
+  assert.equal(lateQueue.knownMsByState.queued, 0, "and the queued backstop is capped the same way");
+  assertIdentity(lateQueue, at(200));
+});

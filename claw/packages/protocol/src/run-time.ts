@@ -176,6 +176,16 @@ const msBetween = (fromDb: string, toDb: string): number =>
 const plusMs = (instantDb: string, ms: number): string =>
   new Date(Date.parse(instantDb) + ms).toISOString();
 
+// Wall time stops when the run does, so a step arriving after the entry was
+// settled has no interval left to cover: without this a late report banks the
+// delay it was late by, and `wall = known + unknown + unbanked` stops holding.
+function coverableMs(entry: RunTimeLedgerEntry, readAtDb: string): number {
+  const end = entry.terminalAtDb && Date.parse(entry.terminalAtDb) < Date.parse(readAtDb)
+    ? entry.terminalAtDb
+    : readAtDb;
+  return Math.max(0, msBetween(entry.lastAcceptedInstantDb, end));
+}
+
 /** What a round trip actually measured, as three numbers rather than one. */
 export function clockOffsetOf(offset: ClockOffset): {
   rttMs: number; offsetMs: number; uncertaintyMs: number;
@@ -353,7 +363,13 @@ export function mergeRunTimeReport(
   readAtDb: string,
 ): RunTimeLedgerEntry {
   if (!isCoveringReport(incoming)) return stored;
-  const budget = Math.max(0, msBetween(stored.lastAcceptedInstantDb, readAtDb));
+  const budget = coverableMs(stored, readAtDb);
+
+  // A new attempt restarts its totals at zero, which is a reset rather than a
+  // regression. Only a report that already passed the row's attempt fence
+  // reaches here, so the reset can only move the entry forward.
+  const fresh = stored.coverageSeen.attemptId !== incoming.attemptId;
+  const seen = fresh ? emptyCoverage(incoming.attemptId) : stored.coverageSeen;
 
   if (!basisAdmissible(incoming.basis)) {
     // Nothing is clamped to zero and no signed correction is applied: nothing
@@ -417,7 +433,7 @@ export function bankQueuedMs(
   queuedTotalMs: number,
   readAtDb: string,
 ): RunTimeLedgerEntry {
-  const budget = Math.max(0, msBetween(stored.lastAcceptedInstantDb, readAtDb));
+  const budget = coverableMs(stored, readAtDb);
   const outstanding = Math.max(0, Math.floor(queuedTotalMs) - stored.knownMsByState.queued);
   const take = Math.min(outstanding, budget);
   if (take === 0) return stored;
