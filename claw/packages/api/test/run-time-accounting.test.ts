@@ -160,6 +160,19 @@ async function settleAttempt(
   return res.statusCode;
 }
 
+/** The fence columns a settled attempt leaves behind, read back as they stand. */
+async function fenceOf(taskId: string): Promise<Record<string, unknown>> {
+  const row = await runRow(h, taskId);
+  return {
+    attempt_id: row.attempt_id,
+    attempt_generation: Number(row.attempt_generation),
+    heartbeat_at: row.heartbeat_at,
+    lease_expires_at: row.lease_expires_at,
+    delivery_seq: Number(row.delivery_seq),
+    delivery_count: Number(row.delivery_count),
+  };
+}
+
 /** Put the lease far enough in the past to clear the reaper's whole grace. */
 const expireLease = (taskId: string) => db.query(
   `UPDATE claw_tasks SET lease_expires_at = clock_timestamp() - INTERVAL '1 day'
@@ -812,6 +825,37 @@ test("a heartbeat racing the settle cannot open a second record for one attempt"
   const attempts = (await ledgerOf("ktsk-ackrace"))!.attempts;
   assert.equal(attempts.length, 1, "one attempt has one record, whatever arrives after it");
   assert.equal(attempts[0].endedAtDb, closedAt, "and it stays closed at the instant it ended");
+});
+
+test("a running event the row has already moved past takes no ownership", async () => {
+  // Only the pair columns were fenced on monotonicity. A delayed running event
+  // for a superseded attempt still took `attempt_id` and spent a generation, so
+  // the row named an attempt that had ended while the pair named the live one --
+  // and the live one's next heartbeat was refused for a token it did hold.
+  await seedRun(h, "ktsk-lateown", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const first = { claim_count: 0, delivery_seq: 10, delivery_count: 1 };
+  const second = { claim_count: 0, delivery_seq: 10, delivery_count: 2 };
+  await announceRunning("ktsk-lateown", "att-1", first);
+  await announceRunning("ktsk-lateown", "att-2", second);
+
+  const live = await fenceOf("ktsk-lateown");
+  assert.equal(live.attempt_id, "att-2");
+  assert.equal(live.attempt_generation, 2);
+  assert.deepEqual([live.delivery_seq, live.delivery_count], [10, 2]);
+
+  await announceRunning("ktsk-lateown", "att-1", first);
+
+  assert.deepEqual(await fenceOf("ktsk-lateown"), live,
+    "an older delivery moves neither the pair nor the attempt it belongs to");
+  assert.equal(
+    (await renew("ktsk-lateown", { attempt_id: "att-2", ...second })).statusCode, 200,
+    "and the attempt that is actually running still renews",
+  );
+  const attempts = (await ledgerOf("ktsk-lateown"))!.attempts;
+  assert.deepEqual(attempts.map((a) => a.attemptId), ["att-1", "att-2"],
+    "the late duplicate opens no third record either");
 });
 
 test("a new attempt closes the record the one before it left open", async () => {

@@ -169,10 +169,22 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
-              attempt_id          = COALESCE($5, attempt_id),
+              -- Fenced on the same pair the columns below are. A delivery the
+              -- row has already moved past is a late duplicate, and letting it
+              -- take ownership hands the run back to a superseded attempt while
+              -- the pair still names the live one -- whose next heartbeat is
+              -- then refused for presenting a token the row no longer holds.
+              attempt_id          = CASE
+                                      WHEN (delivery_seq, delivery_count)
+                                             <= ($6::bigint, $7::bigint)
+                                      THEN COALESCE($5, attempt_id)
+                                      ELSE attempt_id
+                                    END,
               attempt_generation  = CASE
                                       WHEN $5::text IS NOT NULL
                                        AND attempt_id IS DISTINCT FROM $5
+                                       AND (delivery_seq, delivery_count)
+                                             <= ($6::bigint, $7::bigint)
                                       THEN attempt_generation + 1
                                       ELSE attempt_generation
                                     END,
