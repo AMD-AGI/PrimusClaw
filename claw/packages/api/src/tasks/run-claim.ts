@@ -18,10 +18,13 @@ import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
 import { deferQueuedBySoftCeiling } from "./admission.js";
+import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
-import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
+import {
+  deadlineStampSql, requeueSojournSql, RUN_BUDGET_DEFAULT_SEC, RUN_REQUEUE_RESET_SQL,
+} from "./run-budget.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
 import type { ClawTaskRow } from "./types.js";
@@ -341,10 +344,10 @@ export async function releaseClaim(
             lease_expires_at = NULL,
             heartbeat_at = NULL,
             internal_token_hash = NULL,
-            metadata = CASE
+            metadata = ${requeueSojournSql(`CASE
                          WHEN $4::text IS NULL THEN metadata
                          ELSE metadata || jsonb_build_object('last_release', $4::text)
-                       END,
+                       END`)},
             ${RUN_REQUEUE_RESET_SQL}
       WHERE task_id = $1
         AND lease_owner = $2
@@ -448,21 +451,30 @@ async function takeClaim(
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
+  // The prior status is captured here because RETURNING gives the new one, and
+  // this is the only place that knows whether the claim was a queue exit: the
+  // outcomes below it are all produced after this statement already matched.
   const r = await q.query(
-    `UPDATE claw_tasks
+    `WITH prior AS (
+       SELECT task_id, status, metadata->>'queued_since' AS queued_since
+         FROM claw_tasks WHERE task_id = $1
+     )
+     UPDATE claw_tasks
         SET lease_owner = $2,
             lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
             heartbeat_at = NOW(),
             internal_token_hash = $4,
-            status = CASE WHEN status = 'queued' THEN 'preparing' ELSE status END,
-            started_at = COALESCE(started_at, NOW()),
+            status = CASE WHEN claw_tasks.status = 'queued' THEN 'preparing' ELSE claw_tasks.status END,
+            started_at = COALESCE(claw_tasks.started_at, NOW()),
             ${deadlineStampSql(6, 7)},
-            claim_count = COALESCE(claim_count, 0) + 1
-      WHERE task_id = $1
-        AND origin = 'chat'
-        AND metadata->>'dispatch' = 'doorbell'
-        AND status = ANY($5::text[])
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+            claim_count = COALESCE(claw_tasks.claim_count, 0) + 1
+      FROM prior
+      WHERE claw_tasks.task_id = prior.task_id
+        AND claw_tasks.task_id = $1
+        AND claw_tasks.origin = 'chat'
+        AND claw_tasks.metadata->>'dispatch' = 'doorbell'
+        AND claw_tasks.status = ANY($5::text[])
+        AND (claw_tasks.lease_expires_at IS NULL OR claw_tasks.lease_expires_at < NOW())
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks sibling
            WHERE sibling.session_id = claw_tasks.session_id
@@ -474,7 +486,7 @@ async function takeClaim(
         )
         AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$8")}
         AND ${RUN_CLAIM_FENCE_SQL}
-      RETURNING *`,
+      RETURNING claw_tasks.*, prior.status AS prior_status, prior.queued_since`,
     [
       taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE,
       RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node, doorbellSemantics,
@@ -485,7 +497,10 @@ async function takeClaim(
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }
-  const row = r.rows[0] as ClawTaskRow;
+  const row = r.rows[0] as ClawTaskRow & { prior_status?: string; queued_since?: string | null };
+  if (row.prior_status === "queued") {
+    metrics.observeQueueExit("chat", row.queued_since ?? null, "claimed");
+  }
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }

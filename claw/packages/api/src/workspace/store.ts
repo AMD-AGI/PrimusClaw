@@ -41,6 +41,7 @@ import pino from "pino";
 import { PG_INT4_MAX } from "@claw/utils";
 import { envInt, reportSettingProblem } from "../config.js";
 import { db } from "../infra/db.js";
+import { ACTIONABLE_RECEIPT_SQL } from "../tasks/chat-run.js";
 import { newWorkspaceId } from "../tasks/ids.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "./prefix.js";
 
@@ -281,12 +282,16 @@ async function getWorkspace(workspaceId: string): Promise<WorkspaceRow | null> {
  * cannot absorb, so it raises and is logged: one run or session belongs to one
  * workspace, and quietly moving the reference would be the split that index
  * exists to prevent.
+ *
+ * @returns whether the reference is now held. Reported rather than swallowed
+ *          because a caller that carries on regardless takes a workspace it has
+ *          no reference on, and then claims the write side of it.
  */
 export async function acquireRef(
   workspaceId: string,
   kind: WorkspaceRefKind,
   refId: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await db.query(
       `INSERT INTO claw_workspace_refs (workspace_id, ref_kind, ref_id)
@@ -300,8 +305,10 @@ export async function acquireRef(
         WHERE workspace_id = $1`,
       [workspaceId],
     );
+    return true;
   } catch (err) {
     logger.warn({ err, workspaceId, kind, refId }, "workspace.ref_acquire_failed");
+    return false;
   }
 }
 
@@ -358,29 +365,38 @@ export async function releaseRef(
   retentionDays: number = RETENTION_DAYS,
 ): Promise<RefRelease> {
   try {
-    const released = await db.query(
-      `UPDATE claw_workspace_refs SET released_at = NOW()
-        WHERE workspace_id = $1 AND ref_kind = $2 AND ref_id = $3 AND released_at IS NULL`,
-      [workspaceId, kind, refId],
-    );
-    await db.query(
-      `UPDATE claw_workspaces w
-          SET retention_expires_at = NOW() + ($2::int * INTERVAL '1 day'),
-              updated_at = NOW()
-        WHERE w.workspace_id = $1
-          AND (w.retention_expires_at IS NULL
-               OR w.retention_expires_at > NOW() + ($2::int * INTERVAL '1 day'))
-          AND NOT EXISTS (
-            SELECT 1 FROM claw_workspace_refs r
-             WHERE r.workspace_id = w.workspace_id AND r.released_at IS NULL
-          )`,
-      [workspaceId, retentionDays],
-    );
-    return released.rowCount ? "released" : "none_held";
+    return await releaseRefRow(workspaceId, kind, refId, retentionDays);
   } catch (err) {
     logger.warn({ err, workspaceId, kind, refId }, "workspace.ref_release_failed");
     return "failed";
   }
+}
+
+async function releaseRefRow(
+  workspaceId: string,
+  kind: WorkspaceRefKind,
+  refId: string,
+  retentionDays: number,
+): Promise<RefRelease> {
+  const released = await db.query(
+    `UPDATE claw_workspace_refs SET released_at = NOW()
+      WHERE workspace_id = $1 AND ref_kind = $2 AND ref_id = $3 AND released_at IS NULL`,
+    [workspaceId, kind, refId],
+  );
+  await db.query(
+    `UPDATE claw_workspaces w
+        SET retention_expires_at = NOW() + ($2::int * INTERVAL '1 day'),
+            updated_at = NOW()
+      WHERE w.workspace_id = $1
+        AND (w.retention_expires_at IS NULL
+             OR w.retention_expires_at > NOW() + ($2::int * INTERVAL '1 day'))
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_workspace_refs r
+           WHERE r.workspace_id = w.workspace_id AND r.released_at IS NULL
+        )`,
+    [workspaceId, retentionDays],
+  );
+  return released.rowCount ? "released" : "none_held";
 }
 
 /**
@@ -399,6 +415,12 @@ export async function releaseRef(
  * the chat turn and the DAG node have to take the same one. The DAG node took
  * none at all for as long as this lived on the chat path, so the workspace a
  * DAG run was writing could be released and collected under it.
+ *
+ * @returns the workspace, or undefined when the reference could not be taken.
+ *          A workspace id returned over a failed acquire is what let
+ *          `recordRunUse` claim the write side of files nothing recorded this
+ *          run as using, so the claim outlived every reconciler that looks for
+ *          it by reference.
  */
 export async function takeRunRef(
   sessionId: string,
@@ -409,7 +431,7 @@ export async function takeRunRef(
   const workspaceId = bound
     ?? (await ensureSessionWorkspace(sessionId, userId))?.workspace_id;
   if (!workspaceId) return undefined;
-  await acquireRef(workspaceId, "run", taskId);
+  if (!await acquireRef(workspaceId, "run", taskId)) return undefined;
   return workspaceId;
 }
 
@@ -490,6 +512,84 @@ export async function releaseRunUse(taskId: string, changed = true): Promise<voi
   }
 }
 
+/** What became of the release a caller has to be able to prove happened. */
+export type RunRelease = "released" | "none_held" | "ambiguous" | "failed";
+
+/**
+ * The same release, for a caller that has to know whether it landed.
+ *
+ * A compensation pass owes the run's resources before it may mark its receipt
+ * complete, so a failure it cannot see is a claim nothing will ever let go of.
+ * Everything else here stays best-effort; this reports.
+ *
+ * Resolved through both records that can name the workspace rather than through
+ * the live reference `releaseRunUse` reads, because either exists without the
+ * other: a reference already released leaves the writer claim with nothing to
+ * find it by, and a claim taken over a reference that was never recorded leaves
+ * no reference at all. Two workspaces answering for one run is a split nothing
+ * here may pick a side of, so it releases neither.
+ */
+export async function releaseRunUseStrict(
+  taskId: string,
+  changed: boolean,
+): Promise<RunRelease> {
+  let candidates: string[];
+  try {
+    const r = await db.query(
+      `SELECT workspace_id FROM claw_workspace_refs
+        WHERE ref_kind = 'run' AND ref_id = $1
+       UNION
+       SELECT workspace_id FROM claw_workspaces WHERE writer_run_id = $1`,
+      [taskId],
+    );
+    candidates = (r.rows as Array<{ workspace_id: string }>).map((row) => row.workspace_id);
+  } catch (err) {
+    logger.warn({ err, taskId }, "workspace.run_workspace_lookup_failed");
+    return "failed";
+  }
+  if (candidates.length === 0) return "none_held";
+  if (candidates.length > 1) {
+    logger.warn({ taskId, workspaceIds: candidates }, "workspace.run_workspace_ambiguous");
+    return "ambiguous";
+  }
+  const workspaceId = candidates[0];
+  try {
+    await releaseWriterRow(workspaceId, taskId, changed);
+    await releaseRefRow(workspaceId, "run", taskId, RETENTION_DAYS);
+  } catch (err) {
+    logger.warn({ err, taskId, workspaceId }, "workspace.run_release_failed");
+    return "failed";
+  }
+  return "released";
+}
+
+/**
+ * The candidate set of `finalizeDispatchCompensations`, over the `claw_tasks t`
+ * of the scan below.
+ *
+ * Its two remaining terms are implied by the scan rather than restated, so this
+ * is not a second copy of the receipt terms that would drift from the parser:
+ * the finalizer's owed-resource arm holds for every row joined here through a
+ * live run reference, and `ACTIONABLE_RECEIPT_SQL` already matches no state but
+ * `armed` and `terminal`.
+ *
+ * Built per call because tasks/chat-run.ts imports this module: at module
+ * evaluation the fragment can still be uninitialised.
+ */
+function finalizerOwnedSql(): string {
+  return `t.lease_owner IS NULL
+      AND t.lease_expires_at IS NULL
+      AND COALESCE(t.claim_count, 0) = 0
+      AND (
+           (${ACTIONABLE_RECEIPT_SQL})
+           OR (
+                t.metadata->'dispatch_compensation' IS NULL
+                AND t.origin = 'chat'
+                AND (t.metadata->>'dispatch' = 'fat' OR t.metadata->>'dispatch' IS NULL)
+           )
+      )`;
+}
+
 /**
  * Release the references left behind by runs that ended without releasing them.
  *
@@ -506,6 +606,12 @@ export async function releaseRunUse(taskId: string, changed = true): Promise<voi
  * Reconciling here rather than at each closer is what keeps that true for the
  * next closer somebody writes. Idempotent, and cheap enough to want no leader:
  * releaseRunUse only acts on a reference that is still held.
+ *
+ * A row the compensation finalizer owns is left to it: releasing here would let
+ * its reference go as changed, ahead of the verification that pass has to make
+ * before it may call the receipt complete. A row that pass refuses -- a receipt
+ * from a contract this deployment does not know, so outside the set below --
+ * keeps this reconciler as its reference owner.
  */
 export async function releaseRefsOfFinishedRuns(limit = 200): Promise<number> {
   try {
@@ -516,6 +622,7 @@ export async function releaseRefsOfFinishedRuns(limit = 200): Promise<number> {
         WHERE r.ref_kind = 'run'
           AND r.released_at IS NULL
           AND t.status IN ('completed','failed','cancelled')
+          AND NOT COALESCE((${finalizerOwnedSql()}), FALSE)
         LIMIT $1`,
       [limit],
     );
@@ -848,18 +955,26 @@ export async function releaseWriter(
   changed: boolean,
 ): Promise<void> {
   try {
-    await db.query(
-      `UPDATE claw_workspaces
-          SET writer_run_id     = NULL,
-              writer_expires_at = NULL,
-              version           = version + CASE WHEN $3 THEN 1 ELSE 0 END,
-              updated_at        = NOW()
-        WHERE workspace_id = $1 AND writer_run_id = $2`,
-      [workspaceId, runId, changed],
-    );
+    await releaseWriterRow(workspaceId, runId, changed);
   } catch (err) {
     logger.warn({ err, workspaceId, runId }, "workspace.writer_release_failed");
   }
+}
+
+async function releaseWriterRow(
+  workspaceId: string,
+  runId: string,
+  changed: boolean,
+): Promise<void> {
+  await db.query(
+    `UPDATE claw_workspaces
+        SET writer_run_id     = NULL,
+            writer_expires_at = NULL,
+            version           = version + CASE WHEN $3 THEN 1 ELSE 0 END,
+            updated_at        = NOW()
+      WHERE workspace_id = $1 AND writer_run_id = $2`,
+    [workspaceId, runId, changed],
+  );
 }
 
 /**

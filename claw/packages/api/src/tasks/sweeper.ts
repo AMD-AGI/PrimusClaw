@@ -34,11 +34,12 @@ import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { handleMap } from "./sandbox-stopper.js";
 import {
-  DISPATCH_RECONCILE_LEASE_SEC, RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
-  RUN_REQUEUE_RESET_SQL,
+  DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
+  RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL,
 } from "./run-budget.js";
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
+  releaseRunUseStrict,
 } from "../workspace/store.js";
 import {
   ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
@@ -379,6 +380,7 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
             lease_expires_at = NULL,
             heartbeat_at = NULL,
             internal_token_hash = NULL,
+            metadata = ${requeueSojournSql("metadata")},
             ${RUN_REQUEUE_RESET_SQL}
       WHERE status IN ('preparing','running')
         AND origin = 'chat'
@@ -465,11 +467,6 @@ function idsOf(rows: unknown[]): Array<{ task_id: string; session_id: string }> 
     task_id: (r as { task_id: string }).task_id,
     session_id: (r as { session_id: string }).session_id,
   }));
-}
-
-/** How many of these rows were leaving the queue, as opposed to execution. */
-function queuedExits(rows: unknown[]): number {
-  return rows.filter((row) => (row as { prior_status?: string }).prior_status === "queued").length;
 }
 
 interface ExpiredQueuedRow {
@@ -1083,7 +1080,14 @@ async function finalizeOneCompensation(row: FinalizableRow): Promise<boolean> {
   // A completed run's result is evidence that work changed the workspace; a
   // never-held failed or cancelled row changed nothing, and marking it changed
   // would bump the workspace version for a run that never wrote a byte.
-  await releaseRunUse(row.task_id, row.status === "completed");
+  // Strict here, unlike every other release: the receipt only reaches
+  // `complete` once the cleanup it records actually happened, so a failure or
+  // an ambiguous resolution has to leave the row for the next tick.
+  const release = await releaseRunUseStrict(row.task_id, row.status === "completed");
+  if (release === "ambiguous" || release === "failed") {
+    logger.warn({ taskId: row.task_id, release }, "sweeper.compensation_release_failed");
+    return false;
+  }
   if (await stillOwesResources(row.task_id)) {
     logger.warn({ taskId: row.task_id }, "sweeper.compensation_cleanup_incomplete");
     return false;

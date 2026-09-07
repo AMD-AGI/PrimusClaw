@@ -82,7 +82,7 @@ async function renew(body: Record<string, unknown>) {
 
 /** The lease UPDATE, as opposed to the auth lookup that precedes it. */
 function leaseUpdate() {
-  return seen.find((q) => q.sql.startsWith("UPDATE claw_tasks"))!;
+  return seen.find((q) => /UPDATE claw_tasks/.test(q.sql))!;
 }
 
 /** The second statement: the one a caller that holds nothing yet must match. */
@@ -288,7 +288,7 @@ test("a blank brain_id is refused before anything is written", async () => {
   });
 
   assert.equal(res.statusCode, 400);
-  assert.equal(seen.some((q) => q.sql.startsWith("UPDATE claw_tasks")), false);
+  assert.equal(seen.some((q) => /UPDATE claw_tasks/.test(q.sql)), false);
 });
 
 test("a database failure is retryable rather than a lease", async () => {

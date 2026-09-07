@@ -16,6 +16,7 @@ import pino from "pino";
 import {
   acquireAdmissionLock, askFromRow, decideAdmission, type AdmissionRefusal,
 } from "./admission.js";
+import { cancelUnheldFatRun } from "./chat-run.js";
 import { getTask, transitionStatus, updateTask } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
@@ -205,6 +206,13 @@ export async function cancelTask(
   // nothing to acknowledge the cancellation. That one sits in `cancelling`
   // until the sweeper closes it, which is what the sweeper's `cancelling`
   // branch is for.
+  // A chat row nothing holds has nobody to acknowledge the handshake, so the
+  // `cancelling` branch below would park it until a sweeper tick.
+  if ((task.status === "preparing" || task.status === "running")
+      && task.origin === "chat" && await cancelUnheldFatRun(task.task_id)) {
+    return { ok: true, cancelled: 1, interrupt_key: task.session_id ?? undefined };
+  }
+
   const executing = task.status === "preparing" || task.status === "running";
   const updated = await transitionStatus(
     task.task_id,

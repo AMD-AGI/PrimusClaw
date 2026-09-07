@@ -5,7 +5,7 @@ import type { FastifyInstance } from "fastify";
 import { nc, kv, sc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
-import { interruptUnstartedChatRuns } from "../tasks/chat-run.js";
+import { interruptSessionRuns } from "../tasks/chat-run.js";
 import { countIncompatibleDoorbellRuns } from "../tasks/run-claim.js";
 import {
   DOORBELL_SEMANTICS_KEY, doorbellGateOpen, doorbellInFlight, doorbellLatch,
@@ -185,7 +185,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(403).send({ ok: false, error: "access denied" });
     }
     nc.publish(interruptSubject(sessionId));
-    await interruptUnstartedChatRuns(sessionId);
+    await interruptSessionRuns(sessionId);
     return { ok: true };
   });
 

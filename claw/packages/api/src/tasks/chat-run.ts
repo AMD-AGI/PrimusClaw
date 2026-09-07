@@ -41,6 +41,7 @@ import type { RunLease } from "@claw/protocol";
 import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
 import { db } from "../infra/db.js";
+import { metrics, type QueueEntryCause } from "../infra/metrics.js";
 import { newTaskId } from "./ids.js";
 import { insertTask } from "./db.js";
 import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, type RunOrigin } from "./run-budget.js";
@@ -49,6 +50,11 @@ import { recordRunUse, releaseRunUse } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
 
 const logger = pino({ name: "chat-run" });
+
+/** Injection seam for the terminal events an interrupt has to announce. */
+export const chatRunPorts = {
+  publishSessionEvent: publishEvent,
+};
 
 // Same default the DAG expander uses: the API talking to itself, which works
 // out of the box in dev and should be set explicitly in production.
@@ -374,6 +380,15 @@ export interface OpenChatRunInput {
    */
   taskId?: string;
   /**
+   * Why this row is entering the queue.
+   *
+   * `admission` is a run held back by a soft ceiling, and is the only entry
+   * whose wait is a queue wait: a `direct` row's transit through `queued` is
+   * dispatch latency, and measuring it as a sojourn would make a bounded-waits
+   * gate pass however bad the queue was.
+   */
+  queueEntryCause?: QueueEntryCause;
+  /**
    * What a dispatch that never reports its publish outcome leaves for the
    * sweeper to finish. Absent for a caller with nothing to undo.
    */
@@ -527,6 +542,9 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
         user_id: input.userId,
         ...(input.sandboxImage ? { sandbox_image: input.sandboxImage } : {}),
         dispatch: input.dispatch,
+        ...(status === "queued" && input.queueEntryCause === "admission"
+          ? { queued_since: new Date().toISOString() }
+          : {}),
         // One spread writes both, so every doorbell row carries the version it
         // requires. The spec goes to the separate `input` column, where no
         // predicate here or in the reapers can see it.
@@ -539,6 +557,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
     // recording a workspace use for a row that was not written would leak a
     // reference nothing releases.
     if (!row) return null;
+    if (status === "queued") metrics.onQueueEntered(input.queueEntryCause ?? "direct");
     const workspaceId = input.recordWorkspaceUse === false
       ? undefined
       : await recordRunUse(input.sessionId, input.userId, taskId, input.filesWorkspaceId);
@@ -610,6 +629,12 @@ export interface CloseChatRunTarget {
   runClaim?: number;
 }
 
+interface ClosedRow {
+  task_id: string;
+  prior_status: string;
+  queued_since: string | null;
+}
+
 export async function closeChatRun(
   sessionId: string,
   messageId: string | undefined,
@@ -635,12 +660,18 @@ export async function closeChatRun(
       );
       return [];
     }
-    if (messageId) await closeDuplicateDispatchSiblings(sessionId, messageId, closed[0]);
+    for (const row of closed) {
+      if (row.prior_status === "queued") {
+        metrics.observeQueueExit("chat", row.queued_since ?? null, "chat_closed");
+      }
+    }
+    const closedIds = closed.map((row) => row.task_id);
+    if (messageId) await closeDuplicateDispatchSiblings(sessionId, messageId, closedIds[0]);
     // The run is over, so it is no longer a reason to keep the files and no
     // longer the workspace's writer. A run that failed still counts as having
     // changed it: it may have written half of what it meant to.
-    for (const taskId of closed) await releaseRunUse(taskId);
-    return closed;
+    for (const taskId of closedIds) await releaseRunUse(taskId);
+    return closedIds;
   } catch (err) {
     logger.warn({ err, sessionId, messageId, outcome }, "chat_run.close_failed");
     return [];
@@ -660,9 +691,13 @@ async function closeNamedChatRun(
   outcome: ChatRunOutcome,
   reason: string | null,
   message: string | null,
-): Promise<string[]> {
+): Promise<ClosedRow[]> {
   const r = await db.query(
-    `UPDATE claw_tasks
+    `WITH prior AS (
+       SELECT status, metadata->>'queued_since' AS queued_since
+         FROM claw_tasks WHERE task_id = $1
+     )
+     UPDATE claw_tasks
         SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
       WHERE task_id = $1
         AND session_id = $2
@@ -672,13 +707,15 @@ async function closeNamedChatRun(
              COALESCE(claim_count, 0) = $7::int
           OR ($7::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
         )
-      RETURNING task_id`,
+      RETURNING task_id,
+                (SELECT p.status FROM prior p) AS prior_status,
+                (SELECT p.queued_since FROM prior p) AS queued_since`,
     [
       target.taskId, sessionId, outcome, reason, message,
       CLOSEABLE_RUN_STATUSES, target.runClaim ?? null,
     ],
   );
-  return (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
+  return r.rows as ClosedRow[];
 }
 
 /**
@@ -695,9 +732,13 @@ async function closeUnnamedChatRun(
   outcome: ChatRunOutcome,
   reason: string | null,
   message: string | null,
-): Promise<string[]> {
+): Promise<ClosedRow[]> {
   const r = await db.query(
-    `UPDATE claw_tasks
+    `WITH prior AS (
+       SELECT task_id, status, metadata->>'queued_since' AS queued_since
+         FROM claw_tasks WHERE session_id = $1 AND origin IN ('chat','a2a')
+     )
+     UPDATE claw_tasks
         SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
       WHERE session_id = $1
         AND origin IN ('chat','a2a')
@@ -726,15 +767,18 @@ async function closeUnnamedChatRun(
             )
           )
         )
-      RETURNING task_id`,
+      RETURNING task_id,
+                (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id) AS prior_status,
+                (SELECT p.queued_since FROM prior p WHERE p.task_id = claw_tasks.task_id)
+                  AS queued_since`,
     [
       sessionId, CLOSEABLE_RUN_STATUSES, outcome, reason, message,
       messageId ?? null, GUESSABLE_RUN_STATUSES,
     ],
   );
-  const closed = (r.rows as Array<{ task_id: string }>).map((row) => row.task_id);
+  const closed = r.rows as ClosedRow[];
   if (closed.length > 1) {
-    logger.warn({ sessionId, messageId, closed }, "chat_run.close_ambiguous");
+    logger.warn({ sessionId, messageId, closed: closed.map((row) => row.task_id) }, "chat_run.close_ambiguous");
   }
   return closed;
 }
@@ -753,31 +797,46 @@ async function closeDuplicateDispatchSiblings(
   closedTaskId: string,
 ): Promise<void> {
   await db.query(
-    `UPDATE claw_tasks
+    `WITH prior AS (
+       SELECT task_id,
+              CASE WHEN status = 'queued' THEN metadata->>'queued_since' END AS queued_since,
+              status AS prior_status
+         FROM claw_tasks WHERE session_id = $1
+     )
+     UPDATE claw_tasks
         SET status = 'failed',
             failure_reason = 'duplicate_dispatch_row',
             error_message = 'a sibling row for this turn carried the run',
             completed_at = NOW(),
             metadata = jsonb_set(
-              metadata, '{dispatch_compensation}',
+              claw_tasks.metadata, '{dispatch_compensation}',
               jsonb_build_object(
                 'version', 1, 'state', 'terminal',
                 'failure_reason', to_jsonb('duplicate_dispatch_row'::text),
                 'error_message', to_jsonb('a sibling row for this turn carried the run'::text)
               )
             )
-      WHERE session_id = $1
-        AND origin = 'chat'
-        AND metadata->>'message_id' = $2
-        AND task_id <> $3
-        AND status = ANY($4::text[])
-        AND lease_owner IS NULL
-        AND lease_expires_at IS NULL
-        AND COALESCE(claim_count, 0) = 0
+      FROM prior
+      WHERE claw_tasks.session_id = $1
+        AND claw_tasks.origin = 'chat'
+        AND prior.task_id = claw_tasks.task_id
+        AND claw_tasks.metadata->>'message_id' = $2
+        AND claw_tasks.task_id <> $3
+        AND claw_tasks.status = ANY($4::text[])
+        AND claw_tasks.lease_owner IS NULL
+        AND claw_tasks.lease_expires_at IS NULL
+        AND COALESCE(claw_tasks.claim_count, 0) = 0
         AND NOT (${UNSUPPORTED_RECEIPT_SQL})
-        AND (${noDeliveryInFlightSql("$5", "$6")})`,
+        AND (${noDeliveryInFlightSql("$5", "$6")})
+      RETURNING prior.prior_status, prior.queued_since`,
     [sessionId, messageId, closedTaskId, CLOSEABLE_RUN_STATUSES, RUN_FAT_PREPARING_RECONCILE, false],
-  ).catch((err) => {
+  ).then((r) => {
+    for (const row of r.rows as Array<{ prior_status: string; queued_since: string | null }>) {
+      if (row.prior_status === "queued") {
+        metrics.observeQueueExit("chat", row.queued_since ?? null, "duplicate_closed");
+      }
+    }
+  }).catch((err) => {
     logger.warn({ err, sessionId, messageId }, "chat_run.duplicate_sibling_close_failed");
   });
 }
@@ -1012,7 +1071,8 @@ export async function failChatRunDispatch(
     // the instant `insertTask` commits, so claim-next can be running the turn
     // by the time any later step fails. A holder settles its own row.
     const r = await db.query(
-      `UPDATE claw_tasks
+      `WITH prior AS (SELECT status FROM claw_tasks WHERE task_id = $1)
+       UPDATE claw_tasks
           SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
               failure_reason = ${SETTLED_REASON_SQL},
               error_message = $3,
@@ -1027,7 +1087,7 @@ export async function failChatRunDispatch(
                 )
               )
         WHERE ${unheldOpenRowSql("$1", "$4", "$5", "$6", "$7")}
-        RETURNING task_id, session_id, status`,
+        RETURNING task_id, session_id, status, (SELECT p.status FROM prior p) AS prior_status`,
       [
         taskId, failureReason, message, statuses, observed,
         opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
@@ -1037,6 +1097,9 @@ export async function failChatRunDispatch(
     // releasing a workspace or altering a session here would act on a row this
     // call did not establish anything about.
     if (!r.rowCount) return await verdictForUnmatchedRow(taskId, statuses);
+    if ((r.rows[0] as { prior_status?: string }).prior_status === "queued") {
+      metrics.onQueueExited("dispatch_failed");
+    }
     // Reached only when the row was still unheld, so nothing ever executed and
     // the workspace is exactly as the run found it.
     await releaseRunUse(taskId, false);
@@ -1121,10 +1184,17 @@ const SETTLED_REASON_SQL =
  * lost, and the run carries on with nothing recording it.
  */
 export async function interruptUnstartedChatRuns(sessionId: string): Promise<number> {
-  let rows: Array<{ task_id: string; message_id: string | null; user_id: string | null; prompt: string | null }>;
+  let rows: Array<{
+    task_id: string; message_id: string | null; user_id: string | null; prompt: string | null;
+    prior_status: string; queued_since: string | null;
+  }>;
   try {
     const r = await db.query(
-      `UPDATE claw_tasks
+      `WITH prior AS (
+         SELECT task_id, status, metadata->>'queued_since' AS queued_since
+           FROM claw_tasks WHERE session_id = $1 AND origin = 'chat'
+       )
+       UPDATE claw_tasks
           SET status = 'cancelled',
               failure_reason = 'cancelled',
               error_message = 'interrupted before a worker claimed the run',
@@ -1138,10 +1208,19 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
           )
         RETURNING task_id, prompt,
                   metadata->>'message_id' AS message_id,
-                  COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
+                  COALESCE(metadata->>'user_id', input->>'user_id') AS user_id,
+                  (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id)
+                    AS prior_status,
+                  (SELECT p.queued_since FROM prior p WHERE p.task_id = claw_tasks.task_id)
+                    AS queued_since`,
       [sessionId],
     );
     rows = r.rows as typeof rows;
+    for (const row of rows) {
+      if (row.prior_status === "queued") {
+        metrics.observeQueueExit("chat", row.queued_since, "cancelled");
+      }
+    }
   } catch (err) {
     logger.warn({ err, sessionId }, "chat_run.interrupt_unstarted_failed");
     return 0;
@@ -1173,6 +1252,99 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
     );
   }
   return rows.length;
+}
+
+/**
+ * Everything a Stop must reach durably on this session.
+ *
+ * The doorbell half is unchanged. The fat half is what a Stop could not reach
+ * at all: a fat row sits at `preparing` with null holder columns for the whole
+ * of delivery, so `cancelTask`'s status-only guess moved it to `cancelling`
+ * and nothing reaped it from there -- the stale-task reaper skips chat, the
+ * lost-lease reaper wants a lease this row never had, and the request path's
+ * own state list excludes `cancelling`. The row and its session gate wedged
+ * for the life of the deployment.
+ *
+ * Holder evidence is read in the statement that writes the new status, and it
+ * is *current* evidence rather than the durable kind the compensation passes
+ * use: a Stop asks whether a worker holds this row now. A positive claim count
+ * is deliberately absent from that question -- it records that somebody once
+ * held the row, and a requeued row carries one while being held by nobody.
+ */
+export async function interruptSessionRuns(sessionId: string): Promise<number> {
+  const cancelled = await interruptUnstartedChatRuns(sessionId);
+  return cancelled + await cancelUnheldFatRuns(sessionId);
+}
+
+/**
+ * Terminalize the fat rows on this session that no worker holds.
+ *
+ * Held rows keep today's `cancelling` handshake and their existing reapers.
+ * While no arm of the shared guard holds, every fat row reads as held, so this
+ * reproduces today's transition exactly.
+ */
+async function cancelUnheldFatRuns(sessionId: string): Promise<number> {
+  return cancelUnheldFat("session_id = $1", sessionId);
+}
+
+/**
+ * The same terminalization for one named row, for the cancel that names a task
+ * rather than a session.
+ */
+export async function cancelUnheldFatRun(taskId: string): Promise<boolean> {
+  return (await cancelUnheldFat("task_id = $1", taskId)) > 0;
+}
+
+async function cancelUnheldFat(scope: string, scopeValue: string): Promise<number> {
+  const held = `(
+    lease_owner IS NOT NULL
+    OR lease_expires_at IS NOT NULL
+    OR (status IN ('preparing','running') AND NOT (${noDeliveryInFlightSql("$2", "$3")}))
+  )`;
+  try {
+    const r = await db.query(
+      `WITH prior AS (
+         SELECT task_id, status FROM claw_tasks WHERE ${scope} AND origin = 'chat'
+       )
+       UPDATE claw_tasks
+          SET status = CASE WHEN ${held} THEN 'cancelling' ELSE 'cancelled' END,
+              failure_reason = CASE WHEN ${held} THEN failure_reason
+                                    ELSE 'cancelled_before_dispatch_confirmed' END,
+              error_message = CASE WHEN ${held} THEN error_message
+                                   ELSE $4::text END,
+              completed_at = CASE WHEN ${held} THEN completed_at ELSE NOW() END,
+              metadata = CASE
+                WHEN ${held} THEN metadata
+                ELSE jsonb_set(
+                  metadata, '{dispatch_compensation}',
+                  jsonb_build_object(
+                    'version', 1, 'state', 'terminal',
+                    'failure_reason', to_jsonb('cancelled_before_dispatch_confirmed'::text),
+                    'error_message', to_jsonb($4::text)
+                  )
+                )
+              END
+        WHERE ${scope}
+          AND origin = 'chat'
+          AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+          AND status IN ('preparing','running')
+        RETURNING task_id, status,
+                  (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id) AS prior_status`,
+      [
+        scopeValue, RUN_FAT_PREPARING_RECONCILE, false,
+        "the user stopped this turn before any worker took a lease on it",
+      ],
+    );
+    const rows = r.rows as Array<{ task_id: string; status: string; prior_status?: string }>;
+    const terminal = rows.filter((row) => row.status === "cancelled");
+    const leftQueue = rows.filter((row) => row.prior_status === "queued").length;
+    if (leftQueue) metrics.onQueueExited("cancelled", leftQueue);
+    for (const row of terminal) await releaseRunUse(row.task_id, false);
+    return terminal.length;
+  } catch (err) {
+    logger.warn({ err, scope: scopeValue }, "chat_run.cancel_unheld_fat_failed");
+    return 0;
+  }
 }
 
 /**
@@ -1298,12 +1470,12 @@ async function announceInterruptedUnstarted(
     ...event,
   });
   try {
-    await publishEvent(sessionId, of({
+    await chatRunPorts.publishSessionEvent(sessionId, of({
       type: "AssistantMessage",
       data: { content: [{ type: "text", text: finalText }] },
     }));
-    await publishEvent(sessionId, of({ type: "ResultMessage" }));
-    await publishEvent(sessionId, of({
+    await chatRunPorts.publishSessionEvent(sessionId, of({ type: "ResultMessage" }));
+    await chatRunPorts.publishSessionEvent(sessionId, of({
       type: "exec_complete",
       user_id: row.user_id || "default",
       prompt: row.prompt ?? "",

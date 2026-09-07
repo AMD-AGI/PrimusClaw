@@ -42,7 +42,7 @@ after(async () => {
 function stubClaimable(): void {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks")) {
+    if (/UPDATE claw_tasks/.test(sql)) {
       return {
         rows: [{
           task_id: "ktsk_1",
@@ -132,7 +132,7 @@ test("a missing run is 404", async () => {
 test("a held lease is 409", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks")) return { rows: [], rowCount: 0 };
+    if (/UPDATE claw_tasks/.test(sql)) return { rows: [], rowCount: 0 };
     return { rows: [{ status: "preparing", lease_expires_at: "2099-01-01" }], rowCount: 1 };
   }) as typeof db.query;
   const res = await app.inject({
@@ -147,7 +147,7 @@ test("a held lease is 409", async () => {
 test("a row that cannot be hydrated is 422", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("lease_owner")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("lease_owner")) {
       return {
         rows: [{
           task_id: "ktsk_1",
@@ -206,7 +206,7 @@ test("fail-claim by a non-holder is 409", async () => {
 test("fail-claim by the holder ends the row", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("origin = 'chat'")) {
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -225,7 +225,7 @@ test("fail-claim can mark a doorbell term as claim_abandoned", async () => {
   let reason: unknown;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("origin = 'chat'")) {
       reason = params[2];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
@@ -245,7 +245,7 @@ test("fail-claim can mark an unbound claimed run as workspace_unbound", async ()
   let reason: unknown;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("origin = 'chat'")) {
       reason = params[2];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
@@ -265,7 +265,7 @@ test("fail-claim ignores an unknown reason and keeps session_deleted", async () 
   let reason: unknown;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("origin = 'chat'")) {
       reason = params[2];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
@@ -296,7 +296,7 @@ test("exhausted claims are 422 max_retries_exceeded", async () => {
   runClaimPorts.publishSessionEvent = async () => {};
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("claim_count")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("claim_count")) {
       return {
         rows: [{
           task_id: "ktsk_1",

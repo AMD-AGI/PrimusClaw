@@ -272,7 +272,7 @@ test("too many claims fail the row as max_retries_exceeded", async () => {
       () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
     ]);
     const taken = await claimRunById("ktsk_1", "brain-7");
-    assert.ok(seen.some((q) => /claim_count = COALESCE\(claim_count, 0\) \+ 1/.test(q.sql)));
+    assert.ok(seen.some((q) => /claim_count = COALESCE\(claw_tasks\.claim_count, 0\) \+ 1/.test(q.sql)));
     // The reason is a bind parameter now: the poison guard reports
     // lock_contention_exhausted when the last holder said it was waiting on a
     // lock, and max_retries_exceeded otherwise.

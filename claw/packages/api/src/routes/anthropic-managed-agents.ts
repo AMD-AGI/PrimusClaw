@@ -30,7 +30,7 @@ import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { interruptUnstartedChatRuns } from "../tasks/chat-run.js";
+import { interruptSessionRuns } from "../tasks/chat-run.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { createSessionSubscriptionReady, sanitizeSessionEvent } from "../events/store.js";
 import { nc } from "../infra/nats.js";
@@ -947,7 +947,7 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!existing || existing.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
 
     try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort */ }
-    await interruptUnstartedChatRuns(sessionId);
+    await interruptSessionRuns(sessionId);
     await db.query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
     await db.query("UPDATE claw_sessions SET status = 'archived', updated_at = NOW() WHERE session_id = $1", [sessionId]);
     const updated = (await db.query("SELECT * FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0];
@@ -1105,7 +1105,7 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       )).rows[0];
       if (!row || row.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
       try { nc.publish(interruptSubject(sessionId)); } catch { /* best effort, mirrors routes/sessions.ts */ }
-      await interruptUnstartedChatRuns(sessionId);
+      await interruptSessionRuns(sessionId);
       const evt = { id: `evt_${Date.now()}`, type: "user.interrupt", processed_at: new Date().toISOString() };
       return reply.send({ data: [evt] });
     }

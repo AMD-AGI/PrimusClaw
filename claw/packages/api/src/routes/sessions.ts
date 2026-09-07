@@ -11,7 +11,7 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
-  forceIdleAfterInterrupt, interruptUnstartedChatRuns, releaseSessionGateForTurn, takeSessionGate,
+  forceIdleAfterInterrupt, interruptSessionRuns, releaseSessionGateForTurn, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { nc, kv } from "../infra/nats.js";
 import { getUser } from "../auth/middleware.js";
@@ -1247,7 +1247,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(403).send({ ok: false, error: "access denied" });
       }
       try { nc.publish(interruptSubject(sessionId)); } catch { /* ignore publish errors */ }
-      await interruptUnstartedChatRuns(sessionId);
+      await interruptSessionRuns(sessionId);
       // If Brain is running, set a timeout to force idle if exec_complete
       // doesn't arrive within 30s (e.g. Brain stuck in a2a_call HTTP fetch).
       if (row.agent_status === "running") {

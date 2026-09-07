@@ -12,7 +12,9 @@ import {
 } from "@claw/protocol";
 import pino from "pino";
 
-import { metrics, type DispatchHeldCause, type DispatchPath } from "../infra/metrics.js";
+import {
+  metrics, type DispatchHeldCause, type DispatchPath, type QueueEntryCause,
+} from "../infra/metrics.js";
 
 import {
   decideAdmission, envAdmitLimits, hardLimitAfterInsert, sessionTreeShape,
@@ -41,6 +43,8 @@ export interface HandOffInput {
   path?: DispatchPath;
   /** The row id a durable handoff was already reserved under, when one was. */
   taskId?: string;
+  /** Whether a soft ceiling is what put this row on the queue. */
+  queueEntryCause?: QueueEntryCause;
   task: Record<string, unknown>;
   sessionId: string;
   userId: string;
@@ -119,6 +123,7 @@ async function openAdmittedRun(
   return await openRun({
     dispatch: "doorbell",
     taskId: input.taskId,
+    queueEntryCause: input.queueEntryCause ?? "direct",
     // What this dispatch owes if it never reports its publish outcome. Both
     // hand-off callers dispatch into a session that already exists, so the
     // cleanup is to hand its gate back rather than to delete it.
@@ -194,7 +199,13 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   const opened = await withOwnedAdmissionLock(async (client) => {
     const admission = await (input.admit ?? decideAdmission)(ask, client);
     if (admission.kind === "reject") return { admission } as const;
-    return { admission, run: await openAdmittedRun(input) } as const;
+    return {
+      admission,
+      run: await openAdmittedRun({
+        ...input,
+        queueEntryCause: admission.kind === "queue" ? "admission" : "direct",
+      }),
+    } as const;
   });
   if (opened.admission.kind === "reject") {
     return { kind: "rejected", reason: opened.admission.reason };
