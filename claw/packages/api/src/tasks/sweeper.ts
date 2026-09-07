@@ -494,6 +494,7 @@ async function announceRunFailure(
     await sweeperPorts.publishSessionEvent(row.session_id, of({ type: "ResultMessage" }));
     await sweeperPorts.publishSessionEvent(row.session_id, of({
       type: "exec_complete",
+      completion_source: "sweeper",
       user_id: row.user_id ?? "default",
       prompt: row.prompt ?? "",
       final_text: finalText,

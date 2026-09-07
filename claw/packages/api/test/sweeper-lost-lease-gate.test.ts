@@ -329,6 +329,7 @@ test("a reaped worker_lost chat run announces the terminal trio, carrying prompt
   const done = events[2];
   assert.equal(done.failed, true);
   assert.equal(done.failure_reason, "worker_lost");
+  assert.equal(done.completion_source, "sweeper");
   assert.equal(done.message_id, "claw-1");
   assert.equal(done.user_id, "u-1");
   assert.equal(done.prompt, "optimise the kernel");
