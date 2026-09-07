@@ -158,6 +158,7 @@ async function sweepRetention(
   entry: { value: Uint8Array; revision: number },
   info: HandsKvEntry,
   targets: Map<string, RegisteredSandbox>,
+  seenIdentities: Set<string>,
 ): Promise<boolean> {
   const held = sandboxEntryFrom(info);
   if (!held) {
@@ -165,7 +166,13 @@ async function sweepRetention(
     return false;
   }
   const sessionId = sessionIdFromHandsKey(key);
-  targets.set(key, { sessionId, entry: held });
+  // Under the same physical identity as every other target: a retention names
+  // its own key and no session, so keying by it would give a container already
+  // reached through a session binding or a DAG handle a second roster slot and
+  // a second ping a sweep.
+  const identity = sandboxRegistryKey(held);
+  seenIdentities.add(identity);
+  if (!targets.has(identity)) targets.set(identity, { sessionId, entry: held });
 
   const inst = instanceFromEntry(sessionId, info as never);
   const live = inst
@@ -995,7 +1002,7 @@ async function collectTargets(
         // running, idle and unobtainable answers -- never probed for a count,
         // never marked idle, never destroyed or evicted on a failed ping.
         if (isRetentionEntry(info)) {
-          if (!await sweepRetention(deps, key, e, info, targets)) complete = false;
+          if (!await sweepRetention(deps, key, e, info, targets, seenIdentities)) complete = false;
           continue;
         }
         // Post-task idle reuse handle: keep it for reuse but never ping it, so

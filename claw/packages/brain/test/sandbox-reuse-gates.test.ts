@@ -710,3 +710,35 @@ test("a binding naming no endpoint is refused rather than retained under an addr
   assert.deepEqual(destroyed, [], "nothing was destroyed on the way out");
   assert.deepEqual(retained, [], "and nothing was retained under an unresolvable key");
 });
+
+test("reuse is refused while the fleet is uncounted, and registers nothing", async () => {
+  // Reuse makes no admission claim -- the container is already in the fleet --
+  // but it does register a ping target, and a target this replica serves while
+  // its roster does not hold it is the ceiling enforced after the fact rather
+  // than before. Provisioning is refused in the same window, so reuse falling
+  // through to it would only meet the same answer one pod later.
+  const {
+    SandboxCapacityRefused, bindAdmission, markCensusReconciled,
+  } = await import("../src/sandbox/admission.js");
+  const { registered } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const rosterKv = {
+    async get() { return null; },
+    async create() { return 1; },
+    async update() { return 1; },
+  } as unknown as KV;
+
+  await bindAdmission(rosterKv, { ceiling: 8, reconciliationReserve: 2 });
+  try {
+    await assert.rejects(() => tryReuseSessionSandbox(a), SandboxCapacityRefused);
+    assert.deepEqual(registered, [], "nothing is pinged on the strength of an uncounted fleet");
+
+    markCensusReconciled();
+    assert.ok(await tryReuseSessionSandbox(a), "and reuse resumes once a sweep has counted it");
+    assert.deepEqual(registeredIds(registered), ["s-1"]);
+  } finally {
+    // A ceiling of zero binds no roster, which is this module's off state.
+    await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
+  }
+});

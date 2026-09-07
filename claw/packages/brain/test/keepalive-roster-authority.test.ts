@@ -21,7 +21,8 @@ import {
   registerSandbox, resetBackgroundWorkStateForTest, runKeepaliveTickForTest, unregisterSandbox,
 } from "../src/sandbox/keepalive.js";
 import {
-  SandboxCapacityRefused, admitSandbox, bindAdmission, latchRosterStale,
+  SandboxCapacityRefused, admitSandbox, assertFleetCensused, bindAdmission,
+  latchRosterStale,
 } from "../src/sandbox/admission.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { rosterStore } from "../src/sandbox/roster-store.js";
@@ -84,8 +85,10 @@ beforeEach(() => {
   resetBackgroundWorkStateForTest();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      async exec(inst: { id: string }) {
-        pinged.push(inst.id);
+      // Only the keepalive's own refresh counts as a ping: a retention's
+      // live-work read reaches the container through the same exec channel.
+      async exec(inst: { id: string }, cmd: string) {
+        if (cmd.includes("keepalive_ts")) pinged.push(inst.id);
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     } as unknown as SandboxProvider,
@@ -182,4 +185,43 @@ test("a reconciliation that failed serves what it admitted and refuses the rest"
 
   assert.deepEqual(pinged, ["wl-admitted"],
     "the admitted target keeps its refresh; the unadmitted one is not served");
+});
+
+test("a retained container already holding a slot does not take a second one", async () => {
+  // A retention names its own key and no session, so keying the target by that
+  // key gives a container reached through a session binding -- or a DAG handle
+  // -- a second roster slot and a second ping a sweep, against a ceiling whose
+  // deferral count every other handle's refresh gap is proven from.
+  kv.seed("hands.sess-live", entry("wl-both"));
+  kv.seed("hands.retained-XYZ", entry("wl-both", {
+    protected: true, reason: "protected", detail: "live_work_present",
+    keepalive: false, idleSince: 0,
+  }));
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => 1,
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  const held = roster()!.entries.filter((e) => e.identity?.includes("wl-both"));
+  assert.equal(held.length, 1, `one sandbox, one slot: ${JSON.stringify(roster()!.entries)}`);
+  assert.deepEqual(pinged, ["wl-both"], "and pinged once, not once per logical name");
+});
+
+test("reusing an existing sandbox is refused while the fleet is uncounted", async () => {
+  // Reuse makes no claim -- the container is already in the fleet -- but it
+  // does make this replica ping it, and a target served by a replica whose
+  // roster does not hold it is the ceiling enforced after the fact.
+  kv.seed("hands.sess-elsewhere", entry("wl-elsewhere"));
+  await bindAdmission(kv, CAPACITY);
+
+  assert.throws(() => assertFleetCensused("sess-reusing"), SandboxCapacityRefused);
+
+  await runKeepaliveTickForTest({
+    kv, countActiveShells: async () => 1, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.doesNotThrow(() => assertFleetCensused("sess-reusing"),
+    "and allowed once a sweep has reconciled the fleet onto the roster");
 });

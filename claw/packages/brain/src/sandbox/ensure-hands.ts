@@ -57,7 +57,9 @@ import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
-import { admitSandbox, type AdmissionHold } from "./admission.js";
+import {
+  admitSandbox, assertFleetCensused, type AdmissionHold,
+} from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
 
 const logger = pino({ name: "ensure-hands" });
@@ -747,6 +749,11 @@ async function acceptExistingSandbox(
   // no markers needs no write at all -- the entry that passed the gate is
   // already the entry we want.
   if (!await clearIdleMarkers(kv, sessionId, info, identity, binding)) return null;
+  // Before the local registration, which is what makes this replica ping it:
+  // provisioning is not the only way a ping target is taken on, and a reuse
+  // admitted against an uncounted fleet is the same unadmitted target by a
+  // path that never claims a slot.
+  assertFleetCensused(sessionId);
   reuseEffects.registerSandbox(sessionId, identity);
   return { handsUrl: info.handsUrl, created: false, token: info.token, identity };
 }

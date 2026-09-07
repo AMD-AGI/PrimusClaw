@@ -155,6 +155,28 @@ export function markCensusReconciled(): void {
   censusReconciled = true;
 }
 
+/**
+ * Refuse to take on a ping target while the fleet is uncounted.
+ *
+ * Both paths that produce one go through here. Reusing an existing sandbox
+ * makes no claim -- the container is already in the fleet -- but it does make
+ * this replica ping it, and a target served by a replica whose roster does not
+ * hold it is the ceiling being enforced after the fact. The refusal lasts only
+ * until the first sweep, which the boot path awaits.
+ *
+ * @throws SandboxCapacityRefused where a roster is bound and no census has been
+ * reconciled onto it yet.
+ */
+export function assertFleetCensused(sessionId: string): void {
+  if (!roster || censusReconciled) return;
+  logger.warn({ sessionId }, "admission.census_pending");
+  throw new SandboxCapacityRefused(
+    "sandbox admission refused: the keepalive roster has not yet been reconciled "
+    + "against a census of the running fleet, so a target taken on now would be "
+    + "served against a count that omits every sandbox this replica did not create",
+  );
+}
+
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
 export class SandboxCapacityRefused extends Error {}
 
@@ -187,13 +209,7 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
-  if (!censusReconciled) {
-    throw new SandboxCapacityRefused(
-      "sandbox admission refused: the keepalive roster has not yet been reconciled "
-      + "against a census of the running fleet, so a claim would be checked against "
-      + "a count that omits every sandbox this replica did not create",
-    );
-  }
+  assertFleetCensused(sessionId);
   if (localStaleLatch) {
     throw new SandboxCapacityRefused(
       "sandbox admission refused: this replica could not reconcile the keepalive "
