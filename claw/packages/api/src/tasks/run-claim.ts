@@ -16,13 +16,14 @@ import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
 import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
+import { settleRunTime, type RunSettlement } from "./run-time-ledger.js";
 import type { ClawTaskRow } from "./types.js";
 
 const logger = pino({ name: "run-claim" });
@@ -230,8 +231,9 @@ export async function releaseClaim(
   brainId: string,
   claimCount?: number,
   reason?: string,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
+  return settleAndTransition(taskId, settlement, (query) => query(
     `UPDATE claw_tasks
         SET status = 'queued',
             lease_owner = NULL,
@@ -249,9 +251,40 @@ export async function releaseClaim(
         AND ($3::int IS NULL OR claim_count = $3)
       RETURNING task_id`,
     [taskId, brainId, claimCount ?? null, reason ?? null],
-  );
-  return (r.rowCount ?? 0) > 0;
+  ));
 }
+
+/**
+ * Settle the run's time and move the row, as one transaction.
+ *
+ * Rolled back whole when the transition's own fence matches no row: committing
+ * the merge while the release fails is how a superseded attempt's final report
+ * lands in a ledger that now belongs to somebody else.
+ */
+async function settleAndTransition(
+  taskId: string,
+  settlement: RunSettlement | undefined,
+  transition: (query: Querier) => Promise<{ rowCount: number | null }>,
+): Promise<boolean> {
+  if (!settlement) {
+    const r = await transition(db.query);
+    return (r.rowCount ?? 0) > 0;
+  }
+  try {
+    return await inTransaction(async (query) => {
+      await settleRunTime(query, taskId, settlement);
+      const r = await transition(query);
+      if ((r.rowCount ?? 0) === 0) throw new StaleTransition();
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
+}
+
+/** The transition's fence matched nothing, so its whole transaction is void. */
+class StaleTransition extends Error {}
 
 /**
  * Why the holder is ending a claim instead of putting the row back.
@@ -293,8 +326,9 @@ export async function failHeldClaim(
   brainId: string,
   reason: HeldClaimFailureReason = "session_deleted",
   claimCount?: number,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
+  const closed = await settleAndTransition(taskId, settlement, (query) => query(
     `UPDATE claw_tasks
         SET status = 'failed',
             failure_reason = $3,
@@ -311,8 +345,8 @@ export async function failHeldClaim(
         AND ($5::int IS NULL OR claim_count = $5)
       RETURNING task_id`,
     [taskId, brainId, reason, HELD_CLAIM_MESSAGE[reason], claimCount ?? null],
-  );
-  if ((r.rowCount ?? 0) === 0) return false;
+  ));
+  if (!closed) return false;
   await releaseRunUse(taskId, false);
   return true;
 }
@@ -355,7 +389,13 @@ async function takeClaim(
             status = CASE WHEN status = 'queued' THEN 'preparing' ELSE status END,
             started_at = COALESCE(started_at, NOW()),
             ${deadlineStampSql(6, 7)},
-            claim_count = COALESCE(claim_count, 0) + 1
+            claim_count = COALESCE(claim_count, 0) + 1,
+            -- One more SET in the statement that already rotates the row's
+            -- internal token at exactly this boundary: every claim, a
+            -- contention-only one included, invalidates the previous attempt's
+            -- token, which closes the window the status guard leaves open when
+            -- a claim restores the row to preparing under the same pod name.
+            attempt_id = NULL
       WHERE task_id = $1
         AND origin = 'chat'
         AND metadata->>'dispatch' = 'doorbell'
@@ -492,7 +532,7 @@ function claimCountOf(row: ClawTaskRow): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
+async function failExhaustedClaim(row: ClawTaskRow, settlement?: RunSettlement): Promise<boolean> {
   let closed = false;
   // Why it ran out, when the last holder said. The brain has a
   // `lock_contention_exhausted` verdict of its own, but on the doorbell path
@@ -508,7 +548,7 @@ async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
     ? "the workspace this run needs stayed busy for its whole claim budget"
     : "claimed too many times without a terminal result";
   try {
-    const r = await db.query(
+    closed = await settleAndTransition(row.task_id, settlement, (query) => query(
       `UPDATE claw_tasks
           SET status = 'failed',
               failure_reason = $2,
@@ -522,8 +562,7 @@ async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
           AND status IN ('queued','preparing','running')
         RETURNING task_id`,
       [row.task_id, failureReason, message],
-    );
-    closed = (r.rowCount ?? 0) > 0;
+    ));
   } catch (err) {
     logger.warn({ err, taskId: row.task_id }, "run.claim.mark_exhausted_failed");
     return false;

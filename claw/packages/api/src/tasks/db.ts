@@ -5,7 +5,7 @@
  * Thin DB helpers for `claw_tasks` / `claw_task_edges` / `claw_batches`.
  * No business logic; scheduler / dispatcher / sweeper consume these.
  */
-import { db } from "../infra/db.js";
+import { db, type Querier } from "../infra/db.js";
 import type { PoolClient } from "pg";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 import {
@@ -204,6 +204,7 @@ export async function transitionStatus(
   expected: TaskStatus[],
   next: TaskStatus,
   extra: Record<string, unknown> = {},
+  query: Querier = db.query,
 ): Promise<ClawTaskRow | null> {
   const sets: string[] = ["status = $1"];
   const values: unknown[] = [next];
@@ -241,7 +242,7 @@ export async function transitionStatus(
   }
   values.push(taskId);
   values.push(expected);
-  const r = await db.query(
+  const r = await query(
     `UPDATE claw_tasks SET ${sets.join(", ")}
      WHERE task_id = $${i++} AND status = ANY($${i})
      RETURNING *`,

@@ -216,6 +216,50 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
   }
 }
 
+/**
+ * Bank a run's queue time on the row itself, as it leaves the queue.
+ *
+ * A trigger rather than a stamp in each statement that dequeues, because the
+ * claim "every such statement was edited" rests on an enumeration being
+ * complete and it is not: seventeen distinct UPDATEs can move a row off
+ * `queued`, and one missed drops that run's whole wait. Reading OLD makes the
+ * accrual fire on the exit itself, so a statement written later is covered on
+ * the day it is written.
+ *
+ * The second disjunct of the first arm closes the remaining hole: a
+ * `queued -> queued` write that re-stamps `queued_at` (a requeue matching its
+ * own row) banks the segment it is about to erase. The second arm makes entry
+ * symmetrical, so a statement returning a row to the queue without re-stamping
+ * cannot make the next segment start before the row was queued.
+ *
+ * Nothing a scheduling predicate reads is touched: `started_at`,
+ * `deadline_at` and `completed_at` are left alone, and `NOW()` here is the
+ * transaction-start instant those statements already write.
+ */
+async function ensureQueuedAccrualTrigger(client: pg.PoolClient): Promise<void> {
+  await client.query(`
+    CREATE OR REPLACE FUNCTION claw_tasks_accrue_queued() RETURNS trigger AS $$
+    BEGIN
+      IF OLD.status = 'queued'
+         AND (NEW.status IS DISTINCT FROM 'queued'
+              OR NEW.queued_at IS DISTINCT FROM OLD.queued_at) THEN
+        NEW.queued_ms_accrued := OLD.queued_ms_accrued
+          + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - OLD.queued_at)) * 1000)::bigint;
+      END IF;
+      IF NEW.status = 'queued' AND OLD.status IS DISTINCT FROM 'queued' THEN
+        NEW.queued_at := NOW();
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+  await client.query("DROP TRIGGER IF EXISTS claw_tasks_accrue_queued ON claw_tasks");
+  await client.query(`
+    CREATE TRIGGER claw_tasks_accrue_queued BEFORE UPDATE ON claw_tasks
+      FOR EACH ROW EXECUTE FUNCTION claw_tasks_accrue_queued()
+  `);
+}
+
 async function ensureConcurrentIndex(
   client: pg.PoolClient,
   name: string,
@@ -1112,6 +1156,26 @@ export async function initDb(): Promise<void> {
     // budget for fat messages; without it a crash-looping chat run is
     // reclaimed until deadline_at.
     await addTaskCol("claim_count", "INT NOT NULL DEFAULT 0");
+    // Which attempt is executing under the present claim, and how many real
+    // attempts this run has had. `claim_count` cannot answer the second: a
+    // claim deferred for lock contention returns before execution and would
+    // otherwise be indistinguishable from an attempt that ran.
+    await addTaskCol("attempt_id", "TEXT");
+    await addTaskCol("attempt_generation", "INTEGER NOT NULL DEFAULT 0");
+    // The fat path's per-delivery discriminator, from JetStream. A fat row
+    // takes no claim, so this pair is the only value on it that advances when
+    // a redelivery supersedes the attempt before it.
+    await addTaskCol("delivery_seq", "BIGINT NOT NULL DEFAULT 0");
+    await addTaskCol("delivery_count", "BIGINT NOT NULL DEFAULT 0");
+    // Compare-and-swap token for the run's time ledger, so two heartbeats
+    // merging concurrently cannot each compute against a value the other has
+    // already replaced.
+    await addTaskCol("ledger_version", "INTEGER NOT NULL DEFAULT 0");
+    // Queue time, banked by the trigger below rather than by any statement
+    // that moves the row: seventeen statements can take a row off `queued`,
+    // and one left unedited would silently drop that run's whole wait.
+    await addTaskCol("queued_ms_accrued", "BIGINT NOT NULL DEFAULT 0");
+    await ensureQueuedAccrualTrigger(client);
     // What admission counts. It reads the fleet on every chat dispatch -- twice
     // when a ceiling is set -- and filters on the four occupying statuses,
     // which no other index covers, so the planner had nothing to choose but a

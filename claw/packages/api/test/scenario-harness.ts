@@ -104,8 +104,17 @@ CREATE TABLE claw_tasks (
   failure_reason       TEXT,
   error_message        TEXT,
   metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- What a terminal transition writes. Absent, applyAgentDone fails on the
+  -- column rather than on anything a scenario meant to assert.
+  output               TEXT,
+  captures             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  artifacts            JSONB NOT NULL DEFAULT '[]'::jsonb,
+  tool_stats           JSONB,
+  token_usage          JSONB,
+  turns                INT,
   origin               TEXT,
   workspace_id         TEXT,
+  brain_id             TEXT,
   sandbox_workload_id  TEXT,
   platform_message     TEXT,
   platform_node        TEXT,
@@ -118,12 +127,39 @@ CREATE TABLE claw_tasks (
   lease_expires_at     TIMESTAMPTZ,
   heartbeat_at         TIMESTAMPTZ,
   claim_count          INT NOT NULL DEFAULT 0,
+  attempt_id           TEXT,
+  attempt_generation   INTEGER NOT NULL DEFAULT 0,
+  delivery_seq         BIGINT NOT NULL DEFAULT 0,
+  delivery_count       BIGINT NOT NULL DEFAULT 0,
+  ledger_version       INTEGER NOT NULL DEFAULT 0,
+  queued_ms_accrued    BIGINT NOT NULL DEFAULT 0,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   queued_at            TIMESTAMPTZ,
   started_at           TIMESTAMPTZ,
   deadline_at          TIMESTAMPTZ,
   completed_at         TIMESTAMPTZ
 );
+
+-- Copied from initDb rather than approximated: the queue accrual it drives is
+-- the whole reason a scenario can assert on banked queue time at all, and a
+-- fixture without it would report every run as having waited nothing.
+CREATE OR REPLACE FUNCTION claw_tasks_accrue_queued() RETURNS trigger AS $trg$
+BEGIN
+  IF OLD.status = 'queued'
+     AND (NEW.status IS DISTINCT FROM 'queued'
+          OR NEW.queued_at IS DISTINCT FROM OLD.queued_at) THEN
+    NEW.queued_ms_accrued := OLD.queued_ms_accrued
+      + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - OLD.queued_at)) * 1000)::bigint;
+  END IF;
+  IF NEW.status = 'queued' AND OLD.status IS DISTINCT FROM 'queued' THEN
+    NEW.queued_at := NOW();
+  END IF;
+  RETURN NEW;
+END;
+$trg$ LANGUAGE plpgsql;
+
+CREATE TRIGGER claw_tasks_accrue_queued BEFORE UPDATE ON claw_tasks
+  FOR EACH ROW EXECUTE FUNCTION claw_tasks_accrue_queued();
 
 CREATE TABLE claw_conversation_turns (
   session_id   TEXT NOT NULL,
@@ -224,8 +260,9 @@ export async function startHarness(): Promise<Harness> {
   await pg.exec(DDL);
 
   const original = db.query;
+  const originalConnect = db.pool.connect;
   const statements: string[] = [];
-  db.query = (async (text: string, params?: unknown[]) => {
+  const run = async (text: string, params?: unknown[]) => {
     statements.push(text.replace(/\s+/g, " ").trim());
     const r = await pg.query(text, params as never[]) as {
       rows?: unknown[]; affectedRows?: number;
@@ -239,7 +276,16 @@ export async function startHarness(): Promise<Harness> {
     // test was written to ask.
     const rows = r.rows ?? [];
     return { rows, rowCount: rows.length || r.affectedRows || 0 };
-  }) as typeof db.query;
+  };
+  db.query = run as typeof db.query;
+  // `inTransaction` takes its own connection, so a harness that replaced only
+  // `db.query` would send every transactional statement to the real pool --
+  // where it fails on authentication rather than on anything the test meant to
+  // assert. PGlite is one connection, which is what these scenarios model.
+  db.pool.connect = (async () => ({
+    query: run,
+    release: () => {},
+  })) as unknown as typeof db.pool.connect;
 
   return {
     /** Every statement this harness has run since the last reset. */
@@ -254,6 +300,7 @@ export async function startHarness(): Promise<Harness> {
     },
     async close() {
       db.query = original;
+      db.pool.connect = originalConnect;
       await pg.close();
     },
   };

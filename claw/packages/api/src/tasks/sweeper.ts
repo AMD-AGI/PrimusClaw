@@ -22,7 +22,10 @@ import { db } from "../infra/db.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
-import { interruptSubject } from "@claw/protocol";
+import {
+  appendAttemptRecord, bankQueuedMs, interruptSubject, recoveryLossForAttempt,
+  type AttemptRecord,
+} from "@claw/protocol";
 import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../config.js";
 import { nc } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
@@ -30,6 +33,7 @@ import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { handleMap } from "./sandbox-stopper.js";
 import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
+import { applyToLedger, settleTerminalRuns } from "./run-time-ledger.js";
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
 } from "../workspace/store.js";
@@ -434,6 +438,10 @@ export async function reapExpiredQueuedRuns(): Promise<number> {
     // if it had written something.
     await releaseRunUse(row.task_id, false);
     await announceQueueTimeout(row);
+    // No claim ever completed, so there is no anchor instant in any domain to
+    // measure a loss from. Recorded as not computable rather than as zero,
+    // which for this class would read as "nothing was lost".
+    await recordSlotlessAttempt(row.task_id);
   }
   const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
   await releaseSessionsOfLostRuns(ids);
@@ -612,7 +620,8 @@ export async function reapLostLeases(): Promise<number> {
         )
       RETURNING task_id, session_id, origin, lease_owner,
                 metadata->>'message_id' AS message_id,
-                sandbox_workload_id`,
+                sandbox_workload_id, attempt_id, attempt_generation,
+                started_at, heartbeat_at, clock_timestamp() AS detected_at`,
     [LEASE_LOST_GRACE_SEC],
   );
   if (!r.rowCount) return 0;
@@ -623,7 +632,13 @@ export async function reapLostLeases(): Promise<number> {
     lease_owner: string | null;
     message_id: string | null;
     sandbox_workload_id: string | null;
+    attempt_id: string | null;
+    attempt_generation: number | null;
+    started_at: unknown;
+    heartbeat_at: unknown;
+    detected_at: unknown;
   }>;
+  for (const row of rows) await recordDeadAttempt(row);
   logger.warn(
     {
       reaped: r.rowCount,
@@ -1040,6 +1055,9 @@ export async function sweeperTick(): Promise<void> {
   // still exist and is a no-op unless WORKSPACE_IDLE_RELEASE_DAYS is set.
   await runContained("sweeper.release_deleted_refs_failed", releaseRefsOfDeletedSessions);
   await runContained("sweeper.release_idle_refs_failed", releaseRefsOfIdleSessions);
+  // After every reaper that can close a row, so a run this tick ended has its
+  // terminal instant pinned in the same tick rather than the next one.
+  await runContained("sweeper.settle_run_time_failed", settleTerminalRuns);
   // Maintenance: prune expired idempotency rows last so a failure here can't
   // skip the task reapers above.
   await runContained("sweeper.idempotency_prune_failed", reapExpiredIdempotency);
@@ -1067,4 +1085,70 @@ export function stopSweeper(): void {
     clearTimeout(timer);
     timer = null;
   }
+}
+
+/**
+ * Record what a dead attempt lost, from the anchor its class actually has.
+ *
+ * `heartbeat_at` is useless for an attempt that never renewed: `takeClaim`
+ * stamps it in the same UPDATE as `started_at`, so the difference is zero by
+ * construction and reads as a clean death. That class is measured from
+ * `started_at` instead, which is non-zero whenever real time elapsed.
+ */
+/** A database instant as an ISO string, or null when the row carried none. */
+function instantOf(value: unknown): string | null {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) return value;
+  return null;
+}
+
+async function recordDeadAttempt(row: {
+  task_id: string;
+  attempt_id: string | null;
+  attempt_generation: number | null;
+  started_at: unknown;
+  heartbeat_at: unknown;
+  detected_at: unknown;
+}): Promise<void> {
+  // The detection instant has to be the database's: a loss measured from an
+  // API-pod clock against a DB-written anchor is a cross-domain subtraction
+  // with no offset behind it, which this accounting does not do.
+  const detectedAtDb = instantOf(row.detected_at);
+  if (!detectedAtDb) return;
+  const startedAtDb = instantOf(row.started_at);
+  const heartbeatAtDb = instantOf(row.heartbeat_at) ?? undefined;
+  const renewed = !!heartbeatAtDb && !!startedAtDb && heartbeatAtDb > startedAtDb;
+  const record: AttemptRecord = {
+    attemptId: row.attempt_id,
+    attemptGeneration: row.attempt_generation,
+    startedAtDb,
+    endedAtDb: detectedAtDb,
+    ...(renewed ? { lastObservedHeartbeatAtDb: heartbeatAtDb } : {}),
+    renewed,
+    recoveryLoss: { computable: false, lossMs: null },
+  };
+  await appendRunAttempt(row.task_id, {
+    ...record,
+    recoveryLoss: recoveryLossForAttempt(record, detectedAtDb),
+  });
+}
+
+/** A row dispatched but never claimed: no attempt id, no generation, no anchor. */
+async function recordSlotlessAttempt(taskId: string): Promise<void> {
+  await appendRunAttempt(taskId, {
+    attemptId: null,
+    attemptGeneration: null,
+    startedAtDb: null,
+    renewed: false,
+    recoveryLoss: { computable: false, lossMs: null },
+  });
+}
+
+async function appendRunAttempt(taskId: string, record: AttemptRecord): Promise<void> {
+  await applyToLedger(taskId, { key: taskId, source: "task_id" }, (read) =>
+    appendAttemptRecord(bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb), record),
+  ).catch((err) => {
+    logger.warn({ taskId, err: (err as Error)?.message }, "sweeper.attempt_record_failed");
+    return null;
+  });
 }

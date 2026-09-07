@@ -60,8 +60,11 @@ import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
 import { runScript } from "./script-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning,
+  type RunAttemptToken,
 } from "./callback.js";
-import { beginRun, endRun, phaseOf } from "./run-phase.js";
+import type { RunTimeReport } from "@claw/protocol";
+import { randomUUID } from "node:crypto";
+import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
@@ -198,14 +201,15 @@ async function deliverAgentDone(
   kvCkpt: KV,
   request: ExecuteRequest,
   result: ExecuteResult,
+  runTime?: RunTimeReport,
 ): Promise<void> {
   if (!request.task_id) {
-    await fx().postAgentDone(request, result);
+    await fx().postAgentDone(request, result, runTime);
     return;
   }
   const key = pendingCallbackKey(request.task_id);
   await kvCkpt.put(key, sc.encode(JSON.stringify(result)));
-  await fx().postAgentDone(request, result);
+  await fx().postAgentDone(request, result, runTime);
 }
 
 async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteRequest): Promise<void> {
@@ -835,6 +839,14 @@ async function maybeRunSandboxlessTask(
  * decision, engine dispatch, checkpointing, and all terminal-state
  * handling). One instance per task; never reused across tasks.
  */
+/**
+ * The claim a doorbell run holds, or null for a fat delivery that took none.
+ *
+ * Its generation is the discriminator the fat path gets from the delivery pair
+ * instead; a row only ever has one of the two advancing.
+ */
+export type RunClaim = { claimCount: number } | null;
+
 class TaskRunner {
   // Injected singletons (bound once via bindTaskRunnerDeps in main()).
   private readonly kv: KV;
@@ -868,6 +880,16 @@ class TaskRunner {
    * answer. Neither is computed from the other.
    */
   private readonly runIdentity: RunIdentity;
+
+  /**
+   * Which attempt of this run the row should accept reports from.
+   *
+   * Minted here rather than handed down, so an attempt presents a full token
+   * whether or not the write that stores it landed: the row's first renewal
+   * adopts it, which is what keeps accounting off the path that decides
+   * whether a run keeps its lease.
+   */
+  private readonly attempt: RunAttemptToken;
 
   /**
    * The scope those shells are addressable in: this DAG, or this conversation.
@@ -1025,6 +1047,7 @@ class TaskRunner {
     messageId: string,
     userId: string,
     abortCtrl: AbortController,
+    claim: RunClaim,
   ) {
     const deps = getDeps();
     this.kv = deps.kv;
@@ -1040,6 +1063,17 @@ class TaskRunner {
     this.userId = userId;
     this.abortCtrl = abortCtrl;
     this.runId = request.task_id || messageId;
+    // A claimed doorbell has no delivery to count -- its wakeup was acked at
+    // claim time -- and a fat delivery takes no claim, so each path presents
+    // the row's true value for the half it does not have.
+    this.attempt = claim
+      ? { attemptId: randomUUID(), claimCount: claim.claimCount, deliverySeq: 0, deliveryCount: 0 }
+      : {
+          attemptId: randomUUID(),
+          claimCount: 0,
+          deliverySeq: msg.seq,
+          deliveryCount: msg.info.deliveryCount,
+        };
     const resolved = resolveRunIdentity(request, messageId);
     this.runIdentity = resolved.identity;
     if (resolved.leaseShapeMiss) {
@@ -1410,6 +1444,7 @@ class TaskRunner {
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
+      attempt: this.attempt,
     });
     return { hands: newHands, action: "rebuilt" };
   }
@@ -1890,7 +1925,7 @@ class TaskRunner {
       message: "this turn has not opened a sandbox; one opens on the first tool call",
       message_id: this.messageId,
     }).catch(() => { /* a status event must not fail the run */ });
-    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID });
+    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
   }
 
   /**
@@ -1956,6 +1991,7 @@ class TaskRunner {
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
+      attempt: this.attempt,
     });
     this.hands = fx().makeHandsClient(handsUrl, handsToken, this.handsOwner, this.runId);
     // ensureHands returns only after bootstrap and the health check, so this
@@ -2457,6 +2493,7 @@ class TaskRunner {
         this.withPlatformFacts(result),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     // Ack BEFORE logging task.completed: if the process is killed by a hot-
     // reload between the log line and msg.ack(), NATS redelivers the task after
@@ -2879,6 +2916,7 @@ class TaskRunner {
         }),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
     await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
@@ -3108,6 +3146,7 @@ class TaskRunner {
         }),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
     await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
@@ -3210,6 +3249,35 @@ class TaskRunner {
    * something external, which is the measurement that decides whether handing
    * the slot back during waits is worth building (see tasks/run-phase.ts).
    */
+  /**
+   * This attempt's coverage, or nothing when it has none to report yet.
+   *
+   * The opening tick fires before any interval has closed, so it carries no
+   * covering field at all: a report that measured nothing must not advance the
+   * row's watermark, and the interval it spans stays visibly unbanked until a
+   * later report names it.
+   */
+  private coverageReport(): { runTime: RunTimeReport } | null {
+    const snapshot = runTimeOf(this.runIdentity.key);
+    if (!snapshot) return null;
+    const covered = Object.values(snapshot.stateMs).some((ms) => (ms ?? 0) > 0);
+    if (!covered) return null;
+    return {
+      runTime: {
+        key: this.runIdentity.key,
+        attemptId: this.attempt.attemptId,
+        claimCount: this.attempt.claimCount,
+        deliverySeq: this.attempt.deliverySeq,
+        deliveryCount: this.attempt.deliveryCount,
+        // Self-contained brain-clock differences, never instants, so they are
+        // admitted only up to the budget the database itself measured.
+        basis: { kind: "same_domain", domain: "brain" },
+        cumulativeStateMs: snapshot.stateMs,
+        cumulativeReasonMs: snapshot.reasonMs,
+      },
+    };
+  }
+
   private startLeaseHeartbeat(): ReturnType<typeof setInterval> | null {
     // Tracked whether or not there is anywhere to report it to. The ledger is
     // what hands the execution slot back during a wait, and a run dispatched
@@ -3225,6 +3293,8 @@ class TaskRunner {
         waitReason: phase.waitReason,
         waitedMs: phase.waitedMs,
         waits: phase.waits,
+        attempt: this.attempt,
+        ...(this.coverageReport() ?? {}),
       }).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
         // two workers driving one sandbox, or a run writing a workspace a
@@ -3503,8 +3573,11 @@ export async function runHandleTask(
   messageId: string,
   userId: string,
   abortCtrl: AbortController,
+  claim: RunClaim = null,
 ): Promise<void> {
   if (await replayPendingCallback(msg, request, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
-  await new TaskRunner(msg, request, sessionId, lockKey, messageId, userId, abortCtrl).run();
+  await new TaskRunner(
+    msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,
+  ).run();
 }

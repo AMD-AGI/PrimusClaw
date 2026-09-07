@@ -12,7 +12,7 @@
  * The legacy chat path (no `task_id`) is unaffected.
  */
 import type {
-  ExecuteRequest, ExecuteResult, RunPhase, RunWaitReason,
+  ExecuteRequest, ExecuteResult, RunPhase, RunTimeReport, RunWaitReason,
 } from "@claw/protocol";
 import pino from "pino";
 
@@ -24,6 +24,8 @@ export class AgentDoneDeliveryError extends Error {
 
 interface AgentDoneBody {
   task_id?: string;
+  /** This attempt's final per-state totals; see {@link LeaseRenewal.runTime}. */
+  run_time?: RunTimeReport;
   final_text?: string;
   captures?: Record<string, string>;
   artifacts?: Array<Record<string, unknown>>;
@@ -58,6 +60,8 @@ export interface RunOwnership {
   brainId?: string;
   /** The Hands workload serving it, as named by the sandbox provider. */
   sandboxWorkloadId?: string;
+  /** This attempt, so the row can tell it from the one it superseded. */
+  attempt?: RunAttemptToken;
 }
 
 /**
@@ -100,6 +104,13 @@ export async function postTaskRunning(
         // that never reports running has no sandbox to attribute anyway.
         brain_id: ownership.brainId || undefined,
         sandbox_workload_id: ownership.sandboxWorkloadId || undefined,
+        // The row allocates this attempt's generation from these, on a write
+        // that is already best-effort: accounting must never be a reason a run
+        // fails to execute, and the first renewal adopts the token if it is lost.
+        attempt_id: ownership.attempt?.attemptId,
+        claim_count: ownership.attempt?.claimCount,
+        delivery_seq: ownership.attempt?.deliverySeq,
+        delivery_count: ownership.attempt?.deliveryCount,
       }),
       signal: controller.signal,
     });
@@ -119,6 +130,26 @@ export async function postTaskRunning(
   }
 }
 
+/**
+ * Which attempt of a run is speaking.
+ *
+ * `lease_owner` cannot answer this -- it is the pod name, so two attempts of a
+ * redelivered run on one pod carry the same one -- and neither half of this
+ * token can on its own: a claim advances `claim_count` and leaves the delivery
+ * pair alone, a fat-path redelivery advances the pair and never takes a claim.
+ * Together they are monotone over every attempt a row observes.
+ */
+export interface RunAttemptToken {
+  /** Minted by this attempt, so the row can fence a heartbeat that outlived it. */
+  attemptId: string;
+  /** The row's own claim generation; 0 on the fat path, which takes no claim. */
+  claimCount: number;
+  /** JetStream `msg.seq`; 0 on the doorbell path, which has no delivery. */
+  deliverySeq: number;
+  /** JetStream `msg.info.deliveryCount`; 0 likewise. */
+  deliveryCount: number;
+}
+
 /** What a lease renewal tells the row, beyond "the worker is still here". */
 export interface LeaseRenewal {
   brainId: string;
@@ -129,6 +160,13 @@ export interface LeaseRenewal {
   /** Cumulative wall-clock the run has spent waiting rather than executing. */
   waitedMs: number;
   waits: number;
+  /** Fences this renewal against the attempt the row currently holds. */
+  attempt: RunAttemptToken;
+  /**
+   * This attempt's running per-state totals, or absent for a tick that closed
+   * no interval -- the opening one, which has nothing to report yet.
+   */
+  runTime?: RunTimeReport;
 }
 
 /**
@@ -200,6 +238,11 @@ export async function postRunLease(
         wait_reason: renewal.waitReason,
         waited_ms: renewal.waitedMs,
         waits: renewal.waits,
+        attempt_id: renewal.attempt.attemptId,
+        claim_count: renewal.attempt.claimCount,
+        delivery_seq: renewal.attempt.deliverySeq,
+        delivery_count: renewal.attempt.deliveryCount,
+        run_time: renewal.runTime,
       }),
       signal: controller.signal,
     });
@@ -368,6 +411,7 @@ function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
 export async function postAgentDone(
   request: ExecuteRequest,
   result: ExecuteResult,
+  runTime?: RunTimeReport,
 ): Promise<void> {
   if (!request.task_id || !request.callback_url) return;
   const url = `${request.callback_url}/agent_done`;
@@ -383,6 +427,10 @@ export async function postAgentDone(
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
+    // The attempt's last word on its own time, merged in the same transaction
+    // as the terminal transition: what a terminal path with no reporter leaves
+    // uncovered stays unbanked rather than being attributed to a state.
+    run_time: runTime,
     ...platformFields(result),
   };
   const headers: Record<string, string> = {

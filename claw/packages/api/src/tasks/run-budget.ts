@@ -121,6 +121,18 @@ export const RUN_BUDGET_DEFAULT_SEC: Record<RunScope, number> = {
 export const RUN_BUDGET_BACKSTOP_GRACE_SEC = envSec("RUN_BUDGET_BACKSTOP_GRACE_SEC", 5 * 60);
 
 /**
+ * How far a measured clock skew may be from zero before a comparison built on
+ * it is refused.
+ *
+ * Beside the grace above, and deliberately not derived from it: the two carry
+ * the same number today and mean unrelated things, so a change to either must
+ * not be a silent change to both. Re-exported from the accounting module rather
+ * than restated, so the bound the merge enforces and the bound this file names
+ * cannot drift apart.
+ */
+export { RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC } from "@claw/protocol";
+
+/**
  * How long a doorbell may sit at `queued` before the sweeper gives up.
  *
  * Separate from {@link RUN_BUDGET_DEFAULT_SEC}: that clock is execution

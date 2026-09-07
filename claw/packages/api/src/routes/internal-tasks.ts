@@ -31,6 +31,8 @@ import { getTask, transitionStatus } from "../tasks/db.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
 import { db } from "../infra/db.js";
+import { decodeRunTimeReport } from "@claw/protocol";
+import { applyToLedger, bankQueuedTime, bankReportAndQueue } from "../tasks/run-time-ledger.js";
 
 const logger = pino({ name: "internal-tasks" });
 
@@ -123,6 +125,11 @@ interface TaskEventBody {
   brain_id?: string;
   /** The Hands workload provisioned for it, likewise. */
   sandbox_workload_id?: string;
+  /** This attempt, so the row can allocate it a generation. */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
   [key: string]: unknown;
 }
 
@@ -145,20 +152,34 @@ interface TaskEventBody {
  * Best-effort. This describes a run rather than driving it, and a failed
  * write must not turn into a rejected status update.
  */
-async function recordRunOwnership(
-  taskId: string,
-  brainId: string | undefined,
-  workloadId: string | undefined,
-): Promise<void> {
-  if (!brainId && !workloadId) return;
+async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<void> {
+  const brainId = body.brain_id;
+  const workloadId = body.sandbox_workload_id;
+  const attemptId = body.attempt_id;
+  // The early return used to be taken when the event carried neither a brain id
+  // nor a workload id; the attempt token has to keep the statement alive for
+  // exactly those events, or the generation is never allocated for them.
+  if (!brainId && !workloadId && !attemptId) return;
   try {
     await db.query(
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
-              sandbox_workload_id = COALESCE($3, sandbox_workload_id)
+              sandbox_workload_id = COALESCE($3, sandbox_workload_id),
+              attempt_id          = COALESCE($5, attempt_id),
+              attempt_generation  = CASE
+                                      WHEN $5::text IS NOT NULL
+                                       AND attempt_id IS DISTINCT FROM $5
+                                      THEN attempt_generation + 1
+                                      ELSE attempt_generation
+                                    END,
+              delivery_seq        = GREATEST(delivery_seq, COALESCE($6::bigint, 0)),
+              delivery_count      = GREATEST(delivery_count, COALESCE($7::bigint, 0))
         WHERE task_id = $1
           AND status = ANY($4::text[])`,
-      [taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES],
+      [
+        taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
+        attemptId ?? null, body.delivery_seq ?? null, body.delivery_count ?? null,
+      ],
     );
   } catch (err) {
     logger.warn(
@@ -166,6 +187,9 @@ async function recordRunOwnership(
       "task.ownership_write_failed",
     );
   }
+  // Queue time is banked by difference from a total the table maintains, so
+  // whichever observer gets here first banks it and the others bank zero.
+  await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write above */ });
 }
 
 interface RunLeaseBody {
@@ -178,6 +202,35 @@ interface RunLeaseBody {
   /** Cumulative milliseconds this run has spent waiting, as the worker sees it. */
   waited_ms?: number;
   waits?: number;
+  /** The attempt token (§8). Fail-closed: an omitted field is not a zero. */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
+  /** This attempt's running per-state totals, absent on an identity-only tick. */
+  run_time?: unknown;
+}
+
+/** The attempt token, or the field that was missing from it. */
+type AttemptToken =
+  | { ok: true; attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number }
+  | { ok: false; missing: string };
+
+function attemptTokenOf(body: RunLeaseBody): AttemptToken {
+  if (typeof body.attempt_id !== "string" || !body.attempt_id) {
+    return { ok: false, missing: "attempt_id" };
+  }
+  for (const field of ["claim_count", "delivery_seq", "delivery_count"] as const) {
+    const value = body[field];
+    if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false, missing: field };
+  }
+  return {
+    ok: true,
+    attemptId: body.attempt_id,
+    claimCount: body.claim_count as number,
+    deliverySeq: body.delivery_seq as number,
+    deliveryCount: body.delivery_count as number,
+  };
 }
 
 /**
@@ -263,7 +316,11 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
  *
  * @returns the row's status, or null when there is no active row to renew.
  */
-async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string | null> {
+async function renewRunLease(
+  taskId: string,
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): Promise<string | null> {
   const leaseSec = leaseSecondsFromBody(body);
   noteLeaseDisagreement(taskId, leaseSec);
   const phase = body.phase === "waiting" ? "waiting" : "executing";
@@ -276,9 +333,15 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
               metadata         = jsonb_set(
                                    COALESCE(metadata, '{}'::jsonb),
                                    '{run_phase}',
-                                   $4::jsonb,
+                                   COALESCE(metadata->'run_phase', '{}'::jsonb) || $4::jsonb,
                                    true
-                                 )
+                                 ),
+              attempt_id         = $6,
+              attempt_generation = CASE WHEN attempt_id IS DISTINCT FROM $6
+                                        THEN attempt_generation + 1
+                                        ELSE attempt_generation END,
+              delivery_seq       = GREATEST(delivery_seq, $8::bigint),
+              delivery_count     = GREATEST(delivery_count, $9::bigint)
         WHERE task_id = $1
           AND status = ANY($5::text[])
           AND (
@@ -286,6 +349,14 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
              OR lease_owner = $2
              OR lease_expires_at IS NULL
              OR lease_expires_at < NOW()
+          )
+          AND claim_count = $7
+          AND (delivery_seq, delivery_count) <= ($8::bigint, $9::bigint)
+          AND (
+                attempt_id = $6
+             OR attempt_id IS NULL
+             OR ((delivery_seq, delivery_count) < ($8::bigint, $9::bigint)
+                 AND (lease_expires_at IS NULL OR lease_expires_at < NOW()))
           )
         RETURNING status`,
       [
@@ -300,6 +371,10 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
           at: new Date().toISOString(),
         }),
         RENEWABLE_STATUSES,
+        token.attemptId,
+        token.claimCount,
+        token.deliverySeq,
+        token.deliveryCount,
       ],
     );
     return (r.rows[0] as { status?: string } | undefined)?.status ?? null;
@@ -309,6 +384,34 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
     // has ended, and answering 409 would tell a healthy worker to stand down.
     return "unknown";
   }
+}
+
+/**
+ * Bank what this renewal covered, once the row has accepted the attempt.
+ *
+ * After the fence rather than inside it: a report from a superseded attempt
+ * must contribute nothing at all, and the fence is what decides that. The
+ * queued total is banked in the same step whether or not a report came with
+ * it, because no worker can observe queue time.
+ */
+async function mergeRenewalCoverage(taskId: string, body: RunLeaseBody): Promise<void> {
+  const decoded = body.run_time === undefined ? null : decodeRunTimeReport(body.run_time);
+  if (decoded && !decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "run_lease.run_time_rejected");
+    return;
+  }
+  const report = decoded?.report;
+  const identity = report
+    ? { key: report.key, source: "task_id" as const }
+    : { key: taskId, source: "task_id" as const };
+  // Contained for the same reason the renewal's own UPDATE is: a run that is
+  // otherwise fine must not be told to stand down because its accounting could
+  // not be written.
+  await applyToLedger(taskId, identity, (row) => bankReportAndQueue(row, report))
+    .catch((err) => {
+      logger.warn({ taskId, err: (err as Error)?.message }, "run_lease.run_time_merge_failed");
+      return null;
+    });
 }
 
 /**
@@ -494,7 +597,7 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       if (body.type === "statusUpdate" && body.agent_status === "running") {
         const moved = await transitionStatus(taskId, ["preparing"], "running");
         if (moved) logger.info({ taskId }, "task.running");
-        await recordRunOwnership(taskId, body.brain_id, body.sandbox_workload_id);
+        await recordRunOwnership(taskId, body);
       }
       // Otherwise accepted and logged, but not forwarded: this does not
       // publish to NATS `events.task.<task_id>`, so nothing fans the event out
@@ -516,7 +619,18 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
     async (req, reply) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
-      const status = await renewRunLease(taskId, body);
+      const token = attemptTokenOf(body);
+      if (!token.ok) {
+        // Fail closed. Accepting a renewal nobody can attribute to an attempt
+        // is what lets a heartbeat that outlived its attempt revive a lease the
+        // row has already handed on.
+        logger.warn({ taskId, missing: token.missing }, "run_lease.missing_attempt_token");
+        return reply.status(400).send({
+          ok: false, error: `attempt token incomplete: ${token.missing} is required`,
+        });
+      }
+      const status = await renewRunLease(taskId, body, token);
+      if (status) await mergeRenewalCoverage(taskId, body);
       if (!status) {
         // The row is terminal, gone, or held by another worker. Told rather
         // than silently accepted, so a worker can find out it is running

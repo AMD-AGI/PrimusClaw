@@ -10,12 +10,14 @@
  * `last_user` sandbox destruction. Per-DAG aggregation and cascade failure
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import pino from "pino";
 import { getTask, transitionStatus, updateTask } from "./db.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
-import type { TaskStatus } from "./types.js";
+import { decodeRunTimeReport } from "@claw/protocol";
+import { settleRunTime } from "./run-time-ledger.js";
+import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-lifecycle" });
 
@@ -32,6 +34,8 @@ export interface AgentDonePayload {
   failure_reason?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
+  /** The attempt's final per-state totals, merged with the transition. */
+  run_time?: unknown;
   /**
    * What the platform did, when the run ended because the platform ended it.
    *
@@ -51,6 +55,40 @@ export interface AgentDonePayload {
   /** The pod's own account, kept verbatim so a wrong reading can be re-derived. */
   platform_message?: string;
 }
+
+/**
+ * Move the row and bank the attempt's final report as one transaction.
+ *
+ * A duplicate callback whose transition no-ops rolls the merge back with it:
+ * the report belongs to a run somebody else has already closed, and banking it
+ * anyway would credit this attempt's time to whoever holds the row now.
+ */
+async function transitionWithFinalReport(
+  taskId: string,
+  expected: TaskStatus[],
+  next: TaskStatus,
+  patch: Record<string, unknown>,
+  rawReport: unknown,
+): Promise<ClawTaskRow | null> {
+  const decoded = rawReport === undefined ? null : decodeRunTimeReport(rawReport);
+  if (decoded && !decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "agent_done.run_time_rejected");
+  }
+  const report = decoded?.ok ? decoded.report : undefined;
+  if (!report) return transitionStatus(taskId, expected, next, patch);
+  return inTransaction(async (query) => {
+    await settleRunTime(query, taskId, { report });
+    const updated = await transitionStatus(taskId, expected, next, patch, query);
+    if (!updated) throw new TerminalNoop();
+    return updated;
+  }).catch((err) => {
+    if (err instanceof TerminalNoop) return null;
+    throw err;
+  });
+}
+
+/** The terminal transition matched nothing, so its whole transaction is void. */
+class TerminalNoop extends Error {}
 
 function resolveTerminalStatus(p: AgentDonePayload): TaskStatus {
   const r = p.abort_reason ?? "completed";
@@ -130,7 +168,7 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
   const expected: TaskStatus[] = next === "waiting_external"
     ? ["running", "preparing", "queued"]
     : ["running", "preparing", "cancelling", "waiting_external", "queued"];
-  const updated = await transitionStatus(taskId, expected, next, patch);
+  const updated = await transitionWithFinalReport(taskId, expected, next, patch, payload.run_time);
   if (!updated) {
     logger.info({ taskId, next, task_status: task.status }, "agent_done.transition_noop");
     return;

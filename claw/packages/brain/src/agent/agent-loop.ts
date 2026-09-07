@@ -30,7 +30,7 @@ import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
-import { whileWaiting, type WaitMode } from "../tasks/run-phase.js";
+import { whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
@@ -947,7 +947,9 @@ class AgentLoopRunner {
       await this.noteRecoveryExhausted(results, exhausted);
       return;
     }
-    await this.performSandboxRecovery(results);
+    // The run is repairing what it needs to keep executing, which is time it
+    // spends neither working nor waiting on anything outside itself.
+    await whileRecovering(this.opts.runIdentity?.key, () => this.performSandboxRecovery(results));
   }
 
   /** Stop before probing only when neither kind of recovery remains available. */

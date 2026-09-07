@@ -57,7 +57,7 @@ test("T5.2 exactly one module can mint a ledger key", () => {
 test("T5.3 every ledger call site is handed an identity, never a proxy", () => {
   // The test that would have caught the original defect: it reads the argument
   // rather than the value, so a proxy fails here before it can ship.
-  const call = /\b(?:beginRun|endRun|phaseOf|whileWaiting)\s*\(\s*([^,)]*)/g;
+  const call = /\b(?:beginRun|endRun|phaseOf|runTimeOf|whileWaiting|whileRecovering)\s*\(\s*([^,)]*)/g;
   const offenders: string[] = [];
   for (const { file, text } of sources) {
     // The ledger's own module declares these; every other mention is a call.
