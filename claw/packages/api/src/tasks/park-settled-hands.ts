@@ -37,6 +37,18 @@ export const parkSettledHandsPorts = {
   ): Promise<RunEndedParkResult> => parkHandsAfterRun(kv, sessionId, workloadId),
 };
 
+async function parkHandsWithWorkloadCandidates(
+  sessionId: string,
+  workloadIds?: ReadonlySet<string>,
+): Promise<RunEndedParkResult> {
+  if (!workloadIds?.size) return parkSettledHandsPorts.parkHandsAfterRun(sessionId);
+  for (const workloadId of workloadIds) {
+    const result = await parkSettledHandsPorts.parkHandsAfterRun(sessionId, workloadId);
+    if (result.outcome !== "skipped" || result.reason !== "other_sandbox") return result;
+  }
+  return { outcome: "skipped", reason: "other_sandbox" };
+}
+
 /**
  * Put the sandbox handle of a settled session back in the idle pool.
  *
@@ -65,7 +77,7 @@ export const parkSettledHandsPorts = {
  */
 export async function parkHandsOfSettledSessions(
   sessionIds: string[],
-  workloadBySession?: Map<string, string | null>,
+  workloadIdsBySession?: ReadonlyMap<string, ReadonlySet<string>>,
 ): Promise<void> {
   const unique = [...new Set(sessionIds)];
   if (!unique.length) return;
@@ -95,9 +107,9 @@ export async function parkHandsOfSettledSessions(
   for (const sessionId of settled) {
     let result: RunEndedParkResult;
     try {
-      result = await parkSettledHandsPorts.parkHandsAfterRun(
+      result = await parkHandsWithWorkloadCandidates(
         sessionId,
-        workloadBySession?.get(sessionId),
+        workloadIdsBySession?.get(sessionId),
       );
     } catch (err) {
       // The helper catches its own failures, so reaching here means the port

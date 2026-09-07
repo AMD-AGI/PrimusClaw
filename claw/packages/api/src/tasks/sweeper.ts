@@ -710,12 +710,11 @@ export async function reapLostLeases(): Promise<number> {
   // of which is enough on its own to make this release match nothing.
   await releaseSessionsOfLostRuns(
     chatRows.map((row) => row.session_id),
-    // This reaper is the one that knows which sandbox the dead run was on, so
-    // the park can refuse a handle that names a different one. The other two
-    // callers pass nothing and rely on the conditional write, which is the
-    // stronger guard anyway: a handle taken over between the settled check and
-    // the write has a new revision, and the park loses to it.
-    new Map(chatRows.map((row) => [row.session_id, row.sandbox_workload_id])),
+    chatRows.reduce((bySession, row) => {
+      const workloadIds = bySession.get(row.session_id) ?? new Set<string>();
+      if (row.sandbox_workload_id) workloadIds.add(row.sandbox_workload_id);
+      return bySession.set(row.session_id, workloadIds);
+    }, new Map<string, Set<string>>()),
   );
   // A worker and its sandbox commonly disappear together on node loss. The
   // expired lease closes the row; this read records the platform's reason while
@@ -892,7 +891,7 @@ async function countPendingBySession(
  */
 async function releaseSessionsOfLostRuns(
   sessionIds: string[],
-  workloadBySession?: Map<string, string | null>,
+  workloadIdsBySession?: ReadonlyMap<string, ReadonlySet<string>>,
 ): Promise<void> {
   if (!sessionIds.length) return;
   const r = await db.query(
@@ -917,7 +916,7 @@ async function releaseSessionsOfLostRuns(
   // absent from it while its handle is exactly as stranded. Asked separately
   // for that reason; the two would otherwise agree on every session except the
   // ones that need this most.
-  await parkHandsOfSettledSessions(sessionIds, workloadBySession);
+  await parkHandsOfSettledSessions(sessionIds, workloadIdsBySession);
   if (!r.rowCount) return;
   const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
   logger.warn(
@@ -925,7 +924,6 @@ async function releaseSessionsOfLostRuns(
     "sweeper.released_sessions_of_lost_runs",
   );
 }
-
 
 /** Fail `waiting_external` rows past their per-node timeout. */
 export async function reapWaitExternal(): Promise<number> {

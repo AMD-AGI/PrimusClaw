@@ -29,7 +29,7 @@ import {
   sweeperPorts,
 } from "../src/tasks/sweeper.js";
 import { parkSettledHandsPorts } from "../src/tasks/park-settled-hands.js";
-import { parkHandsAfterRun } from "@claw/protocol";
+import { parkHandsAfterRun, type RevisionedKv } from "@claw/protocol";
 
 const originalQuery = db.query;
 const originalPublish = sweeperPorts.publishSessionEvent;
@@ -72,6 +72,22 @@ function stubDb(reaped: Array<Record<string, unknown>>, settled: string[]): void
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
+}
+
+function stubLostWorkloads(workloadIds: Array<string | null>): void {
+  stubDb(workloadIds.map((sandbox_workload_id, index) => ({
+    ...CHAT_RUN,
+    task_id: `t-${index + 1}`,
+    message_id: `m-${index + 1}`,
+    sandbox_workload_id,
+  })), ["s-1"]);
+}
+
+function useParkKv(kv: RevisionedKv): void {
+  parkSettledHandsPorts.parkHandsAfterRun = async (sessionId, workloadId) => {
+    parkCalls.push({ sessionId, workloadId });
+    return parkHandsAfterRun(kv, sessionId, workloadId);
+  };
 }
 
 beforeEach(() => { parkCalls = []; });
@@ -253,4 +269,81 @@ test("P12 a run claimed to exhaustion parks its session's handle", async () => {
     runClaimPorts.buildHistory = originalHistory;
     runClaimPorts.publishSessionEvent = originalEvent;
   }
+});
+
+test("P13 any matching reaped workload parks the handle regardless of row order", async () => {
+  const stale = "claw-2-sandbox-bbb";
+  for (const workloadIds of [[READY.workloadId, stale], [stale, READY.workloadId]]) {
+    stubLostWorkloads(workloadIds);
+    const kv = kvWith(READY);
+    useParkKv(kv);
+
+    assert.equal(await reapLostLeases(), 2);
+    assert.equal(kv.read().keepalive, false, `workloads=${workloadIds}`);
+    assert.equal(kv.store.get("hands.s-1")!.revision, 8, "park only once per session");
+  }
+});
+
+test("P14 null candidates cannot bypass known workload identities for a replacement handle", async () => {
+  const stale = "claw-2-sandbox-bbb";
+  for (const workloadIds of [
+    [null, READY.workloadId, stale],
+    [READY.workloadId, null, stale],
+    [READY.workloadId, stale, null],
+  ]) {
+    stubLostWorkloads(workloadIds);
+    const kv = kvWith({ ...READY, workloadId: "claw-3-sandbox-ccc" });
+    useParkKv(kv);
+
+    await reapLostLeases();
+    assert.equal(kv.read().keepalive, true, `workloads=${workloadIds}`);
+    assert.equal(kv.store.get("hands.s-1")!.revision, 7, "replacement handle was rewritten");
+    assert.deepEqual(parkCalls.map((call) => call.workloadId), [READY.workloadId, stale]);
+  }
+});
+
+test("P15 duplicate workload identities are checked once", async () => {
+  const stale = "claw-2-sandbox-bbb";
+  stubLostWorkloads([stale, stale, READY.workloadId, READY.workloadId]);
+  const kv = kvWith(READY);
+  useParkKv(kv);
+
+  await reapLostLeases();
+  assert.deepEqual(parkCalls.map((call) => call.workloadId), [stale, READY.workloadId]);
+  assert.equal(kv.read().keepalive, false);
+  assert.equal(kv.store.get("hands.s-1")!.revision, 8);
+});
+
+test("P16 a superseded park never retries another reclaimed workload", async () => {
+  const replacementWorkloadId = "claw-2-sandbox-bbb";
+  stubLostWorkloads([READY.workloadId, replacementWorkloadId, READY.workloadId]);
+  const kv = kvWith(READY);
+  let updates = 0;
+  useParkKv({
+    ...kv,
+    async update(key, value, revision) {
+      if (++updates === 1) {
+        const replacement = { ...READY, workloadId: replacementWorkloadId };
+        await kv.update(key, new TextEncoder().encode(JSON.stringify(replacement)), revision);
+      }
+      return kv.update(key, value, revision);
+    },
+  });
+
+  await reapLostLeases();
+  assert.equal(updates, 1, "a CAS conflict must end the session's parking attempt");
+  assert.deepEqual(parkCalls.map((call) => call.workloadId), [READY.workloadId]);
+  assert.equal(kv.read().workloadId, replacementWorkloadId);
+  assert.equal(kv.read().keepalive, true, "the concurrently reused handle was parked");
+});
+
+test("P17 runs without workload identities retain the existing unguarded park", async () => {
+  stubLostWorkloads([null, null]);
+  const kv = kvWith(READY);
+  useParkKv(kv);
+
+  await reapLostLeases();
+  assert.deepEqual(parkCalls, [{ sessionId: "s-1", workloadId: undefined }]);
+  assert.equal(kv.read().keepalive, false);
+  assert.equal(kv.store.get("hands.s-1")!.revision, 8);
 });
