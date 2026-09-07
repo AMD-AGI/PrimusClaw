@@ -21,6 +21,7 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import {
   failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
+  SWEEPABLE_RUN_STATUSES,
 } from "../tasks/chat-run.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
@@ -75,6 +76,8 @@ export interface DispatchInput {
   capturedSessionEnv: Record<string, string>;
   /** Supplied by a caller that took the gate, so marker and turn are one string. */
   messageId?: string;
+  /** Cleanup owed if a doorbell publish is left for reconciliation. */
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   /**
    * The environment this run declares it needs (node count, per-node shape,
    * backend). Validated by the route, so by the time it reaches here it is
@@ -278,6 +281,7 @@ export async function dispatchTaskToBrain(
           filesWorkspaceId,
           pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
           sandboxImage: finalSandboxImage,
+          reconcileAction: input.reconcileAction,
           rememberTaskId: (taskId) => { runTaskId = taskId; },
         });
         if (result.kind === "rejected") {
@@ -343,7 +347,10 @@ export async function dispatchTaskToBrain(
       await noteRefusedPublish(runTaskId);
     }
     const verdict = await sessionDispatchPorts.failChatRunDispatch(
-      runTaskId, String(err?.message ?? err),
+      runTaskId,
+      String(err?.message ?? err),
+      undefined,
+      { statuses: SWEEPABLE_RUN_STATUSES },
     );
     // Only a worker actually holding the row earns the silence. A compensation
     // that could not run establishes nothing, and rolling back is the answer
@@ -387,12 +394,14 @@ async function dispatchByDoorbell(input: {
   filesWorkspaceId?: string;
   pluginId?: number;
   sandboxImage: string | undefined;
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   rememberTaskId: (taskId: string) => void;
 }): Promise<DispatchResult> {
   const { rememberTaskId, ...handOff } = input;
   const result = await handOffAssembledRun({
     ...handOff,
     path: "chat",
+    reconcileAction: input.reconcileAction,
     // The third argument is the dedup id; without it the doorbell has no
     // duplicate-window protection.
     publish: (subject, payload, msgId) =>
@@ -404,12 +413,15 @@ async function dispatchByDoorbell(input: {
     failRun: async (taskId, reason, failureReason) => {
       if (taskId) rememberTaskId(taskId);
       return sessionDispatchPorts.failChatRunDispatch(
-        taskId, reason, failureReason ?? "dispatch_failed",
+        taskId,
+        reason,
+        failureReason ?? "dispatch_failed",
+        { statuses: SWEEPABLE_RUN_STATUSES },
       );
     },
     admit: sessionDispatchPorts.admit,
   });
-  if (result.kind === "dispatched" || result.kind === "queued") {
+  if (result.kind === "dispatched" || result.kind === "queued" || result.kind === "publish_unknown") {
     rememberTaskId(result.taskId);
   }
   if (result.kind === "open_failed") throw new Error("chat_run.open_failed");
@@ -428,6 +440,17 @@ async function dispatchByDoorbell(input: {
       sandboxImage,
       queuePosition: result.queuePosition,
       runId: result.taskId,
+    };
+  }
+  if (result.kind === "publish_unknown") {
+    logger.error(
+      { sessionId: input.sessionId, messageId: input.messageId, runTaskId: result.taskId },
+      "message.dispatch_unknown_awaiting_reconcile",
+    );
+    return {
+      kind: "publish_unknown",
+      messageId: input.messageId,
+      error: new Error("task dispatch outcome unknown"),
     };
   }
   logger.info(

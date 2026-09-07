@@ -11,6 +11,7 @@ import {
   type RunDoorbell,
 } from "@claw/protocol";
 import pino from "pino";
+import type { PoolClient } from "pg";
 
 import {
   metrics, type DispatchHeldCause, type DispatchPath, type QueueEntryCause,
@@ -45,6 +46,8 @@ export interface HandOffInput {
   taskId?: string;
   /** Whether a soft ceiling is what put this row on the queue. */
   queueEntryCause?: QueueEntryCause;
+  /** Cleanup owed if reconciliation, rather than this request, settles the publish. */
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   task: Record<string, unknown>;
   sessionId: string;
   userId: string;
@@ -117,6 +120,7 @@ export async function admissionAskFor(input: HandOffInput): Promise<AdmissionAsk
 
 async function openAdmittedRun(
   input: HandOffInput,
+  client: PoolClient,
 ): Promise<{ taskId: string } | null> {
   const openRun = input.openRun ?? openChatRun;
   // Always `queued` until a worker claims. An admitted run still rings a
@@ -126,10 +130,7 @@ async function openAdmittedRun(
     dispatch: "doorbell",
     taskId: input.taskId,
     queueEntryCause: input.queueEntryCause ?? "direct",
-    // What this dispatch owes if it never reports its publish outcome. Both
-    // hand-off callers dispatch into a session that already exists, so the
-    // cleanup is to hand its gate back rather than to delete it.
-    reconcileAction: "idle_existing_session",
+    reconcileAction: input.reconcileAction ?? "idle_existing_session",
     sessionId: input.sessionId,
     userId: input.userId,
     messageId: input.messageId,
@@ -141,6 +142,7 @@ async function openAdmittedRun(
     spec: persistableSpec(input.task),
     status: "queued",
     issueLease: false,
+    client,
   });
 }
 
@@ -206,7 +208,7 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
       run: await openAdmittedRun({
         ...input,
         queueEntryCause: admission.kind === "queue" ? "admission" : "direct",
-      }),
+      }, client),
     } as const;
   });
   if (opened.admission.kind === "reject") {
@@ -240,7 +242,10 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
   if (hard) return await discardRefusedRun(input, run.taskId, hard);
 
   if (admission.kind === "queue") {
-    await releaseReconcileClaim(run);
+    if (!await releaseReconcileClaim(run)) {
+      logger.warn({ taskId: run.taskId, sessionId: input.sessionId }, "run.dispatch.reconcile_taken");
+      return { kind: "publish_unknown", taskId: run.taskId, messageId };
+    }
     logger.info(
       { taskId: run.taskId, sessionId: input.sessionId, position: admission.position },
       "run.queued",

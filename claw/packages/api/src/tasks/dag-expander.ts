@@ -16,7 +16,8 @@
 import { db } from "../infra/db.js";
 import type { PoolClient } from "pg";
 import {
-  acquireAdmissionLock, decideAdmission, type AdmissionAsk, type AdmissionRefusal,
+  acquireAdmissionLock, anyAdmissionCeilingSet, decideAdmission, envAdmitLimits,
+  withOwnedAdmissionLock, type AdmissionAsk, type AdmissionRefusal,
 } from "./admission.js";
 import { insertEdge, insertTask } from "./db.js";
 import { newTaskId } from "./ids.js";
@@ -361,8 +362,11 @@ export async function createSingleTask(opts: {
   const input = opts.input ?? {};
   const invalid = topologyErrors(input);
   if (invalid) return { admitted: false, invalidTopology: invalid };
+  if (!client && anyAdmissionCeilingSet(envAdmitLimits())) {
+    return await withOwnedAdmissionLock((ownedClient) => createSingleTask(opts, ownedClient));
+  }
 
-  await acquireAdmissionLock(client ?? db);
+  await acquireAdmissionLock(client);
   const ask: AdmissionAsk = {
     origin: "task",
     newRunRoots: 1,

@@ -50,8 +50,6 @@ const logger = pino({ name: "sessions" });
 interface SessionCreateRefusal {
   statusCode: number;
   response: { ok: false; error: string; reason?: string };
-  /** Whether a retry under the same idempotency key replays this answer. */
-  replayable?: true;
 }
 
 export interface NewSessionRow {
@@ -881,11 +879,6 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // message writes no run, so only the two together take the lock.
         const refused = await createSessionRow(newRow, parentSid, user, Boolean(firstMessage));
         if (refused) {
-          if (refused.replayable && idemKey && idemLock) {
-            await saveIdempotencyBestEffort(
-              idemLock.client, userId, route, idemKey, refused.statusCode, refused.response,
-            );
-          }
           return { statusCode: refused.statusCode, response: refused.response };
         }
 
@@ -936,6 +929,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             mcpServers: firstMessage.mcpServers,
             capturedUserEnvSnapshot: userEnvSnapshot,
             capturedSessionEnv: sessionEnv,
+            reconcileAction: "delete_created_session",
           },
           async () => {
             // Strict rollback: remove the session row + its UserMessage event

@@ -140,26 +140,31 @@ describe("an unmetered A2A send is still all-or-nothing", { skip }, () => {
     );
   });
 
-  test("a send onto an existing target keeps that target when the parent check refuses", async () => {
+  test("a send cannot re-parent an existing target", async () => {
     await clear();
     await query(
-      `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id)
-       VALUES ('a2a-live','live','a2a','claw','input_required','ctx-keep',$1)`,
+      `INSERT INTO claw_sessions
+         (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id, parent_session_id)
+       VALUES
+         ('a2a-parent-old','old parent','a2a','claw','idle','ctx-old',$1,NULL),
+         ('a2a-parent-new','new parent','a2a','claw','idle','ctx-new',$1,NULL),
+         ('a2a-live','live','a2a','claw','input_required','ctx-keep',$1,'a2a-parent-old')`,
       [`user:${CALLER.userId}`],
     );
 
     const res = await send(
       { messageId: "m-existing", role: "user", parts: [{ text: "hello" }], taskId: "a2a-live" },
-      { parent_session_id: "a2a-not-a-session" },
+      { parent_session_id: "a2a-parent-new" },
     );
 
-    assert.equal(errorOf(res.body), "Failed to create task");
+    assert.equal(errorOf(res.body), "metadata.parent_session_id cannot re-parent an existing task");
     assert.equal(await runs(), 0, "no counted row is left naming a send that did not happen");
     const row = (await query(
-      "SELECT agent_status, context_id FROM claw_sessions WHERE session_id = 'a2a-live'",
-    )).rows[0] as { agent_status: string; context_id: string };
-    assert.equal(row.agent_status, "input_required", "the send's own write is rolled back with it");
+      "SELECT agent_status, context_id, parent_session_id FROM claw_sessions WHERE session_id = 'a2a-live'",
+    )).rows[0] as { agent_status: string; context_id: string; parent_session_id: string };
+    assert.equal(row.agent_status, "input_required");
     assert.equal(row.context_id, "ctx-keep");
+    assert.equal(row.parent_session_id, "a2a-parent-old");
   });
 
   test("a commit that fails leaves no run row referencing the session it rolled back", async () => {

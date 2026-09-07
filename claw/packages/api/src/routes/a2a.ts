@@ -469,6 +469,15 @@ async function admitAndOpenA2ASend(
   auth: A2AAuthContext,
   spec: A2ARunSpec,
 ): Promise<A2AEntry> {
+  if (message.taskId && spec.parentSessionId) {
+    return {
+      kind: "error",
+      error: makeInvalidParams(
+        rpcId,
+        "metadata.parent_session_id cannot re-parent an existing task",
+      ).error,
+    };
+  }
   return await countingCreatedSession(withOwnedAdmissionLock(async (client) => {
     const ask = await a2aAdmissionAsk(message.taskId ?? null, spec, client);
     const decision = await decideAdmission(ask, client);
@@ -483,7 +492,7 @@ async function admitAndOpenA2ASend(
         error: makeJsonRpcError(rpcId, JSON_RPC_INTERNAL_ERROR, "Failed to resolve task target"),
       };
     }
-    await attachA2AParent(target.taskId, auth, spec, client);
+    await attachA2AParent(target, auth, spec, client);
     const taskId = await openA2ARun(target, text, auth, spec, client);
     return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
   }));
@@ -501,12 +510,13 @@ async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntr
 // On the lock's transaction and before the counted row: the tree ceiling was
 // decided against the shape this write produces.
 async function attachA2AParent(
-  taskId: string,
+  target: SendTarget,
   auth: A2AAuthContext,
   spec: A2ARunSpec,
   q: StatementRunner,
 ): Promise<void> {
   if (!spec.parentSessionId) return;
+  if (!target.created) throw new Error("a2a.reparent_existing_session");
   const parent = (await q.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
     [spec.parentSessionId],
@@ -523,7 +533,7 @@ async function attachA2AParent(
   }
   await q.query(
     "UPDATE claw_sessions SET parent_session_id = $1, team_role = $2 WHERE session_id = $3",
-    [spec.parentSessionId, spec.teamRole || "", taskId],
+    [spec.parentSessionId, spec.teamRole || "", target.taskId],
   );
 }
 

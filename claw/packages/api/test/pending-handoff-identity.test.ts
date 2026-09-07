@@ -16,6 +16,7 @@ import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { openDoorbellBarrier } from "./doorbell-barrier-stub.js";
+import { db } from "../src/infra/db.js";
 import { startHarness, seedSession, seedRun, type Harness } from "./scenario-harness.js";
 
 /**
@@ -48,9 +49,20 @@ function stubPorts(
 }
 
 let h: Harness;
-before(async () => { h = await startHarness(); });
+let originalConnect: typeof db.pool.connect;
+before(async () => {
+  h = await startHarness();
+  originalConnect = db.pool.connect;
+  db.pool.connect = (async () => ({
+    query: (text: string, params?: unknown[]) => db.query(text, params),
+    release: () => {},
+  })) as unknown as typeof db.pool.connect;
+});
 beforeEach(async () => { await h.reset(); });
-after(async () => { await h?.close(); });
+after(async () => {
+  db.pool.connect = originalConnect;
+  await h?.close();
+});
 
 async function seedPending(id: number): Promise<void> {
   await h.sql(

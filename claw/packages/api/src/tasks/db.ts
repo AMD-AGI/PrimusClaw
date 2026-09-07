@@ -13,8 +13,11 @@ import {
   RUN_BUDGET_DEFAULT_SEC, type RunOrigin,
 } from "./run-budget.js";
 
-export async function getTask(taskId: string): Promise<ClawTaskRow | null> {
-  const r = await db.query(`SELECT * FROM claw_tasks WHERE task_id = $1`, [taskId]);
+export async function getTask(
+  taskId: string,
+  client?: StatementRunner,
+): Promise<ClawTaskRow | null> {
+  const r = await (client ?? db).query(`SELECT * FROM claw_tasks WHERE task_id = $1`, [taskId]);
   return (r.rowCount ?? 0) > 0 ? (r.rows[0] as ClawTaskRow) : null;
 }
 

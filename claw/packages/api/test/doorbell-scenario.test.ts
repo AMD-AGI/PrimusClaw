@@ -76,15 +76,15 @@ test("#1 a cancelled doorbell does not idle a session that still holds a live fa
 
 const WEEK = 7 * 24 * 3600;
 
-test("#2 a wedged fat row no longer blocks the last-resort gate release", async () => {
+test("#2 an unsettled fat delivery still holds the last-resort gate", async () => {
   const { reapStuckSessions } = await import("../src/tasks/sweeper.js");
   await seedSession(h, "s1", { updatedAgoSec: WEEK });
   // Reapable by nothing: chat is exempt from reapStaleTasks without
   // RUN_ROWS_SWEEPABLE, and reapLostLeases needs a lease that was written.
   await seedRun(h, "fat", "s1", { status: "preparing", dispatch: "fat", leaseOwner: null });
 
-  assert.equal(await reapStuckSessions(), 1);
-  assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
+  assert.equal(await reapStuckSessions(), 0);
+  assert.equal((await sessionRow(h, "s1")).agent_status, "running");
 });
 
 test("#2 a doorbell whose lease lapsed after its deadline is releasable too", async () => {

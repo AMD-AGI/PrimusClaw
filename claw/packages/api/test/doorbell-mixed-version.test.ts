@@ -13,7 +13,7 @@
 
 import "./doorbell-dispatch-on-env.js";
 
-import test, { afterEach, before } from "node:test";
+import test, { after, afterEach, before } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 
@@ -37,13 +37,20 @@ interface Published { subject: string; payload: string; msgId?: string }
 const SUPPORTED = DOORBELL_SEMANTICS_VERSION;
 const FLOOR: DoorbellLatch = { state: "floor", version: SUPPORTED };
 const originalQuery = db.query;
+const originalConnect = db.pool.connect;
 const originalPorts = { ...sessionDispatchPorts };
 const originalPendingPorts = { ...pendingDispatchPorts };
 
 before(() => {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
+  db.pool.connect = (async () => ({
+    query: (text: string, params?: unknown[]) => db.query(text, params),
+    release: () => {},
+  })) as unknown as typeof db.pool.connect;
 });
+
+after(() => { db.pool.connect = originalConnect; });
 
 afterEach(() => {
   db.query = originalQuery;

@@ -19,7 +19,7 @@
 // plugin/resource/MCP resolution logic between entry points.
 // ─────────────────────────────────────────────────────────────────
 
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import crypto from "node:crypto";
 import { db, MarketplaceDb } from "../infra/db.js";
 import { canViewPlugin, ownerOrAdmin, formatPluginRow } from "../marketplace/plugins.js";
@@ -32,7 +32,9 @@ import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { createSessionSubscriptionReady, sanitizeSessionEvent } from "../events/store.js";
+import {
+  createSessionSubscriptionReady, sanitizeSessionEvent, type SessionSubscription,
+} from "../events/store.js";
 import { metrics } from "../infra/metrics.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import pino from "pino";
@@ -416,6 +418,31 @@ function mapPrimusEventToAnthropic(
 }
 
 export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance): Promise<void> {
+  registerAnthropicModelRoutes(app);
+  registerAnthropicAgentCreateRoutes(app);
+  registerAnthropicAgentReadRoutes(app);
+  registerAnthropicAgentWriteRoutes(app);
+  registerAnthropicEnvironmentReadRoutes(app);
+  registerAnthropicEnvironmentWriteRoutes(app);
+  registerAnthropicSessionCreateRoutes(app);
+  registerAnthropicSessionReadRoutes(app);
+  registerAnthropicSessionWriteRoutes(app);
+  registerAnthropicResourceRoutes(app);
+  registerAnthropicEventRoutes(app);
+  registerAnthropicStreamRoutes(app);
+}
+
+function registerAnthropicAgentReadRoutes(app: FastifyInstance): void {
+  registerAnthropicAgentListAndRetrieveRoutes(app);
+  registerAnthropicAgentVersionRoute(app);
+}
+
+function registerAnthropicSessionReadRoutes(app: FastifyInstance): void {
+  registerAnthropicSessionListAndRetrieveRoutes(app);
+  registerAnthropicSessionEventListRoute(app);
+}
+
+function registerAnthropicModelRoutes(app: FastifyInstance): void {
 
   // --- List Models / Retrieve Model (static compat view, see ANTHROPIC_COMPAT_MODEL) ---
   app.get("/anthropic/v1/models", async (_req, reply) => {
@@ -433,7 +460,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     }
     return reply.send(ANTHROPIC_COMPAT_MODEL);
   });
+}
 
+function registerAnthropicAgentCreateRoutes(app: FastifyInstance): void {
   // --- Create Agent (compat view over existing plugins / default runtime) ---
   app.post("/anthropic/v1/agents", async (req, reply) => {
     const user = getUser(req);
@@ -476,7 +505,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       created_at: new Date().toISOString(),
     });
   });
+}
 
+function registerAnthropicAgentListAndRetrieveRoutes(app: FastifyInstance): void {
   // --- List Agents (P1, design doc §9.5.1) ---
   app.get("/anthropic/v1/agents", async (req, reply) => {
     const user = getUser(req);
@@ -514,7 +545,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!row || !canViewPlugin(row, userId, admin)) return sendError(reply, 404, "not_found_error", `agent ${agentId} not found`);
     return reply.send(formatAgentFromPlugin(row));
   });
+}
 
+function registerAnthropicAgentWriteRoutes(app: FastifyInstance): void {
   // --- Update Agent (P2, design doc §9.5.1 — atomic optimistic lock on anthropic_agent_version) ---
   app.post<{ Params: { id: string } }>("/anthropic/v1/agents/:id", async (req, reply) => {
     const user = getUser(req);
@@ -570,7 +603,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!updated) return sendError(reply, 404, "not_found_error", `agent ${agentId} not found`);
     return reply.send(formatAgentFromPlugin(updated));
   });
+}
 
+function registerAnthropicAgentVersionRoute(app: FastifyInstance): void {
   // --- List Agent Versions (P2 — single-version compat: only the current anthropic_agent_version) ---
   app.get<{ Params: { id: string } }>("/anthropic/v1/agents/:id/versions", async (req, reply) => {
     const user = getUser(req);
@@ -585,7 +620,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!row || !canViewPlugin(row, userId, admin)) return sendError(reply, 404, "not_found_error", `agent ${agentId} not found`);
     return reply.send({ data: [formatAgentFromPlugin(row)], next_page: null });
   });
+}
 
+function registerAnthropicEnvironmentReadRoutes(app: FastifyInstance): void {
   // --- Create Environment (P0 stateless env_default view kept for backward
   // compat with the already-verified Quickstart flow; P1/P2 addendum: also
   // persist a real `resources` row, design doc §9.5.2, so list/retrieve/
@@ -655,7 +692,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     }
     return reply.send(formatEnvironmentFromResource(row));
   });
+}
 
+function registerAnthropicEnvironmentWriteRoutes(app: FastifyInstance): void {
   // --- Update Environment (P2) ---
   app.post<{ Params: { id: string } }>("/anthropic/v1/environments/:id", async (req, reply) => {
     const user = getUser(req);
@@ -727,7 +766,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!updated) return sendError(reply, 404, "not_found_error", `environment ${envId} not found`);
     return reply.send(formatEnvironmentFromResource(updated));
   });
+}
 
+function registerAnthropicSessionCreateRoutes(app: FastifyInstance): void {
   // --- Create Session (real claw_sessions row; Anthropic binding snapshotted into config) ---
   app.post("/anthropic/v1/sessions", async (req, reply) => {
     const user = getUser(req);
@@ -820,7 +861,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       created_at: new Date().toISOString(),
     });
   });
+}
 
+function registerAnthropicSessionListAndRetrieveRoutes(app: FastifyInstance): void {
   // --- List Sessions (P1, design doc §9.5.3 — real cursor over claw_sessions, not offset-encoded) ---
   app.get("/anthropic/v1/sessions", async (req, reply) => {
     const user = getUser(req);
@@ -866,7 +909,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     if (!row || row.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
     return reply.send(formatSessionFromRow(row));
   });
+}
 
+function registerAnthropicSessionWriteRoutes(app: FastifyInstance): void {
   // --- Update Session (P2 — title -> name column, metadata -> config sub-key, no new column) ---
   app.post<{ Params: { id: string } }>("/anthropic/v1/sessions/:id", async (req, reply) => {
     const user = getUser(req);
@@ -963,7 +1008,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     const updated = (await db.query("SELECT * FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0];
     return reply.send(formatSessionFromRow(updated));
   });
+}
 
+function registerAnthropicSessionEventListRoute(app: FastifyInstance): void {
   // --- List Session Events (P1, design doc §9.5.4 — shares mapPrimusEventToAnthropic with the SSE stream route) ---
   app.get<{ Params: { id: string } }>("/anthropic/v1/sessions/:id/events", async (req, reply) => {
     const user = getUser(req);
@@ -1001,7 +1048,9 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     const nextPage = rows.length === limit && lastRow ? encodeCursor("", lastRow.id) : null;
     return reply.send({ data, next_page: nextPage });
   });
+}
 
+function registerAnthropicResourceRoutes(app: FastifyInstance): void {
   // --- Session Resources: Add/List/Retrieve/Update/Delete (P2, design doc §9.5.5 —
   // config-only CRUD; real mount-into-sandbox effect is deferred, Brain work) ---
   app.post<{ Params: { id: string } }>("/anthropic/v1/sessions/:id/resources", async (req, reply) => {
@@ -1095,8 +1144,186 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
     await mergeSessionCompatConfig(sessionId, { primus_claw: { ...rawPrimusClaw, resource_mounts: nextMounts } });
     return reply.send({ id: req.params.resourceId, type: "resource_deleted" });
   });
+}
 
-  // --- Send Session Events (user.message -> shared Brain dispatch) ---
+async function handleInterruptEvent(
+  events: unknown[],
+  sessionId: string,
+  userId: string,
+  reply: FastifyReply,
+): Promise<FastifyReply | null> {
+  if (events.length !== 1 || asJsonObject(events[0])?.type !== "user.interrupt") return null;
+  const row = (await db.query(
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    [sessionId],
+  )).rows[0];
+  if (!row || row.user_id !== userId) {
+    return sendError(reply, 404, "not_found_error", "session not found");
+  }
+  try {
+    await stopSessionRuns(sessionId);
+  } catch {
+    return sendError(reply, 503, "api_error", "the session's runs could not be cancelled");
+  }
+  const event = {
+    id: `evt_${Date.now()}`,
+    type: "user.interrupt",
+    processed_at: new Date().toISOString(),
+  };
+  return reply.send({ data: [event] });
+}
+
+function parseUserMessageEvents(
+  events: unknown[],
+): { messageContent: string } | { error: string } {
+  const textParts: string[] = [];
+  for (const event of events) {
+    const eventObject = asJsonObject(event);
+    if (!eventObject || eventObject.type !== "user.message") {
+      return { error: "only user.message events are supported in P0" };
+    }
+    if (!Array.isArray(eventObject.content) || !eventObject.content.length) {
+      return { error: "user.message.content must be a non-empty array" };
+    }
+    for (const block of eventObject.content) {
+      const blockObject = asJsonObject(block);
+      if (!blockObject || blockObject.type !== "text" || typeof blockObject.text !== "string") {
+        return { error: "only text content blocks are supported in P0" };
+      }
+      textParts.push(blockObject.text);
+    }
+  }
+  const messageContent = textParts.join("\n");
+  return messageContent ? { messageContent } : { error: "content required" };
+}
+
+interface UserMessageTurnConfig {
+  pluginId?: number;
+  workspaceId?: string;
+  resources?: Record<string, unknown>;
+  sessionEnv: Record<string, string>;
+}
+
+type UserMessageGateResult =
+  | { kind: "missing" }
+  | { kind: "queued"; messageId: string }
+  | { kind: "dispatch"; messageId: string; userEnv: Record<string, string> };
+
+async function gateUserMessageTurn(
+  sessionId: string,
+  userId: string,
+  user: ReturnType<typeof getUser>,
+  messageContent: string,
+  config: UserMessageTurnConfig,
+): Promise<UserMessageGateResult> {
+  const messageId = newChatMessageId();
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      "SELECT agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+      [sessionId],
+    );
+    if (!locked.rows.length) {
+      await client.query("ROLLBACK");
+      return { kind: "missing" };
+    }
+    const userEnv = await loadUserEnvSnapshot(client, userId, logger);
+    if (locked.rows[0].agent_status === "running") {
+      const secrets = pendingSecretColumns({
+        llmKey: resolveUserLlmKey(user) || "",
+        platformKey: user?.platformKey || "",
+        userEnv,
+        doorbell: RUN_DOORBELL_DISPATCH,
+      });
+      await client.query(
+        "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb)",
+        [
+          sessionId, messageContent, userId, config.pluginId ?? null, JSON.stringify([]),
+          config.workspaceId ?? null, secrets.platform, secrets.llm, secrets.blob, null,
+          config.resources ? JSON.stringify(config.resources) : null, null,
+          JSON.stringify(secrets.userEnv), JSON.stringify(config.sessionEnv),
+        ],
+      );
+      await client.query("COMMIT");
+      return { kind: "queued", messageId };
+    }
+    await client.query(
+      "UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2, "
+      + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId, messageId],
+    );
+    await client.query("COMMIT");
+    return { kind: "dispatch", messageId, userEnv };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function publishAnthropicRunningEvent(sessionId: string, messageId: string): Promise<void> {
+  const runningId = `claw-running-${messageId}`;
+  const runningEvent = { type: "AnthropicSessionRunning", message_id: runningId, data: {} };
+  try {
+    await db.query(
+      "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
+      [runningId, sessionId, "AnthropicSessionRunning", runningEvent],
+    );
+    const { sc: natsCodec, nc: natsConn } = await import("../infra/nats.js");
+    const { eventSubject } = await import("@claw/protocol");
+    natsConn.publish(`sse.${eventSubject(sessionId)}`, natsCodec.encode(JSON.stringify(runningEvent)));
+  } catch (err) {
+    logger.warn({ err, sessionId }, "anthropic.session_status_running.publish_failed");
+  }
+}
+
+async function dispatchUserMessageTurn(input: {
+  reply: FastifyReply;
+  sessionId: string;
+  userId: string;
+  user: ReturnType<typeof getUser>;
+  messageContent: string;
+  messageId: string;
+  userEnv: Record<string, string>;
+  pluginId?: number;
+  workspaceId?: string;
+  mcpServers?: Record<string, Record<string, unknown>>;
+  resources?: Record<string, unknown>;
+  sessionEnv: Record<string, string>;
+  sentEvent: Record<string, unknown>;
+}): Promise<FastifyReply> {
+  const dispatch = await dispatchTaskToBrain(
+    {
+      sessionId: input.sessionId, userId: input.userId, user: input.user,
+      content: input.messageContent, messageType: "text", toolIds: [],
+      pluginId: input.pluginId, requestImage: undefined, requestResource: input.resources,
+      requestTimeout: undefined, workspaceId: input.workspaceId, mcpServers: input.mcpServers,
+      capturedUserEnvSnapshot: input.userEnv, capturedSessionEnv: input.sessionEnv,
+      messageId: input.messageId,
+    },
+    async () => {
+      await db.query(
+        "UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL, "
+        + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+        [input.sessionId],
+      );
+    },
+  );
+  if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
+    return sendError(input.reply, 503, "api_error", "internal dispatch failed");
+  }
+  if (dispatch.kind === "rejected") {
+    return sendError(input.reply, 429, "rate_limit_error", dispatch.reason);
+  }
+  if (dispatch.kind === "dispatched") {
+    await publishAnthropicRunningEvent(input.sessionId, dispatch.messageId);
+  }
+  return input.reply.send({ data: [{ ...input.sentEvent, id: dispatch.messageId }] });
+}
+
+function registerAnthropicEventRoutes(app: FastifyInstance): void {
   app.post<{ Params: { id: string } }>("/anthropic/v1/sessions/:id/events", async (req, reply) => {
     const user = getUser(req);
     const userId = user?.userId ?? "default";
@@ -1105,44 +1332,11 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
 
     const events = Array.isArray(body.events) ? body.events : [];
     if (!events.length) return sendError(reply, 400, "invalid_request_error", "events must be a non-empty array");
-
-    // --- user.interrupt (P1, design doc §10): reuse the existing native
-    // interrupt.<sessionId> NATS channel — no new Brain capability needed. ---
-    if (events.length === 1 && asJsonObject(events[0])?.type === "user.interrupt") {
-      const row = (await db.query(
-        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-        [sessionId],
-      )).rows[0];
-      if (!row || row.user_id !== userId) return sendError(reply, 404, "not_found_error", "session not found");
-      try {
-        await stopSessionRuns(sessionId);
-      } catch {
-        return sendError(reply, 503, "api_error", "the session's runs could not be cancelled");
-      }
-      const evt = { id: `evt_${Date.now()}`, type: "user.interrupt", processed_at: new Date().toISOString() };
-      return reply.send({ data: [evt] });
-    }
-
-    const textParts: string[] = [];
-    for (const ev of events) {
-      const evObj = asJsonObject(ev);
-      if (!evObj || evObj.type !== "user.message") {
-        return sendError(reply, 400, "invalid_request_error", "only user.message events are supported in P0");
-      }
-      const content = evObj.content;
-      if (!Array.isArray(content) || !content.length) {
-        return sendError(reply, 400, "invalid_request_error", "user.message.content must be a non-empty array");
-      }
-      for (const block of content) {
-        const blockObj = asJsonObject(block);
-        if (!blockObj || blockObj.type !== "text" || typeof blockObj.text !== "string") {
-          return sendError(reply, 400, "invalid_request_error", "only text content blocks are supported in P0");
-        }
-        textParts.push(blockObj.text);
-      }
-    }
-    const messageContent = textParts.join("\n");
-    if (!messageContent) return sendError(reply, 400, "invalid_request_error", "content required");
+    const interrupt = await handleInterruptEvent(events, sessionId, userId, reply);
+    if (interrupt) return interrupt;
+    const parsed = parseUserMessageEvents(events);
+    if ("error" in parsed) return sendError(reply, 400, "invalid_request_error", parsed.error);
+    const { messageContent } = parsed;
 
     const sessionRow = (await db.query(
       "SELECT user_id, config FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -1168,116 +1362,113 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       }
     }
 
-    // Transaction: lock row -> queue (agent busy) or flip to running (idle).
-    // Mirrors the native POST /v1/sessions/:id/messages flow exactly so both
-    // entry points share identical queueing semantics.
-    // Minted before the gate is taken, so the marker naming the gate's owner
-    // and the turn it names are one string.
-    const turnMessageId = newChatMessageId();
-    const client = await db.pool.connect();
-    let queued = false;
-    let capturedUserEnvSnapshot: Record<string, string> = {};
-    try {
-      await client.query("BEGIN");
-      const lockResult = await client.query(
-        "SELECT agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
-        [sessionId],
-      );
-      if (!lockResult.rows.length) {
-        await client.query("ROLLBACK");
-        return sendError(reply, 404, "not_found_error", "session not found");
-      }
-      const status = lockResult.rows[0].agent_status;
-      const userEnvSnapshot = await loadUserEnvSnapshot(client, userId, logger);
-      if (status === "running") {
-        const secrets = pendingSecretColumns({
-          llmKey: resolveUserLlmKey(user) || "",
-          platformKey: user?.platformKey || "",
-          userEnv: userEnvSnapshot,
-          doorbell: RUN_DOORBELL_DISPATCH,
-        });
-        await client.query(
-          "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb)",
-          [
-            sessionId, messageContent, userId,
-            pluginId ?? null, JSON.stringify([]), workspaceId ?? null,
-            secrets.platform, secrets.llm, secrets.blob,
-            null, resources ? JSON.stringify(resources) : null, null,
-            JSON.stringify(secrets.userEnv), JSON.stringify(sessionEnv),
-          ],
-        );
-        await client.query("COMMIT");
-        queued = true;
-      } else {
-        capturedUserEnvSnapshot = userEnvSnapshot;
-        await client.query(
-          "UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2, "
-          + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-          [sessionId, turnMessageId],
-        );
-        await client.query("COMMIT");
-      }
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
-    }
-
-    const sentEvent = { id: `evt_${Date.now()}`, type: "user.message", content: [{ type: "text", text: messageContent }], processed_at: new Date().toISOString() };
-    if (queued) {
-      return reply.send({ data: [sentEvent] });
-    }
-
-    const dispatch = await dispatchTaskToBrain(
-      {
-        sessionId, userId, user,
-        content: messageContent,
-        messageType: "text",
-        toolIds: [],
-        pluginId,
-        requestImage: undefined,
-        requestResource: resources,
-        requestTimeout: undefined,
-        workspaceId,
-        mcpServers,
-        capturedUserEnvSnapshot,
-        capturedSessionEnv: sessionEnv,
-        messageId: turnMessageId,
-      },
-      async () => {
-        await db.query(
-          "UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL, "
-          + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-          [sessionId],
-        );
-      },
+    const gate = await gateUserMessageTurn(
+      sessionId, userId, user, messageContent,
+      { pluginId, workspaceId, resources, sessionEnv },
     );
-    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
-      return sendError(reply, 503, "api_error", "internal dispatch failed");
+    if (gate.kind === "missing") {
+      return sendError(reply, 404, "not_found_error", "session not found");
     }
-    if (dispatch.kind === "rejected") {
-      return sendError(reply, 429, "rate_limit_error", dispatch.reason);
-    }
-    if (dispatch.kind === "dispatched") {
-      const runningId = `claw-running-${dispatch.messageId}`;
-      const runningEvt = { type: "AnthropicSessionRunning", message_id: runningId, data: {} };
-      try {
-        await db.query(
-          "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
-          [runningId, sessionId, "AnthropicSessionRunning", runningEvt],
-        );
-        const { sc: natsCodec, nc: natsConn } = await import("../infra/nats.js");
-        const { eventSubject } = await import("@claw/protocol");
-        natsConn.publish(`sse.${eventSubject(sessionId)}`, natsCodec.encode(JSON.stringify(runningEvt)));
-      } catch (err) {
-        logger.warn({ err, sessionId }, "anthropic.session_status_running.publish_failed");
-      }
-    }
-
-    return reply.send({ data: [{ ...sentEvent, id: dispatch.messageId }] });
+    const sentEvent = { id: `evt_${Date.now()}`, type: "user.message", content: [{ type: "text", text: messageContent }], processed_at: new Date().toISOString() };
+    if (gate.kind === "queued") return reply.send({ data: [sentEvent] });
+    return await dispatchUserMessageTurn({
+      reply, sessionId, userId, user, messageContent, messageId: gate.messageId,
+      userEnv: gate.userEnv, pluginId, workspaceId, mcpServers, resources, sessionEnv, sentEvent,
+    });
   });
+}
 
+interface AnthropicEventStream {
+  subscription: SessionSubscription;
+  response: FastifyReply["raw"];
+  seenIds: Set<string>;
+  isCliClient: boolean;
+  closeAfterHistory: boolean;
+  keepAlive: NodeJS.Timeout;
+  write: (frame: string) => boolean;
+}
+
+async function openAnthropicEventStream(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  sessionId: string,
+  mcpToolPrefixes: string[],
+  turnRunningAtConnect: boolean,
+): Promise<AnthropicEventStream | null> {
+  const userAgent = String(req.headers["user-agent"] ?? "");
+  const isCliClient = CLI_STREAM_CLOSE_ON_IDLE
+    && (/Anthropic\/CLI/i.test(userAgent) || "x-stainless-cli-command" in req.headers);
+  const subscription = await createSessionSubscriptionReady(sessionId);
+  if (!subscription) return null;
+
+  reply.hijack();
+  const response = reply.raw;
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  response.flushHeaders();
+  const write = (frame: string): boolean => {
+    try { response.write(frame); return true; } catch { return false; }
+  };
+  const seenIds = new Set<string>();
+  const historyRows = (await db.query(
+    "SELECT event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
+    [sessionId],
+  )).rows;
+  for (const row of historyRows) {
+    const data = sanitizeSessionEvent(
+      (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},
+    );
+    const eventId = row.event_id as string;
+    const mappedEvents = mapPrimusEventToAnthropic(data, eventId, mcpToolPrefixes);
+    if (!mappedEvents.length) continue;
+    seenIds.add(eventId);
+    for (const mapped of mappedEvents) {
+      write(`id: ${mapped.id}\nevent: ${mapped.type}\ndata: ${JSON.stringify(mapped)}\n\n`);
+    }
+  }
+  const keepAlive = setInterval(() => {
+    try { response.write(": keepalive\n\n"); } catch { /* client gone */ }
+  }, 15_000);
+  req.raw.on("close", () => {
+    clearInterval(keepAlive);
+    subscription.close();
+  });
+  return {
+    subscription, response, seenIds, isCliClient,
+    closeAfterHistory: isCliClient && !turnRunningAtConnect,
+    keepAlive, write,
+  };
+}
+
+async function pumpAnthropicEventStream(
+  stream: AnthropicEventStream,
+  mcpToolPrefixes: string[],
+): Promise<void> {
+  try {
+    for await (const item of stream.subscription.eventsWithSeq()) {
+      if (!item) continue;
+      const liveId = `claw-${item.seq}`;
+      if (stream.seenIds.has(liveId)) continue;
+      const mappedEvents = mapPrimusEventToAnthropic(item.event, liveId, mcpToolPrefixes);
+      if (!mappedEvents.length) continue;
+      stream.seenIds.add(liveId);
+      let idleReached = false;
+      for (const mapped of mappedEvents) {
+        if (!stream.write(
+          `id: ${mapped.id}\nevent: ${mapped.type}\ndata: ${JSON.stringify(mapped)}\n\n`,
+        )) return;
+        if (stream.isCliClient && mapped.type === "session.status_idle") idleReached = true;
+      }
+      if (idleReached) return;
+    }
+  } catch { /* subscription ended or client disconnected */ }
+}
+
+function registerAnthropicStreamRoutes(app: FastifyInstance): void {
   // --- Stream Session Events (Primus native event -> Anthropic event, over SSE) ---
   // Real path is `/events/stream` (sub-path of the events resource), NOT
   // `/stream` directly on the session — confirmed against actual SDK request
@@ -1295,107 +1486,21 @@ export async function registerAnthropicManagedAgentsRoutes(app: FastifyInstance)
       return sendError(reply, 404, "not_found_error", "session not found");
     }
     const { mcpToolPrefixes } = readPrimusClawConfig(session.config);
-
-    // Detect the anthropic-cli client (never matches the JS/Go SDK or curl) so
-    // the idle-close workaround below stays scoped to it alone. See
-    // CLI_STREAM_CLOSE_ON_IDLE for why this is needed.
-    const userAgent = String(req.headers["user-agent"] ?? "");
-    const isCliClient = CLI_STREAM_CLOSE_ON_IDLE &&
-      (/Anthropic\/CLI/i.test(userAgent) || "x-stainless-cli-command" in req.headers);
-    // A turn is in flight iff agent_status is 'running' (set by events.send,
-    // cleared to 'idle' when the turn ends). Decides whether a CLI stream can
-    // close right after history replay (already idle) or must stay open until
-    // the running turn emits session.status_idle.
-    const turnRunningAtConnect = session.agent_status === "running";
-
-    // Eager-ready: the consumer must exist before we resolve the SDK's
-    // stream() promise, otherwise an events.send() called immediately after
-    // (the documented Quickstart order) can race the lazy consumer and drop
-    // the first agent.message. See events/store.ts::createSessionSubscriptionReady.
-    const subscription = await createSessionSubscriptionReady(sessionId);
-    if (!subscription) {
+    const stream = await openAnthropicEventStream(
+      req, reply, sessionId, mcpToolPrefixes, session.agent_status === "running",
+    );
+    if (!stream) {
       return sendError(reply, 503, "api_error", "failed to initialize event stream");
     }
-
-    reply.hijack();
-    const res = reply.raw;
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    res.flushHeaders();
-
-    const sseWrite = (frame: string): boolean => {
-      try { res.write(frame); return true; } catch { return false; }
-    };
-
-    const seenIds = new Set<string>();
-
-    const historyRows = (await db.query(
-      "SELECT event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
-      [sessionId],
-    )).rows;
-    for (const row of historyRows) {
-      const data = sanitizeSessionEvent(
-        (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},
-      );
-      const eid = row.event_id as string;
-      const mappedList = mapPrimusEventToAnthropic(data, eid, mcpToolPrefixes);
-      if (!mappedList.length) continue;
-      seenIds.add(eid);
-      for (const mapped of mappedList) {
-        sseWrite(`id: ${mapped.id}\nevent: ${mapped.type}\ndata: ${JSON.stringify(mapped)}\n\n`);
-      }
-    }
-
-    // Keepalive + cleanup-on-close mirror routes/events.ts exactly (v0.11
-    // design fix: without this the eager JetStream consumer above leaks on
-    // every stream() call once the client disconnects).
-    const keepAlive = setInterval(() => {
-      try { res.write(": keepalive\n\n"); } catch { /* client gone */ }
-    }, 15_000);
-
-    req.raw.on("close", () => {
-      clearInterval(keepAlive);
-      subscription.close();
-    });
-
-    // CLI workaround: if the session is already idle at connect time, the whole
-    // turn is in history (just replayed) and nothing live is coming — close now
-    // so the CLI's buffered iterator terminates and flushes. SDK/curl are never
-    // matched by isCliClient, so they keep the persistent stream.
-    if (isCliClient && !turnRunningAtConnect) {
-      clearInterval(keepAlive);
-      res.end();
+    if (stream.closeAfterHistory) {
+      clearInterval(stream.keepAlive);
+      stream.subscription.close();
+      stream.response.end();
       return reply;
     }
-
-    try {
-      for await (const item of subscription.eventsWithSeq()) {
-        if (!item) continue;
-        const { event: evt, seq } = item;
-        const liveId = `claw-${seq}`;
-        if (seenIds.has(liveId)) continue;
-        const mappedList = mapPrimusEventToAnthropic(evt, liveId, mcpToolPrefixes);
-        if (!mappedList.length) continue;
-        seenIds.add(liveId);
-        let ok = true;
-        let idleReached = false;
-        for (const mapped of mappedList) {
-          if (!sseWrite(`id: ${mapped.id}\nevent: ${mapped.type}\ndata: ${JSON.stringify(mapped)}\n\n`)) { ok = false; break; }
-          if (isCliClient && mapped.type === "session.status_idle") idleReached = true;
-        }
-        if (!ok) break;
-        // CLI workaround: end the stream once idle is delivered so the CLI
-        // flushes and exits instead of blocking on the next event forever.
-        if (idleReached) break;
-      }
-    } catch { /* subscription ended or client disconnected */ }
-
-    clearInterval(keepAlive);
-    res.end();
+    await pumpAnthropicEventStream(stream, mcpToolPrefixes);
+    clearInterval(stream.keepAlive);
+    stream.response.end();
     return reply;
   });
 }

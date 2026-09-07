@@ -167,7 +167,8 @@ export async function reapStaleTasks(): Promise<number> {
          -- turn a missing worker into a run that claims to be alive for hours.
          (lease_expires_at IS NULL
             AND started_at IS NOT NULL
-            AND started_at < NOW() - ($1::int * INTERVAL '1 second'))
+            AND started_at < NOW() - ($1::int * INTERVAL '1 second')
+            AND origin IS DISTINCT FROM 'a2a')
        )
      RETURNING task_id, session_id, dag_root_task_id, deadline_at, sandbox_workload_id`,
     [
@@ -751,7 +752,12 @@ async function closeUnclaimedDispatchSiblings(
   }
   if (!sessionIds.length) return;
   const r = await db.query(
-    `UPDATE claw_tasks t
+    `WITH prior AS (
+       SELECT task_id, status FROM claw_tasks
+        WHERE session_id = ANY($1::text[])
+          AND metadata->>'message_id' = ANY($2::text[])
+     )
+     UPDATE claw_tasks t
         SET status         = 'failed',
             failure_reason = 'dispatch_retried',
             error_message  = 'a retried dispatch opened this row a second time; the turn ran '
@@ -782,10 +788,12 @@ async function closeUnclaimedDispatchSiblings(
         -- and deliberately not claim_count, so the counter still separates the
         -- two: a spare no worker ever took is 0, a requeued row is at least 1.
         AND COALESCE(t.claim_count, 0) = 0
-      RETURNING t.task_id`,
+      RETURNING t.task_id,
+                (SELECT p.status FROM prior p WHERE p.task_id = t.task_id) AS prior_status`,
     [sessionIds, messageIds],
   );
   if (!r.rowCount) return;
+  metrics.onQueueExited("duplicate_closed", queuedExits(r.rows));
   logger.warn(
     { closed: r.rowCount, ids: r.rows.map((row) => (row as { task_id: string }).task_id) },
     "sweeper.closed_unclaimed_dispatch_siblings",
@@ -1452,6 +1460,7 @@ export async function reapWaitExternal(): Promise<number> {
  * joining them.
  */
 export async function reapStuckSessions(): Promise<number> {
+  const settled = await deliveryObservations();
   const r = await db.query(
     `UPDATE claw_sessions s
         SET agent_status = 'idle',
@@ -1469,10 +1478,16 @@ export async function reapStuckSessions(): Promise<number> {
            WHERE t.session_id = s.session_id
              AND t.origin = 'chat'
              AND t.status IN ('queued','preparing','running','cancelling')
-             AND (t.status = 'queued' OR t.lease_expires_at > NOW())
+             AND (
+               t.status = 'queued'
+               OR t.lease_expires_at > NOW()
+               OR NOT COALESCE((
+                 ${noDeliveryInFlightSql("false", deliverySettledSql("$2", "$3"))}
+               ), false)
+             )
         )
       RETURNING session_id`,
-    [SESSION_STUCK_TIMEOUT_SEC],
+    [SESSION_STUCK_TIMEOUT_SEC, settled.wholeStream, settled.ackFloor],
   );
   if (!r.rowCount) return 0;
   const ids = r.rows.map((row) => (row as { session_id: string }).session_id);

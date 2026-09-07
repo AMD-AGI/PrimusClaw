@@ -18,7 +18,8 @@ import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
 import {
-  anySoftCeilingSet, deferQueuedBySoftCeiling, envAdmitLimits, runImmediately,
+  anySoftCeilingSet, askFromRow, chargeAccepted, deferQueuedBySoftCeiling, envAdmitLimits,
+  fillWithinCeiling, loadUsageWithRoots, runImmediately, softOverflow,
   withOwnedAdmissionLock, type AfterCommit,
 } from "./admission.js";
 import { metrics } from "../infra/metrics.js";
@@ -150,6 +151,14 @@ export async function claimRunById(
 ): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim> {
   const taken = await takeUnderSoftCeiling(taskId, brainId, doorbellSemantics, q);
   if (taken === "missing" || taken === "busy" || taken === "deferred") return taken;
+  return await finishClaim(taken, taskId, brainId);
+}
+
+async function finishClaim(
+  taken: TakenRow,
+  taskId: string,
+  brainId: string,
+): Promise<ClaimedRun | "busy" | "unclaimable" | ExhaustedClaim> {
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
     const closed = await failExhaustedClaim(taken);
     if (!closed) {
@@ -201,10 +210,26 @@ export async function claimNextRun(
   const skip: string[] = [];
   let failedAttempts = 0;
   while (failedAttempts < CLAIM_NEXT_ATTEMPTS) {
-    const taskId = await peekNextQueued(skip, doorbellSemantics);
-    if (!taskId) {
-      if (diag) diag.outcome = skip.length ? "all_skipped" : "empty";
-      return null;
+    let taskId: string;
+    let taken: TakenRow | "missing" | "busy" | undefined;
+    const softGated = anySoftCeilingSet(envAdmitLimits());
+    if (softGated) {
+      const selected = await takeNextWithinSoftCeiling(
+        brainId, doorbellSemantics, skip, diag,
+      );
+      if (!selected) {
+        if (diag) diag.outcome = diag.skipped.length || skip.length ? "all_skipped" : "empty";
+        return null;
+      }
+      taskId = selected.taskId;
+      taken = selected.taken;
+    } else {
+      const nextTaskId = await peekNextQueued(skip, doorbellSemantics);
+      if (!nextTaskId) {
+        if (diag) diag.outcome = skip.length ? "all_skipped" : "empty";
+        return null;
+      }
+      taskId = nextTaskId;
     }
     // A hydrate failure that is not about credentials is rethrown by
     // claimRunById, and it used to leave through here: no catch on this loop
@@ -215,7 +240,9 @@ export async function claimNextRun(
     // ordinary database blip reaches here.
     let claimed: Awaited<ReturnType<typeof claimRunById>>;
     try {
-      claimed = await claimRunById(taskId, brainId, doorbellSemantics);
+      claimed = softGated
+        ? (typeof taken === "string" ? taken : await finishClaim(taken!, taskId, brainId))
+        : await claimRunById(taskId, brainId, doorbellSemantics);
     } catch (err) {
       logger.warn({ err, taskId, brainId }, "run.claim_next.skipped_after_error");
       diag?.skipped.push({ cause: "error" });
@@ -223,18 +250,53 @@ export async function claimNextRun(
       failedAttempts++;
       continue;
     }
-    if (typeof claimed === "string" || "kind" in claimed) {
-      const cause = skipCauseOf(claimed);
-      diag?.skipped.push(cause);
-      skip.push(taskId);
-      if (cause.cause !== "deferred") failedAttempts++;
-      continue;
+    if (typeof claimed !== "string" && !("kind" in claimed)) {
+      if (diag) diag.outcome = "claimed";
+      return claimed;
     }
-    if (diag) diag.outcome = "claimed";
-    return claimed;
+    const cause = skipCauseOf(claimed);
+    diag?.skipped.push(cause);
+    skip.push(taskId);
+    if (cause.cause !== "deferred") failedAttempts++;
   }
   if (diag) diag.outcome = "retry_limit";
   return null;
+}
+
+async function takeNextWithinSoftCeiling(
+  brainId: string,
+  doorbellSemantics: number,
+  alreadySkipped: readonly string[],
+  diag?: ClaimNextDiagnostics,
+): Promise<{ taskId: string; taken: TakenRow | "missing" | "busy" } | null> {
+  const limits = envAdmitLimits();
+  return await withOwnedAdmissionLock(async (client, afterCommit) => {
+    const { usage, roots } = await loadUsageWithRoots("executing", client);
+    const accepted = await fillWithinCeiling<ClawTaskRow>({
+      page: (skip) => peekNextQueuedRows(
+        [...alreadySkipped, ...skip], doorbellSemantics, client,
+      ),
+      fits: (row) => {
+        const ask = askFromRow(row, roots);
+        if (softOverflow(usage, ask, limits)) {
+          diag?.skipped.push({ cause: "deferred" });
+          return false;
+        }
+        chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
+        return true;
+      },
+      want: 1,
+      idOf: (row) => row.task_id,
+    });
+    const row = accepted[0];
+    if (!row) return null;
+    const taken = await takeClaimOrBusy(row.task_id, brainId, doorbellSemantics, client);
+    if (typeof taken !== "string" && taken.prior_status === "queued") {
+      const since = taken.queued_since ?? null;
+      afterCommit(() => metrics.observeQueueExit("chat", since, "claimed"));
+    }
+    return { taskId: row.task_id, taken };
+  });
 }
 
 /**
@@ -287,6 +349,31 @@ async function peekNextQueued(skip: string[], doorbellSemantics: number): Promis
     [skip, doorbellSemantics],
   );
   return (r.rows[0] as { task_id?: string } | undefined)?.task_id ?? null;
+}
+
+async function peekNextQueuedRows(
+  skip: string[],
+  doorbellSemantics: number,
+  q: Querier,
+): Promise<ClawTaskRow[]> {
+  const r = await q.query(
+    `SELECT * FROM claw_tasks
+      WHERE status = 'queued'
+        AND origin = 'chat'
+        AND executor = 'brain'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+        AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$2")}
+        AND NOT (task_id = ANY($1::text[]))
+      ORDER BY
+        priority DESC,
+        COALESCE(queued_at, created_at) ASC,
+        created_at ASC
+      LIMIT 1`,
+    [skip, doorbellSemantics],
+  );
+  return r.rows as ClawTaskRow[];
 }
 
 async function markUnclaimable(taskId: string): Promise<void> {

@@ -50,7 +50,7 @@ function stubDb(
     if (sql.startsWith("UPDATE claw_tasks SET")) {
       return { rows: reaped, rowCount: reaped.length };
     }
-    if (sql.startsWith("UPDATE claw_tasks t SET")) {
+    if (/UPDATE claw_tasks t SET/.test(sql)) {
       return { rows: closed, rowCount: closed.length };
     }
     if (sql.startsWith("UPDATE claw_sessions")) {
@@ -76,7 +76,7 @@ function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
 
 /** The statement that closes the rows a retried dispatch left unclaimed. */
 function siblingClose(seen: SeenQuery[]): SeenQuery | undefined {
-  return seen.find((q) => q.sql.startsWith("UPDATE claw_tasks t SET"));
+  return seen.find((q) => /UPDATE claw_tasks t SET/.test(q.sql));
 }
 
 test("a conversation whose run was given up on can be spoken to again", async () => {
@@ -211,7 +211,7 @@ test("the gate is released after the spare row is closed, not before", async () 
   const seen = stubDb([CHAT_RUN]);
   await reapLostLeases();
 
-  const closeAt = seen.findIndex((q) => q.sql.startsWith("UPDATE claw_tasks t SET"));
+  const closeAt = seen.findIndex((q) => /UPDATE claw_tasks t SET/.test(q.sql));
   const releaseAt = seen.findIndex((q) => q.sql.includes("UPDATE claw_sessions"));
   assert.ok(closeAt >= 0 && releaseAt >= 0);
   assert.ok(closeAt < releaseAt, "releasing first releases nothing");

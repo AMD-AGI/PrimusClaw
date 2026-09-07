@@ -159,6 +159,16 @@ function harness(opts: {
       rec.sql.push({ text, params });
       return { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 };
     }
+    if (/SELECT status, failure_reason/.test(text)) {
+      rec.calls.push("inspect-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [], rowCount: 0 };
+    }
+    if (/SET dispatch_task_id = NULL/.test(text)) {
+      rec.calls.push("clear-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [{ id: params[0] }], rowCount: 1 };
+    }
     const isDelete = /DELETE/.test(text);
     const step = /dispatch_compensation/.test(text)
       ? "arm-publish"
@@ -491,7 +501,8 @@ test("P7 a published turn clears the queue row, then marks the session running",
     // The receipt saying a message may exist is durable before the publish
     // that may create one; the sequence naming that message lands after it.
     [
-      "lookup", "bind", "open", "arm-publish", "publish", "record-seq",
+      "lookup", "bind", "reserve-handoff", "inspect-handoff", "clear-handoff",
+      "open", "arm-publish", "publish", "record-seq",
       "delete-pending", "mark-running",
     ],
   );
@@ -522,7 +533,10 @@ test("P8 a row that could not be opened does not publish", async () => {
 
   assert.equal(rec.published.length, 0, "an untracked message is worse than a retry");
   assert.ok(!rec.calls.includes("delete-pending"), "the queue row stays for the retry");
-  assert.deepEqual(rec.calls, ["lookup", "bind", "open"]);
+  assert.deepEqual(
+    rec.calls,
+    ["lookup", "bind", "reserve-handoff", "inspect-handoff", "clear-handoff", "open"],
+  );
 });
 
 test("P9 a turn that cannot be serialised is a publish that certainly failed", async () => {

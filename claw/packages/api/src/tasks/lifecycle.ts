@@ -15,7 +15,8 @@ import { metrics } from "../infra/metrics.js";
 import type { PoolClient } from "pg";
 import pino from "pino";
 import {
-  acquireAdmissionLock, askFromRow, decideAdmission, type AdmissionRefusal,
+  acquireAdmissionLock, anyAdmissionCeilingSet, askFromRow, decideAdmission, envAdmitLimits,
+  withOwnedAdmissionLock, type AdmissionRefusal,
 } from "./admission.js";
 import { cancelUnheldFatRun } from "./chat-run.js";
 import { getTask, transitionStatus, updateTask } from "./db.js";
@@ -184,16 +185,16 @@ async function transitionCancellation(
     `WITH prior AS (
        SELECT * FROM claw_tasks
         WHERE task_id = $1
-          AND status IN ('waiting_deps','waiting_external','queued','preparing','running')
+          AND status = ANY($2::text[])
         FOR UPDATE
      ), updated AS (
        UPDATE claw_tasks t
           SET status = CASE
-                WHEN prior.status IN ('preparing','running') THEN 'cancelling'
-                ELSE 'cancelled'
+                WHEN prior.status = ANY($3::text[]) THEN $4
+                ELSE $5
               END,
               completed_at = CASE
-                WHEN prior.status IN ('preparing','running') THEN t.completed_at
+                WHEN prior.status = ANY($3::text[]) THEN t.completed_at
                 ELSE NOW()
               END
          FROM prior
@@ -204,7 +205,13 @@ async function transitionCancellation(
             prior.metadata->>'dispatch' AS prior_dispatch,
             prior.metadata->>'queued_since' AS prior_queued_since
        FROM updated JOIN prior USING (task_id)`,
-    [taskId],
+    [
+      taskId,
+      ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
+      ["preparing", "running"],
+      "cancelling",
+      "cancelled",
+    ],
   );
   return (r.rows[0] as CancellationTransition | undefined) ?? null;
 }
@@ -317,7 +324,10 @@ export type RetryResult =
   | AdmissionRefusal;
 
 export async function retryTask(taskId: string, client?: PoolClient): Promise<RetryResult> {
-  const task = await getTask(taskId);
+  if (!client && anyAdmissionCeilingSet(envAdmitLimits())) {
+    return await withOwnedAdmissionLock((ownedClient) => retryTask(taskId, ownedClient));
+  }
+  const task = await getTask(taskId, client);
   if (!task) return { ok: false };
   if (task.status !== "failed" && task.status !== "cancelled") return { ok: false };
   // Chat rows are a turn's shadow, not a job the caller retries. Cloning one
@@ -337,7 +347,7 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
   // before the `int4` bound would otherwise re-enter the fleet through retry.
   if (topologyErrors(task.input as Record<string, unknown> | null)) return { ok: false };
 
-  await acquireAdmissionLock(client ?? db);
+  await acquireAdmissionLock(client);
   const decision = await decideAdmission(askFromRow(task, new Set()), client ?? db);
   if (decision.kind === "reject") return { admitted: false, reason: decision.reason };
 

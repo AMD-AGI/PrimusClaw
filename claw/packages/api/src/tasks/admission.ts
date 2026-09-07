@@ -470,8 +470,11 @@ export function anySoftCeilingSet(limits: AdmitLimits): boolean {
  * statement after `BEGIN`: every path taking both this and a `claw_sessions`
  * row lock takes this one first, or two requests holding one each deadlock.
  */
-export async function acquireAdmissionLock(client: StatementRunner): Promise<void> {
+export async function acquireAdmissionLock(client?: PoolClient): Promise<void> {
   if (!anyAdmissionCeilingSet(envAdmitLimits())) return;
+  if (!client) {
+    throw new Error("admission lock requires a transaction client when a ceiling is enabled");
+  }
   await client.query("SELECT pg_advisory_xact_lock($1)", [ADMISSION_LOCK_KEY]);
 }
 

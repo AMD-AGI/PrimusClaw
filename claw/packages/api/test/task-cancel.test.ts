@@ -43,9 +43,8 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
     }
     if (sql.startsWith("WITH prior AS") && /UPDATE claw_tasks t SET status/.test(sql)) {
       const metadata = task.metadata as Record<string, unknown> | undefined;
-      const status = task.status === "preparing" || task.status === "running"
-        ? "cancelling"
-        : "cancelled";
+      const executing = params[2] as string[];
+      const status = executing.includes(String(task.status)) ? params[3] : params[4];
       return {
         rows: [{
           ...task,
@@ -79,9 +78,9 @@ test("cancelling a running task hands it to Brain instead of closing it", async 
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
   assert.ok(transition);
-  assert.match(
-    transition!.sql,
-    /WHEN prior.status IN \('preparing','running'\) THEN 'cancelling'/,
+  assert.equal(
+    transition!.params[3],
+    "cancelling",
     "a running row must not be marked terminal while Brain and its sandbox are still live",
   );
   // The interrupt is published against the DAG root, which is also the key Brain
@@ -112,10 +111,10 @@ test("a queued task is closed outright, since nothing is executing yet", async (
   await cancelTask("t-mid");
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
-  assert.match(transition!.sql, /ELSE 'cancelled'/);
-  assert.match(
-    transition!.sql,
-    /status IN \('waiting_deps','waiting_external','queued','preparing','running'\)/,
+  assert.equal(transition!.params[4], "cancelled");
+  assert.deepEqual(
+    transition!.params[1],
+    ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
     "the write decides from the status it locks, including a concurrent start",
   );
 });
@@ -131,9 +130,9 @@ test("a preparing task is handed to Brain too, because it may already be executi
   const r = await cancelTask("t-mid");
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
-  assert.match(
-    transition!.sql,
-    /WHEN prior.status IN \('preparing','running'\) THEN 'cancelling'/,
+  assert.equal(
+    transition!.params[3],
+    "cancelling",
     "a preparing row may be executing, so it must wait for Brain to acknowledge",
   );
   assert.equal(r.interrupt_key, "t-root");

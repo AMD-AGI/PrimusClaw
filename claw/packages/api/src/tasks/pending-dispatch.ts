@@ -43,7 +43,7 @@ import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import {
   failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
-  takeSessionGate,
+  SWEEPABLE_RUN_STATUSES, takeSessionGate,
 } from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
 import { newTaskId } from "./ids.js";
@@ -491,16 +491,23 @@ export async function dispatchPendingMessage(
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
 
+  const handoff = await preparePendingHandoff(input);
+  if (handoff.kind === "settled") return handoff.result;
+
   const doorbellToken = pendingDispatchPorts.doorbellDispatch();
   if (doorbellToken) {
     // The token is released when this dispatch stops being able to publish a
     // doorbell, on every path out -- the publish resolving, the publish
     // throwing and its compensation returning, or any early return between.
     try {
-      return await finishPendingDoorbell(input, task);
+      return await finishPendingDoorbell(input, task, handoff.taskId);
     } finally {
       doorbellToken.release();
     }
+  }
+
+  if (!await clearReservedDispatchTaskId(input.pendingId, handoff.taskId)) {
+    return handedOffElsewhere(input);
   }
 
   if (!task.user_env || typeof task.user_env !== "object" || !Object.keys(task.user_env).length) {
@@ -574,6 +581,8 @@ export async function dispatchPendingMessage(
       await pendingDispatchPorts.failChatRunDispatch(
         run.taskId,
         String((err as Error)?.message ?? err),
+        undefined,
+        { statuses: SWEEPABLE_RUN_STATUSES },
       );
     }
     throw err; // bubble up so the outer event-consumer nak'd retry can rerun
@@ -638,6 +647,20 @@ async function recordedHandoffState(
     : "consumed";
 }
 
+async function clearReservedDispatchTaskId(
+  pendingId: unknown,
+  taskId: string,
+): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_pending_messages
+        SET dispatch_task_id = NULL
+      WHERE id = $1 AND dispatch_task_id = $2
+      RETURNING id`,
+    [pendingId, taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 /**
  * Stand down: the queue row this drain was assembling is already gone.
  *
@@ -654,37 +677,47 @@ function handedOffElsewhere(input: PendingDispatchInput): PendingDispatchResult 
   return { runId: null };
 }
 
+type PreparedPendingHandoff =
+  | { kind: "ready"; taskId: string }
+  | { kind: "settled"; result: PendingDispatchResult };
+
+async function preparePendingHandoff(
+  input: PendingDispatchInput,
+): Promise<PreparedPendingHandoff> {
+  let handoffId = await reserveDispatchTaskId(input.pendingId);
+  if (!handoffId) return { kind: "settled", result: handedOffElsewhere(input) };
+  while (true) {
+    const recorded = await recordedHandoffState(handoffId);
+    if (recorded === "retryable") {
+      if (!await clearReservedDispatchTaskId(input.pendingId, handoffId)) {
+        return { kind: "settled", result: handedOffElsewhere(input) };
+      }
+      handoffId = await reserveDispatchTaskId(input.pendingId);
+      if (!handoffId) return { kind: "settled", result: handedOffElsewhere(input) };
+      continue;
+    }
+    if (recorded === "open" || recorded === "consumed") {
+      await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
+      forgetUncountedAttempts(input.pendingId);
+      if (recorded === "open") await takeSessionGate(input.sessionId, input.messageId);
+      logger.info(
+        { sessionId: input.sessionId, pendingId: input.pendingId, taskId: handoffId, recorded },
+        "pending.handoff_already_recorded",
+      );
+      return {
+        kind: "settled",
+        result: { runId: recorded === "open" ? handoffId : null },
+      };
+    }
+    return { kind: "ready", taskId: handoffId };
+  }
+}
+
 async function finishPendingDoorbell(
   input: PendingDispatchInput,
   task: Record<string, unknown>,
+  handoffId: string,
 ): Promise<PendingDispatchResult> {
-  let handoffId = await reserveDispatchTaskId(input.pendingId);
-  if (!handoffId) return handedOffElsewhere(input);
-  const recorded = await recordedHandoffState(handoffId);
-  if (recorded === "retryable") {
-    // Terminal as a failed dispatch with no claim ever taken proves nothing
-    // executed under that id, so the turn is still owed -- but the id itself is
-    // spent, and reopening under it would collide with the row it names.
-    await db.query(
-      "UPDATE claw_pending_messages SET dispatch_task_id = NULL WHERE id = $1 AND dispatch_task_id = $2",
-      [input.pendingId, handoffId],
-    );
-    handoffId = await reserveDispatchTaskId(input.pendingId);
-    if (!handoffId) return handedOffElsewhere(input);
-  }
-  if (recorded === "open" || recorded === "consumed") {
-    // The recorded run already owns this message. Publishing again would be a
-    // second wakeup for a turn that has one, or a second turn for one that is
-    // over.
-    await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
-    forgetUncountedAttempts(input.pendingId);
-    if (recorded === "open") await takeSessionGate(input.sessionId, input.messageId);
-    logger.info(
-      { sessionId: input.sessionId, pendingId: input.pendingId, taskId: handoffId, recorded },
-      "pending.handoff_already_recorded",
-    );
-    return { runId: recorded === "open" ? handoffId : null };
-  }
   const result = await handOffAssembledRun({
     taskId: handoffId,
     path: "pending",
@@ -699,7 +732,12 @@ async function finishPendingDoorbell(
     sandboxImage: input.sandboxImage,
     publish: (subject, payload, msgId) => pendingDispatchPorts.publish(subject, payload, msgId),
     openRun: pendingDispatchPorts.openChatRun,
-    failRun: pendingDispatchPorts.failChatRunDispatch,
+    failRun: (taskId, reason, failureReason) => pendingDispatchPorts.failChatRunDispatch(
+      taskId,
+      reason,
+      failureReason,
+      { statuses: SWEEPABLE_RUN_STATUSES },
+    ),
     admit: pendingDispatchPorts.admit,
   });
   if (result.kind === "open_failed") {
