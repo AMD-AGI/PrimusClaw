@@ -421,26 +421,43 @@ export function registeredSandboxCount(sessionId: string): number {
 }
 
 /**
- * Whether the idle-opening write conditioned on `revision` is what the entry holds.
+ * Whose idle-opening write the entry holds, after an update rejected without
+ * saying whether it committed.
  *
  * A rejected update is not the same as a write that did not happen: the bucket
  * can commit and then lose the acknowledgement, and reporting `failed` for that
  * tells the caller a handle is unparked while the sweep is already reading it as
- * parked. `idleRev` settles which of the two it was without guessing -- it holds
- * the revision the write was conditioned on, and the bucket accepts one write
- * per revision, so no other parker can have left this value behind.
+ * parked.
  *
- * A re-read that itself fails answers false: unverified stays `failed`, which is
- * the conservative direction the caller already handles.
+ * The two signals prove different things and neither is spare. `idleRev` holds
+ * the revision a write was conditioned on, and the bucket accepts one write per
+ * revision, so finding this call's own revision there proves an idle-opening
+ * write conditioned on it landed -- but not whose, because every parker racing
+ * from the same read conditions on that revision and writes that same number.
+ * The payload is what names the writer: it carries this call's own `idleSince`,
+ * which a sibling starting from the same entry matches only by stamping the same
+ * millisecond, and two writes that agree to the millisecond are byte-identical
+ * and leave nothing for the distinction to be about.
+ *
+ * A sibling's write is `superseded`, not `failed`: the handle is parked either
+ * way and only the authorship differs, so `failed` would report a pod the fleet
+ * is still pinging when it has already been put away.
  */
-async function idleWriteLanded(kv: KV, kvKey: string, revision: number): Promise<boolean> {
+async function idleWriteOutcome(
+  kv: KV,
+  kvKey: string,
+  attempted: string,
+  revision: number,
+): Promise<"parked" | "superseded" | "unverified"> {
   try {
     const latest = await kv.get(kvKey);
-    if (!latest) return false;
-    const info = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
-    return info.keepalive === false && info.idleRev === revision;
+    if (!latest) return "unverified";
+    const stored = sc.decode(latest.value);
+    if (stored === attempted) return "parked";
+    const info = JSON.parse(stored) as HandsKvEntry;
+    return info.idleRev === revision ? "superseded" : "unverified";
   } catch {
-    return false;
+    return "unverified";
   }
 }
 
@@ -513,11 +530,15 @@ export function markHandsIdle(
       // then refreshes its TTL for the whole reuse window rather than letting
       // it expire -- so the deleted session's platformKey and workload id would
       // outlive it by 15 minutes.
+      const payload = JSON.stringify(info);
       try {
-        await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
+        await kv.update(kvKey, sc.encode(payload), entry.revision);
       } catch (err) {
-        if (isRevisionConflict(err) || !await idleWriteLanded(kv, kvKey, entry.revision)) throw err;
-        logger.info({ sessionId }, "hands.mark_idle_ack_lost");
+        if (isRevisionConflict(err)) throw err;
+        const landed = await idleWriteOutcome(kv, kvKey, payload, entry.revision);
+        if (landed === "unverified") throw err;
+        logger.info({ sessionId, landed }, "hands.mark_idle_ack_lost");
+        return { outcome: landed };
       }
       return { outcome: "parked" };
     })

@@ -289,10 +289,45 @@ test("a write whose acknowledgement is lost is reported as the park it was", asy
   assert.equal(stored.idleRev, REVISION, "the write this call was conditioned on is what landed");
 });
 
-test("another parker's write is not claimed as this call's", async () => {
-  // Same lost acknowledgement, except the value on the key was opened by a
-  // different idle period -- so this call's write did not land, and reporting
-  // `parked` would credit it with somebody else's.
+test("a sibling that won the same revision is not claimed as this call's write", async () => {
+  // The race the revision alone cannot see: two replicas run the same teardown,
+  // both read revision 7, and both build a payload naming it. One wins; this
+  // one's request dies with a transport error that is not a revision conflict,
+  // so it re-reads and finds `idleRev: 7` -- its own number, somebody else's
+  // write. `superseded` rather than `failed` because the handle is parked, and
+  // rather than `parked` because this call is not what parked it.
+  const sibling = {
+    status: "ready", workloadId: "w1", keepalive: false,
+    idleSince: 1000, idleEpoch: 1000, idleRev: REVISION,
+  };
+  let attempted = false;
+  const kv = {
+    async get(key: string) {
+      return {
+        key,
+        value: sc.encode(JSON.stringify(
+          attempted ? sibling : { status: "ready", workloadId: "w1" },
+        )),
+        revision: REVISION,
+      };
+    },
+    async update() {
+      attempted = true;
+      throw new Error("CONNECTION_CLOSED");
+    },
+  } as unknown as KV;
+
+  assert.equal(
+    (await markHandsIdle(kv, SID, "w1")).outcome,
+    "superseded",
+    "this call stored nothing, so it may not report the park as its own",
+  );
+});
+
+test("a park nobody performed is still reported as failed", async () => {
+  // The conservative end of the same branch: the update was rejected, and the
+  // entry carries no idle-opening write conditioned on this call's revision, so
+  // there is no evidence the pod was put away by anyone.
   const kv = {
     async get(key: string) {
       return {
