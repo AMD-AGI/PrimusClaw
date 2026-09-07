@@ -20,7 +20,7 @@ import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } f
 import { latchRosterStale, markRosterStale, releaseAdmission } from "./admission.js";
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
-import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { sessionIdFromHandsKey } from "./hands-key.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -143,12 +143,32 @@ function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
     : `${sessionId}:safe:${entry.workloadId || ""}`;
 }
 
+/**
+ * Delete the binding this decision was taken on.
+ *
+ * Not a key re-derived from the session id: during a rolling upgrade the
+ * binding can sit under the legacy name, and the canonical key can hold a
+ * different generation of the same session -- so re-deriving either leaves the
+ * orphan behind or deletes a live sibling.
+ */
+async function deleteExpiredRetryRecord(
+  kv: KV, sessionId: string, recordKey?: string,
+): Promise<void> {
+  const key = recordKey
+    ?? (await readHandsEntry(kv, sessionId).catch(() => null))?.key;
+  if (!key) return;
+  await kv.delete(key).catch((err) => logger.warn(
+    { err: String(err), sessionId, key }, "keepalive.retry_pending_record_not_deleted",
+  ));
+}
+
 /** Drop orphaned READY sandboxes when a retryable attempt was never redelivered. */
 async function shouldSkipExpiredRetry(
   deps: KeepaliveDeps,
   sessionId: string,
   source: "local" | "kv",
   entry?: SandboxEntry,
+  recordKey?: string,
 ): Promise<boolean> {
   const pending = await getRetryPending(deps.kv, sessionId);
   const nowMs = Date.now();
@@ -174,7 +194,7 @@ async function shouldSkipExpiredRetry(
   }
 
   unregisterSandbox(sessionId, entry);
-  await deps.kv.delete(handsSessionKey(sessionId)).catch(() => {});
+  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey);
   await clearRetryPending(deps.kv, sessionId, pending.lockKey);
   logger.warn(
     {
@@ -967,7 +987,7 @@ async function collectTargets(
           namespace: info.namespace,
           userId: info.userId,
         };
-        if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry)) continue;
+        if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry, key)) continue;
 
         // Renew the record here rather than after the ping it is waiting for.
         // Pings run bounded and in turn, and one can take its whole command

@@ -20,7 +20,9 @@ import { StringCodec, type KV } from "nats";
 import { handsSessionKey, legacyHandsKey } from "../src/sandbox/hands-key.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { readHandsProbeEntry } from "../src/sandbox/container-probe.js";
-import { markHandsIdle } from "../src/sandbox/keepalive.js";
+import { markHandsIdle, runKeepaliveTickForTest } from "../src/sandbox/keepalive.js";
+import { markRetryPending } from "../src/tasks/retry-pending.js";
+import { filterToRegExp } from "./nats-kv-stub.js";
 
 const sc = StringCodec();
 
@@ -51,15 +53,29 @@ interface Writes {
  * A bucket holding the binding under `held` only. Every other key answers
  * absent, so a caller that derives its own key is caught rather than served.
  */
-function kvHolding(held: string, value: unknown = BINDING): { kv: KV; writes: Writes } {
+type SeedableKv = KV & { seed(key: string, value: string): void };
+
+function kvHolding(held: string, value: unknown = BINDING): { kv: SeedableKv; writes: Writes } {
   const writes: Writes = { updated: [], deleted: [] };
   const store = new Map<string, { value: Uint8Array; revision: number }>([
     [held, { value: sc.encode(JSON.stringify(value)), revision: REVISION }],
   ]);
   const kv = {
+    seed(key: string, raw: string) {
+      store.set(key, { value: sc.encode(raw), revision: REVISION });
+    },
     async get(key: string) {
       const found = store.get(key);
       return found ? { key, value: found.value, revision: found.revision } : null;
+    },
+    async keys(filter = ">") {
+      const re = filterToRegExp(filter);
+      const matched = [...store.keys()].filter((k) => re.test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async put(key: string, v: Uint8Array) {
+      store.set(key, { value: v, revision: REVISION });
+      return REVISION;
     },
     async update(key: string, value: Uint8Array, revision: number) {
       const found = store.get(key);
@@ -74,7 +90,7 @@ function kvHolding(held: string, value: unknown = BINDING): { kv: KV; writes: Wr
       writes.deleted.push(key);
       store.delete(key);
     },
-  } as unknown as KV;
+  } as unknown as SeedableKv;
   return { kv, writes };
 }
 
@@ -128,4 +144,46 @@ test("idle parking leaves a binding for a different workload alone", async () =>
   await settle();
 
   assert.deepEqual(writes.updated, []);
+});
+
+test("an expired retry deletes the record it examined, not a re-derived key", async () => {
+  // The sweep drops an orphaned READY sandbox when the retry that owned it was
+  // never redelivered. Deleting a key re-derived from the session id leaves the
+  // legacy record behind -- so the next sweep finds it, pings a workload nobody
+  // is coming back for, and the sandbox is held open indefinitely.
+  const { kv, writes } = kvHolding(LEGACY_KEY);
+  bindHandsKv(kv);
+  await markRetryPending(kv, {
+    sessionId: SESSION_ID,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: "wl-1",
+  });
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.deepEqual(writes.deleted.filter((k) => k.startsWith("hands.")), [LEGACY_KEY],
+    "the orphaned record was left behind and a re-derived key deleted instead");
+});
+
+test("an expired retry leaves a canonical sibling of another generation alone", async () => {
+  // Both keys present, the binding under the legacy name. Re-deriving the
+  // canonical key here does not merely miss -- it deletes a different, live
+  // generation of the same session.
+  const { kv, writes } = kvHolding(LEGACY_KEY);
+  kv.seed(CANONICAL_KEY, JSON.stringify({ ...BINDING, workloadId: "wl-newer" }));
+  bindHandsKv(kv);
+  await markRetryPending(kv, {
+    sessionId: SESSION_ID,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: "wl-1",
+  });
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.ok(!writes.deleted.includes(CANONICAL_KEY),
+    "a live sibling generation was deleted by a key re-derived from the session id");
 });
