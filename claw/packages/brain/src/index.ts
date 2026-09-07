@@ -522,6 +522,8 @@ async function initializeInfrastructure(): Promise<JetStreamManager> {
   bindTaskRunnerDeps({ kv, kvCkpt, emitter, engine });
   let kvTombstones: KV | undefined;
   try {
+    // views.kv creates or attaches; without bindOnly, brain-first boot creates max_age=0 (no expiry).
+    // The API refuses to narrow that bucket later, so bindOnly prevents permanent tombstone growth.
     kvTombstones = await js.views.kv(BRAIN_TOMBSTONES_BUCKET, { bindOnly: true });
   } catch (e) {
     logger.warn(
