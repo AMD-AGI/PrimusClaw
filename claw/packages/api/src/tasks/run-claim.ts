@@ -370,7 +370,9 @@ export async function releaseClaim(
       RETURNING task_id`,
     [taskId, brainId, claimCount ?? null, reason ?? null],
   );
-  return (r.rowCount ?? 0) > 0;
+  const released = (r.rowCount ?? 0) > 0;
+  if (released) metrics.onQueueEntered("requeue");
+  return released;
 }
 
 /**

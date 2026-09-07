@@ -315,6 +315,18 @@ export async function publishDoorbell(
   // The chat message id is a millisecond stamp with no session component and
   // the duplicate window spans the whole stream, so the raw id would drop one
   // of two turns dispatched in the same millisecond by different sessions.
-  await publish(taskSubject(), JSON.stringify(doorbell), doorbellDedupId(sessionId, messageId));
+  await publishRunMessage(() =>
+    publish(taskSubject(), JSON.stringify(doorbell), doorbellDedupId(sessionId, messageId)));
   logger.info({ taskId, sessionId, messageId }, "run.doorbell_published");
+}
+
+export async function publishRunMessage<T>(publish: () => Promise<T>): Promise<T> {
+  try {
+    const result = await publish();
+    metrics.onMessageDispatched("ok");
+    return result;
+  } catch (err) {
+    metrics.onMessageDispatched("error");
+    throw err;
+  }
 }

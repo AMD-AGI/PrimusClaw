@@ -47,7 +47,7 @@ import {
 } from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
 import { newTaskId } from "./ids.js";
-import { handOffAssembledRun } from "./run-dispatch.js";
+import { handOffAssembledRun, publishRunMessage } from "./run-dispatch.js";
 import { injectLiveUserEnv } from "./run-claim.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 
@@ -545,9 +545,9 @@ export async function dispatchPendingMessage(
     // Published under the queued row's id, so a drain that reaches this line
     // twice puts one task on the stream rather than two.
     publishAttempted = true;
-    const seq = await pendingDispatchPorts.publish(
+    const seq = await publishRunMessage(() => pendingDispatchPorts.publish(
       subject, payload, doorbellDedupId(sessionId, input.messageId),
-    );
+    ));
     await recordDispatchSeq(run.taskId, seq);
   } catch (err) {
     // `certain` says whether the run row was torn down, which is the difference

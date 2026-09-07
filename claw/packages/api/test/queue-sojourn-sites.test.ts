@@ -123,6 +123,19 @@ test("a Stop records the rows it took off the queue", async () => {
   );
 });
 
+test("a task cancellation records a queued doorbell leaving the queue", async () => {
+  const { cancelTask } = await import("../src/tasks/lifecycle.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "cancelled-by-id", "s1", {
+    status: "queued", dispatch: "doorbell", messageId: "m-cancelled-by-id",
+  });
+
+  assert.equal(
+    await delta(() => cancelTask("cancelled-by-id"), EXITED, { outcome: "cancelled" }),
+    1,
+  );
+});
+
 test("a dispatch that fails before execution records its own exit", async () => {
   const { failChatRunDispatch } = await import("../src/tasks/chat-run.js");
   await seedSession(h, "s1");

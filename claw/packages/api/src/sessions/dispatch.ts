@@ -22,9 +22,8 @@ import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/proto
 import {
   failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
 } from "../tasks/chat-run.js";
-import { metrics } from "../infra/metrics.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
-import { handOffAssembledRun } from "../tasks/run-dispatch.js";
+import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
 import { decideAdmission } from "../tasks/admission.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
@@ -48,15 +47,7 @@ export const sessionDispatchPorts = {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
   },
   async publishTask(subject: string, payload: string, msgId?: string): Promise<number> {
-    let ack;
-    try {
-      ack = await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined);
-    } catch (err) {
-      metrics.onMessageDispatched("error");
-      throw err;
-    }
-    metrics.onMessageDispatched("ok");
-    return ack.seq;
+    return (await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined)).seq;
   },
 };
 
@@ -331,7 +322,10 @@ export async function dispatchTaskToBrain(
     // A gate, not a note: an unrecorded `attempted` leaves a row denying a
     // message already on the stream, so a throw here must stop the publish.
     await recordPublishState(run.taskId, "attempted");
-    const seq = await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
+    const payload = JSON.stringify(task);
+    const seq = await publishRunMessage(
+      () => sessionDispatchPorts.publishTask(subject, payload),
+    );
     await recordDispatchSeq(run.taskId, seq);
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
     return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage };

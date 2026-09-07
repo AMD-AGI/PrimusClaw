@@ -23,6 +23,7 @@ import {
 
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { db } from "../src/infra/db.js";
+import { registry } from "../src/infra/metrics.js";
 import { dispatchTaskToBrain, sessionDispatchPorts } from "../src/sessions/dispatch.js";
 import { dispatchPendingMessage, pendingDispatchPorts } from "../src/tasks/pending-dispatch.js";
 import {
@@ -108,6 +109,14 @@ function recordPublishes(): Published[] {
   return published;
 }
 
+async function dispatchedMessages(): Promise<number> {
+  const text = await registry.metrics();
+  const line = text.split("\n").find((sample) =>
+    sample.startsWith("claw_api_message_dispatched_total{")
+    && sample.includes('outcome="ok"'));
+  return line ? Number(line.slice(line.lastIndexOf(" ") + 1)) : 0;
+}
+
 function taskInsert(seen: SeenQuery[]): {
   status: string; metadata: Record<string, unknown>; tokenHash: unknown;
 } {
@@ -154,6 +163,7 @@ test("a floor below this API's constant sends every chat turn down the fat branc
   setDoorbellLatch({ state: "invalid", value: String(SUPPORTED - 1) });
   const seen = stubDb();
   const published = recordPublishes();
+  const before = await dispatchedMessages();
 
   const result = await dispatchTaskToBrain(INPUT, async () => {});
 
@@ -167,6 +177,7 @@ test("a floor below this API's constant sends every chat turn down the fat branc
   assert.equal(published.length, 1);
   assert.equal(published[0].msgId, undefined);
   assert.equal(isRunDoorbell(JSON.parse(published[0].payload)), false);
+  assert.equal(await dispatchedMessages() - before, 1);
 });
 
 test("a floor at this API's constant sends it down the doorbell branch", async () => {

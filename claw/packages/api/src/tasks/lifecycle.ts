@@ -11,6 +11,7 @@
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import type { PoolClient } from "pg";
 import pino from "pino";
 import {
@@ -21,7 +22,7 @@ import { getTask, transitionStatus, updateTask } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
-import type { TaskStatus } from "./types.js";
+import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-lifecycle" });
 
@@ -170,6 +171,44 @@ async function maybeStopHandlesForLastUser(
   }
 }
 
+type CancellationTransition = ClawTaskRow & {
+  prior_status: TaskStatus;
+  prior_dispatch: string | null;
+  prior_queued_since: string | null;
+};
+
+async function transitionCancellation(
+  taskId: string,
+): Promise<CancellationTransition | null> {
+  const r = await db.query(
+    `WITH prior AS (
+       SELECT * FROM claw_tasks
+        WHERE task_id = $1
+          AND status IN ('waiting_deps','waiting_external','queued','preparing','running')
+        FOR UPDATE
+     ), updated AS (
+       UPDATE claw_tasks t
+          SET status = CASE
+                WHEN prior.status IN ('preparing','running') THEN 'cancelling'
+                ELSE 'cancelled'
+              END,
+              completed_at = CASE
+                WHEN prior.status IN ('preparing','running') THEN t.completed_at
+                ELSE NOW()
+              END
+         FROM prior
+        WHERE t.task_id = prior.task_id
+       RETURNING t.*
+     )
+     SELECT updated.*, prior.status AS prior_status,
+            prior.metadata->>'dispatch' AS prior_dispatch,
+            prior.metadata->>'queued_since' AS prior_queued_since
+       FROM updated JOIN prior USING (task_id)`,
+    [taskId],
+  );
+  return (r.rows[0] as CancellationTransition | undefined) ?? null;
+}
+
 /**
  * Cancel a task (or virtual DAG root). For execution tasks we set
  * `cancelling` and trust Brain's NATS interrupt channel to react. For
@@ -213,12 +252,13 @@ export async function cancelTask(
     return { ok: true, cancelled: 1, interrupt_key: task.session_id ?? undefined };
   }
 
-  const executing = task.status === "preparing" || task.status === "running";
-  const updated = await transitionStatus(
-    task.task_id,
-    ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
-    executing ? "cancelling" : "cancelled",
-  );
+  const updated = await transitionCancellation(task.task_id);
+  if (
+    updated && updated.prior_status === "queued" && updated.origin === "chat"
+    && updated.prior_dispatch === "doorbell"
+  ) {
+    metrics.observeQueueExit("chat", updated.prior_queued_since, "cancelled");
+  }
   if (updated && task.dag_root_task_id) {
     // A cancelled dependency can never satisfy downstream readiness. Close its
     // entire transitive tail so the virtual root can eventually aggregate.

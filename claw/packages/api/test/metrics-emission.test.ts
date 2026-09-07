@@ -102,6 +102,7 @@ const SKIPPED = "claw_api_run_claim_skipped_total";
 const EXHAUSTED = "claw_api_run_claim_exhausted_total";
 const UNCLAIM = "claw_api_run_unclaim_total";
 const FAILCLAIM = "claw_api_run_fail_claim_total";
+const MESSAGE_DISPATCHED = "claw_api_message_dispatched_total";
 const ENTERED = "claw_api_run_queue_entered_total";
 const WAIT = "claw_api_run_queue_wait_seconds";
 const EXITED = "claw_api_run_queue_exited_total";
@@ -588,6 +589,31 @@ function handOff(over: Partial<HandOffInput> = {}): Promise<HandOffResult> {
     ...over,
   });
 }
+
+test("the doorbell publish call site counts both broker outcomes", async () => {
+  const stub = stubUsage();
+  try {
+    const moved = await delta(
+      async () => {
+        assert.equal((await handOff()).kind, "dispatched");
+        await assert.rejects(
+          () => handOff({
+            publish: async () => { throw new Error("nats down"); },
+            failRun: async () => "unknown",
+          }),
+          /nats down/,
+        );
+      },
+      [
+        { name: MESSAGE_DISPATCHED, labels: { outcome: "ok" } },
+        { name: MESSAGE_DISPATCHED, labels: { outcome: "error" } },
+      ],
+    );
+    assert.deepEqual(moved, [1, 1]);
+  } finally {
+    stub.restore();
+  }
+});
 
 test("a real post-insert refusal books post_insert and does not re-book a decision", async () => {
   const stub = stubUsage({ ahead: { run_roots: 1 } });
@@ -1481,30 +1507,34 @@ test("a queue timeout splits by whether a worker ever held the row", async () =>
   assert.deepEqual([r.e, r.dq], [2, 0]);
 });
 
-test("two requeues and three claims yield three sojourns, each from its own marker", async () => {
+test("two requeues and three claims yield three sojourns and two new queue entries", async () => {
   await h.reset();
   await seedSession(h, "s1");
   const { openChatRun } = await import("../src/tasks/chat-run.js");
   const { claimRunById, releaseClaim } = await import("../src/tasks/run-claim.js");
 
-  const [count, sum, exits] = await delta(
+  const [count, sum, exits, entries] = await delta(
     async () => {
       await openChatRun(queuedRunInput("t-cycled", "admission") as never);
       for (let claim = 0; claim < 3; claim++) {
         await ageMarker("t-cycled", 10);
         const claimed = await claimRunById("t-cycled", "brain-a", DOORBELL_SEMANTICS_VERSION);
         assert.ok(typeof claimed !== "string" && !("kind" in claimed));
-        await releaseClaim("t-cycled", "brain-a", (claimed as { claimCount: number }).claimCount);
+        if (claim < 2) {
+          await releaseClaim("t-cycled", "brain-a", (claimed as { claimCount: number }).claimCount);
+        }
       }
     },
     [
       CLAIMED_WAIT,
       { name: `${WAIT}_sum`, labels: { origin: "chat", outcome: "claimed" } },
       { name: EXITED, labels: { outcome: "claimed" } },
+      { name: ENTERED, labels: { cause: "requeue" } },
     ],
   );
   assert.equal(count, 3);
   assert.equal(exits, 3);
+  assert.equal(entries, 2);
   // A cumulative marker would put 10 + 20 + 30 here; three sojourns put 30.
   assert.ok(
     sum >= 30 - SUM_EPSILON && sum < 35,

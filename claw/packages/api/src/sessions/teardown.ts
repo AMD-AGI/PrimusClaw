@@ -570,17 +570,33 @@ export interface TeardownInput {
  *         the session and every row it has are exactly as they were.
  */
 export async function commitSessionDeletion(sessionId: string): Promise<void> {
+  let queueExits: Array<{
+    prior_status: string;
+    origin: string | null;
+    dispatch: string | null;
+    queued_since: string | null;
+  }>;
   try {
-    await inTransaction(async (query: Querier) => {
+    queueExits = await inTransaction(async (query: Querier) => {
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
-      await query(
-        `UPDATE claw_tasks
+      const cancelled = await query(
+        `WITH prior AS (
+           SELECT task_id, status, origin, metadata
+             FROM claw_tasks
+            WHERE session_id = $1
+              AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
+            FOR UPDATE
+         )
+         UPDATE claw_tasks t
             SET status = 'cancelled',
                 failure_reason = 'session_deleted',
                 error_message = 'the session this run belonged to was deleted',
                 completed_at = NOW()
-          WHERE session_id = $1
-            AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')`,
+           FROM prior
+          WHERE t.task_id = prior.task_id
+         RETURNING prior.status AS prior_status, prior.origin,
+                   prior.metadata->>'dispatch' AS dispatch,
+                   prior.metadata->>'queued_since' AS queued_since`,
         [sessionId],
       );
       for (const table of CONTENT_TABLES) {
@@ -600,6 +616,7 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
           WHERE session_id = $1`,
         [sessionId, INLINE_CLEANUP_BUDGET_MS],
       );
+      return cancelled.rows as typeof queueExits;
     });
   } catch (err) {
     throw new TeardownRefused(
@@ -608,6 +625,11 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       + "either nothing has been changed and the retry does the work, or the commit "
       + "landed and the retry says so with a 404.",
     );
+  }
+  for (const row of queueExits) {
+    if (row.prior_status === "queued" && row.origin === "chat" && row.dispatch === "doorbell") {
+      metrics.observeQueueExit("chat", row.queued_since, "cancelled");
+    }
   }
 }
 

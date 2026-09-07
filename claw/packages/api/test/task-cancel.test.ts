@@ -41,8 +41,21 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
       return params[0] === task.task_id ? { rows: [task], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
-    if (sql.startsWith("UPDATE claw_tasks SET status")) {
-      return { rows: [{ ...task, status: params[0] }], rowCount: 1 };
+    if (sql.startsWith("WITH prior AS") && /UPDATE claw_tasks t SET status/.test(sql)) {
+      const metadata = task.metadata as Record<string, unknown> | undefined;
+      const status = task.status === "preparing" || task.status === "running"
+        ? "cancelling"
+        : "cancelled";
+      return {
+        rows: [{
+          ...task,
+          status,
+          prior_status: task.status,
+          prior_dispatch: metadata?.dispatch ?? null,
+          prior_queued_since: metadata?.queued_since ?? null,
+        }],
+        rowCount: 1,
+      };
     }
     if (sql.startsWith("WITH RECURSIVE downstream")) return { rows: [], rowCount: 0 };
     throw new Error(`stubDb: unexpected query ${sql.slice(0, 80)}`);
@@ -64,10 +77,11 @@ test("cancelling a running task hands it to Brain instead of closing it", async 
 
   assert.deepEqual(r, { ok: true, cancelled: 1, interrupt_key: "t-root" });
 
-  const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
+  const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
   assert.ok(transition);
-  assert.equal(
-    transition!.params[0], "cancelling",
+  assert.match(
+    transition!.sql,
+    /WHEN prior.status IN \('preparing','running'\) THEN 'cancelling'/,
     "a running row must not be marked terminal while Brain and its sandbox are still live",
   );
   // The interrupt is published against the DAG root, which is also the key Brain
@@ -97,14 +111,12 @@ test("a queued task is closed outright, since nothing is executing yet", async (
   const seen = stubDb({ ...RUNNING_IN_DAG, status: "queued" });
   await cancelTask("t-mid");
 
-  const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
-  assert.equal(transition!.params[0], "cancelled");
-  // The expected-status guard still admits `running`: the row may have started
-  // between the read and the write, and losing that race must not silently skip
-  // the cancel.
-  assert.deepEqual(
-    transition!.params[transition!.params.length - 1],
-    ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
+  const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
+  assert.match(transition!.sql, /ELSE 'cancelled'/);
+  assert.match(
+    transition!.sql,
+    /status IN \('waiting_deps','waiting_external','queued','preparing','running'\)/,
+    "the write decides from the status it locks, including a concurrent start",
   );
 });
 
@@ -118,9 +130,10 @@ test("a preparing task is handed to Brain too, because it may already be executi
   const seen = stubDb({ ...RUNNING_IN_DAG, status: "preparing" });
   const r = await cancelTask("t-mid");
 
-  const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
-  assert.equal(
-    transition!.params[0], "cancelling",
+  const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
+  assert.match(
+    transition!.sql,
+    /WHEN prior.status IN \('preparing','running'\) THEN 'cancelling'/,
     "a preparing row may be executing, so it must wait for Brain to acknowledge",
   );
   assert.equal(r.interrupt_key, "t-root");

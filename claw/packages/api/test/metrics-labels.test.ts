@@ -121,7 +121,7 @@ test("existing outcome counters: outcome enum closed at 2 values", () => {
   }
 });
 
-test("admission_decision_total: origin × decision enum closed at 3 × 4", () => {
+test("admission_decision_total: origin × decision enum closed at 4 × 4", () => {
   for (const origin of ADMISSION_ORIGINS) {
     for (const decision of ADMISSION_DECISIONS) {
       assert.doesNotThrow(() => metrics.onAdmissionDecision(origin, decision));
@@ -129,7 +129,7 @@ test("admission_decision_total: origin × decision enum closed at 3 × 4", () =>
   }
 });
 
-test("admission_rejected_total: origin × stage × reason enum closed at 3 × 2 × 5", () => {
+test("admission_rejected_total: origin × stage × reason enum closed at 4 × 2 × 5", () => {
   for (const origin of ADMISSION_ORIGINS) {
     for (const stage of ADMISSION_STAGES) {
       for (const reason of ADMISSION_REJECT_REASONS) {
@@ -165,7 +165,7 @@ test("run_dispatch_held_total: cause enum closed at 3 values", () => {
   }
 });
 
-test("run_claim_total: mode × outcome enum closed at 2 × 9", () => {
+test("run_claim_total: mode × outcome enum closed at 2 × 10", () => {
   for (const mode of CLAIM_MODES) {
     for (const outcome of CLAIM_OUTCOMES) {
       assert.doesNotThrow(() => metrics.onRunClaim(mode, outcome));
@@ -173,7 +173,7 @@ test("run_claim_total: mode × outcome enum closed at 2 × 9", () => {
   }
 });
 
-test("run_claim_skipped_total: cause enum closed at 4 values", () => {
+test("run_claim_skipped_total: cause enum closed at 5 values", () => {
   for (const cause of CLAIM_SKIP_CAUSES) {
     assert.doesNotThrow(() => metrics.onRunClaimSkipped(cause));
   }

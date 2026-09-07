@@ -41,6 +41,7 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { db } from "../src/infra/db.js";
+import { registry } from "../src/infra/metrics.js";
 import {
   dispatchPendingMessage,
   pendingDispatchPorts,
@@ -58,6 +59,14 @@ afterEach(() => {
   db.query = originalQuery;
   Object.assign(pendingDispatchPorts, originalPorts);
 });
+
+async function dispatchedMessages(outcome: "ok" | "error"): Promise<number> {
+  const text = await registry.metrics();
+  const line = text.split("\n").find((sample) =>
+    sample.startsWith("claw_api_message_dispatched_total{")
+    && sample.includes(`outcome="${outcome}"`));
+  return line ? Number(line.slice(line.lastIndexOf(" ") + 1)) : 0;
+}
 
 interface Recorder {
   calls: string[];
@@ -444,7 +453,9 @@ test("P6 the queue row survives a failed publish", async () => {
   // the failure this ordering exists to prevent: the retry has to find the row
   // still there.
   const rec = harness({ publishThrows: refusal("no responders") });
+  const before = await dispatchedMessages("error");
   await assert.rejects(() => dispatchPendingMessage(input()), /no responders/);
+  assert.equal(await dispatchedMessages("error") - before, 1);
   assert.ok(
     !rec.calls.includes("delete-pending"),
     "the queue row was deleted for a message that never went out",
@@ -472,6 +483,7 @@ test("P6b a publish that only timed out keeps its row", async () => {
 
 test("P7 a published turn clears the queue row, then marks the session running", async () => {
   const rec = harness();
+  const before = await dispatchedMessages("ok");
   const result = await dispatchPendingMessage(input());
 
   assert.deepEqual(
@@ -484,6 +496,7 @@ test("P7 a published turn clears the queue row, then marks the session running",
     ],
   );
   assert.equal(result.runId, "ktsk_1");
+  assert.equal(await dispatchedMessages("ok") - before, 1);
   // Found by what the statement is, not by how many precede it: the receipt
   // and sequence writes sit between them.
   const deleted = rec.sql.find((q) => /DELETE FROM claw_pending_messages/.test(q.text));
