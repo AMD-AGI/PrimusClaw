@@ -435,34 +435,36 @@ async function retainInsteadOfDestroying(
 }
 
 /**
- * The key part a retention takes.
+ * The key part a retention takes: the generation its shells' reference rows
+ * record, which is the endpoint that names one sandbox for its whole life.
  *
- * The generation names the container, and a per-shell reference row carries the
- * same value, which is what routes a later poll back to it. A binding carrying
- * none still has to be retained -- releasing the claim without moving it leaves
- * the work in a container the next acquisition's binding overwrites the name of
- * -- so it takes a value derived from the session and the moment instead. The
- * container stays swept, pinged and addressable; only the reference rows cannot
- * resolve it, which is the part the missing generation already cost.
+ * It has to be that exact value and no other. A query naming a shell resolves
+ * the container by matching its row's generation against this key part, so a
+ * key built from anything else -- a workload id, a sandbox name, a value
+ * derived here -- is a container no poll, wait or kill can route back to, which
+ * is the addressability the retention exists to keep.
+ *
+ * @throws where the binding names no endpoint. There is nothing to derive one
+ * from that a reference row would agree with, and a retention nothing can
+ * resolve protects the work only on paper.
  */
 function retentionGeneration(sessionId: string, info: any): string {
-  const named = info.sandboxName || info.workloadId || "";
-  if (named) return named;
-  const derived = `${sessionId}-${info.createdAt || new Date().toISOString()}`;
-  logger.error(
-    { sessionId, derived },
-    "ensureHands.retention_generation_derived",
+  const generation = typeof info.handsUrl === "string" ? info.handsUrl : "";
+  if (generation) return generation;
+  logger.error({ sessionId }, "ensureHands.retention_generation_absent");
+  throw new Error(
+    "the sandbox still holds background work and its binding names no endpoint, "
+    + "so it could be retained under no key its shells could be routed back through",
   );
-  return derived;
 }
 
 /**
  * Whether this container may be destroyed, replaced, rebuilt, or evicted.
  *
  * Read from the records over the exec channel before the act, never from the
- * registry: a restarted Hands has an empty one for reasons that say nothing
- * about the sandbox, and treating empty as evidence of no work is what took a
- * training run down with a health-check failure.
+ * registry: a restarted Hands has an empty registry for reasons that say
+ * nothing about the sandbox, so an empty one is never evidence that no work is
+ * live.
  */
 async function mayDestroy(
   sessionId: string,

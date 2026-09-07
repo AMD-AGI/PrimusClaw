@@ -62,7 +62,13 @@ function parseGathered(stdout: string): GatheredState {
   const state: GatheredState = { marker: null, subtree: null, records: [], livePids: new Set() };
   for (const line of stdout.split("\n")) {
     if (line.startsWith("MARKER ")) {
-      try { state.marker = JSON.parse(line.slice(7)) as EpochMarker; } catch { /* none */ }
+      // A marker is what says this sandbox files records at all, so a value
+      // that is merely parseable cannot stand for one: an empty object would
+      // clear the discriminator and let a zero count be admitted beneath it.
+      try {
+        const parsed: unknown = JSON.parse(line.slice(7));
+        state.marker = isEpochMarker(parsed) ? parsed : null;
+      } catch { /* no marker */ }
     } else if (line.startsWith("SUBTREE ")) {
       const value = line.slice(8).trim();
       state.subtree = value === "ok" || value === "empty" || value === "missing" ? value : null;
@@ -87,6 +93,13 @@ function parseGathered(stdout: string): GatheredState {
     }
   }
   return state;
+}
+
+function isEpochMarker(value: unknown): value is EpochMarker {
+  const m = value as Partial<EpochMarker> | null;
+  return !!m && typeof m === "object" && !Array.isArray(m)
+    && typeof m.epoch === "string" && m.epoch.length > 0
+    && isProcessIdentity(m.bearer);
 }
 
 const OUTCOMES: readonly unknown[] = ["exited", "killed", "failed"];
@@ -120,6 +133,7 @@ function isShellRecord(value: unknown): value is ShellRecord {
     && optional(r.deadline_at, isInstant)
     && optional(r.retain_until, isInstant)
     && optional(r.exit_code, (v) => v === null || Number.isInteger(v))
+    && optional(r.signal, (v) => v === null || (typeof v === "string" && v.length > 0))
     && optional(r.output_available, (v) => typeof v === "boolean")
     // An outcome without its end, or an end without its outcome, is a record
     // half-written by something that is not the writer.

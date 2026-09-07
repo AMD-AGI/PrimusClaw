@@ -19,6 +19,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { nowMs } from "./clock.js";
 import {
   PROTECTED_CLASSES, classifyShellRecord,
   type EpochFreshness, type ProcessView, type ShellClass,
@@ -27,6 +28,8 @@ import {
   type ProcessIdentity, type ShellRecord, listRecordsForOwner, processStartToken,
   readEpochMarker, readRecord, subtreeReadable,
 } from "./shell-records.js";
+
+export { bindClock, nowMs } from "./clock.js";
 
 export interface OwnerLiveness {
   /** Records in a class that blocks reclamation. */
@@ -73,21 +76,6 @@ function readProcessState(pid: number): ProcessView {
  * current nor stale, and reading it as stale would convert unresolved live work
  * into a class that unblocks a destroy.
  */
-/**
- * The current instant, through a seam so a retention test can move hours
- * without waiting them out. No production path sets it.
- */
-let clock: (() => number) | null = null;
-
-/** Test-only. */
-export function bindClock(next: (() => number) | null): void {
-  clock = next;
-}
-
-export function nowMs(): number {
-  return clock ? clock() : Date.now();
-}
-
 /**
  * Whether a terminal outcome is still within the window its run's deadline
  * fixed.

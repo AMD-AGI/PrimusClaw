@@ -167,7 +167,7 @@ async function sweepRetention(
     ? await countLiveWork(inst, HANDS_STATE_DIR)
     : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
   if (live.verdict === "clear") {
-    await releaseRetention(retentionStore(deps), held.sandboxName || held.workloadId || "");
+    await releaseRetention(retentionStore(deps), key);
     return true;
   }
 

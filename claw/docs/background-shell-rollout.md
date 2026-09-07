@@ -381,9 +381,20 @@ refuses without terminating anything: the whole chain — route, credential,
 scope — is exercised and no shell is signalled.
 
 ```sh
+# One inventory row supplies all three: the endpoint to call, and the name and
+# namespace the sandbox's own token is fetched by. Unset variables would send
+# this at nothing and read the refusal as a pass.
+raw=$(inventory) || exit 3
+HANDS_URL=; SBNAME=; SBNS=
+while IFS=$'\t' read -r sid name ns url wid; do
+  [ "$sid" = "$SESSION_ID" ] || continue
+  HANDS_URL=$url; SBNAME=$name; SBNS=$ns; break
+done <<<"$(inventory_rows "$raw")"
+[ -n "$HANDS_URL" ] || { echo 'FAIL: no inventory row for the session; P5 measured nothing'; exit 1; }
+
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   "$(hands_base "$HANDS_URL")/internal/shells/reap" \
-  -H "Authorization: Bearer $(scope_cred "$(hands_token "$SB_NAME" "$SB_NS")" "$SESSION_ID" "")" \
+  -H "Authorization: Bearer $(scope_cred "$(hands_token "$SBNAME" "$SBNS")" "$SESSION_ID" "")" \
   -H 'content-type: application/json' \
   -d '{"cause":"session_cleanup","reclaim_op":"p5"}'
 ```

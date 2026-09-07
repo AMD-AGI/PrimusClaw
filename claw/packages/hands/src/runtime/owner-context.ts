@@ -20,6 +20,8 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import { nowMs } from "./clock.js";
+
 /**
  * Header Brain stamps with the addressing scope a shell belongs to: the DAG
  * root when the run is a DAG node, else the session.
@@ -92,30 +94,20 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
-/** Raised where a deadline was sent and cannot be used. */
-export class MalformedDeadline extends Error {}
-
 /**
- * The deadline as an instant, or absent where none was sent.
+ * The deadline as an instant, or absent.
  *
- * Absent means the header was not sent, which is a run carrying no deadline and
- * retains for the sandbox's life. A header that was sent and names no instant --
- * blank included -- is refused rather than read as absent, since reading it as
- * absent substitutes that policy for the opposite one on a run that did state a
- * bound.
+ * Normalised by substitution rather than repair: missing, malformed, or not a
+ * future instant all become absent -- the named fallback, which retains for the
+ * sandbox's life. Never partially parsed into a shorter window, since a window
+ * shorter than the run that owns it ages a tombstone out while that run can
+ * still ask about it, and an instant already past would fix one of zero length.
  */
 export function normalizeDeadline(raw: unknown): string | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") {
-    throw new MalformedDeadline(`${DEADLINE_HEADER} is not a string, so it names no instant`);
-  }
+  if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
-  if (!Number.isFinite(Date.parse(trimmed))) {
-    throw new MalformedDeadline(
-      `${DEADLINE_HEADER} is not a readable instant, so no retention window could be fixed from it`,
-    );
-  }
-  return trimmed;
+  const at = Date.parse(trimmed);
+  return Number.isFinite(at) && at > nowMs() ? trimmed : undefined;
 }
 
 

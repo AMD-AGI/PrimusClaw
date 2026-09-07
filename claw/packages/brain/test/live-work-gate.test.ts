@@ -227,3 +227,32 @@ test("a record whose fields the classifier reads are not a record refuses the an
     restore = null;
   }
 });
+
+test("a marker that is merely parseable does not establish an epoch", async () => {
+  // The marker is the discriminator for whether this sandbox files records at
+  // all, and a zero count is admissible only beneath a present, readable one.
+  // A value that parses but names no epoch or no bearer would clear that
+  // discriminator and let an empty subtree read as an empty sandbox.
+  const notMarkers = ["{}", "null", "[]", '"e1"', "7",
+    '{"epoch":""}', '{"epoch":"e1"}',
+    '{"epoch":"e1","bearer":{}}',
+    '{"epoch":"e1","bearer":{"pid":0,"startToken":"t"}}',
+    '{"epoch":"e1","bearer":{"pid":7}}'];
+  for (const raw of notMarkers) {
+    sandboxAnswering(`MARKER ${raw}\nSUBTREE ok\nPROCS 7`);
+    const answer = await countLiveWork(INST, STATE_DIR);
+    assert.equal(answer.verdict, "unknown", raw);
+    assert.equal(answer.reason, "no_epoch_marker", raw);
+    restore?.();
+    restore = null;
+  }
+});
+
+test("a record whose signal is neither a name nor null is not a record", async () => {
+  sandboxAnswering(transcript({
+    marker: MARKER,
+    records: [running({ status: "killed", ended_at: "2026-01-01T00:01:00.000Z", signal: 15 })],
+    pids: [7],
+  }));
+  assert.equal((await countLiveWork(INST, STATE_DIR)).verdict, "unknown");
+});

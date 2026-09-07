@@ -29,7 +29,7 @@ process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "claw-retention-"));
 const records = await import("../src/runtime/shell-records.js");
 const liveness = await import("../src/runtime/shell-liveness.js");
 const bg = await import("../src/tools/shell/bg-manager.js");
-const { withCaller, DEADLINE_HEADER, normalizeDeadline, MalformedDeadline } =
+const { withCaller, DEADLINE_HEADER, normalizeDeadline } =
   await import("../src/runtime/owner-context.js");
 const { isolatingSandbox, releaseSandboxIsolation } =
   await import("./support/sandbox-isolation.js");
@@ -57,9 +57,13 @@ after(async () => {
 
 const settle = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
-/** Start a shell as a caller carrying `deadline`, the way the route does. */
-function startUnder(deadline: string | undefined, id: string, command = "exit 0"): void {
-  withCaller({ owner: OWNER, run: RUN, deadline }, () => {
+/**
+ * Start a shell as a caller presenting `header`, the way the route does --
+ * normalised on arrival, so a fixture cannot put on the claim a value the route
+ * would have substituted away.
+ */
+function startUnder(header: unknown, id: string, command = "exit 0"): void {
+  withCaller({ owner: OWNER, run: RUN, deadline: normalizeDeadline(header) }, () => {
     bg.spawnBackground(OWNER, RUN, command, id);
   });
 }
@@ -109,7 +113,6 @@ test("siblings share the expiry their run's deadline fixes, each from its own en
 test("a start with no deadline retains for the sandbox's life", async () => {
   // The fallback for an absent deadline is no expiry, never a substituted
   // constant: a constant would age out a tombstone under a run still reading it.
-  assert.equal(normalizeDeadline(undefined), undefined, "no header is a run with no deadline");
 
   startUnder(undefined, "no-deadline");
   await settle(200);
@@ -118,14 +121,31 @@ test("a start with no deadline retains for the sandbox's life", async () => {
   assert.equal(bg.pollOutput(OWNER, RUN, "no-deadline").structured.shell_class, "finished");
 });
 
-test("a deadline that was sent and cannot be read is refused, not read as absent", () => {
-  // Absent means the run states no bound, which retains forever. Reading a
-  // malformed value as that substitutes the opposite policy on a run that did
-  // state one, and nothing downstream could tell.
-  // Blank is in the list: it was sent, and it names no instant either.
-  for (const raw of ["", "   ", "not-a-date", "2026-13-45T99:99:99Z", "   x   ", 12345, {}]) {
-    assert.throws(() => normalizeDeadline(raw), MalformedDeadline, JSON.stringify(raw));
+test("every deadline that names no future instant substitutes the same fallback", () => {
+  // Substitution, not repair: a value that cannot be read, or that is already
+  // past, becomes the absent fallback rather than a window of its own. A past
+  // instant would fix one of zero length, expiring a tombstone the moment it
+  // was written.
+  const unusable = [
+    undefined, null, "", "   ", "not-a-date", "2026-13-45T99:99:99Z", "   x   ", 12345, {},
+    new Date(simulated - HOUR).toISOString(),
+    new Date(simulated).toISOString(),
+  ];
+  for (const raw of unusable) {
+    assert.equal(normalizeDeadline(raw), undefined, JSON.stringify(raw));
   }
+  // And a future one is taken as sent, unrepaired.
+  const ahead = new Date(simulated + HOUR).toISOString();
+  assert.equal(normalizeDeadline(ahead), ahead);
+});
+
+test("a deadline already past retains for the sandbox's life, not for no time at all", async () => {
+  startUnder(new Date(simulated - HOUR).toISOString(), "backdated");
+  await settle(200);
+
+  simulated += 24 * 365 * HOUR;
+  assert.equal(bg.pollOutput(OWNER, RUN, "backdated").structured.shell_class, "finished",
+    "a past deadline was read as a window rather than as no deadline");
 });
 
 test("a record with no outcome never expires, however long its run is held", () => {

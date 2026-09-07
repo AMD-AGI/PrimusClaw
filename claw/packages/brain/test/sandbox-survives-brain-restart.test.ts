@@ -4,13 +4,24 @@
 /**
  * The half of Brain-restart recovery that lives in the sandbox.
  *
- * **Scope, stated because the name could promise more:** this drives a real
+ * **Scope, stated because the name could promise more.** This drives a real
  * Hands process over a real port and a client in a process of its own, so
- * nothing Brain-local -- transport, module state, heap -- carries across. What
- * it does *not* do is start the Brain application: that needs NATS, Postgres
- * and a task stream, and this tree has no harness that stands them up. So the
- * restore of Brain's own durable task and run state is **not** covered here,
- * and neither is the loop that would consume it.
+ * nothing Brain-local -- transport, module state, heap -- carries across. It
+ * does **not** start the Brain application, so the restore of Brain's own
+ * durable task and run state is not covered here, and neither is the loop that
+ * would consume it.
+ *
+ * That gap is not an oversight, and it is not closable from a unit test in this
+ * repository. `brain/src/index.ts` reaches a listening state only after
+ * `emitter.init(NATS_URL)`, `nc.jetstream()` and `nc.jetstreamManager()`
+ * (`index.ts:512-516`), so a Brain process needs a live NATS with JetStream
+ * before it will start at all. This tree ships no `nats-server` binary and no
+ * harness that stands one up -- the two `config-nats-replicas` tests assert
+ * configuration values and never connect -- and the workflow running these
+ * tests declares no `services:`, so a test written against a real broker would
+ * fail in CI rather than cover anything. Closing it needs an integration
+ * harness that owns a broker and a database, which is a larger change than the
+ * one this file belongs to.
  *
  * What is covered is the property that restore depends on: after everything
  * client-side is gone, the ids in the transcript are still sufficient to reach

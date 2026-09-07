@@ -684,3 +684,29 @@ test("a session whose sandbox was torn down builds a new one instead of failing"
     "no entry means no reuse -- and the caller builds a sandbox, which is what "
     + "the turn needs");
 });
+
+test("a retention is keyed by the generation its shells' rows record", async () => {
+  // A per-shell reference row records the endpoint its shell ran under, and a
+  // query resolves the container by matching that against the retention's key
+  // part. A key built from a workload id or a sandbox name is a container no
+  // poll, wait or kill can route back to.
+  const { retained } = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(retained, [LIVE.handsUrl],
+    "the retention key part must be the generation the rows carry, not another identifier");
+});
+
+test("a binding naming no endpoint is refused rather than retained under an address nothing resolves", async () => {
+  // Deriving a key part here would produce a container that is swept and pinged
+  // and that no reference row can name -- protected on paper only.
+  const { destroyed, retained } = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a } = attempt({ ...LIVE, handsUrl: "", specFingerprint: specOf() });
+
+  await assert.rejects(() => tryReuseSessionSandbox(a), /names no endpoint/);
+  assert.deepEqual(destroyed, [], "nothing was destroyed on the way out");
+  assert.deepEqual(retained, [], "and nothing was retained under an unresolvable key");
+});

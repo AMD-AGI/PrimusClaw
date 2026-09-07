@@ -170,16 +170,6 @@ function sendScopeFailure(
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);
   if (denied) return reply.status(denied.status).send({ error: denied.error });
-  // Read before the transport is opened: a deadline that cannot be used is
-  // refused here rather than becoming the no-deadline fallback further down,
-  // which would retain a run's outcomes for the sandbox's life on a run that
-  // stated a bound.
-  let deadline: string | undefined;
-  try {
-    deadline = normalizeDeadline(req.headers[DEADLINE_HEADER]);
-  } catch (e) {
-    return reply.status(400).send({ error: "deadline_malformed", detail: (e as Error).message });
-  }
   // `enableJsonResponse: true` switches the streamable-HTTP server transport from
   // its default SSE streaming reply to a plain JSON reply: the POST /mcp handler
   // awaits all tool results, then returns a single `Content-Type: application/json`
@@ -203,7 +193,7 @@ app.all("/mcp", async (req, reply) => {
     {
       owner: normalizeOwner(req.headers[OWNER_HEADER]),
       run: normalizeRun(req.headers[RUN_HEADER]),
-      deadline,
+      deadline: normalizeDeadline(req.headers[DEADLINE_HEADER]),
     },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );

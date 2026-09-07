@@ -72,10 +72,11 @@ export async function retainContainer(input: {
 /**
  * Give a retained container back to the ordinary lifetime machinery.
  *
- * Never on a clock: the work this protects has no bounded age.
+ * By the key the caller walked rather than one recomputed from the entry's
+ * fields: the two could disagree, and the one that was walked is the one that
+ * exists. Never on a clock -- the work this protects has no bounded age.
  */
-export async function releaseRetention(store: RetentionStore, generation: string): Promise<void> {
-  const key = retentionKey(generation);
+export async function releaseRetention(store: RetentionStore, key: string): Promise<void> {
   await store.delete(key);
-  logger.info({ key, generation }, "sandbox.retention_released");
+  logger.info({ key }, "sandbox.retention_released");
 }
