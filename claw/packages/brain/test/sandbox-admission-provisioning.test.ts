@@ -17,7 +17,9 @@
 import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { SandboxCapacityRefused, admitSandbox, bindAdmission } from "../src/sandbox/admission.js";
+import {
+  SandboxCapacityRefused, admitSandbox, bindAdmission, markCensusReconciled,
+} from "../src/sandbox/admission.js";
 import { CeilingDisagreement } from "../src/sandbox/admission-roster.js";
 import type { Roster } from "../src/sandbox/admission-roster.js";
 import type { CapacitySettings } from "../src/sandbox/keepalive-capacity.js";
@@ -69,6 +71,9 @@ let store: ReturnType<typeof fakeKv>;
 beforeEach(async () => {
   store = fakeKv();
   await bindAdmission(store.kv as never, CAPACITY);
+  // Admission refuses every claim until a sweep has reconciled a census onto
+  // the roster; these fixtures run no sweep, so they say it happened.
+  markCensusReconciled();
 });
 
 /** Fill the roster to one ordinary slot below the reserve boundary. */

@@ -20,7 +20,9 @@ import { listAllDagHandles } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
-import { latchRosterStale, markRosterStale, releaseAdmission } from "./admission.js";
+import {
+  latchRosterStale, markCensusReconciled, markRosterStale, releaseAdmission,
+} from "./admission.js";
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
@@ -215,14 +217,24 @@ function sandboxEntryFrom(info: HandsKvEntry): SandboxEntry | null {
  * target un-admitted and reconciled in later, which is the ceiling being
  * enforced after the fact rather than before provisioning.
  */
-export function pingTargetIdentity(sessionId: string, entry: SandboxEntry): string {
-  return sandboxRegistryKey(sessionId, entry);
+export function pingTargetIdentity(entry: SandboxEntry): string {
+  return sandboxRegistryKey(entry);
 }
 
-function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
+/**
+ * What the provider assigned, and nothing logical.
+ *
+ * One physical sandbox is reachable under more than one logical name -- a
+ * session binding and a DAG handle map naming the same container under
+ * different roots -- and keying by the name it was reached through counts it
+ * twice: two admission slots against one ceiling and two pings a sweep, which
+ * understates the deferral count the idle-GC deadline is proven against by
+ * exactly the number of doubly-named sandboxes.
+ */
+function sandboxRegistryKey(entry: SandboxEntry): string {
   return entry.provider === "agent-sandbox"
-    ? `${sessionId}:agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`
-    : `${sessionId}:safe:${entry.workloadId || ""}`;
+    ? `agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`
+    : `safe:${entry.workloadId || ""}`;
 }
 
 /**
@@ -334,7 +346,7 @@ async function shouldSkipExpiredRetry(
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
 export function registerSandbox(sessionId: string, entry: SandboxEntry): void {
-  const key = sandboxRegistryKey(sessionId, entry);
+  const key = sandboxRegistryKey(entry);
   // A task has taken this sandbox, so whatever the last sweep concluded about
   // it is about the turn before. Reuse hands the same pod to the next task, so
   // identity alone would carry an `idle` verdict across that boundary -- and a
@@ -381,7 +393,7 @@ export function unregisterSandbox(
   opts: { releaseSlot?: boolean } = { releaseSlot: true },
 ): void {
   const keys = known
-    ? [sandboxRegistryKey(sessionId, known)]
+    ? [sandboxRegistryKey(known)]
     : [...localRegistry.entries()]
       .filter(([, value]) => value.sessionId === sessionId)
       .map(([key]) => key);
@@ -458,7 +470,7 @@ export function markHandsIdle(
       // afterwards, and an `idle` answer from before would suppress pinging for
       // the rest of the cache TTL. registerSandbox invalidates on the way in;
       // this is the way out, and without it the boundary is only half closed.
-      forgetBackgroundWork(sandboxRegistryKey(sessionId, {
+      forgetBackgroundWork(sandboxRegistryKey({
         provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
         workloadId: info.workloadId,
         sessionId: info.sessionId,
@@ -1003,7 +1015,7 @@ async function collectTargets(
         // Read, not asked: the probe runs behind the sweep and leaves its answer
         // for the next one. Under the identity of the sandbox this entry names,
         // so the answer cannot outlive the pod it was about.
-        const identity = sandboxRegistryKey(sessionId, {
+        const identity = sandboxRegistryKey({
           provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
           workloadId: info.workloadId,
           sessionId: info.sessionId,
@@ -1075,7 +1087,7 @@ async function collectTargets(
             const deleted = await deps.kv.delete(key, { previousSeq: e.revision })
               .then(() => true).catch(() => false);
             if (deleted) {
-              const identity = pingTargetIdentity(sessionId, {
+              const identity = pingTargetIdentity({
                 provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
                 workloadId: info.workloadId,
                 platformKey: info.platformKey,
@@ -1114,7 +1126,7 @@ async function collectTargets(
         // costs a write and no read.
         await deps.kv.update(key, e.value, e.revision).catch(() => {});
 
-        const targetKey = sandboxRegistryKey(sessionId, entry);
+        const targetKey = sandboxRegistryKey(entry);
         if (!targets.has(targetKey)) targets.set(targetKey, { sessionId, entry });
       } catch (err) {
         // A record that cannot be used is a sandbox missing from the census,
@@ -1149,7 +1161,7 @@ async function collectTargets(
           ? !!entry.sessionId
           : !!(entry.workloadId && entry.platformKey);
         if (!usable) continue;
-        const key = sandboxRegistryKey(dagRoot, entry);
+        const key = sandboxRegistryKey(entry);
         seenIdentities.add(key);
         if (!targets.has(key)) targets.set(key, { sessionId: dagRoot, entry });
       }
@@ -1291,8 +1303,8 @@ async function admitTargets(
   deps: KeepaliveDeps,
   targets: Map<string, RegisteredSandbox>,
   censusComplete: boolean,
-): Promise<void> {
-  if (!deps.roster) return;
+): Promise<Set<string> | null> {
+  if (!deps.roster) return null;
   const identities = [...targets.keys()];
   try {
     const result = await reconcileTargets(
@@ -1311,22 +1323,16 @@ async function admitTargets(
     await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
     if (censusComplete) {
       // Only a sweep that reconciled a complete census may lift the local
-      // latch: anything less returns the replica to apparent health on the
-      // strength of a reading it could not take.
+      // latch, or report the fleet counted: anything less returns the replica
+      // to apparent health on the strength of a reading it could not take.
       latchRosterStale(false);
+      markCensusReconciled();
     } else {
       latchRosterStale(true);
       logger.error({ targets: identities.length }, "keepalive.census_incomplete");
     }
+    return null;
   } catch (err) {
-    // Reported rather than swallowed, and the sweep still serves what it
-    // collected: an unreconciled roster understates the fleet, so the deferral
-    // count every handle's refresh gap rests on is a number nobody can stand
-    // behind -- but refusing to ping is how a sandbox with live work in it is
-    // reclaimed, which is worse than an understated count nobody admits against.
-    // The sweep still serves what it collected -- refusing to ping is how a
-    // sandbox with live work in it is reclaimed -- but nothing new is admitted
-    // against a roster that is missing targets it was about to take on.
     // If the marker itself cannot be written, the shared roster still looks
     // healthy -- so this replica latches locally as well and every claim it
     // sees is refused until a sweep completes clean. A neighbour that can write
@@ -1343,13 +1349,57 @@ async function admitTargets(
       { err: (err as Error)?.message, targets: identities.length },
       "keepalive.roster_reconcile_failed",
     );
+    // Targets the roster already holds keep being pinged -- refusing those is
+    // how a sandbox with live work in it is reclaimed. The rest are not served:
+    // reconcile-before-serving is what makes the deferral count every handle's
+    // refresh gap rests on a number the fleet agrees on, and pinging a target
+    // no roster holds spends this sweep's budget against that number.
+    return await heldIdentities(deps.roster.store);
+  }
+}
+
+/**
+ * The identities the roster is known to hold, or none where it cannot be read.
+ *
+ * An unreadable roster is not an empty one, but it is equally not evidence that
+ * any particular target was admitted -- and this set is only ever used to decide
+ * what may be served without reconciliation having succeeded.
+ */
+async function heldIdentities(store: RosterStore): Promise<Set<string>> {
+  const current = await store.read().catch(() => null);
+  return new Set(
+    (current?.roster.entries ?? [])
+      .map((e) => e.identity)
+      .filter((i): i is string => !!i),
+  );
+}
+
+/**
+ * Take the targets reconciliation could not admit out of this sweep.
+ *
+ * Reported at error level rather than dropped quietly: an un-admitted target
+ * that is also unserved is a sandbox whose refresh is not happening, and the
+ * failure it precedes -- a handle expiring un-pinged -- looks like nothing at
+ * all from the outside.
+ */
+function dropUnadmitted(
+  targets: Map<string, RegisteredSandbox>, servable: Set<string>,
+): void {
+  const refused: string[] = [];
+  for (const key of [...targets.keys()]) {
+    if (servable.has(key)) continue;
+    targets.delete(key);
+    refused.push(key);
+  }
+  if (refused.length) {
+    logger.error({ refused }, "keepalive.unadmitted_targets_unserved");
   }
 }
 
 /** The verdict the last sweep reached for a target, for tests. */
 const lastVerdict = new Map<string, { fails: number; gone: boolean }>();
-export function lastVerdictForTest(sessionId: string): { fails: number; gone: boolean } | null {
-  for (const [key, v] of lastVerdict) if (key.includes(sessionId)) return v;
+export function lastVerdictForTest(identityPart: string): { fails: number; gone: boolean } | null {
+  for (const [key, v] of lastVerdict) if (key.includes(identityPart)) return v;
   return null;
 }
 
@@ -1362,7 +1412,8 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   ));
   const census = await collectTargets(deps, seenIdentities);
   const targets = census.targets;
-  await admitTargets(deps, targets, census.complete);
+  const servable = await admitTargets(deps, targets, census.complete);
+  if (servable) dropUnadmitted(targets, servable);
 
   // Reap stale failCounts for sessions no longer tracked.
   for (const key of failCounts.keys()) {
@@ -1516,13 +1567,20 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   }
 }
 
-/** Start the periodic keepalive. Idempotent. */
-export function startSandboxKeepalive(deps: KeepaliveDeps): void {
+/**
+ * Start the periodic keepalive. Idempotent.
+ *
+ * @returns the first sweep, which admission waits on: the roster is stamped
+ * empty at boot, so a claim committed before the running fleet has been
+ * reconciled onto it is checked against a count that omits every sandbox this
+ * replica did not create.
+ */
+export function startSandboxKeepalive(deps: KeepaliveDeps): Promise<void> {
   if (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0) {
     logger.info("keepalive.disabled (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0)");
-    return;
+    return Promise.resolve();
   }
-  if (timer) return;
+  if (timer) return Promise.resolve();
   logger.info(
     {
       intervalSec: SANDBOX_KEEPALIVE_INTERVAL_SEC,
@@ -1530,14 +1588,15 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
     },
     "keepalive.start",
   );
-  runGuardedSweep(deps);
+  const census = runGuardedSweep(deps);
   // Guarded, because a sweep is not guaranteed to finish inside its interval:
   // it walks every KV handle serially and can make a network call per idle one.
   // Overlapping sweeps would double every write in here and race each other's
   // conditional updates, and the symptom -- handles refreshed twice, others not
   // at all -- would read as KV flakiness rather than as this.
-  timer = setInterval(() => runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
+  timer = setInterval(() => void runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
   timer.unref?.();
+  return census;
 }
 
 /**
@@ -1549,13 +1608,13 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
  * handles refreshed twice and others not at all, which reads as KV flakiness
  * rather than as this.
  */
-function runGuardedSweep(deps: KeepaliveDeps): void {
+function runGuardedSweep(deps: KeepaliveDeps): Promise<void> {
   if (sweeping) {
     logger.warn({}, "keepalive.tick_still_running");
-    return;
+    return Promise.resolve();
   }
   sweeping = true;
-  tick(deps)
+  return tick(deps)
     .catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"))
     .finally(() => { sweeping = false; });
 }

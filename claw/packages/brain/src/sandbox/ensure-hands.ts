@@ -1251,7 +1251,7 @@ export function makeOnProvisioned(deps: {
     // The reservation stops naming a token and starts naming a target here --
     // ahead of the durable record below, of bootstrap, and of registration.
     try {
-      await deps.hold.bind(pingTargetIdentity(deps.sessionId, {
+      await deps.hold.bind(pingTargetIdentity({
         provider: "safe-workload", workloadId,
       }));
     } catch (bindErr) {
@@ -1423,7 +1423,7 @@ async function ensureHandsAgentSandbox(
   try {
     // The identity the sweep will ping, field for field, or the slot names a
     // target nobody looks for and the sandbox reads as un-admitted.
-    await hold.bind(pingTargetIdentity(sessionId, {
+    await hold.bind(pingTargetIdentity({
       provider: "agent-sandbox",
       sessionId: inst.id,
       sandboxName: inst.sandboxName,

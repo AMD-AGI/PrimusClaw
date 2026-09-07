@@ -45,6 +45,7 @@ export async function bindAdmission(kv: KV, capacity: CapacitySettings): Promise
   // A fresh bind is a fresh view: whatever this process could not reconcile
   // before it bound belonged to a roster it is no longer looking at.
   localStaleLatch = false;
+  censusReconciled = false;
   roster = rosterDeps(kv, capacity).roster ?? null;
   if (!roster) return;
   const { store, config } = roster;
@@ -138,6 +139,22 @@ export async function markRosterStale(reason: string): Promise<void> {
   });
 }
 
+/**
+ * Whether a census of the existing fleet has been reconciled onto the roster at
+ * least once since this process bound it.
+ *
+ * The roster is stamped empty at boot and the first sweep runs behind the
+ * consumer, so between the two a claim is checked against a count that omits
+ * every sandbox this replica did not create -- which is the ceiling being
+ * enforced against a number nobody took.
+ */
+let censusReconciled = false;
+
+/** Recorded by the sweep that reconciled a complete census onto the roster. */
+export function markCensusReconciled(): void {
+  censusReconciled = true;
+}
+
 /** Raised when the fleet is at its declared ceiling. Provisions nothing. */
 export class SandboxCapacityRefused extends Error {}
 
@@ -170,6 +187,13 @@ export async function admitSandbox(sessionId: string): Promise<AdmissionHold> {
   if (!roster) return NO_HOLD;
   const { store, config } = roster;
 
+  if (!censusReconciled) {
+    throw new SandboxCapacityRefused(
+      "sandbox admission refused: the keepalive roster has not yet been reconciled "
+      + "against a census of the running fleet, so a claim would be checked against "
+      + "a count that omits every sandbox this replica did not create",
+    );
+  }
   if (localStaleLatch) {
     throw new SandboxCapacityRefused(
       "sandbox admission refused: this replica could not reconcile the keepalive "

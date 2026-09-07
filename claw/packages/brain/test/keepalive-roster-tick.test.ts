@@ -129,7 +129,7 @@ test("a handle record another replica wrote is admitted and pinged in the same t
   });
 
   const identities = roster()!.entries.map((e) => e.identity);
-  assert.ok(identities.includes("sess-remote:safe:wl-remote"),
+  assert.ok(identities.includes("safe:wl-remote"),
     "an un-admitted target is reconciled in before the sweep serves it, not left "
       + "to whatever capacity the admitted ones leave");
   assert.ok(pinged.includes("wl-remote"),
@@ -162,7 +162,7 @@ test("remote registrations past the ceiling are admitted, reported, and served",
   assert.equal(after.entries.length, filler.length + 3);
   assert.ok(after.entries.length > CONFIG.ceiling, "genuinely past the declared ceiling");
   for (const n of [1, 2, 3]) {
-    assert.ok(after.entries.some((e) => e.identity === `sess-remote-${n}:safe:wl-remote-${n}`), `remote ${n}`);
+    assert.ok(after.entries.some((e) => e.identity === `safe:wl-remote-${n}`), `remote ${n}`);
     assert.ok(pinged.includes(`wl-remote-${n}`),
       "served in this tick, not deferred behind the admitted ones");
   }
@@ -215,9 +215,9 @@ test("a registration arriving mid-sweep is admitted and served by the next one",
   });
 
   const identities = roster()!.entries.map((e) => e.identity);
-  assert.ok(identities.includes("sess-latecomer:safe:wl-latecomer"),
+  assert.ok(identities.includes("safe:wl-latecomer"),
     "admitted, so it counts against the ceiling like every other target");
-  assert.ok(identities.includes("sess-local:safe:wl-local"));
+  assert.ok(identities.includes("safe:wl-local"));
   assert.ok(pinged.includes("wl-latecomer"), "and served");
   assert.ok(pinged.includes("wl-local"));
 });
@@ -226,9 +226,13 @@ test("a sandbox that is unregistered gives its slot straight back", async () => 
   // Held past the unregister, the slot counts against the ceiling for a sandbox
   // that no longer exists, and an ordinary teardown becomes a capacity refusal
   // for the next request.
-  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  const { bindAdmission, admitSandbox, markCensusReconciled } =
+    await import("../src/sandbox/admission.js");
   bindAdmission(kv, { ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve });
-  const identity = "sess-local:safe:wl-local";
+  // No sweep runs here, and admission refuses every claim until one has
+  // reconciled a census onto the roster.
+  markCensusReconciled();
+  const identity = "safe:wl-local";
 
   const hold = await admitSandbox("sess-local");
   await hold.bind(identity);
@@ -249,11 +253,13 @@ test("a sandbox parked for idle reuse keeps its slot", async () => {
   // while this sandbox is still a target the sweep will reconcile back in --
   // the over-cap state admission exists to prevent, reached through ordinary
   // use rather than through a race.
-  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  const { bindAdmission, admitSandbox, markCensusReconciled } =
+    await import("../src/sandbox/admission.js");
   await bindAdmission(kv, {
     ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
   });
-  const identity = "sess-local:safe:wl-local";
+  markCensusReconciled();
+  const identity = "safe:wl-local";
   const hold = await admitSandbox("sess-local");
   await hold.bind(identity);
   registerSandbox("sess-local", {
@@ -306,9 +312,9 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
   const identities = roster()!.entries.map((e) => e.identity);
   assert.ok(roster()!.entries.length > CONFIG.ceiling, "genuinely past the declared ceiling");
   for (const n of [1, 2, 3]) {
-    assert.ok(identities.includes(`sess-remote-${n}:safe:wl-remote-${n}`), `remote ${n} admitted`);
+    assert.ok(identities.includes(`safe:wl-remote-${n}`), `remote ${n} admitted`);
   }
-  assert.ok(identities.includes("sess-working:safe:wl-working"),
+  assert.ok(identities.includes("safe:wl-working"),
     "the target holding live work is admitted, not left to residual capacity");
   assert.ok(kv.get, "sanity");
   assert.ok(values.has("hands.sess-working"),
@@ -319,7 +325,7 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
   // A third tick picks up what arrived during the first two.
   pinged.length = 0;
   await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
-  assert.ok(roster()!.entries.some((e) => e.identity === "sess-latecomer:safe:wl-latecomer"),
+  assert.ok(roster()!.entries.some((e) => e.identity === "safe:wl-latecomer"),
     "the mid-sweep arrival is admitted rather than lost");
   assert.ok(pinged.includes("wl-latecomer"));
 });
@@ -548,7 +554,7 @@ test("a DAG sandbox surviving a restart is admitted and pinged", async () => {
     roster: { store: rosterStore(kv), config: CONFIG },
   });
 
-  assert.ok(roster()!.entries.some((e) => e.identity === "dag-root-1:safe:wl-dag"),
+  assert.ok(roster()!.entries.some((e) => e.identity === "safe:wl-dag"),
     "admitted, so it counts against the ceiling like every other target");
   assert.ok(pinged.includes("wl-dag"), "and pinged, so its idle clock is held off");
 });
@@ -618,11 +624,13 @@ test("a parked handle that expires gives its slot back", async () => {
   // ceiling for a sandbox that no longer exists, and because parking is
   // ordinary use the loss is monotonic -- provisioning is eventually refused
   // for capacity on a fleet that is nowhere near it.
-  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  const { bindAdmission, admitSandbox, markCensusReconciled } =
+    await import("../src/sandbox/admission.js");
   await bindAdmission(kv, {
     ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
   });
-  const identity = "sess-park:safe:wl-park";
+  markCensusReconciled();
+  const identity = "safe:wl-park";
   const hold = await admitSandbox("sess-park");
   await hold.bind(identity);
   kv.seed("hands.sess-park", retained("wl-park"));
@@ -652,11 +660,13 @@ test("an expiry whose delete lost its race keeps the slot", async () => {
   // `previousSeq` loses to a sibling reactivating this very handle. Releasing
   // on a delete that did not happen strips the slot from a target that is live
   // again, so the release cannot be unconditional.
-  const { bindAdmission, admitSandbox } = await import("../src/sandbox/admission.js");
+  const { bindAdmission, admitSandbox, markCensusReconciled } =
+    await import("../src/sandbox/admission.js");
   await bindAdmission(kv, {
     ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
   });
-  const identity = "sess-park:safe:wl-park";
+  markCensusReconciled();
+  const identity = "safe:wl-park";
   const hold = await admitSandbox("sess-park");
   await hold.bind(identity);
   kv.seed("hands.sess-park", retained("wl-park"));

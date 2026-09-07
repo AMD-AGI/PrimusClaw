@@ -904,7 +904,11 @@ async function main() {
   // fleet is a different refresh gap proven against the same handles, and
   // discovering it on a later sweep means it is already serving requests.
   await bindAdmission(kv, capacity);
-  startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
+  // Awaited: admission refuses every claim until a census has been reconciled
+  // onto the roster, and this is that census. Deliveries are already being
+  // served by the time boot reaches here, so leaving it to run behind them
+  // turns the first provisioning of a restarted pod into a capacity refusal.
+  await startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
 
   // Background sweeper: evict stale Hands KV entries whose workloads died
   // outside an active task (covers sessions idle longer than the KV TTL
