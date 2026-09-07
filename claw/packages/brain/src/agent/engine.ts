@@ -59,15 +59,7 @@ export function webToolClientHeaders(): Record<string, string> {
 }
 
 export class AgentEngine {
-  /**
-   * Stand in for an identity the runner failed to thread down.
-   *
-   * Never a second resolution: the resolver prefers `task_id` and would mint
-   * an identity that looks correct while addressing an entry the runner never
-   * opened. A sentinel that takes no request cannot substitute a proxy for the
-   * value that went missing, and the error log is what makes the wiring bug
-   * findable rather than the accounting quietly landing somewhere else.
-   */
+  /** Never a second resolution: that would name an entry nobody opened. */
   private untrackedIdentity(sessionId: string): RunIdentity {
     const identity = untheadedRunIdentity();
     logger.error({ sessionId, runIdentityKey: identity.key }, "engine.run_identity_missing");

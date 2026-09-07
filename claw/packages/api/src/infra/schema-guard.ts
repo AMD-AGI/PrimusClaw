@@ -73,10 +73,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // which is the failure this guard exists to move to startup.
       "origin", "workspace_id", "lease_owner", "lease_expires_at", "heartbeat_at", "event_seq",
       "claim_count", "sandbox_workload_id",
-      // Run time accounting. The lease endpoint's fence reads the attempt
-      // columns on every renewal in the fleet and its merge reads the version,
-      // so a half-applied migration here refuses every heartbeat rather than
-      // degrading one report.
+      // Every renewal in the fleet reads these; half-applied refuses them all.
       "attempt_id", "attempt_generation", "delivery_seq", "delivery_count",
       "ledger_version", "queued_ms_accrued",
       // Named on every task insert, so a database that lost it takes down the

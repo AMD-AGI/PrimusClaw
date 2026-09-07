@@ -173,6 +173,49 @@ interface ChainRun {
   lockKey: string;
 }
 
+/**
+ * Everything that leaves the process, routed back to the chain that owns it.
+ *
+ * Keyed by the owner scope rather than shared, because two chains in flight
+ * together must not share one hands client: the second one's wait would be the
+ * only one anything recorded.
+ */
+function chainSideEffects(): TaskRunnerSideEffects {
+  const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
+  return {
+    ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t" }),
+    destroyHands: noop(undefined),
+    reapPendingHands: noop(undefined),
+    unregisterSandbox: (() => {}) as never,
+    markHandsIdle: (() => {}) as never,
+    markRetryPending: noop(undefined),
+    syncWorkspaceToS3: noop({ uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
+    syncWorkspaceFromS3: noop(undefined),
+    archiveRunToS3: noop(undefined),
+    copyS3Prefix: noop({ copied: 0 }),
+    syncWorkspace: noop({ ok: true }),
+    restoreWorkspace: noop({ ok: true }),
+    postAgentDone: noop(undefined),
+    postTaskRunning: noop(undefined),
+    postRunLease: ((req: { session_id: string }, renewal: Renewal) => {
+      chains.get(req.session_id)?.onRenewal(renewal);
+      return Promise.resolve("running");
+    }) as never,
+    runScript: noop(undefined),
+    refreshTaskLock: noop(undefined),
+    releaseTaskLock: noop(undefined),
+    flushTranscript: (() => Promise.resolve()) as never,
+    // Keyed by the owner scope, which is this run's session: two chains in
+    // flight together must not share one client, or the second one's wait is
+    // the only one anything records.
+    makeHandsClient: ((_url: string, _token: string, owner: string) => ({
+      callTool: (name: string) => chains.get(owner)!.callTool(name),
+      close: async () => {},
+    })) as never,
+  } as unknown as TaskRunnerSideEffects;
+
+}
+
 async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
   const renewals: Renewal[] = [];
   let afterWait: RunPhaseReport | null = null;
@@ -226,38 +269,7 @@ async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
   chains.set(pickRunScope(request), chain);
 
 
-  const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
-  const sideEffects = {
-    ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t" }),
-    destroyHands: noop(undefined),
-    reapPendingHands: noop(undefined),
-    unregisterSandbox: (() => {}) as never,
-    markHandsIdle: (() => {}) as never,
-    markRetryPending: noop(undefined),
-    syncWorkspaceToS3: noop({ uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
-    syncWorkspaceFromS3: noop(undefined),
-    archiveRunToS3: noop(undefined),
-    copyS3Prefix: noop({ copied: 0 }),
-    syncWorkspace: noop({ ok: true }),
-    restoreWorkspace: noop({ ok: true }),
-    postAgentDone: noop(undefined),
-    postTaskRunning: noop(undefined),
-    postRunLease: ((req: { session_id: string }, renewal: Renewal) => {
-      chains.get(req.session_id)?.onRenewal(renewal);
-      return Promise.resolve("running");
-    }) as never,
-    runScript: noop(undefined),
-    refreshTaskLock: noop(undefined),
-    releaseTaskLock: noop(undefined),
-    flushTranscript: (() => Promise.resolve()) as never,
-    // Keyed by the owner scope, which is this run's session: two chains in
-    // flight together must not share one client, or the second one's wait is
-    // the only one anything records.
-    makeHandsClient: ((_url: string, _token: string, owner: string) => ({
-      callTool: (name: string) => chains.get(owner)!.callTool(name),
-      close: async () => {},
-    })) as never,
-  } as unknown as TaskRunnerSideEffects;
+  const sideEffects = chainSideEffects();
 
   const engine = new AgentEngine();
   bindTaskRunnerDeps({

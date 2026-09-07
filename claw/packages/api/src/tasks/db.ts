@@ -196,23 +196,18 @@ export async function updateTask(
 }
 
 /**
- * What every status change owes the run's queue accounting.
- *
  * Every SET expression reads the pre-UPDATE row, so this banks the segment the
- * re-stamp beside it is about to erase -- the `queued -> queued` requeue
- * included. `clock_timestamp()` rather than `NOW()`: a change committed from a
- * transaction that opened before the row was queued would otherwise measure a
- * negative interval and clamp a real wait to nothing.
+ * re-stamp beside it erases, the `queued -> queued` requeue included. And
+ * `clock_timestamp()`: a transaction that opened before the row was queued would
+ * measure a negative interval and clamp a real wait to nothing.
  */
 const QUEUE_ACCRUAL_SQL = `queued_ms_accrued = queued_ms_accrued
       + CASE WHEN status = 'queued'
              THEN GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - queued_at)) * 1000)::bigint
              ELSE 0 END`;
 
-/**
- * A status to move to, or the expression a reaper picks one with per row.
- * Splitting such a reaper into two passes would let a row move between them.
- */
+/** A status, or the expression a reaper picks one with per row: splitting such
+ *  a reaper into two passes would let a row move between them. */
 export type NextStatus = TaskStatus | { sql: string; terminal: true };
 
 // Written as a literal rather than bound, so the statement stays greppable;
@@ -222,33 +217,25 @@ const WRITABLE_STATUSES = new Set<string>([
   "cancelling", "completed", "failed", "cancelled",
 ]);
 
-/** What a status change may carry besides the status itself. */
 export interface StatusTransition {
-  /** Statuses the row may be in for this change to apply. */
   expected?: TaskStatus[];
-  /** Extra SET columns, by name. `metadata` is merged rather than replaced. */
+  /** `metadata` is merged into rather than replacing what the row holds. */
   extra?: Record<string, unknown>;
   /** Raw SET fragments, for assignments a column/value pair cannot express.
    *  Their `$n` placeholders index `params`, exactly as `where`'s do. */
   setSql?: string[];
-  /**
-   * A predicate replacing the `task_id = $n` match entirely, for the cascades
-   * that move many rows at once. `$$next` and `$$accrual` are not available to
-   * it; it is spliced verbatim and must carry its own parameters via `params`.
-   */
+  /** Replaces the `task_id = $n` match entirely, for the cascades that move many
+   *  rows. Spliced verbatim: it carries its own parameters via `params`. */
   where?: string;
   params?: unknown[];
   query?: Querier;
-  /** Extra RETURNING expressions, for a value only this statement can read. */
   returning?: string;
 }
 
 /**
- * The one statement in this codebase that writes `claw_tasks.status`.
- *
- * Single-sourced because the accrual above rides on every status change: a
- * writer issuing its own UPDATE silently drops that run's queued segment. A
- * repo-level test asserts no other source file contains the statement.
+ * The one statement in this codebase that writes `claw_tasks.status`, because
+ * the accrual above rides on every status change: a writer issuing its own
+ * UPDATE silently drops that run's queued segment.
  */
 export async function applyTaskStatusTransition(
   next: NextStatus,
@@ -263,9 +250,6 @@ export async function applyTaskStatusTransition(
   const values: unknown[] = [];
   let i = 1;
   for (const [k, v] of Object.entries(opts.extra ?? {})) {
-    // `metadata` is merged rather than replaced: a caller building one from a
-    // snapshot taken before the transaction would otherwise write back over
-    // whatever else the same transaction has already put in the subtree.
     sets.push(k === "metadata"
       ? `metadata = COALESCE(metadata, '{}'::jsonb) || $${i++}::jsonb`
       : `${k} = $${i++}`);
@@ -273,8 +257,6 @@ export async function applyTaskStatusTransition(
   }
   // `waiting_external` re-stamps for the same reason `queued` does: the column
   // is "waiting since", and the reaper that reads it next measures from here.
-  // Callers no longer stamp it themselves, so the accrual above always sees the
-  // segment this write is closing.
   if (chosen === "queued" || chosen === "waiting_external") {
     sets.push("queued_at = clock_timestamp()");
   }
@@ -324,10 +306,7 @@ export async function applyTaskStatusTransition(
   return r.rows as ClawTaskRow[];
 }
 
-/**
- * Transition a task into the given terminal / non-terminal status. The
- * `expected` filter avoids races where two workers try to flip the same row.
- */
+/** The single-row form. `expected` is the CAS two workers race through. */
 export async function transitionStatus(
   taskId: string,
   expected: TaskStatus[],
