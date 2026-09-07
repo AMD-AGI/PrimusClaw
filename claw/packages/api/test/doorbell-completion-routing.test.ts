@@ -238,3 +238,19 @@ test("the generation the row admits does all three", async () => {
   assert.equal(await turnCount(), 2);
   assert.ok(h.statements.some((s) => s.includes(DRAIN_READ)));
 });
+
+test("a processed stale generation does not suppress the live generation", async () => {
+  const { completionAlreadyProcessed } = await import("../src/events/consumer.js");
+  await seedFencedTurn();
+
+  await deliverCompletion(completion(1));
+  assert.equal(await completionAlreadyProcessed("s1", "m-1"), true);
+
+  h.statements.length = 0;
+  await deliverCompletion(completion(2));
+
+  assert.equal((await runRow(h, "t1")).status, "completed");
+  assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
+  assert.equal(await turnCount(), 2);
+  assert.ok(h.statements.some((statement) => statement.includes(DRAIN_READ)));
+});

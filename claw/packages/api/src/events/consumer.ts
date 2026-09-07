@@ -267,17 +267,26 @@ async function processCompletionEvent(
       ? null
       : await resolveChatRunProvenance(event);
     const namesChatRow = provenance !== null && provenance !== "foreign";
-    const alreadyProcessed = await completionAlreadyProcessed(sessionId, messageId ?? "");
+    const messageAlreadyProcessed = await completionAlreadyProcessed(sessionId, messageId ?? "");
+    const alreadyProcessed = !namesChatRow && messageAlreadyProcessed;
     if (alreadyProcessed) {
-      const superseded = namesChatRow
-        && await completionAdmissibility(provenance, runClaimOf(event)) === "superseded";
-      if (!superseded && messageId && event.completion_source !== "sweeper") {
+      if (messageId && event.completion_source !== "sweeper") {
         await recordCompletionTurns(sessionId, event, messageId);
       }
-      logger.info(
-        { sessionId, rowId, messageId, superseded },
-        "exec_complete.skipped_already_processed",
-      );
+      logger.info({ sessionId, rowId, messageId }, "exec_complete.skipped_already_processed");
+    } else if (namesChatRow && messageAlreadyProcessed) {
+      const verdict = await completionAdmissibility(provenance, runClaimOf(event));
+      if (verdict === "active") {
+        await handleComplete(sessionId, event, rowId, provenance);
+      } else {
+        if (verdict === "settled" && messageId && event.completion_source !== "sweeper") {
+          await recordCompletionTurns(sessionId, event, messageId);
+        }
+        logger.info(
+          { sessionId, rowId, messageId, verdict },
+          "exec_complete.skipped_already_processed",
+        );
+      }
     } else {
       await handleComplete(sessionId, event, rowId, provenance);
     }
@@ -584,26 +593,27 @@ export async function resolveChatRunProvenance(
 }
 
 /**
- * What a completion that closed nothing may still do.
- *
- * `missing` and a settled row this reporter is still admissible for both leave
- * the remaining steps owed -- the second is this event's own redelivery, and
- * each later step is idempotent on its own terms. A reporter the row no longer
- * admits is the case that must stop: a stale generation, or an unfenced report
- * on a row a fenced successor took over.
+ * Whether the named row still admits this reporter, and whether it is active.
+ * Settled rows may accept a turn repair, but only active rows still owe the
+ * gate and queue side effects in `handleComplete`.
  */
 async function completionAdmissibility(
   taskId: string,
   runClaim: number | undefined,
-): Promise<"missing" | "admissible" | "superseded"> {
+): Promise<"missing" | "active" | "settled" | "superseded"> {
   const r = await db.query(
-    "SELECT claim_count, metadata->>'lease_fenced' AS fenced FROM claw_tasks WHERE task_id = $1",
+    "SELECT status, claim_count, metadata->>'lease_fenced' AS fenced FROM claw_tasks WHERE task_id = $1",
     [taskId],
   );
-  const row = r.rows[0] as { claim_count?: unknown; fenced?: string | null } | undefined;
+  const row = r.rows[0] as {
+    status?: string; claim_count?: unknown; fenced?: string | null;
+  } | undefined;
   if (!row) return "missing";
-  if (runClaim === undefined) return row.fenced === "true" ? "superseded" : "admissible";
-  return Number(row.claim_count ?? 0) === runClaim ? "admissible" : "superseded";
+  if (runClaim === undefined && row.fenced === "true") return "superseded";
+  if (runClaim !== undefined && Number(row.claim_count ?? 0) !== runClaim) return "superseded";
+  return ["completed", "failed", "cancelled"].includes(row.status ?? "")
+    ? "settled"
+    : "active";
 }
 
 /** The generation the reporter was issued, omitted rather than invented. */
@@ -657,7 +667,7 @@ async function handleComplete(
     // still coming.
     if (!closed.length && provenance) {
       const verdict = await completionAdmissibility(provenance, runClaimOf(event));
-      if (verdict !== "admissible") {
+      if (verdict === "missing" || verdict === "superseded") {
         logger.info(
           { sessionId, messageId, taskId: provenance, verdict },
           "exec_complete.not_admissible_for_row",
