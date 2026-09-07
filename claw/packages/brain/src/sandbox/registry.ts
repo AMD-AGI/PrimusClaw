@@ -123,14 +123,25 @@ export interface HandsBinding {
  * knows nothing of the other, so a new pod that looked only at the canonical
  * one would read a live session as having no sandbox and provision a second.
  */
+/**
+ * Every key a session's binding can sit under, canonical first.
+ *
+ * Both can hold one at once for the length of a rolling upgrade, so a caller
+ * that has to act on a *particular* generation has to look at all of them
+ * rather than take the first that answers.
+ */
+export function handsEntryKeys(sessionId: string): string[] {
+  const canonical = handsSessionKey(sessionId);
+  const legacy = legacyHandsKey(sessionId);
+  return canonical === legacy ? [canonical] : [canonical, legacy];
+}
+
 export async function readHandsEntry(
   kv: KV, sessionId: string,
 ): Promise<(HandsBinding & { value: string; entry: KvEntry }) | null> {
   // Errors are not caught: an unavailable store is not a session with no
   // sandbox, and reading it as one is how a live workload gets replaced.
-  const canonical = handsSessionKey(sessionId);
-  const legacy = legacyHandsKey(sessionId);
-  for (const key of canonical === legacy ? [canonical] : [canonical, legacy]) {
+  for (const key of handsEntryKeys(sessionId)) {
     const entry = await kv.get(key);
     if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision, entry };
   }

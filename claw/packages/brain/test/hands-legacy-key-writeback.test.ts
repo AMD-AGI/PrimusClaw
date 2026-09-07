@@ -20,7 +20,9 @@ import { StringCodec, type KV } from "nats";
 import { handsSessionKey, legacyHandsKey } from "../src/sandbox/hands-key.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { readHandsProbeEntry } from "../src/sandbox/container-probe.js";
-import { markHandsIdle, runKeepaliveTickForTest } from "../src/sandbox/keepalive.js";
+import {
+  markHandsIdle, registerSandbox, runKeepaliveTickForTest, unregisterSandbox,
+} from "../src/sandbox/keepalive.js";
 import { markRetryPending } from "../src/tasks/retry-pending.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 
@@ -186,4 +188,74 @@ test("an expired retry leaves a canonical sibling of another generation alone", 
 
   assert.ok(!writes.deleted.includes(CANONICAL_KEY),
     "a live sibling generation was deleted by a key re-derived from the session id");
+});
+
+test("an expired retry on a locally registered generation deletes that one", async () => {
+  // The local registry names one particular sandbox and carries no KV key, so
+  // the record has to be found by identity. A canonical-first read returns the
+  // sibling here -- a different, live generation of the same session -- and
+  // deleting it strands the workload it names while leaving the orphan behind.
+  const { kv, writes } = kvHolding(LEGACY_KEY);
+  kv.seed(CANONICAL_KEY, JSON.stringify({ ...BINDING, workloadId: "wl-newer" }));
+  bindHandsKv(kv);
+  const local = {
+    provider: "safe-workload" as const,
+    workloadId: "wl-1",
+    platformKey: "pk-1",
+    sessionId: SESSION_ID,
+    sandboxName: "sb-1",
+    namespace: "ns-1",
+  };
+  registerSandbox(SESSION_ID, local);
+  await markRetryPending(kv, {
+    sessionId: SESSION_ID,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: "wl-1",
+  });
+
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  } finally {
+    unregisterSandbox(SESSION_ID, local);
+  }
+
+  assert.ok(!writes.deleted.includes(CANONICAL_KEY),
+    "the live sibling generation was deleted instead of the registered one");
+  assert.ok(writes.deleted.includes(LEGACY_KEY),
+    "the generation the local registry named was left behind");
+});
+
+test("an expired retry deletes nothing when no record names the registered generation", async () => {
+  // Neither key holds the generation the registry names. Deleting the one that
+  // happens to answer would strand a live workload; an orphan is the cheaper
+  // wrong answer and the bucket TTL takes it.
+  const { kv, writes } = kvHolding(CANONICAL_KEY, { ...BINDING, workloadId: "wl-someone-else" });
+  bindHandsKv(kv);
+  const local = {
+    provider: "safe-workload" as const,
+    workloadId: "wl-gone",
+    platformKey: "pk-1",
+    sessionId: SESSION_ID,
+    sandboxName: "sb-gone",
+    namespace: "ns-1",
+  };
+  registerSandbox(SESSION_ID, local);
+  await markRetryPending(kv, {
+    sessionId: SESSION_ID,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: "wl-gone",
+  });
+
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  } finally {
+    unregisterSandbox(SESSION_ID, local);
+  }
+
+  assert.deepEqual(writes.deleted.filter((k) => k.startsWith("hands.")), [],
+    "a record naming a different sandbox was deleted");
 });

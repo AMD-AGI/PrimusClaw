@@ -11,7 +11,9 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { readHandsEntry, reconcileReservedKeys, sessionHasActiveRunLease } from "./registry.js";
+import {
+  handsEntryKeys, readHandsEntry, reconcileReservedKeys, sessionHasActiveRunLease,
+} from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { listAllDagHandles } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
@@ -144,19 +146,50 @@ function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
 }
 
 /**
+ * The key holding the generation `entry` names.
+ *
+ * A canonical-first read returns whichever key exists, which is the wrong
+ * record when both do: the local registry names one particular generation, and
+ * its sibling under the other key belongs to a different, live one. Matching on
+ * identity is the only way to tell them apart, so an unreadable or
+ * non-matching record is passed over rather than guessed at.
+ */
+async function recordKeyNamingSandbox(
+  kv: KV, sessionId: string, entry: SandboxEntry,
+): Promise<string | null> {
+  for (const key of handsEntryKeys(sessionId)) {
+    const found = await kv.get(key).catch(() => null);
+    if (!found) continue;
+    try {
+      if (sameRegisteredSandbox(entry, JSON.parse(sc.decode(found.value)) as HandsKvEntry)) {
+        return key;
+      }
+    } catch { /* unreadable is not evidence that this is the record we want */ }
+  }
+  return null;
+}
+
+/**
  * Delete the binding this decision was taken on.
  *
  * Not a key re-derived from the session id: during a rolling upgrade the
  * binding can sit under the legacy name, and the canonical key can hold a
  * different generation of the same session -- so re-deriving either leaves the
  * orphan behind or deletes a live sibling.
+ *
+ * Deleting nothing is the safe end of that: an orphan costs a sandbox until the
+ * bucket TTL takes it, while deleting a sibling strands a running workload.
  */
 async function deleteExpiredRetryRecord(
-  kv: KV, sessionId: string, recordKey?: string,
+  kv: KV, sessionId: string, recordKey?: string, entry?: SandboxEntry,
 ): Promise<void> {
   const key = recordKey
-    ?? (await readHandsEntry(kv, sessionId).catch(() => null))?.key;
-  if (!key) return;
+    ?? (entry ? await recordKeyNamingSandbox(kv, sessionId, entry) : null);
+  if (!key) {
+    logger.warn({ sessionId, workloadId: entry?.workloadId },
+      "keepalive.retry_pending_record_unresolved");
+    return;
+  }
   await kv.delete(key).catch((err) => logger.warn(
     { err: String(err), sessionId, key }, "keepalive.retry_pending_record_not_deleted",
   ));
@@ -194,7 +227,7 @@ async function shouldSkipExpiredRetry(
   }
 
   unregisterSandbox(sessionId, entry);
-  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey);
+  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
   await clearRetryPending(deps.kv, sessionId, pending.lockKey);
   logger.warn(
     {
