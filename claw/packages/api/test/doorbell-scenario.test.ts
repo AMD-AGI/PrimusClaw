@@ -773,8 +773,7 @@ test("J reaping a lost lease closes the queued doorbell spare beside it", async 
   // The spare a retried dispatch opened for the same message.
   await seedRun(h, "spare", "s1", { status: "queued", dispatch: "doorbell", messageId: "m-dup" });
 
-  const n = await reapLostLeases();
-  console.log("DBGJ reaped=", n, JSON.stringify(await h.sql("SELECT task_id,status,failure_reason FROM claw_tasks ORDER BY task_id")));
+  await reapLostLeases();
 
   const spare = await runRow(h, "spare");
   assert.equal(spare.status, "failed", "queued is the shape a doorbell retry leaves");
