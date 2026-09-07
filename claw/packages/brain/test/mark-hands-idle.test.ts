@@ -266,3 +266,47 @@ test("both writers of an idle period leave the handle in one shape", async () =>
   assert.equal(written.brain.keepalive, false);
   assert.ok(!("bgRunning" in written.brain), "last period's verdict does not speak for this one");
 });
+
+test("a write whose acknowledgement is lost is reported as the park it was", async () => {
+  // The bucket commits and then the transport dies before the ack arrives. The
+  // entry is parked; saying `failed` would tell `keepalive.stopped_after_task`
+  // the handle is still live and have the fleet keep pinging a parked pod.
+  let stored = { status: "ready", workloadId: "w1" } as Record<string, unknown>;
+  let revision = REVISION;
+  const kv = {
+    async get(key: string) {
+      return { key, value: sc.encode(JSON.stringify(stored)), revision };
+    },
+    async update(_key: string, value: Uint8Array, _revision: number) {
+      stored = JSON.parse(sc.decode(value)) as Record<string, unknown>;
+      revision = REVISION + 1;
+      throw new Error("CONNECTION_CLOSED");
+    },
+  } as unknown as KV;
+
+  assert.deepEqual(await markHandsIdle(kv, SID, "w1"), { outcome: "parked" });
+  assert.equal(stored.keepalive, false);
+  assert.equal(stored.idleRev, REVISION, "the write this call was conditioned on is what landed");
+});
+
+test("another parker's write is not claimed as this call's", async () => {
+  // Same lost acknowledgement, except the value on the key was opened by a
+  // different idle period -- so this call's write did not land, and reporting
+  // `parked` would credit it with somebody else's.
+  const kv = {
+    async get(key: string) {
+      return {
+        key,
+        value: sc.encode(JSON.stringify({
+          status: "ready", workloadId: "w1", keepalive: false, idleRev: REVISION - 1,
+        })),
+        revision: REVISION,
+      };
+    },
+    async update() {
+      throw new Error("CONNECTION_CLOSED");
+    },
+  } as unknown as KV;
+
+  assert.equal((await markHandsIdle(kv, SID, "w1")).outcome, "failed");
+});

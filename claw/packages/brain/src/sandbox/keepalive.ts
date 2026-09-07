@@ -421,6 +421,30 @@ export function registeredSandboxCount(sessionId: string): number {
 }
 
 /**
+ * Whether the idle-opening write conditioned on `revision` is what the entry holds.
+ *
+ * A rejected update is not the same as a write that did not happen: the bucket
+ * can commit and then lose the acknowledgement, and reporting `failed` for that
+ * tells the caller a handle is unparked while the sweep is already reading it as
+ * parked. `idleRev` settles which of the two it was without guessing -- it holds
+ * the revision the write was conditioned on, and the bucket accepts one write
+ * per revision, so no other parker can have left this value behind.
+ *
+ * A re-read that itself fails answers false: unverified stays `failed`, which is
+ * the conservative direction the caller already handles.
+ */
+async function idleWriteLanded(kv: KV, kvKey: string, revision: number): Promise<boolean> {
+  try {
+    const latest = await kv.get(kvKey);
+    if (!latest) return false;
+    const info = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
+    return info.keepalive === false && info.idleRev === revision;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Mark a READY `hands.<sid>` entry idle (keepalive:false) so it is kept as a
  * reuse handle but no longer pinged. Called by stopKeepaliveAfterTask instead
  * of deleting the entry outright, so the next message in the same session
@@ -489,7 +513,12 @@ export function markHandsIdle(
       // then refreshes its TTL for the whole reuse window rather than letting
       // it expire -- so the deleted session's platformKey and workload id would
       // outlive it by 15 minutes.
-      await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
+      try {
+        await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
+      } catch (err) {
+        if (isRevisionConflict(err) || !await idleWriteLanded(kv, kvKey, entry.revision)) throw err;
+        logger.info({ sessionId }, "hands.mark_idle_ack_lost");
+      }
       return { outcome: "parked" };
     })
     .catch((err): RunEndedParkResult => {
