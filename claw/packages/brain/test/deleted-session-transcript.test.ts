@@ -80,7 +80,7 @@ function stubSideEffects(): Partial<TaskRunnerSideEffects> {
     destroyHands: noop(undefined),
     reapPendingHands: noop(undefined),
     unregisterSandbox: (() => {}) as never,
-    markHandsIdle: (() => {}) as never,
+    markHandsIdle: (() => Promise.resolve({ outcome: "parked" })) as never,
     syncWorkspaceFromS3: noop(undefined),
     postAgentDone: noop(undefined),
     postTaskRunning: noop(undefined),

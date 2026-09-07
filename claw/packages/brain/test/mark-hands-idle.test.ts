@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * What markHandsIdle does when it cannot do its job.
+ * What markHandsIdle does when it cannot do its job, and what it says it did.
  *
  * It runs at every task's terminal state to park the sandbox handle for reuse.
  * The handle matters beyond reuse though: the idle sweeper walks `hands.*` to
@@ -11,6 +11,12 @@
  * deleting the entry on a transient KV blip would turn a hiccup into a leaked
  * cluster, while an entry nobody can parse is worth dropping because every
  * consumer skips it anyway.
+ *
+ * Every branch's returned outcome is pinned beside its side effect, because
+ * that outcome is the only thing separating a park from a refusal at the call
+ * site: `keepalive.stopped_after_task` reports `parked` from it, and a branch
+ * that wrote nothing while reporting success is how a handle nobody parks gets
+ * pinged by the whole fleet until the workload's absolute deadline.
  */
 
 import { test } from "node:test";
@@ -18,14 +24,10 @@ import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";
 
 import { isRevisionConflict } from "@claw/utils";
+import { parkHandsAfterRun, type RevisionedKv } from "@claw/protocol";
 import { markHandsIdle } from "../src/sandbox/keepalive.js";
 
 const sc = StringCodec();
-
-/** markHandsIdle is fire-and-forget, so let its promise chain settle. */
-function settle(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 10));
-}
 
 interface StubCalls {
   deleted: string[];
@@ -76,9 +78,9 @@ const KEY = `hands.${SID}`;
 test("a READY handle is parked with a revision-conditioned write", async () => {
   const { kv, calls } = stubKv({ entry: { status: "ready", workloadId: "w1" } });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.deepEqual(result, { outcome: "parked" });
   assert.deepEqual(
     calls.updated,
     [{ key: KEY, revision: REVISION }],
@@ -90,9 +92,9 @@ test("a READY handle is parked with a revision-conditioned write", async () => {
 test("a read failure never authorizes deleting an unknown owner", async () => {
   const { kv, calls } = stubKv({ getError: new Error("TIMEOUT") });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.equal(result.outcome, "failed", "a blip is not a park, and must not be logged as one");
   assert.deepEqual(calls.deleted, []);
 });
 
@@ -102,9 +104,9 @@ test("a failed conditional write preserves the latest owner", async () => {
     updateError: new Error("CONNECTION_CLOSED"),
   });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.equal(result.outcome, "failed");
   assert.deepEqual(calls.deleted, []);
 });
 
@@ -119,18 +121,18 @@ test("losing the write race leaves whatever the winner wrote", async () => {
     updateError: conflict,
   });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.equal(result.outcome, "superseded", "the winner parked it; this caller did not");
   assert.deepEqual(calls.deleted, []);
 });
 
 test("an unparseable entry is preserved because it may name a live sandbox", async () => {
   const { kv, calls } = stubKv({ raw: "{ not json" });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.deepEqual(result, { outcome: "skipped", reason: "unreadable" });
   assert.deepEqual(calls.deleted, []);
   assert.deepEqual(calls.updated, []);
 });
@@ -140,9 +142,9 @@ test("a handle for a different workload is left untouched", async () => {
   // sandbox, and parking it as idle would misrepresent what is running.
   const { kv, calls } = stubKv({ entry: { status: "ready", workloadId: "w2" } });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.deepEqual(result, { outcome: "skipped", reason: "other_sandbox" });
   assert.deepEqual(calls.updated, []);
   assert.deepEqual(calls.deleted, []);
 });
@@ -158,14 +160,14 @@ test("agent-sandbox idle marking compares its full identity", async () => {
     },
   });
 
-  markHandsIdle(kv, SID, {
+  const result = await markHandsIdle(kv, SID, {
     provider: "agent-sandbox",
     sessionId: "agent-session",
     sandboxName: "sandbox-a",
     namespace: "ns",
   });
-  await settle();
 
+  assert.deepEqual(result, { outcome: "skipped", reason: "other_sandbox" });
   assert.deepEqual(calls.updated, []);
   assert.deepEqual(calls.deleted, []);
 });
@@ -192,9 +194,173 @@ test("a lost write race is recognised as one, not as a KV error", () => {
 test("a pending handle is not parked", async () => {
   const { kv, calls } = stubKv({ entry: { status: "pending", workloadId: "w1" } });
 
-  markHandsIdle(kv, SID, "w1");
-  await settle();
+  const result = await markHandsIdle(kv, SID, "w1");
 
+  assert.deepEqual(result, { outcome: "skipped", reason: "not_ready" });
   assert.deepEqual(calls.updated, []);
   assert.deepEqual(calls.deleted, []);
+});
+
+test("a handle nobody wrote is reported gone, not parked", async () => {
+  const { kv, calls } = stubKv({});
+
+  const result = await markHandsIdle(kv, SID, "w1");
+
+  assert.deepEqual(result, { outcome: "gone" }, "a fresh task will recreate one");
+  assert.deepEqual(calls.updated, []);
+});
+
+test("both writers of an idle period leave the handle in one shape", async () => {
+  // The reason the field-setting is shared code at all: the sweep reclaims on
+  // these fields and the background-work verdict is matched to a period by
+  // them, so if Brain's park and the API's reaper disagree about any one of
+  // them, the fleet acts on a verdict from a period that has already ended.
+  const HELD = {
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "w1",
+    handsUrl: "http://sandbox:9100/mcp",
+    token: "tok",
+    keepalive: true,
+    idleSince: 111,
+    idleEpoch: 111,
+    idleRev: 2,
+    bgCheckedAt: 900,
+    bgRunning: true,
+    bgEpoch: 111,
+    bgIdleSince: 111,
+    bgIdleRev: 2,
+    bgRev: 3,
+    workSeenAt: 950,
+  };
+
+  const written: Record<string, Record<string, unknown>> = {};
+  const capturingKv = (into: string) => ({
+    async get(key: string) {
+      return { key, value: sc.encode(JSON.stringify(HELD)), revision: REVISION };
+    },
+    async update(_key: string, value: Uint8Array, _revision: number) {
+      written[into] = JSON.parse(sc.decode(value)) as Record<string, unknown>;
+      return REVISION + 1;
+    },
+  });
+
+  assert.deepEqual(
+    await markHandsIdle(capturingKv("brain") as unknown as KV, SID, "w1"),
+    { outcome: "parked" },
+  );
+  assert.deepEqual(
+    await parkHandsAfterRun(capturingKv("api") as unknown as RevisionedKv, SID, "w1"),
+    { outcome: "parked" },
+  );
+
+  for (const [who, entry] of Object.entries(written)) {
+    assert.equal(entry.idleEpoch, entry.idleSince, `${who}: the period is named by its stamp`);
+    // The clock reading legitimately differs between two writers, so it is
+    // pinned to a constant before the shapes are compared. So does the witness
+    // one of them signs its own write with, which is not part of the shape the
+    // sweep reads and is why it stays off `applyRunEndedIdleFields`.
+    entry.idleSince = 0;
+    entry.idleEpoch = 0;
+    delete entry.idleWriter;
+  }
+  assert.deepEqual(written.brain, written.api, "a divergence here is a divergence in the sweep");
+  assert.equal(written.brain.idleRev, REVISION);
+  assert.equal(written.brain.keepalive, false);
+  assert.ok(!("bgRunning" in written.brain), "last period's verdict does not speak for this one");
+});
+
+test("a write whose acknowledgement is lost is reported as the park it was", async () => {
+  // The bucket commits and then the transport dies before the ack arrives. The
+  // entry is parked; saying `failed` would tell `keepalive.stopped_after_task`
+  // the handle is still live and have the fleet keep pinging a parked pod.
+  let stored = { status: "ready", workloadId: "w1" } as Record<string, unknown>;
+  let revision = REVISION;
+  const kv = {
+    async get(key: string) {
+      return { key, value: sc.encode(JSON.stringify(stored)), revision };
+    },
+    async update(_key: string, value: Uint8Array, _revision: number) {
+      stored = JSON.parse(sc.decode(value)) as Record<string, unknown>;
+      revision = REVISION + 1;
+      throw new Error("CONNECTION_CLOSED");
+    },
+  } as unknown as KV;
+
+  assert.deepEqual(await markHandsIdle(kv, SID, "w1"), { outcome: "parked" });
+  assert.equal(stored.keepalive, false);
+  assert.equal(stored.idleRev, REVISION, "the write this call was conditioned on is what landed");
+});
+
+test("two callers racing one revision at one millisecond report distinct outcomes", async () => {
+  // Two concurrent markHandsIdle calls race against one bucket revision. Both
+  // read revision 7 and both stamp the same millisecond, so they
+  // compose identical bytes but for the witness. One wins the CAS; the loser's
+  // conflict reply is lost in transit and surfaces as a transport error, which
+  // is the path that re-reads. Neither the revision nor the payload can tell
+  // the two apart, so the outcomes must come from the witness, not the timing.
+  const frozen = Date.now;
+  Date.now = () => 1_000;
+  try {
+    let stored = JSON.stringify({ status: "ready", workloadId: "w1" });
+    let revision = REVISION;
+    const seen: string[] = [];
+    const kv = {
+      async get(key: string) {
+        return { key, value: sc.encode(stored), revision };
+      },
+      async update(_key: string, value: Uint8Array, rev: number) {
+        seen.push(sc.decode(value));
+        // The conflict the bucket raised never reached us; all this caller sees
+        // is a dead connection, so isRevisionConflict cannot classify it.
+        if (rev !== revision) throw new Error("CONNECTION_CLOSED");
+        stored = sc.decode(value);
+        revision += 1;
+        return revision;
+      },
+    } as unknown as KV;
+
+    const outcomes = (await Promise.all([
+      markHandsIdle(kv, SID, "w1"),
+      markHandsIdle(kv, SID, "w1"),
+    ])).map((r) => r.outcome);
+
+    assert.equal(seen.length, 2, "sanity: both callers attempted a write");
+    const [a, b] = seen.map((raw) => {
+      const info = JSON.parse(raw) as Record<string, unknown>;
+      delete info.idleWriter;
+      return info;
+    });
+    assert.deepEqual(a, b, "sanity: the two writes differ in nothing but the witness");
+
+    assert.deepEqual(
+      [...outcomes].sort(),
+      ["parked", "superseded"],
+      "exactly one of them parked the handle, and the other must not claim it",
+    );
+  } finally {
+    Date.now = frozen;
+  }
+});
+
+test("a park nobody performed is still reported as failed", async () => {
+  // The conservative end of the same branch: the update was rejected, and the
+  // entry carries no idle-opening write conditioned on this call's revision, so
+  // there is no evidence the pod was put away by anyone.
+  const kv = {
+    async get(key: string) {
+      return {
+        key,
+        value: sc.encode(JSON.stringify({
+          status: "ready", workloadId: "w1", keepalive: false, idleRev: REVISION - 1,
+        })),
+        revision: REVISION,
+      };
+    },
+    async update() {
+      throw new Error("CONNECTION_CLOSED");
+    },
+  } as unknown as KV;
+
+  assert.equal((await markHandsIdle(kv, SID, "w1")).outcome, "failed");
 });

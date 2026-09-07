@@ -22,6 +22,7 @@ import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
   registerSandbox, markHandsIdle, backgroundWorkStateSizesForTest,
+  ageBackgroundWorkCacheForTest,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -41,6 +42,18 @@ const ENTRY = {
   // Long past the reuse window, so the sweep wants to expire it.
   idleSince: 0,
 };
+
+/**
+ * Inside the reuse window, and not this exact instant.
+ *
+ * A stamp and an answer landing on the same millisecond cannot be told apart
+ * from an old replica re-idling a handle onto the millisecond of a verdict it
+ * carried through a task, so the sweep re-asks rather than believe it -- see
+ * measuredSinceIdleBegan. A real handle idles a network round-trip before any
+ * probe can answer about it; only a KV and a probe that are both in memory can
+ * collide with themselves, and a test that does is measuring its own speed.
+ */
+const IDLED_A_MOMENT_AGO = Date.now() - 1_000;
 
 let restoreProviders: (() => void) | null = null;
 
@@ -330,7 +343,7 @@ test("a task taking the sandbox back throws away the last verdict", async () => 
   // cache holds.
   // Inside the reuse window, so the sweep keeps the handle instead of expiring
   // it -- this is about the answer, not about the expiry.
-  const { kv } = fakeKv({ idleSince: Date.now() });
+  const { kv } = fakeKv({ idleSince: IDLED_A_MOMENT_AGO });
   stubPingableProvider();
   let probes = 0;
   const deps = { kv, countActiveShells: async () => { probes += 1; return 0; } };
@@ -354,6 +367,7 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   // still in flight when the swap happens writes under the key it started with,
   // which nothing reads any more, instead of overwriting the new pod's state.
   let workloadId = "wl-1";
+  const idleSince = IDLED_A_MOMENT_AGO;
   const kv = {
     async keys(filter = ">") {
       const key = `hands.${SESSION}`;
@@ -362,7 +376,11 @@ test("an answer about a replaced sandbox does not land on its successor", async 
     },
     async get(key: string) {
       if (key !== `hands.${SESSION}`) return null;
-      const v = { ...ENTRY, workloadId, idleSince: Date.now() };
+      // `idleSince` is fixed rather than re-stamped per read: a KV whose stored
+      // entry changes every time it is looked at is not one, and here it would
+      // move the idle period under the sweep between the two ticks this test is
+      // about. Inside the reuse window, which is all it has to be.
+      const v = { ...ENTRY, workloadId, idleSince };
       return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
     },
     async delete() {}, async put() { return 1; },
@@ -423,7 +441,7 @@ test("a probe still in the air when a task takes the sandbox back is discarded",
   // help -- the promise writes when it lands, not when it started. Without a
   // generation the stale `idle` sits there for the cache TTL, and a turn that
   // left a background shell behind reads as one that left nothing.
-  const { kv } = fakeKv({ idleSince: Date.now() });
+  const { kv } = fakeKv({ idleSince: IDLED_A_MOMENT_AGO });
   stubPingableProvider();
   let release: (() => void) | null = null;
   const inFlight = new Promise<void>((r) => { release = r; });
@@ -655,6 +673,13 @@ test("generation bookkeeping does not grow without bound", async () => {
   await runKeepaliveTickForTest(empty);
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest(empty);
+
+  // Absence alone deliberately does not collect a verdict: a sweep walks a
+  // rotating slice of the handles, so "not in this tick" is the normal state of
+  // a live sandbox and reaping on it discarded answers before the sweep that
+  // would read them. Age is the bound, so the test spends the age.
+  ageBackgroundWorkCacheForTest(60 * 60_000);
+  await runKeepaliveTickForTest(empty);
   // Every map the helper exposes, not just the generations: "nothing is left
   // behind" is the claim, and each of these is a separate per-identity entry
   // that would grow with every sandbox the Brain ever saw if its own reap were
@@ -765,7 +790,7 @@ test("handing a handle back to the idle pool re-opens the question", async () =>
   // Inside the reuse window: the shared ENTRY is deliberately long expired, and
   // an expired idle handle is deleted by the sweep -- which would remove the
   // thing this test hands back.
-  const { kv } = fakeKv({ idleSince: Date.now() });
+  const { kv } = fakeKv({ idleSince: IDLED_A_MOMENT_AGO });
   let asked = 0;
   const deps = { kv, countActiveShells: async () => { asked += 1; return 0; } };
 
