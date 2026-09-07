@@ -315,17 +315,38 @@ export async function settleRunTime(
  * at all still gets its instant pinned. What no report covered stays unbanked.
  */
 export async function settleTerminalRuns(limit = 200): Promise<number> {
+  let settled = 0;
+  // Oldest first, and looped rather than one page: ordering newest-first meant
+  // a burst larger than one page pushed the same recent rows in front of the
+  // older ones every sweep, and the rows behind them were never pinned at all
+  // -- so their unbanked time grew for as long as the burst lasted.
+  for (let page = 0; page < MAX_SETTLE_PAGES; page++) {
+    const found = await settleTerminalPage(limit);
+    settled += found.settled;
+    if (found.rows < limit) break;
+  }
+  return settled;
+}
+
+/** How many pages one pass will walk before leaving the rest to the next. */
+const MAX_SETTLE_PAGES = 50;
+
+async function settleTerminalPage(limit: number): Promise<{ rows: number; settled: number }> {
   const r = await db.query(
     `SELECT task_id FROM claw_tasks
       WHERE completed_at IS NOT NULL
         AND COALESCE((metadata->'run_phase'->'ledger'->>'settled')::boolean, false) = false
-      ORDER BY completed_at DESC
+      ORDER BY completed_at ASC
       LIMIT $1`,
     [limit],
   );
   let settled = 0;
   for (const row of r.rows as Array<{ task_id: string }>) {
     const entry = await applyToLedger(row.task_id, { key: row.task_id, source: "task_id" }, (read) => {
+      // Re-read on every compare-and-swap retry, not only in the predicate that
+      // selected the row: another replica settling the same row between the two
+      // would otherwise have its terminal instant rewritten by the loser.
+      if (read.entry.settled) return read.entry;
       const banked = bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb);
       // Clamped upward against the anchor: `completed_at` is written with a
       // transaction-start NOW(), so it can sit behind an anchor a later
@@ -336,7 +357,7 @@ export async function settleTerminalRuns(limit = 200): Promise<number> {
         : banked.lastAcceptedInstantDb;
       return { ...banked, terminalAtDb, settled: true };
     });
-    if (entry) settled++;
+    if (entry?.settled) settled++;
   }
-  return settled;
+  return { rows: r.rows.length, settled };
 }

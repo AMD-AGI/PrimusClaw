@@ -42,6 +42,8 @@ import { startHarness, seedRun, seedSession, runRow, type Harness } from "./scen
 
 const TOKEN = "cluster-internal-token";
 const SESSION = "s-acct";
+/** Pages one settle pass will walk; mirrors MAX_SETTLE_PAGES in run-time-ledger.ts. */
+const SETTLE_PAGE_CAP = 50;
 const BRAIN = "brain-1";
 
 let h: Harness;
@@ -493,6 +495,63 @@ test("B21 the settle pass creates the entry for a terminal row with no run_phase
     `the wait is the only thing this run has to account for; got ${ledger!.knownMsByState.queued}ms`);
   assert.equal(ledger!.settled, true);
   assert.ok(ledger!.terminalAtDb, "and its terminal instant is pinned");
+});
+
+test("AC4 the settle pass reaches the oldest terminal runs, not only the newest", async () => {
+  // One pass is bounded, so the order it selects in decides which rows it ever
+  // reaches. Newest-first meant a burst wider than the bound pushed the same
+  // recent rows in front every sweep, and the rows behind them -- the ones whose
+  // unbanked time had grown longest -- were never pinned at all.
+  const rows = SETTLE_PAGE_CAP + 5;
+  for (let i = 0; i < rows; i++) {
+    await seedRun(h, `ktsk-age-${i}`, SESSION, { status: "queued", queuedAgoSec: 1 });
+    // Oldest first, by the column the pass orders on.
+    await db.query(
+      `UPDATE claw_tasks SET status='failed', completed_at = NOW() - ($2::int * INTERVAL '1 second')
+        WHERE task_id=$1`, [`ktsk-age-${i}`, rows - i]);
+  }
+
+  assert.equal(await settleTerminalRuns(1), SETTLE_PAGE_CAP, "one pass walks its whole page budget");
+  assert.equal((await ledgerOf("ktsk-age-0"))!.settled, true, "the oldest row is reached first");
+  assert.equal(await ledgerOf(`ktsk-age-${rows - 1}`), null,
+    "and the newest is what the bound leaves for the next pass");
+
+  assert.equal(await settleTerminalRuns(1), 5, "which the next pass then takes");
+});
+
+test("AC4 a settle that lost the race leaves the winner's terminal instant alone", async () => {
+  // The select says unsettled and the compare-and-swap read happens after it, so
+  // another replica can settle the row in between. Rechecking only in the
+  // predicate lets the loser write its own terminal instant over the winner's.
+  await seedRun(h, "ktsk-race", SESSION, { status: "queued", queuedAgoSec: 1 });
+  await db.query(
+    `UPDATE claw_tasks SET status='failed', completed_at=NOW() WHERE task_id=$1`, ["ktsk-race"]);
+
+  const realQuery = db.query;
+  let raced = false;
+  db.query = (async (text: string, params?: unknown[]) => {
+    const r = await realQuery(text, params);
+    // Between the select and the entry read the pass is about to do, which is
+    // exactly where the other replica's write lands.
+    if (!raced && /completed_at IS NOT NULL/.test(text)) {
+      raced = true;
+      db.query = realQuery;
+      await settleTerminalRuns();
+      db.query = winner as typeof db.query;
+    }
+    return r;
+  }) as typeof db.query;
+  const winner = db.query;
+  try {
+    await settleTerminalRuns();
+  } finally {
+    db.query = realQuery;
+  }
+
+  const ledger = await ledgerOf("ktsk-race");
+  assert.equal(ledger!.settled, true);
+  assert.equal(ledger!.ledgerVersion, 1,
+    "the loser must write nothing at all, not rewrite what the winner settled");
 });
 
 test("AC1 the settle pass stops unbanked time growing and leaves the queue total alone", async () => {
