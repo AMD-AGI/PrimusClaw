@@ -7,8 +7,9 @@
  *
  * Nothing logged any of this before: a lookup that missed returned `fn()` and
  * `phaseOf` answered `executing` / `waitedMs: 0`, byte-identical to a run that
- * genuinely never waited. Asserted from a child process because pino writes to
- * fd 1 through sonic-boom, past every in-process seam.
+ * genuinely never waited. Asserted from a child process, whose stdout the
+ * fixture funnels through one writer so a line's position here is the order the
+ * run produced it in.
  */
 import test from "node:test";
 import assert from "node:assert/strict";

@@ -4,9 +4,12 @@
 /**
  * The lines this work exists to make visible, driven in a child process.
  *
- * pino writes through sonic-boom to fd 1, past `process.stdout.write` and past
- * `fs.writeSync`, so an in-process test cannot see a log line at all. The
- * parent (run-identity-logs.test.ts) reads this process's stdout instead.
+ * The parent (run-identity-logs.test.ts) reads a line's position in this
+ * process's stdout as its place in the run. Each pino logger would otherwise
+ * own an async sonic-boom on fd 1 and land its lines in whatever order the
+ * writes complete, out of step with the marks below; pino builds that
+ * sonic-boom only while `process.stdout.write` is still the prototype's, so
+ * claiming it before the first logger exists puts every writer in one FIFO.
  */
 process.env.BG_SHELL_ENABLED = "true";
 process.env.WEB_SEARCH_PROVIDER = "disabled";
@@ -14,6 +17,13 @@ process.env.WEB_FETCH_ENABLED = "false";
 
 import assert from "node:assert/strict";
 import type { ExecuteRequest, ToolSchema } from "@claw/protocol";
+
+let stdoutWrites = 0;
+const stdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = ((...args: Parameters<typeof stdoutWrite>) => {
+  stdoutWrites += 1;
+  return stdoutWrite(...args);
+}) as typeof process.stdout.write;
 
 const { beginRun, endRun, phaseOf, whileWaiting } = await import("../../src/tasks/run-phase.js");
 const { resolveRunIdentity } = await import("../../src/tasks/run-identity.js");
@@ -61,7 +71,9 @@ const mark = (name: string) => console.log(`FIXTURE ${name}`);
 // A wait against a key the ledger does not hold: the work still runs, and the
 // miss is no longer indistinguishable from a run that never waited.
 const orphan = resolveRunIdentity({ session_id: "s", task_id: "never-begun" } as ExecuteRequest, "").identity;
+const beforeMiss = stdoutWrites;
 assert.equal(await whileWaiting(orphan.key, "background_command", "timed", async () => 7), 7);
+assert.ok(stdoutWrites > beforeMiss, "pino bypassed stdout, so no mark below orders anything");
 mark("miss-returned-the-work");
 
 // A sub-agent forwarded its parent's identity, so its wait hits: nothing is
