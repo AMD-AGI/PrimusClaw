@@ -16,6 +16,7 @@ import pino from "pino";
 import { decodeRunTimeReport } from "@claw/protocol";
 import {
   claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim,
+  settleFinishedClaim,
 } from "../tasks/run-claim.js";
 import type { RunSettlement } from "../tasks/run-time-ledger.js";
 
@@ -129,6 +130,21 @@ export async function registerInternalRunRoutes(app: FastifyInstance): Promise<v
         settlementFrom(req.params.taskId, req.body),
       );
       if (!failed) return reply.status(409).send({ ok: false, error: "not_holder" });
+      return { ok: true };
+    },
+  );
+
+  app.post<{ Params: { taskId: string } }>(
+    "/v1/internal/tasks/:taskId/settle-attempt",
+    { preHandler: clusterInternalAuth },
+    async (req, reply) => {
+      const brainId = brainIdFrom(req.body);
+      if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
+      const settled = await settleFinishedClaim(
+        req.params.taskId, brainId, claimCountFrom(req.body),
+        settlementFrom(req.params.taskId, req.body),
+      );
+      if (!settled) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };
     },
   );

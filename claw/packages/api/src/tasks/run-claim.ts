@@ -292,6 +292,42 @@ async function settleAndTransition(
 class StaleTransition extends Error {}
 
 /**
+ * Close a finished holder's attempt record, leaving the row where it is.
+ *
+ * The chat path's success is the one attempt boundary with no transition of its
+ * own: the row carries no `callback_url`, so no `agent_done` arrives, and the
+ * completion event closes the row later without knowing which attempt ran it.
+ * Fenced like a release, because a holder whose claim has since been taken is
+ * settling somebody else's attempt.
+ */
+export async function settleFinishedClaim(
+  taskId: string,
+  brainId: string,
+  claimCount?: number,
+  settlement?: RunSettlement,
+): Promise<boolean> {
+  const settled: RunSettlement = { ...settlement, closeAttempt: true };
+  try {
+    return await inTransaction(async (query) => {
+      const held = await query(
+        `SELECT 1 FROM claw_tasks
+          WHERE task_id = $1 AND lease_owner = $2
+            AND ($3::int IS NULL OR claim_count = $3)
+          FOR UPDATE`,
+        [taskId, brainId, claimCount ?? null],
+      );
+      if (held.rowCount === 0) throw new StaleTransition();
+      const outcome = await settleRunTime(query, taskId, settled);
+      if (!outcome.ok) throw new StaleTransition();
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
+}
+
+/**
  * Why the holder is ending a claim instead of putting the row back.
  *
  * `session_deleted` is the tombstone loop: unclaiming would let the next idle

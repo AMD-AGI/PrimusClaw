@@ -19,7 +19,9 @@ function apiBase(): string {
   return (process.env.INTERNAL_BACKEND_URL ?? "").trim().replace(/\/$/, "");
 }
 
-function taskActionUrl(taskId: string, action: "claim" | "unclaim" | "fail-claim"): string {
+type HolderAction = "unclaim" | "fail-claim" | "settle-attempt";
+
+function taskActionUrl(taskId: string, action: "claim" | HolderAction): string {
   const base = apiBase();
   if (!base || !taskId) return "";
   return `${base}/v1/internal/tasks/${encodeURIComponent(taskId)}/${action}`;
@@ -86,13 +88,27 @@ export async function failClaimedRun(
   });
 }
 
+/**
+ * End this attempt's record without giving the row back: a chat row carries no
+ * `callback_url`, so a clean finish sends no `agent_done` to settle it.
+ */
+export async function settleClaimedRun(
+  taskId: string,
+  claimCount?: number,
+  runTime?: RunTimeReport,
+): Promise<void> {
+  await postHolderAction(taskId, "settle-attempt", "run.settle_attempt_failed", {
+    ...claimExtra(claimCount), ...(runTime ? { run_time: runTime } : {}),
+  });
+}
+
 function claimExtra(claimCount?: number): Record<string, string | number> {
   return typeof claimCount === "number" ? { claim_count: claimCount } : {};
 }
 
 async function postHolderAction(
   taskId: string,
-  action: "unclaim" | "fail-claim",
+  action: HolderAction,
   warn: string,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
@@ -122,8 +138,8 @@ async function postHolderAction(
       logger.warn({ err, taskId, action, attempt: i + 1 }, warn);
     }
   }
-  // Every attempt failed and the caller cannot act on it -- both callers are
-  // settling a row they are done with. Logged at error rather than swallowed
+  // Every attempt failed and the caller cannot act on it -- every caller is
+  // settling a row it is done with. Logged at error rather than swallowed
   // because what follows is invisible otherwise: the row keeps a lease nobody
   // is renewing, and only the sweeper's requeue pass will notice, a minute or
   // more later.

@@ -13,7 +13,7 @@
 import type { JsMsg } from "nats";
 import type { RunTimeReport } from "@claw/protocol";
 
-import { failClaimedRun, unclaimRun } from "../clients/run-claim.js";
+import { failClaimedRun, settleClaimedRun, unclaimRun } from "../clients/run-claim.js";
 
 /** Why a claimed row is going back. Only contention is a wait; the rest are faults. */
 export type RetryReason = "lock_contention" | "retry" | "drain";
@@ -23,6 +23,7 @@ export interface ClaimedDeliveryActions {
     taskId: string, claimCount?: number, reason?: RetryReason, runTime?: RunTimeReport,
   ) => Promise<void>;
   fail: (taskId: string, claimCount?: number, runTime?: RunTimeReport) => Promise<void>;
+  settle: (taskId: string, claimCount?: number, runTime?: RunTimeReport) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -37,6 +38,7 @@ const defaultActions: ClaimedDeliveryActions = {
     unclaimRun(taskId, claimCount, reason ?? "retry", runTime),
   fail: (taskId, claimCount, runTime) =>
     failClaimedRun(taskId, "claim_abandoned", claimCount, runTime),
+  settle: (taskId, claimCount, runTime) => settleClaimedRun(taskId, claimCount, runTime),
 };
 
 /**
@@ -148,7 +150,12 @@ export function claimedDoorbellMsg(
 ): JsMsg {
   const sleep = actions.sleep ?? defaultSleep;
   return {
-    ack() {},
+    // A chat row carries no `callback_url`, so a run that finishes cleanly
+    // issues no `agent_done`: this ack is the only boundary left to end the
+    // attempt on, and without it the record stays open with no instant on it.
+    ack() {
+      void actions.settle(taskId, claimCount, takeDeclaredReport(taskId));
+    },
     nak(millis?: number) {
       const delayMs = typeof millis === "number" ? Math.max(0, millis) : 0;
       void settleRetry(taskId, claimCount, delayMs, sleep, actions.retryLater);

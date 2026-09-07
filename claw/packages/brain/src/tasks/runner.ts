@@ -892,6 +892,9 @@ class TaskRunner {
   /** Whether this attempt has issued the identity-only report that opens it. */
   private coverageOpened = false;
 
+  /** A claimed run settles on its ack; a fat one settles through `agent_done`. */
+  private readonly claimed: boolean;
+
   /**
    * The scope those shells are addressable in: this DAG, or this conversation.
    *
@@ -1067,6 +1070,7 @@ class TaskRunner {
     // A claimed doorbell has no delivery to count -- its wakeup was acked at
     // claim time -- and a fat delivery takes no claim, so each path presents
     // the row's true value for the half it does not have.
+    this.claimed = claim !== null;
     this.attempt = claim
       ? { attemptId: randomUUID(), claimCount: claim.claimCount, deliverySeq: 0, deliveryCount: 0 }
       : {
@@ -2501,7 +2505,7 @@ class TaskRunner {
     // ack_wait and the entire execution repeats from scratch. Since exec_complete
     // is already persisted in JetStream, the event-consumer can handle post-
     // completion logic (pending messages, summaries) even if Brain dies here.
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
     logger.info({
       sessionId: this.sessionId, messageId: this.messageId, turns: result.turns, elapsedMs: result.elapsedMs,
       // A completed run always has both -- the loop that produced this result
@@ -2921,7 +2925,7 @@ class TaskRunner {
       this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
   }
 
   private async handleRetryableError(err: any): Promise<void> {
@@ -3152,7 +3156,7 @@ class TaskRunner {
       this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
   }
 
   /**
@@ -3287,6 +3291,18 @@ class TaskRunner {
    */
   private declareCoverage(): void {
     declareFinalReport(this.request.task_id ?? "", this.coverageReport()?.runTime);
+  }
+
+  /**
+   * Ack this delivery, having first handed the ack what the attempt covered.
+   *
+   * Only for a claimed run: a fat delivery's ack is a real JetStream ack that
+   * takes no declaration, and its coverage has already gone out on `agent_done`.
+   * Declaring there would leave an entry nothing ever takes.
+   */
+  private async ackTerminal(): Promise<void> {
+    if (this.claimed) this.declareCoverage();
+    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
   }
 
   private startLeaseHeartbeat(): ReturnType<typeof setInterval> | null {

@@ -13,6 +13,7 @@ import { claimedDoorbellMsg } from "../src/delivery/doorbell-delivery.js";
 test("nak after a claimed doorbell unclaims after the delay, and does not ack again", async () => {
   const retries: string[] = [];
   const failed: string[] = [];
+  const settled: string[] = [];
   const slept: number[] = [];
   const generations: Array<number | undefined> = [];
   const msg = claimedDoorbellMsg(
@@ -22,6 +23,7 @@ test("nak after a claimed doorbell unclaims after the delay, and does not ack ag
     {
       retryLater: async (taskId, claimCount) => { retries.push(taskId); generations.push(claimCount); },
       fail: async (taskId, claimCount) => { failed.push(taskId); generations.push(claimCount); },
+      settle: async (taskId, claimCount) => { settled.push(taskId); generations.push(claimCount); },
       sleep: async (ms) => { slept.push(ms); },
     },
   );
@@ -35,10 +37,11 @@ test("nak after a claimed doorbell unclaims after the delay, and does not ack ag
   msg.ack();
   msg.term();
   await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(settled, ["ktsk_1"], "the ack ends the attempt without moving the row");
   assert.deepEqual(failed, ["ktsk_1"]);
-  // Both settlements carry the generation, so the API can refuse one that
+  // Every settlement carries the generation, so the API can refuse one that
   // arrives after the row has been claimed again.
-  assert.deepEqual(generations, [4, 4]);
+  assert.deepEqual(generations, [4, 4, 4]);
 });
 
 test("nak(0) unclaims immediately, matching a fat-path SIGTERM nak", async () => {
@@ -50,6 +53,7 @@ test("nak(0) unclaims immediately, matching a fat-path SIGTERM nak", async () =>
     {
       retryLater: async (taskId) => { retries.push(taskId); },
       fail: async () => {},
+      settle: async () => {},
       sleep: async () => { throw new Error("nak(0) must not wait"); },
     },
   );
@@ -71,6 +75,7 @@ test("a shutdown releases rows still waiting out their backoff", async () => {
     {
       retryLater: async (taskId, claimCount) => { released.push([taskId, claimCount]); },
       fail: async () => {},
+      settle: async () => {},
       sleep: () => new Promise<void>((r) => { resolveSleep = r; }),
     },
   );
@@ -101,6 +106,7 @@ test("the attempt's final coverage travels with the release the nak triggers", a
   const msg = claimedDoorbellMsg({ seq: 3, info: { deliveryCount: 1 } }, "ktsk_h", 2, {
     retryLater: async (_id, _count, _reason, runTime) => { released.push(runTime); },
     fail: async () => {},
+    settle: async () => {},
     sleep: async () => {},
   });
 
@@ -128,6 +134,7 @@ test("a release for an attempt that declared nothing carries nothing", async () 
       seen.push(runTime);
     },
     fail: async () => {},
+    settle: async () => {},
     sleep: async () => {},
   };
 
@@ -143,12 +150,14 @@ test("a release for an attempt that declared nothing carries nothing", async () 
 test("the claim client puts the final report on the release wire", async () => {
   // The other half of the handoff: what the delivery loop hands to the client
   // has to reach the endpoint, or the API settles without it.
-  const { unclaimRun, failClaimedRun } = await import("../src/clients/run-claim.js");
+  const { unclaimRun, failClaimedRun, settleClaimedRun } = await import("../src/clients/run-claim.js");
   const originalBase = process.env.INTERNAL_BACKEND_URL;
   process.env.INTERNAL_BACKEND_URL = "http://api.test";
   const bodies: Array<Record<string, unknown>> = [];
+  const urls: string[] = [];
   const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+  globalThis.fetch = (async (url: string, init: { body: string }) => {
+    urls.push(url);
     bodies.push(JSON.parse(init.body));
     return { ok: true, status: 200, async json() { return {}; } };
   }) as unknown as typeof fetch;
@@ -160,14 +169,17 @@ test("the claim client puts the final report on the release wire", async () => {
   try {
     await unclaimRun("ktsk_j", 1, "retry", report);
     await failClaimedRun("ktsk_j", "claim_abandoned", 1, report);
+    await settleClaimedRun("ktsk_j", 1, report);
   } finally {
     globalThis.fetch = realFetch;
     if (originalBase === undefined) delete process.env.INTERNAL_BACKEND_URL;
     else process.env.INTERNAL_BACKEND_URL = originalBase;
   }
 
-  assert.equal(bodies.length, 2, "both settle routes were called");
+  assert.equal(bodies.length, 3, "every settle route was called");
+  assert.deepEqual(urls.map((u) => u.split("/").pop()), ["unclaim", "fail-claim", "settle-attempt"]);
   for (const body of bodies) {
     assert.deepEqual(body.run_time, report, "the report reaches the endpoint that settles");
+    assert.equal(body.claim_count, 1, "fenced on the generation this holder took");
   }
 });

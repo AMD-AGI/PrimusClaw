@@ -21,7 +21,7 @@ import { mergeRunTimeReport, runTimeTotals, type RunTimeLedgerEntry } from "@cla
 import { db, inTransaction } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
-import { releaseClaim } from "../src/tasks/run-claim.js";
+import { releaseClaim, settleFinishedClaim } from "../src/tasks/run-claim.js";
 import { applyTaskStatusTransition, transitionStatus } from "../src/tasks/db.js";
 import { cancelTask } from "../src/tasks/lifecycle.js";
 import { interruptUnstartedChatRuns } from "../src/tasks/chat-run.js";
@@ -120,6 +120,18 @@ async function ledgerOf(taskId: string): Promise<RunTimeLedgerEntry | null> {
 }
 
 const queuedMsOf = async (taskId: string) => Number((await runRow(h, taskId)).queued_ms_accrued);
+
+/** The settle a holder issues on its ack, through the endpoint it POSTs to. */
+async function settleAttempt(
+  taskId: string, claimCount: number, runTime?: unknown,
+): Promise<number> {
+  const res = await app.inject({
+    method: "POST", url: `/v1/internal/tasks/${taskId}/settle-attempt`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: BRAIN, claim_count: claimCount, run_time: runTime },
+  });
+  return res.statusCode;
+}
 
 /** Put the lease far enough in the past to clear the reaper's whole grace. */
 const expireLease = (taskId: string) => db.query(
@@ -605,6 +617,44 @@ test("a release closes the attempt record even when it carries no report", async
   const record = (await ledgerOf("ktsk-noreport-close"))!.attempts[0];
   assert.ok(record.endedAtDb, "an attempt must not end with its record still open");
   assert.equal(record.recoveryLoss.computable, true);
+});
+
+test("the settle a finished holder sends closes its attempt without moving the row", async () => {
+  // The successful claimed-doorbell path: the row carries no `callback_url`, so
+  // no `agent_done` arrives and the completion event closes it later, knowing
+  // nothing about which attempt ran it. Before the ack settled, this attempt's
+  // record stayed open with no instant on it for the life of the row.
+  await seedRun(h, "ktsk-acksettle", SESSION, {
+    status: "running", claimCount: 2, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { claim_count: 2 };
+  await announceRunning("ktsk-acksettle", "att-1", token);
+  assert.equal((await ledgerOf("ktsk-acksettle"))!.attempts[0].endedAtDb, undefined,
+    "the record is open while the attempt runs");
+
+  assert.equal(
+    await settleAttempt("ktsk-acksettle", 2, coverage("ktsk-acksettle", "att-1", token, 400)),
+    200,
+  );
+
+  const ledger = await ledgerOf("ktsk-acksettle");
+  assert.ok(ledger!.attempts[0].endedAtDb, "a finished attempt must not keep an open record");
+  assert.ok(ledger!.knownMsByState.executing >= 400, "and its last coverage is banked");
+  assert.equal((await runRow(h, "ktsk-acksettle")).status, "running",
+    "the run is finished, but closing the row belongs to the completion event");
+});
+
+test("a settle from a holder the row has moved past is refused", async () => {
+  // The same fence a release carries, and for a sharper reason: the record this
+  // would close belongs to whichever attempt the row holds now.
+  await seedRun(h, "ktsk-ackstale", SESSION, {
+    status: "running", claimCount: 3, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-ackstale", "att-2", { claim_count: 3 });
+
+  assert.equal(await settleAttempt("ktsk-ackstale", 2), 409, "a superseded generation settles nothing");
+  assert.equal((await ledgerOf("ktsk-ackstale"))!.attempts[0].endedAtDb, undefined,
+    "the live attempt's record is left exactly as it was");
 });
 
 test("a running event for a row that has been released opens no attempt record", async () => {
