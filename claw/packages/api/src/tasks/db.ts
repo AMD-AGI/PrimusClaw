@@ -196,20 +196,73 @@ export async function updateTask(
 }
 
 /**
- * Transition a task into the given terminal / non-terminal status. The
- * `expected` filter avoids races where two workers try to flip the same row.
+ * What every status change owes the run's queue accounting.
+ *
+ * Every SET expression reads the pre-UPDATE row, so this banks the segment the
+ * re-stamp beside it is about to erase -- the `queued -> queued` requeue
+ * included. `clock_timestamp()` rather than `NOW()`: a change committed from a
+ * transaction that opened before the row was queued would otherwise measure a
+ * negative interval and clamp a real wait to nothing.
  */
-export async function transitionStatus(
-  taskId: string,
-  expected: TaskStatus[],
-  next: TaskStatus,
-  extra: Record<string, unknown> = {},
-  query: Querier = db.query,
-): Promise<ClawTaskRow | null> {
-  const sets: string[] = ["status = $1"];
-  const values: unknown[] = [next];
-  let i = 2;
-  for (const [k, v] of Object.entries(extra)) {
+const QUEUE_ACCRUAL_SQL = `queued_ms_accrued = queued_ms_accrued
+      + CASE WHEN status = 'queued'
+             THEN GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - queued_at)) * 1000)::bigint
+             ELSE 0 END`;
+
+/**
+ * A status to move to, or the expression a reaper picks one with per row.
+ * Splitting such a reaper into two passes would let a row move between them.
+ */
+export type NextStatus = TaskStatus | { sql: string; terminal: true };
+
+// Written as a literal rather than bound, so the statement stays greppable;
+// checked at runtime because a literal is only safe while it is one of these.
+const WRITABLE_STATUSES = new Set<string>([
+  "waiting_deps", "waiting_external", "queued", "preparing", "running",
+  "cancelling", "completed", "failed", "cancelled",
+]);
+
+/** What a status change may carry besides the status itself. */
+export interface StatusTransition {
+  /** Statuses the row may be in for this change to apply. */
+  expected?: TaskStatus[];
+  /** Extra SET columns, by name. `metadata` is merged rather than replaced. */
+  extra?: Record<string, unknown>;
+  /** Raw SET fragments, for assignments a column/value pair cannot express.
+   *  Their `$n` placeholders index `params`, exactly as `where`'s do. */
+  setSql?: string[];
+  /**
+   * A predicate replacing the `task_id = $n` match entirely, for the cascades
+   * that move many rows at once. `$$next` and `$$accrual` are not available to
+   * it; it is spliced verbatim and must carry its own parameters via `params`.
+   */
+  where?: string;
+  params?: unknown[];
+  query?: Querier;
+  /** Extra RETURNING expressions, for a value only this statement can read. */
+  returning?: string;
+}
+
+/**
+ * The one statement in this codebase that writes `claw_tasks.status`.
+ *
+ * Single-sourced because the accrual above rides on every status change: a
+ * writer issuing its own UPDATE silently drops that run's queued segment. A
+ * repo-level test asserts no other source file contains the statement.
+ */
+export async function applyTaskStatusTransition(
+  next: NextStatus,
+  opts: StatusTransition = {},
+): Promise<ClawTaskRow[]> {
+  const chosen = typeof next === "string" ? next : null;
+  if (chosen && !WRITABLE_STATUSES.has(chosen)) {
+    throw new Error(`applyTaskStatusTransition: refusing unknown status '${chosen}'`);
+  }
+  const statusSql = chosen ? `'${chosen}'` : (next as { sql: string }).sql;
+  const sets: string[] = [QUEUE_ACCRUAL_SQL];
+  const values: unknown[] = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(opts.extra ?? {})) {
     // `metadata` is merged rather than replaced: a caller building one from a
     // snapshot taken before the transaction would otherwise write back over
     // whatever else the same transaction has already put in the subtree.
@@ -220,15 +273,12 @@ export async function transitionStatus(
   }
   // `waiting_external` re-stamps for the same reason `queued` does: the column
   // is "waiting since", and the reaper that reads it next measures from here.
-  //
-  // Without this, `reapWaitExternal` counts a row's external-call budget from
-  // the moment the row was created. That was invisible while `insertTask` left
-  // `queued_at` null -- these rows simply never matched -- and became reachable
-  // when the insert started stamping it for the doorbell queue. A task that
-  // runs for forty minutes and then makes its first external call was failed as
-  // `external_timeout` the instant it parked, having waited no time at all.
-  if (next === "queued" || next === "waiting_external") sets.push("queued_at = NOW()");
-  if (next === "preparing" || next === "running") {
+  // Callers no longer stamp it themselves, so the accrual above always sees the
+  // segment this write is closing.
+  if (chosen === "queued" || chosen === "waiting_external") {
+    sets.push("queued_at = clock_timestamp()");
+  }
+  if (chosen === "preparing" || chosen === "running") {
     // COALESCE for the same reason as the deadline below: a row passes through
     // preparing on its way to running, and `started_at` is meant to be when
     // work on it began, not when it last changed status. Overwriting it would
@@ -242,18 +292,53 @@ export async function transitionStatus(
     values.push(RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node);
     i += 2;
   }
-  if (next === "completed" || next === "failed" || next === "cancelled") {
+  if (!chosen || chosen === "completed" || chosen === "failed" || chosen === "cancelled") {
     sets.push("completed_at = NOW()");
   }
+  const query = opts.query ?? db.query;
+  // Caller-supplied SQL numbers its parameters from 1; they land after this
+  // function's own, so both fragments are shifted by the same offset.
+  const shift = (sql: string) => sql.replace(/\$(\d+)/g, (_m, n) => `$${Number(n) + i - 1}`);
+  sets.push(...(opts.setSql ?? []).map(shift));
+  const returning = `*${opts.returning ? `, ${opts.returning}` : ""}`;
+  if (opts.where) {
+    const r = await query(
+      `UPDATE claw_tasks SET status = ${statusSql}, ${sets.join(", ")}`
+      + ` WHERE ${shift(opts.where)} RETURNING ${returning}`,
+      [...values, ...(opts.params ?? [])],
+    );
+    return r.rows as ClawTaskRow[];
+  }
+  const [taskId] = opts.params ?? [];
   values.push(taskId);
-  values.push(expected);
+  const idParam = i++;
+  const predicate = opts.expected
+    ? `task_id = $${idParam} AND status = ANY($${i})`
+    : `task_id = $${idParam}`;
+  if (opts.expected) values.push(opts.expected);
   const r = await query(
-    `UPDATE claw_tasks SET ${sets.join(", ")}
-     WHERE task_id = $${i++} AND status = ANY($${i})
-     RETURNING *`,
+    `UPDATE claw_tasks SET status = ${statusSql}, ${sets.join(", ")}`
+    + ` WHERE ${predicate} RETURNING ${returning}`,
     values,
   );
-  return (r.rowCount ?? 0) > 0 ? (r.rows[0] as ClawTaskRow) : null;
+  return r.rows as ClawTaskRow[];
+}
+
+/**
+ * Transition a task into the given terminal / non-terminal status. The
+ * `expected` filter avoids races where two workers try to flip the same row.
+ */
+export async function transitionStatus(
+  taskId: string,
+  expected: TaskStatus[],
+  next: TaskStatus,
+  extra: Record<string, unknown> = {},
+  query: Querier = db.query,
+): Promise<ClawTaskRow | null> {
+  const rows = await applyTaskStatusTransition(next, {
+    expected, extra, params: [taskId], query,
+  });
+  return rows[0] ?? null;
 }
 
 /** Find tasks that depend on `taskId` (forward edges). */

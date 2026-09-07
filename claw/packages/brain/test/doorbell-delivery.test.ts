@@ -85,3 +85,89 @@ test("a shutdown releases rows still waiting out their backoff", async () => {
   assert.deepEqual(released, [["ktsk_drain", 7]]);
   resolveSleep?.();
 });
+
+test("the attempt's final coverage travels with the release the nak triggers", async () => {
+  // `TaskRunner` naks the claimed wrapper and the delivery loop issues the
+  // release; the two know nothing about each other, so without this handoff the
+  // attempt ends with its record open and its last interval unbanked.
+  const { declareFinalReport } = await import("../src/delivery/doorbell-delivery.js");
+  const report = {
+    key: "ktsk_h", attemptId: "att-1", claimCount: 2, deliverySeq: 0, deliveryCount: 0,
+    basis: { kind: "same_domain", domain: "brain" },
+    cumulativeStateMs: { executing: 120 },
+  } as unknown as Parameters<typeof declareFinalReport>[1];
+
+  const released: unknown[] = [];
+  const msg = claimedDoorbellMsg({ seq: 3, info: { deliveryCount: 1 } }, "ktsk_h", 2, {
+    retryLater: async (_id, _count, _reason, runTime) => { released.push(runTime); },
+    fail: async () => {},
+    sleep: async () => {},
+  });
+
+  declareFinalReport("ktsk_h", report);
+  msg.nak(0);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(released.length, 1);
+  assert.deepEqual(released[0], report, "the release carries what the attempt measured");
+});
+
+test("a release for an attempt that declared nothing carries nothing", async () => {
+  // And the declaration is taken once: a later attempt must not release under
+  // its predecessor's coverage.
+  const { declareFinalReport } = await import("../src/delivery/doorbell-delivery.js");
+  const report = {
+    key: "ktsk_i", attemptId: "att-1", claimCount: 1, deliverySeq: 0, deliveryCount: 0,
+    basis: { kind: "same_domain", domain: "brain" },
+    cumulativeStateMs: { executing: 10 },
+  } as unknown as Parameters<typeof declareFinalReport>[1];
+
+  const seen: unknown[] = [];
+  const actions = {
+    retryLater: async (_id: string, _c?: number, _r?: unknown, runTime?: unknown) => {
+      seen.push(runTime);
+    },
+    fail: async () => {},
+    sleep: async () => {},
+  };
+
+  declareFinalReport("ktsk_i", report);
+  claimedDoorbellMsg({ seq: 1, info: { deliveryCount: 1 } }, "ktsk_i", 1, actions as never).nak(0);
+  await new Promise((r) => setTimeout(r, 0));
+  claimedDoorbellMsg({ seq: 1, info: { deliveryCount: 2 } }, "ktsk_i", 2, actions as never).nak(0);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.deepEqual(seen, [report, undefined]);
+});
+
+test("the claim client puts the final report on the release wire", async () => {
+  // The other half of the handoff: what the delivery loop hands to the client
+  // has to reach the endpoint, or the API settles without it.
+  const { unclaimRun, failClaimedRun } = await import("../src/clients/run-claim.js");
+  const originalBase = process.env.INTERNAL_BACKEND_URL;
+  process.env.INTERNAL_BACKEND_URL = "http://api.test";
+  const bodies: Array<Record<string, unknown>> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, status: 200, async json() { return {}; } };
+  }) as unknown as typeof fetch;
+  const report = {
+    key: "ktsk_j", attemptId: "att-9", claimCount: 1, deliverySeq: 0, deliveryCount: 0,
+    basis: { kind: "same_domain", domain: "brain" },
+    cumulativeStateMs: { executing: 55 },
+  } as never;
+  try {
+    await unclaimRun("ktsk_j", 1, "retry", report);
+    await failClaimedRun("ktsk_j", "claim_abandoned", 1, report);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (originalBase === undefined) delete process.env.INTERNAL_BACKEND_URL;
+    else process.env.INTERNAL_BACKEND_URL = originalBase;
+  }
+
+  assert.equal(bodies.length, 2, "both settle routes were called");
+  for (const body of bodies) {
+    assert.deepEqual(body.run_time, report, "the report reaches the endpoint that settles");
+  }
+});

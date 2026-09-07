@@ -883,12 +883,9 @@ class TaskRunner {
   private readonly runIdentity: RunIdentity;
 
   /**
-   * Which attempt of this run the row should accept reports from.
-   *
-   * Minted here rather than handed down, so an attempt presents a full token
-   * whether or not the write that stores it landed: the row's first renewal
-   * adopts it, which is what keeps accounting off the path that decides
-   * whether a run keeps its lease.
+   * Which attempt of this run the row should accept reports from. Minted here,
+   * so a lost allocation write costs a row update rather than a lease: the
+   * row's first renewal adopts the token instead.
    */
   private readonly attempt: RunAttemptToken;
 
@@ -3259,10 +3256,9 @@ class TaskRunner {
   /**
    * This attempt's coverage, or nothing when it has none to report yet.
    *
-   * The opening tick carries no covering field at all, whatever the clock has
-   * done between `beginRun` and it: a report that fires before this attempt has
-   * observed anything must not advance the row's watermark, and the interval it
-   * spans stays visibly unbanked until a later report names it.
+   * The opening tick carries no covering field, whatever the clock did between
+   * `beginRun` and it: a report that measured nothing must not advance the
+   * row's watermark, and the interval stays visibly unbanked.
    */
   private coverageReport(): { runTime: RunTimeReport } | null {
     if (!this.coverageOpened) return null;
@@ -3277,8 +3273,7 @@ class TaskRunner {
         claimCount: this.attempt.claimCount,
         deliverySeq: this.attempt.deliverySeq,
         deliveryCount: this.attempt.deliveryCount,
-        // Self-contained brain-clock differences, never instants, so they are
-        // admitted only up to the budget the database itself measured.
+        // Differences, never instants, so the database's own budget bounds them.
         basis: { kind: "same_domain", domain: "brain" },
         cumulativeStateMs: snapshot.stateMs,
         cumulativeReasonMs: snapshot.reasonMs,
@@ -3287,11 +3282,8 @@ class TaskRunner {
   }
 
   /**
-   * Hand this attempt's coverage to the release that is about to be issued.
-   *
-   * The release goes out from the delivery loop, which has the task id and
-   * nothing else; without this the attempt ends with its record still open and
-   * its final interval unbanked.
+   * Hand this attempt's coverage to the release about to be issued: it goes out
+   * from the delivery loop, which has the task id and nothing else.
    */
   private declareCoverage(): void {
     declareFinalReport(this.request.task_id ?? "", this.coverageReport()?.runTime);
@@ -3306,10 +3298,8 @@ class TaskRunner {
     const tick = () => {
       const phase = phaseOf(this.runIdentity.key);
       const coverage = this.coverageReport();
-      // Only from the second tick onward. The opening one fires before this
-      // attempt has observed anything, so it is identity-only by construction
-      // rather than because the clock happened not to advance between
-      // `beginRun` and the millisecond it read.
+      // Only from the second tick onward, by construction rather than because
+      // the clock happened not to advance since `beginRun`.
       this.coverageOpened = true;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,

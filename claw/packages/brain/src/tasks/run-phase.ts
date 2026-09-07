@@ -4,27 +4,16 @@
 /**
  * How much of a run is spent executing, and how much doing something else.
  *
- * A run holds an execution slot from the moment it starts until the moment it
- * ends, whether it is calling the model or sitting on a background command
- * that has two hours left to run. A pod can be idle and full at the same time.
- *
- * Two things come out of knowing when a run is not executing. The slot goes
- * back to the pod for the duration, which is what stops a queue from standing
- * still behind runs that are not running. And the time is reported with each
- * lease renewal, as a running total per state, which is what the accounting on
- * the row is built from -- see @claw/protocol's run-time module for what the
- * totals mean once they get there.
+ * A run holds an execution slot whether it is calling the model or sitting on a
+ * background command with two hours left, so a pod can be idle and full at
+ * once. Knowing which buys two things: the slot goes back to the pod for the
+ * duration, and the time is reported with each lease renewal as a running total
+ * per state -- see @claw/protocol's run-time module for what it means there.
  *
  * A run is in exactly one state at a time and entering a new one closes the
- * previous, so the totals sum to the run's own wall clock rather than to more
- * than it. What is not handed back during a wait is the sandbox, so parking is
- * bounded by a resident ceiling in the gate rather than being free. See
- * tasks/execution-gate.ts.
- *
- * Waits are recorded here and keyed by the run's identity rather than held on
- * the runner, because the places that know a wait is happening are several
- * layers below it, and passing a handle down to each would put this concern
- * into signatures that have nothing else to do with it.
+ * previous, so the totals sum to the run's own wall clock rather than past it.
+ * What is not handed back is the sandbox, so parking is bounded by a resident
+ * ceiling in the gate. See tasks/execution-gate.ts.
  */
 import {
   REASON_STATE,
@@ -67,12 +56,9 @@ const WAITING_STATES: readonly RunTimeKnownState[] = [
 ];
 
 /**
- * What to do with the pod's execution slot when a run starts and stops
- * waiting.
- *
- * Injected rather than imported so this module stays a plain ledger: tests
- * drive an isolated gate, and the sub-agent path -- which runs inside a slot
- * its parent already holds -- is measured without ever reading these.
+ * What to do with the pod's execution slot around a wait. Injected rather than
+ * imported so this module stays a plain ledger and a timing-only call site
+ * never reads it at all.
  */
 export interface ParkHooks {
   /** @returns whether a slot was actually given back. */
@@ -164,12 +150,9 @@ async function whileInState<T>(
 /**
  * Run `fn` with the run marked as waiting on `reason`.
  *
- * The slot is reacquired before the caller continues, and that reacquisition
- * can block: the pod may have given the slot to something else while this run
- * was waiting. Which is the intended behaviour -- a run coming back from an
- * approval takes its turn -- but it means the time between "the user clicked
- * approve" and "the tool ran" now includes a queue, and it is still counted as
- * waiting, because from the run's point of view that is what it is.
+ * The slot is reacquired before the caller continues, and that can block: the
+ * queue for it is counted as waiting, because from the run's point of view that
+ * is what it is.
  */
 export function whileWaiting<T>(
   key: RunIdentityKey | undefined,
@@ -233,13 +216,8 @@ export function phaseOf(key: RunIdentityKey): RunPhaseReport {
   };
 }
 
-/**
- * The run's time by state, as running totals for this attempt.
- *
- * Totals rather than deltas: the merge on the row banks the difference against
- * what it has already seen, so a lost or duplicated report costs nothing and a
- * retried one banks nothing twice.
- */
+/** Running totals, not deltas: the merge on the row banks the difference, so a
+ *  lost or duplicated report costs nothing. */
 export function runTimeOf(key: RunIdentityKey): RunTimeSnapshot | null {
   const state = runs.get(key);
   return state ? totalsOf(state) : null;

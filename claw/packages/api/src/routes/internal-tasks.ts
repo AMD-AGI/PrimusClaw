@@ -153,15 +153,19 @@ interface TaskEventBody {
  * write must not turn into a rejected status update.
  */
 async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<void> {
+  if (!(await writeRunOwnership(taskId, body))) return;
+  await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write */ });
+  if (body.attempt_id) await openAttemptRecordFor(taskId, body.attempt_id);
+}
+
+/** @returns whether the row was in a state that still accepts this attempt. */
+async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<boolean> {
   const brainId = body.brain_id;
   const workloadId = body.sandbox_workload_id;
   const attemptId = body.attempt_id;
-  // The early return used to be taken when the event carried neither a brain id
-  // nor a workload id; the attempt token has to keep the statement alive for
-  // exactly those events, or the generation is never allocated for them.
-  if (!brainId && !workloadId && !attemptId) return;
+  if (!brainId && !workloadId && !attemptId) return false;
   try {
-    await db.query(
+    const r = await db.query(
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
@@ -185,18 +189,14 @@ async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<
         attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
       ],
     );
+    return (r.rowCount ?? 0) > 0;
   } catch (err) {
     logger.warn(
       { taskId, err: (err as Error)?.message },
       "task.ownership_write_failed",
     );
+    return false;
   }
-  // Queue time is banked by difference from a total the table maintains, so
-  // whichever observer gets here first banks it and the others bank zero.
-  await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write above */ });
-  // The attempt's start instant, read from the database rather than taken from
-  // the row's `started_at`, which is COALESCEd across claims.
-  if (attemptId) await openAttemptRecordFor(taskId, attemptId);
 }
 
 interface RunLeaseBody {
@@ -324,11 +324,8 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
  * @returns the row's status, or null when there is no active row to renew.
  */
 /**
- * What the row said about a renewal.
- *
- * `unavailable` is kept apart from a status because it is not one: the fence
- * never ran, so nothing may be banked against it, while the caller is still
- * told it is live -- a database hiccup is not evidence that a run has ended.
+ * `unavailable` is not a status: the fence never ran, so nothing may be banked,
+ * while the caller is still told it is live.
  */
 type RenewalOutcome =
   | { kind: "accepted"; status: string }
@@ -411,11 +408,9 @@ async function renewRunLease(
 /**
  * Bank what this renewal covered, against the attempt the row still holds.
  *
- * Two fences, because the UPDATE above cannot be one of them: it commits on
- * its own, and a release or a takeover can land between it and this read. The
- * nested report has to present the same token the row accepted -- a body may
- * carry any two it likes -- and the row has to still hold that attempt when
- * the entry is read.
+ * Two fences, because the UPDATE above commits on its own and a release or
+ * takeover can land between it and this read: the nested report must present
+ * the token the row accepted, and the row must still hold that attempt.
  */
 async function mergeRenewalCoverage(
   taskId: string,

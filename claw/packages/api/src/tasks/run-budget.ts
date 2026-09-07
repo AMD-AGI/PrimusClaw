@@ -120,16 +120,9 @@ export const RUN_BUDGET_DEFAULT_SEC: Record<RunScope, number> = {
  */
 export const RUN_BUDGET_BACKSTOP_GRACE_SEC = envSec("RUN_BUDGET_BACKSTOP_GRACE_SEC", 5 * 60);
 
-/**
- * How far a measured clock skew may be from zero before a comparison built on
- * it is refused.
- *
- * Beside the grace above, and deliberately not derived from it: the two carry
- * the same number today and mean unrelated things, so a change to either must
- * not be a silent change to both. Re-exported from the accounting module rather
- * than restated, so the bound the merge enforces and the bound this file names
- * cannot drift apart.
- */
+// Not derived from the grace above: the two carry the same number and mean
+// unrelated things. Re-exported so it cannot drift from the bound the merge
+// enforces.
 export { RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC } from "@claw/protocol";
 
 /**
@@ -220,13 +213,11 @@ const BUDGET_SECONDS_SQL = `NULLIF(
  * `reapExpiredDoorbellRuns`'s job.
  *
  * The cost is queue position: `peekNextQueued` orders by `queued_at ASC`, so a
- * requeued row now sorts behind rows that arrived while it was executing
- * rather than ahead of them. That is the trade -- going to the back of a queue
- * it can still be served from, instead of staying at the front of one it is
- * about to be failed out of.
+ * requeued row sorts behind rows that arrived while it was executing rather
+ * than ahead of them. The stamp itself is written by the one function that
+ * changes a status, so the segment it opens is banked rather than erased.
  */
-export const RUN_REQUEUE_RESET_SQL = `queued_at = NOW(),
-            started_at = NULL`;
+export const RUN_REQUEUE_RESET_SQL = "started_at = NULL";
 
 const DEADLINE_STAMP_SQL = `deadline_at = COALESCE(
   deadline_at,

@@ -4,17 +4,10 @@
 /**
  * Where a run's time ledger lives on the row, and how a report reaches it.
  *
- * The merge rule itself is in @claw/protocol -- pure, total, and shared with
- * the worker that produces the reports. What is here is everything that makes
- * applying it safe against the row: reading the stored entry, its version and
- * a database-clock instant in one statement, and writing back only if nobody
- * else has written since.
- *
- * Every instant is `clock_timestamp()`, never `NOW()`. `NOW()` is fixed at
- * transaction start, so a transaction that began earlier and commits later can
- * pair its own older instant with an anchor a later transaction already
- * advanced -- a negative coverage budget, or a terminal instant behind the
- * anchor.
+ * The merge rule is in @claw/protocol; what is here makes applying it safe
+ * against the row. Every instant is `clock_timestamp()`: `NOW()` is fixed at
+ * transaction start, so a transaction that began earlier and commits later
+ * would pair its own older instant with an anchor already advanced.
  */
 import pino from "pino";
 
@@ -37,13 +30,8 @@ const logger = pino({ name: "run-time-ledger" });
 /** How many times a merge may lose the compare-and-swap before giving up. */
 const MAX_CAS_ATTEMPTS = 5;
 
-/**
- * The row's own view of a run's time, read in one statement.
- *
- * `queuedTotalMs` closes the open segment at read time, so it is complete the
- * moment the row stops being queued and needs no knowledge of which statement
- * ended it.
- */
+// `queuedTotalMs` closes the open segment at read time, so it is complete the
+// moment the row stops being queued, whichever statement ended it.
 const READ_LEDGER_SQL = `
   SELECT metadata->'run_phase'->'ledger' AS ledger,
          ledger_version,
@@ -86,6 +74,10 @@ const iso = (value: unknown): string =>
 function readRow(row: Record<string, unknown> | undefined, identity: RunIdentityRef): LedgerRow | null {
   if (!row) return null;
   const readAtDb = iso(row.read_at);
+  // Every accounting instant is derived from this one. A row that cannot
+  // supply it has no ledger to compute, and inventing one would put an
+  // unparseable anchor into the entry rather than failing here.
+  if (Number.isNaN(Date.parse(readAtDb))) return null;
   const queuedAtDb = row.queued_at ? iso(row.queued_at) : readAtDb;
   const stored = row.ledger as RunTimeLedgerEntry | null;
   return {
@@ -126,9 +118,8 @@ export async function readLedgerForUpdate(
 /**
  * Store an entry, refusing if anybody has written since it was read.
  *
- * @returns whether this writer won. A loser must re-read the entry, its
- *          version and a fresh read instant together -- the coverage budget is
- *          computed from that pair -- rather than retrying the same merge.
+ * @returns whether this writer won. A loser re-reads the entry, its version and
+ *          a fresh read instant together, since the budget comes from the pair.
  */
 export async function writeLedger(
   taskId: string,
@@ -153,13 +144,8 @@ export async function writeLedger(
 /** What one banking step did to an entry, and whether it changed anything. */
 type Step = (row: LedgerRow) => RunTimeLedgerEntry;
 
-/**
- * Apply a step under compare-and-swap, re-reading on every lost race.
- *
- * The re-read takes the entry, the version and the read instant in one
- * statement again, so no write is ever computed against a value another writer
- * has already replaced.
- */
+// Re-reads entry, version and read instant together on every lost race, so no
+// write is computed against a value another writer has replaced.
 export async function applyToLedger(
   taskId: string,
   identity: RunIdentityRef,
@@ -176,14 +162,9 @@ export async function applyToLedger(
   return null;
 }
 
-/**
- * Bank whatever a report covers, plus whatever queue time is still outstanding.
- *
- * The queued total comes from the row rather than from the report: no worker
- * observes the queue, and a run that timed out in it never allocated an attempt
- * to report under. Banking by difference makes whichever observer arrives first
- * the one that banks, with no flag to coordinate.
- */
+// The queued total comes from the row, not the report: no worker observes the
+// queue, and a run that timed out in it never allocated an attempt to report
+// under. Banking by difference needs no flag to be once-only.
 export function bankReportAndQueue(row: LedgerRow, report?: RunTimeReportInput): RunTimeLedgerEntry {
   const queued = bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb);
   if (!report || !isCoveringReport(report)) return queued;
@@ -205,17 +186,14 @@ export async function bankQueuedTime(taskId: string): Promise<RunTimeLedgerEntry
 /**
  * Open this attempt's durable record, at the instant the row accepted it.
  *
- * The start instant is read from the database in the same statement as the
- * entry, so it is the attempt's own: the row's `started_at` is COALESCEd
+ * The start instant is the attempt's own: the row's `started_at` is COALESCEd
  * across claims and names the first attempt's start for every later one.
- *
- * Idempotent, and refused outright once the row holds a different attempt, so
- * an allocation that lands late cannot open a record for an attempt that has
- * already been superseded.
  */
 export async function openAttemptRecordFor(taskId: string, attemptId: string): Promise<void> {
   await applyToLedger(taskId, { key: taskId, source: "task_id" }, (row) => {
-    if (row.attemptId !== attemptId) return row.entry;
+    // A late duplicate of the running event would otherwise open a second,
+    // never-closed record on a run that has already ended.
+    if (row.attemptId !== attemptId || isTerminal(row)) return row.entry;
     return beginAttemptRecord(
       bankQueuedMs(row.entry, row.queuedTotalMs, row.readAtDb),
       attemptId, row.attemptGeneration, row.readAtDb,
@@ -223,13 +201,8 @@ export async function openAttemptRecordFor(taskId: string, attemptId: string): P
   }).catch(() => null);
 }
 
-/**
- * Bank a renewal's coverage against the attempt the row currently holds.
- *
- * One step, because all three things it does have to be decided against the
- * same read: whether the row still holds this attempt, whether its record has
- * been opened yet, and what its report may bank.
- */
+// One step, because all three things it decides -- does the row still hold this
+// attempt, is its record open, what may its report bank -- need the same read.
 export async function mergeRenewal(
   taskId: string,
   attemptId: string,
@@ -240,7 +213,9 @@ export async function mergeRenewal(
     // A release or a takeover between the fenced UPDATE and this read leaves
     // the row holding somebody else's attempt; the coverage is not this
     // ledger's any more.
-    if (row.attemptId !== attemptId) {
+    // A release moves the row to `queued` and a takeover replaces the attempt;
+    // the first leaves `attempt_id` where it was, so status is half the answer.
+    if (row.attemptId !== attemptId || !RENEWABLE_STATUSES.has(row.status)) {
       stale = true;
       return row.entry;
     }
@@ -252,7 +227,7 @@ export async function mergeRenewal(
     return report && reportIsCurrent(row, report)
       ? mergeRunTimeReport(renewed, report, row.readAtDb)
       : renewed;
-  }).catch(() => null);
+  });
   if (stale) return "stale";
   return applied ? "merged" : "unavailable";
 }
@@ -261,19 +236,33 @@ export async function mergeRenewal(
 export interface RunSettlement {
   /** The attempt's last word on its own time, if it sent one. */
   report?: RunTimeReportInput;
-  /** Close the open record for this attempt, and compute what it lost. */
-  closeAttemptId?: string;
+  /**
+   * Close the attempt's open record and compute what it lost.
+   *
+   * Named only when the caller knows which attempt it is settling; a release
+   * that carries no report closes whichever attempt the row still holds, so an
+   * attempt does not end with its record open and no instant on it.
+   */
+  closeAttempt?: boolean;
 }
 
 /**
  * Whether the row still holds the attempt a report was produced under.
  *
- * `lease_owner` cannot answer this and neither can status: a claim restores a
- * row to `preparing` under the same pod name, and a redelivered fat attempt
- * finds its predecessor's status unchanged. The token is what separates them,
- * and it is read in the same statement that reads the entry the report would
- * be banked into.
+ * `lease_owner` cannot say: a claim restores a row to `preparing` under the
+ * same pod name. Read in the same statement as the entry it would be banked to.
  */
+/** The statuses a live attempt renews from; a release leaves all of them. */
+const RENEWABLE_STATUSES = new Set(["preparing", "running", "cancelling"]);
+
+/** Statuses a run can report time from. Anything else has already ended. */
+const LIVE_STATUSES = new Set(["queued", "preparing", "running", "cancelling", "waiting_external", "waiting_deps"]);
+
+/** Whether the row has ended, by its own status or its pinned terminal instant. */
+export function isTerminal(row: LedgerRow): boolean {
+  return row.completedAtDb !== null || !LIVE_STATUSES.has(row.status);
+}
+
 export function reportIsCurrent(row: LedgerRow, report: RunTimeReportInput): boolean {
   if (row.claimCount !== report.claimCount) return false;
   if (row.deliverySeq !== report.deliverySeq || row.deliveryCount !== report.deliveryCount) {
@@ -284,13 +273,9 @@ export function reportIsCurrent(row: LedgerRow, report: RunTimeReportInput): boo
   return row.attemptId === report.attemptId;
 }
 
-/**
- * Bank an attempt's final report and close its record, holding the row.
- *
- * Under a row lock rather than the optimistic retry: the merge and the row's
- * own transition have to commit together, or a superseded attempt's last report
- * lands in a ledger that no longer belongs to it.
- */
+// Under a row lock rather than the optimistic retry: the merge and the row's
+// transition commit together, or a superseded attempt's last report lands in a
+// ledger that is no longer its own.
 export type SettleOutcome =
   | { ok: true; entry: RunTimeLedgerEntry }
   | { ok: false; reason: "missing" | "stale_attempt" };
@@ -309,9 +294,10 @@ export async function settleRunTime(
     return { ok: false, reason: "stale_attempt" };
   }
   const banked = bankReportAndQueue(row, settlement.report);
-  const closed = settlement.closeAttemptId
-    ? endAttemptRecord(banked, settlement.closeAttemptId, row.readAtDb)
-    : banked;
+  const closing = settlement.closeAttempt
+    ? (settlement.report?.attemptId ?? row.attemptId)
+    : null;
+  const closed = closing ? endAttemptRecord(banked, closing, row.readAtDb) : banked;
   if (closed !== row.entry) await writeLedger(taskId, closed, row.ledgerVersion, query);
   return { ok: true, entry: closed };
 }
@@ -319,11 +305,8 @@ export async function settleRunTime(
 /**
  * Pin a terminal run's entry once, and bank whatever the queue still owes it.
  *
- * Terminality is recognised rather than signalled: no terminal statement is
- * hooked, so a path with no reporter at all -- a queue-timeout reap, a
- * cancellation, a session deletion -- still gets its instant pinned and its
- * queue time banked. What no report covered stays unbanked, which is the honest
- * answer: nobody said what the run was doing, not that it was unknowable.
+ * Terminality is recognised rather than signalled, so a path with no reporter
+ * at all still gets its instant pinned. What no report covered stays unbanked.
  */
 export async function settleTerminalRuns(limit = 200): Promise<number> {
   const r = await db.query(

@@ -45,13 +45,12 @@ function stubDb(
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push({ sql, params });
-    // The reap itself is the statement without an alias; the sibling close is
-    // `UPDATE claw_tasks t` and reports its own rows.
-    if (sql.startsWith("UPDATE claw_tasks SET")) {
-      return { rows: reaped, rowCount: reaped.length };
-    }
-    if (sql.startsWith("UPDATE claw_tasks t SET")) {
-      return { rows: closed, rowCount: closed.length };
+    // Both are the one status statement now; the sibling close is the one
+    // whose predicate zips the two id arrays.
+    if (sql.startsWith("UPDATE claw_tasks SET status")) {
+      const isSiblingClose = /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(sql);
+      const rows = isSiblingClose ? closed : reaped;
+      return { rows, rowCount: rows.length };
     }
     if (sql.startsWith("UPDATE claw_sessions")) {
       return { rows: released, rowCount: released.length };
@@ -63,11 +62,11 @@ function stubDb(
 
 const CHAT_RUN = {
   task_id: "t-1", session_id: "s-1", origin: "chat",
-  lease_owner: "brain-a", message_id: "claw-pending-7",
+  lease_owner: "brain-a", metadata: { message_id: "claw-pending-7" },
 };
 const DAG_RUN = {
   task_id: "t-2", session_id: "s-2", origin: "dag_node",
-  lease_owner: "brain-a", message_id: null,
+  lease_owner: "brain-a", metadata: {},
 };
 
 function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
@@ -76,7 +75,9 @@ function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
 
 /** The statement that closes the rows a retried dispatch left unclaimed. */
 function siblingClose(seen: SeenQuery[]): SeenQuery | undefined {
-  return seen.find((q) => q.sql.startsWith("UPDATE claw_tasks t SET"));
+  // Identified by the predicate that pairs the two id arrays: both reaps go
+  // through the one statement that writes a status.
+  return seen.find((q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
 }
 
 test("a conversation whose run was given up on can be spoken to again", async () => {
@@ -98,7 +99,7 @@ test("the gate stays shut while anything is still executing", async () => {
 
   const [update] = sessionUpdates(seen);
   assert.match(update.sql, /NOT EXISTS/);
-  assert.match(update.sql, /t\.status IN \('queued','preparing','running','cancelling'\)/);
+  assert.match(update.sql, /status IN \('queued','preparing','running','cancelling'\)/);
   assert.match(update.sql, /s\.agent_status = 'running'/,
     "an idle or failed session is not this reaper's to overwrite");
   assert.match(update.sql, /s\.deleted_at IS NULL/);
@@ -127,7 +128,7 @@ test("a run the user stopped is archived as cancelled, not as a worker we lost",
   const sql = seen[0]!.sql;
   assert.match(sql, /SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END/);
   assert.match(sql, /failure_reason = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'worker_lost' END/);
-  const errorMessage = /error_message = CASE (.*?) END, completed_at/.exec(sql)?.[1];
+  const errorMessage = /error_message = CASE ([\s\S]*?) END/.exec(sql)?.[1];
   assert.ok(errorMessage, "the error_message CASE has moved; this test is reading the wrong text");
   assert.match(errorMessage, /WHEN status = 'cancelling' THEN 'the run was cancelled/,
     "the message an operator reads first has to agree with the status beside it");
@@ -166,13 +167,13 @@ test("the row a replayed dispatch left behind is closed with the one that was le
 
   const close = siblingClose(seen);
   assert.ok(close, "the spare row is what holds the gate shut; something has to close it");
-  assert.match(close.sql, /t\.lease_expires_at IS NULL/,
+  assert.match(close.sql, /lease_expires_at IS NULL/,
     "a row with a lease belongs to a worker and is the reap's business, not this one's");
-  assert.match(close.sql, /t\.metadata->>'message_id' = sibling\.message_id/);
-  assert.match(close.sql, /t\.origin = 'chat'/);
-  assert.match(close.sql, /t\.status IN \('queued','preparing','running','cancelling'\)/,
+  assert.match(close.sql, /metadata->>'message_id' = sibling\.message_id/);
+  assert.match(close.sql, /origin = 'chat'/);
+  assert.match(close.sql, /status IN \('queued','preparing','running','cancelling'\)/,
     "idempotent: a row already closed by the completion event is left as it is");
-  assert.deepEqual(close.params, [["s-1"], ["claw-pending-7"]]);
+  assert.deepEqual(close.params.filter(Array.isArray), [["s-1"], ["claw-pending-7"]]);
 });
 
 test("a never-leased row for a different message is not this reaper's to close", async () => {
@@ -184,9 +185,9 @@ test("a never-leased row for a different message is not this reaper's to close",
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
-  assert.match(close.sql, /FROM unnest\(\$1::text\[\], \$2::text\[\]\) AS sibling\(session_id, message_id\)/,
+  assert.match(close.sql, /unnest\(\$\d+::text\[\], \$\d+::text\[\]\) AS sibling\(session_id, message_id\)/,
     "the pair is what selects a row, so a different message in the same session misses");
-  assert.deepEqual(close.params[1], ["claw-pending-7"],
+  assert.deepEqual(close.params.filter(Array.isArray)[1], ["claw-pending-7"],
     "only the message the reaped row was dispatched under");
 });
 
@@ -197,7 +198,7 @@ test("the spare row is not archived as a worker that was lost", async () => {
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
-  assert.match(close.sql, /failure_reason = 'dispatch_retried'/);
+  assert.match(close.params.join("|"), /dispatch_retried/);
   assert.doesNotMatch(close.sql, /worker_lost/);
 });
 
@@ -209,7 +210,8 @@ test("the gate is released after the spare row is closed, not before", async () 
   const seen = stubDb([CHAT_RUN]);
   await reapLostLeases();
 
-  const closeAt = seen.findIndex((q) => q.sql.startsWith("UPDATE claw_tasks t SET"));
+  const closeAt = seen.findIndex(
+    (q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
   const releaseAt = seen.findIndex((q) => q.sql.includes("UPDATE claw_sessions"));
   assert.ok(closeAt >= 0 && releaseAt >= 0);
   assert.ok(closeAt < releaseAt, "releasing first releases nothing");
@@ -218,7 +220,7 @@ test("the gate is released after the spare row is closed, not before", async () 
 test("a reaped row with no recorded message id asks for no siblings", async () => {
   // Matching on a NULL message id would pair every such row with every other,
   // which is the one way this statement could reach a run nobody replayed.
-  const seen = stubDb([{ ...CHAT_RUN, message_id: null }]);
+  const seen = stubDb([{ ...CHAT_RUN, metadata: {} }]);
   await reapLostLeases();
 
   assert.equal(siblingClose(seen), undefined);
@@ -232,15 +234,15 @@ test("the two arrays reach unnest paired, with the unidentifiable rows dropped",
   // sessions that were never reaped. The one reap that has to drop out is the
   // row with no recorded message id, and it has to drop out of both.
   const seen = stubDb([
-    { ...CHAT_RUN, task_id: "t-a", session_id: "s-a", message_id: "claw-pending-1" },
-    { ...CHAT_RUN, task_id: "t-b", session_id: "s-b", message_id: null },
-    { ...CHAT_RUN, task_id: "t-c", session_id: "s-c", message_id: "claw-pending-3" },
+    { ...CHAT_RUN, task_id: "t-a", session_id: "s-a", metadata: { message_id: "claw-pending-1" } },
+    { ...CHAT_RUN, task_id: "t-b", session_id: "s-b", metadata: {} },
+    { ...CHAT_RUN, task_id: "t-c", session_id: "s-c", metadata: { message_id: "claw-pending-3" } },
   ]);
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
   assert.deepEqual(
-    close.params,
+    close.params.filter(Array.isArray),
     [["s-a", "s-c"], ["claw-pending-1", "claw-pending-3"]],
     "the surviving pairs must still be (s-a, 1) and (s-c, 3), in that order",
   );

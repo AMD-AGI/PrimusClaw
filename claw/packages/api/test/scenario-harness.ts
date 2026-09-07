@@ -29,7 +29,7 @@
  * does with a claim belongs in the live environment.
  */
 
-import { db } from "../src/infra/db.js";
+import { clawTasksSchemaSql, db } from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
@@ -85,96 +85,6 @@ CREATE TABLE claw_pending_messages (
   content     TEXT,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
-
-CREATE TABLE claw_tasks (
-  task_id              TEXT PRIMARY KEY,
-  session_id           TEXT NOT NULL,
-  -- The columns a retry clone names. Absent, retryTask fails on the column
-  -- list rather than on anything a scenario meant to assert.
-  parent_task_id       TEXT,
-  batch_id             TEXT,
-  dag_id               TEXT,
-  script               JSONB,
-  depends_on           TEXT[] NOT NULL DEFAULT '{}',
-  mode                 TEXT NOT NULL DEFAULT 'llm',
-  model                TEXT,
-  tools_allowlist      JSONB NOT NULL DEFAULT '[]'::jsonb,
-  skills               JSONB NOT NULL DEFAULT '[]'::jsonb,
-  rules_text           TEXT,
-  agent_hooks          JSONB NOT NULL DEFAULT '{}'::jsonb,
-  backend_mcp_url      TEXT,
-  workspace_throwaway  BOOLEAN NOT NULL DEFAULT FALSE,
-  dag_root_task_id     TEXT,
-  dag_node_id          TEXT,
-  plugin_id            BIGINT,
-  name                 TEXT NOT NULL DEFAULT 'chat',
-  input                JSONB NOT NULL DEFAULT '{}'::jsonb,
-  prompt               TEXT,
-  priority             INT NOT NULL DEFAULT 0,
-  executor             TEXT NOT NULL DEFAULT 'brain',
-  sandbox_spec         JSONB,
-  callback_url         TEXT,
-  internal_token_hash  TEXT,
-  status               TEXT NOT NULL,
-  failure_reason       TEXT,
-  error_message        TEXT,
-  metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
-  -- What a terminal transition writes. Absent, applyAgentDone fails on the
-  -- column rather than on anything a scenario meant to assert.
-  output               TEXT,
-  captures             JSONB NOT NULL DEFAULT '{}'::jsonb,
-  artifacts            JSONB NOT NULL DEFAULT '[]'::jsonb,
-  tool_stats           JSONB,
-  token_usage          JSONB,
-  turns                INT,
-  origin               TEXT,
-  workspace_id         TEXT,
-  brain_id             TEXT,
-  sandbox_workload_id  TEXT,
-  platform_message     TEXT,
-  platform_node        TEXT,
-  platform_exit_code   INT,
-  platform_container_reason TEXT,
-  platform_facts_resolved_at TIMESTAMPTZ,
-  platform_facts_next_retry_at TIMESTAMPTZ,
-  platform_facts_attempts INT NOT NULL DEFAULT 0,
-  lease_owner          TEXT,
-  lease_expires_at     TIMESTAMPTZ,
-  heartbeat_at         TIMESTAMPTZ,
-  claim_count          INT NOT NULL DEFAULT 0,
-  attempt_id           TEXT,
-  attempt_generation   INTEGER NOT NULL DEFAULT 0,
-  delivery_seq         BIGINT NOT NULL DEFAULT 0,
-  delivery_count       BIGINT NOT NULL DEFAULT 0,
-  ledger_version       INTEGER NOT NULL DEFAULT 0,
-  queued_ms_accrued    BIGINT NOT NULL DEFAULT 0,
-  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  queued_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-  started_at           TIMESTAMPTZ,
-  deadline_at          TIMESTAMPTZ,
-  completed_at         TIMESTAMPTZ
-);
-
--- Copied from initDb rather than approximated: the queue accrual it drives is
--- the whole reason a scenario can assert on banked queue time at all, and a
--- fixture without it would report every run as having waited nothing.
-CREATE OR REPLACE FUNCTION claw_tasks_accrue_queued() RETURNS trigger AS $trg$
-BEGIN
-  IF OLD.status = 'queued'
-     AND (NEW.status IS DISTINCT FROM 'queued'
-          OR NEW.queued_at IS DISTINCT FROM OLD.queued_at) THEN
-    NEW.queued_ms_accrued := OLD.queued_ms_accrued
-      + GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - OLD.queued_at)) * 1000)::bigint;
-  END IF;
-  IF NEW.status = 'queued' AND OLD.status IS DISTINCT FROM 'queued' THEN
-    NEW.queued_at := clock_timestamp();
-  END IF;
-  RETURN NEW;
-END;
-$trg$ LANGUAGE plpgsql;
-
-CREATE TRIGGER claw_tasks_accrue_queued BEFORE UPDATE ON claw_tasks
-  FOR EACH ROW EXECUTE FUNCTION claw_tasks_accrue_queued();
 
 CREATE TABLE claw_conversation_turns (
   session_id   TEXT NOT NULL,
@@ -273,6 +183,12 @@ export async function startHarness(): Promise<Harness> {
   initUserEnvCrypto();
   const pg = await PGlite.create();
   await pg.exec(DDL);
+  // The task table comes from the production migration rather than from a copy
+  // of it here: the queue accounting depends on that DDL exactly, and a
+  // restated fixture would pass whatever the real statements do.
+  for (const sql of clawTasksSchemaSql()) {
+    await pg.exec(sql).catch(() => { /* idempotent, exactly as initDb treats it */ });
+  }
 
   const original = db.query;
   const originalConnect = db.pool.connect;

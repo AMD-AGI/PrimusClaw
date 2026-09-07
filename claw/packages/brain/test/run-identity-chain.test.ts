@@ -30,7 +30,7 @@ const { AgentEngine } = await import("../src/agent/engine.js");
 const { AnthropicProvider } = await import("../src/llm/anthropic-provider.js");
 const { OpenAiProvider } = await import("../src/llm/openai-provider.js");
 const { activeAbort } = await import("../src/tasks/abort-registry.js");
-const { pickLockKey } = await import("../src/tasks/lock.js");
+const { pickLockKey, pickRunScope } = await import("../src/tasks/lock.js");
 const { phaseOf, setParkHooks } = await import("../src/tasks/run-phase.js");
 const { resolveRunIdentity } = await import("../src/tasks/run-identity.js");
 const { ExecutionGate } = await import("../src/tasks/execution-gate.js");
@@ -40,6 +40,7 @@ type LlmTurnResult = import("../src/llm/provider.js").LlmTurnResult;
 type HandsClient = import("../src/clients/hands.js").HandsClient;
 type RunPhaseReport = import("../src/tasks/run-phase.js").RunPhaseReport;
 type RunIdentity = import("../src/tasks/run-identity.js").RunIdentity;
+type ExecuteExtras = import("../src/agent/index.js").ExecuteExtras;
 
 /** The one tool the loop treats as a wait, as the parent would offer it. */
 const WAIT_SCHEMA = {
@@ -60,15 +61,18 @@ const originalOpenAi = OpenAiProvider.prototype.createSession;
 
 interface Turn { content: unknown[]; stopReason: string }
 
-/**
- * An LLM that asks for one `wait` and then stops.
- *
- * Installed on both providers' prototypes because the deployment-wide style is
- * read at import time and the loop asks the singleton for a session.
- */
-function installScriptedLlm(turns: Turn[], onTurn?: (index: number) => void): void {
+const ONE_WAIT: Turn[] = [
+  {
+    content: [{ type: "tool_use", id: "t1", name: "wait", input: { shell_id: "bg-1" } }],
+    stopReason: "tool_use",
+  },
+  { content: [{ type: "text", text: "done" }], stopReason: "end_turn" },
+];
+
+/** An LLM that replays `turns` and reports which one it is on. */
+function scriptedSession(turns: Turn[], onTurn?: (index: number) => void): LlmSession {
   let index = 0;
-  const session: LlmSession = {
+  return {
     async streamTurn() {
       const turn = turns[index++];
       onTurn?.(index - 1);
@@ -82,18 +86,20 @@ function installScriptedLlm(turns: Turn[], onTurn?: (index: number) => void): vo
     },
     async complete() { return "summary"; },
   } as unknown as LlmSession;
-  AnthropicProvider.prototype.createSession = () => session;
-  OpenAiProvider.prototype.createSession = () => session;
 }
 
-function waitThenFinish(onTurn?: (index: number) => void): void {
-  installScriptedLlm([
-    {
-      content: [{ type: "tool_use", id: "t1", name: "wait", input: { shell_id: "bg-1" } }],
-      stopReason: "tool_use",
-    },
-    { content: [{ type: "text", text: "done" }], stopReason: "end_turn" },
-  ], onTurn);
+/**
+ * One provider stub for the whole file, dispatching by session.
+ *
+ * The deployment-wide style is read at import time and the loop asks the
+ * singleton for a session, so a per-run stub would be overwritten by whichever
+ * concurrent run installed one last.
+ */
+function installProviderStub(): void {
+  const create = (opts: { sessionId?: string }) =>
+    chains.get(opts.sessionId ?? "")?.session ?? scriptedSession(ONE_WAIT);
+  AnthropicProvider.prototype.createSession = create as never;
+  OpenAiProvider.prototype.createSession = create as never;
 }
 
 function fakeMsg(): JsMsg {
@@ -134,11 +140,32 @@ interface Scenario {
   waitThrows?: boolean;
   request?: Partial<ExecuteRequest>;
   lease?: boolean;
+  /** Distinct per concurrent run, so the shared dispatcher can tell them apart. */
+  sessionId?: string;
   /** What the dispatcher computed; defaults to the fixture's message id. */
   messageId?: string;
 }
 
+/** How many chains are inside `driveChain` right now, so a test can prove overlap. */
+let chainsInFlight = 0;
+
+/**
+ * Per-run handlers, keyed by session.
+ *
+ * `bindTaskRunnerDeps` is process-global, so two chains in flight together
+ * would otherwise each overwrite the other's engine and hands. Binding one
+ * dispatcher that looks the run up is what makes a concurrent test possible.
+ */
+const chains = new Map<string, {
+  onExecute: (extras: ExecuteExtras | undefined) => void;
+  callTool: (name: string) => Promise<string>;
+  onRenewal: (renewal: Renewal) => void;
+  session: LlmSession;
+}>();
+
 interface ChainRun {
+  /** Whether another chain was in flight while this one waited. */
+  overlapped: boolean;
   renewals: Renewal[];
   /** Taken on the turn after the wait, before the runner's own cleanup. */
   afterWait: RunPhaseReport | null;
@@ -149,8 +176,9 @@ interface ChainRun {
 async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
   const renewals: Renewal[] = [];
   let afterWait: RunPhaseReport | null = null;
+  const sessionId = scenario.sessionId ?? SESSION;
   const request = {
-    session_id: SESSION,
+    session_id: sessionId,
     task_id: TASK,
     dag_root_task_id: DAG_ROOT,
     files_workspace_id: WORKSPACE,
@@ -166,28 +194,37 @@ async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
 
   const messageId = scenario.messageId ?? MESSAGE;
   const lockKey = pickLockKey(request);
+  let overlapped = false;
+  chainsInFlight++;
   // Read off the boundary rather than re-resolved: an identity-less run mints a
   // fresh key per resolution, so asking the resolver again would name a
   // different run. This also pins that the runner set the field at all.
   let threaded: RunIdentity | undefined;
 
-  waitThenFinish((index) => {
+  const callTool = async (name: string) => {
+    if (name !== "wait") return "ok";
+    overlapped ||= chainsInFlight > 1;
+    await scenario.duringWait?.(threaded!.key);
+    await new Promise((r) => setTimeout(r, scenario.waitMs ?? 40));
+    if (scenario.waitThrows) throw new Error("the background command died");
+    return "shell finished";
+  };
+  const chain = {
+    onExecute: (extras) => { threaded = extras?.runIdentity; },
+    callTool,
+    onRenewal: (renewal) => { renewals.push({ ...renewal }); },
     // The turn after the tool result: the wait has closed and the runner has
     // not reached its cleanup, which is the only vantage point from which a
     // completed wait's totals are still readable.
-    if (index === 1) afterWait = phaseOf(threaded!.key);
-  });
+    session: scriptedSession(ONE_WAIT, (index) => {
+      if (index === 1) afterWait = phaseOf(threaded!.key);
+    }),
+  };
+  // Under both names it is reached by: the engine and the LLM stub see the
+  // session, the hands client sees the scope its shells are filed under.
+  chains.set(sessionId, chain);
+  chains.set(pickRunScope(request), chain);
 
-  const hands = {
-    async callTool(name: string) {
-      if (name !== "wait") return "ok";
-      await scenario.duringWait?.(threaded!.key);
-      await new Promise((r) => setTimeout(r, scenario.waitMs ?? 40));
-      if (scenario.waitThrows) throw new Error("the background command died");
-      return "shell finished";
-    },
-    async close() {},
-  } as unknown as HandsClient;
 
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
   const sideEffects = {
@@ -205,15 +242,21 @@ async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
     restoreWorkspace: noop({ ok: true }),
     postAgentDone: noop(undefined),
     postTaskRunning: noop(undefined),
-    postRunLease: ((_req: unknown, renewal: Renewal) => {
-      renewals.push({ ...renewal });
+    postRunLease: ((req: { session_id: string }, renewal: Renewal) => {
+      chains.get(req.session_id)?.onRenewal(renewal);
       return Promise.resolve("running");
     }) as never,
     runScript: noop(undefined),
     refreshTaskLock: noop(undefined),
     releaseTaskLock: noop(undefined),
     flushTranscript: (() => Promise.resolve()) as never,
-    makeHandsClient: (() => hands) as never,
+    // Keyed by the owner scope, which is this run's session: two chains in
+    // flight together must not share one client, or the second one's wait is
+    // the only one anything records.
+    makeHandsClient: ((_url: string, _token: string, owner: string) => ({
+      callTool: (name: string) => chains.get(owner)!.callTool(name),
+      close: async () => {},
+    })) as never,
   } as unknown as TaskRunnerSideEffects;
 
   const engine = new AgentEngine();
@@ -222,9 +265,9 @@ async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
     kvCkpt: fakeKv(),
     emitter: { async emit() {} } as never,
     engine: {
-      execute(req, onEvent, signal, hands, extras) {
-        threaded = extras?.runIdentity;
-        return engine.execute(req, onEvent, signal, hands, extras);
+      execute(req, onEvent, signal, handsClient, extras) {
+        chains.get(req.session_id)?.onExecute(extras);
+        return engine.execute(req, onEvent, signal, handsClient, extras);
       },
     },
     sideEffects,
@@ -232,13 +275,16 @@ async function driveChain(scenario: Scenario = {}): Promise<ChainRun> {
 
   const abortCtrl = new AbortController();
   activeAbort.set(lockKey, abortCtrl);
-  await runHandleTask(fakeMsg(), request, SESSION, lockKey, messageId, "u1", abortCtrl);
+  await runHandleTask(fakeMsg(), request, sessionId, lockKey, messageId, "u1", abortCtrl);
   activeAbort.delete(lockKey);
+  chainsInFlight--;
+  chains.delete(sessionId);
+  chains.delete(pickRunScope(request));
   assert.ok(threaded, "TaskRunner is the sole producer: the extras must carry an identity");
-  return { renewals, afterWait, identityKey: threaded!.key, lockKey };
+  return { renewals, afterWait, identityKey: threaded!.key, lockKey, overlapped };
 }
 
-before(() => { });
+before(() => { installProviderStub(); });
 beforeEach(() => { setParkHooks(null); });
 after(() => {
   AnthropicProvider.prototype.createSession = originalAnthropic;
@@ -396,16 +442,27 @@ test("T4.5 two same-millisecond fat-chat turns are timed and parked independentl
     unpark: async () => { events.push("unpark"); },
   });
 
-  const first = await driveChain({
-    waitMs: 30,
-    request: { task_id: undefined, run_lease: { url: `http://api.test/v1/internal/tasks/ktsk_p/lease`, token: "t" } },
-    messageId: shared,
-  });
-  const second = await driveChain({
-    waitMs: 30,
-    request: { task_id: undefined, run_lease: { url: `http://api.test/v1/internal/tasks/ktsk_q/lease`, token: "t" } },
-    messageId: shared,
-  });
+  // Started together and awaited together: run sequentially, a leak between
+  // the two entries has already been cleaned up by the first run's `endRun`
+  // before the second one begins, so the test could not see it.
+  const [first, second] = await Promise.all([
+    driveChain({
+      waitMs: 120, sessionId: "sess-concurrent-a",
+      request: {
+        task_id: undefined, dag_root_task_id: undefined, files_workspace_id: "ws-a",
+        run_lease: { url: "http://api.test/v1/internal/tasks/ktsk_p/lease", token: "t" },
+      },
+      messageId: shared,
+    }),
+    driveChain({
+      waitMs: 120, sessionId: "sess-concurrent-b",
+      request: {
+        task_id: undefined, dag_root_task_id: undefined, files_workspace_id: "ws-b",
+        run_lease: { url: "http://api.test/v1/internal/tasks/ktsk_q/lease", token: "t" },
+      },
+      messageId: shared,
+    }),
+  ]);
 
   assert.equal(first.identityKey, "ktsk_p");
   assert.equal(second.identityKey, "ktsk_q");
@@ -414,8 +471,10 @@ test("T4.5 two same-millisecond fat-chat turns are timed and parked independentl
   assert.equal(first.afterWait!.waits, 1, "each run's wait lands on its own entry");
   assert.equal(second.afterWait!.waits, 1);
   assert.ok(first.afterWait!.waitedMs > 0 && second.afterWait!.waitedMs > 0);
-  assert.deepEqual(events, ["park", "unpark", "park", "unpark"],
+  assert.equal(events.filter((e) => e === "park").length, 2,
     "both are top-level runs, so both hand their slot back for the wait");
+  assert.equal(events.filter((e) => e === "unpark").length, 2);
+  assert.equal(first.overlapped, true, "the two runs really were in flight together");
 });
 
 test("T5.5 the runner opens the ledger under the task id, not a proxy", async () => {
@@ -476,7 +535,10 @@ test("T3.2 a sub-agent's wait is timed against its parent's entry and parks noth
   const identity = resolveRunIdentity(
     { session_id: SESSION, task_id: "parent-run" } as ExecuteRequest, "",
   ).identity;
-  waitThenFinish();
+  const subSession = scriptedSession(ONE_WAIT);
+  chains.set("sub-agent", {
+    onExecute: () => {}, callTool: async () => "ok", onRenewal: () => {}, session: subSession,
+  });
   const hands = {
     async callTool(name: string) {
       if (name !== "wait") return "ok";
@@ -495,7 +557,7 @@ test("T3.2 a sub-agent's wait is timed against its parent's entry and parks noth
       parentSchemas: [WAIT_SCHEMA], hands,
       onEvent: async () => {},
       model: "m", apiUrl: "http://localhost:0", apiKey: "k",
-      maxTurns: 4, sessionId: SESSION, depth: 1,
+      maxTurns: 4, sessionId: "sub-agent", depth: 1,
       runIdentity: identity,
     });
     const report = phaseOf(identity.key);

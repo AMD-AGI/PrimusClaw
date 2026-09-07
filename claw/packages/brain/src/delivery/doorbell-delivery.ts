@@ -19,8 +19,10 @@ import { failClaimedRun, unclaimRun } from "../clients/run-claim.js";
 export type RetryReason = "lock_contention" | "retry" | "drain";
 
 export interface ClaimedDeliveryActions {
-  retryLater: (taskId: string, claimCount?: number, reason?: RetryReason) => Promise<void>;
-  fail: (taskId: string, claimCount?: number) => Promise<void>;
+  retryLater: (
+    taskId: string, claimCount?: number, reason?: RetryReason, runTime?: RunTimeReport,
+  ) => Promise<void>;
+  fail: (taskId: string, claimCount?: number, runTime?: RunTimeReport) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -31,10 +33,10 @@ const defaultSleep = (ms: number): Promise<void> =>
   });
 
 const defaultActions: ClaimedDeliveryActions = {
-  retryLater: (taskId, claimCount, reason) =>
-    unclaimRun(taskId, claimCount, reason ?? "retry", takeDeclaredReport(taskId)),
-  fail: (taskId, claimCount) =>
-    failClaimedRun(taskId, "claim_abandoned", claimCount, takeDeclaredReport(taskId)),
+  retryLater: (taskId, claimCount, reason, runTime) =>
+    unclaimRun(taskId, claimCount, reason ?? "retry", runTime),
+  fail: (taskId, claimCount, runTime) =>
+    failClaimedRun(taskId, "claim_abandoned", claimCount, runTime),
 };
 
 /**
@@ -152,7 +154,7 @@ export function claimedDoorbellMsg(
       void settleRetry(taskId, claimCount, delayMs, sleep, actions.retryLater);
     },
     term() {
-      void actions.fail(taskId, claimCount);
+      void actions.fail(taskId, claimCount, takeDeclaredReport(taskId));
     },
     working() {},
     seq: base.seq,
@@ -167,16 +169,19 @@ async function settleRetry(
   claimCount: number | undefined,
   delayMs: number,
   sleep: (ms: number) => Promise<void>,
-  retryLater: (taskId: string, claimCount?: number, reason?: RetryReason) => Promise<void>,
+  retryLater: ClaimedDeliveryActions["retryLater"],
 ): Promise<void> {
   if (!taskId) return;
   const reason = takeDeclaredReason(taskId);
+  // Taken now rather than when the retry fires: the attempt that declared it
+  // is ending here, and a later attempt must not release under its coverage.
+  const runTime = takeDeclaredReport(taskId);
   let fired = false;
   const fire = async (): Promise<void> => {
     if (fired) return;
     fired = true;
     pendingRetries.delete(taskId);
-    const p = retryLater(taskId, claimCount, reason);
+    const p = retryLater(taskId, claimCount, reason, runTime);
     inFlightReleases.add(p);
     try { await p; } finally { inFlightReleases.delete(p); }
   };

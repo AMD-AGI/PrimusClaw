@@ -18,11 +18,19 @@ import {
 const originalQuery = db.query;
 after(() => { db.query = originalQuery; });
 
-function stubDb(returning: Array<Record<string, unknown>> = []): string[] {
-  const seen: string[] = [];
-  db.query = (async (text: string) => {
+/**
+ * Statements this pass issued, as text, with the values each one bound.
+ *
+ * A reaper's reason is a bind parameter rather than an inlined literal, so a
+ * statement's text alone no longer says what it recorded.
+ */
+function stubDb(returning: Array<Record<string, unknown>> = []): string[] & { params: unknown[][] } {
+  const seen = [] as unknown as string[] & { params: unknown[][] };
+  seen.params = [];
+  db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push(sql);
+    seen.params.push(params);
     return { rows: returning, rowCount: returning.length };
   }) as typeof db.query;
   return seen;
@@ -49,7 +57,7 @@ test("a queued doorbell past its wait is failed as queue_timeout", async () => {
   const seen = stubDb([{ task_id: "ktsk_1", session_id: "s-1" }]);
   assert.equal(await reapExpiredQueuedRuns(), 1);
   assert.match(seen[0], /status = 'failed'/);
-  assert.match(seen[0], /failure_reason = 'queue_timeout'/);
+  assert.match(seen.params[0].join("|"), /queue_timeout/, "recorded as its own reason");
   assert.match(seen[0], /status = 'queued'/);
   assert.match(seen[0], /queued_at/);
   assert.doesNotMatch(seen[0], /deadline_at/);
@@ -78,7 +86,7 @@ test("a queue timeout ends the turn on the stream, not only in the table", async
   // UserMessage stayed on an open stream with no reply and no result.
   stubDb([{
     task_id: "ktsk_1", session_id: "s-1", prompt: "hello",
-    claim_count: 0, message_id: "msg-1", user_id: "u-1",
+    claim_count: 0, metadata: { message_id: "msg-1", user_id: "u-1" },
   }]);
   const events = captureEvents();
 
@@ -125,8 +133,10 @@ test("a requeue winds the attempt clocks back and leaves the turn's deadline alo
   // its two hours once per claim.
   const seen = stubDb();
   await requeueLostDoorbellLeases();
-  assert.match(seen[0], /queued_at = NOW\(\)/);
-  assert.match(seen[0], /started_at = NULL/);
+  assert.match(seen[0], /queued_at = clock_timestamp\(\)/,
+    "the segment this write opens is measured from the instant it opens");
+  assert.ok(seen.params[0].includes(null), "and the attempt's own clock is wound back");
+  assert.match(seen[0], /started_at = \$/);
   assert.doesNotMatch(seen[0], /deadline_at = NULL/);
 });
 
@@ -136,11 +146,11 @@ test("a doorbell past its deadline is closed by a reaper of its own", async () =
   // skipping chat. Without this one the row never reaches a terminal state.
   const seen = stubDb([{
     task_id: "ktsk_9", session_id: "s-9", prompt: "hi",
-    claim_count: 3, message_id: "m-9", user_id: "u-9",
+    claim_count: 3, metadata: { message_id: "m-9", user_id: "u-9" },
   }]);
   const events = captureEvents();
   assert.equal(await reapExpiredDoorbellRuns(), 1);
-  assert.match(seen[0], /failure_reason = 'run_budget_exhausted'/);
+  assert.match(seen.params[0].join("|"), /run_budget_exhausted/);
   assert.match(seen[0], /metadata->>'dispatch' = 'doorbell'/);
   assert.match(seen[0], /deadline_at < NOW\(\)/);
   assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);

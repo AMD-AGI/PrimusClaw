@@ -42,9 +42,9 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
       return params[0] === task.task_id ? { rows: [task], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
     if (sql.startsWith("UPDATE claw_tasks SET status")) {
-      return { rows: [{ ...task, status: params[0] }], rowCount: 1 };
+      const next = /SET status = '(\w+)'/.exec(sql)?.[1] ?? task.status;
+      return { rows: [{ ...task, status: next }], rowCount: 1 };
     }
-    if (sql.startsWith("WITH RECURSIVE downstream")) return { rows: [], rowCount: 0 };
     throw new Error(`stubDb: unexpected query ${sql.slice(0, 80)}`);
   }) as typeof db.query;
   return seen;
@@ -66,8 +66,8 @@ test("cancelling a running task hands it to Brain instead of closing it", async 
 
   const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
   assert.ok(transition);
-  assert.equal(
-    transition!.params[0], "cancelling",
+  assert.match(
+    transition!.sql, /SET status = 'cancelling'/,
     "a running row must not be marked terminal while Brain and its sandbox are still live",
   );
   // The interrupt is published against the DAG root, which is also the key Brain
@@ -79,7 +79,9 @@ test("the downstream cascade closes only rows that cannot be executing", async (
   const seen = stubDb(RUNNING_IN_DAG);
   await cancelTask("t-mid");
 
-  const cascade = seen.find((q) => q.sql.startsWith("WITH RECURSIVE downstream"));
+  // The recursion is inside the predicate now: one statement writes a status,
+  // so a CTE cannot prefix it.
+  const cascade = seen.find((q) => /WITH RECURSIVE downstream/.test(q.sql) && q !== seen[1]);
   assert.ok(cascade, "a task inside a DAG must close its transitive tail");
   assert.match(
     cascade!.sql,
@@ -87,7 +89,7 @@ test("the downstream cascade closes only rows that cannot be executing", async (
     "the cascade targets the pre-execution states",
   );
   assert.doesNotMatch(
-    cascade!.sql,
+    cascade!.sql.replace(/^UPDATE claw_tasks SET status = 'cancelled'/, ""),
     /'preparing'|'running'|'cancelling'/,
     "widening this to rows that may be executing would mark live work terminal without stopping it",
   );
@@ -98,7 +100,7 @@ test("a queued task is closed outright, since nothing is executing yet", async (
   await cancelTask("t-mid");
 
   const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
-  assert.equal(transition!.params[0], "cancelled");
+  assert.match(transition!.sql, /SET status = 'cancelled'/);
   // The expected-status guard still admits `running`: the row may have started
   // between the read and the write, and losing that race must not silently skip
   // the cancel.
@@ -119,8 +121,8 @@ test("a preparing task is handed to Brain too, because it may already be executi
   const r = await cancelTask("t-mid");
 
   const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
-  assert.equal(
-    transition!.params[0], "cancelling",
+  assert.match(
+    transition!.sql, /SET status = 'cancelling'/,
     "a preparing row may be executing, so it must wait for Brain to acknowledge",
   );
   assert.equal(r.interrupt_key, "t-root");

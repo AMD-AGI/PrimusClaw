@@ -67,7 +67,7 @@ function settlementFrom(taskId: string, body: unknown): RunSettlement | undefine
     logger.warn({ taskId, rejected: decoded.rejected }, "run.release.run_time_rejected");
     return undefined;
   }
-  return { report: decoded.report, closeAttemptId: decoded.report.attemptId };
+  return { report: decoded.report, closeAttempt: true };
 }
 
 function brainIdFrom(body: unknown): string {

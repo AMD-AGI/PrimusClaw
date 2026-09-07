@@ -12,7 +12,7 @@
  */
 import { db, inTransaction } from "../infra/db.js";
 import pino from "pino";
-import { getTask, transitionStatus, updateTask } from "./db.js";
+import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
@@ -82,9 +82,7 @@ async function transitionWithFinalReport(
     // transition beside it would end a run somebody else is executing, and the
     // status guard cannot tell the two apart once the row has been reclaimed
     // under the same pod name.
-    const settled = await settleRunTime(query, taskId, {
-      report, closeAttemptId: report.attemptId,
-    });
+    const settled = await settleRunTime(query, taskId, { report, closeAttempt: true });
     if (!settled.ok) throw new StaleAttempt(settled.reason);
     const updated = await transitionStatus(taskId, expected, next, patch, query);
     if (!updated) throw new TerminalNoop();
@@ -233,16 +231,14 @@ export async function cancelTask(
   if (!task) return { ok: false, cancelled: 0 };
 
   if (task.dag_node_id === "__dag_root__") {
-    const r = await db.query(
-      `UPDATE claw_tasks
-       SET status = 'cancelled', failure_reason = 'cancelled', completed_at = NOW()
-       WHERE dag_root_task_id = $1
-         AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
-       RETURNING task_id`,
-      [task.task_id],
-    );
+    const rows = await applyTaskStatusTransition("cancelled", {
+      extra: { failure_reason: "cancelled" },
+      where: "dag_root_task_id = $1 AND status IN "
+        + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
+      params: [task.task_id],
+    });
     await stopAllHandlesForDag(task.task_id, task.session_id);
-    return { ok: true, cancelled: r.rowCount ?? 0, interrupt_key: task.task_id };
+    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id };
   }
 
   // `preparing` counts as executing, not as pending. The dispatcher sets it at
@@ -287,21 +283,26 @@ export async function cancelTask(
     //     what the single-task transition above does. The DAG-root branch may
     //     list `running` because it pairs the UPDATE with `stopAllHandlesForDag`
     //     plus an interrupt publish; this recursive tail has no such pairing.
-    await db.query(
-      `WITH RECURSIVE downstream(task_id) AS (
-         SELECT to_task_id FROM claw_task_edges WHERE from_task_id = $1
-         UNION
-         SELECT e.to_task_id
-           FROM claw_task_edges e
-           JOIN downstream d ON e.from_task_id = d.task_id
-       )
-       UPDATE claw_tasks
-          SET status = 'cancelled', failure_reason = 'cancelled',
-              error_message = $2, completed_at = NOW()
-        WHERE task_id IN (SELECT task_id FROM downstream)
-          AND status IN ('waiting_deps','waiting_external','queued')`,
-      [task.task_id, `upstream ${task.task_id} cancelled`],
-    );
+    await applyTaskStatusTransition("cancelled", {
+      extra: {
+        failure_reason: "cancelled",
+        error_message: `upstream ${task.task_id} cancelled`,
+      },
+      // The recursion moves inside the predicate so the one statement that
+      // writes a status stays one statement; a CTE cannot prefix it.
+      where: `task_id IN (
+          WITH RECURSIVE downstream(task_id) AS (
+            SELECT to_task_id FROM claw_task_edges WHERE from_task_id = $1
+            UNION
+            SELECT e.to_task_id
+              FROM claw_task_edges e
+              JOIN downstream d ON e.from_task_id = d.task_id
+          )
+          SELECT task_id FROM downstream
+        )
+        AND status IN ('waiting_deps','waiting_external','queued')`,
+      params: [task.task_id],
+    });
   }
   return {
     ok: !!updated,

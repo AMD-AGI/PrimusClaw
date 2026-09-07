@@ -4,23 +4,12 @@
 /**
  * What a run's wall time is made of, and how a report of it is banked.
  *
- * One identity holds everywhere below:
- *
  *     wall = known + unknown + unbanked
  *
- * `known` is the closed-interval time attributed to one of the seven named
- * states, `unknown` is time a reporter said it could not attribute, and
- * `unbanked` is time that has elapsed and nobody has reported yet. The third
- * term is additive rather than a residual computed by subtraction, which is
- * what makes the identity hold after every merge instead of only at the end.
- *
- * Everything here is in the database's clock domain. A pod-measured duration
- * enters only as a claim against a budget the database sized, so no accounted
- * quantity depends on a pod clock agreeing with the database's.
- *
- * Shared between the brain, which produces reports, and the API, which merges
- * and stores them, because a merge rule the two packages state separately is
- * two rules.
+ * `unbanked` is additive rather than a residual computed by subtraction, which
+ * is what makes the identity hold after every merge instead of only at the end.
+ * Everything is in the database's clock domain: a pod-measured duration enters
+ * only as a claim against a budget the database sized.
  */
 import type { RunIdentityKey, RunIdentityRef } from "./run-identity.js";
 import type { RunWaitReason } from "./types.js";
@@ -31,13 +20,8 @@ export type RunTimeState =
 
 export type RunTimeKnownState = Exclude<RunTimeState, "unknown">;
 
-/**
- * Canonical order, matching the state table in the design.
- *
- * A merge applies keys in this order so the same report against the same entry
- * yields the same result wherever it runs: with a budget smaller than the
- * report, which key gets the remainder is otherwise arbitrary.
- */
+// Applied in this order by every merge: with a budget smaller than the report,
+// which key gets the remainder is otherwise arbitrary.
 export const RUN_TIME_KNOWN_STATES: readonly RunTimeKnownState[] = [
   "queued", "executing", "waiting_human", "waiting_background",
   "waiting_resource", "waiting_external", "recovering",
@@ -55,11 +39,8 @@ const RUN_WAIT_REASONS: readonly RunWaitReason[] = ["approval", "background_comm
 export type ClockDomain = "brain" | "api" | "db";
 
 /**
- * One round trip, from which the offset and its uncertainty are derived.
- *
- * A single caller-instant-minus-server-instant difference is transit delay and
- * offset added together and removes neither, so the three readings travel
- * rather than the answer.
+ * One round trip. A single caller-minus-server difference is transit delay and
+ * offset added together, so the three readings travel rather than the answer.
  */
 export interface ClockOffset {
   readonly callerDomain: ClockDomain;
@@ -71,12 +52,8 @@ export interface ClockOffset {
   readonly receivedAtMs: number;
 }
 
-/**
- * Which clocks produced the endpoints of every duration in one report.
- *
- * A mixed-domain duration that does not name both endpoints, or names them
- * without an offset, is unrepresentable rather than discouraged.
- */
+/** A mixed-domain duration without both endpoints and an offset is
+ *  unrepresentable rather than discouraged. */
 export type DurationBasis =
   | { readonly kind: "same_domain"; readonly domain: ClockDomain }
   | {
@@ -86,15 +63,8 @@ export type DurationBasis =
       readonly offset: ClockOffset;
     };
 
-/**
- * How far a measured skew may be from zero before a comparison built on it is
- * refused.
- *
- * Declared independently of the sweeper's backstop grace, which happens to
- * carry the same number: that one is a race-ordering margin between a run's
- * self-report and the deadline sweep, and folding the two would make a change
- * to either a silent change to both.
- */
+// Independent of the sweeper's backstop grace, which carries the same number
+// and means a race-ordering margin: folding them makes one change into two.
 export const RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC = 300;
 
 /** Covered values are running totals for `attemptId`, never deltas. */
@@ -180,13 +150,8 @@ function emptyCoverage(attemptId: string): CoverageSeen {
   return { attemptId, stateMs: {}, reasonMs: {}, unknownMs: 0 };
 }
 
-/**
- * A fresh entry anchored at the instant the run became accounting-eligible.
- *
- * The epoch is `queued_at` rather than the first report, so time a run spent
- * queued before anything observed it is `unbanked` from the first read instead
- * of vanishing from the identity.
- */
+// Anchored at `queued_at` rather than at the first report, so time a run spent
+// queued before anything observed it is unbanked rather than absent.
 export function newRunTimeLedgerEntry(
   identity: RunIdentityRef,
   queuedAtDb: string,
@@ -244,14 +209,9 @@ function basisAdmissible(basis: DurationBasis): boolean {
   return Math.abs(offsetMs) + uncertaintyMs <= RUN_TIME_ACCOUNTING_SKEW_BOUND_SEC * 1000;
 }
 
-/**
- * A covered value as it may be banked, given where its endpoints were measured.
- *
- * A duration whose start was read on the caller's clock and whose end was read
- * on the database's carries the offset between them, so the offset comes back
- * out; the uncertainty is then subtracted rather than ignored, which makes what
- * is banked a lower bound and leaves the shortfall visible as unbanked time.
- */
+// A duration measured start-on-caller, end-on-database carries the offset, so
+// it comes back out; subtracting the uncertainty makes what is banked a lower
+// bound and leaves the shortfall visible as unbanked time.
 function admissibleValue(raw: number, basis: DurationBasis): number {
   const value = Math.max(Math.floor(raw), 0);
   if (basis.kind === "same_domain") return value;
@@ -612,14 +572,8 @@ function decodeBasis(raw: unknown): DurationBasis | string {
   };
 }
 
-/**
- * A covered map, with every key checked against its closed vocabulary.
- *
- * An unrecognised key or a value that is not a finite, non-negative number is
- * refused by name. Copying the map through instead would put a string where
- * the merge does arithmetic, and let a key nothing accounts for sit in the
- * stored entry looking like a state.
- */
+// Refused by name rather than copied through: a string here reaches the
+// merge's arithmetic, and an unknown key sits in the entry looking like a state.
 function decodeCovered<K extends string>(
   raw: unknown,
   field: string,

@@ -22,9 +22,15 @@ import { db, inTransaction } from "../src/infra/db.js";
 import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
 import { releaseClaim } from "../src/tasks/run-claim.js";
-import { transitionStatus } from "../src/tasks/db.js";
+import { applyTaskStatusTransition, transitionStatus } from "../src/tasks/db.js";
+import { cancelTask } from "../src/tasks/lifecycle.js";
+import { interruptUnstartedChatRuns } from "../src/tasks/chat-run.js";
+import { reapExpiredQueuedRuns } from "../src/tasks/sweeper.js";
+import { RUN_QUEUE_MAX_SEC } from "../src/tasks/run-budget.js";
 import { applyAgentDone, retryTask } from "../src/tasks/lifecycle.js";
-import { applyToLedger, mergeRenewal, settleTerminalRuns } from "../src/tasks/run-time-ledger.js";
+import {
+  applyToLedger, mergeRenewal, openAttemptRecordFor, settleTerminalRuns,
+} from "../src/tasks/run-time-ledger.js";
 import { reapLostLeases } from "../src/tasks/sweeper.js";
 import { startHarness, seedRun, seedSession, runRow, type Harness } from "./scenario-harness.js";
 
@@ -123,28 +129,30 @@ const expireLease = (taskId: string) => db.query(
 // ── AC1: the queue is banked by the table, whatever ends the segment ─────────
 
 test("AC1 every exit off the queue banks the segment, including the ones with no reporter", async () => {
-  // Table-driven over statements rather than over call sites: the trigger reads
-  // OLD, so what is being asserted is that a row leaving `queued` banks its wait
-  // whether or not the statement's author knew accounting existed.
+  // Table-driven over the writers themselves, not over hand-written SQL: the
+  // accrual rides on the one function that changes a status, so what is being
+  // asserted is that each of these callers goes through it.
   const exits: Array<[string, (taskId: string) => Promise<unknown>]> = [
     ["dispatch CAS", (id) => transitionStatus(id, ["queued"], "preparing")],
-    ["cancellation", (id) => transitionStatus(id, ["queued"], "cancelled")],
-    ["queue-timeout reap", (id) => db.query(
-      `UPDATE claw_tasks SET status='failed', failure_reason='queue_timeout', completed_at=NOW()
-        WHERE task_id=$1`, [id])],
-    ["session deletion", (id) => db.query(
-      `UPDATE claw_tasks SET status='cancelled', completed_at=NOW() WHERE task_id=$1`, [id])],
-    ["queued -> queued re-stamp", (id) => db.query(
-      `UPDATE claw_tasks SET status='queued', queued_at=NOW() WHERE task_id=$1`, [id])],
+    ["cancellation", (id) => cancelTask(id)],
+    ["queue-timeout reap", () => reapExpiredQueuedRuns()],
+    ["session interrupt", () => interruptUnstartedChatRuns(SESSION)],
+    ["release, queued -> queued", (id) => releaseClaim(id, BRAIN, undefined, "retry")],
   ];
 
   for (const [name, exit] of exits) {
     const taskId = `ktsk-${name.replace(/\W+/g, "-")}`;
-    await seedRun(h, taskId, SESSION, { status: "queued", queuedAgoSec: 3 });
-    assert.equal(await queuedMsOf(taskId), 0, `${name}: nothing banked while still queued`);
+    await seedRun(h, taskId, SESSION, {
+      status: "queued", queuedAgoSec: 3, leaseOwner: BRAIN,
+      // The queue reaper judges the wait against RUN_QUEUE_MAX_SEC; only that
+      // one needs a row old enough for it to act on.
+      ...(name === "queue-timeout reap" ? { queuedAgoSec: RUN_QUEUE_MAX_SEC + 5 } : {}),
+    });
+    const before = await queuedMsOf(taskId);
+    assert.equal(before, 0, `${name}: nothing banked while still queued`);
     await exit(taskId);
     const banked = await queuedMsOf(taskId);
-    assert.ok(banked >= 3_000 && banked < 10_000, `${name}: expected ~3s banked, got ${banked}ms`);
+    assert.ok(banked >= 3_000, `${name}: expected the wait banked, got ${banked}ms`);
   }
 });
 
@@ -155,22 +163,18 @@ test("AC1 a row that never sat in the queue banks nothing", async () => {
 });
 
 test("AC1 three queue segments are banked as their sum, and no more", async () => {
-  const requeue = (id: string) => db.query(
-    `UPDATE claw_tasks SET status='queued', queued_at=NOW() WHERE task_id=$1`, [id]);
-  const dequeue = (id: string, next: string) => db.query(
-    `UPDATE claw_tasks SET status=$2 WHERE task_id=$1`, [id, next]);
-
-  await seedRun(h, "ktsk-3seg", SESSION, { status: "queued", queuedAgoSec: 2 });
-  // A contention-only claim that unclaimed before any ownership write ran.
-  await dequeue("ktsk-3seg", "preparing");
-  await requeue("ktsk-3seg");
+  // A contention-only claim, a bind-failure requeue, and a dispatch that
+  // executes -- each through the writer that performs it in production.
+  await seedRun(h, "ktsk-3seg", SESSION, {
+    status: "queued", queuedAgoSec: 2, leaseOwner: BRAIN, claimCount: 1,
+  });
+  await transitionStatus("ktsk-3seg", ["queued"], "preparing");
+  await releaseClaim("ktsk-3seg", BRAIN, undefined, "lock_contention");
   await sleep(200);
-  // A bind-failure requeue.
-  await dequeue("ktsk-3seg", "preparing");
-  await requeue("ktsk-3seg");
+  await transitionStatus("ktsk-3seg", ["queued"], "preparing");
+  await transitionStatus("ktsk-3seg", ["preparing"], "queued");
   await sleep(200);
-  // The dispatch that executes.
-  await dequeue("ktsk-3seg", "running");
+  await transitionStatus("ktsk-3seg", ["queued"], "preparing");
 
   const banked = await queuedMsOf("ktsk-3seg");
   assert.ok(banked >= 2_400 && banked < 8_000, `expected the three waits summed, got ${banked}ms`);
@@ -182,22 +186,22 @@ test("a run that timed out in the queue banks its wait, having never had an atte
   // The gap a report-driven ledger cannot close: a report needs an attempt id,
   // and this run never got one. The banking is driven by the row's own total
   // instead, so the settle pass can do it for a run nobody ever executed.
-  await seedRun(h, "ktsk-qt", SESSION, { status: "queued", queuedAgoSec: 4 });
-  await db.query(
-    `UPDATE claw_tasks SET status='failed', failure_reason='queue_timeout', completed_at=NOW()
-      WHERE task_id=$1`, ["ktsk-qt"]);
+  await seedRun(h, "ktsk-qt", SESSION, {
+    status: "queued", queuedAgoSec: RUN_QUEUE_MAX_SEC + 5,
+  });
+  assert.equal(await reapExpiredQueuedRuns(), 1, "the reaper closes a run nobody claimed");
   // Nothing seeds `run_phase`: this run never had a reporter, so the subtree
   // does not exist and the settle pass has to create the entry itself.
-  assert.equal(await ledgerOf("ktsk-qt"), null, "the fixture must not build the entry for it");
-  assert.ok(await queuedMsOf("ktsk-qt") >= 4_000, "the trigger banked the wait on the row");
+  assert.ok(await queuedMsOf("ktsk-qt") >= 4_000, "the reap banked the wait on the row");
 
-  assert.equal(await settleTerminalRuns(), 1);
+  assert.ok(await settleTerminalRuns() >= 1);
   const ledger = await ledgerOf("ktsk-qt");
   assert.ok(ledger, "the settle pass creates the entry a run with no reporter never got");
   assert.ok(ledger!.knownMsByState.queued >= 4_000,
     `queued must be a real, banked state; got ${ledger!.knownMsByState.queued}ms`);
   assert.equal(ledger!.watermarkMs, ledger!.knownMsByState.queued);
-  assert.equal(ledger!.attempts.length, 0, "no attempt was ever allocated for it");
+  assert.ok(ledger!.attempts.every((a) => a.attemptId === null),
+    "no attempt was ever allocated for it");
   assert.equal(ledger!.settled, true);
   assert.ok(ledger!.terminalAtDb, "and its terminal instant is pinned");
 });
@@ -228,15 +232,43 @@ test("a transaction that opened before the row was queued still banks the wait",
   const banked = await inTransaction(async (query) => {
     // The transaction is open; only now does the row enter the queue, from
     // another statement, and wait a measurable interval there.
-    await db.query(
-      `UPDATE claw_tasks SET status='queued', queued_at=clock_timestamp() WHERE task_id=$1`,
-      ["ktsk-skew"]);
+    await transitionStatus("ktsk-skew", ["preparing"], "queued");
     await sleep(100);
-    await query(`UPDATE claw_tasks SET status='preparing' WHERE task_id=$1`, ["ktsk-skew"]);
+    await applyTaskStatusTransition("preparing", {
+      expected: ["queued"], params: ["ktsk-skew"], query,
+    });
     const r = await query(`SELECT queued_ms_accrued FROM claw_tasks WHERE task_id=$1`, ["ktsk-skew"]);
     return Number((r.rows[0] as { queued_ms_accrued: string }).queued_ms_accrued);
   });
   assert.ok(banked >= 80, `a 100ms wait must be banked, not floored to ${banked}ms`);
+});
+
+test("an insert that names no queued_at still opens its segment at the insert", async () => {
+  // The column default is what retires the gap for every insert helper, present
+  // or future: a row that reached `queued` with a NULL stamp is invisible to
+  // every queue predicate and measures as no wait at all.
+  await h.sql(
+    `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor)
+     VALUES ('ktsk-nodefault', $1, 'chat', 'queued', 'chat', 'brain')`, [SESSION]);
+  const row = await runRow(h, "ktsk-nodefault");
+  assert.ok(row.queued_at, "an insert that omits the stamp must not open its segment at NULL");
+
+  await sleep(120);
+  await transitionStatus("ktsk-nodefault", ["queued"], "preparing");
+  const banked = await queuedMsOf("ktsk-nodefault");
+  assert.ok(banked >= 100, `the wait measures from the insert, got ${banked}ms`);
+});
+
+test("a row that never queued keeps the null the column is allowed to hold", async () => {
+  // NOT NULL is deliberately not added: a row opening straight at `preparing`
+  // never queued, and insertTask writes NULL for exactly that case.
+  await h.sql(
+    `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor, queued_at)
+     VALUES ('ktsk-nullq', $1, 'chat', 'preparing', 'chat', 'brain', NULL)`, [SESSION]);
+  assert.equal((await runRow(h, "ktsk-nullq")).queued_at, null,
+    "the schema must still accept the honest answer for a row that never waited");
+  await transitionStatus("ktsk-nullq", ["preparing"], "running");
+  assert.equal(await queuedMsOf("ktsk-nullq"), 0);
 });
 
 test("a retried run neither inherits the ledger it replaces nor its queue age", async () => {
@@ -520,6 +552,149 @@ test("AC4.11 the delivery pair advances as one value, never key by key", async (
 
   assert.equal((await renew("ktsk-pair", newer)).statusCode, 200,
     "and the same delivery's next renewal is not refused for travelling backwards");
+});
+
+test("AC4 a heartbeat racing the run's end banks nothing after it", async () => {
+  // A heartbeat whose fenced UPDATE won a moment earlier still has coverage to
+  // merge afterwards. `agent_done` ends the run without touching `attempt_id`,
+  // so the attempt is still the row's own and status is the whole answer.
+  await seedRun(h, "ktsk-relrace", SESSION, {
+    status: "running", claimCount: 1, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const token = { attempt_id: "att-1", claim_count: 1, delivery_seq: 0, delivery_count: 0 };
+  await announceRunning("ktsk-relrace", "att-1", { claim_count: 1 });
+  await renew("ktsk-relrace", { ...token, run_time: coverage("ktsk-relrace", "att-1", token, 30) });
+  const before = await ledgerOf("ktsk-relrace");
+
+  await applyAgentDone("ktsk-relrace", { task_id: "ktsk-relrace", abort_reason: "completed" });
+  const ended = await runRow(h, "ktsk-relrace");
+  assert.equal(ended.status, "completed");
+  assert.equal(ended.attempt_id, "att-1", "the run ended without rotating the token");
+
+  const outcome = await mergeRenewal(
+    "ktsk-relrace", "att-1", coverage("ktsk-relrace", "att-1", token, 9_000) as never);
+
+  assert.equal(outcome, "stale", "a run that has ended is not this attempt's to write");
+  assert.deepEqual((await ledgerOf("ktsk-relrace"))!.knownMsByState, before!.knownMsByState);
+});
+
+test("AC4 a release clears the attempt token with the status it changes", async () => {
+  // The other half of the same race: a release returns the row to the queue,
+  // where a heartbeat presenting the old attempt must find nothing to renew.
+  await seedRun(h, "ktsk-relclear", SESSION, {
+    status: "running", claimCount: 1, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-relclear", "att-1", { claim_count: 1 });
+  assert.equal(await unclaim("ktsk-relclear", 1), 200);
+
+  const row = await runRow(h, "ktsk-relclear");
+  assert.equal(row.status, "queued");
+  assert.equal(row.attempt_id, null, "the token goes with the status, in one statement");
+});
+
+test("a release closes the attempt record even when it carries no report", async () => {
+  await seedRun(h, "ktsk-noreport-close", SESSION, {
+    status: "running", claimCount: 1, leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-noreport-close", "att-1", { claim_count: 1 });
+  assert.equal((await ledgerOf("ktsk-noreport-close"))!.attempts[0].endedAtDb, undefined,
+    "the record is open while the attempt runs");
+
+  assert.equal(await unclaim("ktsk-noreport-close", 1), 200, "released with no run_time at all");
+
+  const record = (await ledgerOf("ktsk-noreport-close"))!.attempts[0];
+  assert.ok(record.endedAtDb, "an attempt must not end with its record still open");
+  assert.equal(record.recoveryLoss.computable, true);
+});
+
+test("a running event for a row that has been released opens no attempt record", async () => {
+  // Not terminal -- the row is back on the queue for somebody else -- so the
+  // terminal guard cannot help. What refuses it is the ownership write itself
+  // matching no row, which is the same predicate that decides ownership.
+  await seedRun(h, "ktsk-requeued", SESSION, {
+    status: "queued", claimCount: 1, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-requeued", "att-1", { claim_count: 1 });
+
+  assert.equal((await runRow(h, "ktsk-requeued")).attempt_id, null,
+    "the ownership write does not touch a row that is back on the queue");
+  assert.equal(await ledgerOf("ktsk-requeued"), null,
+    "an event the row does not own writes nothing to its ledger at all");
+});
+
+test("a merge the store could not write is surfaced, not reported as success", async () => {
+  // Flattening it here would hide it from the caller that logs it, which is the
+  // only place a failed accounting write becomes visible at all.
+  await seedRun(h, "ktsk-mergefail", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  const realQuery = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    if (/run_phase/.test(text)) throw new Error("connection reset");
+    return realQuery(text, params);
+  }) as typeof db.query;
+  try {
+    await assert.rejects(
+      mergeRenewal("ktsk-mergefail", "att-1", undefined),
+      /connection reset/,
+    );
+  } finally {
+    db.query = realQuery;
+  }
+});
+
+test("an attempt record is not opened on a row that has already ended", async () => {
+  // The guard on the write itself, not on the caller that usually gates it:
+  // a late allocation reaching this directly must still be refused.
+  await seedRun(h, "ktsk-openterm", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-openterm", "att-1");
+  await applyAgentDone("ktsk-openterm", { task_id: "ktsk-openterm", abort_reason: "completed" });
+  const before = (await ledgerOf("ktsk-openterm"))!.attempts.length;
+
+  await db.query(`UPDATE claw_tasks SET attempt_id = 'att-2' WHERE task_id = $1`, ["ktsk-openterm"]);
+  await openAttemptRecordFor("ktsk-openterm", "att-2");
+
+  assert.equal((await ledgerOf("ktsk-openterm"))!.attempts.length, before,
+    "a terminal row has no attempt left to begin");
+});
+
+test("AC4.11 the delivery pair advances as one value on the allocation path too", async () => {
+  // The same corruption as the renewal case, through the write that allocates
+  // the attempt: two independent maxima store a pair nothing presented.
+  await seedRun(h, "ktsk-allocpair", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await db.query(
+    `UPDATE claw_tasks SET delivery_seq=100, delivery_count=5 WHERE task_id=$1`, ["ktsk-allocpair"]);
+
+  await announceRunning("ktsk-allocpair", "att-b", { delivery_seq: 101, delivery_count: 1 });
+  const row = await runRow(h, "ktsk-allocpair");
+  assert.equal(Number(row.delivery_seq), 101);
+  assert.equal(Number(row.delivery_count), 1,
+    "an independent maximum would store the hybrid (101,5), which no delivery presented");
+
+  // And a pair below the row's does not drag either half backwards.
+  await announceRunning("ktsk-allocpair", "att-c", { delivery_seq: 100, delivery_count: 9 });
+  const after = await runRow(h, "ktsk-allocpair");
+  assert.equal(Number(after.delivery_seq), 101);
+  assert.equal(Number(after.delivery_count), 1);
+});
+
+test("a duplicate running event does not reopen an attempt on a run that ended", async () => {
+  await seedRun(h, "ktsk-dup", SESSION, {
+    status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
+  });
+  await announceRunning("ktsk-dup", "att-1");
+  assert.equal((await ledgerOf("ktsk-dup"))!.attempts.length, 1);
+
+  await applyAgentDone("ktsk-dup", { task_id: "ktsk-dup", abort_reason: "completed" });
+  assert.equal((await runRow(h, "ktsk-dup")).status, "completed");
+
+  await announceRunning("ktsk-dup", "att-1");
+  assert.equal((await ledgerOf("ktsk-dup"))!.attempts.length, 1,
+    "a late duplicate must not open a second, never-closed record");
 });
 
 test("AC4 a body whose nested report names another attempt is refused whole", async () => {

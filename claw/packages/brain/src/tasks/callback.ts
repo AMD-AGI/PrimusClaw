@@ -131,13 +131,9 @@ export async function postTaskRunning(
 }
 
 /**
- * Which attempt of a run is speaking.
- *
- * `lease_owner` cannot say: it is the pod name, so two attempts of a
- * redelivered run on one pod share it. Neither half here can on its own
- * either -- a claim advances `claim_count` and leaves the pair alone, a
- * fat-path redelivery advances the pair and takes no claim -- but together
- * they are monotone over every attempt a row observes.
+ * Which attempt of a run is speaking. `lease_owner` cannot say -- it is the pod
+ * name -- and neither half here can alone: a claim advances `claim_count`, a
+ * fat redelivery advances the pair. Together they are monotone.
  */
 export interface RunAttemptToken {
   /** Minted by this attempt, so the row can fence a heartbeat that outlived it. */
