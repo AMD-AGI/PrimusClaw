@@ -123,6 +123,15 @@ interface HandsKvEntry {
    */
   idleRev?: number;
   /**
+   * Which call opened this idle period, read only by a park re-reading after an
+   * update that did not say whether it committed.
+   *
+   * Off the shape `applyRunEndedIdleFields` writes, so the sweep cannot come to
+   * depend on a field only one of the two parkers sets. A value from an earlier
+   * period is inert: a token names the one call that minted it.
+   */
+  idleWriter?: string;
+  /**
    * The last background-work answer, and when it was taken.
    *
    * On the handle rather than only in memory because the sweep that asks and the
@@ -429,32 +438,26 @@ export function registeredSandboxCount(sessionId: string): number {
  * tells the caller a handle is unparked while the sweep is already reading it as
  * parked.
  *
- * The two signals prove different things and neither is spare. `idleRev` holds
- * the revision a write was conditioned on, and the bucket accepts one write per
- * revision, so finding this call's own revision there proves an idle-opening
- * write conditioned on it landed -- but not whose, because every parker racing
- * from the same read conditions on that revision and writes that same number.
- * The payload is what names the writer: it carries this call's own `idleSince`,
- * which a sibling starting from the same entry matches only by stamping the same
- * millisecond, and two writes that agree to the millisecond are byte-identical
- * and leave nothing for the distinction to be about.
+ * Authorship cannot be read off anything the entry would hold anyway. Parkers
+ * racing from one read share the revision, and compose the same bytes when they
+ * also share a millisecond, so only `idleWriter` -- minted per call, never
+ * repeated -- makes the answer independent of how the two writes were timed.
  *
- * A sibling's write is `superseded`, not `failed`: the handle is parked either
- * way and only the authorship differs, so `failed` would report a pod the fleet
- * is still pinging when it has already been put away.
+ * A revision that matches under a witness that does not is a sibling's park:
+ * `superseded` rather than `failed`, because the handle is parked either way and
+ * `failed` would report a pod the fleet is still pinging.
  */
 async function idleWriteOutcome(
   kv: KV,
   kvKey: string,
-  attempted: string,
+  witness: string,
   revision: number,
 ): Promise<"parked" | "superseded" | "unverified"> {
   try {
     const latest = await kv.get(kvKey);
     if (!latest) return "unverified";
-    const stored = sc.decode(latest.value);
-    if (stored === attempted) return "parked";
-    const info = JSON.parse(stored) as HandsKvEntry;
+    const info = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
+    if (info.idleWriter === witness) return "parked";
     return info.idleRev === revision ? "superseded" : "unverified";
   } catch {
     return "unverified";
@@ -530,12 +533,13 @@ export function markHandsIdle(
       // then refreshes its TTL for the whole reuse window rather than letting
       // it expire -- so the deleted session's platformKey and workload id would
       // outlive it by 15 minutes.
-      const payload = JSON.stringify(info);
+      const witness = nextEntryToken();
+      info.idleWriter = witness;
       try {
-        await kv.update(kvKey, sc.encode(payload), entry.revision);
+        await kv.update(kvKey, sc.encode(JSON.stringify(info)), entry.revision);
       } catch (err) {
         if (isRevisionConflict(err)) throw err;
-        const landed = await idleWriteOutcome(kv, kvKey, payload, entry.revision);
+        const landed = await idleWriteOutcome(kv, kvKey, witness, entry.revision);
         if (landed === "unverified") throw err;
         logger.info({ sessionId, landed }, "hands.mark_idle_ack_lost");
         return { outcome: landed };
@@ -1274,17 +1278,17 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
 }
 
 /**
- * A name for one probe, unique across the fleet for as long as it is held.
+ * A name for one mark this replica puts on an entry, unique across the fleet.
  *
- * Only has to distinguish the probes whose reservations sit on one entry at one
- * moment, which is a handful; the prefix is what keeps two replicas from
- * choosing the same name for two different questions.
+ * The sequence separates this process's marks and the prefix separates
+ * processes, so a name identifies the one call that minted it. Used for probe
+ * reservations and for the witness a park signs its write with.
  */
-const bgProbeTokenPrefix = Math.random().toString(36).slice(2, 10);
-let bgProbeTokenSeq = 0;
-function nextProbeToken(): string {
-  bgProbeTokenSeq += 1;
-  return `${bgProbeTokenPrefix}${bgProbeTokenSeq.toString(36)}`;
+const entryTokenPrefix = Math.random().toString(36).slice(2, 10);
+let entryTokenSeq = 0;
+function nextEntryToken(): string {
+  entryTokenSeq += 1;
+  return `${entryTokenPrefix}${entryTokenSeq.toString(36)}`;
 }
 
 /**
@@ -1449,7 +1453,7 @@ function dispatchProbes(
     // And the fleet-wide half of the same statement, which is what a replica
     // deciding a reclaim can actually read. The probe below is dispatched only
     // if this one is published; see reserveProbe.
-    const token = nextProbeToken();
+    const token = nextEntryToken();
 
     // True once anything has invalidated this identity since the candidate was
     // formed. Called again after every suspension point below, not once at the

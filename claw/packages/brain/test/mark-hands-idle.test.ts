@@ -256,10 +256,13 @@ test("both writers of an idle period leave the handle in one shape", async () =>
 
   for (const [who, entry] of Object.entries(written)) {
     assert.equal(entry.idleEpoch, entry.idleSince, `${who}: the period is named by its stamp`);
-    // The one field that legitimately differs between two writers is the clock
-    // reading, so it is pinned to a constant before the shapes are compared.
+    // The clock reading legitimately differs between two writers, so it is
+    // pinned to a constant before the shapes are compared. So does the witness
+    // one of them signs its own write with, which is not part of the shape the
+    // sweep reads and is why it stays off `applyRunEndedIdleFields`.
     entry.idleSince = 0;
     entry.idleEpoch = 0;
+    delete entry.idleWriter;
   }
   assert.deepEqual(written.brain, written.api, "a divergence here is a divergence in the sweep");
   assert.equal(written.brain.idleRev, REVISION);
@@ -289,39 +292,55 @@ test("a write whose acknowledgement is lost is reported as the park it was", asy
   assert.equal(stored.idleRev, REVISION, "the write this call was conditioned on is what landed");
 });
 
-test("a sibling that won the same revision is not claimed as this call's write", async () => {
-  // The race the revision alone cannot see: two replicas run the same teardown,
-  // both read revision 7, and both build a payload naming it. One wins; this
-  // one's request dies with a transport error that is not a revision conflict,
-  // so it re-reads and finds `idleRev: 7` -- its own number, somebody else's
-  // write. `superseded` rather than `failed` because the handle is parked, and
-  // rather than `parked` because this call is not what parked it.
-  const sibling = {
-    status: "ready", workloadId: "w1", keepalive: false,
-    idleSince: 1000, idleEpoch: 1000, idleRev: REVISION,
-  };
-  let attempted = false;
-  const kv = {
-    async get(key: string) {
-      return {
-        key,
-        value: sc.encode(JSON.stringify(
-          attempted ? sibling : { status: "ready", workloadId: "w1" },
-        )),
-        revision: REVISION,
-      };
-    },
-    async update() {
-      attempted = true;
-      throw new Error("CONNECTION_CLOSED");
-    },
-  } as unknown as KV;
+test("two callers racing one revision at one millisecond report distinct outcomes", async () => {
+  // The reviewer's race, run through the real markHandsIdle twice against one
+  // bucket. Both read revision 7 and both stamp the same millisecond, so they
+  // compose identical bytes but for the witness. One wins the CAS; the loser's
+  // conflict reply is lost in transit and surfaces as a transport error, which
+  // is the path that re-reads. Neither the revision nor the payload can tell
+  // the two apart, so the outcomes must come from the witness, not the timing.
+  const frozen = Date.now;
+  Date.now = () => 1_000;
+  try {
+    let stored = JSON.stringify({ status: "ready", workloadId: "w1" });
+    let revision = REVISION;
+    const seen: string[] = [];
+    const kv = {
+      async get(key: string) {
+        return { key, value: sc.encode(stored), revision };
+      },
+      async update(_key: string, value: Uint8Array, rev: number) {
+        seen.push(sc.decode(value));
+        // The conflict the bucket raised never reached us; all this caller sees
+        // is a dead connection, so isRevisionConflict cannot classify it.
+        if (rev !== revision) throw new Error("CONNECTION_CLOSED");
+        stored = sc.decode(value);
+        revision += 1;
+        return revision;
+      },
+    } as unknown as KV;
 
-  assert.equal(
-    (await markHandsIdle(kv, SID, "w1")).outcome,
-    "superseded",
-    "this call stored nothing, so it may not report the park as its own",
-  );
+    const outcomes = (await Promise.all([
+      markHandsIdle(kv, SID, "w1"),
+      markHandsIdle(kv, SID, "w1"),
+    ])).map((r) => r.outcome);
+
+    assert.equal(seen.length, 2, "sanity: both callers attempted a write");
+    const [a, b] = seen.map((raw) => {
+      const info = JSON.parse(raw) as Record<string, unknown>;
+      delete info.idleWriter;
+      return info;
+    });
+    assert.deepEqual(a, b, "sanity: the two writes differ in nothing but the witness");
+
+    assert.deepEqual(
+      [...outcomes].sort(),
+      ["parked", "superseded"],
+      "exactly one of them parked the handle, and the other must not claim it",
+    );
+  } finally {
+    Date.now = frozen;
+  }
 });
 
 test("a park nobody performed is still reported as failed", async () => {
