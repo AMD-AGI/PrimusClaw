@@ -29,6 +29,7 @@ import {
   validateTopology, type EnvironmentTopology,
 } from "@claw/protocol";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
+import { metrics } from "../infra/metrics.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
 import {
@@ -931,6 +932,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, response);
+          metrics.onSessionCreated("ok");
           return { statusCode: 200, response };
         }
 
@@ -1019,7 +1021,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           },
         };
         if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, okResp);
+        metrics.onSessionCreated("ok");
         return { statusCode: 200, response: okResp };
+      } catch (err) {
+        metrics.onSessionCreated("error");
+        throw err;
       } finally {
         if (idemLock) await releaseIdempotencyLock(idemLock);
       }

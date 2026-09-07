@@ -61,6 +61,7 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
 import { getS3Client } from "../infra/s3-client.js";
+import { metrics } from "../infra/metrics.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
 import { sc, nc, kv, kvTombstones, jsm, EVENT_STREAM } from "../infra/nats.js";
 import { rememberSessionDeleted } from "./deleted-cache.js";
@@ -929,7 +930,14 @@ export async function recordCleanupOutcome(
  */
 export async function teardownSession(input: TeardownInput): Promise<string[]> {
   const { sessionId } = input;
-  await commitSessionDeletion(sessionId);
+  // Counted here rather than at the two routes, for the reason this module
+  // exists: a second copy of the accounting is a second thing to drift.
+  try {
+    await commitSessionDeletion(sessionId);
+  } catch (err) {
+    metrics.onSessionDeleted("error");
+    throw err;
+  }
   const incomplete = await runSessionCleanup(input, { budgetMs: INLINE_CLEANUP_BUDGET_MS });
   await recordCleanupOutcome(sessionId, incomplete);
   if (incomplete.length) {
@@ -939,6 +947,7 @@ export async function teardownSession(input: TeardownInput): Promise<string[]> {
     // a slow one from a stuck one.
     logger.warn({ sessionId, incomplete }, "session.cleanup_deferred");
   }
+  metrics.onSessionDeleted("ok");
   return incomplete;
 }
 
