@@ -1,0 +1,5 @@
+{
+  "extends": "../../../../tsconfig.base.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "../.." },
+  "include": ["run-identity-brand.type-test.ts"]
+}

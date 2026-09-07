@@ -26,9 +26,11 @@ import {
   activeAbort, LEASE_LOST_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "../src/tasks/abort-registry.js";
 import { beginRun, endRun, phaseOf, whileWaiting } from "../src/tasks/run-phase.js";
+import { testRunKey } from "./support/run-identity.js";
 
 const SESSION = "sess-lease";
 const MESSAGE = "msg-lease";
+const TASK = "task-lease";
 
 function fakeMsg() {
   const verdicts: string[] = [];
@@ -131,6 +133,9 @@ async function runScenario(opts: {
 
   const request = {
     session_id: SESSION,
+    // A real task id, so the ledger this scenario reads is the one the runner
+    // opened rather than an entry a synthetic lock key happened to agree with.
+    task_id: TASK,
     prompt: "hi",
     user_id: "u1",
     ...(opts.lease ? { run_lease: opts.lease } : {}),
@@ -164,11 +169,11 @@ test("a run without a lease says nothing", async () => {
 });
 
 test("a waiting run reports the wait, not that it is busy", async () => {
-  const key = "run-phase-unit";
+  const key = testRunKey("run-phase-unit");
   beginRun(key);
   try {
     let observed: string | undefined;
-    await whileWaiting(key, "approval", async () => {
+    await whileWaiting(key, "approval", "timed+park", async () => {
       observed = phaseOf(key).phase;
     });
     assert.equal(observed, "waiting", "time spent waiting on a person is not execution");
@@ -180,11 +185,11 @@ test("a waiting run reports the wait, not that it is busy", async () => {
 });
 
 test("a wait that throws still stops counting as a wait", async () => {
-  const key = "run-phase-throw";
+  const key = testRunKey("run-phase-throw");
   beginRun(key);
   try {
     await assert.rejects(
-      whileWaiting(key, "background_command", async () => { throw new Error("denied"); }),
+      whileWaiting(key, "background_command", "timed+park", async () => { throw new Error("denied"); }),
     );
     assert.equal(phaseOf(key).phase, "executing",
       "a run stuck in 'waiting' forever would make the measurement useless");
@@ -197,11 +202,11 @@ test("nested waits are one stretch of not executing", async () => {
   // An approval requested while a background command is outstanding is still
   // one stretch of the run standing still. Counting both would put the waiting
   // fraction above one and make the number unusable for capacity planning.
-  const key = "run-phase-nested";
+  const key = testRunKey("run-phase-nested");
   beginRun(key);
   try {
-    await whileWaiting(key, "background_command", async () => {
-      await whileWaiting(key, "approval", async () => {
+    await whileWaiting(key, "background_command", "timed+park", async () => {
+      await whileWaiting(key, "approval", "timed+park", async () => {
         assert.equal(phaseOf(key).waitReason, "background_command",
           "the outer reason is the one that describes the stretch");
       });
@@ -216,9 +221,9 @@ test("nested waits are one stretch of not executing", async () => {
 test("an untracked run does not blow up the tool call it wraps", async () => {
   // Sub-agents and script-mode runs are not tracked. Waiting there should be a
   // no-op, not a crash inside the tool dispatch path.
-  const value = await whileWaiting(undefined, "approval", async () => 42);
+  const value = await whileWaiting(undefined, "approval", "timed+park", async () => 42);
   assert.equal(value, 42);
-  assert.equal(await whileWaiting("never-begun", "approval", async () => 7), 7);
+  assert.equal(await whileWaiting(testRunKey("never-begun"), "approval", "timed+park", async () => 7), 7);
 });
 
 test("a run whose row has gone terminal stops itself", async () => {

@@ -62,6 +62,7 @@ import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning,
 } from "./callback.js";
 import { beginRun, endRun, phaseOf } from "./run-phase.js";
+import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
@@ -859,6 +860,16 @@ class TaskRunner {
   private readonly runId: string;
 
   /**
+   * This run in the phase ledger.
+   *
+   * Deliberately a second value beside {@link runId} rather than a derivation
+   * of it: that one decides which sandbox shells a redelivered attempt
+   * re-adopts, and the lease and message tiers here would silently change that
+   * answer. Neither is computed from the other.
+   */
+  private readonly runIdentity: RunIdentity;
+
+  /**
    * The scope those shells are addressable in: this DAG, or this conversation.
    *
    * Not the gate key, even though it used to be the same string. The gate now
@@ -1029,6 +1040,23 @@ class TaskRunner {
     this.userId = userId;
     this.abortCtrl = abortCtrl;
     this.runId = request.task_id || messageId;
+    const resolved = resolveRunIdentity(request, messageId);
+    this.runIdentity = resolved.identity;
+    if (resolved.leaseShapeMiss) {
+      logger.warn(
+        { sessionId, messageId, leaseUrl: request.run_lease?.url },
+        "run_identity.lease_shape_miss",
+      );
+    }
+    // Distinct from the event above: a run with nothing to identify it is a
+    // degradation this design expects, while an unrecognised lease URL is an
+    // upstream regression, and folding the two would let the second hide.
+    if (this.runIdentity.source === "unknown") {
+      logger.warn(
+        { sessionId, messageId, runIdentityKey: this.runIdentity.key },
+        "run_identity.unknown",
+      );
+    }
     this.handsOwner = pickRunScope(request);
 
     this.userIdHex = /^[0-9a-f]{32}$/.test(userId) ? userId : null;
@@ -2174,6 +2202,7 @@ class TaskRunner {
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
+          runIdentity: this.runIdentity,
         });
       }
     } finally {
@@ -3185,10 +3214,10 @@ class TaskRunner {
     // Tracked whether or not there is anywhere to report it to. The ledger is
     // what hands the execution slot back during a wait, and a run dispatched
     // by a path that does not issue leases waits exactly as long as any other.
-    beginRun(this.lockKey);
+    beginRun(this.runIdentity.key);
     if (!this.request.run_lease?.url) return null;
     const tick = () => {
-      const phase = phaseOf(this.lockKey);
+      const phase = phaseOf(this.runIdentity.key);
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
@@ -3445,7 +3474,7 @@ class TaskRunner {
       cancelDeadline();
       clearInterval(this.keepAlive);
       if (leaseTimer) clearInterval(leaseTimer);
-      endRun(this.lockKey);
+      endRun(this.runIdentity.key);
       activeAbort.delete(this.lockKey);
       await fx().releaseTaskLock(this.lockKey);
       // The transport, not the sandbox: the pod is parked for the next message

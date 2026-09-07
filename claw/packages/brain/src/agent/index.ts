@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest, ExecuteResult, EventCallback, TokenUsage, Message } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, EventCallback, RunIdentity, TokenUsage, Message } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import pino from "pino";
 
@@ -170,6 +170,15 @@ export interface ExecuteExtras {
    * reach /workspace, and never for a turn the model answers on its own.
    */
   attachHands?: () => Promise<HandsClient>;
+  /**
+   * Identity this run is tracked under in the phase ledger.
+   *
+   * Optional only because the whole interface is; the contract is that
+   * TaskRunner, the sole production producer, always sets it. Absence at this
+   * boundary is a wiring bug rather than a run without an identity, and the
+   * engine reports it as one instead of resolving a second time.
+   */
+  runIdentity?: RunIdentity;
 }
 
 export interface Engine {

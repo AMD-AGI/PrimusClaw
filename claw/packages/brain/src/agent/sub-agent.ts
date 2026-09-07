@@ -5,7 +5,7 @@ import { agentLoop } from "./agent-loop.js";
 import { ToolRouter, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
+import type { Message, ToolSchema, EventCallback, RunIdentity } from "@claw/protocol";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 
@@ -78,6 +78,8 @@ export interface RunSubagentOptions {
   depth: number;
   /** Parent's HookRunner, forwarded so PreToolUse/PostToolUse fire in subs too. */
   hooks?: HookRunner;
+  /** The run this sub-agent executes inside, so its waits are attributed to it. */
+  runIdentity?: RunIdentity;
   /** Web tool services from the parent, shared across sub-agents. */
   webToolServices?: WebToolServices;
 }
@@ -203,7 +205,10 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       // Sub-agents forbid further nesting (enforced by agent-loop via depth).
       depth: opts.depth,
       hooks: opts.hooks,
-    } as any);
+      // Forwarded, not re-derived: a sub-agent's waits belong to the run its
+      // parent opened, and omitting this is how they went uncounted.
+      runIdentity: opts.runIdentity,
+    });
   } catch (err: any) {
     failed = true;
     result = {

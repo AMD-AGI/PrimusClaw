@@ -27,8 +27,9 @@ import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
 } from "../config.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, EventCallback, RunIdentity } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
+import { untheadedRunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
 
@@ -58,6 +59,21 @@ export function webToolClientHeaders(): Record<string, string> {
 }
 
 export class AgentEngine {
+  /**
+   * Stand in for an identity the runner failed to thread down.
+   *
+   * Never a second resolution: the resolver prefers `task_id` and would mint
+   * an identity that looks correct while addressing an entry the runner never
+   * opened. A sentinel that takes no request cannot substitute a proxy for the
+   * value that went missing, and the error log is what makes the wiring bug
+   * findable rather than the accounting quietly landing somewhere else.
+   */
+  private untrackedIdentity(sessionId: string): RunIdentity {
+    const identity = untheadedRunIdentity();
+    logger.error({ sessionId, runIdentityKey: identity.key }, "engine.run_identity_missing");
+    return identity;
+  }
+
   async execute(
     request: ExecuteRequest,
     onEvent: EventCallback,
@@ -74,6 +90,7 @@ export class AgentEngine {
     const platformKey = request.platform_key || "";
     const model = request.model || DEFAULT_MODEL;
     const sessionId = request.session_id;
+    const runIdentity = extras?.runIdentity ?? this.untrackedIdentity(sessionId);
 
     logger.info({ sessionId, model, apiUrl, apiStyle: LLM_API_STYLE }, "engine.execute_start");
 
@@ -354,7 +371,7 @@ export class AgentEngine {
           depth: 0,
           hands: attached,
           attachHands: sandbox,
-          runKey: request.dag_root_task_id || request.session_id,
+          runIdentity,
           platformMcpClients: mcpResult.clients,
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,

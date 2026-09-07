@@ -26,7 +26,19 @@
  * handle down to each would put this concern into signatures that have nothing
  * else to do with it.
  */
-import type { RunWaitReason } from "@claw/protocol";
+import type { RunIdentityKey, RunWaitReason } from "@claw/protocol";
+import pino from "pino";
+
+const logger = pino({ name: "run-phase" });
+
+/**
+ * Whether a wait may hand the pod's execution slot back for its duration.
+ *
+ * Required and undefaulted at every call site: a slot belongs to whoever
+ * acquired it, and a sub-agent waiting inside its parent's slot would be
+ * handing back one it does not own, admitting work the pod never intended.
+ */
+export type WaitMode = "timed" | "timed+park";
 
 interface RunPhaseState {
   /** Why the run is currently waiting, or null while it is executing. */
@@ -39,7 +51,7 @@ interface RunPhaseState {
   waits: number;
 }
 
-const runs = new Map<string, RunPhaseState>();
+const runs = new Map<RunIdentityKey, RunPhaseState>();
 
 /**
  * What to do with the pod's execution slot when a run starts and stops
@@ -63,12 +75,12 @@ export function setParkHooks(next: ParkHooks | null): void {
 }
 
 /** Start tracking a run. Idempotent: a redelivery re-enters the same key. */
-export function beginRun(key: string): void {
+export function beginRun(key: RunIdentityKey): void {
   runs.set(key, { waitingOn: null, waitStartedAt: 0, waitedMs: 0, waits: 0 });
 }
 
 /** Stop tracking a run. Every beginRun needs exactly one endRun. */
-export function endRun(key: string): void {
+export function endRun(key: RunIdentityKey): void {
   runs.delete(key);
 }
 
@@ -89,16 +101,21 @@ export function endRun(key: string): void {
  * waiting, because from the run's point of view that is what it is.
  */
 export async function whileWaiting<T>(
-  key: string | undefined,
+  key: RunIdentityKey | undefined,
   reason: RunWaitReason,
+  mode: WaitMode,
   fn: () => Promise<T>,
 ): Promise<T> {
   const state = key ? runs.get(key) : undefined;
-  if (!state || state.waitingOn) return fn();
+  if (!state) {
+    logger.warn({ reason, mode, keyed: key !== undefined }, "run_phase.ledger_miss");
+    return fn();
+  }
+  if (state.waitingOn) return fn();
   state.waitingOn = reason;
   state.waitStartedAt = Date.now();
   state.waits++;
-  const parked = hooks;
+  const parked = mode === "timed+park" ? hooks : null;
   // A run that had no slot to give back must not come back holding one, so the
   // answer travels with the pair rather than being inferred on return.
   const gaveSlotBack = parked?.park() ?? false;
@@ -125,7 +142,7 @@ export interface RunPhaseReport {
 }
 
 /** What to report with the next lease renewal. */
-export function phaseOf(key: string): RunPhaseReport {
+export function phaseOf(key: RunIdentityKey): RunPhaseReport {
   const state = runs.get(key);
   if (!state) return { phase: "executing", waitedMs: 0, waits: 0 };
   const inFlight = state.waitingOn ? Date.now() - state.waitStartedAt : 0;
