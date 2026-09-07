@@ -217,11 +217,8 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
 }
 
 /**
- * The task table's own schema, as one idempotent sequence.
- *
- * Returned rather than executed so the schema tests drive this migration
- * instead of a copy of it: a fixture that restates the DDL passes whatever the
- * production statements do.
+ * Returned rather than executed so the schema tests drive this migration itself:
+ * a fixture that restates the DDL passes whatever the production statements do.
  */
 export function clawTasksSchemaSql(): string[] {
   const out: string[] = [];
@@ -231,7 +228,6 @@ export function clawTasksSchemaSql(): string[] {
   return out;
 }
 
-/** The table as a fresh deployment gets it, in one idempotent statement. */
 function taskTableSql(out: string[]): void {
   out.push(`
       CREATE TABLE IF NOT EXISTS claw_tasks (
@@ -295,19 +291,12 @@ function taskTableSql(out: string[]): void {
 }
 
 /**
- * The columns that turn this table into a record of runs rather than only of
- * DAG tasks.
- *
- * Chat turns write rows here, and a chat turn had no persisted identity at all:
- * nothing to sweep when it hangs, nothing for the workspace collector to check
- * ownership against, nothing to count when asking how many runs a tenant has in
- * flight. Every one arrives empty and unread -- nullable, or defaulted -- so
- * this step only adds.
+ * What turns this table into a record of runs rather than only of DAG tasks.
+ * Every column arrives empty and unread, so this step only adds.
  *
  * Deliberately not added, though the design lists them:
- *   - `run_id`. `task_id` is already a ULID primary key and is what every
- *     index, foreign reference and CAS is built on; a second identifier for the
- *     same row would be two things to keep agreeing.
+ *   - `run_id`. `task_id` is already a ULID primary key and what every index,
+ *     reference and CAS is built on; a second one is two things to keep agreeing.
  *   - `root_run_id`. `dag_root_task_id` already is it.
  *   - `on_child_failure` / `topology`. Policy for features not built yet.
  */
@@ -315,19 +304,15 @@ function runColumnsSql(out: string[]): void {
   const col = (name: string, type: string) => {
     out.push(`ALTER TABLE claw_tasks ADD COLUMN IF NOT EXISTS ${name} ${type}`);
   };
-  // What produced this run: 'chat', 'task' (the standalone task API) or
-  // 'dag_node'. Until now the kind was inferred from whether
-  // `dag_root_task_id` was set, which cannot separate the first two -- and
-  // gets the answer wrong for a standalone task, handing a batch job the
-  // budget meant for a conversational turn. Nullable, because rows written
-  // before this column exist and the inference stays as the fallback.
+  // 'chat', 'task' or 'dag_node'. Inferring it from `dag_root_task_id` cannot
+  // separate the first two, and hands a standalone task the budget meant for a
+  // conversational turn. Nullable: older rows keep the inference as a fallback.
   col("origin", "TEXT");
   // Which workspace the run's files live in. The collector currently infers
   // ownership from paths, which is why it cannot safely delete anything.
   col("workspace_id", "TEXT");
-  // Who is executing the run. Declared in CREATE TABLE since the table
-  // existed but never written to until now, and a deployment old enough to
-  // predate the declaration would fail the write rather than skip it.
+  // Who is executing the run. Also ALTERed, because a deployment old enough to
+  // predate the declaration above would fail the write rather than skip it.
   col("brain_id", "TEXT");
   col("sandbox_workload_id", "TEXT");
   // Worker liveness, the half of the old timeout that was never about how
@@ -339,13 +324,10 @@ function runColumnsSql(out: string[]): void {
   // Monotonic per-run event counter, so a reconnecting reader can say what
   // it has already seen instead of receiving the stream from the top.
   col("event_seq", "BIGINT NOT NULL DEFAULT 0");
-  // What the platform did to this run, captured when it ended.
-  //
-  // Recorded rather than fetched on read. A dispatcher above Claw polls a couple
-  // of hundred live runs every thirty seconds; resolving each one against SaFE at
-  // that point would be two hundred calls per sweep, and it would be asking for
-  // facts that stopped changing when the run did. Written once at the terminal,
-  // the batch read is one query.
+  // What the platform did to this run, recorded when it ended rather than
+  // fetched on read: a dispatcher polling a couple of hundred live runs every
+  // thirty seconds would otherwise make that many SaFE calls per sweep, for
+  // facts that stopped changing when the run did.
   col("platform_exit_code", "INT");
   col("platform_node", "TEXT");
   // The pod's own account is kept verbatim so kill-reason vocabulary can
@@ -398,7 +380,6 @@ function runColumnsSql(out: string[]): void {
   // honest answer.
 }
 
-/** What makes the queued segment measurable on every row, however inserted. */
 function queueAccrualSql(out: string[]): void {
   out.push("ALTER TABLE claw_tasks ALTER COLUMN queued_at SET DEFAULT clock_timestamp()");
   out.push(`UPDATE claw_tasks SET queued_at = created_at
