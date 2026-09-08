@@ -34,8 +34,6 @@ import { startHarness, seedRun, seedSession, runRow, type Harness } from "./scen
 
 const TOKEN = "cluster-internal-token";
 const SESSION = "s-acct";
-/** Pages one settle pass will walk; mirrors MAX_SETTLE_PAGES in run-time-ledger.ts. */
-const SETTLE_PAGE_CAP = 50;
 const BRAIN = "brain-1";
 
 let h: Harness;
@@ -330,7 +328,8 @@ test("AC4 the settle pass reaches the oldest terminal runs, not only the newest"
   // reaches. Newest-first meant a burst wider than the bound pushed the same
   // recent rows in front every sweep, and the rows behind them -- the ones whose
   // unbanked time had grown longest -- were never pinned at all.
-  const rows = SETTLE_PAGE_CAP + 5;
+  const budget = 3;
+  const rows = budget + 2;
   for (let i = 0; i < rows; i++) {
     await seedRun(h, `ktsk-age-${i}`, SESSION, { status: "queued", queuedAgoSec: 1 });
     // Oldest first, by the column the pass orders on.
@@ -339,12 +338,12 @@ test("AC4 the settle pass reaches the oldest terminal runs, not only the newest"
         WHERE task_id=$1`, [`ktsk-age-${i}`, rows - i]);
   }
 
-  assert.equal(await settleTerminalRuns(1), SETTLE_PAGE_CAP, "one pass walks its whole page budget");
+  assert.equal(await settleTerminalRuns(budget), budget, "one pass respects its total row budget");
   assert.equal((await ledgerOf("ktsk-age-0"))!.settled, true, "the oldest row is reached first");
   assert.equal(await ledgerOf(`ktsk-age-${rows - 1}`), null,
     "and the newest is what the bound leaves for the next pass");
 
-  assert.equal(await settleTerminalRuns(1), 5, "which the next pass then takes");
+  assert.equal(await settleTerminalRuns(budget), 2, "which the next pass then takes");
 });
 
 test("AC4 a settle that lost the race leaves the winner's terminal instant alone", async () => {

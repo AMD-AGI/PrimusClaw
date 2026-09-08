@@ -340,32 +340,19 @@ export async function settleRunTime(
 }
 
 /**
- * Pin a terminal run's entry once, and bank whatever the queue still owes it.
+ * Pin and bank at most `limit` terminal runs per sweep.
  *
  * Terminality is recognised rather than signalled, so a path with no reporter
  * at all still gets its instant pinned. What no report covered stays unbanked.
  */
 export async function settleTerminalRuns(limit = 200): Promise<number> {
-  let settled = 0;
-  // Oldest-first paging prevents a sustained burst of newer terminal rows from
+  // Oldest-first batches prevent a sustained burst of newer terminal rows from
   // starving entries whose unbanked time has already been growing longest.
-  for (let page = 0; page < MAX_SETTLE_PAGES; page++) {
-    const found = await settleTerminalPage(limit);
-    settled += found.settled;
-    if (found.rows < limit) break;
-  }
-  return settled;
-}
-
-/** How many pages one pass will walk before leaving the rest to the next. */
-const MAX_SETTLE_PAGES = 50;
-
-async function settleTerminalPage(limit: number): Promise<{ rows: number; settled: number }> {
   const r = await db.query(
     `SELECT task_id FROM claw_tasks
       WHERE completed_at IS NOT NULL
         AND COALESCE((metadata->'run_phase'->'ledger'->>'settled')::boolean, false) = false
-      ORDER BY completed_at ASC
+      ORDER BY completed_at ASC, task_id ASC
       LIMIT $1`,
     [limit],
   );
@@ -388,5 +375,5 @@ async function settleTerminalPage(limit: number): Promise<{ rows: number; settle
     });
     if (entry?.settled) settled++;
   }
-  return { rows: r.rows.length, settled };
+  return settled;
 }
