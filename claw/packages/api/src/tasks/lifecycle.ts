@@ -291,7 +291,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             replace(callback_url,    task_id, $1),
             replace(backend_mcp_url, task_id, $1),
             CASE WHEN coalesce(array_length(depends_on,1),0) = 0 THEN 'queued' ELSE 'waiting_deps' END,
-            metadata,
+            metadata - 'sandbox',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
             workspace_throwaway

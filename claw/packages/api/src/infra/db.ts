@@ -1135,16 +1135,19 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await ensureConcurrentIndex(
       client,
-      "idx_tasks_platform_facts_pending",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
+      "idx_tasks_platform_facts_pending_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v2
          ON claw_tasks(
            platform_facts_next_retry_at ASC NULLS FIRST,
            completed_at ASC,
            task_id ASC
          )
        WHERE status = 'failed'
-         AND failure_reason IN ('brain_timeout','worker_lost')
-         AND sandbox_workload_id IS NOT NULL
+         AND failure_reason IN (
+           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
+           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed'
+         )
          AND platform_facts_resolved_at IS NULL`,
     );
     await client.query(

@@ -15,6 +15,7 @@ import type {
   ExecuteRequest, ExecuteResult, RunPhase, RunWaitReason,
 } from "@claw/protocol";
 import pino from "pino";
+import type { SandboxEntry } from "../sandbox/keepalive.js";
 
 const logger = pino({ name: "task-callback" });
 
@@ -122,6 +123,7 @@ export async function postTaskRunning(
 /** What a lease renewal tells the row, beyond "the worker is still here". */
 export interface LeaseRenewal {
   brainId: string;
+  sandbox?: { provider: "safe-workload" | "agent-sandbox"; handle: string };
   /** How long the row should consider the lease valid from now. */
   leaseSeconds: number;
   phase: RunPhase;
@@ -129,6 +131,13 @@ export interface LeaseRenewal {
   /** Cumulative wall-clock the run has spent waiting rather than executing. */
   waitedMs: number;
   waits: number;
+}
+
+export function sandboxForLease(entry: SandboxEntry | null): LeaseRenewal["sandbox"] {
+  if (!entry) return undefined;
+  const provider = entry.provider ?? "safe-workload";
+  const handle = provider === "agent-sandbox" ? entry.sessionId : entry.workloadId;
+  return handle ? { provider, handle } : undefined;
 }
 
 /**
@@ -195,6 +204,7 @@ export async function postRunLease(
       },
       body: JSON.stringify({
         brain_id: renewal.brainId,
+        sandbox: renewal.sandbox,
         lease_seconds: renewal.leaseSeconds,
         phase: renewal.phase,
         wait_reason: renewal.waitReason,

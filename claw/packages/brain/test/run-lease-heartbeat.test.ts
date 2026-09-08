@@ -26,6 +26,9 @@ import {
   activeAbort, LEASE_LOST_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "../src/tasks/abort-registry.js";
 import { beginRun, endRun, phaseOf, whileWaiting } from "../src/tasks/run-phase.js";
+import type { LeaseRenewal } from "../src/tasks/callback.js";
+import type { SandboxEntry } from "../src/sandbox/keepalive.js";
+import { RUN_LEASE_HEARTBEAT_MS } from "../src/config.js";
 
 const SESSION = "sess-lease";
 const MESSAGE = "msg-lease";
@@ -76,19 +79,13 @@ function result(): ExecuteResult {
   } as ExecuteResult;
 }
 
-interface Renewal {
-  brainId: string;
-  phase: string;
-  waitedMs: number;
-  leaseSeconds: number;
-}
-
 async function runScenario(opts: {
   lease?: { url: string; token: string };
+  identity?: SandboxEntry;
   engineBehavior?: (extras: ExecuteExtras | undefined) => Promise<ExecuteResult>;
   leaseVerdict?: (n: number) => string;
 }) {
-  const renewals: Renewal[] = [];
+  const renewals: LeaseRenewal[] = [];
   const { msg } = fakeMsg();
   const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
@@ -96,7 +93,7 @@ async function runScenario(opts: {
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
 
   const sideEffects = {
-    ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t" }),
+    ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t", identity: opts.identity }),
     destroyHands: noop(undefined),
     reapPendingHands: noop(undefined),
     unregisterSandbox: (() => {}) as never,
@@ -110,7 +107,7 @@ async function runScenario(opts: {
     restoreWorkspace: noop({ ok: true }),
     postAgentDone: noop(undefined),
     postTaskRunning: noop(undefined),
-    postRunLease: ((_req: unknown, renewal: Renewal) => {
+    postRunLease: ((_req: unknown, renewal: LeaseRenewal) => {
       renewals.push(renewal);
       return Promise.resolve(opts.leaseVerdict?.(renewals.length) ?? "running");
     }) as never,
@@ -154,7 +151,32 @@ test("a run with a lease claims it before it starts working", async () => {
   assert.ok(renewals.length >= 1, "the lease is taken up front");
   assert.equal(renewals[0].phase, "executing");
   assert.ok(renewals[0].leaseSeconds > 0);
+  assert.equal(renewals[0].sandbox, undefined);
 });
+
+for (const identity of [
+  { workloadId: "workload-1", platformKey: "private-key" },
+  { provider: "agent-sandbox" as const, sessionId: "router-session-1", sandboxName: "pod-1" },
+]) {
+  test(`a later heartbeat reports the lazily attached ${identity.provider ?? "safe-workload"} handle`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const { renewals } = await runScenario({
+      lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+      identity,
+      async engineBehavior(extras) {
+        await extras!.attachHands!();
+        t.mock.timers.tick(RUN_LEASE_HEARTBEAT_MS);
+        return result();
+      },
+    });
+    assert.equal(renewals[0].sandbox, undefined);
+    assert.deepEqual(renewals.at(-1)?.sandbox, {
+      provider: identity.provider ?? "safe-workload",
+      handle: identity.provider === "agent-sandbox" ? identity.sessionId : identity.workloadId,
+    });
+    assert.ok(renewals.length > 1);
+  });
+}
 
 test("a run without a lease says nothing", async () => {
   // Runs dispatched before the lease existed, and everything with no row of
