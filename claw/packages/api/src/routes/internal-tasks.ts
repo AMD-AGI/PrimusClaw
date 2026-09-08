@@ -133,25 +133,7 @@ interface TaskEventBody {
   [key: string]: unknown;
 }
 
-/**
- * Record which brain is running a task and which sandbox it provisioned.
- *
- * Both columns have existed since the table was created and nothing has ever
- * written to them, which leaves a running task anonymous: an operator with a
- * task id cannot say which pod's logs to read, and the sweeper cannot tell a
- * sandbox belonging to a live run apart from one whose run is long gone --
- * so it deletes neither, and abandoned sandboxes accumulate.
- *
- * Written unconditionally rather than only alongside a successful
- * `preparing -> running` transition, because a redelivered message runs on a
- * different pod with a different sandbox while the row is already `running`;
- * that is precisely the case where stale ownership misdirects a cleanup.
- * Terminal rows are excluded: attributing a sandbox to a finished run would
- * point cleanup at something that has already been torn down.
- *
- * Best-effort. This describes a run rather than driving it, and a failed
- * write must not turn into a rejected status update.
- */
+/** Best-effort attribution of an active run to its executing brain and sandbox. */
 async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<void> {
   if (!(await writeRunOwnership(taskId, body))) return;
   await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write */ });
@@ -169,41 +151,25 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
-              -- Fenced on the same pair the columns below are. A delivery the
-              -- row has already moved past is a late duplicate, and letting it
-              -- take ownership hands the run back to a superseded attempt while
-              -- the pair still names the live one -- whose next heartbeat is
-              -- then refused for presenting a token the row no longer holds.
-              -- The pair fence admits its own delivery, so a settle leaves the
-              -- attempt's last running event still able to pass it; the spent
-              -- token is what refuses that one, as it does a late heartbeat.
-              attempt_id          = CASE
-                                      WHEN (delivery_seq, delivery_count)
-                                             <= ($6::bigint, $7::bigint)
-                                       AND $5 IS DISTINCT FROM settled_attempt_id
-                                      THEN COALESCE($5, attempt_id)
-                                      ELSE attempt_id
-                                    END,
+              attempt_id          = COALESCE($5, attempt_id),
               attempt_generation  = CASE
                                       WHEN $5::text IS NOT NULL
                                        AND attempt_id IS DISTINCT FROM $5
-                                       AND (delivery_seq, delivery_count)
-                                             <= ($6::bigint, $7::bigint)
-                                       AND $5 IS DISTINCT FROM settled_attempt_id
                                       THEN attempt_generation + 1
                                       ELSE attempt_generation
                                     END,
-              delivery_seq        = CASE WHEN (delivery_seq, delivery_count)
-                                              < ($6::bigint, $7::bigint)
-                                         THEN $6::bigint ELSE delivery_seq END,
-              delivery_count      = CASE WHEN (delivery_seq, delivery_count)
-                                              < ($6::bigint, $7::bigint)
-                                         THEN $7::bigint ELSE delivery_count END
+              delivery_seq        = $6::bigint,
+              delivery_count      = $7::bigint
         WHERE task_id = $1
-          AND status = ANY($4::text[])`,
+          AND status = ANY($4::text[])
+          -- Doorbell delivery pairs stay at (0, 0); each claim advances claim_count.
+          AND claim_count = $8::int
+          AND (delivery_seq, delivery_count) <= ($6::bigint, $7::bigint)
+          AND ($5::text IS NULL OR $5 IS DISTINCT FROM settled_attempt_id)`,
       [
         taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
         attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
+        body.claim_count ?? 0,
       ],
     );
     return (r.rowCount ?? 0) > 0;

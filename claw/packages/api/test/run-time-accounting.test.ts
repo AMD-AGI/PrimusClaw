@@ -24,7 +24,7 @@ import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
 import { claimRunById, releaseClaim } from "../src/tasks/run-claim.js";
 import { applyTaskStatusTransition, transitionStatus } from "../src/tasks/db.js";
 import { cancelTask } from "../src/tasks/lifecycle.js";
-import { reapExpiredQueuedRuns, reapLostLeases } from "../src/tasks/sweeper.js";
+import { reapExpiredQueuedRuns, reapLostLeases, requeueLostDoorbellLeases } from "../src/tasks/sweeper.js";
 import { RUN_QUEUE_MAX_SEC } from "../src/tasks/run-budget.js";
 import { applyAgentDone, retryTask } from "../src/tasks/lifecycle.js";
 import {
@@ -66,6 +66,10 @@ interface TokenFields {
   attempt_id?: string; claim_count?: number; delivery_seq?: number; delivery_count?: number;
 }
 
+interface OwnershipFields {
+  brain_id?: string; sandbox_workload_id?: string;
+}
+
 async function renew(taskId: string, body: Record<string, unknown> & TokenFields) {
   return app.inject({
     method: "POST",
@@ -89,18 +93,29 @@ function coverage(taskId: string, attemptId: string, token: TokenFields, executi
 
 /** The running signal a brain sends when its attempt starts executing. */
 async function announceRunning(
-  taskId: string, attemptId: string, token: TokenFields = {},
+  taskId: string, attemptId: string | undefined, token: TokenFields = {},
+  ownership: OwnershipFields = {},
 ): Promise<number> {
   const res = await app.inject({
     method: "POST", url: `/v1/internal/tasks/${taskId}/event`,
     headers: { authorization: `Bearer ${TOKEN}` },
     payload: {
       type: "statusUpdate", agent_status: "running", brain_id: BRAIN,
-      attempt_id: attemptId, claim_count: token.claim_count ?? 0,
-      delivery_seq: token.delivery_seq ?? 0, delivery_count: token.delivery_count ?? 0,
+      claim_count: 0, delivery_seq: 0, delivery_count: 0,
+      ...token, ...ownership, attempt_id: attemptId,
     },
   });
   return res.statusCode;
+}
+
+async function claimDoorbellAttempt(taskId: string, expectedClaimCount: number, brainId = BRAIN) {
+  const claimed = await claimRunById(taskId, brainId);
+  assert.ok(typeof claimed === "object" && "claimCount" in claimed, "the real claim must succeed");
+  assert.equal(claimed.claimCount, expectedClaimCount, "every successful claim advances its token");
+  return {
+    attempt_id: `att-${expectedClaimCount}`, claim_count: claimed.claimCount,
+    delivery_seq: 0, delivery_count: 0,
+  };
 }
 
 /** The release a holder issues through the endpoint the brain actually calls. */
@@ -166,6 +181,10 @@ async function settleAttempt(
 async function fenceOf(taskId: string): Promise<Record<string, unknown>> {
   const row = await runRow(h, taskId);
   return {
+    brain_id: row.brain_id,
+    sandbox_workload_id: row.sandbox_workload_id,
+    lease_owner: row.lease_owner,
+    claim_count: Number(row.claim_count),
     attempt_id: row.attempt_id,
     attempt_generation: Number(row.attempt_generation),
     heartbeat_at: row.heartbeat_at,
@@ -206,7 +225,7 @@ test("AC1 three queue segments are banked as their sum, and no more", async () =
   // The column is only half the claim. What the run is accounted by is the
   // ledger, and an entry created after the last requeue is anchored at that
   // requeue -- so the segments before it have no budget to be admitted under.
-  await announceRunning("ktsk-3seg", "att-1");
+  await announceRunning("ktsk-3seg", "att-1", { claim_count: 1 });
   const ledger = await ledgerOf("ktsk-3seg");
   assert.equal(ledger!.knownMsByState.queued, banked,
     "every segment the row banked has to reach the ledger, not just the newest");
@@ -956,6 +975,112 @@ test("a fat retry's own delivery cannot re-adopt the attempt it just settled", a
   assert.equal((await fenceOf("ktsk-fatlate")).attempt_id, "att-2");
 });
 
+test("doorbell reclaims reject older claim ownership with the unchanged delivery pair", async () => {
+  const taskId = "ktsk-reclaim-own";
+  await seedRun(h, taskId, SESSION, { status: "queued", claimable: true });
+  const attempts = [];
+  for (let claimCount = 1; claimCount <= 3; claimCount++) {
+    const ownership = { brain_id: `brain-${claimCount}`, sandbox_workload_id: `sandbox-${claimCount}` };
+    const token = await claimDoorbellAttempt(taskId, claimCount, ownership.brain_id);
+    attempts.push({ token, ownership });
+    assert.equal(await announceRunning(taskId, token.attempt_id, token, ownership), 200);
+    assert.equal((await renew(taskId, { ...token, brain_id: ownership.brain_id })).statusCode, 200);
+    if (claimCount < 3) {
+      await expireLease(taskId);
+      assert.equal(await requeueLostDoorbellLeases(), 1);
+      const queued = await runRow(h, taskId);
+      assert.equal(queued.status, "queued");
+      assert.equal(queued.attempt_id, null);
+    }
+  }
+  const live = await fenceOf(taskId);
+  assert.equal(live.attempt_id, "att-3");
+  assert.equal(live.attempt_generation, 3);
+  assert.equal(live.claim_count, 3);
+  assert.equal(live.brain_id, "brain-3");
+  assert.equal(live.sandbox_workload_id, "sandbox-3");
+  assert.deepEqual([live.delivery_seq, live.delivery_count], [0, 0]);
+
+  for (const { token, ownership } of attempts.slice(0, 2)) {
+    assert.equal(await announceRunning(taskId, token.attempt_id, token, ownership), 200);
+    assert.deepEqual(await fenceOf(taskId), live, "all earlier claims must leave live ownership intact");
+  }
+  const oldest = attempts[0];
+  assert.equal(await announceRunning(taskId, oldest.token.attempt_id,
+    { ...oldest.token, claim_count: undefined }, oldest.ownership), 200);
+  assert.deepEqual(await fenceOf(taskId), live, "a missing claim count cannot bypass the fence");
+  const current = attempts[2];
+  assert.equal((await renew(taskId, { ...current.token, brain_id: current.ownership.brain_id })).statusCode, 200);
+  assert.deepEqual((await ledgerOf(taskId))!.attempts.map((a) => a.attemptId), ["att-1", "att-2", "att-3"]);
+});
+
+test("a released doorbell claim cannot overwrite its replacement's ownership", async () => {
+  const taskId = "ktsk-release-own";
+  await seedRun(h, taskId, SESSION, { status: "queued", claimable: true });
+  const first = await claimDoorbellAttempt(taskId, 1);
+  const firstOwner = { brain_id: BRAIN, sandbox_workload_id: "sandbox-1" };
+  assert.equal(await announceRunning(taskId, first.attempt_id, first, firstOwner), 200);
+  assert.equal((await renew(taskId, first)).statusCode, 200);
+  assert.equal(await unclaim(taskId, first.claim_count), 200);
+  const secondOwner = { brain_id: "brain-2", sandbox_workload_id: "sandbox-2" };
+  const second = await claimDoorbellAttempt(taskId, 2, secondOwner.brain_id);
+  assert.equal(await announceRunning(taskId, second.attempt_id, second, secondOwner), 200);
+  const live = await fenceOf(taskId);
+  assert.equal(live.attempt_id, second.attempt_id);
+  assert.equal(live.attempt_generation, 2);
+  assert.equal(live.brain_id, secondOwner.brain_id);
+  assert.equal(live.sandbox_workload_id, secondOwner.sandbox_workload_id);
+  assert.deepEqual([live.delivery_seq, live.delivery_count], [0, 0]);
+
+  assert.equal(await announceRunning(taskId, first.attempt_id, first, firstOwner), 200);
+
+  assert.deepEqual(await fenceOf(taskId), live);
+  assert.equal((await renew(taskId, { ...second, brain_id: secondOwner.brain_id })).statusCode, 200);
+});
+
+test("an expired preparing claim cannot announce ownership after a direct takeover", async () => {
+  const taskId = "ktsk-preparing-own";
+  await seedRun(h, taskId, SESSION, { status: "queued", claimable: true });
+  const first = await claimDoorbellAttempt(taskId, 1);
+  assert.equal((await runRow(h, taskId)).status, "preparing");
+  await expireLease(taskId);
+  const ownership = { brain_id: "brain-2", sandbox_workload_id: "sandbox-2" };
+  const second = await claimDoorbellAttempt(taskId, 2, ownership.brain_id);
+  const taken = await fenceOf(taskId);
+  assert.equal(taken.attempt_id, null);
+  assert.equal(taken.attempt_generation, 0);
+  assert.equal(taken.claim_count, 2);
+  assert.deepEqual([taken.delivery_seq, taken.delivery_count], [0, 0]);
+
+  assert.equal(await announceRunning(taskId, first.attempt_id, first,
+    { brain_id: BRAIN, sandbox_workload_id: "sandbox-1" }), 200);
+
+  assert.deepEqual(await fenceOf(taskId), taken, "an unannounced replacement owns the claim already");
+  assert.equal(await announceRunning(taskId, second.attempt_id, second, ownership), 200);
+  assert.equal((await renew(taskId, { ...second, brain_id: ownership.brain_id })).statusCode, 200);
+  const live = await fenceOf(taskId);
+  assert.equal(live.attempt_id, second.attempt_id);
+  assert.equal(live.attempt_generation, 1);
+  assert.equal(live.brain_id, ownership.brain_id);
+  assert.equal(live.sandbox_workload_id, ownership.sandbox_workload_id);
+});
+
+test("a legacy owner-only event still identifies an untouched fat run", async () => {
+  const taskId = "ktsk-legacy-own";
+  await seedRun(h, taskId, SESSION, { status: "preparing", dispatch: "fat" });
+  const ownership = { brain_id: BRAIN, sandbox_workload_id: "sandbox-1" };
+
+  assert.equal(await announceRunning(taskId, undefined,
+    { claim_count: undefined, delivery_seq: undefined, delivery_count: undefined }, ownership), 200);
+
+  const row = await runRow(h, taskId);
+  assert.equal(row.status, "running");
+  assert.equal(row.brain_id, ownership.brain_id);
+  assert.equal(row.sandbox_workload_id, ownership.sandbox_workload_id);
+  assert.equal(row.attempt_id, null);
+  assert.equal(Number(row.attempt_generation), 0);
+});
+
 test("a running event the row has already moved past takes no ownership", async () => {
   // Only the pair columns were fenced on monotonicity. A delayed running event
   // for a superseded attempt still took `attempt_id` and spent a generation, so
@@ -966,20 +1091,28 @@ test("a running event the row has already moved past takes no ownership", async 
   });
   const first = { claim_count: 0, delivery_seq: 10, delivery_count: 1 };
   const second = { claim_count: 0, delivery_seq: 10, delivery_count: 2 };
-  await announceRunning("ktsk-lateown", "att-1", first);
-  await announceRunning("ktsk-lateown", "att-2", second);
+  const firstOwner = { brain_id: BRAIN, sandbox_workload_id: "sandbox-1" };
+  const secondOwner = { brain_id: "brain-2", sandbox_workload_id: "sandbox-2" };
+  await announceRunning("ktsk-lateown", "att-1", first, firstOwner);
+  await expireLease("ktsk-lateown");
+  await announceRunning("ktsk-lateown", "att-2", second, secondOwner);
+  assert.equal((await renew("ktsk-lateown", {
+    attempt_id: "att-2", ...second, brain_id: secondOwner.brain_id,
+  })).statusCode, 200);
 
   const live = await fenceOf("ktsk-lateown");
   assert.equal(live.attempt_id, "att-2");
   assert.equal(live.attempt_generation, 2);
+  assert.equal(live.brain_id, secondOwner.brain_id);
+  assert.equal(live.sandbox_workload_id, secondOwner.sandbox_workload_id);
   assert.deepEqual([live.delivery_seq, live.delivery_count], [10, 2]);
 
-  await announceRunning("ktsk-lateown", "att-1", first);
+  await announceRunning("ktsk-lateown", "att-1", first, firstOwner);
 
   assert.deepEqual(await fenceOf("ktsk-lateown"), live,
-    "an older delivery moves neither the pair nor the attempt it belongs to");
+    "an older delivery cannot change the attempt, brain or sandbox it belongs to");
   assert.equal(
-    (await renew("ktsk-lateown", { attempt_id: "att-2", ...second })).statusCode, 200,
+    (await renew("ktsk-lateown", { attempt_id: "att-2", ...second, brain_id: secondOwner.brain_id })).statusCode, 200,
     "and the attempt that is actually running still renews",
   );
   const attempts = (await ledgerOf("ktsk-lateown"))!.attempts;
@@ -998,17 +1131,18 @@ test("a running event for an attempt that already settled takes no ownership bac
     status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
   });
   const token = { claim_count: 0, delivery_seq: 4, delivery_count: 1 };
-  await announceRunning("ktsk-settleown", "att-1", token);
+  await announceRunning("ktsk-settleown", "att-1", token, { sandbox_workload_id: "sandbox-1" });
   assert.equal(await settleAttempt("ktsk-settleown", 0, undefined, true), 200);
 
   const settledFence = await fenceOf("ktsk-settleown");
   assert.equal(settledFence.attempt_id, null);
   assert.equal(settledFence.attempt_generation, 1);
 
-  await announceRunning("ktsk-settleown", "att-1", token);
+  await announceRunning("ktsk-settleown", "att-1", token,
+    { brain_id: "brain-late", sandbox_workload_id: "sandbox-late" });
 
   assert.deepEqual(await fenceOf("ktsk-settleown"), settledFence,
-    "the settled attempt's own delivery restores neither the id nor a generation");
+    "the settled attempt's own delivery cannot change any ownership field");
   const attempts = (await ledgerOf("ktsk-settleown"))!.attempts;
   assert.equal(attempts.length, 1, "and it opens no second record beside the closed one");
   assert.ok(attempts[0].endedAtDb, "which stays closed");
@@ -1018,15 +1152,23 @@ test("a new attempt after a settle still adopts, at the generation after the set
   await seedRun(h, "ktsk-settlenext", SESSION, {
     status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,
   });
-  await announceRunning("ktsk-settlenext", "att-1", { claim_count: 0, delivery_seq: 4, delivery_count: 1 });
+  await announceRunning("ktsk-settlenext", "att-1", { claim_count: 0, delivery_seq: 4, delivery_count: 1 },
+    { sandbox_workload_id: "sandbox-1" });
   assert.equal(await settleAttempt("ktsk-settlenext", 0, undefined, true), 200);
 
-  await announceRunning("ktsk-settlenext", "att-2", { claim_count: 0, delivery_seq: 5, delivery_count: 2 });
+  const token = { claim_count: 0, delivery_seq: 5, delivery_count: 2 };
+  const ownership = { brain_id: "brain-2", sandbox_workload_id: "sandbox-2" };
+  await announceRunning("ktsk-settlenext", "att-2", token, ownership);
 
   const fence = await fenceOf("ktsk-settlenext");
   assert.equal(fence.attempt_id, "att-2", "the fence is about the attempt that ended, not the run");
   assert.equal(fence.attempt_generation, 2, "and the settled attempt spent no generation of its own");
+  assert.equal(fence.brain_id, ownership.brain_id);
+  assert.equal(fence.sandbox_workload_id, ownership.sandbox_workload_id);
   assert.deepEqual([fence.delivery_seq, fence.delivery_count], [5, 2]);
+  assert.equal((await renew("ktsk-settlenext", {
+    ...token, attempt_id: "att-2", brain_id: ownership.brain_id,
+  })).statusCode, 200);
   assert.deepEqual(
     (await ledgerOf("ktsk-settlenext"))!.attempts.map((a) => a.attemptId), ["att-1", "att-2"]);
 });
