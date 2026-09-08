@@ -114,10 +114,52 @@ Secret in that namespace and set `serviceMonitor.bearerTokenSecret.name`.
 
 ## Building the image
 
-`./build.sh` (needs `REGISTRY`; set `HARBOR_PASSWORD` to build in-cluster with
-kaniko when there is no docker daemon). The tag it writes names the LiteLLM
+`./build.sh` needs `REGISTRY`. Set `PUSH_SECRET` to select an in-cluster Kaniko
+build using an existing registry credential Secret when there is no Docker
+daemon. The tag it writes names the LiteLLM
 version taken from the Dockerfile, and `deploy.sh` refuses an image whose
 version-named tag disagrees with that pin.
+
+## Responses stream errors
+
+The image includes a checked patch for LiteLLM 1.99.0. When an upstream request
+fails after a native Responses stream has started, the proxy emits
+`response.failed` with the upstream error message and a recognizable error code.
+This lets Responses clients report the cause instead of an unexpected end of
+stream. The patch preserves the response ID and event sequence when available,
+and does not append another failure after a terminal event. Chat Completions
+and the Cursor conversion endpoint keep their existing stream formats.
+
+The build verifies SHA-256 hashes of the upstream files before applying the
+patch. A different source version fails the build and requires reviewing the
+patch against that version. Both Docker and Kaniko include the patch installer
+and helper in their build context. Retry, fallback, and cooldown policies are
+unchanged by this patch.
+
+From the repository root, run the local checks:
+
+```bash
+python3 -m unittest discover -s deploy/litellm/tests -p 'test_*.py'
+bash scripts/release-tests/litellm-build-context.sh
+```
+
+Verify a built image against a synthetic upstream without provider credentials
+or a database:
+
+```bash
+docker run --rm --entrypoint python3 \
+  -v "$PWD/deploy/litellm/tests:/tests:ro" "$LITELLM_TEST_IMAGE" \
+  /tests/integration_responses_stream_errors.py
+```
+
+The integration check exercises the actual LiteLLM HTTP server. Its `--serve`
+mode keeps the synthetic service running for a Codex CLI check through a local
+port-forward:
+
+```bash
+python3 deploy/litellm/tests/integration_responses_stream_errors.py \
+  --codex-url http://127.0.0.1:4000
+```
 
 ## Upgrading LiteLLM
 

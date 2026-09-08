@@ -10,9 +10,8 @@
 # away from the Dockerfile beside it. `claw/deploy/build.sh` had solved the
 # same problem with an in-cluster kaniko job; this borrows that shape.
 #
-#   HARBOR_PASSWORD  push password for $REGISTRY (presence selects kaniko)
-#   PUSH_SECRET      Secret holding .dockerconfigjson for $REGISTRY (kaniko backend)
-#   HARBOR_USERNAME  push user (default: admin)
+#   PUSH_SECRET      Secret holding .dockerconfigjson; selects the kaniko backend
+#   HARBOR_PASSWORD  legacy selector for kaniko; credentials still use PUSH_SECRET
 #   REGISTRY         e.g. harbor.example.com/primussafe
 #   NAMESPACE        where the build job runs (default: primus-claw)
 #   TAG              default: v<litellm version from the Dockerfile>-<date>
@@ -26,7 +25,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NAMESPACE="${NAMESPACE:-primus-claw}"
 REGISTRY="${REGISTRY:?REGISTRY is required, e.g. harbor.example.com/primussafe}"
-HARBOR_USERNAME="${HARBOR_USERNAME:-admin}"
 
 # Read the pinned version out of the Dockerfile so the tag cannot disagree.
 BASE_VERSION="$(grep -oE '^FROM .*litellm:v[0-9.]+' "$SCRIPT_DIR/Dockerfile" | grep -oE 'v[0-9.]+' | head -1)"
@@ -36,8 +34,8 @@ IMG="$REGISTRY/litellm:$TAG"
 
 echo "[litellm-build] building $IMG (base $BASE_VERSION)"
 
-if [ -z "${HARBOR_PASSWORD:-}" ]; then
-  command -v docker >/dev/null || { echo "ERROR: no HARBOR_PASSWORD for the kaniko backend and no docker daemon" >&2; exit 1; }
+if [ -z "${PUSH_SECRET:-}" ] && [ -z "${HARBOR_PASSWORD:-}" ]; then
+  command -v docker >/dev/null || { echo "ERROR: set PUSH_SECRET for kaniko, or install docker" >&2; exit 1; }
   docker build -t "$IMG" "$SCRIPT_DIR"
   docker push "$IMG"
   echo "[litellm-build] pushed $IMG"
@@ -46,12 +44,17 @@ fi
 
 JOB="litellm-build-$(date +%s)"
 CTX="litellm-build-ctx-$(date +%s)"
-cleanup() { kubectl -n "$NAMESPACE" delete cm "$CTX" --ignore-not-found >/dev/null 2>&1 || true; }
+CONTEXT_ARCHIVE="$(mktemp)"
+cleanup() {
+  rm -f "$CONTEXT_ARCHIVE"
+  kubectl -n "$NAMESPACE" delete cm "$CTX" --ignore-not-found >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
+tar -C "$SCRIPT_DIR" --exclude='__pycache__' --exclude='*.pyc' \
+  -czf "$CONTEXT_ARCHIVE" Dockerfile apim_key_hook.py patches
 kubectl -n "$NAMESPACE" create cm "$CTX" \
-  --from-file=Dockerfile="$SCRIPT_DIR/Dockerfile" \
-  --from-file=apim_key_hook.py="$SCRIPT_DIR/apim_key_hook.py" \
+  --from-file=build-context.tar.gz="$CONTEXT_ARCHIVE" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Registry auth is read from an existing pull/push secret rather than inlined
@@ -75,7 +78,7 @@ spec:
       initContainers:
       - name: ctx
         image: busybox:1.36
-        command: ["sh","-c","cp /cm/Dockerfile /cm/apim_key_hook.py /workspace/"]
+        command: ["sh","-c","tar -xzf /cm/build-context.tar.gz -C /workspace"]
         volumeMounts:
         - {name: ws, mountPath: /workspace}
         - {name: cm, mountPath: /cm}

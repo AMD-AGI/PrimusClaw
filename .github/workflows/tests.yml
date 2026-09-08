@@ -94,3 +94,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - run: bash scripts/release-tests/litellm-existing-secret.sh
+
+  litellm-stream-errors:
+    name: LiteLLM Responses stream errors
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - run: python3 -m unittest discover -s deploy/litellm/tests -p 'test_*.py'
+
+      - run: bash scripts/release-tests/litellm-build-context.sh

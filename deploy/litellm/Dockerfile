@@ -6,6 +6,10 @@
 FROM ghcr.io/berriai/litellm:v1.99.0@sha256:570a872d2fde8f1bc4a147634810941103c14697270f0f2918c5aa7d8201cac5
 
 WORKDIR /app
+
+COPY patches/ /tmp/litellm-patches/
+RUN python3 /tmp/litellm-patches/apply_responses_stream_errors.py && \
+    rm -rf /tmp/litellm-patches
  
 # ═══ Inject custom hook files ═══
 # In the base image, litellm is pip-installed, so the import path resolves to
