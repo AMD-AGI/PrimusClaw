@@ -188,8 +188,43 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// compute and set overall Ready condition
 	readyCondition := r.computeReadyCondition(sandbox, allErrors, svc, pod)
 	meta.SetStatusCondition(&sandbox.Status.Conditions, readyCondition)
+	applyPodTerminalConditions(sandbox, pod)
 
 	return allErrors
+}
+
+// applyPodTerminalConditions records Succeeded/Failed from the Pod phase so
+// SaFE ResourceTemplate can map a finished codeinterpreter container to a
+// workload terminal phase. Ready stays False after the Pod leaves Running.
+func applyPodTerminalConditions(sandbox *sandboxv1alpha1.Sandbox, pod *corev1.Pod) {
+	if pod == nil {
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+		return
+	}
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1alpha1.SandboxConditionSucceeded),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1alpha1.SandboxReasonPodSucceeded,
+			Message:            "Pod phase is Succeeded",
+		})
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	case corev1.PodFailed:
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1alpha1.SandboxConditionFailed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1alpha1.SandboxReasonPodFailed,
+			Message:            "Pod phase is Failed",
+		})
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+	default:
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	}
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1alpha1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {

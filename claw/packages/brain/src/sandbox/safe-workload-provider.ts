@@ -103,6 +103,8 @@ export class SafeWorkloadProvider implements SandboxProvider {
       displayName: sandboxWorkloadName(),
       groupVersionKind: { kind: "Sandbox", version: "v1" },
       priority: SANDBOX_WORKLOAD_PRIORITY,
+      // After the sandbox Pod reaches Succeeded/Failed (codeinterpreter exited),
+      // SaFE maps that to a terminal workload phase and this TTL deletes it.
       ttlSecondsAfterFinished: params.ttlSec ?? 10,
       workspace: ns,
       labels: params.labels ?? {},

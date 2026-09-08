@@ -17,9 +17,17 @@ func (c ConditionType) String() string { return string(c) }
 const (
 	// SandboxConditionReady indicates readiness for Sandbox
 	SandboxConditionReady ConditionType = "Ready"
+	// SandboxConditionSucceeded is True when the sandbox Pod has phase Succeeded.
+	SandboxConditionSucceeded ConditionType = "Succeeded"
+	// SandboxConditionFailed is True when the sandbox Pod has phase Failed.
+	SandboxConditionFailed ConditionType = "Failed"
 
 	// SandboxReasonExpired indicates expired state for Sandbox
 	SandboxReasonExpired = "SandboxExpired"
+	// SandboxReasonPodSucceeded is the reason on SandboxConditionSucceeded.
+	SandboxReasonPodSucceeded = "PodSucceeded"
+	// SandboxReasonPodFailed is the reason on SandboxConditionFailed.
+	SandboxReasonPodFailed = "PodFailed"
 )
 
 type PodMetadata struct {

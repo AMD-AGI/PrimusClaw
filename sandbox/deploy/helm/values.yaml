@@ -24,6 +24,9 @@ controlplane:
   config:
     leaderElect: true
     extensions: true
+    # Off by default: PrimusClaw brain owns sandbox reclaim. Set true to restore
+    # LastActivity-based idle-GC.
+    enableIdleGC: false
     sessionTimeout: 15m
     envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
     auditEnabled: true

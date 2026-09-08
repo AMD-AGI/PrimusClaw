@@ -173,6 +173,7 @@ spec:
             - --gc-interval={{ .Values.workloadmanager.config.gcInterval }}
             - --default-ttl={{ .Values.workloadmanager.config.defaultTTL }}
             - --session-timeout={{ .Values.controlplane.config.sessionTimeout }}
+            - --enable-idle-gc={{ ternary "true" "false" .Values.controlplane.config.enableIdleGC }}
             - --leader-elect={{ ternary "true" "false" .Values.controlplane.config.leaderElect }}
             - --extensions={{ ternary "true" "false" .Values.controlplane.config.extensions }}
             - --namespace={{ .Release.Namespace }}
