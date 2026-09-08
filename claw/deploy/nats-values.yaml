@@ -157,16 +157,17 @@ config:
                   # enough for backpressure to kick in.
                   - "$JS.FC.PRIMUS_CLAW_EVENTS.>"
                   - "$JS.FC.KV_BRAIN_REGISTRY.>"
+                  - "$JS.FC.KV_DOORBELL_FLOOR.>"
                   # KV writes. A put, update or delete is a publish.
                   - "$KV.BRAIN_REGISTRY.hands.*"
                   - "$KV.BRAIN_REGISTRY.lock.>"
                   - "$KV.BRAIN_REGISTRY.deleted.*"
                   - "$KV.BRAIN_REGISTRY.dag-handles.>"
                   - "$KV.BRAIN_REGISTRY.brain.min_version"
-                  - "$KV.BRAIN_REGISTRY.brain.doorbell_semantics"
+                  - "$KV.DOORBELL_FLOOR.brain.doorbell_semantics"
                   - "$KV.BRAIN_TOMBSTONES.deleted.*"
                   - "$KV.SYSTEM_ENV.current"
-                  # Bucket lifecycle. api creates and reconciles four buckets,
+                  # Bucket lifecycle. api creates and reconciles five buckets,
                   # including BRAIN_CHECKPOINTS -- provisioning only; see the
                   # note under that bucket's absence from the data lists.
                   - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
@@ -181,6 +182,9 @@ config:
                   - "$JS.API.STREAM.INFO.KV_SYSTEM_ENV"
                   - "$JS.API.STREAM.CREATE.KV_SYSTEM_ENV"
                   - "$JS.API.STREAM.UPDATE.KV_SYSTEM_ENV"
+                  - "$JS.API.STREAM.INFO.KV_DOORBELL_FLOOR"
+                  - "$JS.API.STREAM.CREATE.KV_DOORBELL_FLOOR"
+                  - "$JS.API.STREAM.UPDATE.KV_DOORBELL_FLOOR"
                   # KV reads: direct get, plus the non-direct fallback taken
                   # when a bucket predates allow_direct.
                   - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
@@ -189,6 +193,9 @@ config:
                   - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES"
                   - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES.>"
                   - "$JS.API.STREAM.MSG.GET.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR"
+                  - "$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_DOORBELL_FLOOR"
                   # kv.keys() and kv.watch() build ordered ephemeral consumers
                   # and tear them down again; without DELETE each sweep leaks
                   # one, and every teardown here is a bare .catch(() => {}).
@@ -197,6 +204,11 @@ config:
                   - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
+                  - "$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR"
+                  - "$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.INFO.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_DOORBELL_FLOOR.>"
               subscribe:
                 allow:
                   # Reply inboxes, subscribe only. Nobody gets publish on

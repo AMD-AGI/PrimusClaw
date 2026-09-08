@@ -27,6 +27,29 @@ pass=0
 ok()   { pass=$((pass + 1)); echo "  ok: $1"; }
 bad()  { echo "  FAIL: $1" >&2; exit 1; }
 
+api_permissions="$(sed -n '/          - user: api$/,/          - user: brain$/p' "$deploy_dir/nats-values.yaml")"
+while IFS= read -r grant; do
+  grep -Fq -- "- \"$grant\"" <<<"$api_permissions" \
+    || bad "the api NATS account is missing the Doorbell floor grant $grant"
+done <<'EOF'
+$JS.FC.KV_DOORBELL_FLOOR.>
+$KV.DOORBELL_FLOOR.brain.doorbell_semantics
+$JS.API.STREAM.INFO.KV_DOORBELL_FLOOR
+$JS.API.STREAM.CREATE.KV_DOORBELL_FLOOR
+$JS.API.STREAM.UPDATE.KV_DOORBELL_FLOOR
+$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR
+$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR.>
+$JS.API.STREAM.MSG.GET.KV_DOORBELL_FLOOR
+$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR
+$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR.>
+$JS.API.CONSUMER.INFO.KV_DOORBELL_FLOOR.>
+$JS.API.CONSUMER.MSG.NEXT.KV_DOORBELL_FLOOR.>
+$JS.API.CONSUMER.DELETE.KV_DOORBELL_FLOOR.>
+EOF
+grep -Fq -- '- "$KV.BRAIN_REGISTRY.brain.doorbell_semantics"' <<<"$api_permissions" \
+  && bad "the api NATS account still grants the Doorbell floor key in the expiring registry"
+ok "the api account can provision, read, watch, and update the Doorbell floor"
+
 # ── A helm that records its argv instead of rendering ────────────────────
 # render_chart's whole contract is the command line it builds, so that is what
 # is captured. Writing something to $dst keeps the redirection honest.
