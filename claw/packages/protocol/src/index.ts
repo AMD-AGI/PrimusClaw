@@ -14,8 +14,12 @@ export * from "./sandbox/shell-record.js";
 export * from "./sandbox/shell-classify.js";
 export {
   parkHandsHandle,
+  parkHandsAfterRun,
+  applyRunEndedIdleFields,
   type ParkOutcome,
   type ParkResult,
+  type RunEndedParkOutcome,
+  type RunEndedParkResult,
   type RevisionedKv,
 } from "./sandbox/park-hands.js";
 // Shared because both sides read the same SaFE payload: Brain reads it when a

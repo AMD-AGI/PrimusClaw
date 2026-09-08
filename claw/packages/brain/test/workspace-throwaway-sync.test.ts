@@ -67,7 +67,7 @@ function stubSideEffects(): Partial<TaskRunnerSideEffects> {
     destroyHands: record("destroyHands", undefined),
     reapPendingHands: record("reapPendingHands", undefined),
     unregisterSandbox: ((..._a: unknown[]) => { calls.push("unregisterSandbox"); }) as never,
-    markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); }) as never,
+    markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     // The checkpoint and the terminal sync are the same function; only the
     // destination tells them apart, so the call is logged with it.
     syncWorkspaceToS3: ((

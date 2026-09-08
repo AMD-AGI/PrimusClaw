@@ -9,12 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // inferenceKeyCache fetches the user's inference API Key from Workload Manager
@@ -92,7 +93,7 @@ func (c *inferenceKeyCache) setSessionID(id string) {
 	c.sessionID = id
 
 	if c.wmURL == "" {
-		slog.Debug("inferenceKeyCache: WORKLOAD_MANAGER_URL not set, skipping fetch")
+		log.Debug("inferenceKeyCache: WORKLOAD_MANAGER_URL not set, skipping fetch")
 		c.closeReady.Do(func() { close(c.ready) })
 		return
 	}
@@ -130,7 +131,7 @@ func (c *inferenceKeyCache) getApiKey() string {
 	select {
 	case <-c.ready:
 	case <-time.After(15 * time.Second):
-		slog.Warn("inferenceKeyCache: timed out waiting for policy fetch (JWT may not have been captured)")
+		log.Warn("inferenceKeyCache: timed out waiting for policy fetch (JWT may not have been captured)")
 	}
 
 	c.mu.RLock()
@@ -162,7 +163,7 @@ func (c *inferenceKeyCache) waitForReady() {
 	select {
 	case <-c.ready:
 	case <-time.After(30 * time.Second):
-		slog.Warn("inferenceKeyCache: timed out waiting for first request")
+		log.Warn("inferenceKeyCache: timed out waiting for first request")
 	}
 }
 
@@ -195,7 +196,7 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 
 		apiKey, err := c.doFetch(ctx, url)
 		if err != nil {
-			slog.Warn("inferenceKeyCache: fetch failed",
+			log.Warn("inferenceKeyCache: fetch failed",
 				"attempt", attempt+1, "error", err)
 			continue
 		}
@@ -206,14 +207,14 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 		c.mu.Unlock()
 
 		if apiKey != "" {
-			slog.Info("inferenceKeyCache: API key cached", "sessionId", sid)
+			log.Info("inferenceKeyCache: API key cached", "sessionId", sid)
 		} else {
-			slog.Debug("inferenceKeyCache: inference not enabled for this session", "sessionId", sid)
+			log.Debug("inferenceKeyCache: inference not enabled for this session", "sessionId", sid)
 		}
 		return
 	}
 
-	slog.Warn("inferenceKeyCache: all retries exhausted, inference API key not available",
+	log.Warn("inferenceKeyCache: all retries exhausted, inference API key not available",
 		"sessionId", sid)
 }
 

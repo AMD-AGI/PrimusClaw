@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/rand"
 	"strings"
 	"time"
@@ -33,6 +32,7 @@ import (
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -610,7 +610,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 					})
 					rbCancel()
 					if rbErr != nil {
-						slog.Error("warm-pool claim rollback failed; pod may be held until its deadline",
+						log.Error("warm-pool claim rollback failed; pod may be held until its deadline",
 							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
 					}
 					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
@@ -1377,7 +1377,7 @@ func (c *K8sSandboxCreator) findSandboxBySessionID(
 		err := c.cachedReader.List(ctx, indexed, ctrlclient.MatchingFields{SessionIDIndexField: sessionID})
 		switch {
 		case err != nil:
-			slog.Warn("indexed sandbox lookup unavailable, falling back to a full list",
+			log.Warn("indexed sandbox lookup unavailable, falling back to a full list",
 				"sessionId", sessionID, "error", err)
 		case len(indexed.Items) > 0:
 			return c.confirmSandbox(ctx, sessionID, &indexed.Items[0])

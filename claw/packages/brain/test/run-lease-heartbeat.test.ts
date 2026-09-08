@@ -100,7 +100,7 @@ async function runScenario(opts: {
     destroyHands: noop(undefined),
     reapPendingHands: noop(undefined),
     unregisterSandbox: (() => {}) as never,
-    markHandsIdle: (() => {}) as never,
+    markHandsIdle: (() => Promise.resolve({ outcome: "parked" })) as never,
     markRetryPending: noop(undefined),
     syncWorkspaceToS3: noop({ uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }),
     syncWorkspaceFromS3: noop(undefined),

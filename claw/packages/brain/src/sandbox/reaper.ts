@@ -455,13 +455,21 @@ export function startSandboxSweeper(): void {
  * exemption is load-bearing rather than merely faster.
  */
 export function eligibleForClusterReclaim(
-  info: { keepalive?: unknown; sessionDeleted?: unknown; idleSince?: unknown },
+  info: {
+    keepalive?: unknown;
+    sessionDeleted?: unknown;
+    idleSince?: unknown;
+    workSeenAt?: unknown;
+  },
   now: number,
 ): boolean {
   if (info.keepalive !== false) return false;
   if (info.sessionDeleted === true) return true;
   const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-  return idleSince > 0 && now - idleSince >= MULTI_NODE_IDLE_RECLAIM_MS;
+  const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
+  // Keep this reuse window aligned with keepalive.ts: observed work extends it.
+  const reuseWindowStart = Math.max(idleSince, workSeenAt);
+  return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
 }
 
 /**

@@ -6,7 +6,6 @@ package workloadmanager
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -100,14 +100,14 @@ func NewSandboxWatcher(cfg SandboxWatcherConfig, st store.Store, k8s kubernetes.
 
 // Run starts the periodic scan loop. Blocks until ctx is cancelled.
 func (w *SandboxWatcher) Run(ctx context.Context) {
-	slog.Info("sandbox-watcher: started", "interval", w.cfg.Interval)
+	log.Info("sandbox-watcher: started", "interval", w.cfg.Interval)
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("sandbox-watcher: stopped")
+			log.Info("sandbox-watcher: stopped")
 			return
 		case <-ticker.C:
 			w.scan(ctx)
@@ -123,7 +123,7 @@ func (w *SandboxWatcher) scan(ctx context.Context) {
 
 	sessions, err := w.store.ListAllSandboxes(ctx, 10000)
 	if err != nil {
-		slog.Warn("sandbox-watcher: failed to list sessions", "error", err)
+		log.Warn("sandbox-watcher: failed to list sessions", "error", err)
 		return
 	}
 
@@ -202,7 +202,7 @@ func (w *SandboxWatcher) markUnhealthy(sess *store.SandboxInfo, node, status, re
 	defer w.mu.Unlock()
 
 	if _, exists := w.unhealthy[sess.SessionID]; !exists {
-		slog.Warn("sandbox-watcher: unhealthy pod detected",
+		log.Warn("sandbox-watcher: unhealthy pod detected",
 			"sessionId", sess.SessionID,
 			"pod", sess.SandboxName,
 			"namespace", sess.Namespace,
@@ -231,7 +231,7 @@ func (w *SandboxWatcher) resolveRecovered(healthy map[string]bool) {
 
 	for sid, issue := range w.unhealthy {
 		if healthy[sid] {
-			slog.Info("sandbox-watcher: pod recovered",
+			log.Info("sandbox-watcher: pod recovered",
 				"sessionId", sid,
 				"pod", issue.PodName,
 				"downtime", time.Since(issue.DetectedAt).Round(time.Second),

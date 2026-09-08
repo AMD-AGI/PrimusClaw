@@ -1,0 +1,67 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+Prometheus Operator ServiceMonitor for the LiteLLM /metrics endpoint.
+
+LiteLLM serves Prometheus counters only in-process. Without a scrape object
+those series vanish on every pod restart, and the cluster TSDB never sees
+requested_model labels. The VictoriaMetrics Operator's Prometheus converter
+turns this ServiceMonitor into a VMServiceScrape.
+
+The path is /metrics/ so the scrape does not spend a redirect on /metrics
+(307 to /metrics/).
+
+The endpoint requires the proxy master key. bearerTokenSecret is resolved in
+the ServiceMonitor's namespace, which is the release namespace unless
+serviceMonitor.namespace is set. A Secret name from the application release
+is only valid in that same namespace; placing the ServiceMonitor elsewhere
+requires serviceMonitor.bearerTokenSecret.name to name a Secret that already
+exists there.
+*/ -}}
+{{- if .Values.serviceMonitor.enabled }}
+{{- $smNs := default .Release.Namespace .Values.serviceMonitor.namespace }}
+{{- $bts := default dict .Values.serviceMonitor.bearerTokenSecret }}
+{{- $explicitToken := index $bts "name" | default "" }}
+{{- if and .Values.serviceMonitor.namespace (ne $smNs .Release.Namespace) (not $explicitToken) }}
+{{- fail "serviceMonitor.namespace is not the release namespace; set serviceMonitor.bearerTokenSecret.name to a Secret in that namespace. bearerTokenSecret is resolved where the ServiceMonitor lives, not where the Service lives." }}
+{{- end }}
+{{- $tokenName := $explicitToken | default (include "litellm.secretName" .) }}
+{{- $tokenKey := index $bts "key" | default "master_key" }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  {{- if .Values.serviceMonitor.namespace }}
+  namespace: {{ .Values.serviceMonitor.namespace }}
+  {{- end }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics/
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      bearerTokenSecret:
+        name: {{ $tokenName }}
+        key: {{ $tokenKey }}
+      {{- with .Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

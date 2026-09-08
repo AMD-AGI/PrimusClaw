@@ -14,7 +14,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,10 +21,10 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -164,7 +163,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// An unreadable store is a fault, and this line is the only thing that
 		// says so. Retried promptly, because reclamation should resume as soon as
 		// the store does.
-		slog.Warn("deferring idle check, activity unavailable",
+		log.Warn("deferring idle check, activity unavailable",
 			"sandbox", sandbox.Name,
 			"namespace", sandbox.Namespace,
 			"retry_after", unknownActivityRequeue,
@@ -287,21 +286,21 @@ func (r *SandboxReconciler) deregisterSession(ctx context.Context, sessionID, na
 		// process-local bookkeeping holds this sandbox, so it is no guarantee.
 		// Logged rather than returned all the same: the Sandbox is deleted, so a
 		// requeue would only re-Get a resource that no longer exists.
-		slog.Warn("idle-gc: session lookup failed, mapping left to its TTL",
+		log.Warn("idle-gc: session lookup failed, mapping left to its TTL",
 			"sessionID", sessionID, "sandbox", name, "error", err)
 		return
 	}
 	if info == nil || info.SandboxName != name || info.Namespace != namespace {
-		slog.Info("idle-gc: session now points at another sandbox, leaving it alone",
+		log.Info("idle-gc: session now points at another sandbox, leaving it alone",
 			"sessionID", sessionID, "sandbox", name)
 		return
 	}
 	if err := r.Store.DeleteSandboxBySessionID(ctx, sessionID); err != nil {
-		slog.Warn("idle-gc: failed to deregister session",
+		log.Warn("idle-gc: failed to deregister session",
 			"sessionID", sessionID, "error", err)
 		return
 	}
-	slog.Info("idle-gc: session deregistered", "sessionID", sessionID)
+	log.Info("idle-gc: session deregistered", "sessionID", sessionID)
 }
 
 // resolveLastActivity returns the activity timestamp to judge a sandbox by, or
@@ -415,7 +414,7 @@ func (r *SandboxReconciler) emitIdleDeletedEvent(
 	}
 	audit.NormalizeEvent(event)
 	if err := r.Audit.Store(ctx, event); err != nil {
-		slog.Warn("agentd: failed to emit idle-gc audit event",
+		log.Warn("agentd: failed to emit idle-gc audit event",
 			"sandbox", sandbox.Name,
 			"session_id", sessionID,
 			"error", err)
