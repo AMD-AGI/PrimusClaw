@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
 import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
@@ -953,7 +954,7 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
 /**
  * Fleet-unique token for probe reservations and idle-write acknowledgement.
  */
-const entryTokenPrefix = Math.random().toString(36).slice(2, 10);
+const entryTokenPrefix = randomBytes(16).toString("hex");
 let entryTokenSeq = 0;
 function nextEntryToken(): string {
   entryTokenSeq += 1;
