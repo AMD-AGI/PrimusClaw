@@ -77,7 +77,7 @@ document_of() {
 # The eight ceilings as the Secret spells them, which is the only form a pod
 # ever sees. RUN_DOORBELL_DISPATCH must NOT be there: one key in one Secret is
 # what made a rollback of API dispatch also stop Brain draining the backlog.
-assert_safe_defaults() {
+assert_zero_ceilings() {
   local render="$1" why="$2" secret="$tmp/secret-doc.yaml"
   document_of "$render" "primus-claw/templates/secret.yaml" >"$secret"
   if rg -q 'RUN_DOORBELL_DISPATCH' "$secret"; then
@@ -100,10 +100,16 @@ doorbell_env_of() {
 echo "==> chart defaults and the rollout test profile"
 
 renders "chart defaults render" "$tmp/defaults.yaml" "${release_base[@]}"
-assert_safe_defaults "$tmp/defaults.yaml" "chart defaults are Doorbell off and all eight ceilings zero"
+assert_zero_ceilings "$tmp/defaults.yaml" "chart defaults keep all eight ceilings at zero"
+[ "$(doorbell_env_of api-deployment.yaml "${release_base[@]}")" = 'value: "true"' ] \
+  || bad "the chart default did not enable API Doorbell dispatch"
+ok "API Doorbell dispatch ships on"
 
 renders "the rollout test profile renders" "$tmp/rollout.yaml" "${rollout_base[@]}"
-assert_safe_defaults "$tmp/rollout.yaml" "the rolled-back state renders clean"
+assert_zero_ceilings "$tmp/rollout.yaml" "the rolled-back state renders clean"
+[ "$(doorbell_env_of api-deployment.yaml "${rollout_base[@]}")" = 'value: "false"' ] \
+  || bad "the rollback profile did not disable API Doorbell dispatch"
+ok "the rollback profile keeps API Doorbell dispatch off"
 
 echo "==> one env name, two chart values"
 
@@ -167,7 +173,7 @@ renders "R1 alone renders: ceilings cleared, Doorbell still on" "$tmp/r1.yaml" \
 renders "R4 after R1 renders: Doorbell off once the ceilings are clear" "$tmp/r4.yaml" \
   "${rollout_base[@]}" --set-string api.admitHardRuns=0 \
   --set features.runDoorbellDispatch=false
-assert_safe_defaults "$tmp/r4.yaml" "the R4 render is the shipped default shape"
+assert_zero_ceilings "$tmp/r4.yaml" "the R4 rollback render keeps every ceiling at zero"
 
 echo "==> the rendered rollback state carries nothing internal"
 
@@ -208,5 +214,18 @@ checksum_b="$(checksum_of 3)"
 [ "$checksum_a" != "$checksum_b" ] \
   || bad "changing a ceiling did not change checksum/rollout-config, so the pods would not restart"
 ok "a ceiling change rolls the API pods"
+
+doorbell_checksum_of() {
+  helm template rollout-test "$chart_dir" "${release_base[@]}" \
+    --set "features.runDoorbellDispatch=$1" \
+    --show-only templates/api-deployment.yaml 2>"$err" |
+    rg -o 'checksum/rollout-config: \S+'
+}
+checksum_on="$(doorbell_checksum_of true)"
+checksum_off="$(doorbell_checksum_of false)"
+[ -n "$checksum_on" ] || bad "api-deployment.yaml carries no checksum/rollout-config annotation"
+[ "$checksum_on" != "$checksum_off" ] \
+  || bad "disabling Doorbell did not change checksum/rollout-config, so the pods would not restart"
+ok "an explicit false Doorbell value rolls the API pods"
 
 echo "helm values schema: $pass checks passed"
