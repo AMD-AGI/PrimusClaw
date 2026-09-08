@@ -405,25 +405,7 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   // still in flight when the swap happens writes under the key it started with,
   // which nothing reads any more, instead of overwriting the new pod's state.
   let workloadId = "wl-1";
-  const idleSince = IDLED_A_MOMENT_AGO;
-  const kv = {
-    async keys(filter = ">") {
-      const key = `hands.${SESSION}`;
-      const matched = filterToRegExp(filter).test(key) ? [key] : [];
-      return (async function* () { yield* matched; })();
-    },
-    async get(key: string) {
-      if (key !== `hands.${SESSION}`) return null;
-      // `idleSince` is fixed rather than re-stamped per read: a KV whose stored
-      // entry changes every time it is looked at is not one, and here it would
-      // move the idle period under the sweep between the two ticks this test is
-      // about. Inside the reuse window, which is all it has to be.
-      const v = { ...ENTRY, workloadId, idleSince };
-      return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
-    },
-    async delete() {}, async put() { return 1; },
-    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
-  } as unknown as KV;
+  const { kv, revision } = fakeKv({ idleSince: IDLED_A_MOMENT_AGO });
   stubPingableProvider();
   const asked: string[] = [];
   const deps = {
@@ -432,7 +414,10 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   };
 
   await sweepUntilProbed(deps);
-  workloadId = "wl-2";                       // reuse failed; a new pod took over
+  workloadId = "wl-2";
+  await kv.update(`hands.${SESSION}`, sc.encode(JSON.stringify({
+    ...ENTRY, workloadId, idleSince: IDLED_A_MOMENT_AGO,
+  })), revision());
   await runKeepaliveTickForTest(deps);
   await new Promise((r) => setImmediate(r));
 
@@ -841,4 +826,46 @@ test("handing a handle back to the idle pool re-opens the question", async () =>
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest(deps);
   assert.ok(asked > 0, "the handle going back into the pool must discard the old answer");
+});
+
+test("provider and record evidence stay within the asynchronous probe limit", async () => {
+  const status = Promise.withResolvers<void>();
+  const records = Promise.withResolvers<void>();
+  let statusReads = 0;
+  let recordReads = 0;
+  const provider = {
+    async get() {
+      statusReads += 1;
+      await status.promise;
+      return { running: true, healthy: true, state: "running" };
+    },
+    async exec(_inst: unknown, command: string) {
+      if (command.includes("epoch.json")) {
+        recordReads += 1;
+        await records.promise;
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider });
+  const deps = {
+    kv: manyIdleHandles(24),
+    countActiveShells: async () => { throw new Error("unreachable"); },
+  };
+  try {
+    await runKeepaliveTickForTest(deps);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(statusReads, 8);
+    await runKeepaliveTickForTest(deps);
+    assert.equal(statusReads, 8, "waiting for provider status must keep the probe slots reserved");
+    status.resolve();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(recordReads, 8);
+    await runKeepaliveTickForTest(deps);
+    assert.equal(statusReads, 8, "waiting for records must keep the same slots reserved");
+  } finally {
+    status.resolve();
+    records.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
 });

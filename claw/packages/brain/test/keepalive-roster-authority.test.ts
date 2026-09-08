@@ -225,3 +225,47 @@ test("reusing an existing sandbox is refused while the fleet is uncounted", asyn
   assert.doesNotThrow(() => assertFleetCensused("sess-reusing"),
     "and allowed once a sweep has reconciled the fleet onto the roster");
 });
+
+test("gone evidence releases admission only after the binding delete succeeds", async (t) => {
+  for (const conflict of [false, true]) {
+    await t.test(conflict ? "competing owner" : "deleted binding", async () => {
+      resetBackgroundWorkStateForTest();
+      const values = new Map<string, Uint8Array>();
+      const kv = makeKv(values);
+      const key = "hands.sess-gone";
+      kv.seed(key, entry("wl-gone", { keepalive: false, idleSince: Date.now() }));
+      await bindAdmission(kv, CAPACITY);
+      const restore = bindSandboxProviders({
+        safeWorkload: {
+          async get() { return { running: false, healthy: false, state: "absent" }; },
+          async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+        } as unknown as SandboxProvider,
+      });
+      const countActiveShells = async () => { throw new Error("unreachable"); };
+      const roster = { store: rosterStore(kv), config: CONFIG };
+      try {
+        await runKeepaliveTickForTest({ kv, countActiveShells, roster });
+        await new Promise((r) => setImmediate(r));
+        assert.ok((await roster.store.read())!.roster.entries.some((e) => e.identity === "safe:wl-gone"));
+        const deletingKv = {
+          ...kv,
+          async delete(deleting: string, options: { previousSeq?: number }) {
+            assert.equal(deleting, key);
+            assert.equal(options.previousSeq, (await kv.get(key))!.revision);
+            if (conflict) {
+              kv.seed(key, entry("wl-gone", { keepalive: true }));
+              throw new Error("revision conflict");
+            }
+            return kv.delete(deleting, options);
+          },
+        } as unknown as KV;
+        await runKeepaliveTickForTest({ kv: deletingKv, countActiveShells, roster });
+        assert.equal(values.has(key), conflict);
+        assert.equal((await roster.store.read())!.roster.entries.some((e) => e.identity === "safe:wl-gone"), conflict);
+      } finally {
+        restore();
+        await bindAdmission(kv, { ceiling: 0, reconciliationReserve: 0 });
+      }
+    });
+  }
+});
