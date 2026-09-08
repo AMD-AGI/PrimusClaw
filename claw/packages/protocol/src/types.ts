@@ -231,7 +231,7 @@ export type RunWaitReason = "approval" | "background_command";
 /** Brain task execution request (Backend Dispatcher → Brain HTTP). */
 export interface ExecuteRequest {
   // ── Task identity ─────────────────────────────────────────────────────
-  /** Required for task-system dispatch (Phase 4+); legacy chat path leaves this undefined and engines fall back to `session_id`/`message_id` for log correlation. */
+  /** Required for task-system dispatch (Phase 4+); older API replicas without chat task-ID forwarding leave this undefined during a rolling deploy, and engines fall back to `session_id`/`message_id` for log correlation. */
   task_id?: string;
   session_id: string;
   /** Idempotency key for engine-level deduplication. */
