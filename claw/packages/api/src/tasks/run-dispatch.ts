@@ -285,12 +285,12 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
 /**
  * Hand the reconciliation marker back, if this dispatch still owns it.
  *
- * A row opened with no horizon has nothing to release, which is not a loss of
+ * A row opened with no token has nothing to release, which is not a loss of
  * ownership -- so it answers true.
  */
-async function releaseReconcileClaim(run: { taskId: string; reconcileAt?: Date }): Promise<boolean> {
-  if (!run.reconcileAt) return true;
-  return await clearDispatchReconcile(run.taskId, run.reconcileAt);
+async function releaseReconcileClaim(run: { taskId: string; reconcileToken?: string }): Promise<boolean> {
+  if (!run.reconcileToken) return true;
+  return await clearDispatchReconcile(run.taskId, run.reconcileToken);
 }
 
 export function persistableSpec(task: Record<string, unknown>): Record<string, unknown> {

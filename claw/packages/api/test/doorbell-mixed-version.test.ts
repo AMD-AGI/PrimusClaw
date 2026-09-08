@@ -93,11 +93,21 @@ function boundWorkspace() {
 /** The real `openChatRun` runs here, so the row stamp is read out of its own insert. */
 function stubDb(): SeenQuery[] {
   const seen: SeenQuery[] = [];
+  const reconcileClaims = new Map<unknown, unknown>();
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     seen.push({ sql, params });
     if (BIND_LOOKUP.test(sql)) return boundWorkspace();
-    if (/^INSERT INTO claw_tasks/.test(sql)) return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    if (/^INSERT INTO claw_tasks/.test(sql)) {
+      const metadata = JSON.parse(params[26] as string);
+      if (metadata.dispatch_reconcile_token) reconcileClaims.set(params[0], metadata.dispatch_reconcile_token);
+      return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    }
+    if (/dispatch_reconcile_at = NULL/.test(sql)) {
+      const owned = reconcileClaims.has(params[0]) && reconcileClaims.get(params[0]) === params[1];
+      if (owned) reconcileClaims.delete(params[0]);
+      return { rows: [], rowCount: owned ? 1 : 0 };
+    }
     // The receipt write CASes on the armed row the insert above just wrote, and
     // a publisher whose receipt matches nothing refuses to publish at all.
     if (/dispatch_compensation,publish/.test(sql)) return { rows: [], rowCount: 1 };

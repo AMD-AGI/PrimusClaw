@@ -94,8 +94,7 @@ test("once the horizon elapses the row is settled and the marker cleared", async
   assert.equal(row.dispatch_reconcile_action, null);
 });
 
-test("taking a row extends its horizon, so a publisher that resumes owns nothing", async () => {
-  // The take is what invalidates every outstanding publisher compare-and-swap.
+test("reconciliation clears a claimed row's marker without rolling back execution", async () => {
   const { reconcileAmbiguousDispatches } = await import("../src/tasks/sweeper.js");
   await seedSession(h, "s1");
   await seedRun(h, "held", "s1", {

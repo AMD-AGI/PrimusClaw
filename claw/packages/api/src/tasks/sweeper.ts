@@ -1299,18 +1299,9 @@ export async function auditRefusedCompensations(limit = 20): Promise<number> {
   return r.rowCount;
 }
 
-/**
- * Finish the publish-failure cleanup a dispatch could not conclude itself.
- *
- * A non-NULL `dispatch_reconcile_at` means compensation, or the caller cleanup
- * behind it, never reached a durable conclusion. Two writers can reach such a
- * row -- the publisher that wrote the marker, and this sweep -- and the horizon
- * bounds the race while the marker itself decides it: taking a row extends the
- * column in the statement that selects it, which invalidates every publisher
- * compare-and-swap still outstanding, and a tick that dies mid-compensation
- * leaves the row eligible again one lease later rather than wedged.
- */
+/** Retry unsettled dispatch cleanup after its reconciliation deadline. */
 export async function reconcileAmbiguousDispatches(limit = 100): Promise<number> {
+  // Revoke the publisher's token atomically with taking the row, before cleanup can yield.
   const taken = await db.query(
     `WITH due AS (
        SELECT task_id FROM claw_tasks
@@ -1321,7 +1312,8 @@ export async function reconcileAmbiguousDispatches(limit = 100): Promise<number>
         FOR UPDATE SKIP LOCKED
      )
      UPDATE claw_tasks t
-        SET dispatch_reconcile_at = NOW() + ($2::int * INTERVAL '1 second')
+        SET dispatch_reconcile_at = NOW() + ($2::int * INTERVAL '1 second'),
+            metadata = t.metadata - 'dispatch_reconcile_token'
        FROM due
       WHERE t.task_id = due.task_id
       RETURNING t.task_id, t.session_id, t.status, t.failure_reason,

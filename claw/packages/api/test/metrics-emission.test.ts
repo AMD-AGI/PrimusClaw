@@ -738,9 +738,7 @@ function inputForKind(kind: (typeof RESULT_KINDS)[number], path: DispatchPath): 
   if (kind === "rejected") return { path, limits: { ...UNLIMITED, hardRuns: 1 } };
   if (kind === "open_failed") return { path, openRun: (async () => null) as never };
   if (kind === "publish_unknown") {
-    // A horizon the row no longer carries: `clearDispatchReconcile` matches
-    // nothing, so reconciliation owns the outcome rather than this caller.
-    return { path, openRun: (async () => ({ ...OPENED, reconcileAt: new Date() })) as never };
+    return { path, openRun: (async () => ({ ...OPENED, reconcileToken: "claim-taken" })) as never };
   }
   return { path };
 }

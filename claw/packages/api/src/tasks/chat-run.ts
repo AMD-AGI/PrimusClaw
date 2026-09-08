@@ -106,25 +106,18 @@ export type ChatRunOutcome = "completed" | "failed" | "cancelled";
  * closes it alongside the row it reaps, keyed on this id being the one thing the
  * two rows share.
  */
-/**
- * Give up this dispatch's claim on its own reconciliation marker.
- *
- * Compare-and-set on the exact horizon the insert wrote, because
- * reconciliation takes a row by extending that column: a publisher whose clear
- * matches nothing has been overtaken and no longer owns the outcome, so it must
- * report that rather than a verdict it cannot stand behind.
- *
- * @returns whether this caller still owned the row.
- */
+/** Release this publisher's reconciliation claim. Returns false after takeover. */
 export async function clearDispatchReconcile(
   taskId: string,
-  horizon: Date | string,
+  token: string,
 ): Promise<boolean> {
   const r = await db.query(
     `UPDATE claw_tasks
-        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
-      WHERE task_id = $1 AND dispatch_reconcile_at = $2`,
-    [taskId, horizon],
+        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
+            metadata = metadata - 'dispatch_reconcile_token'
+      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+        AND metadata->>'dispatch_reconcile_token' = $2`,
+    [taskId, token],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -463,11 +456,8 @@ export interface OpenChatRunInput {
 /** What openChatRun hands back: the row's id, and how to keep it alive. */
 export interface OpenChatRunResult {
   taskId: string;
-  /**
-   * The reconciliation horizon written with the row, which the publisher CASes
-   * on to prove it still owns the outcome. Absent when none was armed.
-   */
-  reconcileAt?: Date;
+  /** Absent when no reconciliation marker was armed. */
+  reconcileToken?: string;
   /** The workspace this run's files belong to, when one could be recorded. */
   workspaceId?: string;
   /**
@@ -538,6 +528,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
   // the absence here a limit rather than a convention.
   const issueLease = input.issueLease !== false;
   const leaseToken = issueLease ? randomBytes(32).toString("hex") : null;
+  const reconcileToken = input.reconcileAction ? randomBytes(16).toString("hex") : undefined;
   const status = input.status ?? "preparing";
   try {
     const row = await insertTask({
@@ -561,6 +552,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
         user_id: input.userId,
         ...(input.sandboxImage ? { sandbox_image: input.sandboxImage } : {}),
         dispatch: input.dispatch,
+        ...(reconcileToken ? { dispatch_reconcile_token: reconcileToken } : {}),
         ...(status === "queued" && input.queueEntryCause === "admission"
           ? { queued_since: new Date().toISOString() }
           : {}),
@@ -582,7 +574,7 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
       : await recordRunUse(input.sessionId, input.userId, taskId, input.filesWorkspaceId);
     return {
       taskId,
-      reconcileAt: (row as { dispatch_reconcile_at?: Date | null }).dispatch_reconcile_at ?? undefined,
+      reconcileToken,
       workspaceId,
       ...(leaseToken ? {
         lease: {
