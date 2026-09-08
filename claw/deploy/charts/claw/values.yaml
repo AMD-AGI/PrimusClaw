@@ -602,10 +602,13 @@ features:
   # background tools.
   backgroundShell: false
   # Chat dispatch publishes a doorbell and injects credentials at claim time
-  # instead of putting the full execute request on the shared durable. Off
-  # until every Brain replica understands the doorbell: a mixed fleet must
-  # keep serving fat messages.
-  runDoorbellDispatch: false
+  # instead of putting the full execute request on the shared durable. On by
+  # default. A mixed fleet is not a hazard this value has to guard: the
+  # capability floor does that, and an API whose fleet has not asserted a floor
+  # at least as high as its own semantics version falls back to fat dispatch on
+  # its own. Set false to roll Doorbell back, and leave brainDoorbellExecution
+  # true so Brain keeps draining the rows already queued.
+  runDoorbellDispatch: true
   # Whether a Brain replica executes doorbell runs at all: with this false it
   # declines a doorbell on the wire and its claim-next loop takes no doorbell
   # row. On by default -- a kill-switch that ships killed is not a kill-switch.

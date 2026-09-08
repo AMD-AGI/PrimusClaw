@@ -47,20 +47,49 @@ export type DoorbellLatch =
  * because they have different causes and different operator responses:
  * collapsing them would make "the watch died" read as "the operator turned it
  * off" in the logs.
+ *
+ * The starting value is the baseline floor rather than `unknown`. Version 1 is
+ * the first semantics there has ever been, and every reader in the tree already
+ * treats its absence as 1 -- `doorbellSemanticsOf` on the wire, and
+ * `COALESCE((metadata->>'doorbell_semantics')::int, 1)` in both claim filters --
+ * so a fleet that has asserted nothing is a version-1 fleet, not an unknown one.
+ * Requiring an assertion to reach a floor the whole tree already assumes turned
+ * every existing doorbell installation off on upgrade, silently, and demanded an
+ * operator step to get back to the behaviour it already had. The floor earns its
+ * keep from version 2 onward, where an assertion says something the default
+ * cannot.
+ *
+ * A revocation still closes the gate, and survives a restart, because the delete
+ * is a tombstone the watch replays out of a bucket that does not expire.
  */
-let latch: DoorbellLatch = { state: "unknown", reason: "no delivery yet" };
+export const DOORBELL_SEMANTICS_BASELINE = 1;
+let latch: DoorbellLatch = { state: "floor", version: DOORBELL_SEMANTICS_BASELINE };
 
 /** Tokens issued and not yet released. Bounded by the dispatches in progress. */
 let inFlight = 0;
 
-/** One-way while the latch is closed, so it cannot flicker open under a rollback. */
-let barrierOpen = false;
+/**
+ * One-way while the latch is closed, so it cannot flicker open under a rollback.
+ *
+ * Initialised from the latch rather than to `false`. Only `setDoorbellLatch`
+ * moves it, and an empty floor bucket delivers no watch event at all, so a
+ * hardcoded `false` here leaves the barrier shut on exactly the installation the
+ * baseline exists for -- one that has asserted nothing. The two are the same
+ * decision read twice; seeding one and not the other is how the baseline reached
+ * a live cluster and still dispatched fat.
+ */
+let barrierOpen = gateOpenFor(latch);
 
 export function doorbellLatch(): DoorbellLatch {
   return latch;
 }
 
 /** True iff the deployment wants doorbells and the fleet has asserted it can take them. */
+/** The gate's own predicate, so the barrier can be seeded from the same rule. */
+function gateOpenFor(l: DoorbellLatch): boolean {
+  return RUN_DOORBELL_DISPATCH && l.state === "floor" && l.version >= DOORBELL_SEMANTICS_VERSION;
+}
+
 export function doorbellGateOpen(): boolean {
   return RUN_DOORBELL_DISPATCH
     && latch.state === "floor"

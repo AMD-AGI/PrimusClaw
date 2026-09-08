@@ -335,7 +335,7 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * Off by default: a rolling fleet must keep serving fat messages until every
  * Brain replica understands the doorbell. See packages/api/src/tasks/run-claim.ts.
  */
-export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", false);
+export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
 /**
  * The deployment's assertion that every Brain able to receive `tasks.execute`

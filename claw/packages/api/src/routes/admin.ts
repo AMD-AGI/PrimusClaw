@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { FastifyInstance } from "fastify";
-import { nc, kv, sc } from "../infra/nats.js";
+import { nc, kv, kvDoorbellFloor, sc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import { stopSessionRuns } from "../tasks/chat-run.js";
@@ -21,6 +21,12 @@ async function readKvString(key: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** The floor lives in its own non-expiring bucket; see DOORBELL_FLOOR_BUCKET. */
+async function readFloorString(): Promise<string | null> {
+  const e = await kvDoorbellFloor.get(DOORBELL_SEMANTICS_KEY).catch(() => null);
+  return e ? sc.decode(e.value) : null;
 }
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
@@ -60,8 +66,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         error: `semantics must not exceed this API's own ${DOORBELL_SEMANTICS_VERSION}`,
       });
     }
-    const previous = await readKvString(DOORBELL_SEMANTICS_KEY);
-    await kv.put(DOORBELL_SEMANTICS_KEY, sc.encode(String(semantics)));
+    const previous = await readFloorString();
+    await kvDoorbellFloor.put(DOORBELL_SEMANTICS_KEY, sc.encode(String(semantics)));
     req.log.info(
       { key: DOORBELL_SEMANTICS_KEY, previous, current: semantics },
       "brain.doorbell_semantics.updated",
@@ -71,8 +77,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   // The gate closing does not prove nothing more is coming; poll in-flight too.
   app.delete("/v1/internal/brain/doorbell-semantics", { preHandler: internalAuth }, async (req) => {
-    const previous = await readKvString(DOORBELL_SEMANTICS_KEY);
-    await kv.delete(DOORBELL_SEMANTICS_KEY);
+    const previous = await readFloorString();
+    await kvDoorbellFloor.delete(DOORBELL_SEMANTICS_KEY);
     req.log.warn({ key: DOORBELL_SEMANTICS_KEY, previous }, "brain.doorbell_semantics.revoked");
     return { ok: true, key: DOORBELL_SEMANTICS_KEY, previous };
   });

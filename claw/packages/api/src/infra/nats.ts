@@ -28,6 +28,7 @@ export let kv: KV;
 export let kvCkpt: KV;
 export let kvSystemEnv: KV;
 export let kvTombstones: KV;
+export let kvDoorbellFloor: KV;
 
 // Stream + subject names are stable across environments. Multi-account
 // isolation at the NATS server level keeps each environment's messages
@@ -52,6 +53,18 @@ export const SYSTEM_ENV_BUCKET = "SYSTEM_ENV";
 // session -- a task the queue can still redeliver, and every event still held
 // on the event stream, whichever of the two windows is the longer.
 export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
+// The fleet's asserted doorbell-semantics floor. Its own bucket, and one with
+// no expiry, because it is an operator assertion about the fleet rather than
+// coordination state: the registry's five-minute TTL is chosen for `lock.<key>`
+// and aging the floor out of it produced two failures at once -- a running
+// replica whose in-memory latch never learned the key had gone kept publishing
+// doorbells, while any replica that restarted read nothing and fell back to fat.
+// The fleet then disagreed with itself about the wire format, which is the one
+// thing the floor exists to prevent. Durability is also what makes a revocation
+// survive a restart: the delete is a tombstone a new watcher replays, whereas an
+// entry that merely ages out delivers no operation at all.
+export const DOORBELL_FLOOR_BUCKET = "DOORBELL_FLOOR";
+const DOORBELL_FLOOR_TTL_MS = 0;
 
 // KV bucket config (Plan Y v2). Local consts; brain/src/config.ts mirrors
 // these so a future @claw/shared-config package has one grep target. The
@@ -297,7 +310,8 @@ export async function initNats(): Promise<void> {
   kvCkpt = buckets.checkpoints;
   kvTombstones = buckets.tombstones;
   kvSystemEnv = buckets.systemEnv;
-  startDoorbellSemanticsWatch(kv);
+  kvDoorbellFloor = buckets.doorbellFloor;
+  startDoorbellSemanticsWatch(kvDoorbellFloor);
 
   logger.info(
     {
@@ -329,6 +343,7 @@ export interface KvBuckets {
   checkpoints: KV;
   tombstones: KV;
   systemEnv: KV;
+  doorbellFloor: KV;
 }
 
 /**
@@ -365,6 +380,11 @@ export async function ensureKvBuckets(
     systemEnv: await ensure(SYSTEM_ENV_BUCKET, {
       ttl: SYSTEM_ENV_TTL_MS,
       replicas: SYSTEM_ENV_REPLICAS,
+    }),
+    // Doorbell capability floor: an operator assertion, so it does not expire.
+    doorbellFloor: await ensure(DOORBELL_FLOOR_BUCKET, {
+      ttl: DOORBELL_FLOOR_TTL_MS,
+      replicas: BRAIN_REGISTRY_REPLICAS,
     }),
   };
 }

@@ -483,7 +483,7 @@ test("the tombstone bucket is the one bucket whose TTL is never narrowed", async
   assert.equal(calls[0].opts.ttlPolicy, "widenOnly");
 });
 
-test("and it is the only bucket of the four that asks for that policy", async () => {
+test("and it is the only bucket of the five that asks for that policy", async () => {
   // The conclusion of this whole change, and the thing nothing else holds: every
   // other bucket's TTL is a setting this code is the authority on, so one of them
   // given `widenOnly` as well is a bucket a shortened setting can no longer
@@ -495,7 +495,7 @@ test("and it is the only bucket of the four that asks for that policy", async ()
 
   assert.deepEqual(
     calls.map((c) => c.name),
-    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV"],
+    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV", "DOORBELL_FLOOR"],
     "every bucket this process owns goes through here, or the guard below sees less than it claims",
   );
   assert.deepEqual(
@@ -508,8 +508,18 @@ test("and it is the only bucket of the four that asks for that policy", async ()
       `${call.name}'s TTL is a setting, so a start-up has to be able to shorten it`);
   }
   assert.deepEqual(Object.keys(buckets).sort(),
-    ["checkpoints", "registry", "systemEnv", "tombstones"],
-    "and every one of them is handed back, since initNats binds all four");
+    ["checkpoints", "doorbellFloor", "registry", "systemEnv", "tombstones"],
+    "and every one of them is handed back, since initNats binds all five");
+  // The floor is an operator assertion about the fleet, not coordination state,
+  // and the two failures a TTL on it produces are not symmetrical: a running
+  // replica never learns the key aged out and goes on publishing doorbells,
+  // while any replica that restarts reads nothing and falls back to fat. The
+  // fleet then disagrees with itself about the wire format -- the one thing the
+  // floor exists to prevent. Zero is also what lets a revocation survive a
+  // restart, since the delete stays a tombstone the next watcher replays.
+  const floor = calls.find((c) => c.name === "DOORBELL_FLOOR");
+  assert.ok(floor, "the floor bucket is provisioned here or nowhere");
+  assert.equal(floor.opts.ttl, 0, "an asserted floor must not age out from under the fleet");
 });
 
 test("the bucket's own line says whether that retention was measured or assumed", () => {

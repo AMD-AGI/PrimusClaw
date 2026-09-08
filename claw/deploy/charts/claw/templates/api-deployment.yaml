@@ -60,7 +60,7 @@ spec:
         # that path a changed ceiling would reach the Secret and never reach a
         # pod, which reads its environment once at start.
         checksum/rollout-config: {{ printf "%v|%v|%v|%v|%v|%v|%v|%v|%v"
-          (get (.Values.features | default dict) "runDoorbellDispatch" | default false)
+          (get (.Values.features | default dict) "runDoorbellDispatch" | default true)
           (get .Values.api "admitSoftRuns" | default 0)
           (get .Values.api "admitHardRuns" | default 0)
           (get .Values.api "admitSoftSandboxes" | default 0)
@@ -109,7 +109,7 @@ spec:
         # executes them unless killed. A single Secret key would have made a
         # rollback of the first also stop the second draining the backlog.
         - name: RUN_DOORBELL_DISPATCH
-          value: {{ dig "runDoorbellDispatch" false (.Values.features | default dict) | quote }}
+          value: {{ dig "runDoorbellDispatch" true (.Values.features | default dict) | quote }}
         - name: NODE_OPTIONS
           value: {{ .Values.api.nodeOptions | quote }}
         - name: BRAIN_TASK_TIMEOUT_SEC
