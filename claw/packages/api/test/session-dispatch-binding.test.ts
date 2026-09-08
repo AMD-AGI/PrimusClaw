@@ -370,8 +370,9 @@ function readyToOpen(doorbell: boolean): void {
 test("D10 the default path names the run row it opened", async () => {
   readyToOpen(false);
   const published: Array<Record<string, unknown>> = [];
+  let dispatch: string | undefined;
   sessionDispatchPorts.openChatRun = (async (input) => {
-    assert.equal(input.dispatch, "fat");
+    dispatch = input.dispatch;
     return { taskId: OPENED };
   }) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async (_subject, payload) => {
@@ -382,6 +383,7 @@ test("D10 the default path names the run row it opened", async () => {
     throw new Error("a dispatched turn must not roll back");
   });
 
+  assert.equal(dispatch, "fat");
   assert.equal(result.kind, "dispatched");
   assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
   assert.equal(published[0]?.task_id, OPENED);
