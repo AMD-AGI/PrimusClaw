@@ -40,7 +40,15 @@ nothing is reporting -- see *Why the expressions look like this*.
 
 ## Preconditions
 
-1. Every API and Brain replica runs an image that understands the doorbell
+1. Apply or re-apply the NATS values for the environment before any API image
+   that ships `RUN_DOORBELL_DISPATCH=true` starts. The supported full-deploy
+   path is `deploy/deploy.sh` without `--skip-nats`; it renders
+   `deploy/nats-values.yaml`, waits for the NATS Helm upgrade, and only then
+   applies the API Deployment. `deploy/upgrade.sh` does not touch NATS, so use
+   it only after the NATS values apply has completed separately. The API creates
+   the `DOORBELL_FLOOR` bucket during startup even when dispatch is disabled;
+   without the new KV grants, startup fails and the API pods crash-loop.
+2. Every API and Brain replica runs an image that understands the doorbell
    protocol and the reconciled unclaim/fail-claim reason vocabulary, and the
    fleet's floor has been asserted:
 
@@ -55,15 +63,15 @@ nothing is reporting -- see *Why the expressions look like this*.
    slower and never incorrect, so a stage that never starts is the failure
    mode rather than a mixed fleet being handed a message it cannot read. The
    API refuses an assertion above its own version.
-2. No legacy `preparing` rows are outstanding from a previous attempt.
+3. No legacy `preparing` rows are outstanding from a previous attempt.
    Reconciling them is gated on `RUN_FAT_PREPARING_RECONCILE`, the API's
    assertion that every Brain able to receive a task takes a durable holder
    before it executes; it ships off and is read from the API process
    environment, not from a chart value. Turning it on before every replica on
    both sides is new lets a reaper close a delivery that is about to run.
-3. Prometheus reaches the API `/metrics` endpoint of every replica, and P1
+4. Prometheus reaches the API `/metrics` endpoint of every replica, and P1
    below passes.
-4. Every run-creating path is routed through admission, so a ceiling means what
+5. Every run-creating path is routed through admission, so a ceiling means what
    it says. All four origins reach `decideAdmission`: `chat` from the session
    create, `a2a` from both send paths, and `dag_node` and `task` from the DAG
    expander.

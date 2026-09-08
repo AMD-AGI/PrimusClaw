@@ -178,6 +178,14 @@ kubectl rollout restart deployment/primus-claw-brain -n primus-claw
 
 ### Doorbell Dispatch and Admission Ceilings
 
+Before rolling an API image that ships `RUN_DOORBELL_DISPATCH=true`, apply or
+re-apply the NATS values for the environment. `deploy/deploy.sh` without
+`--skip-nats` renders `deploy/nats-values.yaml`, waits for the NATS Helm upgrade,
+and only then applies the API Deployment. `deploy/upgrade.sh` does not touch
+NATS, so use it only after the NATS values apply has completed separately.
+Without the new `DOORBELL_FLOOR` KV grants, API startup fails and the pods
+crash-loop.
+
 `features.runDoorbellDispatch` ships on, while the eight `api.admit*` ceilings
 ship at `"0"`. The runtime capability floor keeps dispatch on the fat path until
 the fleet explicitly asserts support. Raising ceilings and rolling Doorbell back
