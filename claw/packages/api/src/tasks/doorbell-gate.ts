@@ -13,10 +13,8 @@
  *
  * The second is an operator-asserted floor in a KV key. Every state in which
  * this process has never observed a usable floor resolves to fat dispatch --
- * slower, and never incorrect. What failing closed does NOT cover is a floor
- * this process HAS observed: the bucket drops aged entries with no marker at
- * all, so an expiry is silence rather than a revocation, and revocation is an
- * explicit operator step instead.
+ * slower, and never incorrect. An observed floor remains in the non-expiring
+ * bucket until an explicit operator revocation replaces it with a tombstone.
  *
  * A boolean is not enough for that step. Between the branch and the publish a
  * dispatch does real work, so a revocation landing in that window closes the
@@ -47,49 +45,20 @@ export type DoorbellLatch =
  * because they have different causes and different operator responses:
  * collapsing them would make "the watch died" read as "the operator turned it
  * off" in the logs.
- *
- * The starting value is the baseline floor rather than `unknown`. Version 1 is
- * the first semantics there has ever been, and every reader in the tree already
- * treats its absence as 1 -- `doorbellSemanticsOf` on the wire, and
- * `COALESCE((metadata->>'doorbell_semantics')::int, 1)` in both claim filters --
- * so a fleet that has asserted nothing is a version-1 fleet, not an unknown one.
- * Requiring an assertion to reach a floor the whole tree already assumes turned
- * every existing doorbell installation off on upgrade, silently, and demanded an
- * operator step to get back to the behaviour it already had. The floor earns its
- * keep from version 2 onward, where an assertion says something the default
- * cannot.
- *
- * A revocation still closes the gate, and survives a restart, because the delete
- * is a tombstone the watch replays out of a bucket that does not expire.
  */
-export const DOORBELL_SEMANTICS_BASELINE = 1;
-let latch: DoorbellLatch = { state: "floor", version: DOORBELL_SEMANTICS_BASELINE };
+let latch: DoorbellLatch = { state: "unknown", reason: "no delivery yet" };
 
 /** Tokens issued and not yet released. Bounded by the dispatches in progress. */
 let inFlight = 0;
 
-/**
- * One-way while the latch is closed, so it cannot flicker open under a rollback.
- *
- * Initialised from the latch rather than to `false`. Only `setDoorbellLatch`
- * moves it, and an empty floor bucket delivers no watch event at all, so a
- * hardcoded `false` here leaves the barrier shut on exactly the installation the
- * baseline exists for -- one that has asserted nothing. The two are the same
- * decision read twice; seeding one and not the other is how the baseline reached
- * a live cluster and still dispatched fat.
- */
-let barrierOpen = gateOpenFor(latch);
+/** One-way while the latch is closed, so it cannot flicker open under a rollback. */
+let barrierOpen = false;
 
 export function doorbellLatch(): DoorbellLatch {
   return latch;
 }
 
 /** True iff the deployment wants doorbells and the fleet has asserted it can take them. */
-/** The gate's own predicate, so the barrier can be seeded from the same rule. */
-function gateOpenFor(l: DoorbellLatch): boolean {
-  return RUN_DOORBELL_DISPATCH && l.state === "floor" && l.version >= DOORBELL_SEMANTICS_VERSION;
-}
-
 export function doorbellGateOpen(): boolean {
   return RUN_DOORBELL_DISPATCH
     && latch.state === "floor"

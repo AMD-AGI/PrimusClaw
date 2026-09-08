@@ -75,9 +75,7 @@ test("an unparseable value is invalid, which is not the same fact as absent", ()
   }
 });
 
-test("expiry is silence: no operation arrives, so no latch moves", () => {
-  // The bucket drops aged entries with no marker at all, which is exactly why
-  // revocation cannot be left to the key's lifetime.
+test("an observed floor stays open until another operation arrives", () => {
   setDoorbellLatch({ state: "floor", version: SUPPORTED });
   const before = doorbellLatch();
   assert.deepEqual(doorbellLatch(), before);

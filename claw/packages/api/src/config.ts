@@ -332,8 +332,8 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
  * at claim time, instead of putting the full execute request on JetStream.
  *
- * Off by default: a rolling fleet must keep serving fat messages until every
- * Brain replica understands the doorbell. See packages/api/src/tasks/run-claim.ts.
+ * On by default. The capability floor keeps each API on fat dispatch until the
+ * fleet explicitly asserts support for this binary's semantics version.
  */
 export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
