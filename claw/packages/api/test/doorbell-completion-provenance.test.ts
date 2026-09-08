@@ -201,3 +201,40 @@ test("a chat completion reaches the close that is fenced to its generation", asy
     assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
   });
 });
+
+test("a fat completion closes its fenced row before the lease reaper", async () => {
+  await withLiveSession(async () => {
+    const { reapLostLeases } = await import("../src/tasks/sweeper.js");
+    await seedSession(h, "s-fat", { gateOwner: "m-fat" });
+    await seedRun(h, "fat-run", "s-fat", {
+      status: "running", dispatch: "fat", messageId: "m-fat",
+      leaseOwner: "brain-a", leaseExpiresInSec: -3600, claimCount: 1,
+    });
+    await seedRun(h, "other-run", "s-fat", {
+      status: "running", dispatch: "fat", messageId: "m-other",
+      leaseOwner: "brain-b", leaseExpiresInSec: 3600, claimCount: 1,
+    });
+    await h.sql(
+      `UPDATE claw_tasks
+          SET metadata = metadata || '{"dispatch":"fat","lease_fenced":"true"}'::jsonb
+        WHERE task_id = 'fat-run'`,
+    );
+
+    await deliverCompletion({
+      session_id: "s-fat", message_id: "m-fat", task_id: "fat-run", run_claim: 1,
+      user_id: "u-fat", prompt: "hello", final_text: "done",
+      failed: false, error_count: 0, skills_used: {},
+    });
+
+    const completed = await runRow(h, "fat-run");
+    assert.equal(completed.status, "completed");
+    assert.ok(completed.completed_at);
+    assert.ok((await h.sql(
+      `SELECT processed_at FROM claw_session_events
+        WHERE session_id = 's-fat' AND event = 'exec_complete'`,
+    ))[0].processed_at);
+    assert.equal(await reapLostLeases(), 0);
+    assert.equal((await runRow(h, "fat-run")).status, "completed");
+    assert.equal((await runRow(h, "other-run")).status, "running");
+  });
+});

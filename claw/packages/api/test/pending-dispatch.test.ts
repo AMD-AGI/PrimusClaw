@@ -14,7 +14,7 @@
  *
  * Coverage:
  *   P1 the row exists before the message does
- *   P2 the lease travels with the turn
+ *   P2 the lease and row identity travel with the turn
  *   P3 the turn names the files it writes, and says it was required to
  *   P3b a replayed turn is published under the same id, so the stream sees one
  *   P3c two sessions sharing a message id are two turns, not one
@@ -213,10 +213,12 @@ test("P1 the row exists before the message does", async () => {
   );
 });
 
-test("P2 the lease travels with the turn", async () => {
+test("P2 the lease and row identity travel with the turn", async () => {
   const rec = harness();
   await dispatchPendingMessage(input());
+  assert.equal(rec.opened[0].dispatch, "fat");
   assert.deepEqual(rec.published[0].task.run_lease, { url: "http://api/lease", token: "t0ken" });
+  assert.equal(rec.published[0].task.task_id, "ktsk_1");
 });
 
 test("P3 the turn names the files it writes, and says it was required to", async () => {

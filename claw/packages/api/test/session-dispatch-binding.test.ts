@@ -369,6 +369,14 @@ function readyToOpen(doorbell: boolean): void {
 
 test("D10 the default path names the run row it opened", async () => {
   readyToOpen(false);
+  const published: Array<Record<string, unknown>> = [];
+  sessionDispatchPorts.openChatRun = (async (input) => {
+    assert.equal(input.dispatch, "fat");
+    return { taskId: OPENED };
+  }) as typeof sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.publishTask = async (_subject, payload) => {
+    published.push(JSON.parse(payload));
+  };
 
   const result = await dispatchTaskToBrain(INPUT, async () => {
     throw new Error("a dispatched turn must not roll back");
@@ -376,6 +384,7 @@ test("D10 the default path names the run row it opened", async () => {
 
   assert.equal(result.kind, "dispatched");
   assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
+  assert.equal(published[0]?.task_id, OPENED);
 });
 
 test("D10b the doorbell path names the run row it opened", async () => {

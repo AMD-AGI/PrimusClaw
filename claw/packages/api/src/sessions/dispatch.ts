@@ -337,6 +337,7 @@ export async function dispatchTaskToBrain(
       throw new Error("chat_run.open_failed");
     }
     runTaskId = run.taskId;
+    task.task_id = run.taskId;
     task.run_lease = run.lease;
 
     subject = taskSubject();

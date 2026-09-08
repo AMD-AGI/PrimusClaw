@@ -534,6 +534,7 @@ export async function dispatchPendingMessage(
     logger.error({ sessionId, pendingId: input.pendingId }, "pending.open_failed");
     throw new Error("chat_run.open_failed");
   }
+  task.task_id = run.taskId;
   task.run_lease = run.lease;
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
