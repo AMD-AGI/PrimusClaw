@@ -14,6 +14,7 @@
 import type {
   ExecuteRequest, ExecuteResult, RunPhase, RunTimeReport, RunWaitReason,
 } from "@claw/protocol";
+import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
 
 const logger = pino({ name: "task-callback" });
@@ -306,6 +307,31 @@ function truncateFinalText(text: string): string {
   return truncate(text, MAX_FINAL_TEXT_BYTES, "final text");
 }
 
+function boundedAttemptReport(raw: unknown): RunTimeReport | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object") {
+    throw new AgentDoneDeliveryError("run_time: expected an object with an attempt token");
+  }
+  const report = raw as Partial<RunTimeReport>;
+  for (const field of ["key", "attemptId"] as const) {
+    const value = report[field];
+    if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > MAX_DOWNGRADED_FIELD_BYTES) {
+      throw new AgentDoneDeliveryError(`run_time.${field}: expected a non-empty string of at most ${MAX_DOWNGRADED_FIELD_BYTES} bytes`);
+    }
+  }
+  // Identity survives verbatim; an identity-only report attributes no duration.
+  const decoded = decodeRunTimeReport({
+    key: report.key,
+    attemptId: report.attemptId,
+    claimCount: report.claimCount,
+    deliverySeq: report.deliverySeq,
+    deliveryCount: report.deliveryCount,
+    basis: { kind: "same_domain", domain: "brain" },
+  });
+  if (!decoded.ok) throw new AgentDoneDeliveryError(`run_time.${decoded.rejected}`);
+  return decoded.report;
+}
+
 /**
  * The body with everything optional taken out of it.
  *
@@ -328,6 +354,7 @@ function withoutPayload(body: AgentDoneBody): AgentDoneBody {
   // function instead of a property of the input.
   const downgraded: AgentDoneBody = {
     task_id: body.task_id ? truncateField(body.task_id, "task id") : body.task_id,
+    run_time: boundedAttemptReport(body.run_time),
     final_text: "[dropped: the callback body exceeded the size the API accepts]",
     captures: {},
     artifacts: [],
@@ -444,8 +471,8 @@ export async function postAgentDone(
       // and will be exactly as large next time. Shed it once and retry that,
       // rather than spending the remaining attempts proving the point.
       if (resp.status === 413 && !shed) {
-        shed = true;
         payload = withoutPayload(body);
+        shed = true;
         // Ordinary failures get three attempts. If the first size answer only
         // arrives on the third, grant the newly-built lean payload one distinct
         // send rather than constructing it and immediately leaving the loop.
@@ -454,6 +481,7 @@ export async function postAgentDone(
       }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
     } catch (error) {
+      if (error instanceof AgentDoneDeliveryError) throw error;
       lastError = error instanceof Error ? error : new Error(String(error));
     } finally {
       clearTimeout(timeout);
