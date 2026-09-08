@@ -107,6 +107,24 @@ test("keeps claim_count required, since takeClaim increments it on every claim",
   assert.ok(tasks?.columns.includes("claim_count"));
 });
 
+for (const column of [
+  "attempt_id",
+  "attempt_generation",
+  "settled_attempt_id",
+  "delivery_seq",
+  "delivery_count",
+  "ledger_version",
+  "queued_ms_accrued",
+]) {
+  test(`keeps ${column} required for run accounting`, () => {
+    const problems = missingSchemaObjects(
+      REQUIRED_SCHEMA,
+      without([["claw_tasks", column]]),
+    );
+    assert.deepEqual(problems, [`claw_tasks is missing column(s): ${column}`]);
+  });
+}
+
 test("keeps the run-time epoch required, since requeues overwrite queued_at", () => {
   const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
   assert.ok(tasks?.columns.includes("run_time_epoch_at"));
