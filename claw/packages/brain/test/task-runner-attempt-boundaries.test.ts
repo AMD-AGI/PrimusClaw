@@ -12,7 +12,6 @@ import type { NatsEmitter } from "../src/events/emitter.js";
 import {
   claimedDoorbellMsg, declareFinalReport, flushPendingRetries,
 } from "../src/delivery/doorbell-delivery.js";
-import { AgentDoneDeliveryError } from "../src/tasks/callback.js";
 import { bindTaskRunnerDeps, runHandleTask, type TaskRunnerSideEffects } from "../src/tasks/runner.js";
 import { activeAbort } from "../src/tasks/abort-registry.js";
 
@@ -223,16 +222,13 @@ test("a fat retry settles its attempt, since no release endpoint will", async ()
   // redelivery's first heartbeat until it lapses on its own.
   const attempts: Array<{ taskId: string; claimCount?: number; releaseLease?: boolean }> = [];
   const kv = fakeKv();
-  const engine: Engine = { async execute() { return completed; } };
+  const engine: Engine = { async execute() { throw new Error("fetch failed"); } };
   bindTaskRunnerDeps({
     kv, kvCkpt: kv,
     emitter: { async emit() {} } as unknown as NatsEmitter,
     engine,
     sideEffects: {
       ...stubSideEffects(),
-      // The handoff this run cannot complete, which is what sends it back for a
-      // redelivery rather than to a terminal ack.
-      postAgentDone: (async () => { throw new AgentDoneDeliveryError("backend unavailable"); }) as never,
       settleRunAttempt: (async (taskId: string, claimCount?: number, _r?: unknown, releaseLease?: boolean) => {
         attempts.push({ taskId, claimCount, releaseLease });
       }) as never,

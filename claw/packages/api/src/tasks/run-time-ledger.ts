@@ -237,6 +237,8 @@ export async function mergeRenewal(
 export interface RunSettlement {
   /** The attempt's last word on its own time, if it sent one. */
   report?: RunTimeReport;
+  /** A final callback may precede every successful running or heartbeat write. */
+  adoptUnrecordedAttempt?: boolean;
   /**
    * Close the attempt's open record and compute what it lost.
    *
@@ -276,6 +278,34 @@ export type SettleOutcome =
   | { ok: true; entry: RunTimeLedgerEntry }
   | { ok: false; reason: "missing" | "stale_attempt" };
 
+async function adoptReportedAttempt(
+  query: Querier,
+  taskId: string,
+  report: RunTimeReport,
+): Promise<boolean> {
+  const adopted = await query(
+    `UPDATE claw_tasks
+        SET attempt_id = $2,
+            attempt_generation = attempt_generation + 1,
+            delivery_seq = $4::bigint,
+            delivery_count = $5::bigint
+      WHERE task_id = $1
+        AND status IN ('preparing', 'running', 'cancelling')
+        AND completed_at IS NULL
+        AND claim_count = $3::int
+        AND (delivery_seq, delivery_count) <= ($4::bigint, $5::bigint)
+        AND $2 IS DISTINCT FROM settled_attempt_id
+        AND attempt_id IS DISTINCT FROM $2
+        AND (
+          attempt_id IS NULL
+          OR ((delivery_seq, delivery_count) < ($4::bigint, $5::bigint)
+              AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()))
+        )`,
+    [taskId, report.attemptId, report.claimCount, report.deliverySeq, report.deliveryCount],
+  );
+  return (adopted.rowCount ?? 0) > 0;
+}
+
 export async function settleRunTime(
   query: Querier,
   taskId: string,
@@ -284,10 +314,21 @@ export async function settleRunTime(
   const identity = settlement.report
     ? { key: settlement.report.key, source: "task_id" as const }
     : { key: taskId, source: "task_id" as const };
-  const row = await readLedgerForUpdate(query, taskId, identity);
+  let row = await readLedgerForUpdate(query, taskId, identity);
   if (!row) return { ok: false, reason: "missing" };
   if (settlement.report && !reportIsCurrent(row, settlement.report)) {
-    return { ok: false, reason: "stale_attempt" };
+    if (!settlement.adoptUnrecordedAttempt
+      || !(await adoptReportedAttempt(query, taskId, settlement.report))) {
+      return { ok: false, reason: "stale_attempt" };
+    }
+    row = await readLedgerForUpdate(query, taskId, identity);
+    if (!row) return { ok: false, reason: "missing" };
+    row = {
+      ...row,
+      entry: beginAttemptRecord(
+        row.entry, settlement.report.attemptId, row.attemptGeneration, row.readAtDb,
+      ),
+    };
   }
   const banked = bankReportAndQueue(row, settlement.report);
   const closing = settlement.closeAttempt

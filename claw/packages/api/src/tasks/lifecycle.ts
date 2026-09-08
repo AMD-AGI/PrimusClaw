@@ -82,7 +82,9 @@ async function transitionWithFinalReport(
     // transition beside it would end a run somebody else is executing, and the
     // status guard cannot tell the two apart once the row has been reclaimed
     // under the same pod name.
-    const settled = await settleRunTime(query, taskId, { report, closeAttempt: true });
+    const settled = await settleRunTime(query, taskId, {
+      report, closeAttempt: true, adoptUnrecordedAttempt: true,
+    });
     if (!settled.ok) throw new StaleAttempt(settled.reason);
     const updated = await transitionStatus(taskId, expected, next, patch, query);
     if (!updated) throw new TerminalNoop();

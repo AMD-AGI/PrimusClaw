@@ -210,7 +210,8 @@ async function deliverAgentDone(
     return;
   }
   const key = pendingCallbackKey(request.task_id);
-  await kvCkpt.put(key, sc.encode(JSON.stringify(result)));
+  const pending = runTime ? { ...result, run_time: runTime } : result;
+  await kvCkpt.put(key, sc.encode(JSON.stringify(pending)));
   await fx().postAgentDone(request, result, runTime);
 }
 
@@ -743,8 +744,9 @@ async function replayPendingCallback(
   if (!entry) return false;
 
   try {
-    const result = JSON.parse(sc.decode(entry.value)) as ExecuteResult;
-    await fx().postAgentDone(request, result);
+    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
+      ExecuteResult & { run_time?: RunTimeReport };
+    await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
   } catch (err) {
@@ -3226,7 +3228,7 @@ class TaskRunner {
         exhaustedLog,
       );
       await this.releaseAfterTerminal();
-      await this.nakAfterAttempt(5_000);
+      this.msg.nak(5_000);
     }
   }
 
@@ -3588,7 +3590,7 @@ class TaskRunner {
         // The run finished; only the handoff failed, and the nak redelivers it.
         outcome = "retryable";
         await this.releaseAfterTerminal();
-        await this.nakAfterAttempt(5_000);
+        this.msg.nak(5_000);
       } else if (err instanceof SandboxProvisionTerminalError) {
         // Terminal sandbox-provisioning outcome (SaFE workload Failed/Stopped,
         // pod died before ready, workload gone, or status unreadable past the
