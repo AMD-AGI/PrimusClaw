@@ -271,6 +271,7 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner      = COALESCE($2, lease_owner),
+              brain_id         = COALESCE($2, brain_id),
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at     = NOW(),
               metadata         = jsonb_set(
