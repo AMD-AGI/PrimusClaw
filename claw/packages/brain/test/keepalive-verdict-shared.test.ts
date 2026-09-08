@@ -309,21 +309,9 @@ test("a verdict is not stamped onto whatever took the key while the probe was ou
   );
 });
 
-// The interval between two probes of the same identity is the interval the
-// streak has to survive, and it is not the one the shared verdict is sized for.
-// A verdict is read by whichever replica sweeps next; a streak is in-process, so
-// only the replica that failed can add to it, and it waits out the rotation
-// multiplied by the replica count -- tens of minutes even on a small fleet, and
-// longer on a bigger one. Against a thirty-minute memory that is the bug: every
-// failure aged out before the same replica could fail again, the count never
-// left one, and the give-up path existed without ever being able to fire.
-//
-// The interval below stands for that scale rather than for any one deployment's
-// number. What the test pins is the ordering -- a memory shorter than the
-// revisit interval can never accumulate a streak -- not the value.
 const SAME_REPLICA_REVISIT_MS = 36 * 60_000;
 
-test("a run of failures accumulates across the interval the same replica returns on", async () => {
+test("repeated failures across long revisit intervals never authorize reclaim", async () => {
   const k = fakeKv();
   stubPingableProvider();
   const deps = {
@@ -381,7 +369,7 @@ test("a streak is not dropped by an unrelated verdict aging out", async () => {
   assert.equal(
     backgroundWorkStateSizesForTest().streaks, 1,
     "the run of failures is fresh and unrelated to the answer that expired; "
-      + "reaping it here restarts the count and the give-up never arrives",
+      + "reaping it here loses the recent failures needed for reporting",
   );
 });
 
@@ -1009,17 +997,6 @@ test("a `running` on the handle is not outranked by a local `idle` with a later 
 
 test("an `idle` answer landing late does not overwrite a `running` one from the same period", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  // The read side prefers `running` from either copy, and that only decides
-  // anything while both answers exist to be compared. One verdict is kept per
-  // handle, so the write side is where an answer can be made to stop existing:
-  // whichever probe persists last is what every later sweep reads, and the two
-  // probes are on different replicas with no ordering between them.
-  //
-  // Nothing above catches it. The identity check says the entry still names the
-  // sandbox that was probed, and the period checks say it is still in the idle
-  // period that was probed. Both are true of the loser of this race -- it is the
-  // same sandbox and the same period; it is simply the less authoritative answer
-  // about them, and it arrives second.
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1198,20 +1175,6 @@ test("a `running` answer is not dropped by an `idle` one decided against the sam
 
 test("a `running` answer is not given up on because the contention outlasted its retries", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  // The retry above settles the same-revision race by re-reading and insisting.
-  // The retries are counted, though, and the count was the whole guarantee: an
-  // `idle` that keeps arriving for as long as the `running` keeps trying wins by
-  // outlasting it, and giving up is the one outcome a `running` answer may not
-  // have. Losing the update is cheap for `idle` -- another sweep files it again
-  // -- and terminal for `running`, because what it leaves behind is not "no
-  // answer" but the contending `idle`, and the next replica to read that
-  // reclaims a sandbox with a shell in it. So the retries have to outlast the
-  // contention rather than the other way round.
-  //
-  // Sustained, and against a live period the whole time: every contending write
-  // here leaves the period's name exactly as it found it, so nothing this
-  // replica re-asks on the way round ever tells it to stop for a legitimate
-  // reason. The only thing standing between it and the write is the counter.
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1301,22 +1264,6 @@ test("a `running` answer is not given up on because the contention outlasted its
 
 test("a `running` answer is not lost to a reclaim decided on the `idle` it is contesting", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  // The retry settles the same-revision race by insisting: the `idle` that won
-  // the conditional update is re-read and overwritten. That works only for as
-  // long as there is an entry to overwrite.
-  //
-  // Which is not something the retry controls. The `idle` it lost to is a
-  // published verdict the moment it lands, and any replica that reads it sees a
-  // spare handle past its reuse window with no registration and no run lease
-  // behind it -- so it reclaims. The reclaim does not merely beat the `running`
-  // answer to the entry; it removes the entry both answers are about, and the
-  // retry then finds no key, has nothing to insist against, and drops a
-  // measurement of live background work on the floor. The budget it had left is
-  // beside the point, which is why more of it is not the repair.
-  //
-  // Nothing tied the reclaim to the question still being asked. A verdict is
-  // published where every replica can read it; the probe that is still deciding
-  // it was not.
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1767,4 +1714,75 @@ test("gone reclamation respects an active run lease and a competing revision", a
       assert.ok(!k.deleted.includes(KEY), `${guard} must prevent a gone verdict from deleting ownership`);
     });
   }
+});
+
+test("positive verdicts refresh before expiry without restarting the idle window", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  let probes = 0;
+  const refresh = Promise.withResolvers<void>();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      probes += 1;
+      if (probes === 2) await refresh.promise;
+      return 0;
+    },
+  };
+  await sweep(deps);
+  const idleSince = k.current().idleSince;
+  const firstMeasurement = k.current().bgCheckedAt;
+  t.mock.timers.tick(4 * 60_000);
+  try {
+    await sweep(deps);
+    assert.equal(probes, 2, "refresh must start while the five-minute verdict is still valid");
+    assert.equal(k.current().bgCheckedAt, firstMeasurement, "the asynchronous refresh is pending");
+    t.mock.timers.tick(30_000);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, idleSince, "pending refresh keeps a valid positive verdict");
+  } finally {
+    refresh.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(k.current().bgCheckedAt, Date.now());
+  for (let minute = 0; minute < 12 && !k.deleted.includes(KEY); minute++) {
+    t.mock.timers.tick(60_000);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, idleSince);
+  }
+  assert.ok(k.deleted.includes(KEY), "repeated zero replies must complete the fifteen-minute window");
+});
+
+test("a failed refresh invalidates local and shared idle evidence immediately", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  assert.equal(k.current().bgRunning, 0);
+  t.mock.timers.tick(4 * 60_000);
+  const pendingEvidence = Promise.withResolvers<void>();
+  restoreProviders?.();
+  stubPingableProvider({
+    async get() {
+      await pendingEvidence.promise;
+      return { running: false, healthy: false, state: "unknown" };
+    },
+  });
+  const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("refresh failed"); } };
+  try {
+    await sweep(deps);
+    assert.equal(k.current().bgRunning, undefined, "the failed refresh invalidates the shared zero");
+    assert.equal(k.current().bgCheckedAt, undefined);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, Date.now(), "the local zero cannot survive a failed refresh");
+    assert.ok(!k.deleted.includes(KEY));
+  } finally {
+    pendingEvidence.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
+  resetBackgroundWorkStateForTest();
+  t.mock.timers.tick(16 * 60_000);
+  await sweep(deps);
+  assert.ok(!k.deleted.includes(KEY), "a restarted replica must also see the failure as unknown");
 });

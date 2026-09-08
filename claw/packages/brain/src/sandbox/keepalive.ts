@@ -629,6 +629,7 @@ type BackgroundWork = "running" | "idle" | "gone" | "unknown";
 
 /** Local measured-verdict reuse interval. */
 const BG_PROBE_TTL_MS = 5 * 60_000;
+const BG_PROBE_REFRESH_MS = 4 * 60_000;
 
 /**
  * Consecutive unanswered probes before reporting an unreconciled handle.
@@ -691,7 +692,6 @@ const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 
 let pingDeferred: string[] = [];
 
 
-/** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<
   string,
   {
@@ -892,7 +892,7 @@ function usableCachedVerdict(
   if (!measuredUnderThisIdlePeriod(
     cached.at, cached.idleSince, cached.idleRev, info, cached.state,
   )) return null;
-  if (cached.state === "gone"
+  if ((cached.state === "gone" || cached.state === "unknown")
     && (!cached.verdictAtStart || !sameVerdict(cached.verdictAtStart, info))) return null;
   return cached;
 }
@@ -923,7 +923,9 @@ function peekBackgroundWork(
   if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
   const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
-  if (cached?.state === "gone") return { state: "gone", source: "mem", at: cached.at };
+  if (cached?.state === "gone" || cached?.state === "unknown") {
+    return { state: cached.state, source: "mem", at: cached.at };
+  }
   // Cross-replica timestamps are not ordered. `running` therefore wins any
   // disagreement; when both say `running`, the later stamp only advances an anchor.
   if (cached?.state === "running" && shared?.state === "running") {
@@ -944,7 +946,7 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
   if (!info.handsUrl || !info.token) return false;
   // A verdict from another idle period cannot suppress a fresh probe.
   const cached = usableCachedVerdict(identity, info);
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
+  if (cached && cached.state !== "unknown" && Date.now() - cached.at < BG_PROBE_REFRESH_MS) return false;
   return !bgProbeInFlight.has(identity);
 }
 
@@ -1071,15 +1073,48 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
       await recordProbeVerdict(deps, probe, running > 0 ? "running" : "idle", running);
     } catch (err) {
       if (probeIsStale(probe)) return;
+      await invalidateProbeVerdict(deps, probe);
+      if (probeIsStale(probe)) return;
       const evidence = await readProbeEvidence(probe);
       if (probeIsStale(probe)) return;
       if (evidence.state === "unknown") reportUnknownProbe(probe, err);
       else await recordProbeVerdict(deps, probe, evidence.state, evidence.running);
     }
   } catch (err) {
-    if (!probeIsStale(probe)) reportUnknownProbe(probe, err);
+    if (!probeIsStale(probe)) {
+      await invalidateProbeVerdict(deps, probe);
+      if (!probeIsStale(probe)) reportUnknownProbe(probe, err);
+    }
   } finally {
     await releaseProbe(deps, key, identity, token);
+  }
+}
+
+async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProbe): Promise<void> {
+  const { key, identity, info, verdictAtStart } = probe;
+  bgProbeCache.set(identity, {
+    at: Date.now(), state: "unknown", epoch: info.idleEpoch,
+    idleSince: info.idleSince, idleRev: info.idleRev, verdictAtStart,
+  });
+  try {
+    const e = await deps.kv.get(key);
+    if (!e || probeIsStale(probe)) return;
+    const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(current) !== identity || !sameIdlePeriod(info.idleEpoch, current)
+      || info.idleSince !== current.idleSince || info.idleRev !== current.idleRev
+      || !sameVerdict(verdictAtStart, current)) return;
+    if (current.bgCheckedAt === undefined && current.bgRunning === undefined) {
+      bgProbeCache.delete(identity);
+      return;
+    }
+    for (const field of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"] as const) {
+      delete current[field];
+    }
+    await deps.kv.update(key, sc.encode(JSON.stringify(current)), e.revision);
+    if (!probeIsStale(probe)) bgProbeCache.delete(identity);
+    probe.verdictAtStart = verdictWitness(current);
+  } catch (err) {
+    logger.warn({ err, sessionId: probe.sessionId }, "keepalive.verdict_invalidation_failed");
   }
 }
 
