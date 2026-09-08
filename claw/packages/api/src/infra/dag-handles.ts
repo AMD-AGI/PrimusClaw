@@ -17,9 +17,22 @@
  */
 
 import { HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
+import type { KV } from "nats";
 import { js } from "./nats.js";
 
 const BUCKET = "DAG_HANDLES";
+
+/**
+ * The same bucket, for the one sweep that must also delete from it.
+ *
+ * `bindOnly` for the reason the module header gives: attaching must never make
+ * this process the bucket's creator. Writing is not what that rule is about --
+ * reading the wrong bucket is, and a sweep that deletes from the registry
+ * bucket instead of this one enumerates an empty map and reaps nothing.
+ */
+export async function dagHandlesBucket(): Promise<KV> {
+  return js.views.kv(BUCKET, { bindOnly: true });
+}
 
 export async function listDagHandles(): Promise<Array<[string, Record<string, HandleInfo>]>> {
   const bucket = await js.views.kv(BUCKET, { bindOnly: true });
