@@ -97,11 +97,9 @@ RUN npm run build -w packages/utils \
 # Sandbox runs this binary directly from shared storage or via Brain HTTP download.
 # Must run BEFORE src cleanup since bun build needs the TS source.
 #
-# Uses Debian 11 / Bullseye (glibc 2.31) so the binary runs on older base
-# images like sglang/ROCm (Ubuntu 20.04) and PyTorch (Ubuntu 20.04/22.04).
-# Previous Debian 12 builds linked to glibc 2.36 which caused immediate
-# crashes on containers with glibc < 2.36.
-FROM debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd AS bun-builder
+# Uses AlmaLinux 8 (glibc 2.28) so the binary runs on older base images like
+# sglang/ROCm and PyTorch without relying on an end-of-life build distribution.
+FROM almalinux:8-minimal@sha256:6cafa4a66d9a241a580cb6f2a20744f03ed1d1c4a882bb9eef81075c8131c8a8 AS bun-builder
 WORKDIR /app
 
 # Bun is installed from a pinned release archive whose checksum is verified,
@@ -110,15 +108,15 @@ WORKDIR /app
 # otherwise be whatever upstream published most recently.
 ARG BUN_VERSION=1.3.14
 ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
-RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+RUN microdnf install -y curl unzip ca-certificates \
+ && microdnf clean all \
  && curl -fsSL -o /tmp/bun.zip \
       "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
  && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
  && unzip -q /tmp/bun.zip -d /tmp/bun \
  && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
  && rm -rf /tmp/bun.zip /tmp/bun \
- && bun --version \
- && rm -rf /var/lib/apt/lists/*
+ && bun --version
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages ./packages
