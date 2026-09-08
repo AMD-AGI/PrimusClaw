@@ -5,8 +5,8 @@ SPDX-License-Identifier: MIT
 
 # Doorbell dispatch rollout
 
-How to turn on Doorbell chat dispatch and cluster-wide admission one value at a
-time, what to watch at each step, and how to get back to the shipped defaults.
+How to stage Doorbell chat dispatch and cluster-wide admission one value at a
+time, what to watch at each step, and how to roll them back safely.
 
 ## What this document is
 
@@ -685,10 +685,10 @@ symptom is `F` failing and you are mid-rollback with no serving API. The chart
 refuses to render that combination for the same reason.
 
 The "atomically" alternative is **not** "keep the ceilings, flip Doorbell
-only". It is **one config load landing directly on a validator-compatible final
-state** -- normally all eight ceilings `"0"` *and* `runDoorbellDispatch: false`
-together. It buys never sitting in the R1-to-R4 window and costs the R3 drain
-check, so it is for an emergency where a duplicated run is the lesser risk.
+only". It is **one config load landing directly on the rollback state** -- all
+eight ceilings `"0"` and `runDoorbellDispatch: false` together. It buys never
+sitting in the R1-to-R4 window and costs the R3 drain check, so it is for an
+emergency where a duplicated run is the lesser risk.
 
 ### Procedure
 

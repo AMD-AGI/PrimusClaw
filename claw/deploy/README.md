@@ -178,9 +178,10 @@ kubectl rollout restart deployment/primus-claw-brain -n primus-claw
 
 ### Doorbell Dispatch and Admission Ceilings
 
-`features.runDoorbellDispatch` and the eight `api.admit*` ceilings ship off and
-at `"0"`. Turning them on is a staged procedure with its own gates and a
-strict rollback order -- clear the ceilings first, disable Doorbell second, or
+`features.runDoorbellDispatch` ships on, while the eight `api.admit*` ceilings
+ship at `"0"`. The runtime capability floor keeps dispatch on the fat path until
+the fleet explicitly asserts support. Raising ceilings and rolling Doorbell back
+follow a strict order -- clear the ceilings first, disable Doorbell second, or
 the API refuses to start. See [`../docs/doorbell-rollout.md`](../docs/doorbell-rollout.md).
 
 `features.brainDoorbellExecution` is the Brain-side kill-switch and renders the

@@ -107,7 +107,7 @@ test("the sequential rollback is accepted in order and refused in reverse", () =
   assert.equal(validateRolloutConfig(REVERSE_ORDER).ok, false);
 });
 
-test("the atomic rollback and the shipped defaults are the same accepted state", () => {
+test("the atomic rollback state is accepted", () => {
   assert.deepEqual(validateRolloutConfig(R4_DOORBELL_OFF), { ok: true });
   assert.deepEqual(
     validateRolloutConfig({ doorbellDispatch: false, ceilings: ceilings() }),
