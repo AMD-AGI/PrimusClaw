@@ -297,23 +297,52 @@ export async function reconcileTargets(
 }
 
 /**
- * Renew this replica's entries, and release those nobody renewed.
+ * Renew the entries the census still accounts for, and let the rest age out.
  *
  * `named` is the set of identities a handle record still names; a bound entry
  * in it is adopted and renewed rather than released, because releasing a slot
  * for a target still being pinged is what carries the fleet past the ceiling.
+ *
+ * Renewal is decided by liveness, never by ownership. A replica that renewed
+ * every entry it had claimed reset the age on entries whose sandboxes were long
+ * gone, so `reap` never saw one past the horizon and never got to consult the
+ * census about it at all -- the roster then only grew, and admission refused
+ * every new sandbox against a count made almost entirely of corpses.
+ *
+ * Ageing is still what releases, not a single absent census: `censusComplete`
+ * says whether this sweep read the fleet whole, and one that did not renews on
+ * ownership and reaps nothing.
  */
 export async function renewAndReap(
   store: RosterStore, config: RosterConfig, named: Set<string>, now = Date.now(),
+  censusComplete = true,
 ): Promise<number> {
   return mutate<number>(store, config, (roster) => {
+    if (!censusComplete) {
+      // A census that could not be read whole is no evidence a target is gone.
+      // Aged against it, a live sandbox missing from the reading would free its
+      // slot while it is still being pinged -- the over-admission the ceiling
+      // exists to forbid. Renew on ownership, reap nothing, and leave the
+      // decision to the next sweep that reads the fleet whole.
+      const held = roster.entries.map((entry) =>
+        (entry.claimedBy === config.replicaId
+          || (entry.identity !== null && named.has(entry.identity))
+          ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now }
+          : entry));
+      return { write: { ...roster, entries: held }, result: held.length };
+    }
     // The one place reaping happens, and the only one that holds the set of
     // identities a handle record still names.
     const kept = reap(roster, config, now, named);
-    const entries = kept.entries.map((entry) =>
-      (entry.claimedBy === config.replicaId || (entry.identity && named.has(entry.identity))
-        ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now }
-        : entry));
+    const entries = kept.entries.map((entry) => {
+      // A provisional entry names no sandbox, so no census can ever account for
+      // it; the horizon is the only thing that can hold its slot while the
+      // sandbox it was claimed for is still being provisioned.
+      const accounted = entry.identity === null
+        ? entry.claimedBy === config.replicaId
+        : named.has(entry.identity);
+      return accounted ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now } : entry;
+    });
     return { write: { ...roster, entries }, result: entries.length };
   });
 }

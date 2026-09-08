@@ -300,3 +300,75 @@ test("a roster that cannot be written is raised, never answered as an empty flee
   await assert.rejects(() => claimProvisionalSlot(alwaysStale, CONFIG), RosterContended);
   await assert.rejects(() => renewAndReap(alwaysStale, CONFIG, new Set()), RosterContended);
 });
+
+/**
+ * The claiming replica is the one that sweeps its own targets in production,
+ * and it is the path every reap test above leaves out: they all reap from the
+ * non-claiming side, or with the target still in the census. Renewing on
+ * ownership rather than on liveness therefore held every dead entry forever,
+ * because the age `reap` tests was reset by the same sweep that should have
+ * retired it -- observed live as a roster of 103 entries against a ceiling of
+ * 16, of which 2 named a sandbox that still existed.
+ */
+test("the replica that claimed a target releases it once the census stops naming it",
+  async () => {
+    const shared = sharedStore();
+    const a = shared.store("replica-a");
+    const claim = await claimProvisionalSlot(a, CONFIG);
+    assert.ok(claim.ok);
+    await bindSlot(a, CONFIG, claim.token, "sandbox-dead");
+
+    // Sweeps arrive far more often than the horizon, exactly as in production.
+    const sweepMs = CONFIG.reclaimHorizonMs / 4;
+    const start = Date.now();
+    for (let i = 1; i <= 40; i++) {
+      await renewAndReap(a, CONFIG, new Set<string>(), start + i * sweepMs);
+    }
+
+    assert.equal(shared.peek()!.entries.length, 0,
+      "a target no census has named for ten reclaim horizons must not hold a slot");
+  });
+
+test("a target absent from one census is aged, not released", async () => {
+  // One census that missed a target is not proof the target is gone. The
+  // horizon has to stand between the two, or a sweep that raced a registration
+  // releases the slot of a sandbox that is still being pinged.
+  const shared = sharedStore();
+  const a = shared.store("replica-a");
+  const claim = await claimProvisionalSlot(a, CONFIG);
+  assert.ok(claim.ok);
+  await bindSlot(a, CONFIG, claim.token, "sandbox-quiet");
+  const bound = Date.now();
+
+  await renewAndReap(a, CONFIG, new Set<string>(), bound + CONFIG.reclaimHorizonMs - 1);
+  assert.equal(shared.peek()!.entries.length, 1, "held throughout the horizon");
+
+  // And it is adopted again the moment the census names it, with no memory of
+  // having been absent.
+  await renewAndReap(a, CONFIG, new Set(["sandbox-quiet"]), bound + CONFIG.reclaimHorizonMs - 1);
+  const readopted = shared.peek()!.entries[0];
+  assert.equal(readopted.identity, "sandbox-quiet");
+  await renewAndReap(a, CONFIG, new Set(["sandbox-quiet"]),
+    readopted.renewedAtMs + CONFIG.reclaimHorizonMs * 10);
+  assert.equal(shared.peek()!.entries.length, 1,
+    "a named target survives any age, because the census is what decides");
+});
+
+test("an incomplete census neither ages nor releases", async () => {
+  // A scan that could not read everything produces a smaller set. Ageing
+  // against it would free the slot of a live sandbox, which is the
+  // over-admission the ceiling exists to forbid.
+  const shared = sharedStore();
+  const a = shared.store("replica-a");
+  const claim = await claimProvisionalSlot(a, CONFIG);
+  assert.ok(claim.ok);
+  await bindSlot(a, CONFIG, claim.token, "sandbox-unread");
+  const bound = Date.now();
+
+  for (let i = 1; i <= 40; i++) {
+    await renewAndReap(a, CONFIG, new Set<string>(),
+      bound + i * CONFIG.reclaimHorizonMs, false);
+  }
+  assert.equal(shared.peek()!.entries.length, 1,
+    "a target a sweep could not read is not a target a sweep may retire");
+});

@@ -1670,7 +1670,9 @@ async function admitTargets(
         "keepalive.roster_capacity_breach",
       );
     }
-    await renewAndReap(deps.roster.store, deps.roster.config, new Set(identities));
+    await renewAndReap(
+      deps.roster.store, deps.roster.config, new Set(identities), Date.now(), censusComplete,
+    );
     if (censusComplete) {
       // Only a sweep that reconciled a complete census may lift the local
       // latch, or report the fleet counted: anything less returns the replica
