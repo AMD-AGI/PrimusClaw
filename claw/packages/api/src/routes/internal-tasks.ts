@@ -223,6 +223,12 @@ function attemptTokenOf(body: RunLeaseBody): AttemptToken {
   };
 }
 
+function isLegacyRunLease(body: RunLeaseBody): boolean {
+  return typeof body.brain_id === "string" && body.brain_id.trim().length > 0
+    && ["attempt_id", "claim_count", "delivery_seq", "delivery_count", "run_time"]
+      .every((field) => !Object.hasOwn(body, field));
+}
+
 /**
  * Widest lease a worker may ask for. A long one delays noticing a dead pod.
  *
@@ -286,6 +292,17 @@ type RenewalOutcome =
   | { kind: "refused" }
   | { kind: "unavailable" };
 
+function runPhasePatch(body: RunLeaseBody): string {
+  const phase = body.phase === "waiting" ? "waiting" : "executing";
+  return JSON.stringify({
+    phase,
+    wait_reason: phase === "waiting" ? (body.wait_reason ?? null) : null,
+    waited_ms: Math.max(Math.floor(Number(body.waited_ms) || 0), 0),
+    waits: Math.max(Math.floor(Number(body.waits) || 0), 0),
+    at: new Date().toISOString(),
+  });
+}
+
 /** Renew the lease and return whether its attempt fence was applied. */
 async function renewRunLease(
   taskId: string,
@@ -294,7 +311,6 @@ async function renewRunLease(
 ): Promise<RenewalOutcome> {
   const leaseSec = leaseSecondsFromBody(body);
   noteLeaseDisagreement(taskId, leaseSec);
-  const phase = body.phase === "waiting" ? "waiting" : "executing";
   try {
     const r = await db.query(
       `UPDATE claw_tasks
@@ -344,13 +360,7 @@ async function renewRunLease(
         taskId,
         body.brain_id || null,
         leaseSec,
-        JSON.stringify({
-          phase,
-          wait_reason: phase === "waiting" ? (body.wait_reason ?? null) : null,
-          waited_ms: Math.max(Math.floor(Number(body.waited_ms) || 0), 0),
-          waits: Math.max(Math.floor(Number(body.waits) || 0), 0),
-          at: new Date().toISOString(),
-        }),
+        runPhasePatch(body),
         RENEWABLE_STATUSES,
         token.attemptId,
         token.claimCount,
@@ -362,6 +372,47 @@ async function renewRunLease(
     return status ? { kind: "accepted", status } : { kind: "refused" };
   } catch (err) {
     logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_renew_failed");
+    return { kind: "unavailable" };
+  }
+}
+
+async function renewLegacyRunLease(
+  taskId: string, body: RunLeaseBody, authorization: string | undefined,
+): Promise<RenewalOutcome> {
+  const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  const tokenHash = createHash("sha256").update(bearer).digest("hex");
+  const leaseSec = leaseSecondsFromBody(body);
+  noteLeaseDisagreement(taskId, leaseSec);
+  try {
+    const r = await db.query(
+      `UPDATE claw_tasks
+          SET lease_owner = $2,
+              lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
+              heartbeat_at = NOW(),
+              metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb), '{run_phase}',
+                COALESCE(metadata->'run_phase', '{}'::jsonb) || $4::jsonb, true)
+        WHERE task_id = $1
+          AND status = ANY($5::text[])
+          -- Claim rotation can race authentication; fence the bearer again here.
+          AND internal_token_hash = $6
+          -- Generation never clears, so entering the attempt protocol closes this bridge.
+          AND attempt_generation = 0
+          AND attempt_id IS NULL
+          AND settled_attempt_id IS NULL
+          AND (delivery_seq, delivery_count) = (0, 0)
+          AND (
+            lease_owner = $2
+            OR (COALESCE(metadata->>'dispatch', '') <> 'doorbell'
+                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < NOW()))
+          )
+        RETURNING status`,
+      [taskId, body.brain_id, leaseSec, runPhasePatch(body), RENEWABLE_STATUSES, tokenHash],
+    );
+    const status = (r.rows[0] as { status?: string } | undefined)?.status;
+    return status ? { kind: "accepted", status } : { kind: "refused" };
+  } catch (err) {
+    logger.warn({ taskId, err: (err as Error)?.message }, "run.legacy_lease_renew_failed");
     return { kind: "unavailable" };
   }
 }
@@ -626,18 +677,18 @@ function registerLeaseRoute(app: FastifyInstance): void {
       const { taskId } = req.params;
       const body = req.body ?? {};
       const token = attemptTokenOf(body);
-      if (!token.ok) {
-        // Fail closed. Accepting a renewal nobody can attribute to an attempt
-        // is what lets a heartbeat that outlived its attempt revive a lease the
-        // row has already handed on.
+      if (!token.ok && !isLegacyRunLease(body)) {
+        // A partial modern token must never fall back to the legacy bridge.
         logger.warn({ taskId, missing: token.missing }, "run_lease.missing_attempt_token");
         return reply.status(400).send({
           ok: false, error: `attempt token incomplete: ${token.missing} is required`,
         });
       }
-      const outcome = await renewRunLease(taskId, body, token);
+      const outcome = token.ok
+        ? await renewRunLease(taskId, body, token)
+        : await renewLegacyRunLease(taskId, body, req.headers.authorization);
       if (outcome.kind === "accepted") {
-        await mergeRenewalCoverage(taskId, body, token);
+        if (token.ok) await mergeRenewalCoverage(taskId, body, token);
         return { ok: true, status: outcome.status };
       }
       // Nothing was banked: the fence never matched, so the coverage this body
