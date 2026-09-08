@@ -304,10 +304,9 @@ class StaleTransition extends Error {}
  *
  * The attempt token is cleared either way: the attempt is over, and a heartbeat
  * still in flight under it would otherwise renew a lease nobody is holding and
- * open a second record beside the one just closed. `releaseLease` additionally
- * drops the lease, which the fat retry needs and the completing run does not --
- * a redelivery lands on whichever replica pulls it, and a live lease owned by
- * another pod refuses its first renewal until the lease lapses.
+ * open a second record beside the one just closed. `releaseLease` expires the
+ * lease and releases its owner so a redelivery can renew immediately. The
+ * timestamp lets the reaper close the run if no replacement arrives.
  *
  * Fenced like a release, because a holder whose claim has since been taken is
  * settling somebody else's attempt.
@@ -340,7 +339,7 @@ export async function settleFinishedClaim(
                 heartbeat_at = NULL,
                 settled_attempt_id = COALESCE($3, settled_attempt_id),
                 lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
-                lease_expires_at = CASE WHEN $2 THEN NULL ELSE lease_expires_at END
+                lease_expires_at = CASE WHEN $2 THEN clock_timestamp() ELSE lease_expires_at END
           WHERE task_id = $1`,
         [taskId, releaseLease, closed],
       );

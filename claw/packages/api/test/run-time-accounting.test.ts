@@ -962,7 +962,8 @@ test("a fat retry's own delivery cannot re-adopt the attempt it just settled", a
   assert.equal(await settleAttempt("ktsk-fatlate", 0, undefined, true), 200);
 
   const settledFence = await fenceOf("ktsk-fatlate");
-  assert.equal(settledFence.lease_expires_at, null, "the retry gave the lease back");
+  assert.ok(settledFence.lease_expires_at instanceof Date);
+  assert.ok(settledFence.lease_expires_at.getTime() <= Date.now(), "the retry expired its lease");
 
   assert.equal((await renew("ktsk-fatlate", token)).statusCode, 409);
   assert.deepEqual(await fenceOf("ktsk-fatlate"), settledFence,
