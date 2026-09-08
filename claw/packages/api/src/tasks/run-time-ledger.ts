@@ -237,7 +237,7 @@ export async function mergeRenewal(
 export interface RunSettlement {
   /** The attempt's last word on its own time, if it sent one. */
   report?: RunTimeReport;
-  /** A final callback may precede every successful running or heartbeat write. */
+  /** Final settlement may precede every successful running or heartbeat write. */
   adoptUnrecordedAttempt?: boolean;
   /**
    * Close the attempt's open record and compute what it lost.

@@ -268,7 +268,9 @@ async function settleAndTransition(
   // Always a settlement, report or not: the attempt this boundary ends has a
   // record open, and leaving it open loses the only instant that says when it
   // stopped.
-  const settled: RunSettlement = { ...settlement, closeAttempt: true };
+  const settled: RunSettlement = {
+    ...settlement, closeAttempt: true, adoptUnrecordedAttempt: true,
+  };
   try {
     return await inTransaction(async (query) => {
       // A report from an attempt the row has moved past is refused, and the
