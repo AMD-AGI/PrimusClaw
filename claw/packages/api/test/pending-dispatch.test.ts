@@ -53,7 +53,13 @@ import { randomBytes } from "node:crypto";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 
 const originalQuery = db.query;
-const originalPorts = { ...pendingDispatchPorts };
+// Doorbell closed unless a test opens it. These cases are about fat dispatch,
+// and they used to reach it by inheriting a default that was off -- so the day
+// dispatch shipped on, every one of them silently changed which branch it
+// exercised. Saying it here keeps each test's subject its own to declare; the
+// doorbell cases below still override this port explicitly.
+const originalPorts = { ...pendingDispatchPorts, doorbellDispatch: () => null };
+Object.assign(pendingDispatchPorts, originalPorts);
 
 afterEach(() => {
   db.query = originalQuery;

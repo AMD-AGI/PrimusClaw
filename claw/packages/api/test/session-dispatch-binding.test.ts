@@ -36,7 +36,13 @@ import { closedDoorbellBarrier, openDoorbellBarrier } from "./doorbell-barrier-s
 interface SeenQuery { sql: string; params: unknown[] }
 
 const originalQuery = db.query;
-const originalPorts = { ...sessionDispatchPorts };
+// Doorbell closed unless a test opens it. These cases are about fat dispatch,
+// and they used to reach it by inheriting a default that was off -- so the day
+// dispatch shipped on, every one of them silently changed which branch it
+// exercised. Saying it here keeps each test's subject its own to declare; the
+// doorbell cases below still override this port explicitly.
+const originalPorts = { ...sessionDispatchPorts, doorbellDispatch: () => null };
+Object.assign(sessionDispatchPorts, originalPorts);
 afterEach(() => {
   db.query = originalQuery;
   Object.assign(sessionDispatchPorts, originalPorts);
