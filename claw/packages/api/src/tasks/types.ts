@@ -63,6 +63,7 @@ export interface ClawTaskRow {
   origin: "chat" | "task" | "dag_node" | "a2a" | null;
   created_at: string;
   queued_at: string | null;
+  run_time_epoch_at: string | null;
   started_at: string | null;
   /** When this run's active budget runs out. Null on rows that predate the column. */
   deadline_at: string | null;

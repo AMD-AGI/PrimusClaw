@@ -24,7 +24,11 @@ import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
-import { interruptSubject } from "@claw/protocol";
+import {
+  appendAttemptRecord, bankQueuedMs, endAttemptRecord, interruptSubject,
+  noteAttemptRenewal, openAttemptRecord,
+  type AttemptRecord,
+} from "@claw/protocol";
 import {
   envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
@@ -36,8 +40,11 @@ import { stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { handleMap } from "./sandbox-stopper.js";
 import {
   DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
-  RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL,
+  RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
 } from "./run-budget.js";
+import { applyTaskStatusTransition } from "./db.js";
+import type { ClawTaskRow } from "./types.js";
+import { applyToLedger, settleTerminalRuns } from "./run-time-ledger.js";
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
   releaseRunUseStrict,
@@ -124,38 +131,35 @@ let timer: NodeJS.Timeout | null = null;
  * also what it had before.
  */
 export async function reapStaleTasks(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-     SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
-         failure_reason = CASE
-                            WHEN status = 'cancelling' THEN 'cancelled'
-                            WHEN deadline_at IS NOT NULL
-                                 AND deadline_at < NOW() - ($3::int * INTERVAL '1 second')
-                              THEN 'run_budget_exhausted'
-                            ELSE 'brain_timeout'
-                          END,
-         error_message = CASE
-                           -- The same branch in the same position as the one
-                           -- above. Without it a run the user stopped is
-                           -- archived as cancelled, beside an error message
-                           -- saying its budget ran out.
-                           WHEN status = 'cancelling'
-                             THEN 'the run was cancelled; it never confirmed the stop, and the sweeper closed the row'
-                           WHEN deadline_at IS NOT NULL
-                                AND deadline_at < NOW() - ($3::int * INTERVAL '1 second')
-                             THEN 'run budget exhausted at ' || deadline_at
-                                  || '; the run did not report a terminal state within the grace period'
-                           ELSE $2
-                         END,
-         completed_at = NOW()
-     WHERE status IN ('preparing','running','cancelling')
+  const reaped = await applyTaskStatusTransition(
+    { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END", terminal: true },
+    {
+      setSql: [
+        `failure_reason = CASE
+             WHEN status = 'cancelling' THEN 'cancelled'
+             WHEN deadline_at IS NOT NULL
+                  AND deadline_at < NOW() - ($3::int * INTERVAL '1 second')
+               THEN 'run_budget_exhausted'
+             ELSE 'brain_timeout'
+           END`,
+        // The same branch in the same position as the one above. Without it a
+        // run the user stopped is archived as cancelled, beside an error
+        // message saying its budget ran out.
+        `error_message = CASE
+             WHEN status = 'cancelling'
+               THEN 'the run was cancelled; it never confirmed the stop, and the sweeper closed the row'
+             WHEN deadline_at IS NOT NULL
+                  AND deadline_at < NOW() - ($3::int * INTERVAL '1 second')
+               THEN 'run budget exhausted at ' || deadline_at
+                    || '; the run did not report a terminal state within the grace period'
+             ELSE $2
+           END`,
+      ],
+      where: `status IN ('preparing','running','cancelling')
        AND ($4::boolean OR origin IS DISTINCT FROM 'chat')
        -- The virtual DAG root is inserted at 'running' and never dispatched to
        -- a worker, so no lease and no liveness of its own: reapStuckDagRoots
-       -- judges it against its children instead. Excluded explicitly because
-       -- what exempts it today is only that nothing stamps its started_at --
-       -- an accident of the insert path, and one that would close a healthy
-       -- graph an hour in the moment anything did.
+       -- judges it against its children instead.
        AND executor IS DISTINCT FROM 'dag'
        AND (
          (deadline_at IS NOT NULL
@@ -163,25 +167,25 @@ export async function reapStaleTasks(): Promise<number> {
          OR
          -- The never-claimed arm. A healthy task or DAG node renews its lease
          -- immediately, so a NULL lease after this long means no worker ever
-         -- accepted the run (or one too old to speak the lease protocol did).
-         -- Its execution budget is independent: a deadline hours away must not
-         -- turn a missing worker into a run that claims to be alive for hours.
+         -- accepted the run.
          (lease_expires_at IS NULL
             AND started_at IS NOT NULL
             AND started_at < NOW() - ($1::int * INTERVAL '1 second')
+            -- a2a rows are closed by their own protocol, not by this backstop.
             AND origin IS DISTINCT FROM 'a2a')
-       )
-     RETURNING task_id, session_id, dag_root_task_id, deadline_at, sandbox_workload_id`,
-    [
-      BRAIN_TASK_TIMEOUT_SEC,
-      `no agent_done after ${BRAIN_TASK_TIMEOUT_SEC}s`,
-      RUN_BUDGET_BACKSTOP_GRACE_SEC,
-      RUN_ROWS_SWEEPABLE,
-    ],
+       )`,
+      params: [
+        BRAIN_TASK_TIMEOUT_SEC,
+        `no agent_done after ${BRAIN_TASK_TIMEOUT_SEC}s`,
+        RUN_BUDGET_BACKSTOP_GRACE_SEC,
+        RUN_ROWS_SWEEPABLE,
+      ],
+    },
   );
+  const r = { rowCount: reaped.length };
   if (!r.rowCount) return 0;
 
-  const rows = r.rows as Array<{
+  const rows = reaped as unknown as Array<{
     task_id: string;
     session_id: string;
     dag_root_task_id: string | null;
@@ -285,43 +289,39 @@ export const interruptPublisher = {
  *  greppable forever after).
  */
 export async function reapStuckDagRoots(): Promise<number> {
-  const reaped = await db.query(
-    `UPDATE claw_tasks parent
-        SET status         = 'failed',
-            failure_reason = 'dag_root_stuck',
-            error_message  = 'reaper: child(ren) failed but dag_root still running',
-            completed_at   = NOW()
-      WHERE parent.dag_node_id = '__dag_root__'
-        AND parent.status IN ('running','preparing')
-        AND parent.created_at < NOW() - ($1::int * INTERVAL '1 second')
+  const reaped = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "dag_root_stuck",
+      error_message: "reaper: child(ren) failed but dag_root still running",
+    },
+    where: `dag_node_id = '__dag_root__'
+        AND status IN ('running','preparing')
+        AND created_at < NOW() - ($1::int * INTERVAL '1 second')
         AND EXISTS (
           SELECT 1 FROM claw_tasks child
-           WHERE child.dag_root_task_id = parent.task_id
+           WHERE child.dag_root_task_id = claw_tasks.task_id
              AND child.dag_node_id <> '__dag_root__'
              AND child.status = 'failed'
-        )
-      RETURNING task_id`,
-    [BRAIN_TASK_TIMEOUT_SEC],
-  );
-  if (!reaped.rowCount) return 0;
-  const ids = reaped.rows.map((r) => (r as { task_id: string }).task_id);
-  const cascade = await db.query(
-    `UPDATE claw_tasks child
-        SET status         = 'failed',
-            failure_reason = 'deps_failed',
-            error_message  = 'cascaded from dag_root_stuck reap',
-            completed_at   = NOW()
-      WHERE child.dag_root_task_id = ANY($1::text[])
-        AND child.dag_node_id <> '__dag_root__'
-        AND child.status NOT IN ('failed','completed','cancelled')
-      RETURNING task_id`,
-    [ids],
-  );
+        )`,
+    params: [BRAIN_TASK_TIMEOUT_SEC],
+  });
+  if (!reaped.length) return 0;
+  const ids = reaped.map((r) => r.task_id);
+  const cascade = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "deps_failed",
+      error_message: "cascaded from dag_root_stuck reap",
+    },
+    where: `dag_root_task_id = ANY($1::text[])
+        AND dag_node_id <> '__dag_root__'
+        AND status NOT IN ('failed','completed','cancelled')`,
+    params: [ids],
+  });
   logger.warn(
-    { reapedRoots: reaped.rowCount, cascadedChildren: cascade.rowCount ?? 0, ids },
+    { reapedRoots: reaped.length, cascadedChildren: cascade.length, ids },
     "sweeper.reaped_dag_roots",
   );
-  return reaped.rowCount;
+  return reaped.length;
 }
 
 /**
@@ -375,32 +375,34 @@ export async function reapStuckDagRoots(): Promise<number> {
  * long as nobody collapses the string onto one line.
  */
 export async function requeueLostDoorbellLeases(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'queued',
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL,
-            metadata = ${requeueSojournSql("metadata")},
-            ${RUN_REQUEUE_RESET_SQL}
-      WHERE status IN ('preparing','running')
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+      started_at: null,
+    },
+    // Each trip round the requeue loop is measured as its own wait.
+    setSql: [`metadata = ${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")}`],
+    where: `status IN ('preparing','running')
         AND origin = 'chat'
         AND metadata->>'dispatch' = 'doorbell'
         AND lease_expires_at IS NOT NULL
         AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
-        AND (deadline_at IS NULL OR deadline_at > NOW())
-      RETURNING task_id, session_id`,
-    [LEASE_LOST_GRACE_SEC],
-  );
-  if (!r.rowCount) return 0;
+        AND (deadline_at IS NULL OR deadline_at > NOW())`,
+    params: [LEASE_LOST_GRACE_SEC],
+  });
+  if (!rows.length) return 0;
   logger.warn(
-    { requeued: r.rowCount, graceSec: LEASE_LOST_GRACE_SEC, rows: r.rows },
+    { requeued: rows.length, graceSec: LEASE_LOST_GRACE_SEC,
+      rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
     "sweeper.requeued_lost_doorbell_leases",
   );
-  metrics.onDoorbellLeaseRequeued(r.rowCount);
-  metrics.onQueueEntered("requeue", r.rowCount);
-  return r.rowCount;
+  metrics.onDoorbellLeaseRequeued(rows.length);
+  metrics.onQueueEntered("requeue", rows.length);
+  return rows.length;
 }
 
 /**
@@ -426,23 +428,19 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
  * and never reset, so a non-zero count means somebody held this run.
  */
 export async function reapExpiredQueuedRuns(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = 'queue_timeout',
-            error_message = 'queued past RUN_QUEUE_MAX_SEC without a worker claiming the run',
-            completed_at = NOW()
-      WHERE status = 'queued'
+  const reaped = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "queue_timeout",
+      error_message: "queued past RUN_QUEUE_MAX_SEC without a worker claiming the run",
+    },
+    where: `status = 'queued'
         AND origin = 'chat'
         AND metadata->>'dispatch' = 'doorbell'
         AND queued_at IS NOT NULL
-        AND queued_at < NOW() - ($1::int * INTERVAL '1 second')
-      RETURNING task_id, session_id, prompt, claim_count,
-                metadata->>'message_id' AS message_id,
-                metadata->>'queued_since' AS queued_since,
-                COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
-    [RUN_QUEUE_MAX_SEC],
-  );
+        AND queued_at < NOW() - ($1::int * INTERVAL '1 second')`,
+    params: [RUN_QUEUE_MAX_SEC],
+  });
+  const r = { rows: reaped.map(expiredRowOf), rowCount: reaped.length };
   if (!r.rowCount) return 0;
   // Ids, not rows: the RETURNING above carries `prompt` so the announcement
   // can quote the turn, and this sink has no redaction.
@@ -455,6 +453,10 @@ export async function reapExpiredQueuedRuns(): Promise<number> {
     // if it had written something.
     await releaseRunUse(row.task_id, false);
     await announceQueueTimeout(row);
+    // No claim ever completed, so there is no anchor instant in any domain to
+    // measure a loss from. Recorded as not computable rather than as zero,
+    // which for this class would read as "nothing was lost".
+    await recordSlotlessAttempt(row.task_id);
   }
   await releaseSessionsOfLostRuns(
     (r.rows as Array<{ session_id: string; message_id?: string | null }>)
@@ -469,6 +471,26 @@ function idsOf(rows: unknown[]): Array<{ task_id: string; session_id: string }> 
     task_id: (r as { task_id: string }).task_id,
     session_id: (r as { session_id: string }).session_id,
   }));
+}
+
+/** The announcement fields a reaper quotes, from the row it just closed. */
+function expiredRowOf(row: ClawTaskRow): ExpiredQueuedRow {
+  return {
+    task_id: row.task_id,
+    session_id: row.session_id,
+    prompt: row.prompt ?? null,
+    claim_count: (row as ClawTaskRow & { claim_count?: number }).claim_count ?? null,
+    message_id: (row.metadata?.message_id as string | undefined)
+      ?? (row as ClawTaskRow & { message_id?: string | null }).message_id ?? null,
+    // Restamped on every requeue, so this is when the current wait began rather
+    // than when the row was first written -- which is what the exit metric
+    // measures against.
+    queued_since: (row.metadata?.queued_since as string | undefined)
+      ?? (row as ClawTaskRow & { queued_since?: string | null }).queued_since ?? null,
+    user_id: (row.metadata?.user_id as string | undefined)
+      ?? (row.input?.user_id as string | undefined)
+      ?? (row as ClawTaskRow & { user_id?: string | null }).user_id ?? null,
+  };
 }
 
 interface ExpiredQueuedRow {
@@ -561,11 +583,11 @@ async function announceRunFailure(
  * row archived as retries-exhausted, with nothing recorded about why.
  *
  * Not `reapExpiredQueuedRuns`, which is the tempting second backstop and is not
- * one. It judges the wait from `queued_at`, and `RUN_REQUEUE_RESET_SQL` stamps
- * `queued_at = NOW()` on every requeue, so a row going round that loop never
- * accumulates `RUN_QUEUE_MAX_SEC` of queue time and this reaper never matches
- * it. Turning the budget off does not hand the backstop to the queue ceiling;
- * it leaves exactly one, counted in claims rather than in time.
+ * one. It judges the wait from `queued_at`, and `applyTaskStatusTransition`
+ * stamps a fresh `queued_at` on every requeue, so a row going round that loop
+ * never accumulates `RUN_QUEUE_MAX_SEC` of queue time and this reaper never
+ * matches it. Turning the budget off does not hand the backstop to the queue
+ * ceiling; it leaves exactly one, counted in claims rather than in time.
  *
  * Which is not merely untidy. The row keeps its slice of the admission count,
  * so a tenant's ceiling erodes one abandoned turn at a time, and it keeps the
@@ -578,37 +600,27 @@ async function announceRunFailure(
  * its own timeout is given the same chance to do it first.
  */
 export async function reapExpiredDoorbellRuns(): Promise<number> {
-  const r = await db.query(
-    // RETURNING gives the new status, and the queue accounting needs the old
-    // one: this reaper's WHERE is not queued-only, so only some of the rows it
-    // closes are leaving the queue.
-    `WITH prior AS (
-       SELECT task_id, status FROM claw_tasks
-        WHERE origin = 'chat'
-          AND metadata->>'dispatch' = 'doorbell'
-          AND status IN ('queued','preparing','running')
-          AND deadline_at IS NOT NULL
-          AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
-          AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-     )
-     UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = 'run_budget_exhausted',
-            error_message = 'run budget exhausted at ' || deadline_at
-                            || '; the lease lapsed after the deadline, so no worker could take it again',
-            completed_at = NOW(),
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL
-      FROM prior
-      WHERE claw_tasks.task_id = prior.task_id
-      RETURNING prior.status AS prior_status,
-                claw_tasks.task_id, session_id, prompt, claim_count,
-                metadata->>'message_id' AS message_id,
-                COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
-    [RUN_BUDGET_BACKSTOP_GRACE_SEC],
-  );
+  const reaped = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "run_budget_exhausted",
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+    },
+    setSql: [
+      "error_message = 'run budget exhausted at ' || deadline_at"
+      + " || '; the lease lapsed after the deadline, so no worker could take it again'",
+    ],
+    where: `origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND status IN ('queued','preparing','running')
+        AND deadline_at IS NOT NULL
+        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())`,
+    params: [RUN_BUDGET_BACKSTOP_GRACE_SEC],
+  });
+  const r = { rows: reaped.map(expiredRowOf), rowCount: reaped.length };
   if (!r.rowCount) return 0;
   logger.warn({ reaped: r.rowCount, ids: idsOf(r.rows) }, "sweeper.reaped_expired_doorbell_runs");
   for (const row of r.rows as ExpiredQueuedRow[]) {
@@ -631,19 +643,20 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 }
 
 export async function reapLostLeases(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status         = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
-            failure_reason = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'worker_lost' END,
-            error_message  = CASE
-                               WHEN status = 'cancelling'
-                                 THEN 'the run was cancelled; its worker went away before confirming the stop, '
-                                      || 'and the sweeper closed the row'
-                               ELSE 'the lease on this run expired at ' || lease_expires_at
-                                    || '; no worker has renewed it since'
-                             END,
-            completed_at   = NOW()
-      WHERE status IN ('preparing','running','cancelling')
+  const reaped = await applyTaskStatusTransition(
+    { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END", terminal: true },
+    {
+      setSql: [
+        "failure_reason = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'worker_lost' END",
+        `error_message = CASE
+             WHEN status = 'cancelling'
+               THEN 'the run was cancelled; its worker went away before confirming the stop, '
+                    || 'and the sweeper closed the row'
+             ELSE 'the lease on this run expired at ' || lease_expires_at
+                  || '; no worker has renewed it since'
+           END`,
+      ],
+      where: `status IN ('preparing','running','cancelling')
         AND lease_expires_at IS NOT NULL
         AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
         -- COALESCE, not a bare comparison: a fat chat row has no dispatch
@@ -659,33 +672,34 @@ export async function reapLostLeases(): Promise<number> {
           origin = 'chat'
           AND COALESCE(metadata->>'dispatch', '') = 'doorbell'
           AND status IN ('preparing','running')
-        )
-      RETURNING task_id, session_id, origin, lease_owner,
-                metadata->>'message_id' AS message_id,
-                sandbox_workload_id,
-                failure_reason,
-                prompt,
-                COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
-    [LEASE_LOST_GRACE_SEC],
+        )`,
+      params: [LEASE_LOST_GRACE_SEC],
+      // The loss instant has to be the database's, and this is the statement
+      // that detected the death.
+      returning: "clock_timestamp() AS detected_at",
+    },
   );
-  if (!r.rowCount) return 0;
-  const rows = r.rows as Array<{
-    task_id: string;
-    session_id: string;
-    origin: string;
-    lease_owner: string | null;
-    message_id: string | null;
-    sandbox_workload_id: string | null;
-    failure_reason: string;
-    prompt: string | null;
-    user_id: string | null;
-  }>;
+  if (!reaped.length) return 0;
+  const rows = reaped.map((row) => ({
+    task_id: row.task_id,
+    session_id: row.session_id,
+    origin: row.origin ?? "",
+    lease_owner: (row as ClawTaskRow & { lease_owner?: string | null }).lease_owner ?? null,
+    message_id: (row.metadata?.message_id as string | undefined) ?? null,
+    sandbox_workload_id: row.sandbox_workload_id ?? null,
+    failure_reason: row.failure_reason ?? "",
+    prompt: row.prompt ?? null,
+    user_id: (row.metadata?.user_id as string | undefined)
+      ?? (row.input?.user_id as string | undefined) ?? null,
+    attempt_id: (row as ClawTaskRow & { attempt_id?: string | null }).attempt_id ?? null,
+    heartbeat_at: (row as ClawTaskRow & { heartbeat_at?: unknown }).heartbeat_at,
+    detected_at: (row as ClawTaskRow & { detected_at?: unknown }).detected_at,
+  }));
+  for (const row of rows) await recordDeadAttempt(row);
   logger.warn(
     {
-      reaped: r.rowCount,
+      reaped: rows.length,
       graceSec: LEASE_LOST_GRACE_SEC,
-      // prompt is intentionally dropped: it is user input, and RETURNING now
-      // carries it for the announce below. Everything else is diagnostic.
       rows: rows.map(({ prompt: _prompt, ...rest }) => rest),
     },
     "sweeper.reaped_lost_leases",
@@ -766,7 +780,7 @@ export async function reapLostLeases(): Promise<number> {
     logger.warn({ err }, "sweeper.lost_lease_platform_backfill_failed");
     return 0;
   });
-  return r.rowCount;
+  return rows.length;
 }
 
 /**
@@ -829,47 +843,32 @@ async function closeUnclaimedDispatchSiblings(
     messageIds.push(row.message_id);
   }
   if (!sessionIds.length) return;
-  const r = await db.query(
-    `WITH prior AS (
-       SELECT task_id, status FROM claw_tasks
-        WHERE session_id = ANY($1::text[])
-          AND metadata->>'message_id' = ANY($2::text[])
-     )
-     UPDATE claw_tasks t
-        SET status         = 'failed',
-            failure_reason = 'dispatch_retried',
-            error_message  = 'a retried dispatch opened this row a second time; the turn ran '
-                             || 'under the row that held the lease, and no worker ever claimed this one',
-            completed_at   = NOW()
-       FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
-      WHERE t.session_id = sibling.session_id
-        AND t.metadata->>'message_id' = sibling.message_id
-        AND t.origin = 'chat'
+  const closed = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "dispatch_retried",
+      error_message: "a retried dispatch opened this row a second time; the turn ran "
+        + "under the row that held the lease, and no worker ever claimed this one",
+    },
+    // The pairing arrives as a predicate: two arrays zipped by unnest, so a
+    // sibling is matched on session and message id together rather than on
+    // either alone.
+    where: `EXISTS (
+          SELECT 1 FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
+           WHERE claw_tasks.session_id = sibling.session_id
+             AND claw_tasks.metadata->>'message_id' = sibling.message_id
+        )
+        AND origin = 'chat'
         -- A doorbell spare actually sits at queued. The rest of this list is
         -- the world before the doorbell, when every row a dispatch opened went
-        -- straight to preparing; a retried doorbell dispatch opens its second
-        -- row at queued with no lease, so none of the three matched and the
-        -- spare survived the pass written to close it. It then holds the
-        -- session gate shut -- closeChatRun counts queued as occupying -- and,
-        -- worse, still satisfies peekNextQueued, so the row whose whole
-        -- description is "no worker ever claimed this one" gets claimed and
-        -- runs the turn a second time.
-        -- (No backticks: this statement is a template literal.)
-        AND t.status IN ('queued','preparing','running','cancelling')
-        AND t.lease_expires_at IS NULL
+        -- straight to preparing.
+        AND status IN ('queued','preparing','running','cancelling')
+        AND lease_expires_at IS NULL
         -- Never claimed, which is what this row's own error message says about
-        -- it. Without this, adding queued above would also catch a row
-        -- requeueLostDoorbellLeases had just put back: that pass runs one step
-        -- earlier in the same tick and leaves the row queued with no lease, so
-        -- a turn deliberately handed back for another attempt would be closed
-        -- as a duplicate instead. A requeue resets queued_at and started_at
-        -- and deliberately not claim_count, so the counter still separates the
-        -- two: a spare no worker ever took is 0, a requeued row is at least 1.
-        AND COALESCE(t.claim_count, 0) = 0
-      RETURNING t.task_id,
-                (SELECT p.status FROM prior p WHERE p.task_id = t.task_id) AS prior_status`,
-    [sessionIds, messageIds],
-  );
+        -- it: a spare no worker ever took is 0, a requeued row is at least 1.
+        AND COALESCE(claim_count, 0) = 0`,
+    params: [sessionIds, messageIds],
+  });
+  const r = { rowCount: closed.length, rows: closed };
   if (!r.rowCount) return;
   metrics.onQueueExited("duplicate_closed", queuedExits(r.rows));
   logger.warn(
@@ -1477,28 +1476,22 @@ export async function drainOrphanedPendingMessages(limit = 20): Promise<number> 
 
 /** Fail `waiting_external` rows past their per-node timeout. */
 export async function reapWaitExternal(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-     SET status = 'failed', failure_reason = 'external_timeout',
-         error_message = 'wait_external did not resolve in time',
-         completed_at = NOW()
-     WHERE status = 'waiting_external'
-       AND COALESCE(
-             (metadata->'derived'->>'wait_external_timeout_sec')::int,
-             $1
-           ) > 0
+  const rows = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "external_timeout",
+      error_message: "wait_external did not resolve in time",
+    },
+    where: `status = 'waiting_external'
+       AND COALESCE((metadata->'derived'->>'wait_external_timeout_sec')::int, $1) > 0
        AND completed_at IS NULL
        AND queued_at IS NOT NULL
        AND queued_at < NOW() - (
-         COALESCE(
-           (metadata->'derived'->>'wait_external_timeout_sec')::int,
-           $1
-         ) * INTERVAL '1 second'
-       )
-     RETURNING task_id`,
-    [WAIT_EXTERNAL_DEFAULT_SEC],
-  );
-  return r.rowCount ?? 0;
+         COALESCE((metadata->'derived'->>'wait_external_timeout_sec')::int, $1)
+         * INTERVAL '1 second'
+       )`,
+    params: [WAIT_EXTERNAL_DEFAULT_SEC],
+  });
+  return rows.length;
 }
 
 /**
@@ -1709,6 +1702,9 @@ export async function sweeperTick(): Promise<void> {
   // still exist and is a no-op unless WORKSPACE_IDLE_RELEASE_DAYS is set.
   await runContained("sweeper.release_deleted_refs_failed", releaseRefsOfDeletedSessions);
   await runContained("sweeper.release_idle_refs_failed", releaseRefsOfIdleSessions);
+  // After every reaper that can close a row, so a run this tick ended has its
+  // terminal instant pinned in the same tick rather than the next one.
+  await runContained("sweeper.settle_run_time_failed", settleTerminalRuns);
   // Maintenance: prune expired idempotency rows last so a failure here can't
   // skip the task reapers above.
   await runContained("sweeper.idempotency_prune_failed", reapExpiredIdempotency);
@@ -1736,4 +1732,70 @@ export function stopSweeper(): void {
     clearTimeout(timer);
     timer = null;
   }
+}
+
+/** A database instant as an ISO string, or null when the row carried none. */
+function instantOf(value: unknown): string | null {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) return value;
+  return null;
+}
+
+/** No claim ever completed, so no anchor instant exists in any domain. */
+const slotlessRecord = (): AttemptRecord => ({
+  attemptId: null,
+  attemptGeneration: null,
+  startedAtDb: null,
+  renewed: false,
+  recoveryLoss: { computable: false, lossMs: null },
+});
+
+/**
+ * Close the record of an attempt whose worker went away.
+ *
+ * The anchor is the attempt's own start, from the record its allocation
+ * opened. The row's `started_at` cannot serve: `takeClaim` COALESCEs it, so
+ * after a redelivery it names the first attempt's start and would charge every
+ * later attempt with its predecessors' whole lifetimes. `heartbeat_at` cannot
+ * either, for an attempt that never renewed -- it is stamped in the same
+ * UPDATE as `started_at`, so the difference is zero by construction.
+ *
+ * An attempt with no open record never reached the allocating write, and is
+ * recorded as the class whose loss is explicitly not computable.
+ */
+async function recordDeadAttempt(row: {
+  task_id: string;
+  attempt_id: string | null;
+  heartbeat_at: unknown;
+  detected_at: unknown;
+}): Promise<void> {
+  // The detection instant has to be the database's: a loss measured from an
+  // API-pod clock against a DB-written anchor is a cross-domain subtraction
+  // with no offset behind it, which this accounting does not do.
+  const detectedAtDb = instantOf(row.detected_at);
+  if (!detectedAtDb) return;
+  const attemptId = row.attempt_id;
+  const heartbeatAtDb = instantOf(row.heartbeat_at) ?? undefined;
+  await applyToLedger(row.task_id, { key: row.task_id, source: "task_id" }, (read) => {
+    const banked = bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb);
+    const open = attemptId ? openAttemptRecord(banked, attemptId) : undefined;
+    if (!open || !attemptId) return appendAttemptRecord(banked, slotlessRecord());
+    const renewed = !!heartbeatAtDb && !!open.startedAtDb && heartbeatAtDb > open.startedAtDb;
+    const observed = renewed ? noteAttemptRenewal(banked, attemptId, heartbeatAtDb!) : banked;
+    return endAttemptRecord(observed, attemptId, detectedAtDb);
+  }).catch((err) => {
+    logger.warn({ taskId: row.task_id, err: (err as Error)?.message }, "sweeper.attempt_record_failed");
+    return null;
+  });
+}
+
+/** A row dispatched but never claimed: no attempt id, no generation, no anchor. */
+async function recordSlotlessAttempt(taskId: string): Promise<void> {
+  await applyToLedger(taskId, { key: taskId, source: "task_id" }, (read) =>
+    appendAttemptRecord(
+      bankQueuedMs(read.entry, read.queuedTotalMs, read.readAtDb), slotlessRecord()),
+  ).catch((err) => {
+    logger.warn({ taskId, err: (err as Error)?.message }, "sweeper.attempt_record_failed");
+    return null;
+  });
 }

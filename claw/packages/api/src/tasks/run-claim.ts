@@ -16,7 +16,7 @@ import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db, RUN_CLAIM_FENCE_SQL } from "../infra/db.js";
+import { db, inTransaction, RUN_CLAIM_FENCE_SQL, type Querier } from "../infra/db.js";
 import {
   anySoftCeilingSet, askFromRow, chargeAccepted, deferQueuedBySoftCeiling, envAdmitLimits,
   fillWithinCeiling, loadUsageWithRoots, runImmediately, softOverflow,
@@ -26,12 +26,12 @@ import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
+import { applyTaskStatusTransition } from "./db.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
-import {
-  deadlineStampSql, requeueSojournSql, RUN_BUDGET_DEFAULT_SEC, RUN_REQUEUE_RESET_SQL,
-} from "./run-budget.js";
+import { requeueSojournSql } from "./run-budget.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
+import { settleRunTime, type RunSettlement } from "./run-time-ledger.js";
 import type { ClawTaskRow } from "./types.js";
 
 /**
@@ -39,7 +39,7 @@ import type { ClawTaskRow } from "./types.js";
  * drive it inside a transaction of its own; substituting the `db` singleton
  * instead puts both transactions on one connection, which is no interleaving.
  */
-export interface Querier {
+export interface StatementSource {
   query(text: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
 }
 
@@ -128,9 +128,9 @@ async function takeUnderSoftCeiling(
   taskId: string,
   brainId: string,
   doorbellSemantics: number,
-  q: Querier | undefined,
+  q: StatementSource | undefined,
 ): Promise<TakenRow | "missing" | "busy" | "deferred"> {
-  const gated = async (on: Querier, afterCommit: AfterCommit) => {
+  const gated = async (on: StatementSource, afterCommit: AfterCommit) => {
     if (await deferQueuedBySoftCeiling(taskId, on)) return "deferred" as const;
     const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, on);
     if (typeof taken !== "string" && taken.prior_status === "queued") {
@@ -148,7 +148,7 @@ export async function claimRunById(
   taskId: string,
   brainId: string,
   doorbellSemantics = 1,
-  q?: Querier,
+  q?: StatementSource,
 ): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim> {
   const taken = await takeUnderSoftCeiling(taskId, brainId, doorbellSemantics, q);
   if (taken === "missing" || taken === "busy" || taken === "deferred") return taken;
@@ -355,7 +355,7 @@ async function peekNextQueued(skip: string[], doorbellSemantics: number): Promis
 async function peekNextQueuedRows(
   skip: string[],
   doorbellSemantics: number,
-  q: Querier,
+  q: StatementSource,
 ): Promise<ClawTaskRow[]> {
   const r = await q.query(
     `SELECT * FROM claw_tasks
@@ -378,25 +378,22 @@ async function peekNextQueuedRows(
 }
 
 async function markUnclaimable(taskId: string): Promise<void> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = 'unclaimable',
-            error_message = 'run spec could not be hydrated at claim time',
-            completed_at = NOW(),
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL
-      WHERE task_id = $1
-        AND status IN ('queued','preparing')
-      RETURNING *`,
-    [taskId],
-  ).catch((err) => {
+  const rows = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "unclaimable",
+      error_message: "run spec could not be hydrated at claim time",
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+    },
+    where: "task_id = $1 AND status IN ('queued','preparing')",
+    params: [taskId],
+  }).catch((err) => {
     logger.warn({ err, taskId }, "run.claim.mark_unclaimable_failed");
-    return { rows: [], rowCount: 0 };
+    return [] as ClawTaskRow[];
   });
-  const row = r.rows[0] as ClawTaskRow | undefined;
+  const row = rows[0];
   if (!row) return;
   await releaseRunUse(taskId, false);
   await announceClaimFailure(
@@ -404,6 +401,106 @@ async function markUnclaimable(taskId: string): Promise<void> {
     "unclaimable",
     "Task failed: this run could not be started. Please send a new message.",
   );
+}
+
+/**
+ * Settle the run's time and move the row, as one transaction.
+ *
+ * Rolled back whole when the transition's own fence matches no row: committing
+ * the merge while the release fails is how a superseded attempt's final report
+ * lands in a ledger that now belongs to somebody else.
+ */
+async function settleAndTransition(
+  taskId: string,
+  settlement: RunSettlement | undefined,
+  transition: (query: Querier) => Promise<ClawTaskRow[]>,
+): Promise<boolean> {
+  // Always a settlement, report or not: the attempt this boundary ends has a
+  // record open, and leaving it open loses the only instant that says when it
+  // stopped.
+  const settled: RunSettlement = {
+    ...settlement, closeAttempt: true, adoptUnrecordedAttempt: true,
+  };
+  try {
+    return await inTransaction(async (query) => {
+      // A report from an attempt the row has moved past is refused, and the
+      // release beside it goes with it: whoever holds the row now is entitled
+      // to it, and this caller is settling somebody else's run.
+      const outcome = await settleRunTime(query, taskId, settled);
+      // Only a superseded attempt voids the release. A row whose ledger cannot
+      // be read is refused by the transition's own fence a moment later, and
+      // failing here would replace that answer with a less informative one.
+      if (!outcome.ok && outcome.reason === "stale_attempt") throw new StaleTransition();
+      const rows = await transition(query);
+      if (rows.length === 0) throw new StaleTransition();
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
+}
+
+/** The transition's fence matched nothing, so its whole transaction is void. */
+class StaleTransition extends Error {}
+
+/**
+ * End a holder's attempt without moving the row between states.
+ *
+ * Two boundaries reach here, and neither has a transition of its own. A claimed
+ * chat run that succeeded carries no `callback_url`, so no `agent_done` arrives
+ * and the completion event closes the row later knowing nothing about which
+ * attempt ran it. A fat delivery that naks for a retry has no release endpoint
+ * at all -- JetStream redelivers the same message -- so this is where its
+ * coverage and its record are settled.
+ *
+ * The attempt token is cleared either way: the attempt is over, and a heartbeat
+ * still in flight under it would otherwise renew a lease nobody is holding and
+ * open a second record beside the one just closed. `releaseLease` expires the
+ * lease and releases its owner so a redelivery can renew immediately. The
+ * timestamp lets the reaper close the run if no replacement arrives.
+ *
+ * Fenced like a release, because a holder whose claim has since been taken is
+ * settling somebody else's attempt.
+ */
+export async function settleFinishedClaim(
+  taskId: string,
+  brainId: string,
+  claimCount?: number,
+  settlement?: RunSettlement,
+  releaseLease = false,
+): Promise<boolean> {
+  const settled: RunSettlement = { ...settlement, closeAttempt: true };
+  try {
+    return await inTransaction(async (query) => {
+      const held = await query(
+        `SELECT attempt_id FROM claw_tasks
+          WHERE task_id = $1 AND lease_owner = $2
+            AND ($3::int IS NULL OR claim_count = $3)
+          FOR UPDATE`,
+        [taskId, brainId, claimCount ?? null],
+      );
+      if (held.rowCount === 0) throw new StaleTransition();
+      const outcome = await settleRunTime(query, taskId, settled);
+      if (!outcome.ok) throw new StaleTransition();
+      const closed = settlement?.report?.attemptId
+        ?? (held.rows[0] as { attempt_id: string | null }).attempt_id;
+      await query(
+        `UPDATE claw_tasks
+            SET attempt_id = NULL,
+                heartbeat_at = NULL,
+                settled_attempt_id = COALESCE($3, settled_attempt_id),
+                lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
+                lease_expires_at = CASE WHEN $2 THEN clock_timestamp() ELSE lease_expires_at END
+          WHERE task_id = $1`,
+        [taskId, releaseLease, closed],
+      );
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
 }
 
 /**
@@ -438,27 +535,36 @@ export async function releaseClaim(
   brainId: string,
   claimCount?: number,
   reason?: string,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'queued',
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL,
-            metadata = ${requeueSojournSql(`CASE
-                         WHEN $4::text IS NULL THEN metadata
-                         ELSE metadata || jsonb_build_object('last_release', $4::text)
-                       END`)},
-            ${RUN_REQUEUE_RESET_SQL}
-      WHERE task_id = $1
+  // `setSql` rather than `extra.metadata`: one statement may assign a column
+  // once, and this assignment does two things -- carry the release reason and
+  // restamp the sojourn marker, so a row going round the requeue loop three
+  // times is measured as three waits rather than one that keeps growing.
+  const released = await settleAndTransition(taskId, settlement, (query) =>
+    applyTaskStatusTransition("queued", {
+      extra: {
+        lease_owner: null,
+        lease_expires_at: null,
+        heartbeat_at: null,
+        internal_token_hash: null,
+        // Cleared with the status, so a heartbeat racing this release cannot
+        // find the row still holding the attempt it is reporting for.
+        attempt_id: null,
+        started_at: null,
+      },
+      setSql: [`metadata = ${requeueSojournSql(`CASE
+                         WHEN $4::text IS NULL THEN COALESCE(metadata, '{}'::jsonb)
+                         ELSE COALESCE(metadata, '{}'::jsonb)
+                              || jsonb_build_object('last_release', $4::text)
+                       END`)}`],
+      where: `task_id = $1
         AND lease_owner = $2
         AND status IN ('queued','preparing','running')
-        AND ($3::int IS NULL OR claim_count = $3)
-      RETURNING task_id`,
-    [taskId, brainId, claimCount ?? null, reason ?? null],
-  );
-  const released = (r.rowCount ?? 0) > 0;
+        AND ($3::int IS NULL OR claim_count = $3)`,
+      params: [taskId, brainId, claimCount ?? null, reason ?? null],
+      query,
+    }));
   if (released) metrics.onQueueEntered("requeue");
   return released;
 }
@@ -506,26 +612,28 @@ export async function failHeldClaim(
   brainId: string,
   reason: HeldClaimFailureReason = "session_deleted",
   claimCount?: number,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = $3,
-            error_message = $4,
-            completed_at = NOW(),
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL
-      WHERE task_id = $1
+  const closed = await settleAndTransition(taskId, settlement, (query) =>
+    applyTaskStatusTransition("failed", {
+      extra: {
+        failure_reason: reason,
+        error_message: HELD_CLAIM_MESSAGE[reason],
+        lease_owner: null,
+        lease_expires_at: null,
+        heartbeat_at: null,
+        internal_token_hash: null,
+        attempt_id: null,
+      },
+      where: `task_id = $1
         AND lease_owner = $2
         AND origin = 'chat'
         AND status IN ('queued','preparing','running')
-        AND ($5::int IS NULL OR claim_count = $5)
-      RETURNING task_id`,
-    [taskId, brainId, reason, HELD_CLAIM_MESSAGE[reason], claimCount ?? null],
-  );
-  if ((r.rowCount ?? 0) === 0) return false;
+        AND ($3::int IS NULL OR claim_count = $3)`,
+      params: [taskId, brainId, claimCount ?? null],
+      query,
+    }));
+  if (!closed) return false;
   await releaseRunUse(taskId, false);
   return true;
 }
@@ -555,35 +663,44 @@ async function takeClaim(
   taskId: string,
   brainId: string,
   doorbellSemantics: number,
-  q: Querier,
+  q: StatementSource,
 ): Promise<TakenRow | "missing" | "busy"> {
   const token = randomBytes(32).toString("hex");
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
-  // RETURNING gives the new status, and this is the only place that can still
-  // tell whether the claim was a queue exit.
-  const r = await q.query(
-    `WITH prior AS (
-       SELECT task_id, status, metadata->>'queued_since' AS queued_since
-         FROM claw_tasks WHERE task_id = $1
-     )
-     UPDATE claw_tasks
-        SET lease_owner = $2,
-            lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
-            heartbeat_at = NOW(),
-            internal_token_hash = $4,
-            status = CASE WHEN claw_tasks.status = 'queued' THEN 'preparing' ELSE claw_tasks.status END,
-            started_at = COALESCE(claw_tasks.started_at, NOW()),
-            ${deadlineStampSql(6, 7)},
-            claim_count = COALESCE(claw_tasks.claim_count, 0) + 1
-      FROM prior
-      WHERE claw_tasks.task_id = prior.task_id
-        AND claw_tasks.task_id = $1
-        AND claw_tasks.origin = 'chat'
-        AND claw_tasks.metadata->>'dispatch' = 'doorbell'
-        AND claw_tasks.status = ANY($5::text[])
-        AND (claw_tasks.lease_expires_at IS NULL OR claw_tasks.lease_expires_at < NOW())
+  // The prior state, locked before the claim writes over it: this is the only
+  // place that can still tell whether the claim was a queue exit, and an
+  // UPDATE's RETURNING answers with what the row became.
+  const before = await q.query(
+    `SELECT status AS prior_status, metadata->>'queued_since' AS queued_since
+       FROM claw_tasks WHERE task_id = $1 FOR UPDATE`,
+    [taskId],
+  );
+  // Through the one writer of `status`, which stamps `started_at` and the
+  // execution deadline for `preparing` itself, so the explicit stamps this
+  // statement used to carry are its job now. `preparing` for a row already
+  // there leaves the status alone and banks a zero segment, which is what the
+  // old conditional expression said.
+  const rows = await applyTaskStatusTransition("preparing", {
+    extra: {
+      lease_owner: brainId,
+      internal_token_hash: hash,
+      // Every claim, a contention-only one included, invalidates the previous
+      // attempt's token, which closes the window the status guard leaves open
+      // when a claim restores the row to preparing under the same pod name.
+      attempt_id: null,
+    },
+    setSql: [
+      "lease_expires_at = NOW() + ($2::int * INTERVAL '1 millisecond')",
+      "heartbeat_at = NOW()",
+      "claim_count = COALESCE(claim_count, 0) + 1",
+    ],
+    where: `task_id = $1
+        AND origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND status = ANY($3::text[])
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks sibling
            WHERE sibling.session_id = claw_tasks.session_id
@@ -593,20 +710,20 @@ async function takeClaim(
              AND sibling.metadata->>'message_id' = claw_tasks.metadata->>'message_id'
              AND sibling.status IN ('preparing','running','cancelling')
         )
-        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$8")}
-        AND ${RUN_CLAIM_FENCE_SQL}
-      RETURNING claw_tasks.*, prior.status AS prior_status, prior.queued_since`,
-    [
-      taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE,
-      RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node, doorbellSemantics,
-    ],
-  );
-  if ((r.rowCount ?? 0) === 0) {
-    const exists = await q.query(`SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId]);
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$4")}
+        AND ${RUN_CLAIM_FENCE_SQL}`,
+    params: [taskId, RUN_LEASE_TTL_MS, CLAIMABLE, doorbellSemantics],
+    query: ((text, params) => q.query(text, params)) as Querier,
+  });
+  if (rows.length === 0) {
+    const exists = await q.query(
+      `SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId],
+    );
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }
-  const row = r.rows[0] as TakenRow;
+  const prior = before.rows[0] as { prior_status?: string; queued_since?: string } | undefined;
+  const row = { ...rows[0], ...(prior ?? {}) } as TakenRow;
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }
@@ -620,7 +737,7 @@ async function takeClaimOrBusy(
   taskId: string,
   brainId: string,
   doorbellSemantics: number,
-  q: Querier,
+  q: StatementSource,
 ): Promise<TakenRow | "missing" | "busy"> {
   try {
     return await takeClaim(taskId, brainId, doorbellSemantics, q);
@@ -743,7 +860,7 @@ function claimCountOf(row: ClawTaskRow): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
+async function failExhaustedClaim(row: ClawTaskRow, settlement?: RunSettlement): Promise<boolean> {
   let closed = false;
   // Why it ran out, when the last holder said. The brain has a
   // `lock_contention_exhausted` verdict of its own, but on the doorbell path
@@ -759,22 +876,21 @@ async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
     ? "the workspace this run needs stayed busy for its whole claim budget"
     : "claimed too many times without a terminal result";
   try {
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = 'failed',
-              failure_reason = $2,
-              error_message = $3,
-              completed_at = NOW(),
-              lease_owner = NULL,
-              lease_expires_at = NULL,
-              heartbeat_at = NULL,
-              internal_token_hash = NULL
-        WHERE task_id = $1
-          AND status IN ('queued','preparing','running')
-        RETURNING task_id`,
-      [row.task_id, failureReason, message],
-    );
-    closed = (r.rowCount ?? 0) > 0;
+    closed = await settleAndTransition(row.task_id, settlement, (query) =>
+      applyTaskStatusTransition("failed", {
+        extra: {
+          failure_reason: failureReason,
+          error_message: message,
+          lease_owner: null,
+          lease_expires_at: null,
+          heartbeat_at: null,
+          internal_token_hash: null,
+          attempt_id: null,
+        },
+        where: "task_id = $1 AND status IN ('queued','preparing','running')",
+        params: [row.task_id],
+        query,
+      }));
   } catch (err) {
     logger.warn({ err, taskId: row.task_id }, "run.claim.mark_exhausted_failed");
     return false;

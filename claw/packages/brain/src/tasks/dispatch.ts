@@ -592,7 +592,10 @@ async function handleResolvedRequest(
   // button, cancelTask and the sweeper all address a session or a DAG root.
   registerRunAddresses(lockKey, [request.session_id, request.dag_root_task_id]);
   // Track promise for graceful drain.
-  const taskPromise = runHandleTask(msg, request, sessionId, lockKey, messageId, userId, abortCtrl);
+  const taskPromise = runHandleTask(
+    msg, request, sessionId, lockKey, messageId, userId, abortCtrl,
+    claimedDoorbell ? { claimCount: claimGeneration ?? 0 } : null,
+  );
   inflightHandleTasks.add(taskPromise);
   taskPromise.finally(() => {
     inflightHandleTasks.delete(taskPromise);

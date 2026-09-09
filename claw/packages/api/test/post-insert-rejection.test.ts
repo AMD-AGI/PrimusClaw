@@ -85,7 +85,10 @@ describe("a post-insert refusal erases its row", { skip }, () => {
   test("the discard and the settle bind one predicate", async () => {
     const { readFile } = await import("node:fs/promises");
     const src = await readFile(new URL("../src/tasks/chat-run.ts", import.meta.url), "utf8");
-    const uses = src.match(/WHERE \$\{unheldOpenRowSql\(/g) ?? [];
+    // The DELETE still splices it into its own `WHERE`; the UPDATE goes through
+    // `applyTaskStatusTransition`, which takes the predicate as `where:`. Two
+    // spellings, one guard -- which is what this asserts.
+    const uses = src.match(/(WHERE \$\{unheldOpenRowSql\(|where: unheldOpenRowSql\()/g) ?? [];
     assert.equal(uses.length, 2, "the DELETE and the UPDATE share the guard, verb aside");
     assert.match(src, /DELETE FROM claw_tasks\n\s*WHERE \$\{unheldOpenRowSql\(/);
   });

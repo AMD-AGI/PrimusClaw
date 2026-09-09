@@ -44,8 +44,8 @@ import { db } from "../infra/db.js";
 import { nc } from "../infra/nats.js";
 import { metrics, type QueueEntryCause } from "../infra/metrics.js";
 import { newTaskId } from "./ids.js";
-import { insertTask } from "./db.js";
-import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, type RunOrigin } from "./run-budget.js";
+import { applyTaskStatusTransition, insertTask } from "./db.js";
+import type { RunOrigin } from "./run-budget.js";
 import type { TaskStatus } from "./types.js";
 import { recordRunUse, releaseRunUse } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
@@ -608,15 +608,10 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
  */
 export async function markChatRunRunning(sessionId: string): Promise<void> {
   try {
-    await db.query(
-      `UPDATE claw_tasks
-          SET status = 'running',
-              ${deadlineStampSql(2, 3)}
-        WHERE session_id = $1
-          AND origin = 'chat'
-          AND status = 'preparing'`,
-      [sessionId, RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node],
-    );
+    await applyTaskStatusTransition("running", {
+      where: "session_id = $1 AND origin = 'chat' AND status = 'preparing'",
+      params: [sessionId],
+    });
   } catch (err) {
     logger.warn({ err, sessionId }, "chat_run.mark_running_failed");
   }
@@ -708,30 +703,27 @@ async function closeNamedChatRun(
   reason: string | null,
   message: string | null,
 ): Promise<ClosedRow[]> {
-  const r = await db.query(
-    `WITH prior AS (
-       SELECT status, metadata->>'queued_since' AS queued_since
-         FROM claw_tasks WHERE task_id = $1
-     )
-     UPDATE claw_tasks
-        SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
-      WHERE task_id = $1
+  // Prior state first, locked: the queue-exit metric is measured from what the
+  // row was, and a transition answers with what it became.
+  const before = await db.query(
+    `SELECT status AS prior_status, metadata->>'queued_since' AS queued_since
+       FROM claw_tasks WHERE task_id = $1 FOR UPDATE`,
+    [target.taskId],
+  );
+  const closed = await applyTaskStatusTransition(outcome, {
+    extra: { failure_reason: reason, error_message: message },
+    where: `task_id = $1
         AND session_id = $2
         AND origin IN ('chat','a2a')
-        AND status = ANY($6::text[])
+        AND status = ANY($3::text[])
         AND (
-             COALESCE(claim_count, 0) = $7::int
-          OR ($7::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
-        )
-      RETURNING task_id,
-                (SELECT p.status FROM prior p) AS prior_status,
-                (SELECT p.queued_since FROM prior p) AS queued_since`,
-    [
-      target.taskId, sessionId, outcome, reason, message,
-      CLOSEABLE_RUN_STATUSES, target.runClaim ?? null,
-    ],
-  );
-  return r.rows as ClosedRow[];
+             COALESCE(claim_count, 0) = $4::int
+          OR ($4::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
+        )`,
+    params: [target.taskId, sessionId, CLOSEABLE_RUN_STATUSES, target.runClaim ?? null],
+  });
+  const prior = before.rows[0] as { prior_status?: string; queued_since?: string } | undefined;
+  return closed.map((row) => ({ ...row, ...(prior ?? {}) })) as ClosedRow[];
 }
 
 /**
@@ -749,31 +741,37 @@ async function closeUnnamedChatRun(
   reason: string | null,
   message: string | null,
 ): Promise<ClosedRow[]> {
-  const r = await db.query(
-    `WITH prior AS (
-       SELECT task_id, status, metadata->>'queued_since' AS queued_since
-         FROM claw_tasks WHERE session_id = $1 AND origin IN ('chat','a2a')
-     )
-     UPDATE claw_tasks
-        SET status = $3, failure_reason = $4, error_message = $5, completed_at = NOW()
-      WHERE session_id = $1
+  // Prior state first, keyed by task: this close may match several rows and
+  // each one's queue-exit metric is measured from what that row was.
+  const before = await db.query(
+    `SELECT task_id, status AS prior_status, metadata->>'queued_since' AS queued_since
+       FROM claw_tasks WHERE session_id = $1 AND origin IN ('chat','a2a') FOR UPDATE`,
+    [sessionId],
+  );
+  const priorById = new Map(
+    (before.rows as Array<{ task_id: string; prior_status: string; queued_since: string | null }>)
+      .map((row) => [row.task_id, row]),
+  );
+  const moved = await applyTaskStatusTransition(outcome, {
+    extra: { failure_reason: reason, error_message: message },
+    where: `session_id = $1
         AND origin IN ('chat','a2a')
         AND metadata->>'lease_fenced' IS DISTINCT FROM 'true'
         AND (
           (
             status = ANY($2::text[])
-            AND metadata->>'message_id' = $6
+            AND metadata->>'message_id' = $3
             AND NOT EXISTS (
               SELECT 1 FROM claw_tasks settled
                WHERE settled.session_id = $1
                  AND settled.origin IN ('chat','a2a')
-                 AND settled.metadata->>'message_id' = $6
+                 AND settled.metadata->>'message_id' = $3
                  AND NOT (settled.status = ANY($2::text[]))
             )
           )
           OR (
-            $6::text IS NULL
-            AND status = ANY($7::text[])
+            $3::text IS NULL
+            AND status = ANY($4::text[])
             AND NOT EXISTS (
               SELECT 1 FROM claw_tasks other
                WHERE other.session_id = $1
@@ -782,17 +780,14 @@ async function closeUnnamedChatRun(
                  AND other.task_id <> claw_tasks.task_id
             )
           )
-        )
-      RETURNING task_id,
-                (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id) AS prior_status,
-                (SELECT p.queued_since FROM prior p WHERE p.task_id = claw_tasks.task_id)
-                  AS queued_since`,
-    [
-      sessionId, CLOSEABLE_RUN_STATUSES, outcome, reason, message,
-      messageId ?? null, GUESSABLE_RUN_STATUSES,
-    ],
-  );
-  const closed = r.rows as ClosedRow[];
+        )`,
+    params: [sessionId, CLOSEABLE_RUN_STATUSES, messageId ?? null, GUESSABLE_RUN_STATUSES],
+  });
+  const closed = moved.map((row) => ({
+    ...row,
+    prior_status: priorById.get(row.task_id)?.prior_status,
+    queued_since: priorById.get(row.task_id)?.queued_since ?? null,
+  })) as ClosedRow[];
   if (closed.length > 1) {
     logger.warn({ sessionId, messageId, closed: closed.map((row) => row.task_id) }, "chat_run.close_ambiguous");
   }
@@ -812,41 +807,46 @@ async function closeDuplicateDispatchSiblings(
   messageId: string,
   closedTaskId: string,
 ): Promise<void> {
-  await db.query(
-    `WITH prior AS (
-       SELECT task_id,
-              CASE WHEN status = 'queued' THEN metadata->>'queued_since' END AS queued_since,
-              status AS prior_status
-         FROM claw_tasks WHERE session_id = $1
-     )
-     UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = 'duplicate_dispatch_row',
-            error_message = 'a sibling row for this turn carried the run',
-            completed_at = NOW(),
-            metadata = jsonb_set(
-              claw_tasks.metadata, '{dispatch_compensation}',
+  // Prior state first: only rows that were `queued` count as queue exits, and
+  // a transition answers with what they became.
+  const before = await db.query(
+    `SELECT task_id,
+            CASE WHEN status = 'queued' THEN metadata->>'queued_since' END AS queued_since,
+            status AS prior_status
+       FROM claw_tasks WHERE session_id = $1 FOR UPDATE`,
+    [sessionId],
+  );
+  const priorById = new Map(
+    (before.rows as Array<{ task_id: string; prior_status: string; queued_since: string | null }>)
+      .map((row) => [row.task_id, row]),
+  );
+  await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "duplicate_dispatch_row",
+      error_message: "a sibling row for this turn carried the run",
+    },
+    setSql: [`metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb), '{dispatch_compensation}',
               jsonb_build_object(
                 'version', 1, 'state', 'terminal',
                 'failure_reason', to_jsonb('duplicate_dispatch_row'::text),
                 'error_message', to_jsonb('a sibling row for this turn carried the run'::text)
               )
-            )
-      FROM prior
-      WHERE claw_tasks.session_id = $1
-        AND claw_tasks.origin = 'chat'
-        AND prior.task_id = claw_tasks.task_id
-        AND claw_tasks.metadata->>'message_id' = $2
-        AND claw_tasks.task_id <> $3
-        AND claw_tasks.status = ANY($4::text[])
-        AND claw_tasks.lease_owner IS NULL
-        AND claw_tasks.lease_expires_at IS NULL
-        AND COALESCE(claw_tasks.claim_count, 0) = 0
+            )`],
+    where: `session_id = $1
+        AND origin = 'chat'
+        AND metadata->>'message_id' = $2
+        AND task_id <> $3
+        AND status = ANY($4::text[])
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
         AND NOT (${UNSUPPORTED_RECEIPT_SQL})
-        AND (${noDeliveryInFlightSql("$5", "$6")})
-      RETURNING prior.prior_status, prior.queued_since`,
-    [sessionId, messageId, closedTaskId, CLOSEABLE_RUN_STATUSES, RUN_FAT_PREPARING_RECONCILE, false],
-  ).then((r) => {
+        AND (${noDeliveryInFlightSql("$5", "$6")})`,
+    params: [sessionId, messageId, closedTaskId, CLOSEABLE_RUN_STATUSES,
+      RUN_FAT_PREPARING_RECONCILE, false],
+  }).then((moved) => {
+    const r = { rows: moved.map((row) => priorById.get(row.task_id)).filter(Boolean) };
     for (const row of r.rows as Array<{ prior_status: string; queued_since: string | null }>) {
       if (row.prior_status === "queued") {
         metrics.observeQueueExit("chat", row.queued_since ?? null, "duplicate_closed");
@@ -1083,29 +1083,40 @@ export async function failChatRunDispatch(
     // the row the instant `insertTask` commits, so claim-next can be running
     // the turn by the time the dispatch this compensates for fails. A holder
     // settles its own row.
-    const r = await db.query(
-      `WITH prior AS (SELECT status FROM claw_tasks WHERE task_id = $1)
-       UPDATE claw_tasks
-          SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
-              failure_reason = ${SETTLED_REASON_SQL},
-              error_message = $3,
-              completed_at = NOW(),
-              metadata = jsonb_set(
-                metadata, '{dispatch_compensation}',
+    const before = await db.query(
+      "SELECT status AS prior_status FROM claw_tasks WHERE task_id = $1 FOR UPDATE",
+      [taskId],
+    );
+    // A conditional status: a row already told to cancel ends cancelled, and
+    // everything else fails. The one writer takes the expression whole.
+    const settled = await applyTaskStatusTransition(
+      { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END", terminal: true },
+      {
+        setSql: [
+          `failure_reason = ${SETTLED_REASON_SQL}`,
+          "error_message = $3",
+          `metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb), '{dispatch_compensation}',
                 jsonb_build_object(
                   'version', 1,
                   'state', 'terminal',
                   'failure_reason', ${SETTLED_REASON_SQL},
                   'error_message', $3::text
                 )
-              )
-        WHERE ${unheldOpenRowSql("$1", "$4", "$5", "$6", "$7")}
-        RETURNING task_id, session_id, status, (SELECT p.status FROM prior p) AS prior_status`,
-      [
-        taskId, failureReason, message, statuses, observed,
-        opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
-      ],
+              )`,
+        ],
+        where: unheldOpenRowSql("$1", "$4", "$5", "$6", "$7"),
+        params: [
+          taskId, failureReason, message, statuses, observed,
+          opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
+        ],
+      },
     );
+    const priorStatus = (before.rows[0] as { prior_status?: string } | undefined)?.prior_status;
+    const r = {
+      rowCount: settled.length,
+      rows: settled.map((row) => ({ ...row, prior_status: priorStatus })),
+    };
     // Every statement after a non-match must be a SELECT: attaching a receipt,
     // releasing a workspace or altering a session here would act on a row this
     // call did not establish anything about.
@@ -1202,33 +1213,38 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
     prior_status: string; queued_since: string | null;
   }>;
   try {
-    const r = await db.query(
-      `WITH prior AS (
-         SELECT task_id, status, metadata->>'queued_since' AS queued_since
-           FROM claw_tasks WHERE session_id = $1 AND origin = 'chat'
-       )
-       UPDATE claw_tasks
-          SET status = 'cancelled',
-              failure_reason = 'cancelled',
-              error_message = 'interrupted before a worker claimed the run',
-              completed_at = NOW()
-        WHERE session_id = $1
+    const before = await db.query(
+      `SELECT task_id, status AS prior_status, metadata->>'queued_since' AS queued_since
+         FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' FOR UPDATE`,
+      [sessionId],
+    );
+    const priorById = new Map(
+      (before.rows as Array<{ task_id: string; prior_status: string; queued_since: string | null }>)
+        .map((row) => [row.task_id, row]),
+    );
+    const cancelled = await applyTaskStatusTransition("cancelled", {
+      extra: {
+        failure_reason: "cancelled",
+        error_message: "interrupted before a worker claimed the run",
+      },
+      where: `session_id = $1
           AND origin = 'chat'
           AND metadata->>'dispatch' = 'doorbell'
           AND (
             status = 'queued'
             OR (status = 'preparing' AND lease_owner IS NULL)
-          )
-        RETURNING task_id, prompt,
-                  metadata->>'message_id' AS message_id,
-                  COALESCE(metadata->>'user_id', input->>'user_id') AS user_id,
-                  (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id)
-                    AS prior_status,
-                  (SELECT p.queued_since FROM prior p WHERE p.task_id = claw_tasks.task_id)
-                    AS queued_since`,
-      [sessionId],
-    );
-    rows = r.rows as typeof rows;
+          )`,
+      params: [sessionId],
+    });
+    rows = cancelled.map((row) => ({
+      task_id: row.task_id,
+      prompt: row.prompt ?? null,
+      message_id: (row.metadata?.message_id as string | undefined) ?? null,
+      user_id: (row.metadata?.user_id as string | undefined)
+        ?? (row.input?.user_id as string | undefined) ?? null,
+      prior_status: priorById.get(row.task_id)?.prior_status ?? "",
+      queued_since: priorById.get(row.task_id)?.queued_since ?? null,
+    })) as typeof rows;
     for (const row of rows) {
       if (row.prior_status === "queued") {
         metrics.observeQueueExit("chat", row.queued_since, "cancelled");
@@ -1336,39 +1352,56 @@ async function cancelUnheldFat(scope: string, scopeValue: string): Promise<numbe
     OR (status IN ('preparing','running') AND NOT (${noDeliveryInFlightSql("$2", "$3")}))
   )`;
   try {
-    const r = await db.query(
-      `WITH prior AS (
-         SELECT task_id, status FROM claw_tasks WHERE ${scope} AND origin = 'chat'
-       )
-       UPDATE claw_tasks
-          SET status = CASE WHEN ${held} THEN 'cancelling' ELSE 'cancelled' END,
-              failure_reason = CASE WHEN ${held} THEN failure_reason
-                                    ELSE 'cancelled_before_dispatch_confirmed' END,
-              error_message = CASE WHEN ${held} THEN error_message
-                                   ELSE $4::text END,
-              completed_at = CASE WHEN ${held} THEN completed_at ELSE NOW() END,
-              metadata = CASE
-                WHEN ${held} THEN metadata
+    const before = await db.query(
+      // `scope` carries $1 alone; the transition below is what needs the rest.
+      `SELECT task_id, status AS prior_status FROM claw_tasks
+        WHERE ${scope} AND origin = 'chat' FOR UPDATE`,
+      [scopeValue],
+    );
+    const priorById = new Map(
+      (before.rows as Array<{ task_id: string; prior_status: string }>)
+        .map((row) => [row.task_id, row.prior_status]),
+    );
+    // A held row is only told to cancel; an unheld one is closed outright, and
+    // carries the receipt saying so. One conditional expression, through the
+    // one writer, so the accrual rides along either way.
+    const moved = await applyTaskStatusTransition(
+      { sql: `CASE WHEN ${held} THEN 'cancelling' ELSE 'cancelled' END`, terminal: true },
+      {
+        setSql: [
+          `failure_reason = CASE WHEN ${held} THEN failure_reason
+                                    ELSE 'cancelled_before_dispatch_confirmed' END`,
+          `error_message = CASE WHEN ${held} THEN error_message ELSE $4::text END`,
+          `metadata = CASE
+                WHEN ${held} THEN COALESCE(metadata, '{}'::jsonb)
                 ELSE jsonb_set(
-                  metadata, '{dispatch_compensation}',
+                  COALESCE(metadata, '{}'::jsonb), '{dispatch_compensation}',
                   jsonb_build_object(
                     'version', 1, 'state', 'terminal',
                     'failure_reason', to_jsonb('cancelled_before_dispatch_confirmed'::text),
                     'error_message', to_jsonb($4::text)
                   )
                 )
-              END
-        WHERE ${scope}
+              END`,
+        ],
+        where: `${scope}
           AND origin = 'chat'
           AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
-          AND status IN ('preparing','running')
-        RETURNING task_id, status,
-                  (SELECT p.status FROM prior p WHERE p.task_id = claw_tasks.task_id) AS prior_status`,
-      [
-        scopeValue, RUN_FAT_PREPARING_RECONCILE, false,
-        "the user stopped this turn before any worker took a lease on it",
-      ],
+          AND status IN ('preparing','running')`,
+        params: [
+          scopeValue, RUN_FAT_PREPARING_RECONCILE, false,
+          "the user stopped this turn before any worker took a lease on it",
+        ],
+      },
     );
+    const r = {
+      rowCount: moved.length,
+      rows: moved.map((row) => ({
+        task_id: row.task_id,
+        status: row.status,
+        prior_status: priorById.get(row.task_id),
+      })),
+    };
     const rows = r.rows as Array<{ task_id: string; status: string; prior_status?: string }>;
     const terminal = rows.filter((row) => row.status === "cancelled");
     const leftQueue = rows.filter((row) => row.prior_status === "queued").length;

@@ -82,13 +82,12 @@ function stubDb(
     seen.push({ sql, params });
     timeline.push({ kind: "query", sql });
     if (failOn?.test(sql)) throw new Error("db is down");
-    // The reap itself is the statement without an alias; the sibling close is
-    // `UPDATE claw_tasks t` and reports its own rows.
-    if (sql.startsWith("UPDATE claw_tasks SET")) {
-      return { rows: reaped, rowCount: reaped.length };
-    }
-    if (/UPDATE claw_tasks t SET/.test(sql)) {
-      return { rows: closed, rowCount: closed.length };
+    // Both are the one status statement now; the sibling close is the one
+    // whose predicate zips the two id arrays.
+    if (sql.startsWith("UPDATE claw_tasks SET status")) {
+      const isSiblingClose = /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(sql);
+      const rows = isSiblingClose ? closed : reaped;
+      return { rows, rowCount: rows.length };
     }
     if (sql.startsWith("UPDATE claw_sessions")) {
       return { rows: released, rowCount: released.length };
@@ -101,15 +100,14 @@ function stubDb(
 /** Every column the reap's RETURNING hands the code below, as a real row has them. */
 const CHAT_RUN = {
   task_id: "t-1", session_id: "s-1", origin: "chat",
-  lease_owner: "brain-a", message_id: "claw-pending-7",
-  sandbox_workload_id: null, failure_reason: "worker_lost",
-  prompt: "optimise the kernel", user_id: "u-1",
+  lease_owner: "brain-a", metadata: { message_id: "claw-pending-7", user_id: "u-1" },
+  input: {}, sandbox_workload_id: null, failure_reason: "worker_lost",
+  prompt: "optimise the kernel",
 };
 const DAG_RUN = {
   task_id: "t-2", session_id: "s-2", origin: "dag_node",
-  lease_owner: "brain-a", message_id: null,
-  sandbox_workload_id: null, failure_reason: "worker_lost",
-  prompt: null, user_id: null,
+  lease_owner: "brain-a", metadata: {}, input: {},
+  sandbox_workload_id: null, failure_reason: "worker_lost", prompt: null,
 };
 
 function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
@@ -118,7 +116,9 @@ function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
 
 /** The statement that closes the rows a retried dispatch left unclaimed. */
 function siblingClose(seen: SeenQuery[]): SeenQuery | undefined {
-  return seen.find((q) => /UPDATE claw_tasks t SET/.test(q.sql));
+  // Identified by the predicate that pairs the two id arrays: both reaps go
+  // through the one statement that writes a status.
+  return seen.find((q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
 }
 
 test("a conversation whose run was given up on can be spoken to again", async () => {
@@ -142,7 +142,7 @@ test("the gate stays shut while anything is still executing", async () => {
 
   const [update] = sessionUpdates(seen);
   assert.match(update.sql, /NOT EXISTS/);
-  assert.match(update.sql, /t\.status IN \('queued','preparing','running','cancelling'\)/);
+  assert.match(update.sql, /status IN \('queued','preparing','running','cancelling'\)/);
   assert.match(update.sql, /s\.agent_status = 'running'/,
     "an idle or failed session is not this reaper's to overwrite");
   assert.match(update.sql, /s\.deleted_at IS NULL/);
@@ -171,7 +171,7 @@ test("a run the user stopped is archived as cancelled, not as a worker we lost",
   const sql = seen[0]!.sql;
   assert.match(sql, /SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END/);
   assert.match(sql, /failure_reason = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'worker_lost' END/);
-  const errorMessage = /error_message = CASE (.*?) END, completed_at/.exec(sql)?.[1];
+  const errorMessage = /error_message = CASE ([\s\S]*?) END/.exec(sql)?.[1];
   assert.ok(errorMessage, "the error_message CASE has moved; this test is reading the wrong text");
   assert.match(errorMessage, /WHEN status = 'cancelling' THEN 'the run was cancelled/,
     "the message an operator reads first has to agree with the status beside it");
@@ -212,13 +212,13 @@ test("the row a replayed dispatch left behind is closed with the one that was le
 
   const close = siblingClose(seen);
   assert.ok(close, "the spare row is what holds the gate shut; something has to close it");
-  assert.match(close.sql, /t\.lease_expires_at IS NULL/,
+  assert.match(close.sql, /lease_expires_at IS NULL/,
     "a row with a lease belongs to a worker and is the reap's business, not this one's");
-  assert.match(close.sql, /t\.metadata->>'message_id' = sibling\.message_id/);
-  assert.match(close.sql, /t\.origin = 'chat'/);
-  assert.match(close.sql, /t\.status IN \('queued','preparing','running','cancelling'\)/,
+  assert.match(close.sql, /metadata->>'message_id' = sibling\.message_id/);
+  assert.match(close.sql, /origin = 'chat'/);
+  assert.match(close.sql, /status IN \('queued','preparing','running','cancelling'\)/,
     "idempotent: a row already closed by the completion event is left as it is");
-  assert.deepEqual(close.params, [["s-1"], ["claw-pending-7"]]);
+  assert.deepEqual(close.params.filter(Array.isArray), [["s-1"], ["claw-pending-7"]]);
 });
 
 test("a never-leased row for a different message is not this reaper's to close", async () => {
@@ -230,9 +230,9 @@ test("a never-leased row for a different message is not this reaper's to close",
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
-  assert.match(close.sql, /FROM unnest\(\$1::text\[\], \$2::text\[\]\) AS sibling\(session_id, message_id\)/,
+  assert.match(close.sql, /unnest\(\$\d+::text\[\], \$\d+::text\[\]\) AS sibling\(session_id, message_id\)/,
     "the pair is what selects a row, so a different message in the same session misses");
-  assert.deepEqual(close.params[1], ["claw-pending-7"],
+  assert.deepEqual(close.params.filter(Array.isArray)[1], ["claw-pending-7"],
     "only the message the reaped row was dispatched under");
 });
 
@@ -243,7 +243,7 @@ test("the spare row is not archived as a worker that was lost", async () => {
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
-  assert.match(close.sql, /failure_reason = 'dispatch_retried'/);
+  assert.match(close.params.join("|"), /dispatch_retried/);
   assert.doesNotMatch(close.sql, /worker_lost/);
 });
 
@@ -255,7 +255,8 @@ test("the gate is released after the spare row is closed, not before", async () 
   const seen = stubDb([CHAT_RUN]);
   await reapLostLeases();
 
-  const closeAt = seen.findIndex((q) => /UPDATE claw_tasks t SET/.test(q.sql));
+  const closeAt = seen.findIndex(
+    (q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
   const releaseAt = seen.findIndex((q) => q.sql.includes("UPDATE claw_sessions"));
   assert.ok(closeAt >= 0 && releaseAt >= 0);
   assert.ok(closeAt < releaseAt, "releasing first releases nothing");
@@ -264,7 +265,7 @@ test("the gate is released after the spare row is closed, not before", async () 
 test("a reaped row with no recorded message id asks for no siblings", async () => {
   // Matching on a NULL message id would pair every such row with every other,
   // which is the one way this statement could reach a run nobody replayed.
-  const seen = stubDb([{ ...CHAT_RUN, message_id: null }]);
+  const seen = stubDb([{ ...CHAT_RUN, metadata: {} }]);
   await reapLostLeases();
 
   assert.equal(siblingClose(seen), undefined);
@@ -278,15 +279,15 @@ test("the two arrays reach unnest paired, with the unidentifiable rows dropped",
   // sessions that were never reaped. The one reap that has to drop out is the
   // row with no recorded message id, and it has to drop out of both.
   const seen = stubDb([
-    { ...CHAT_RUN, task_id: "t-a", session_id: "s-a", message_id: "claw-pending-1" },
-    { ...CHAT_RUN, task_id: "t-b", session_id: "s-b", message_id: null },
-    { ...CHAT_RUN, task_id: "t-c", session_id: "s-c", message_id: "claw-pending-3" },
+    { ...CHAT_RUN, task_id: "t-a", session_id: "s-a", metadata: { message_id: "claw-pending-1" } },
+    { ...CHAT_RUN, task_id: "t-b", session_id: "s-b", metadata: {} },
+    { ...CHAT_RUN, task_id: "t-c", session_id: "s-c", metadata: { message_id: "claw-pending-3" } },
   ]);
   await reapLostLeases();
 
   const close = siblingClose(seen)!;
   assert.deepEqual(
-    close.params,
+    close.params.filter(Array.isArray),
     [["s-a", "s-c"], ["claw-pending-1", "claw-pending-3"]],
     "the surviving pairs must still be (s-a, 1) and (s-c, 3), in that order",
   );
@@ -321,8 +322,9 @@ function captureEvents(): Array<Record<string, unknown>> {
 test("a reaped worker_lost chat run announces the terminal trio, carrying prompt and user_id", async () => {
   stubDb([{
     task_id: "t-1", session_id: "s-1", origin: "chat",
-    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
-    failure_reason: "worker_lost", prompt: "optimise the kernel", user_id: "u-1",
+    lease_owner: "brain-a", metadata: { message_id: "claw-1", user_id: "u-1" },
+    input: {}, sandbox_workload_id: null, failure_reason: "worker_lost",
+    prompt: "optimise the kernel",
   }]);
   const events = captureEvents();
 
@@ -342,8 +344,8 @@ test("a cancelled reap does not announce a failed turn", async () => {
   // user-cancelled row must be left out or it reads as a failure.
   stubDb([{
     task_id: "t-1", session_id: "s-1", origin: "chat",
-    lease_owner: "brain-a", message_id: "claw-1", sandbox_workload_id: null,
-    failure_reason: "cancelled", prompt: "stop", user_id: "u-1",
+    lease_owner: "brain-a", metadata: { message_id: "claw-1", user_id: "u-1" },
+    input: {}, sandbox_workload_id: null, failure_reason: "cancelled", prompt: "stop",
   }]);
   const events = captureEvents();
 
@@ -354,8 +356,8 @@ test("a cancelled reap does not announce a failed turn", async () => {
 test("a non-chat reaped run announces nothing", async () => {
   stubDb([{
     task_id: "t-2", session_id: "s-2", origin: "dag_node",
-    lease_owner: "brain-a", message_id: null, sandbox_workload_id: null,
-    failure_reason: "worker_lost", prompt: null, user_id: null,
+    lease_owner: "brain-a", metadata: {}, input: {}, sandbox_workload_id: null,
+    failure_reason: "worker_lost", prompt: null,
   }]);
   const events = captureEvents();
 
@@ -391,12 +393,12 @@ test("the terminal trio survives a sibling close that throws", async () => {
   // statement that could still suppress the announce by throwing -- so it is
   // caught rather than raised, and a spare row left open is accepted as the
   // smaller failure. reapStuckSessions is still the backstop for it.
-  const seen = stubDb([CHAT_RUN], [], [], /UPDATE claw_tasks t SET/);
+  const seen = stubDb([CHAT_RUN], [], [], /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/);
   const events = captureEvents();
 
   assert.equal(await reapLostLeases(), 1, "a spare row that would not close is not a failed tick");
   assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
-  assert.ok(seen.some((q) => /UPDATE claw_tasks t SET/.test(q.sql)),
+  assert.ok(seen.some((q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql)),
     "the close was attempted -- otherwise this proves nothing");
   assert.ok(seen.some((q) => q.sql.includes("UPDATE claw_sessions")),
     "and the pass carried on to the gate release");
@@ -441,7 +443,8 @@ test("the spare row is closed before the turn is announced", async () => {
 
   const firstEvent = timeline.findIndex((step) => step.kind === "event");
   const siblingAt = timeline.findIndex(
-    (step) => step.kind === "query" && /UPDATE claw_tasks t SET/.test(step.sql));
+    (step) => step.kind === "query"
+      && /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(step.sql));
   assert.ok(siblingAt >= 0 && firstEvent >= 0);
   assert.ok(siblingAt < firstEvent,
     "the consumer must have nothing left to match by the time it sees the event");
@@ -478,21 +481,21 @@ function stubDbWithSpare(spare: FakeRow, onExecComplete: () => Promise<void>): v
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     timeline.push({ kind: "query", sql });
-    if (sql.startsWith("UPDATE claw_tasks SET status = CASE")) {
-      return { rows: [CHAT_RUN], rowCount: 1 };
-    }
     // The sibling close: the statement that knows this row was never claimed.
-    if (/UPDATE claw_tasks t SET/.test(sql)) {
+    if (/unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(sql)) {
       if (!open()) return { rows: [], rowCount: 0 };
       spare.status = "failed";
       spare.failure_reason = "dispatch_retried";
       return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
     }
+    if (sql.startsWith("UPDATE claw_tasks SET status = CASE")) {
+      return { rows: [CHAT_RUN], rowCount: 1 };
+    }
     // closeChatRun: a blanket update over every open row with this message id.
-    if (sql.startsWith("UPDATE claw_tasks SET status = $3")) {
-      if (!open() || params[5] !== CHAT_RUN.message_id) return { rows: [], rowCount: 0 };
-      spare.status = String(params[2]);
-      spare.failure_reason = params[3] === null ? null : String(params[3]);
+    if (sql.includes("metadata->>'message_id'")) {
+      if (!open() || params[4] !== CHAT_RUN.metadata.message_id) return { rows: [], rowCount: 0 };
+      spare.status = "failed";
+      spare.failure_reason = params[0] === null ? null : String(params[0]);
       return { rows: [{ task_id: spare.task_id }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -503,7 +506,10 @@ test("a consumer that reads the announce first cannot brand the spare row worker
   const spare: FakeRow = { task_id: "t-spare", status: "queued", failure_reason: null };
   timeline = [];
   published = [];
-  stubDbWithSpare(spare, () => closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost"));
+  stubDbWithSpare(
+    spare,
+    () => closeChatRun("s-1", CHAT_RUN.metadata.message_id, "failed", "worker_lost"),
+  );
 
   assert.equal(await reapLostLeases(), 1);
   assert.notEqual(spare.failure_reason, "worker_lost",
@@ -525,7 +531,7 @@ test("a consumer arriving after the reap finds the spare row already accounted f
   stubDbWithSpare(spare, async () => {});
 
   await reapLostLeases();
-  await closeChatRun("s-1", CHAT_RUN.message_id, "failed", "worker_lost");
+  await closeChatRun("s-1", CHAT_RUN.metadata.message_id, "failed", "worker_lost");
 
   assert.equal(spare.failure_reason, "dispatch_retried",
     "a terminal row is outside closeChatRun's open-status predicate, whenever the event lands");
@@ -615,5 +621,6 @@ test("the reap log records the run without carrying its prompt", async () => {
     sandbox_workload_id: null,
     failure_reason: "worker_lost",
     user_id: "u-1",
+    attempt_id: null,
   });
 });

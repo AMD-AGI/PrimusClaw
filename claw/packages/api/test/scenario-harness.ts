@@ -29,7 +29,7 @@
  * does with a claim belongs in the live environment.
  */
 
-import { db } from "../src/infra/db.js";
+import { clawTasksSchemaSql, db } from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
@@ -70,7 +70,23 @@ CREATE TABLE claw_sessions (
   team_role      TEXT DEFAULT '',
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
-  deleted_at     TIMESTAMPTZ
+  deleted_at     TIMESTAMPTZ,
+  -- Added by an ALTER in db.ts rather than the CREATE, and written by
+  -- commitSessionDeletion in the same transaction that cancels the session's
+  -- runs: without them that whole transaction rolls back on an unknown column.
+  cleanup_state    TEXT,
+  cleanup_attempts INT NOT NULL DEFAULT 0,
+  cleanup_next_at  TIMESTAMPTZ,
+  cleanup_error    TEXT
+);
+
+-- Read by listDownstream, and by cancelTask's recursive cascade, to find the
+-- rows an upstream failure closes.
+CREATE TABLE claw_task_edges (
+  id                BIGSERIAL PRIMARY KEY,
+  dag_root_task_id  TEXT NOT NULL,
+  from_task_id      TEXT NOT NULL,
+  to_task_id        TEXT NOT NULL
 );
 
 CREATE TABLE claw_session_events (
@@ -99,64 +115,6 @@ CREATE TABLE claw_pending_messages (
   -- retry finishes that handoff instead of creating a sibling.
   dispatch_task_id TEXT,
   created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE claw_tasks (
-  task_id              TEXT PRIMARY KEY,
-  session_id           TEXT NOT NULL,
-  -- Named by insertTask's column list, so a scenario driving a real open fails
-  -- on the column rather than on the behaviour under test.
-  parent_task_id       TEXT,
-  batch_id             TEXT,
-  dag_id               TEXT,
-  script               JSONB,
-  depends_on           TEXT[],
-  mode                 TEXT,
-  model                TEXT,
-  tools_allowlist      JSONB,
-  skills               JSONB,
-  rules_text           TEXT,
-  agent_hooks          JSONB,
-  backend_mcp_url      TEXT,
-  workspace_throwaway  BOOLEAN NOT NULL DEFAULT FALSE,
-  dag_root_task_id     TEXT,
-  dag_node_id          TEXT,
-  plugin_id            BIGINT,
-  name                 TEXT NOT NULL DEFAULT 'chat',
-  input                JSONB NOT NULL DEFAULT '{}'::jsonb,
-  prompt               TEXT,
-  priority             INT NOT NULL DEFAULT 0,
-  executor             TEXT NOT NULL DEFAULT 'brain',
-  sandbox_spec         JSONB,
-  callback_url         TEXT,
-  internal_token_hash  TEXT,
-  status               TEXT NOT NULL,
-  failure_reason       TEXT,
-  error_message        TEXT,
-  metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
-  origin               TEXT,
-  workspace_id         TEXT,
-  sandbox_workload_id  TEXT,
-  platform_message     TEXT,
-  platform_node        TEXT,
-  platform_exit_code   INT,
-  platform_container_reason TEXT,
-  platform_facts_resolved_at TIMESTAMPTZ,
-  platform_facts_next_retry_at TIMESTAMPTZ,
-  platform_facts_attempts INT NOT NULL DEFAULT 0,
-  lease_owner          TEXT,
-  lease_expires_at     TIMESTAMPTZ,
-  heartbeat_at         TIMESTAMPTZ,
-  claim_count          INT NOT NULL DEFAULT 0,
-  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  queued_at            TIMESTAMPTZ,
-  started_at           TIMESTAMPTZ,
-  deadline_at          TIMESTAMPTZ,
-  completed_at         TIMESTAMPTZ,
-  -- When reconciliation may take a dispatch whose outcome was never decided,
-  -- and the cleanup it is then owed.
-  dispatch_reconcile_at     TIMESTAMPTZ,
-  dispatch_reconcile_action TEXT
 );
 
 CREATE TABLE claw_conversation_turns (
@@ -261,6 +219,7 @@ CREATE TABLE claw_workspace_refs (
 
 const TABLES = [
   "claw_tasks",
+  "claw_task_edges",
   "claw_sessions",
   "claw_session_events",
   "claw_pending_messages",
@@ -288,11 +247,18 @@ export async function startHarness(): Promise<Harness> {
   initUserEnvCrypto();
   const pg = await PGlite.create();
   await pg.exec(DDL);
+  // The task table comes from the production migration rather than from a copy
+  // of it here: the queue accounting depends on that DDL exactly, and a
+  // restated fixture would pass whatever the real statements do.
+  for (const sql of clawTasksSchemaSql()) {
+    await pg.exec(sql).catch(() => { /* idempotent, exactly as initDb treats it */ });
+  }
 
   const original = db.query;
+  const originalConnect = db.pool.connect;
   const originalLockConnect = db.lockPool.connect;
   const statements: string[] = [];
-  db.query = (async (text: string, params?: unknown[]) => {
+  const run = async (text: string, params?: unknown[]) => {
     statements.push(text.replace(/\s+/g, " ").trim());
     const r = await pg.query(text, params as never[]) as {
       rows?: unknown[]; affectedRows?: number;
@@ -306,7 +272,16 @@ export async function startHarness(): Promise<Harness> {
     // test was written to ask.
     const rows = r.rows ?? [];
     return { rows, rowCount: rows.length || r.affectedRows || 0 };
-  }) as typeof db.query;
+  };
+  db.query = run as typeof db.query;
+  // `inTransaction` takes its own connection, so a harness that replaced only
+  // `db.query` would send every transactional statement to the real pool --
+  // where it fails on authentication rather than on anything the test meant to
+  // assert. PGlite is one connection, which is what these scenarios model.
+  db.pool.connect = (async () => ({
+    query: run,
+    release: () => {},
+  })) as unknown as typeof db.pool.connect;
 
   // PGlite has one backend; concurrency scenarios supply their own lock clients.
   db.lockPool.connect = (async () => ({ query: db.query, release() {} })) as unknown as typeof db.lockPool.connect;
@@ -324,6 +299,7 @@ export async function startHarness(): Promise<Harness> {
     },
     async close() {
       db.query = original;
+      db.pool.connect = originalConnect;
       db.lockPool.connect = originalLockConnect;
       await pg.close();
     },
@@ -413,6 +389,7 @@ export async function seedRun(
        lease_owner,
        lease_expires_at,
        queued_at,
+       run_time_epoch_at,
        started_at,
        deadline_at,
        claim_count
@@ -420,7 +397,10 @@ export async function seedRun(
        $1, $2, 'chat', $3, $4, 'brain', $5::jsonb, $12::jsonb, $13,
        $6,
        CASE WHEN $7::int IS NULL THEN NULL ELSE NOW() + ($7::int * INTERVAL '1 second') END,
-       CASE WHEN $8::int IS NULL THEN NULL ELSE NOW() - ($8::int * INTERVAL '1 second') END,
+       CASE WHEN $8::int IS NULL THEN clock_timestamp()
+            ELSE clock_timestamp() - ($8::int * INTERVAL '1 second') END,
+       CASE WHEN $8::int IS NULL THEN clock_timestamp()
+            ELSE clock_timestamp() - ($8::int * INTERVAL '1 second') END,
        CASE WHEN $9::int IS NULL THEN NULL ELSE NOW() - ($9::int * INTERVAL '1 second') END,
        CASE WHEN $10::int IS NULL THEN NULL ELSE NOW() + ($10::int * INTERVAL '1 second') END,
        $11

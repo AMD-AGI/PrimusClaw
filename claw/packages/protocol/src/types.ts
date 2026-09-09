@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import type { RunTimeReport } from "./run-time.js";
+
 import type { EnvironmentTopology } from "./topology.js";
 
 /** Conversation message for LLM API. */
@@ -197,6 +199,21 @@ export interface RunLeaseRequest {
    * when the acceptance was served by an API that returned none.
    */
   run_claim?: number;
+  /**
+   * Which attempt this renewal speaks for, and how many the row has seen.
+   *
+   * Beside `run_claim` rather than instead of it: the generation fences a
+   * doorbell delivery against a stale acceptance, while these fence one
+   * attempt against its own successor -- `brain_id` is a pod name and cannot
+   * tell the two apart, and a fat row takes no claim at all, so the delivery
+   * pair below is the only value on it that advances.
+   */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
+  /** The interval this tick closed. Absent on the opening one, which closed none. */
+  run_time?: RunTimeReport;
 }
 
 /** What the lease endpoint answers a caller it accepted. */

@@ -18,10 +18,13 @@ import { metrics } from "../infra/metrics.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
 
+import { decodeRunTimeReport } from "@claw/protocol";
 import {
   claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim,
+  settleFinishedClaim,
   type ClaimedRun, type ClaimNextDiagnostics,
 } from "../tasks/run-claim.js";
+import type { RunSettlement } from "../tasks/run-time-ledger.js";
 
 const logger = pino({ name: "internal-runs" });
 
@@ -101,6 +104,31 @@ const SEMANTICS_INVALID = {
     `doorbell_semantics must be an integer between 1 and ${DOORBELL_SEMANTICS_MAX}, or absent`,
 } as const;
 
+/**
+ * The attempt's last word on its own time, when the holder sends one.
+ *
+ * Refused rather than partially accepted: a report that does not decode is a
+ * caller this endpoint does not understand, and banking half of it would put
+ * numbers in the ledger that no attempt produced.
+ */
+function settlementFrom(taskId: string, body: unknown): RunSettlement | undefined {
+  const raw = body && typeof body === "object"
+    ? (body as { run_time?: unknown }).run_time
+    : undefined;
+  if (raw === undefined) return undefined;
+  const decoded = decodeRunTimeReport(raw);
+  if (!decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "run.release.run_time_rejected");
+    return undefined;
+  }
+  return { report: decoded.report, closeAttempt: true };
+}
+
+function releaseLeaseFrom(body: unknown): boolean {
+  return body !== null && typeof body === "object"
+    && (body as { release_lease?: unknown }).release_lease === true;
+}
+
 function brainIdFrom(body: unknown): string {
   const raw = fieldOf(body, "brain_id");
   return typeof raw === "string" && raw.trim() ? raw.trim() : "";
@@ -174,7 +202,10 @@ function registerUnclaimRoute(app: FastifyInstance): void {
       const reason = given ?? "unspecified";
       let released: boolean;
       try {
-        released = await releaseClaim(req.params.taskId, brainId, claimCount, given);
+        released = await releaseClaim(
+          req.params.taskId, brainId, claimCount, given,
+          settlementFrom(req.params.taskId, req.body),
+        );
       } catch (err) {
         metrics.onRunUnclaim(reason, "error");
         throw err;
@@ -199,13 +230,33 @@ function registerFailClaimRoute(app: FastifyInstance): void {
       if (reason === "invalid") return reply.status(400).send(FAIL_CLAIM_REASON_INVALID);
       let failed: boolean;
       try {
-        failed = await failHeldClaim(req.params.taskId, brainId, reason, claimCount);
+        failed = await failHeldClaim(
+          req.params.taskId, brainId, reason, claimCount,
+          settlementFrom(req.params.taskId, req.body),
+        );
       } catch (err) {
         metrics.onRunFailClaim(reason, "error");
         throw err;
       }
       metrics.onRunFailClaim(reason, failed ? "accepted" : "not_holder");
       if (!failed) return reply.status(409).send({ ok: false, error: "not_holder" });
+      return { ok: true };
+    },
+  );
+  app.post<{ Params: { taskId: string } }>(
+    "/v1/internal/tasks/:taskId/settle-attempt",
+    { preHandler: clusterInternalAuth },
+    async (req, reply) => {
+      const brainId = brainIdFrom(req.body);
+      if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id_required" });
+      const claimCount = claimCountFrom(req.body);
+      if (claimCount === "invalid") return reply.status(400).send(CLAIM_COUNT_INVALID);
+      const settled = await settleFinishedClaim(
+        req.params.taskId, brainId, claimCount,
+        settlementFrom(req.params.taskId, req.body),
+        releaseLeaseFrom(req.body),
+      );
+      if (!settled) return reply.status(409).send({ ok: false, error: "not_holder" });
       return { ok: true };
     },
   );

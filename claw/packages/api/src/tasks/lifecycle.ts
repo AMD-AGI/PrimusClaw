@@ -10,7 +10,7 @@
  * `last_user` sandbox destruction. Per-DAG aggregation and cascade failure
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import type { PoolClient } from "pg";
 import pino from "pino";
@@ -19,10 +19,12 @@ import {
   withOwnedAdmissionLock, type AdmissionRefusal,
 } from "./admission.js";
 import { cancelUnheldFatRun } from "./chat-run.js";
-import { getTask, transitionStatus, updateTask } from "./db.js";
+import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
+import { decodeRunTimeReport } from "@claw/protocol";
+import { settleRunTime } from "./run-time-ledger.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-lifecycle" });
@@ -40,6 +42,8 @@ export interface AgentDonePayload {
   failure_reason?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
+  /** The attempt's final per-state totals, merged with the transition. */
+  run_time?: unknown;
   /**
    * What the platform did, when the run ended because the platform ended it.
    *
@@ -59,6 +63,58 @@ export interface AgentDonePayload {
   /** The pod's own account, kept verbatim so a wrong reading can be re-derived. */
   platform_message?: string;
 }
+
+/**
+ * Move the row and bank the attempt's final report as one transaction.
+ *
+ * A duplicate callback whose transition no-ops rolls the merge back with it:
+ * the report belongs to a run somebody else has already closed, and banking it
+ * anyway would credit this attempt's time to whoever holds the row now.
+ */
+async function transitionWithFinalReport(
+  taskId: string,
+  expected: TaskStatus[],
+  next: TaskStatus,
+  patch: Record<string, unknown>,
+  rawReport: unknown,
+): Promise<ClawTaskRow | null> {
+  const decoded = rawReport === undefined ? null : decodeRunTimeReport(rawReport);
+  if (decoded && !decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "agent_done.run_time_rejected");
+  }
+  const report = decoded?.ok ? decoded.report : undefined;
+  if (!report) return transitionStatus(taskId, expected, next, patch);
+  return inTransaction(async (query) => {
+    // The token decides the whole callback, not just its accounting. A report
+    // from an attempt the row has moved past is not merely uninteresting: the
+    // transition beside it would end a run somebody else is executing, and the
+    // status guard cannot tell the two apart once the row has been reclaimed
+    // under the same pod name.
+    const settled = await settleRunTime(query, taskId, {
+      report, closeAttempt: true, adoptUnrecordedAttempt: true,
+    });
+    if (!settled.ok) throw new StaleAttempt(settled.reason);
+    const updated = await transitionStatus(taskId, expected, next, patch, query);
+    if (!updated) throw new TerminalNoop();
+    return updated;
+  }).catch((err) => {
+    if (err instanceof StaleAttempt) {
+      logger.warn({ taskId, attemptId: report.attemptId, reason: err.reason },
+        "agent_done.superseded_attempt");
+      return null;
+    }
+    if (err instanceof TerminalNoop) return null;
+    throw err;
+  });
+}
+
+/** The report speaks for an attempt the row no longer holds. */
+class StaleAttempt extends Error {
+  constructor(readonly reason: string) { super(reason); }
+}
+
+/** The terminal transition matched nothing, so its whole transaction is void. */
+class TerminalNoop extends Error {}
 
 function resolveTerminalStatus(p: AgentDonePayload): TaskStatus {
   const r = p.abort_reason ?? "completed";
@@ -111,14 +167,15 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     if (!externalId) {
       logger.warn({ taskId }, "agent_done.wait_external_missing_id");
     }
-    const merged = {
-      ...(task.metadata ?? {}),
+    // Only the subtree this branch owns: the write is a shallow merge, so
+    // naming the whole document would put a pre-transaction snapshot back over
+    // the ledger the same transaction just merged.
+    patch.metadata = JSON.stringify({
       derived: {
         ...(task.metadata?.derived as Record<string, unknown> | undefined ?? {}),
         external_id: externalId,
       },
-    };
-    patch.metadata = JSON.stringify(merged);
+    });
   }
 
   // Use a CAS-safe transition so a duplicate callback can't override a
@@ -138,7 +195,7 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
   const expected: TaskStatus[] = next === "waiting_external"
     ? ["running", "preparing", "queued"]
     : ["running", "preparing", "cancelling", "waiting_external", "queued"];
-  const updated = await transitionStatus(taskId, expected, next, patch);
+  const updated = await transitionWithFinalReport(taskId, expected, next, patch, payload.run_time);
   if (!updated) {
     logger.info({ taskId, next, task_status: task.status }, "agent_done.transition_noop");
     return;
@@ -228,16 +285,14 @@ export async function cancelTask(
   if (!task) return { ok: false, cancelled: 0 };
 
   if (task.dag_node_id === "__dag_root__") {
-    const r = await db.query(
-      `UPDATE claw_tasks
-       SET status = 'cancelled', failure_reason = 'cancelled', completed_at = NOW()
-       WHERE dag_root_task_id = $1
-         AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
-       RETURNING task_id`,
-      [task.task_id],
-    );
+    const rows = await applyTaskStatusTransition("cancelled", {
+      extra: { failure_reason: "cancelled" },
+      where: "dag_root_task_id = $1 AND status IN "
+        + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
+      params: [task.task_id],
+    });
     await stopAllHandlesForDag(task.task_id, task.session_id);
-    return { ok: true, cancelled: r.rowCount ?? 0, interrupt_key: task.task_id };
+    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id };
   }
 
   if ((task.status === "preparing" || task.status === "running")
@@ -253,23 +308,49 @@ export async function cancelTask(
     metrics.observeQueueExit("chat", updated.prior_queued_since, "cancelled");
   }
   if (updated && task.dag_root_task_id) {
-    // Executing rows own a live Brain run and sandbox, so they must transition
-    // through `cancelling` rather than be closed directly in the database.
-    await db.query(
-      `WITH RECURSIVE downstream(task_id) AS (
-         SELECT to_task_id FROM claw_task_edges WHERE from_task_id = $1
-         UNION
-         SELECT e.to_task_id
-           FROM claw_task_edges e
-           JOIN downstream d ON e.from_task_id = d.task_id
-       )
-       UPDATE claw_tasks
-          SET status = 'cancelled', failure_reason = 'cancelled',
-              error_message = $2, completed_at = NOW()
-        WHERE task_id IN (SELECT task_id FROM downstream)
-          AND status IN ('waiting_deps','waiting_external','queued')`,
-      [task.task_id, `upstream ${task.task_id} cancelled`],
-    );
+    // A cancelled dependency can never satisfy downstream readiness. Close its
+    // entire transitive tail so the virtual root can eventually aggregate.
+    //
+    // The status list deliberately stops short of the executing states, and
+    // that is not an oversight in two separate ways:
+    //
+    //   - It cannot matter. `promoteReadyTasks` only leaves `waiting_deps` when
+    //     EVERY dep is `completed`, and the row we just cancelled is not, so no
+    //     transitive downstream can have started. `queued` / `waiting_external`
+    //     are in the list defensively, not because the graph can reach them
+    //     from here. `preparing` used to be listed for the same defensive
+    //     reason and no longer is: it means the row may already be executing,
+    //     so closing one here would be the mistake described below. If the
+    //     invariant above is ever broken, leaving such a row for the sweeper is
+    //     slower but not wrong, whereas closing it under a live run is wrong.
+    //   - It would be wrong anyway. A row that is executing owns a Brain run and
+    //     a sandbox, and marking it `cancelled` straight in the database stops
+    //     neither: the work keeps burning a GPU and a late `agent_done` would
+    //     write over the terminal state. Execution is stopped by going through
+    //     `cancelling` and waiting for Brain to acknowledge, which is exactly
+    //     what the single-task transition above does. The DAG-root branch may
+    //     list `running` because it pairs the UPDATE with `stopAllHandlesForDag`
+    //     plus an interrupt publish; this recursive tail has no such pairing.
+    await applyTaskStatusTransition("cancelled", {
+      extra: {
+        failure_reason: "cancelled",
+        error_message: `upstream ${task.task_id} cancelled`,
+      },
+      // The recursion moves inside the predicate so the one statement that
+      // writes a status stays one statement; a CTE cannot prefix it.
+      where: `task_id IN (
+          WITH RECURSIVE downstream(task_id) AS (
+            SELECT to_task_id FROM claw_task_edges WHERE from_task_id = $1
+            UNION
+            SELECT e.to_task_id
+              FROM claw_task_edges e
+              JOIN downstream d ON e.from_task_id = d.task_id
+          )
+          SELECT task_id FROM downstream
+        )
+        AND status IN ('waiting_deps','waiting_external','queued')`,
+      params: [task.task_id],
+    });
   }
   return {
     ok: !!updated,
@@ -324,7 +405,7 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
         input, prompt, script, depends_on, priority,
         executor, mode, model, tools_allowlist, skills, rules_text, agent_hooks,
         sandbox_spec, callback_url, backend_mcp_url,
-        status, metadata, workspace_throwaway)
+        status, metadata, workspace_throwaway, queued_at, run_time_epoch_at)
      SELECT $1, session_id, task_id, batch_id,
             dag_id, dag_node_id, dag_root_task_id, plugin_id, name,
             input, prompt, script, depends_on, priority,
@@ -336,10 +417,18 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
             replace(callback_url,    task_id, $1),
             replace(backend_mcp_url, task_id, $1),
             CASE WHEN coalesce(array_length(depends_on,1),0) = 0 THEN 'queued' ELSE 'waiting_deps' END,
-            metadata,
+            -- The replacement is a different run: it must not inherit the
+            -- previous one's settled time ledger or the identity that ledger
+            -- was keyed under, which would credit this run with the other's
+            -- states and leave it marked terminal before it starts.
+            metadata - 'run_phase' - 'last_release' - 'retried_into',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
-            workspace_throwaway
+            workspace_throwaway,
+            -- Its wait starts now. Copying the original's stamp would age the
+            -- replacement into the queue-timeout reap the moment it is written.
+            clock_timestamp(),
+            clock_timestamp()
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );

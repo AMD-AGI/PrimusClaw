@@ -32,10 +32,12 @@ import { parkSettledHandsPorts } from "../src/tasks/park-settled-hands.js";
 import { parkHandsAfterRun, type RevisionedKv } from "@claw/protocol";
 
 const originalQuery = db.query;
+const originalConnect = db.pool.connect;
 const originalPublish = sweeperPorts.publishSessionEvent;
 const originalPark = parkSettledHandsPorts.parkHandsAfterRun;
 after(() => {
   db.query = originalQuery;
+  db.pool.connect = originalConnect;
   sweeperPorts.publishSessionEvent = originalPublish;
   parkSettledHandsPorts.parkHandsAfterRun = originalPark;
 });
@@ -93,7 +95,13 @@ function useParkKv(kv: RevisionedKv): void {
   };
 }
 
-beforeEach(() => { parkCalls = []; });
+beforeEach(() => {
+  parkCalls = [];
+  db.pool.connect = (async () => ({
+    query: (text: string, params?: unknown[]) => db.query(text, params),
+    release() {},
+  })) as unknown as typeof db.pool.connect;
+});
 
 test("P1 a reaped worker_lost chat run parks the handle of its session", async () => {
   stubDb([CHAT_RUN], ["s-1"]);

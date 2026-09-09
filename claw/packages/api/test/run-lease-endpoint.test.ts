@@ -71,13 +71,18 @@ function stubDb(): void {
   }) as typeof db.query;
 }
 
+/** The attempt token every renewal now has to present. */
+const TOKEN_FIELDS = {
+  attempt_id: "att-1", claim_count: 0, delivery_seq: 7, delivery_count: 1,
+};
+
 async function renew(body: Record<string, unknown>) {
   stubDb();
   return app.inject({
     method: "POST",
     url: "/v1/internal/tasks/t-1/lease",
     headers: { authorization: `Bearer ${TOKEN}` },
-    payload: body,
+    payload: { ...TOKEN_FIELDS, ...body },
   });
 }
 

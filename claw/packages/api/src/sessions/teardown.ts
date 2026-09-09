@@ -59,6 +59,7 @@ import { cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome
 import pino from "pino";
 
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
 import { getS3Client } from "../infra/s3-client.js";
 import { metrics } from "../infra/metrics.js";
@@ -579,26 +580,35 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
   try {
     queueExits = await inTransaction(async (query: Querier) => {
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
+      // The prior state, locked before the transition writes over it. The
+      // doorbell queue-exit metric below is taken from what these rows were,
+      // and an UPDATE's RETURNING can only answer with what they became.
+      // `FOR UPDATE` is what makes the two statements one decision: the rows
+      // the transition then matches are exactly these, held for the
+      // transaction.
       const cancelled = await query(
-        `WITH prior AS (
-           SELECT task_id, status, origin, metadata
-             FROM claw_tasks
-            WHERE session_id = $1
-              AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
-            FOR UPDATE
-         )
-         UPDATE claw_tasks t
-            SET status = 'cancelled',
-                failure_reason = 'session_deleted',
-                error_message = 'the session this run belonged to was deleted',
-                completed_at = NOW()
-           FROM prior
-          WHERE t.task_id = prior.task_id
-         RETURNING prior.status AS prior_status, prior.origin,
-                   prior.metadata->>'dispatch' AS dispatch,
-                   prior.metadata->>'queued_since' AS queued_since`,
+        `SELECT status AS prior_status, origin,
+                metadata->>'dispatch' AS dispatch,
+                metadata->>'queued_since' AS queued_since
+           FROM claw_tasks
+          WHERE session_id = $1
+            AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
+          FOR UPDATE`,
         [sessionId],
       );
+      // Through the shared transition rather than its own UPDATE, so a run
+      // cancelled by a delete accrues its queued time and stamps its run-time
+      // epoch like every other ending does.
+      await applyTaskStatusTransition("cancelled", {
+        extra: {
+          failure_reason: "session_deleted",
+          error_message: "the session this run belonged to was deleted",
+        },
+        where: "session_id = $1 AND status IN "
+          + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
+        params: [sessionId],
+        query,
+      });
       for (const table of CONTENT_TABLES) {
         await query(
           `UPDATE ${table} SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL`,

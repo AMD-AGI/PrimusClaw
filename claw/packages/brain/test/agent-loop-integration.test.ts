@@ -25,6 +25,7 @@ import type { ToolRouter } from "../src/tools/router.js";
 import type { CheckpointState } from "../src/agent/index.js";
 import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { beginRun, endRun, setParkHooks } from "../src/tasks/run-phase.js";
+import { testRunIdentity } from "./support/run-identity.js";
 
 // ── fakes ────────────────────────────────────────────────────────────────────
 
@@ -297,6 +298,7 @@ test("a tool nobody has to approve does not park the run", async () => {
     { content: [toolUse("t1", "read", { path: "/a.txt" })], stopReason: "tool_use" },
     { content: [textBlock("ok")], stopReason: "end_turn" },
   ]);
+  const parked = testRunIdentity("run-parking");
   const parkEvents: string[] = [];
   setParkHooks({
     park: () => { parkEvents.push("park"); return true; },
@@ -311,14 +313,14 @@ test("a tool nobody has to approve does not park the run", async () => {
     llmSession: session,
     router: recordingRouter(() => "contents"),
     hitl: hitl as unknown as LoopOptions["hitl"],
-    runKey: "run-parking",
+    runIdentity: parked,
   });
 
-  beginRun("run-parking");
+  beginRun(parked.key);
   try {
     await agentLoop([{ role: "user", content: "read" }], TOOLS, opts);
   } finally {
-    endRun("run-parking");
+    endRun(parked.key);
     setParkHooks(null);
   }
 

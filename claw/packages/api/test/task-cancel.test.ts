@@ -46,23 +46,10 @@ function stubDb(task: Record<string, unknown>): SeenQuery[] {
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
       return params[0] === task.task_id ? { rows: [task], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
-    if (sql.startsWith("WITH prior AS") && /UPDATE claw_tasks t SET status/.test(sql)) {
-      const metadata = task.metadata as Record<string, unknown> | undefined;
-      const executing = params[2] as string[];
-      const status = executing.includes(String(task.status)) ? params[3] : params[4];
-      query.rows = [{
-        ...task,
-        status,
-        prior_status: task.status,
-        prior_dispatch: metadata?.dispatch ?? null,
-        prior_queued_since: metadata?.queued_since ?? null,
-      }];
-      return {
-        rows: query.rows,
-        rowCount: 1,
-      };
+    if (sql.startsWith("UPDATE claw_tasks SET status")) {
+      const next = /SET status = '(\w+)'/.exec(sql)?.[1] ?? task.status;
+      return { rows: [{ ...task, status: next }], rowCount: 1 };
     }
-    if (sql.startsWith("WITH RECURSIVE downstream")) return { rows: [], rowCount: 0 };
     throw new Error(`stubDb: unexpected query ${sql.slice(0, 80)}`);
   }) as typeof db.query;
   return seen;
@@ -84,9 +71,8 @@ test("cancelling a running task hands it to Brain instead of closing it", async 
 
   const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
   assert.ok(transition);
-  assert.equal(
-    transition!.rows?.[0]?.status,
-    "cancelling",
+  assert.match(
+    transition!.sql, /SET status = 'cancelling'/,
     "a running row must not be marked terminal while Brain and its sandbox are still live",
   );
   // The interrupt is published against the DAG root, which is also the key Brain
@@ -98,7 +84,9 @@ test("the downstream cascade closes only rows that cannot be executing", async (
   const seen = stubDb(RUNNING_IN_DAG);
   await cancelTask("t-mid");
 
-  const cascade = seen.find((q) => q.sql.startsWith("WITH RECURSIVE downstream"));
+  // The recursion is inside the predicate now: one statement writes a status,
+  // so a CTE cannot prefix it.
+  const cascade = seen.find((q) => /WITH RECURSIVE downstream/.test(q.sql) && q !== seen[1]);
   assert.ok(cascade, "a task inside a DAG must close its transitive tail");
   assert.match(
     cascade!.sql,
@@ -106,7 +94,7 @@ test("the downstream cascade closes only rows that cannot be executing", async (
     "the cascade targets the pre-execution states",
   );
   assert.doesNotMatch(
-    cascade!.sql,
+    cascade!.sql.replace(/^UPDATE claw_tasks SET status = 'cancelled'/, ""),
     /'preparing'|'running'|'cancelling'/,
     "widening this to rows that may be executing would mark live work terminal without stopping it",
   );
@@ -116,8 +104,11 @@ test("a queued task is closed outright, since nothing is executing yet", async (
   const seen = stubDb({ ...RUNNING_IN_DAG, status: "queued" });
   await cancelTask("t-mid");
 
-  const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
-  assert.equal(transition!.rows?.[0]?.status, "cancelled");
+  const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
+  assert.match(transition!.sql, /SET status = 'cancelled'/);
+  // The expected-status guard still admits `running`: the row may have started
+  // between the read and the write, and losing that race must not silently skip
+  // the cancel.
   assert.deepEqual(
     transition!.params[1],
     ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
@@ -135,10 +126,9 @@ test("a preparing task is handed to Brain too, because it may already be executi
   const seen = stubDb({ ...RUNNING_IN_DAG, status: "preparing" });
   const r = await cancelTask("t-mid");
 
-  const transition = seen.find((q) => /UPDATE claw_tasks t SET status/.test(q.sql));
-  assert.equal(
-    transition!.rows?.[0]?.status,
-    "cancelling",
+  const transition = seen.find((q) => q.sql.startsWith("UPDATE claw_tasks SET status"));
+  assert.match(
+    transition!.sql, /SET status = 'cancelling'/,
     "a preparing row may be executing, so it must wait for Brain to acknowledge",
   );
   assert.equal(r.interrupt_key, "t-root");

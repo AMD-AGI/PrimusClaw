@@ -15,6 +15,7 @@ import {
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { openChatRun } from "../tasks/chat-run.js";
+import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
 import type { PoolClient } from "pg";
@@ -585,11 +586,12 @@ async function rollbackA2AAdmission(
 ): Promise<void> {
   try {
     if (!publishWasPreDelivery(err)) {
-      await db.query(
-        `UPDATE claw_tasks SET status = 'cancelling'
-          WHERE task_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')`,
-        [taskId],
-      );
+      // Through the one writer of `status`: its own UPDATE would skip the
+      // queued-time accrual every transition carries.
+      await applyTaskStatusTransition("cancelling", {
+        where: "task_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')",
+        params: [taskId],
+      });
       await js.publish(
         `tasks.${target.taskId}.cancel`,
         sc.encode(JSON.stringify({ type: "cancel", session_id: target.taskId })),
@@ -888,11 +890,10 @@ async function handleCancelTask(
   );
   // `cancelling`, not terminal: the execution may be live off JetStream with no
   // lease to prove it, and this state is in both counted sets.
-  await db.query(
-    `UPDATE claw_tasks SET status = 'cancelling'
-      WHERE session_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')`,
-    [params.id],
-  );
+  await applyTaskStatusTransition("cancelling", {
+    where: "session_id = $1 AND origin = 'a2a' AND status IN ('preparing','running')",
+    params: [params.id],
+  });
 
   try {
     const cancelPayload = { type: "cancel", session_id: params.id };

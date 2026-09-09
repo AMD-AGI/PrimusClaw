@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { ExecuteRequest, ExecuteResult, EventCallback, TokenUsage, Message } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import type { HandsClient } from "../clients/hands.js";
 import pino from "pino";
 
@@ -170,6 +171,8 @@ export interface ExecuteExtras {
    * reach /workspace, and never for a turn the model answers on its own.
    */
   attachHands?: () => Promise<HandsClient>;
+  /** Optional only because this interface is: TaskRunner always sets it. */
+  runIdentity?: RunIdentity;
 }
 
 export interface Engine {

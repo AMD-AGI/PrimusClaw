@@ -20,7 +20,7 @@
  *   - Tick interval defaults to 2s and is configurable through
  *     `TASK_SCHEDULER_TICK_MS`.
  */
-import { db, type StatementRunner } from "../infra/db.js";
+import { db, type Querier, type StatementRunner } from "../infra/db.js";
 import pino from "pino";
 import {
   anySoftCeilingSet, askFromRow, chargeAccepted, envAdmitLimits, fillWithinCeiling,
@@ -28,7 +28,9 @@ import {
   withOwnedAdmissionLock, type AdmissionUsage,
 } from "./admission.js";
 import { dispatchPreparedRow, dispatchTask } from "./dispatcher.js";
-import { listDownstream, transitionStatus, updateTask } from "./db.js";
+import {
+  applyTaskStatusTransition, listDownstream, transitionStatus, updateTask,
+} from "./db.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-scheduler" });
@@ -44,7 +46,7 @@ let timer: NodeJS.Timeout | null = null;
 
 const READY_PREDICATE_SQL = `status = 'waiting_deps'
        AND NOT EXISTS (
-         SELECT 1 FROM unnest(depends_on) dep
+         SELECT 1 FROM unnest(claw_tasks.depends_on) dep
          JOIN claw_tasks p ON p.task_id = dep
          WHERE p.status <> 'completed'
        )`;
@@ -106,13 +108,12 @@ function chargeIfWithinHardHeadroom(
 export async function promoteReadyTasks(): Promise<number> {
   const limits = envAdmitLimits();
   if (limits.hardRuns <= 0 && limits.hardSandboxes <= 0 && limits.hardGpuNodes <= 0) {
-    const r = await db.query(
-      `UPDATE claw_tasks
-       SET status = 'queued', queued_at = NOW()
-       WHERE ${READY_PREDICATE_SQL}
-       RETURNING task_id`,
-    );
-    return r.rowCount ?? 0;
+    // Through the one writer of `status`, so a promotion banks the segment the
+    // row just spent and stamps its run-time epoch. Its own UPDATE dropped both.
+    const promoted = await applyTaskStatusTransition("queued", {
+      where: READY_PREDICATE_SQL,
+    });
+    return promoted.length;
   }
   return await withOwnedAdmissionLock(async (client) => {
     const { usage, roots } = await loadUsageWithRoots("occupying", client);
@@ -127,15 +128,14 @@ export async function promoteReadyTasks(): Promise<number> {
     // serialises admission decisions, not the whole task lifecycle, so
     // `cascadeFailures` and cancellation may have failed one of these rows
     // since it was selected, and an unconditional UPDATE would resurrect it.
-    const r = await client.query(
-      `UPDATE claw_tasks
-       SET status = 'queued', queued_at = NOW()
-       WHERE task_id = ANY($1::text[])
-         AND ${READY_PREDICATE_SQL}
-       RETURNING task_id`,
-      [admitted.map((row) => row.task_id)],
-    );
-    return r.rowCount ?? 0;
+    // On the lock's own connection, and through the same writer: the ceiling
+    // decision is what this path adds, not a second way of writing a status.
+    const promoted = await applyTaskStatusTransition("queued", {
+      where: `task_id = ANY($1::text[]) AND ${READY_PREDICATE_SQL}`,
+      params: [admitted.map((row) => row.task_id)],
+      query: ((text, params) => client.query(text, params)) as Querier,
+    });
+    return promoted.length;
   });
 }
 
@@ -153,16 +153,17 @@ export async function cascadeFailures(): Promise<number> {
   for (const row of failed.rows as Array<{ task_id: string }>) {
     const downs = await listDownstream(row.task_id);
     if (downs.length === 0) continue;
-    const r = await db.query(
-      `UPDATE claw_tasks
-       SET status = 'failed', failure_reason = 'deps_failed',
-           error_message = $1, completed_at = NOW()
-       WHERE task_id = ANY($2)
+    const cascadedRows = await applyTaskStatusTransition("failed", {
+      extra: {
+        failure_reason: "deps_failed",
+        error_message: `upstream ${row.task_id} failed`,
+      },
+      where: `task_id = ANY($1)
          AND status IN ('waiting_deps','waiting_external','queued')
          AND COALESCE(metadata->'derived'->>'on_failure','cascade_fail') = 'cascade_fail'`,
-      [`upstream ${row.task_id} failed`, downs],
-    );
-    cascaded += r.rowCount ?? 0;
+      params: [downs],
+    });
+    cascaded += cascadedRows.length;
   }
   return cascaded;
 }
@@ -292,7 +293,12 @@ async function reserveQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
     return await reserveForExecution(
       client,
       accepted,
-      (row, c) => transitionStatus(row.task_id, ["queued"], "preparing", {}, c),
+      // `transitionStatus` takes the querier as a function now; the reservation
+      // still hands out the connection object it holds the lock on.
+      (row, c) => transitionStatus(
+        row.task_id, ["queued"], "preparing", {},
+        ((text, params) => c.query(text, params)) as Querier,
+      ),
     );
   });
 }
