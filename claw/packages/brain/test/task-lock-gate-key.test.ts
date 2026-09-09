@@ -114,3 +114,25 @@ test("a DAG node named only by its node id is still a node", () => {
     "ktsk_n",
   );
 });
+
+test("a DAG node without a task id uses its node id and stays separate from siblings", () => {
+  for (const task_id of [undefined, ""]) {
+    for (const dag_root_task_id of [undefined, "root-1"]) {
+      const fields = { task_id, dag_root_task_id };
+      assert.equal(pickShellRun(req({ ...fields, dag_node_id: "node-a" })), "node-a");
+      assert.equal(pickShellRun(req({ ...fields, dag_node_id: "node-b" })), "node-b");
+    }
+  }
+});
+
+test("a DAG request without a task or node id cannot use the conversation shell scope", () => {
+  for (const task_id of [undefined, ""]) {
+    for (const dag_node_id of [undefined, ""]) {
+      assert.throws(
+        () => pickShellRun(req({ task_id, dag_node_id, dag_root_task_id: "root-1" })),
+        /DAG shell scope requires a non-empty task_id or dag_node_id/,
+      );
+    }
+  }
+  assert.equal(pickShellRun(req()), "");
+});

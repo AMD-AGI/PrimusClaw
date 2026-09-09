@@ -853,7 +853,7 @@ class AgentLoopRunner {
     }
     if (ownsSlot && !isTrackedRun(key)) {
       metrics.onParkKeyUnusable(site, "untracked");
-      logger.warn({ site, sessionId: this.sessionId, parkKey: key }, "park.key_untracked");
+      logger.warn({ site, sessionId: this.sessionId, runIdentityKey: key }, "park.key_untracked");
     }
     return key;
   }

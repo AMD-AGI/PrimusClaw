@@ -249,12 +249,15 @@ export function pickRunScope(request: ExecuteRequest): string {
 }
 
 /**
- * Shell-filing key within the owner scope: a DAG node's task id, or empty so
- * conversation shells remain addressable across turns.
+ * Shell-filing key: a DAG node's task or node id, or empty for a conversation.
+ * Throws when a DAG request has neither a task id nor a node id.
  */
 export function pickShellRun(request: ExecuteRequest): string {
   const isDagNode = !!(request.dag_root_task_id || request.dag_node_id);
-  return isDagNode ? (request.task_id || "") : "";
+  if (!isDagNode) return "";
+  const shellRun = request.task_id || request.dag_node_id;
+  if (!shellRun) throw new Error("DAG shell scope requires a non-empty task_id or dag_node_id");
+  return shellRun;
 }
 
 /**

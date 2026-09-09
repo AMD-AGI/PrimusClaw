@@ -917,7 +917,7 @@ class TaskRunner {
    */
   private readonly handsOwner: string;
 
-  /** Shell-filing key: the DAG node's task id, or empty across conversation turns. */
+  /** Shell-filing key: the DAG node's task or node id, or empty for a conversation. */
   private readonly shellRun: string;
 
   // userIdHex: only sessions whose user_id matches /^[0-9a-f]{32}$/ go

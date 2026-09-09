@@ -20,6 +20,7 @@ import {
   applyRunEndedIdleFields,
   type RevisionedKv,
 } from "../src/sandbox/park-hands.js";
+import { handsSessionKey } from "../src/sandbox/hands-key.js";
 
 const SESSION = "sess-park";
 const KEY = `hands.${SESSION}`;
@@ -49,17 +50,18 @@ interface Recorded {
   writes: Array<{ value: Record<string, unknown>; revision: number }>;
 }
 
-function kvHolding(entry: Record<string, unknown> | null, revision = REVISION): Recorded {
+function kvHolding(entry: Record<string, unknown> | null, revision = REVISION, key = KEY): Recorded {
   const writes: Recorded["writes"] = [];
   return {
     writes,
     kv: {
-      async get(key: string) {
-        assert.equal(key, KEY, "the handle is addressed by session id");
+      async get(readKey: string) {
+        assert.equal(readKey, key, "the handle is addressed by session id");
         if (!entry) return null;
         return { value: new TextEncoder().encode(JSON.stringify(entry)), revision };
       },
-      async update(_key: string, value: Uint8Array, rev: number) {
+      async update(writeKey: string, value: Uint8Array, rev: number) {
+        assert.equal(writeKey, key);
         writes.push({
           value: JSON.parse(new TextDecoder().decode(value)) as Record<string, unknown>,
           revision: rev,
@@ -146,6 +148,28 @@ test("parking opens a new idle period in the one shape the sweep understands", a
 test("a handle nobody wrote is not a handle to park", async () => {
   const { kv, writes } = kvHolding(null);
   assert.deepEqual(await parkHandsAfterRun(kv, SESSION, "wl-1"), { outcome: "gone" });
+  assert.equal(writes.length, 0);
+});
+
+test("parking addresses sessions with reserved prefixes through their encoded keys", async () => {
+  for (const sessionId of ["retained-session", "=literal"]) {
+    const key = handsSessionKey(sessionId);
+    assert.notEqual(key, `hands.${sessionId}`);
+    const { kv, writes } = kvHolding({ ...READY }, REVISION, key);
+
+    assert.deepEqual(await parkHandsAfterRun(kv, sessionId, "wl-1"), { outcome: "parked" });
+    assert.equal(writes.length, 1);
+  }
+});
+
+test("parking rejects a session id that is indistinguishable from an encoded key", async () => {
+  const sessionId = handsSessionKey("retained-session").slice("hands.".length);
+  const { kv, writes } = kvHolding({ ...READY });
+
+  await assert.rejects(
+    parkHandsAfterRun(kv, sessionId, "wl-1"),
+    /shaped exactly like a re-keyed registry entry/,
+  );
   assert.equal(writes.length, 0);
 });
 
