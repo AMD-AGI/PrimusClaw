@@ -39,8 +39,7 @@ import pino from "pino";
 import type { RunLease } from "@claw/protocol";
 import { db } from "../infra/db.js";
 import { newTaskId } from "./ids.js";
-import { insertTask } from "./db.js";
-import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC } from "./run-budget.js";
+import { applyTaskStatusTransition, insertTask } from "./db.js";
 import type { TaskStatus } from "./types.js";
 import { recordRunUse, releaseRunUse } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
@@ -268,15 +267,10 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
  */
 export async function markChatRunRunning(sessionId: string): Promise<void> {
   try {
-    await db.query(
-      `UPDATE claw_tasks
-          SET status = 'running',
-              ${deadlineStampSql(2, 3)}
-        WHERE session_id = $1
-          AND origin = 'chat'
-          AND status = 'preparing'`,
-      [sessionId, RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node],
-    );
+    await applyTaskStatusTransition("running", {
+      where: "session_id = $1 AND origin = 'chat' AND status = 'preparing'",
+      params: [sessionId],
+    });
   } catch (err) {
     logger.warn({ err, sessionId }, "chat_run.mark_running_failed");
   }
@@ -320,19 +314,20 @@ export async function closeChatRun(
   const openStatuses: TaskStatus[] = ["queued", "preparing", "running", "cancelling"];
   const guessableStatuses: TaskStatus[] = ["preparing", "running", "cancelling"];
   try {
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = $3,
-              failure_reason = $4,
-              error_message = $5,
-              completed_at = NOW()
-        WHERE session_id = $1
+    const closed = await applyTaskStatusTransition(outcome, {
+      extra: {
+        failure_reason: outcome === "completed" ? null : (failureReason ?? outcome),
+        error_message: outcome === "completed"
+          ? null
+          : (failureReason ?? "").slice(0, 2000) || null,
+      },
+      where: `session_id = $1
           AND origin = 'chat'
           AND (
-            (status = ANY($2) AND metadata->>'message_id' = $6)
+            (status = ANY($2) AND metadata->>'message_id' = $3)
             OR (
-              $6::text IS NULL
-              AND status = ANY($7)
+              $3::text IS NULL
+              AND status = ANY($4)
               AND NOT EXISTS (
                 SELECT 1 FROM claw_tasks other
                  WHERE other.session_id = $1
@@ -341,18 +336,10 @@ export async function closeChatRun(
                    AND other.task_id <> claw_tasks.task_id
               )
             )
-          )
-        RETURNING task_id`,
-      [
-        sessionId,
-        openStatuses,
-        outcome,
-        outcome === "completed" ? null : (failureReason ?? outcome),
-        outcome === "completed" ? null : (failureReason ?? "").slice(0, 2000) || null,
-        messageId ?? null,
-        guessableStatuses,
-      ],
-    );
+          )`,
+      params: [sessionId, openStatuses, messageId ?? null, guessableStatuses],
+    });
+    const r = { rows: closed, rowCount: closed.length };
     if (!r.rowCount) {
       // Not an error on its own: a run swept, cancelled or already closed by a
       // duplicate event has nothing left to close. Logged because during the
@@ -486,19 +473,12 @@ export async function failChatRunDispatch(
     //
     // A holder settles its own row: it has the lease, the generation and the
     // terminal event. Leaving it alone is the whole fix.
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = 'failed',
-              failure_reason = $2,
-              error_message = $3,
-              completed_at = NOW()
-        WHERE task_id = $1
-          AND status IN (${OPEN_RUN_STATUS_SQL})
-          AND lease_owner IS NULL
-        RETURNING task_id`,
-      [taskId, failureReason, reason.slice(0, 2000)],
-    );
-    if (!r.rowCount) return await verdictForUnmatchedRow(taskId);
+    const closed = await applyTaskStatusTransition("failed", {
+      extra: { failure_reason: failureReason, error_message: reason.slice(0, 2000) },
+      where: `task_id = $1 AND status IN (${OPEN_RUN_STATUS_SQL}) AND lease_owner IS NULL`,
+      params: [taskId],
+    });
+    if (!closed.length) return await verdictForUnmatchedRow(taskId);
     // Reached only when the row was still unclaimed, so nothing ever executed
     // and the workspace is exactly as the run found it.
     await releaseRunUse(taskId, false);
@@ -552,25 +532,27 @@ export async function failChatRunDispatch(
 export async function interruptUnstartedChatRuns(sessionId: string): Promise<number> {
   let rows: Array<{ task_id: string; message_id: string | null; user_id: string | null; prompt: string | null }>;
   try {
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = 'cancelled',
-              failure_reason = 'cancelled',
-              error_message = 'interrupted before a worker claimed the run',
-              completed_at = NOW()
-        WHERE session_id = $1
+    const cancelled = await applyTaskStatusTransition("cancelled", {
+      extra: {
+        failure_reason: "cancelled",
+        error_message: "interrupted before a worker claimed the run",
+      },
+      where: `session_id = $1
           AND origin = 'chat'
           AND metadata->>'dispatch' = 'doorbell'
           AND (
             status = 'queued'
             OR (status = 'preparing' AND lease_owner IS NULL)
-          )
-        RETURNING task_id, prompt,
-                  metadata->>'message_id' AS message_id,
-                  COALESCE(metadata->>'user_id', input->>'user_id') AS user_id`,
-      [sessionId],
-    );
-    rows = r.rows as typeof rows;
+          )`,
+      params: [sessionId],
+    });
+    rows = cancelled.map((row) => ({
+      task_id: row.task_id,
+      prompt: row.prompt ?? null,
+      message_id: (row.metadata?.message_id as string | undefined) ?? null,
+      user_id: (row.metadata?.user_id as string | undefined)
+        ?? (row.input?.user_id as string | undefined) ?? null,
+    }));
   } catch (err) {
     logger.warn({ err, sessionId }, "chat_run.interrupt_unstarted_failed");
     return 0;

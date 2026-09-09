@@ -25,7 +25,7 @@
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import type { JsMsg, KV } from "nats";
-import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, RunTimeReport } from "@claw/protocol";
 import {
   bindTaskRunnerDeps,
   resolvePoisonedTask,
@@ -47,6 +47,7 @@ import { forgetDeletedSessions, markSessionDeleted } from "../src/infra/deleted-
 function fakeMsg(deliveryCount = 1) {
   const verdicts: string[] = [];
   const msg = {
+    seq: 7,
     info: { deliveryCount },
     ack() { verdicts.push("ack"); },
     nak(ms?: number) { verdicts.push(`nak:${ms ?? "none"}`); },
@@ -200,11 +201,16 @@ async function runScenario(opts: {
    * this attempt writes a checkpoint of its own.
    */
   seedCheckpoint?: Partial<CheckpointState>;
+  seedCallback?: Uint8Array;
 }) {
   const sessionId = opts.sessionId ?? SESSION;
   const { msg, verdicts } = fakeMsg(opts.deliveryCount ?? 1);
   const { kv } = fakeKv();
   const { kv: kvCkpt, store: ckptStore } = fakeKv();
+  if (opts.seedCallback) {
+    assert.ok(opts.taskId, "a persisted callback belongs to a task");
+    ckptStore.set(`task-result.${opts.taskId}`, opts.seedCallback);
+  }
   if (opts.seedCheckpoint) {
     ckptStore.set(
       ckptKey(sessionId),
@@ -819,43 +825,83 @@ test("poisoned task whose handoff never succeeds terminates instead of vanishing
 });
 
 test("redelivery replays a persisted callback without executing the task again", async () => {
-  const { msg, verdicts } = fakeMsg(2);
-  const { kv } = fakeKv();
-  const { kv: kvCkpt, store } = fakeKv();
-  const { emitter } = fakeEmitter();
-  const { sideEffects, calls } = stubSideEffects();
   const taskId = "task-outbox";
-  store.set(
-    `task-result.${taskId}`,
-    new TextEncoder().encode(JSON.stringify(result({ finalText: "already finished" }))),
-  );
-  const engine: Engine = {
-    async execute() {
-      calls.push("engine.execute");
-      return result();
+  const stored = result({ finalText: "already finished" });
+  let replayedCount = 0;
+  const r = await runScenario({
+    taskId, deliveryCount: 2,
+    seedCallback: new TextEncoder().encode(JSON.stringify(stored)),
+    engineBehavior: async () => result(),
+    sideEffects: {
+      postAgentDone: async (_request, replayed, runTime) => {
+        replayedCount++;
+        assert.deepEqual(replayed, stored);
+        assert.equal(runTime, undefined, "older outbox entries carry no report");
+      },
     },
-  };
-  bindTaskRunnerDeps({ kv, kvCkpt, emitter, engine, sideEffects });
+  });
 
-  const request = {
-    task_id: taskId,
-    session_id: SESSION,
-    prompt: "hi",
-    user_id: "u1",
-    platform_key: "pk",
-  } as ExecuteRequest;
-  const abortCtrl = new AbortController();
-  const lockKey = `lock.${taskId}`;
-  activeAbort.set(lockKey, abortCtrl);
-
-  await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
-
-  assert.deepEqual(verdicts, ["ack"]);
-  assert.equal(calls.filter((call) => call === "postAgentDone").length, 1);
-  assert.ok(!calls.includes("engine.execute"), "replay must not repeat task side effects");
-  assert.equal(store.has(`task-result.${taskId}`), false);
-  assert.ok(calls.includes("releaseTaskLock"));
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(replayedCount, 1);
+  assert.ok(!r.calls.includes("engine.execute"), "replay must not repeat task side effects");
+  assert.equal(r.ckptStore.has(`task-result.${taskId}`), false);
+  assert.ok(r.calls.includes("releaseTaskLock"));
 });
+
+for (const outcome of ["success", "failure"] as const) {
+  test(`a ${outcome} callback retry preserves its final report and attempt for replay`, async () => {
+    const taskId = `task-outbox-${outcome}`;
+    let sentResult: ExecuteResult | undefined;
+    let sentReport: RunTimeReport | undefined;
+    let settledAttempts = 0;
+    const first = await runScenario({
+      taskId,
+      request: { run_lease: { url: `http://api.test/v1/internal/tasks/${taskId}/lease`, token: "t" } },
+      engineBehavior: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        if (outcome === "failure") throw new Error("schema validation failed");
+        return result({ finalText: "already finished" });
+      },
+      sideEffects: {
+        postRunLease: async () => "running",
+        postAgentDone: async (_request, completed, runTime) => {
+          sentResult = completed;
+          sentReport = runTime;
+          throw new AgentDoneDeliveryError("backend unavailable");
+        },
+        settleRunAttempt: async () => { settledAttempts++; },
+      },
+    });
+    assert.deepEqual(first.verdicts, ["nak:5000"]);
+    assert.ok(sentReport, "the executing attempt produced real coverage");
+    assert.equal(sentReport.key, taskId);
+    assert.ok((sentReport.cumulativeStateMs?.executing ?? 0) > 0);
+    const stored = first.ckptStore.get(`task-result.${taskId}`);
+    assert.ok(stored, "the failed callback leaves a durable result");
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(stored)).run_time, sentReport,
+      "the producer persists the same attempt token and coverage as the callback");
+    assert.equal(settledAttempts, 0, "a callback replay must retain the attempt token it will report");
+
+    let replayed = 0;
+    const second = await runScenario({
+      taskId, deliveryCount: 2, seedCallback: stored,
+      engineBehavior: async () => result(),
+      sideEffects: {
+        postAgentDone: async (_request, completed, runTime) => {
+          replayed++;
+          assert.deepEqual(completed, sentResult, "the report is separate from the execution result");
+          assert.deepEqual(runTime, sentReport, "redelivery retains the original attempt identity");
+        },
+      },
+    });
+
+    assert.equal(replayed, 1);
+    assert.deepEqual(second.verdicts, ["ack"]);
+    assert.ok(!second.calls.includes("engine.execute"));
+    assert.equal(second.completion, undefined, "replay does not emit a second completion event");
+    assert.equal(second.ckptStore.has(`task-result.${taskId}`), false);
+  });
+}
 
 // ── in-flight snapshot recovery ───────────────────────────────────────────
 

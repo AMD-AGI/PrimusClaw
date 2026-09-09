@@ -19,6 +19,10 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { beginRun, endRun, phaseOf, setParkHooks, whileWaiting } from "../src/tasks/run-phase.js";
+import { testRunKey } from "./support/run-identity.js";
+
+const RUN_1 = testRunKey("run-1");
+const NEVER_BEGAN = testRunKey("never-began");
 
 interface Recorder {
   events: string[];
@@ -48,16 +52,16 @@ afterEach(() => { setParkHooks(null); });
 describe("parking while a run waits", () => {
   it("P1 parks for the wait and takes a slot again afterwards", async () => {
     const rec = recordingHooks();
-    beginRun("run-1");
+    beginRun(RUN_1);
     try {
-      const seen = await whileWaiting("run-1", "approval", async () => {
+      const seen = await whileWaiting(RUN_1, "approval", "timed+park", async () => {
         assert.deepEqual(rec.events, ["park"], "the slot is gone before the wait begins");
         return "approved";
       });
       assert.equal(seen, "approved");
       assert.deepEqual(rec.events, ["park", "unpark"]);
     } finally {
-      endRun("run-1");
+      endRun(RUN_1);
     }
   });
 
@@ -66,15 +70,15 @@ describe("parking while a run waits", () => {
     // period of the run not running. Parking twice would decrement the pod's
     // count twice for a single run.
     const rec = recordingHooks();
-    beginRun("run-1");
+    beginRun(RUN_1);
     try {
-      await whileWaiting("run-1", "background_command", async () => {
-        await whileWaiting("run-1", "approval", async () => {});
+      await whileWaiting(RUN_1, "background_command", "timed+park", async () => {
+        await whileWaiting(RUN_1, "approval", "timed+park", async () => {});
         assert.deepEqual(rec.events, ["park"], "the inner wait is already parked");
       });
       assert.deepEqual(rec.events, ["park", "unpark"]);
     } finally {
-      endRun("run-1");
+      endRun(RUN_1);
     }
   });
 
@@ -82,24 +86,26 @@ describe("parking while a run waits", () => {
     // An approval that is denied, a background command that errors, an abort
     // mid-wait: all of them leave through the same throw.
     const rec = recordingHooks();
-    beginRun("run-1");
+    beginRun(RUN_1);
     try {
-      await assert.rejects(whileWaiting("run-1", "approval", async () => {
+      await assert.rejects(whileWaiting(RUN_1, "approval", "timed+park", async () => {
         throw new Error("denied");
       }));
       assert.deepEqual(rec.events, ["park", "unpark"]);
-      assert.equal(phaseOf("run-1").phase, "executing");
+      assert.equal(phaseOf(RUN_1).phase, "executing");
     } finally {
-      endRun("run-1");
+      endRun(RUN_1);
     }
   });
 
   it("P4 parks nothing for a run nobody is tracking", async () => {
-    // Sub-agents run inside a slot their parent holds and are not tracked.
-    // Parking on their behalf would release a slot this run does not own.
+    // A key the ledger does not hold still runs the work and still parks
+    // nothing. What it no longer does is pass unremarked: the miss is logged,
+    // which run-identity-logs.test.ts asserts from a child process because
+    // pino writes past every in-process seam.
     const rec = recordingHooks();
-    await whileWaiting("never-began", "approval", async () => {});
-    await whileWaiting(undefined, "approval", async () => {});
+    await whileWaiting(NEVER_BEGAN, "approval", "timed+park", async () => {});
+    await whileWaiting(undefined, "approval", "timed+park", async () => {});
     assert.deepEqual(rec.events, []);
   });
 
@@ -109,14 +115,14 @@ describe("parking while a run waits", () => {
     // fewer task for the rest of its life. Not reachable today -- only the
     // delivery loop binds these hooks -- but it is invisible if it ever is.
     const rec = recordingHooks(false, false);
-    beginRun("run-1");
+    beginRun(RUN_1);
     try {
-      await whileWaiting("run-1", "approval", async () => {});
+      await whileWaiting(RUN_1, "approval", "timed+park", async () => {});
       assert.deepEqual(rec.events, ["park", "unpark"]);
       assert.equal(rec.unparkedWith, false,
         "the return has to know what the park managed, or it guesses in the costly direction");
     } finally {
-      endRun("run-1");
+      endRun(RUN_1);
     }
   });
 
@@ -125,9 +131,9 @@ describe("parking while a run waits", () => {
     // can queue. Continuing anyway would put the pod over its ceiling, which
     // is the thing the gate exists to prevent.
     const rec = recordingHooks(true);
-    beginRun("run-1");
+    beginRun(RUN_1);
     let resumed = false;
-    const call = whileWaiting("run-1", "approval", async () => {}).then(() => { resumed = true; });
+    const call = whileWaiting(RUN_1, "approval", "timed+park", async () => {}).then(() => { resumed = true; });
 
     await new Promise((r) => setImmediate(r));
     assert.equal(resumed, false, "still queueing for a slot");
@@ -136,7 +142,7 @@ describe("parking while a run waits", () => {
     rec.release?.();
     await call;
     assert.equal(resumed, true);
-    endRun("run-1");
+    endRun(RUN_1);
   });
 
   it("P6 counts the queue for a slot as waiting", async () => {
@@ -144,20 +150,20 @@ describe("parking while a run waits", () => {
     // the very stretches they spend queueing, which inflates the fraction the
     // capacity decision is based on.
     const rec = recordingHooks(true);
-    beginRun("run-1");
-    const call = whileWaiting("run-1", "approval", async () => {});
+    beginRun(RUN_1);
+    const call = whileWaiting(RUN_1, "approval", "timed+park", async () => {});
 
     await new Promise((r) => setTimeout(r, 20));
-    const during = phaseOf("run-1");
+    const during = phaseOf(RUN_1);
     assert.equal(during.phase, "waiting");
     assert.equal(during.waitReason, "approval");
     assert.ok(during.waitedMs >= 15, `expected the wait to be counted, got ${during.waitedMs}ms`);
 
     rec.release?.();
     await call;
-    const after = phaseOf("run-1");
+    const after = phaseOf(RUN_1);
     assert.equal(after.phase, "executing");
     assert.equal(after.waits, 1, "one stretch of waiting, however long it took to come back");
-    endRun("run-1");
+    endRun(RUN_1);
   });
 });

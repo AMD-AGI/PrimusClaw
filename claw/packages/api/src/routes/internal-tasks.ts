@@ -32,6 +32,8 @@ import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
 import { db } from "../infra/db.js";
+import { decodeRunTimeReport } from "@claw/protocol";
+import { bankQueuedTime, mergeRenewal, openAttemptRecordFor } from "../tasks/run-time-ledger.js";
 
 const logger = pino({ name: "internal-tasks" });
 
@@ -124,63 +126,104 @@ interface TaskEventBody {
   brain_id?: string;
   /** The Hands workload provisioned for it, likewise. */
   sandbox_workload_id?: string;
+  /** This attempt, so the row can allocate it a generation. */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
   [key: string]: unknown;
 }
 
-type RunOwnership =
-  | { source: "dispatched"; brainId?: string; workloadId?: string }
-  | { source: "lease"; brainId: string; sandbox: SandboxHandle };
+/** Best-effort attribution of an active run to its executing brain and sandbox. */
+async function recordRunOwnership(taskId: string, body: TaskEventBody): Promise<void> {
+  if (!(await writeRunOwnership(taskId, body))) return;
+  await bankQueuedTime(taskId).catch(() => { /* best-effort, like the write */ });
+  if (body.attempt_id) await openAttemptRecordFor(taskId, body.attempt_id);
+}
 
-async function recordRunOwnership(
-  taskId: string,
-  ownership: RunOwnership,
-): Promise<void> {
-  if (ownership.source === "dispatched" && !ownership.brainId && !ownership.workloadId) return;
+/** @returns whether the row was in a state that still accepts this attempt. */
+async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<boolean> {
+  const brainId = body.brain_id;
+  const workloadId = body.sandbox_workload_id;
+  const attemptId = body.attempt_id;
+  if (!brainId && !workloadId && !attemptId) return false;
   try {
-    if (ownership.source === "lease") {
-      // A renewed lease can change hands before this second write reaches the row.
-      await db.query(
-        `UPDATE claw_tasks
-            SET sandbox_workload_id = $3,
-                metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
-          WHERE task_id = $1
-            AND lease_owner = $2
-            AND lease_expires_at > NOW()
-            AND status = ANY($5::text[])`,
-        [
-          taskId,
-          ownership.brainId,
-          ownership.sandbox.provider === "safe-workload" ? ownership.sandbox.handle : null,
-          JSON.stringify(ownership.sandbox),
-          RENEWABLE_STATUSES,
-        ],
-      );
-    } else {
-      await db.query(
-        `UPDATE claw_tasks
-            SET brain_id            = COALESCE($2, brain_id),
-                sandbox_workload_id = COALESCE($3, sandbox_workload_id),
-                metadata = CASE WHEN $5::jsonb IS NULL THEN metadata
-                           ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $5::jsonb, true)
-                           END
-          WHERE task_id = $1
-            AND status = ANY($4::text[])`,
-        [
-          taskId,
-          ownership.brainId || null,
-          ownership.workloadId || null,
-          RENEWABLE_STATUSES,
-          ownership.workloadId
-            ? JSON.stringify({ provider: "safe-workload", handle: ownership.workloadId })
-            : null,
-        ],
-      );
-    }
+    const r = await db.query(
+      `UPDATE claw_tasks
+          SET brain_id            = COALESCE($2, brain_id),
+              sandbox_workload_id = COALESCE($3, sandbox_workload_id),
+              metadata = CASE WHEN $9::jsonb IS NULL THEN metadata
+                         ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
+                         END,
+              attempt_id          = COALESCE($5, attempt_id),
+              attempt_generation  = CASE
+                                      WHEN $5::text IS NOT NULL
+                                       AND attempt_id IS DISTINCT FROM $5
+                                      THEN attempt_generation + 1
+                                      ELSE attempt_generation
+                                    END,
+              delivery_seq        = $6::bigint,
+              delivery_count      = $7::bigint
+        WHERE task_id = $1
+          AND status = ANY($4::text[])
+          -- Doorbell delivery pairs stay at (0, 0); each claim advances claim_count.
+          AND claim_count = $8::int
+          AND (delivery_seq, delivery_count) <= ($6::bigint, $7::bigint)
+          AND ($5::text IS NULL OR $5 IS DISTINCT FROM settled_attempt_id)`,
+      [
+        taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
+        attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
+        body.claim_count ?? 0,
+        workloadId ? JSON.stringify({ provider: "safe-workload", handle: workloadId }) : null,
+      ],
+    );
+    return (r.rowCount ?? 0) > 0;
   } catch (err) {
     logger.warn(
       { taskId, err: (err as Error)?.message },
       "task.ownership_write_failed",
     );
+    return false;
+  }
+}
+
+async function recordLeaseSandbox(
+  taskId: string,
+  brainId: string,
+  sandbox: SandboxHandle,
+  token: AttemptToken,
+  authorization: string | undefined,
+): Promise<void> {
+  const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  try {
+    // Renewal and sandbox storage can straddle a takeover, including one by the same brain.
+    await db.query(
+      `UPDATE claw_tasks
+          SET sandbox_workload_id = $3,
+              metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+        WHERE task_id = $1
+          AND lease_owner = $2
+          AND lease_expires_at > NOW()
+          AND status = ANY($5::text[])
+          AND (
+            ($6::text IS NOT NULL AND attempt_id = $6 AND claim_count = $7
+              AND (delivery_seq, delivery_count) = ($8::bigint, $9::bigint))
+            OR ($6::text IS NULL AND attempt_generation = 0
+              AND internal_token_hash = $10 AND attempt_id IS NULL AND settled_attempt_id IS NULL)
+          )`,
+      [
+        taskId, brainId,
+        sandbox.provider === "safe-workload" ? sandbox.handle : null,
+        JSON.stringify(sandbox), RENEWABLE_STATUSES,
+        token.ok ? token.attemptId : null,
+        token.ok ? token.claimCount : null,
+        token.ok ? token.deliverySeq : null,
+        token.ok ? token.deliveryCount : null,
+        token.ok ? null : createHash("sha256").update(bearer).digest("hex"),
+      ],
+    );
+  } catch (err) {
+    logger.warn({ taskId, err: (err as Error)?.message }, "task.ownership_write_failed");
   }
 }
 
@@ -195,6 +238,41 @@ interface RunLeaseBody {
   /** Cumulative milliseconds this run has spent waiting, as the worker sees it. */
   waited_ms?: number;
   waits?: number;
+  /** The attempt token (§8). Fail-closed: an omitted field is not a zero. */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
+  /** This attempt's running per-state totals, absent on an identity-only tick. */
+  run_time?: unknown;
+}
+
+/** The attempt token, or the field that was missing from it. */
+type AttemptToken =
+  | { ok: true; attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number }
+  | { ok: false; missing: string };
+
+function attemptTokenOf(body: RunLeaseBody): AttemptToken {
+  if (typeof body.attempt_id !== "string" || !body.attempt_id) {
+    return { ok: false, missing: "attempt_id" };
+  }
+  for (const field of ["claim_count", "delivery_seq", "delivery_count"] as const) {
+    const value = body[field];
+    if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false, missing: field };
+  }
+  return {
+    ok: true,
+    attemptId: body.attempt_id,
+    claimCount: body.claim_count as number,
+    deliverySeq: body.delivery_seq as number,
+    deliveryCount: body.delivery_count as number,
+  };
+}
+
+function isLegacyRunLease(body: RunLeaseBody): boolean {
+  return typeof body.brain_id === "string" && body.brain_id.trim().length > 0
+    && ["attempt_id", "claim_count", "delivery_seq", "delivery_count", "run_time"]
+      .every((field) => !Object.hasOwn(body, field));
 }
 
 /**
@@ -252,38 +330,33 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
 }
 
 /**
- * Renew a run's lease and record what it is doing.
- *
- * The lease is the row's own answer to "is anything still running this?", and
- * the answer it replaces was inferred from whether a queue message remained
- * unacknowledged -- which cannot separate a worker that died from one that is
- * slow, and takes the redelivery budget to conclude either. Renewed every few
- * seconds, an expired lease means the worker is gone, within the TTL.
- *
- * The phase is the other half, and the more interesting one: a run holds its
- * slot whether it is calling the model or waiting on a command that has an
- * hour left, and nothing has ever measured which. Accumulated on the row so
- * the ratio can be read per run and across the fleet.
- *
- * Only non-terminal rows are touched, so a late renewal for a run that has
- * already finished changes nothing and tells the caller so.
- *
- * The owner predicate is what makes the lease a fence rather than a timestamp.
- * Without it the row accepted a renewal from anyone: when two workers ended up
- * on one run -- a lock that expired under a worker that could not renew it, and
- * a redelivery that took it over -- both renewed this row, both were told they
- * were live, and nothing in the system could name which of them was. Whoever
- * holds an unexpired lease keeps it; anyone else is refused and stands down.
- * Expiry is what makes an honest takeover possible, so it has to be part of the
- * predicate: the resuming worker's first renewal names an owner that is not the
- * dead one, and only a lapsed lease lets it through.
- *
- * @returns the row's status, or null when there is no active row to renew.
+ * `unavailable` is not a status: the fence never ran, so nothing may be banked,
+ * while the caller is still told it is live.
  */
-async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string | null> {
+type RenewalOutcome =
+  | { kind: "accepted"; status: string }
+  | { kind: "refused" }
+  | { kind: "unavailable" };
+
+function runPhasePatch(body: RunLeaseBody): string {
+  const phase = body.phase === "waiting" ? "waiting" : "executing";
+  return JSON.stringify({
+    phase,
+    wait_reason: phase === "waiting" ? (body.wait_reason ?? null) : null,
+    waited_ms: Math.max(Math.floor(Number(body.waited_ms) || 0), 0),
+    waits: Math.max(Math.floor(Number(body.waits) || 0), 0),
+    at: new Date().toISOString(),
+  });
+}
+
+/** Renew the lease and return whether its attempt fence was applied. */
+async function renewRunLease(
+  taskId: string,
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): Promise<RenewalOutcome> {
   const leaseSec = leaseSecondsFromBody(body);
   noteLeaseDisagreement(taskId, leaseSec);
-  const phase = body.phase === "waiting" ? "waiting" : "executing";
   try {
     const r = await db.query(
       `UPDATE claw_tasks
@@ -294,9 +367,19 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
               metadata         = jsonb_set(
                                    COALESCE(metadata, '{}'::jsonb),
                                    '{run_phase}',
-                                   $4::jsonb,
+                                   COALESCE(metadata->'run_phase', '{}'::jsonb) || $4::jsonb,
                                    true
-                                 )
+                                 ),
+              attempt_id         = $6,
+              attempt_generation = CASE WHEN attempt_id IS DISTINCT FROM $6
+                                        THEN attempt_generation + 1
+                                        ELSE attempt_generation END,
+              delivery_seq       = CASE WHEN (delivery_seq, delivery_count)
+                                             < ($8::bigint, $9::bigint)
+                                        THEN $8::bigint ELSE delivery_seq END,
+              delivery_count     = CASE WHEN (delivery_seq, delivery_count)
+                                             < ($8::bigint, $9::bigint)
+                                        THEN $9::bigint ELSE delivery_count END
         WHERE task_id = $1
           AND status = ANY($5::text[])
           AND (
@@ -305,28 +388,130 @@ async function renewRunLease(taskId: string, body: RunLeaseBody): Promise<string
              OR lease_expires_at IS NULL
              OR lease_expires_at < NOW()
           )
+          AND claim_count = $7
+          AND (delivery_seq, delivery_count) <= ($8::bigint, $9::bigint)
+          -- A settled attempt's token is spent. Clearing attempt_id is what stops
+          -- a late heartbeat renewing under it, but a cleared column reads just
+          -- like a run no attempt ever opened, which is the adoption arm's
+          -- legitimate target -- so the id itself is remembered. (No backticks:
+          -- this statement is a template literal.)
+          AND $6 IS DISTINCT FROM settled_attempt_id
+          AND (
+                attempt_id = $6
+             OR attempt_id IS NULL
+             OR ((delivery_seq, delivery_count) < ($8::bigint, $9::bigint)
+                 AND (lease_expires_at IS NULL OR lease_expires_at < NOW()))
+          )
         RETURNING status`,
       [
         taskId,
         body.brain_id || null,
         leaseSec,
-        JSON.stringify({
-          phase,
-          wait_reason: phase === "waiting" ? (body.wait_reason ?? null) : null,
-          waited_ms: Math.max(Math.floor(Number(body.waited_ms) || 0), 0),
-          waits: Math.max(Math.floor(Number(body.waits) || 0), 0),
-          at: new Date().toISOString(),
-        }),
+        runPhasePatch(body),
         RENEWABLE_STATUSES,
+        token.attemptId,
+        token.claimCount,
+        token.deliverySeq,
+        token.deliveryCount,
       ],
     );
-    return (r.rows[0] as { status?: string } | undefined)?.status ?? null;
+    const status = (r.rows[0] as { status?: string } | undefined)?.status;
+    return status ? { kind: "accepted", status } : { kind: "refused" };
   } catch (err) {
     logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_renew_failed");
-    // Reported as a live run: a database hiccup is not evidence that the run
-    // has ended, and answering 409 would tell a healthy worker to stand down.
-    return "unknown";
+    return { kind: "unavailable" };
   }
+}
+
+async function renewLegacyRunLease(
+  taskId: string, body: RunLeaseBody, authorization: string | undefined,
+): Promise<RenewalOutcome> {
+  const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  const tokenHash = createHash("sha256").update(bearer).digest("hex");
+  const leaseSec = leaseSecondsFromBody(body);
+  noteLeaseDisagreement(taskId, leaseSec);
+  try {
+    const r = await db.query(
+      `UPDATE claw_tasks
+          SET lease_owner = $2,
+              brain_id = $2,
+              lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
+              heartbeat_at = NOW(),
+              metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb), '{run_phase}',
+                COALESCE(metadata->'run_phase', '{}'::jsonb) || $4::jsonb, true)
+        WHERE task_id = $1
+          AND status = ANY($5::text[])
+          -- Claim rotation can race authentication; fence the bearer again here.
+          AND internal_token_hash = $6
+          -- Generation never clears, so entering the attempt protocol closes this bridge.
+          AND attempt_generation = 0
+          AND attempt_id IS NULL
+          AND settled_attempt_id IS NULL
+          AND (delivery_seq, delivery_count) = (0, 0)
+          AND (
+            lease_owner = $2
+            OR (COALESCE(metadata->>'dispatch', '') <> 'doorbell'
+                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < NOW()))
+          )
+        RETURNING status`,
+      [taskId, body.brain_id, leaseSec, runPhasePatch(body), RENEWABLE_STATUSES, tokenHash],
+    );
+    const status = (r.rows[0] as { status?: string } | undefined)?.status;
+    return status ? { kind: "accepted", status } : { kind: "refused" };
+  } catch (err) {
+    logger.warn({ taskId, err: (err as Error)?.message }, "run.legacy_lease_renew_failed");
+    return { kind: "unavailable" };
+  }
+}
+
+/**
+ * Bank what this renewal covered, against the attempt the row still holds.
+ *
+ * Two fences, because the UPDATE above commits on its own and a release or
+ * takeover can land between it and this read: the nested report must present
+ * the token the row accepted, and the row must still hold that attempt.
+ */
+async function mergeRenewalCoverage(
+  taskId: string,
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): Promise<void> {
+  const decoded = body.run_time === undefined ? null : decodeRunTimeReport(body.run_time);
+  if (decoded && !decoded.ok) {
+    logger.warn({ taskId, rejected: decoded.rejected }, "run_lease.run_time_rejected");
+    return;
+  }
+  const report = decoded?.report;
+  if (report && !sameAttemptToken(report, token)) {
+    logger.warn(
+      { taskId, tokenAttemptId: token.attemptId, reportAttemptId: report.attemptId },
+      "run_lease.run_time_token_mismatch",
+    );
+    return;
+  }
+  // Contained for the same reason the renewal's own UPDATE is: a run that is
+  // otherwise fine must not be told to stand down because its accounting could
+  // not be written.
+  const outcome = await mergeRenewal(taskId, token.attemptId, report)
+    .catch((err) => {
+      logger.warn({ taskId, err: (err as Error)?.message }, "run_lease.run_time_merge_failed");
+      return "unavailable" as const;
+    });
+  if (outcome === "stale") {
+    logger.warn({ taskId, attemptId: token.attemptId }, "run_lease.run_time_superseded");
+  }
+}
+
+/** Whether a nested report speaks for the attempt the lease body presented. */
+function sameAttemptToken(
+  report: { attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number },
+  token: Extract<AttemptToken, { ok: true }>,
+): boolean {
+  return report.attemptId === token.attemptId
+    && report.claimCount === token.claimCount
+    && report.deliverySeq === token.deliverySeq
+    && report.deliveryCount === token.deliveryCount;
 }
 
 /**
@@ -462,40 +647,19 @@ async function buildBackendMcpCtxStub(
   };
 }
 
-function registerRunLeaseRoute(app: FastifyInstance): void {
-  app.post<{ Params: { taskId: string }; Body: RunLeaseBody }>(
-    "/v1/internal/tasks/:taskId/lease",
-    { preHandler: internalTaskAuth("lease") },
-    async (req, reply) => {
-      const { taskId } = req.params;
-      const body = req.body ?? {};
-      const sandbox = parseSandboxHandle(body.sandbox);
-      if (body.sandbox !== undefined && !sandbox) {
-        return reply.status(400).send({
-          ok: false,
-          error: "sandbox.provider must be 'safe-workload' or 'agent-sandbox'; sandbox.handle must be a non-empty string of at most 1024 characters"
-            + " without control characters and cannot be '.' or '..'",
-        });
-      }
-      const status = await renewRunLease(taskId, body);
-      if (!status) {
-        const reason = await classifyLeaseRefusal(taskId, body.brain_id);
-        return reply.status(409).send({ ok: false, error: "run is not active", reason });
-      }
-      if (status !== "unknown" && sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
-        await recordRunOwnership(taskId, { source: "lease", brainId: body.brain_id, sandbox });
-      }
-      return { ok: true, status };
-    },
-  );
+export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
+  registerAgentDoneRoute(app);
+  registerEventRoute(app);
+  registerLeaseRoute(app);
+  registerBackendMcpRoute(app);
 }
 
-export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
-  // Brain → Backend: task finished (success / failure / wait_external).
+/** Brain → Backend: task finished (success / failure / wait_external). */
+function registerAgentDoneRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: AgentDoneBody }>(
     "/v1/internal/tasks/:taskId/agent_done",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
       logger.info(
@@ -512,32 +676,24 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
-  // Brain → Backend: streaming events (assistantTextDelta / toolUse / ...).
+/** Brain → Backend: streaming events (assistantTextDelta / toolUse / ...). */
+function registerEventRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: TaskEventBody }>(
     "/v1/internal/tasks/:taskId/event",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
-      logger.debug(
-        { taskId, type: body.type ?? null },
-        "task.event.received",
-      );
-      // Brain reports that the sandbox is up and the engine has started. The
-      // dispatcher only ever got the row as far as `preparing`, so without
-      // this the row stays there until it goes terminal and `running` is a
-      // status nothing can be in.
-      //
+      logger.debug({ taskId, type: body.type ?? null }, "task.event.received");
       // CAS on `preparing` alone, which makes a duplicate or late-arriving
       // signal a no-op: a row that has since been cancelled, swept, or
       // finished must not be dragged back into running.
       if (body.type === "statusUpdate" && body.agent_status === "running") {
         const moved = await transitionStatus(taskId, ["preparing"], "running");
         if (moved) logger.info({ taskId }, "task.running");
-        await recordRunOwnership(taskId, {
-          source: "dispatched", brainId: body.brain_id, workloadId: body.sandbox_workload_id,
-        });
+        await recordRunOwnership(taskId, body);
       }
       // Otherwise accepted and logged, but not forwarded: this does not
       // publish to NATS `events.task.<task_id>`, so nothing fans the event out
@@ -545,22 +701,78 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
       return { ok: true };
     },
   );
+}
 
-  registerRunLeaseRoute(app);
+/**
+ * Brain → Backend: this run is still alive, and here is what it is doing.
+ *
+ * Kept apart from the two endpoints above because it says something much
+ * smaller than either: not that the run finished, not that its status changed,
+ * only that a worker was still there a moment ago. Nothing here moves a row
+ * between states or triggers scheduling, which is what makes it safe to call
+ * every few seconds for every run in the fleet.
+ */
+function registerLeaseRoute(app: FastifyInstance): void {
+  app.post<{ Params: { taskId: string }; Body: RunLeaseBody }>(
+    "/v1/internal/tasks/:taskId/lease",
+    { preHandler: internalTaskAuth("lease") },
+    async (req, reply) => {
+      const { taskId } = req.params;
+      const body = req.body ?? {};
+      const sandbox = parseSandboxHandle(body.sandbox);
+      if (body.sandbox !== undefined && !sandbox) {
+        return reply.status(400).send({
+          ok: false,
+          error: "sandbox.provider must be 'safe-workload' or 'agent-sandbox'; sandbox.handle must be a non-empty string of at most 1024 characters"
+            + " without control characters and cannot be '.' or '..'",
+        });
+      }
+      const token = attemptTokenOf(body);
+      if (!token.ok && !isLegacyRunLease(body)) {
+        // A partial modern token must never fall back to the legacy bridge.
+        logger.warn({ taskId, missing: token.missing }, "run_lease.missing_attempt_token");
+        return reply.status(400).send({
+          ok: false, error: `attempt token incomplete: ${token.missing} is required`,
+        });
+      }
+      const outcome = token.ok
+        ? await renewRunLease(taskId, body, token)
+        : await renewLegacyRunLease(taskId, body, req.headers.authorization);
+      if (outcome.kind === "accepted") {
+        if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
+          await recordLeaseSandbox(taskId, body.brain_id, sandbox, token, req.headers.authorization);
+        }
+        if (token.ok) await mergeRenewalCoverage(taskId, body, token);
+        return { ok: true, status: outcome.status };
+      }
+      // Nothing was banked: the fence never matched, so the coverage this body
+      // carries belongs to a ledger this caller may no longer write.
+      if (outcome.kind === "unavailable") return { ok: true, status: "unknown" };
+      // Told which of the three refusals it was, because "two workers on one
+      // run" and "this run was cancelled" ask the refused worker for opposite
+      // things: one must give its sandbox and its delivery back, the other
+      // must leave both alone, because they are the live worker's now.
+      const reason = await classifyLeaseRefusal(taskId, body.brain_id);
+      return reply.status(409).send({ ok: false, error: "run is not active", reason });
+    },
+  );
+}
 
-  // Brain → Backend: Backend-side MCP tool call (JSON-RPC 2.0).
-  // Supports `initialize`, `tools/list`, `tools/call` per task-design §8.2.
+/**
+ * Brain → Backend: Backend-side MCP tool call (JSON-RPC 2.0).
+ * Supports `initialize`, `tools/list`, `tools/call` per task-design §8.2.
+ */
+function registerBackendMcpRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: JsonRpcRequest }>(
     "/v1/internal/tasks/:taskId/backend-mcp",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req, _reply) => {
+    async (req) => {
       const { taskId } = req.params;
       const body = (req.body ?? {}) as JsonRpcRequest;
-      const response = await handleBackendMcpRequest(body, taskId, {
+      return handleBackendMcpRequest(body, taskId, {
         buildContext: () => buildBackendMcpCtxStub(req, taskId),
         logger,
       });
-      return response;
     },
   );
 }

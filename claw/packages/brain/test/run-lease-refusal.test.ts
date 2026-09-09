@@ -28,6 +28,7 @@ const request = {
 const renewal = {
   brainId: "brain-7", leaseSeconds: 45, phase: "executing" as const,
   waitReason: null, waitedMs: 0, waits: 0,
+  attempt: { attemptId: "att-1", claimCount: 0, deliverySeq: 3, deliveryCount: 1 },
 };
 
 /** Answer every renewal with one status and one body. */

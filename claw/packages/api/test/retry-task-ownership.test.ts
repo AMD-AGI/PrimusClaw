@@ -13,30 +13,16 @@ let h: Harness;
 
 before(async () => {
   h = await startHarness();
-  await h.sql(`
-    ALTER TABLE claw_tasks
-      ADD COLUMN parent_task_id TEXT,
-      ADD COLUMN batch_id TEXT,
-      ADD COLUMN dag_id TEXT,
-      ADD COLUMN script JSONB,
-      ADD COLUMN depends_on TEXT[] NOT NULL DEFAULT '{}',
-      ADD COLUMN mode TEXT NOT NULL DEFAULT 'llm',
-      ADD COLUMN model TEXT,
-      ADD COLUMN tools_allowlist JSONB NOT NULL DEFAULT '[]'::jsonb,
-      ADD COLUMN skills JSONB NOT NULL DEFAULT '[]'::jsonb,
-      ADD COLUMN rules_text TEXT,
-      ADD COLUMN agent_hooks JSONB NOT NULL DEFAULT '{}'::jsonb,
-      ADD COLUMN backend_mcp_url TEXT,
-      ADD COLUMN workspace_throwaway BOOLEAN NOT NULL DEFAULT FALSE,
-      ADD COLUMN brain_id TEXT
-  `);
 });
 
 beforeEach(async () => { await h.reset(); });
 after(async () => { await h?.close(); });
 
 async function seedOriginal(sandbox: SandboxHandle | null) {
-  const metadata = { ...RETAINED_METADATA, ...(sandbox ? { sandbox } : {}) };
+  const metadata = {
+    ...RETAINED_METADATA, ...(sandbox ? { sandbox } : {}),
+    run_phase: { phase: "waiting" }, last_release: { reason: "worker_lost" }, retried_into: "previous-retry",
+  };
   const workloadId = sandbox?.provider === "agent-sandbox" ? null : sandbox?.handle ?? "legacy-workload";
   await h.sql(
     `INSERT INTO claw_tasks

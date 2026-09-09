@@ -67,7 +67,7 @@ test("an expired lease closes the run, and says which one it was", async () => {
     "a worker that vanished is a different failure from a run that overran");
   assert.match(
     seen[0]!.sql,
-    /RETURNING[\s\S]*sandbox_workload_id/,
+    /RETURNING \*/,
     "the reaper must retain the handle needed to ask why the worker disappeared",
   );
 });

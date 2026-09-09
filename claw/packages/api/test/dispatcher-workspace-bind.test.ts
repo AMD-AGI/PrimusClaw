@@ -127,8 +127,15 @@ const SERVER_MANAGED_CONFIG = {
 function transitions(seen: SeenQuery[]): string[] {
   return seen
     .filter((q) => STATUS_WRITE.test(q.sql))
-    .map((q) => `${(q.params[q.params.length - 1] as string[]).join("|")} -> ${String(q.params[0])}`);
+    .map((q) => {
+      const expected = q.params.find(Array.isArray) as string[] | undefined;
+      const next = /SET status = '(\w+)'/.exec(q.sql)?.[1] ?? "?";
+      return `${(expected ?? []).join("|")} -> ${next}`;
+    });
 }
+
+/** The status a transition statement wrote. */
+const wroteStatus = (q: SeenQuery): string => /SET status = '(\w+)'/.exec(q.sql)?.[1] ?? "?";
 
 test("B1 a binding failure puts the task back on the queue", async () => {
   const seen = stubDb(new Date().toISOString());
@@ -152,7 +159,7 @@ test("B2 the requeued row does not read as one that has already failed", async (
   await dispatchTask("ktsk_1");
 
   const requeue = seen.filter((q) => STATUS_WRITE.test(q.sql)).at(-1)!;
-  assert.equal(requeue.params[0], "queued");
+  assert.equal(wroteStatus(requeue), "queued");
   assert.ok(
     requeue.params.includes(null),
     "a queued row carrying a failure_reason reads as one that has given up",
@@ -173,7 +180,7 @@ test("B3 past the window the task fails, with a reason of its own", async () => 
   await dispatchTask("ktsk_1");
 
   const final = seen.filter((q) => STATUS_WRITE.test(q.sql)).at(-1)!;
-  assert.equal(final.params[0], "failed");
+  assert.equal(wroteStatus(final), "failed");
   assert.ok(
     final.params.includes("workspace_bind_failed"),
     "no agent ran, so calling it agent_error sends whoever reads it to the wrong place",
@@ -200,7 +207,7 @@ test("B4 every other dispatch failure is still terminal, and still agent_error",
   assert.equal(result.ok, false);
   assert.match(String(result.reason), /session s-1 not found/);
   const final = seen.filter((q) => STATUS_WRITE.test(q.sql)).at(-1)!;
-  assert.equal(final.params[0], "failed");
+  assert.equal(wroteStatus(final), "failed");
   assert.ok(final.params.includes("agent_error"));
 });
 

@@ -178,19 +178,19 @@ test("starting the engine moves the session's open run, and only that", async ()
   assert.match(seen[0].sql, /status = 'preparing'/, "and only a row that has not moved on");
   assert.match(seen[0].sql, /deadline_at = COALESCE/,
     "COALESCE so a row that already got a deadline at insert keeps it");
-  assert.equal(seen[0].params[0], "s-1");
-  assert.equal(seen[0].params[1], RUN_BUDGET_DEFAULT_SEC.chat);
-  assert.equal(seen[0].params[2], RUN_BUDGET_DEFAULT_SEC.dag_node);
+  assert.equal(seen[0].params[0], RUN_BUDGET_DEFAULT_SEC.chat);
+  assert.equal(seen[0].params[1], RUN_BUDGET_DEFAULT_SEC.dag_node);
+  assert.equal(seen[0].params[2], "s-1");
 });
 
 test("closing prefers the run the completion event names", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "completed");
 
-  assert.match(seen[0].sql, /metadata->>'message_id' = \$6/);
-  assert.equal(seen[0].params[5], "claw-42");
-  assert.equal(seen[0].params[2], "completed");
-  assert.equal(seen[0].params[3], null, "a run that completed has no failure reason");
+  assert.match(seen[0].sql, /metadata->>'message_id' = \$5/);
+  assert.match(seen[0].sql, /SET status = 'completed'/);
+  assert.equal(seen[0].params[4], "claw-42");
+  assert.equal(seen[0].params[0], null, "a run that completed has no failure reason");
 });
 
 test("closing falls back to the only open run when the event names none", async () => {
@@ -200,8 +200,8 @@ test("closing falls back to the only open run when the event names none", async 
   // idle. The statement therefore insists there is no other open row.
   const seen = stubDb();
   await closeChatRun("s-1", undefined, "completed");
-  assert.equal(seen[0].params[5], null);
-  assert.match(seen[0].sql, /\$6::text IS NULL/);
+  assert.equal(seen[0].params[4], null);
+  assert.match(seen[0].sql, /\$5::text IS NULL/);
   assert.match(seen[0].sql, /NOT EXISTS/,
     "two open rows are not both the run that just ended");
 });
@@ -209,16 +209,16 @@ test("closing falls back to the only open run when the event names none", async 
 test("an interrupted run is recorded as cancelled, not failed", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "cancelled");
-  assert.equal(seen[0].params[2], "cancelled");
+  assert.match(seen[0].sql, /SET status = 'cancelled'/);
 });
 
 test("a failure reason is recorded and bounded", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "failed", "x".repeat(5000));
 
-  assert.equal(seen[0].params[2], "failed");
+  assert.match(seen[0].sql, /SET status = 'failed'/);
   assert.equal(
-    (seen[0].params[4] as string).length, 2000,
+    (seen[0].params[1] as string).length, 2000,
     "failure paths are where oversized strings come from",
   );
 });
@@ -233,7 +233,7 @@ test("a publish failure closes the row describing the run that never ran", async
   await failChatRunDispatch("ktsk_x", "nats unreachable");
 
   assert.match(seen[0].sql, /UPDATE claw_tasks SET status = 'failed'/);
-  assert.deepEqual(seen[0].params, ["ktsk_x", "dispatch_failed", "nats unreachable"]);
+  assert.deepEqual(seen[0].params, ["dispatch_failed", "nats unreachable", "ktsk_x"]);
   assert.match(
     seen[0].sql,
     /status IN \('queued','preparing','running'\)/,

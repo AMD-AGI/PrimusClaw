@@ -23,7 +23,6 @@ let h: Harness;
 
 before(async () => {
   h = await startHarness();
-  await h.sql("ALTER TABLE claw_tasks ADD COLUMN brain_id TEXT");
   await h.sql("ALTER TABLE claw_sessions ADD COLUMN config JSONB");
   app = Fastify();
   app.addHook("onRequest", async (req) => {
@@ -41,8 +40,8 @@ beforeEach(async () => {
     platform_key: PLATFORM_KEY, _server_managed_credentials: true,
   }]);
   await h.sql(
-    `INSERT INTO claw_tasks (task_id, session_id, status, origin, internal_token_hash)
-     VALUES ('run-1', 'session-1', 'running', 'chat', $1)`,
+    `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, internal_token_hash)
+     VALUES ('run-1', 'session-1', 'chat', 'running', 'chat', $1)`,
     [createHash("sha256").update(TOKEN).digest("hex")],
   );
   platformBackfillPorts.readHandsEntry = async () => assert.fail("persisted ownership needs no KV lookup");
@@ -102,6 +101,7 @@ for (const [message, containerReason, expected] of [
       headers: { authorization: `Bearer ${TOKEN}` },
       payload: {
         brain_id: "worker-1", lease_seconds: 45,
+        attempt_id: "attempt-1", claim_count: 0, delivery_seq: 0, delivery_count: 0,
         sandbox: { provider: "safe-workload", handle: "workload-1" },
       },
     });

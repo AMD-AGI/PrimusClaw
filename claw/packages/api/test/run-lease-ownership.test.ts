@@ -22,7 +22,6 @@ let h: Harness;
 before(async () => {
   delete process.env.AUTH_INTERNAL_TOKEN;
   h = await startHarness();
-  await h.sql("ALTER TABLE claw_tasks ADD COLUMN brain_id TEXT");
   app = Fastify();
   await registerInternalTaskRoutes(app);
   await app.ready();
@@ -32,8 +31,8 @@ beforeEach(async () => {
   await h.reset();
   await h.sql(
     `INSERT INTO claw_tasks
-       (task_id, session_id, status, origin, callback_url, internal_token_hash)
-     VALUES ($1, 'session-1', 'running', 'chat', NULL, $2)`,
+       (task_id, session_id, name, status, origin, callback_url, internal_token_hash)
+     VALUES ($1, 'session-1', 'chat', 'running', 'chat', NULL, $2)`,
     [TASK_ID, createHash("sha256").update(TASK_TOKEN).digest("hex")],
   );
 });
@@ -55,7 +54,10 @@ async function postTaskRoute(route: "lease" | "event", payload: Record<string, u
 }
 
 async function renew(body: Record<string, unknown>) {
-  return postTaskRoute("lease", { lease_seconds: 45, ...body });
+  return postTaskRoute("lease", {
+    lease_seconds: 45, attempt_id: "attempt-1", claim_count: 0, delivery_seq: 0, delivery_count: 0,
+    ...body,
+  });
 }
 
 async function reportRunningEvent(body: Record<string, unknown>) {
@@ -228,12 +230,24 @@ for (const sandbox of [SAFE_SANDBOX, AGENT_SANDBOX]) {
     await setSandbox(sandbox);
     const original = await storedRun();
 
-    const res = await renew({ brain_id: "worker-a" });
+    const res = await postTaskRoute("lease", { brain_id: "worker-a", lease_seconds: 45 });
 
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { ok: true, status: "running" });
     const run = await storedRun();
     assert.equal(run.sandbox_workload_id, original.sandbox_workload_id);
+    assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, sandbox);
+  });
+
+  test(`a legacy lease records the worker and its ${sandbox.provider} sandbox`, async () => {
+    const res = await postTaskRoute("lease", { brain_id: "worker-a", lease_seconds: 45, sandbox });
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json(), { ok: true, status: "running" });
+    const run = await storedRun();
+    assert.equal(run.brain_id, "worker-a");
+    assert.equal(run.lease_owner, "worker-a");
+    assert.equal(run.sandbox_workload_id, sandbox.provider === "safe-workload" ? sandbox.handle : null);
     assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, sandbox);
   });
 }
@@ -294,28 +308,32 @@ test("a handle at the maximum length remains an opaque value", async () => {
   assert.deepEqual(((await storedRun()).metadata as Record<string, unknown>).sandbox, sandbox);
 });
 
-test("a takeover between lease renewal and sandbox storage keeps the successor's identity", async () => {
-  await setLeaseOwner("worker-a", 600);
-  await setSandbox(SAFE_SANDBOX);
-  let successor: Record<string, unknown> | undefined;
+for (const successorBrain of ["worker-a", "worker-b"]) {
+  test(`a takeover by ${successorBrain} between lease renewal and sandbox storage keeps the successor's identity`, async () => {
+    await setLeaseOwner("worker-a", 600);
+    await setSandbox(SAFE_SANDBOX);
+    let successor: Record<string, unknown> | undefined;
 
-  const res = await renewAtLeaseBoundary({ brain_id: "worker-a", sandbox: SAFE_SANDBOX }, {
-    after: async () => {
-      await h.sql("UPDATE claw_tasks SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE task_id = $1", [TASK_ID]);
-      const takeover = await renew({ brain_id: "worker-b", sandbox: AGENT_SANDBOX });
-      assert.equal(takeover.statusCode, 200);
-      assert.deepEqual(takeover.json(), { ok: true, status: "running" });
-      successor = await storedRun();
-    },
+    const res = await renewAtLeaseBoundary({ brain_id: "worker-a", sandbox: SAFE_SANDBOX }, {
+      after: async () => {
+        await h.sql("UPDATE claw_tasks SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE task_id = $1", [TASK_ID]);
+        const takeover = await renew({
+          brain_id: successorBrain, sandbox: AGENT_SANDBOX, attempt_id: "attempt-2", delivery_seq: 1,
+        });
+        assert.equal(takeover.statusCode, 200);
+        assert.deepEqual(takeover.json(), { ok: true, status: "running" });
+        successor = await storedRun();
+      },
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json(), { ok: true, status: "running" });
+    assert.ok(successor);
+    assert.equal(successor.brain_id, successorBrain);
+    assert.deepEqual((successor.metadata as Record<string, unknown>).sandbox, AGENT_SANDBOX);
+    assert.deepEqual(await storedRun(), successor);
   });
-
-  assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.json(), { ok: true, status: "running" });
-  assert.ok(successor);
-  assert.equal(successor.brain_id, "worker-b");
-  assert.deepEqual((successor.metadata as Record<string, unknown>).sandbox, AGENT_SANDBOX);
-  assert.deepEqual(await storedRun(), successor);
-});
+}
 
 test("a run completed between lease renewal and sandbox storage keeps its last sandbox", async () => {
   await setLeaseOwner("worker-a", 600);

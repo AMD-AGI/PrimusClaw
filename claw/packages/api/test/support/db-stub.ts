@@ -36,6 +36,9 @@ export interface DbStub {
   sql(): string[];
   /** Whether any statement matches. */
   ran(re: RegExp): boolean;
+  /** Whether any statement mentions this, in its text or in its parameters.
+   *  A value the statement binds rather than inlines is still a value it wrote. */
+  wrote(re: RegExp): boolean;
   /** How many connections the run took, which is how a transaction is spotted. */
   connections: number;
   restore(): void;
@@ -77,6 +80,9 @@ export function stubDb(answer: Answer = () => []): DbStub {
     seen,
     sql: () => seen.map((q) => q.sql),
     ran: (re: RegExp) => seen.some((q) => re.test(q.sql)),
+    wrote: (re: RegExp) => seen.some(
+      (q) => re.test(q.sql) || q.params.some((v) => re.test(String(v))),
+    ),
     get connections() { return connections; },
     restore() {
       db.query = originalQuery;

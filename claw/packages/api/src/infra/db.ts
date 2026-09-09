@@ -216,6 +216,179 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
   }
 }
 
+/**
+ * Returned rather than executed so the schema tests drive this migration itself:
+ * a fixture that restates the DDL passes whatever the production statements do.
+ */
+export function clawTasksSchemaSql(): string[] {
+  const out: string[] = [];
+  taskTableSql(out);
+  runColumnsSql(out);
+  queueAccrualSql(out);
+  return out;
+}
+
+function taskTableSql(out: string[]): void {
+  out.push(`
+      CREATE TABLE IF NOT EXISTS claw_tasks (
+        task_id              TEXT PRIMARY KEY,
+        session_id           TEXT NOT NULL,
+        parent_task_id       TEXT,
+        batch_id             TEXT,
+        dag_id               TEXT,
+        dag_node_id          TEXT,
+        dag_root_task_id     TEXT,
+        plugin_id            BIGINT,
+        name                 TEXT NOT NULL,
+        input                JSONB NOT NULL DEFAULT '{}'::jsonb,
+        prompt               TEXT,
+        script               JSONB,
+        depends_on           TEXT[] NOT NULL DEFAULT '{}',
+        priority             INT NOT NULL DEFAULT 0,
+        executor             TEXT NOT NULL DEFAULT 'brain',
+        mode                 TEXT NOT NULL DEFAULT 'llm',
+        model                TEXT,
+        tools_allowlist      JSONB NOT NULL DEFAULT '[]'::jsonb,
+        skills               JSONB NOT NULL DEFAULT '[]'::jsonb,
+        rules_text           TEXT,
+        agent_hooks          JSONB NOT NULL DEFAULT '{}'::jsonb,
+        sandbox_spec         JSONB,
+        callback_url         TEXT,
+        backend_mcp_url      TEXT,
+        internal_token_hash  TEXT,
+        brain_id             TEXT,
+        sandbox_workload_id  TEXT,
+        status               TEXT NOT NULL,
+        failure_reason       TEXT,
+        error_message        TEXT,
+        output               TEXT,
+        artifacts            JSONB NOT NULL DEFAULT '[]'::jsonb,
+        captures             JSONB NOT NULL DEFAULT '{}'::jsonb,
+        tool_stats           JSONB,
+        token_usage          JSONB,
+        turns                INT,
+        metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
+        origin               TEXT,
+        workspace_id         TEXT,
+        lease_owner          TEXT,
+        lease_expires_at     TIMESTAMPTZ,
+        heartbeat_at         TIMESTAMPTZ,
+        event_seq            BIGINT NOT NULL DEFAULT 0,
+        claim_count          INT NOT NULL DEFAULT 0,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        queued_at            TIMESTAMPTZ DEFAULT clock_timestamp(),
+        started_at           TIMESTAMPTZ,
+        deadline_at          TIMESTAMPTZ,
+        completed_at         TIMESTAMPTZ
+      )
+  `);
+  // Existing deployments predate deadline_at. Rows without one keep falling
+  // back to the old started_at + BRAIN_TASK_TIMEOUT_SEC rule in the sweeper.
+  out.push(
+    "ALTER TABLE claw_tasks ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ",
+  );
+
+}
+
+/**
+ * What turns this table into a record of runs rather than only of DAG tasks.
+ * Every column arrives empty and unread, so this step only adds.
+ *
+ * Deliberately not added, though the design lists them:
+ *   - `run_id`. `task_id` is already a ULID primary key and what every index,
+ *     reference and CAS is built on; a second one is two things to keep agreeing.
+ *   - `root_run_id`. `dag_root_task_id` already is it.
+ *   - `on_child_failure` / `topology`. Policy for features not built yet.
+ */
+function runColumnsSql(out: string[]): void {
+  const col = (name: string, type: string) => {
+    out.push(`ALTER TABLE claw_tasks ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+  };
+  // 'chat', 'task' or 'dag_node'. Inferring it from `dag_root_task_id` cannot
+  // separate the first two, and hands a standalone task the budget meant for a
+  // conversational turn. Nullable: older rows keep the inference as a fallback.
+  col("origin", "TEXT");
+  // Which workspace the run's files live in. The collector currently infers
+  // ownership from paths, which is why it cannot safely delete anything.
+  col("workspace_id", "TEXT");
+  // Who is executing the run. Also ALTERed, because a deployment old enough to
+  // predate the declaration above would fail the write rather than skip it.
+  col("brain_id", "TEXT");
+  col("sandbox_workload_id", "TEXT");
+  // Worker liveness, the half of the old timeout that was never about how
+  // long a run may take. Renewed by heartbeat; a lease that expires means
+  // the worker is gone, which is knowable in seconds rather than hours.
+  col("lease_owner", "TEXT");
+  col("lease_expires_at", "TIMESTAMPTZ");
+  col("heartbeat_at", "TIMESTAMPTZ");
+  // Monotonic per-run event counter, so a reconnecting reader can say what
+  // it has already seen instead of receiving the stream from the top.
+  col("event_seq", "BIGINT NOT NULL DEFAULT 0");
+  // What the platform did to this run, recorded when it ended rather than
+  // fetched on read: a dispatcher polling a couple of hundred live runs every
+  // thirty seconds would otherwise make that many SaFE calls per sweep, for
+  // facts that stopped changing when the run did.
+  col("platform_exit_code", "INT");
+  col("platform_node", "TEXT");
+  // The pod's own account is kept verbatim so kill-reason vocabulary can
+  // evolve without rewriting stored history.
+  col("platform_message", "TEXT");
+  // The container's own termination reason. Separate from the message above
+  // because the pod-level one describes the kills decided above the container
+  // and is empty for an OOM -- which is the ending exit code 137 alone cannot
+  // tell from an eviction or a deliberate stop.
+  col("platform_container_reason", "TEXT");
+  // Content cannot say whether a read happened -- an empty pod message is a
+  // valid answer -- and these also keep two replicas off the same workload.
+  col("platform_facts_resolved_at", "TIMESTAMPTZ");
+  col("platform_facts_next_retry_at", "TIMESTAMPTZ");
+  col("platform_facts_attempts", "INT NOT NULL DEFAULT 0");
+  // A task that has already delivered its output elsewhere: uploading the tree
+  // afterwards copies it again to a prefix nobody reads. Default false, because
+  // with the shared-disk sync off S3 is the only durable copy of a workspace.
+  col("workspace_throwaway", "BOOLEAN NOT NULL DEFAULT FALSE");
+  // How many times a doorbell run has been claimed. The poison delivery
+  // budget for fat messages; without it a crash-looping chat run is
+  // reclaimed until deadline_at.
+  col("claim_count", "INT NOT NULL DEFAULT 0");
+  // Which attempt is executing, and how many real ones this run has had.
+  // `claim_count` cannot answer the second: a claim deferred for lock contention
+  // returns before execution and would look like an attempt that ran.
+  col("attempt_id", "TEXT");
+  col("attempt_generation", "INTEGER NOT NULL DEFAULT 0");
+  // The last attempt settled on this row. `attempt_id` is cleared when one
+  // ends, and a cleared column reads exactly like a run no attempt ever opened,
+  // which is what the lease route's adoption arm is for.
+  col("settled_attempt_id", "TEXT");
+  // The fat path's per-delivery discriminator, from JetStream. A fat row
+  // takes no claim, so this pair is the only value on it that advances when
+  // a redelivery supersedes the attempt before it.
+  col("delivery_seq", "BIGINT NOT NULL DEFAULT 0");
+  col("delivery_count", "BIGINT NOT NULL DEFAULT 0");
+  // Compare-and-swap token for the run's time ledger, so two heartbeats
+  // merging concurrently cannot each compute against a value the other has
+  // already replaced.
+  col("ledger_version", "INTEGER NOT NULL DEFAULT 0");
+  // Queue time. Every status change contributes its segment through the one
+  // function that writes `status`, so the total is complete without any
+  // caller knowing the accounting exists.
+  col("queued_ms_accrued", "BIGINT NOT NULL DEFAULT 0");
+  // Stable across requeues, unlike queued_at, so a late-created ledger keeps
+  // the instant at which this run first became eligible for accounting.
+  col("run_time_epoch_at", "TIMESTAMPTZ");
+}
+
+/** Backfill the timing anchors older rows did not carry. */
+function queueAccrualSql(out: string[]): void {
+  // A queued insert that omits queued_at must still open a measurable segment.
+  // It stays nullable because a row can begin outside the queue.
+  out.push("ALTER TABLE claw_tasks ALTER COLUMN queued_at SET DEFAULT clock_timestamp()");
+  out.push(`UPDATE claw_tasks SET queued_at = created_at
+        WHERE queued_at IS NULL AND status = 'queued'`);
+  out.push(`UPDATE claw_tasks SET run_time_epoch_at = queued_at
+        WHERE run_time_epoch_at IS NULL AND queued_at IS NOT NULL`);
+}
+
 async function ensureConcurrentIndex(
   client: pg.PoolClient,
   name: string,
@@ -977,144 +1150,7 @@ export async function initDb(): Promise<void> {
       "CREATE INDEX IF NOT EXISTS idx_batches_status ON claw_batches(status)",
     ).catch(() => {});
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS claw_tasks (
-        task_id              TEXT PRIMARY KEY,
-        session_id           TEXT NOT NULL,
-        parent_task_id       TEXT,
-        batch_id             TEXT,
-        dag_id               TEXT,
-        dag_node_id          TEXT,
-        dag_root_task_id     TEXT,
-        plugin_id            BIGINT,
-        name                 TEXT NOT NULL,
-        input                JSONB NOT NULL DEFAULT '{}'::jsonb,
-        prompt               TEXT,
-        script               JSONB,
-        depends_on           TEXT[] NOT NULL DEFAULT '{}',
-        priority             INT NOT NULL DEFAULT 0,
-        executor             TEXT NOT NULL DEFAULT 'brain',
-        mode                 TEXT NOT NULL DEFAULT 'llm',
-        model                TEXT,
-        tools_allowlist      JSONB NOT NULL DEFAULT '[]'::jsonb,
-        skills               JSONB NOT NULL DEFAULT '[]'::jsonb,
-        rules_text           TEXT,
-        agent_hooks          JSONB NOT NULL DEFAULT '{}'::jsonb,
-        sandbox_spec         JSONB,
-        callback_url         TEXT,
-        backend_mcp_url      TEXT,
-        internal_token_hash  TEXT,
-        brain_id             TEXT,
-        sandbox_workload_id  TEXT,
-        status               TEXT NOT NULL,
-        failure_reason       TEXT,
-        error_message        TEXT,
-        output               TEXT,
-        artifacts            JSONB NOT NULL DEFAULT '[]'::jsonb,
-        captures             JSONB NOT NULL DEFAULT '{}'::jsonb,
-        tool_stats           JSONB,
-        token_usage          JSONB,
-        turns                INT,
-        metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
-        origin               TEXT,
-        workspace_id         TEXT,
-        lease_owner          TEXT,
-        lease_expires_at     TIMESTAMPTZ,
-        heartbeat_at         TIMESTAMPTZ,
-        event_seq            BIGINT NOT NULL DEFAULT 0,
-        claim_count          INT NOT NULL DEFAULT 0,
-        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        queued_at            TIMESTAMPTZ,
-        started_at           TIMESTAMPTZ,
-        deadline_at          TIMESTAMPTZ,
-        completed_at         TIMESTAMPTZ
-      )
-    `);
-    // Existing deployments predate deadline_at. Rows without one keep falling
-    // back to the old started_at + BRAIN_TASK_TIMEOUT_SEC rule in the sweeper.
-    await client.query(
-      "ALTER TABLE claw_tasks ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ",
-    ).catch(() => {});
-
-    // Columns that turn this table into a record of runs rather than only of
-    // DAG tasks. Chat turns are about to start writing rows here, and a chat
-    // turn currently has no persisted identity at all: nothing to sweep when
-    // it hangs, nothing for the workspace collector to check ownership
-    // against, nothing to count when asking how many runs a tenant has in
-    // flight. Every one of them arrives empty and unread -- nullable, or in
-    // `event_seq`'s case defaulted -- so this step only adds.
-    //
-    // Deliberately not added, though the design lists them:
-    //   - `run_id`. `task_id` is already a ULID primary key and is what every
-    //     index, foreign reference and CAS is built on; a second identifier
-    //     for the same row would be two things to keep agreeing. The design's
-    //     objection was to `claw-${Date.now()}`, which is the chat message id
-    //     and was never a candidate for this column.
-    //   - `root_run_id`. `dag_root_task_id` already is it. Adding a synonym
-    //     before the two can differ just creates a question about which one to
-    //     trust; it can be renamed when the DAG columns are split out.
-    //   - `on_child_failure` / `topology`. Policy for features not built yet.
-    const addTaskCol = async (col: string, type: string) => {
-      await client.query(
-        `ALTER TABLE claw_tasks ADD COLUMN IF NOT EXISTS ${col} ${type}`,
-      ).catch(() => {});
-    };
-    // What produced this run: 'chat', 'task' (the standalone task API) or
-    // 'dag_node'. Until now the kind was inferred from whether
-    // `dag_root_task_id` was set, which cannot separate the first two -- and
-    // gets the answer wrong for a standalone task, handing a batch job the
-    // budget meant for a conversational turn. Nullable, because rows written
-    // before this column exist and the inference stays as the fallback.
-    await addTaskCol("origin", "TEXT");
-    // Which workspace the run's files live in. The collector currently infers
-    // ownership from paths, which is why it cannot safely delete anything.
-    await addTaskCol("workspace_id", "TEXT");
-    // Who is executing the run. Declared in CREATE TABLE since the table
-    // existed but never written to until now, and a deployment old enough to
-    // predate the declaration would fail the write rather than skip it.
-    await addTaskCol("brain_id", "TEXT");
-    await addTaskCol("sandbox_workload_id", "TEXT");
-    // Worker liveness, the half of the old timeout that was never about how
-    // long a run may take. Renewed by heartbeat; a lease that expires means
-    // the worker is gone, which is knowable in seconds rather than hours.
-    await addTaskCol("lease_owner", "TEXT");
-    await addTaskCol("lease_expires_at", "TIMESTAMPTZ");
-    await addTaskCol("heartbeat_at", "TIMESTAMPTZ");
-    // Monotonic per-run event counter, so a reconnecting reader can say what
-    // it has already seen instead of receiving the stream from the top.
-    await addTaskCol("event_seq", "BIGINT NOT NULL DEFAULT 0");
-    // What the platform did to this run, captured when it ended.
-    //
-    // Recorded rather than fetched on read. A dispatcher above Claw polls a couple
-    // of hundred live runs every thirty seconds; resolving each one against SaFE at
-    // that point would be two hundred calls per sweep, and it would be asking for
-    // facts that stopped changing when the run did. Written once at the terminal,
-    // the batch read is one query.
-    await addTaskCol("platform_exit_code", "INT");
-    await addTaskCol("platform_node", "TEXT");
-    // The pod's own account is kept verbatim so kill-reason vocabulary can
-    // evolve without rewriting stored history.
-    await addTaskCol("platform_message", "TEXT");
-    // The container's own termination reason. Separate from the message above
-    // because the pod-level one describes the kills decided above the container
-    // and is empty for an OOM -- which is the ending exit code 137 alone cannot
-    // tell from an eviction or a deliberate stop.
-    await addTaskCol("platform_container_reason", "TEXT");
-    // Content cannot say whether a read happened: an empty pod message is a
-    // valid answer. These fields separate a conclusive read from a transient
-    // failure and keep multiple API replicas from fetching the same workload.
-    await addTaskCol("platform_facts_resolved_at", "TIMESTAMPTZ");
-    await addTaskCol("platform_facts_next_retry_at", "TIMESTAMPTZ");
-    await addTaskCol("platform_facts_attempts", "INT NOT NULL DEFAULT 0");
-    // Declared by a task whose workspace is throwaway -- it has already delivered
-    // its output somewhere else, so uploading the tree afterwards copies it a
-    // second time to a prefix nobody reads. Default false: with the shared-disk
-    // sync off by default, S3 is the only durable copy of a workspace.
-    await addTaskCol("workspace_throwaway", "BOOLEAN NOT NULL DEFAULT FALSE");
-    // How many times a doorbell run has been claimed. The poison delivery
-    // budget for fat messages; without it a crash-looping chat run is
-    // reclaimed until deadline_at.
-    await addTaskCol("claim_count", "INT NOT NULL DEFAULT 0");
+    for (const sql of clawTasksSchemaSql()) await client.query(sql).catch(() => {});
     // What admission counts. It reads the fleet on every chat dispatch -- twice
     // when a ceiling is set -- and filters on the four occupying statuses,
     // which no other index covers, so the planner had nothing to choose but a
