@@ -69,7 +69,7 @@ import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
-import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
+import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
@@ -882,6 +882,27 @@ class TaskRunner {
    */
   private readonly handsOwner: string;
 
+  /**
+   * The run identity background shells are filed under, which is not this run's
+   * id for a conversation.
+   *
+   * A DAG node's shells are its own: a sibling node under the same graph root
+   * arrives as its own run and is not entitled to them, and the node's terminal
+   * state reaps them. A conversation's are the opposite case -- they are
+   * expected to outlive the turn, and the next turn of the same conversation is
+   * meant to poll them, which is the whole point of starting one in the
+   * background. Filing them under the turn's own task id made every turn a
+   * stranger to the last: the next one addressed a bucket its shell was never
+   * in and was answered `not found` over a process still running, by then
+   * reachable by nobody and holding the sandbox open until its deadline.
+   *
+   * Empty is not a gap here but the documented third state -- shells that
+   * belong to no run and are stopped only when Hands stops, which is exactly a
+   * conversation's. `runId` is untouched: the handle rows, their per-run
+   * cleanup and the run id the API reports all still key on the turn.
+   */
+  private readonly shellRun: string;
+
   // userIdHex: only sessions whose user_id matches /^[0-9a-f]{32}$/ go
   // through the Plan Y v2 workspace-sync path (shared-filesystem restore
   // requires a hex user id; see workspace/sync.ts assertSafeIds). Other
@@ -1046,6 +1067,7 @@ class TaskRunner {
     this.abortCtrl = abortCtrl;
     this.runId = request.task_id || messageId;
     this.handsOwner = pickRunScope(request);
+    this.shellRun = pickShellRun(request);
 
     this.userIdHex = /^[0-9a-f]{32}$/.test(userId) ? userId : null;
     this.userIdForSync = request.user_id || "default";
@@ -1357,7 +1379,7 @@ class TaskRunner {
       { skipSessionReuse: true, signal: this.abortCtrl.signal },
     );
     const newHands = fx().makeHandsClient(
-      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at,
+      newUrl, newToken, this.handsOwner, this.shellRun, this.request.deadline_at,
     );
     // Fold the newest in-flight snapshot into the session prefix *before*
     // restoring from it. The session prefix only advances on a successful
@@ -1494,7 +1516,7 @@ class TaskRunner {
   private replaceHandsClient(): HandsClient {
     this.hands?.close().catch(() => {});
     const fresh = fx().makeHandsClient(
-      this.handsUrl, this.handsToken, this.handsOwner, this.runId, this.request.deadline_at,
+      this.handsUrl, this.handsToken, this.handsOwner, this.shellRun, this.request.deadline_at,
     );
     this.hands = fresh;
     return fresh;
@@ -2001,7 +2023,7 @@ class TaskRunner {
       sandboxWorkloadId: this.handsWorkloadId,
     });
     this.hands = fx().makeHandsClient(
-      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at,
+      handsUrl, handsToken, this.handsOwner, this.shellRun, this.request.deadline_at,
     );
     // ensureHands returns only after bootstrap and the health check, so this
     // is the first moment a sandbox can actually be used -- unlike the
@@ -2068,7 +2090,7 @@ class TaskRunner {
     // never opens the MCP transport, so there is nothing holding a connection.
     return fx().makeHandsClient(
       info.handsUrl, typeof info.token === "string" ? info.token : "",
-      this.handsOwner, this.runId, this.request.deadline_at,
+      this.handsOwner, this.shellRun, this.request.deadline_at,
     );
   }
 
