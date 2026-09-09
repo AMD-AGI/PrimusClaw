@@ -17,6 +17,7 @@ import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
 const TOKEN = "cluster-internal-token";
 const originalQuery = db.query;
+const originalConnect = db.pool.connect;
 const originalEnvToken = process.env.AUTH_INTERNAL_TOKEN;
 
 let app: FastifyInstance;
@@ -30,10 +31,18 @@ before(async () => {
   app = Fastify();
   await registerInternalRunRoutes(app);
   await app.ready();
+  // A release settles the attempt's ledger in the same transaction as its
+  // status change, which takes its own connection; without this the tests
+  // reach the real pool instead of the stub each of them installs.
+  db.pool.connect = (async () => ({
+    query: (text: string, params?: unknown[]) => db.query(text, params),
+    release: () => {},
+  })) as never;
 });
 
 after(async () => {
   db.query = originalQuery;
+  db.pool.connect = originalConnect;
   if (originalEnvToken === undefined) delete process.env.AUTH_INTERNAL_TOKEN;
   else process.env.AUTH_INTERNAL_TOKEN = originalEnvToken;
   await app.close();
@@ -226,7 +235,7 @@ test("fail-claim can mark a doorbell term as claim_abandoned", async () => {
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
-      reason = params[2];
+      reason = params[0];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -246,7 +255,7 @@ test("fail-claim can mark an unbound claimed run as workspace_unbound", async ()
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
-      reason = params[2];
+      reason = params[0];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -266,7 +275,7 @@ test("fail-claim ignores an unknown reason and keeps session_deleted", async () 
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
-      reason = params[2];
+      reason = params[0];
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -366,6 +375,7 @@ test("the claim route reports the row's generation, and the settle routes read i
   assert.equal(released.statusCode, 200);
   const upd = seen.find((q) => /SET status = 'queued'/.test(q.sql));
   assert.ok(upd, "the release ran");
-  assert.equal(upd?.params[2], 4, "and it carried the parsed generation into the CAS");
-  assert.equal(upd?.params[3], "lock_contention", "and the reason");
+  assert.ok(upd?.params.includes(4), "and it carried the parsed generation into the CAS");
+  assert.match(String(upd?.params.find((p) => typeof p === "string" && p.includes("last_release"))),
+    /lock_contention/, "and the reason");
 });

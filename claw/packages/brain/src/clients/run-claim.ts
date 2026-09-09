@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, RunTimeReport } from "@claw/protocol";
 import pino from "pino";
 
 import { AUTH_INTERNAL_TOKEN, BRAIN_ID } from "../config.js";
@@ -19,7 +19,9 @@ function apiBase(): string {
   return (process.env.INTERNAL_BACKEND_URL ?? "").trim().replace(/\/$/, "");
 }
 
-function taskActionUrl(taskId: string, action: "claim" | "unclaim" | "fail-claim"): string {
+type HolderAction = "unclaim" | "fail-claim" | "settle-attempt";
+
+function taskActionUrl(taskId: string, action: "claim" | HolderAction): string {
   const base = apiBase();
   if (!base || !taskId) return "";
   return `${base}/v1/internal/tasks/${encodeURIComponent(taskId)}/${action}`;
@@ -66,9 +68,11 @@ export async function unclaimRun(
   taskId: string,
   claimCount?: number,
   reason?: "lock_contention" | "retry" | "drain" | "hydrate_failed",
+  runTime?: RunTimeReport,
 ): Promise<void> {
   await postHolderAction(taskId, "unclaim", "run.unclaim_failed", {
     ...claimExtra(claimCount), ...(reason ? { reason } : {}),
+    ...(runTime ? { run_time: runTime } : {}),
   });
 }
 
@@ -76,9 +80,27 @@ export async function failClaimedRun(
   taskId: string,
   reason: "session_deleted" | "claim_abandoned" | "workspace_unbound" = "session_deleted",
   claimCount?: number,
+  runTime?: RunTimeReport,
 ): Promise<void> {
   await postHolderAction(taskId, "fail-claim", "run.fail_claim_failed", {
     reason, ...claimExtra(claimCount),
+    ...(runTime ? { run_time: runTime } : {}),
+  });
+}
+
+/**
+ * End this attempt's record without giving the row back: a chat row carries no
+ * `callback_url`, so a clean finish sends no `agent_done` to settle it.
+ */
+export async function settleClaimedRun(
+  taskId: string,
+  claimCount?: number,
+  runTime?: RunTimeReport,
+  releaseLease = false,
+): Promise<void> {
+  await postHolderAction(taskId, "settle-attempt", "run.settle_attempt_failed", {
+    ...claimExtra(claimCount), ...(runTime ? { run_time: runTime } : {}),
+    ...(releaseLease ? { release_lease: true } : {}),
   });
 }
 
@@ -88,9 +110,9 @@ function claimExtra(claimCount?: number): Record<string, string | number> {
 
 async function postHolderAction(
   taskId: string,
-  action: "unclaim" | "fail-claim",
+  action: HolderAction,
   warn: string,
-  extra: Record<string, string | number> = {},
+  extra: Record<string, unknown> = {},
 ): Promise<void> {
   const url = taskActionUrl(taskId, action);
   if (!url) return;
@@ -118,8 +140,8 @@ async function postHolderAction(
       logger.warn({ err, taskId, action, attempt: i + 1 }, warn);
     }
   }
-  // Every attempt failed and the caller cannot act on it -- both callers are
-  // settling a row they are done with. Logged at error rather than swallowed
+  // Every attempt failed and the caller cannot act on it -- every caller is
+  // settling a row it is done with. Logged at error rather than swallowed
   // because what follows is invisible otherwise: the row keeps a lease nobody
   // is renewing, and only the sweeper's requeue pass will notice, a minute or
   // more later.

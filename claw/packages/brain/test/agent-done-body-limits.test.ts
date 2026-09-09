@@ -20,9 +20,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import type { ExecuteRequest, ExecuteResult, RunTimeReport } from "@claw/protocol";
 
-import { postAgentDone } from "../src/tasks/callback.js";
+import { AgentDoneDeliveryError, postAgentDone } from "../src/tasks/callback.js";
 
 const REQUEST = {
   task_id: "ktsk_big", callback_url: "http://api.test/v1/internal/tasks/ktsk_big",
@@ -82,6 +82,7 @@ test("R2 a 413 sheds the body once instead of retrying it identically", async ()
   assert.deepEqual(cap.bodies[0].captures, { report: "y".repeat(1000) });
   assert.deepEqual(cap.bodies[1].captures, {}, "the second carries no payload");
   assert.match(String(cap.bodies[1].final_text), /exceeded the size/);
+  assert.equal(Object.hasOwn(cap.bodies[1], "run_time"), false, "legacy callbacks stay tokenless");
 });
 
 test("R3 the shed retry still carries the outcome", async () => {
@@ -214,4 +215,74 @@ test("R6 the shed body keeps the facts a stranded run is found again by", async 
     "the external id survived unbounded",
   );
   assert.deepEqual(Object.keys(metadata!), ["external_id"], "nothing else rode along under metadata");
+});
+
+function runTime(): RunTimeReport {
+  return {
+    key: REQUEST.task_id!, attemptId: "attempt-1", claimCount: 0, deliverySeq: 10, deliveryCount: 1,
+    basis: { kind: "same_domain", domain: "brain" }, cumulativeStateMs: { executing: 12 },
+  };
+}
+
+test("a shed report retains only bounded attempt identity, even with oversized optional data", async () => {
+  const report = {
+    ...runTime(),
+    cumulativeStateMs: { executing: 12, unexpected: "x".repeat(HUGE) },
+    cumulativeReasonMs: { unexpected: "x".repeat(HUGE) },
+    basis: { ...runTime().basis, unexpected: "x".repeat(HUGE) },
+    unexpected: "x".repeat(HUGE),
+  } as unknown as RunTimeReport;
+  const original = globalThis.fetch;
+  const cap = capture([413, 200]);
+  try {
+    await postAgentDone(REQUEST, pathologicalResult(), report);
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  assert.equal(cap.bodies.length, 2);
+  assert.deepEqual(cap.bodies[1].run_time, {
+    key: REQUEST.task_id, attemptId: report.attemptId, claimCount: report.claimCount,
+    deliverySeq: report.deliverySeq, deliveryCount: report.deliveryCount,
+    basis: { kind: "same_domain", domain: "brain" },
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(cap.bodies[1]), "utf8") < 32 * 1024);
+});
+
+test("attempt strings at the byte bound survive a shed report verbatim", async () => {
+  const report = { ...runTime(), key: "é".repeat(512), attemptId: "𝟘".repeat(256) };
+  const original = globalThis.fetch;
+  const cap = capture([413, 200]);
+  try {
+    await postAgentDone(REQUEST, result(), report);
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  const shed = cap.bodies[1].run_time as RunTimeReport;
+  assert.equal(shed.key, report.key);
+  assert.equal(shed.attemptId, report.attemptId);
+});
+
+test("invalid or oversized attempt identity never becomes an unfenced shed callback", async () => {
+  for (const report of [
+    { ...runTime(), key: "é".repeat(513) },
+    { ...runTime(), attemptId: "" },
+    { ...runTime(), claimCount: -1 },
+    null,
+  ]) {
+    const original = globalThis.fetch;
+    const cap = capture([413, 200]);
+    try {
+      await assert.rejects(
+        () => postAgentDone(REQUEST, result(), report as unknown as RunTimeReport),
+        (error: unknown) => error instanceof AgentDoneDeliveryError && /run_time/.test(error.message),
+      );
+    } finally {
+      globalThis.fetch = original;
+    }
+    assert.equal(cap.bodies.length, 1, "invalid local identity must not be retried as an unfenced completion");
+    assert.ok(cap.bodies.every((body) => Object.hasOwn(body, "run_time")));
+    assert.ok(cap.bodies.every((body) => body.final_text === "ok"));
+  }
 });

@@ -16,14 +16,15 @@ import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
+import { applyTaskStatusTransition } from "./db.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
-import { deadlineStampSql, RUN_BUDGET_DEFAULT_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
+import { settleRunTime, type RunSettlement } from "./run-time-ledger.js";
 import type { ClawTaskRow } from "./types.js";
 
 const logger = pino({ name: "run-claim" });
@@ -171,25 +172,22 @@ async function peekNextQueued(skip: string[]): Promise<string | null> {
 }
 
 async function markUnclaimable(taskId: string): Promise<void> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = 'unclaimable',
-            error_message = 'run spec could not be hydrated at claim time',
-            completed_at = NOW(),
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL
-      WHERE task_id = $1
-        AND status IN ('queued','preparing')
-      RETURNING *`,
-    [taskId],
-  ).catch((err) => {
+  const rows = await applyTaskStatusTransition("failed", {
+    extra: {
+      failure_reason: "unclaimable",
+      error_message: "run spec could not be hydrated at claim time",
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+    },
+    where: "task_id = $1 AND status IN ('queued','preparing')",
+    params: [taskId],
+  }).catch((err) => {
     logger.warn({ err, taskId }, "run.claim.mark_unclaimable_failed");
-    return { rows: [], rowCount: 0 };
+    return [] as ClawTaskRow[];
   });
-  const row = r.rows[0] as ClawTaskRow | undefined;
+  const row = rows[0];
   if (!row) return;
   await releaseRunUse(taskId, false);
   await announceClaimFailure(
@@ -231,27 +229,128 @@ export async function releaseClaim(
   brainId: string,
   claimCount?: number,
   reason?: string,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'queued',
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL,
-            metadata = CASE
-                         WHEN $4::text IS NULL THEN metadata
-                         ELSE metadata || jsonb_build_object('last_release', $4::text)
-                       END,
-            ${RUN_REQUEUE_RESET_SQL}
-      WHERE task_id = $1
+  return settleAndTransition(taskId, settlement, (query) =>
+    applyTaskStatusTransition("queued", {
+      extra: {
+        lease_owner: null,
+        lease_expires_at: null,
+        heartbeat_at: null,
+        internal_token_hash: null,
+        // Cleared with the status, so a heartbeat racing this release cannot
+        // find the row still holding the attempt it is reporting for.
+        attempt_id: null,
+        started_at: null,
+        ...(reason ? { metadata: JSON.stringify({ last_release: reason }) } : {}),
+      },
+      where: `task_id = $1
         AND lease_owner = $2
         AND status IN ('queued','preparing','running')
-        AND ($3::int IS NULL OR claim_count = $3)
-      RETURNING task_id`,
-    [taskId, brainId, claimCount ?? null, reason ?? null],
-  );
-  return (r.rowCount ?? 0) > 0;
+        AND ($3::int IS NULL OR claim_count = $3)`,
+      params: [taskId, brainId, claimCount ?? null],
+      query,
+    }));
+}
+
+/**
+ * Settle the run's time and move the row, as one transaction.
+ *
+ * Rolled back whole when the transition's own fence matches no row: committing
+ * the merge while the release fails is how a superseded attempt's final report
+ * lands in a ledger that now belongs to somebody else.
+ */
+async function settleAndTransition(
+  taskId: string,
+  settlement: RunSettlement | undefined,
+  transition: (query: Querier) => Promise<ClawTaskRow[]>,
+): Promise<boolean> {
+  // Always a settlement, report or not: the attempt this boundary ends has a
+  // record open, and leaving it open loses the only instant that says when it
+  // stopped.
+  const settled: RunSettlement = {
+    ...settlement, closeAttempt: true, adoptUnrecordedAttempt: true,
+  };
+  try {
+    return await inTransaction(async (query) => {
+      // A report from an attempt the row has moved past is refused, and the
+      // release beside it goes with it: whoever holds the row now is entitled
+      // to it, and this caller is settling somebody else's run.
+      const outcome = await settleRunTime(query, taskId, settled);
+      // Only a superseded attempt voids the release. A row whose ledger cannot
+      // be read is refused by the transition's own fence a moment later, and
+      // failing here would replace that answer with a less informative one.
+      if (!outcome.ok && outcome.reason === "stale_attempt") throw new StaleTransition();
+      const rows = await transition(query);
+      if (rows.length === 0) throw new StaleTransition();
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
+}
+
+/** The transition's fence matched nothing, so its whole transaction is void. */
+class StaleTransition extends Error {}
+
+/**
+ * End a holder's attempt without moving the row between states.
+ *
+ * Two boundaries reach here, and neither has a transition of its own. A claimed
+ * chat run that succeeded carries no `callback_url`, so no `agent_done` arrives
+ * and the completion event closes the row later knowing nothing about which
+ * attempt ran it. A fat delivery that naks for a retry has no release endpoint
+ * at all -- JetStream redelivers the same message -- so this is where its
+ * coverage and its record are settled.
+ *
+ * The attempt token is cleared either way: the attempt is over, and a heartbeat
+ * still in flight under it would otherwise renew a lease nobody is holding and
+ * open a second record beside the one just closed. `releaseLease` expires the
+ * lease and releases its owner so a redelivery can renew immediately. The
+ * timestamp lets the reaper close the run if no replacement arrives.
+ *
+ * Fenced like a release, because a holder whose claim has since been taken is
+ * settling somebody else's attempt.
+ */
+export async function settleFinishedClaim(
+  taskId: string,
+  brainId: string,
+  claimCount?: number,
+  settlement?: RunSettlement,
+  releaseLease = false,
+): Promise<boolean> {
+  const settled: RunSettlement = { ...settlement, closeAttempt: true };
+  try {
+    return await inTransaction(async (query) => {
+      const held = await query(
+        `SELECT attempt_id FROM claw_tasks
+          WHERE task_id = $1 AND lease_owner = $2
+            AND ($3::int IS NULL OR claim_count = $3)
+          FOR UPDATE`,
+        [taskId, brainId, claimCount ?? null],
+      );
+      if (held.rowCount === 0) throw new StaleTransition();
+      const outcome = await settleRunTime(query, taskId, settled);
+      if (!outcome.ok) throw new StaleTransition();
+      const closed = settlement?.report?.attemptId
+        ?? (held.rows[0] as { attempt_id: string | null }).attempt_id;
+      await query(
+        `UPDATE claw_tasks
+            SET attempt_id = NULL,
+                heartbeat_at = NULL,
+                settled_attempt_id = COALESCE($3, settled_attempt_id),
+                lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
+                lease_expires_at = CASE WHEN $2 THEN clock_timestamp() ELSE lease_expires_at END
+          WHERE task_id = $1`,
+        [taskId, releaseLease, closed],
+      );
+      return true;
+    });
+  } catch (err) {
+    if (err instanceof StaleTransition) return false;
+    throw err;
+  }
 }
 
 /**
@@ -294,26 +393,28 @@ export async function failHeldClaim(
   brainId: string,
   reason: HeldClaimFailureReason = "session_deleted",
   claimCount?: number,
+  settlement?: RunSettlement,
 ): Promise<boolean> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET status = 'failed',
-            failure_reason = $3,
-            error_message = $4,
-            completed_at = NOW(),
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            heartbeat_at = NULL,
-            internal_token_hash = NULL
-      WHERE task_id = $1
+  const closed = await settleAndTransition(taskId, settlement, (query) =>
+    applyTaskStatusTransition("failed", {
+      extra: {
+        failure_reason: reason,
+        error_message: HELD_CLAIM_MESSAGE[reason],
+        lease_owner: null,
+        lease_expires_at: null,
+        heartbeat_at: null,
+        internal_token_hash: null,
+        attempt_id: null,
+      },
+      where: `task_id = $1
         AND lease_owner = $2
         AND origin = 'chat'
         AND status IN ('queued','preparing','running')
-        AND ($5::int IS NULL OR claim_count = $5)
-      RETURNING task_id`,
-    [taskId, brainId, reason, HELD_CLAIM_MESSAGE[reason], claimCount ?? null],
-  );
-  if ((r.rowCount ?? 0) === 0) return false;
+        AND ($3::int IS NULL OR claim_count = $3)`,
+      params: [taskId, brainId, claimCount ?? null],
+      query,
+    }));
+  if (!closed) return false;
   await releaseRunUse(taskId, false);
   return true;
 }
@@ -347,20 +448,26 @@ async function takeClaim(
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET lease_owner = $2,
-            lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
-            heartbeat_at = NOW(),
-            internal_token_hash = $4,
-            status = CASE WHEN status = 'queued' THEN 'preparing' ELSE status END,
-            started_at = COALESCE(started_at, NOW()),
-            ${deadlineStampSql(6, 7)},
-            claim_count = COALESCE(claim_count, 0) + 1
-      WHERE task_id = $1
+  // `preparing` for a row already there leaves the status alone and banks a
+  // zero segment, which is what the old conditional expression said.
+  const rows = await applyTaskStatusTransition("preparing", {
+    extra: {
+      lease_owner: brainId,
+      internal_token_hash: hash,
+      // Every claim, a contention-only one included, invalidates the previous
+      // attempt's token, which closes the window the status guard leaves open
+      // when a claim restores the row to preparing under the same pod name.
+      attempt_id: null,
+    },
+    setSql: [
+      "lease_expires_at = NOW() + ($2::int * INTERVAL '1 millisecond')",
+      "heartbeat_at = NOW()",
+      "claim_count = COALESCE(claim_count, 0) + 1",
+    ],
+    where: `task_id = $1
         AND origin = 'chat'
         AND metadata->>'dispatch' = 'doorbell'
-        AND status = ANY($5::text[])
+        AND status = ANY($3::text[])
         AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks sibling
@@ -370,16 +477,15 @@ async function takeClaim(
              AND sibling.metadata->>'message_id' IS NOT NULL
              AND sibling.metadata->>'message_id' = claw_tasks.metadata->>'message_id'
              AND sibling.status IN ('preparing','running','cancelling')
-        )
-      RETURNING *`,
-    [taskId, brainId, RUN_LEASE_TTL_MS, hash, CLAIMABLE, RUN_BUDGET_DEFAULT_SEC.chat, RUN_BUDGET_DEFAULT_SEC.dag_node],
-  );
-  if ((r.rowCount ?? 0) === 0) {
+        )`,
+    params: [taskId, RUN_LEASE_TTL_MS, CLAIMABLE],
+  });
+  if (rows.length === 0) {
     const exists = await db.query(`SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId]);
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }
-  const row = r.rows[0] as ClawTaskRow;
+  const row = rows[0];
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }
@@ -493,7 +599,7 @@ function claimCountOf(row: ClawTaskRow): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
+async function failExhaustedClaim(row: ClawTaskRow, settlement?: RunSettlement): Promise<boolean> {
   let closed = false;
   // Why it ran out, when the last holder said. The brain has a
   // `lock_contention_exhausted` verdict of its own, but on the doorbell path
@@ -509,22 +615,21 @@ async function failExhaustedClaim(row: ClawTaskRow): Promise<boolean> {
     ? "the workspace this run needs stayed busy for its whole claim budget"
     : "claimed too many times without a terminal result";
   try {
-    const r = await db.query(
-      `UPDATE claw_tasks
-          SET status = 'failed',
-              failure_reason = $2,
-              error_message = $3,
-              completed_at = NOW(),
-              lease_owner = NULL,
-              lease_expires_at = NULL,
-              heartbeat_at = NULL,
-              internal_token_hash = NULL
-        WHERE task_id = $1
-          AND status IN ('queued','preparing','running')
-        RETURNING task_id`,
-      [row.task_id, failureReason, message],
-    );
-    closed = (r.rowCount ?? 0) > 0;
+    closed = await settleAndTransition(row.task_id, settlement, (query) =>
+      applyTaskStatusTransition("failed", {
+        extra: {
+          failure_reason: failureReason,
+          error_message: message,
+          lease_owner: null,
+          lease_expires_at: null,
+          heartbeat_at: null,
+          internal_token_hash: null,
+          attempt_id: null,
+        },
+        where: "task_id = $1 AND status IN ('queued','preparing','running')",
+        params: [row.task_id],
+        query,
+      }));
   } catch (err) {
     logger.warn({ err, taskId: row.task_id }, "run.claim.mark_exhausted_failed");
     return false;

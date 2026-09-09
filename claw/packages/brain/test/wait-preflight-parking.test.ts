@@ -14,10 +14,8 @@
  * So the class is read first, without blocking and without consuming output,
  * and the same value decides both.
  *
- * The park key is the other half. The run-phase ledger is keyed by the run's
- * gate/lock key while the parking sites used to pass its addressing scope; under
- * the default gate configuration those differ, the lookup missed, and the slot
- * was held for the whole of every wait with nothing logged or counted.
+ * Waits use the same run identity as the ledger, independent of the sandbox
+ * addressing scope and the execution gate key.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -28,6 +26,9 @@ import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { createServer } from "node:http";
 import { HandsClient } from "../src/clients/hands.js";
 import { beginRun, endRun, setParkHooks } from "../src/tasks/run-phase.js";
+import { testRunIdentity } from "./support/run-identity.js";
+
+const RUN = testRunIdentity("run-1");
 
 const TOOLS: ToolSchema[] = [
   { name: "wait", description: "wait", input_schema: { type: "object", properties: {} } },
@@ -99,16 +100,15 @@ async function runWait(
       { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope",
-    parkKey: "gate-lock-key",
+    runIdentity: RUN,
     ...over,
   };
 
-  beginRun((over.parkKey ?? "gate-lock-key") as string);
+  beginRun((over.runIdentity ?? RUN).key);
   try {
     await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
   } finally {
-    endRun((over.parkKey ?? "gate-lock-key") as string);
+    endRun((over.runIdentity ?? RUN).key);
     setParkHooks(null);
   }
   return parkEvents;
@@ -136,13 +136,13 @@ test("a wait on a running shell parks, and classifies before it routes", async (
       { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope", parkKey: "gate-lock-key",
+    runIdentity: RUN,
   };
-  beginRun("gate-lock-key");
+  beginRun(RUN.key);
   try {
     await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
   } finally {
-    endRun("gate-lock-key");
+    endRun(RUN.key);
     setParkHooks(null);
   }
 
@@ -174,13 +174,13 @@ test("the execution slot is observably free while the wait is parked", async () 
       { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope", parkKey: "gate-lock-key",
+    runIdentity: RUN,
   };
-  beginRun("gate-lock-key");
+  beginRun(RUN.key);
   try {
     await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
   } finally {
-    endRun("gate-lock-key");
+    endRun(RUN.key);
     setParkHooks(null);
   }
 
@@ -200,9 +200,6 @@ test("every class that cannot block returns without touching the slot", async ()
 });
 
 test("a site that cannot park under a usable key says so rather than skipping", async () => {
-  // The ledger helper cannot report this: a missing entry is the legitimate
-  // sub-agent case there. Only the site knows it holds its own slot and can
-  // name the key it passed.
   const { registry } = await import("../src/infra/metrics.js");
   const counted = async (): Promise<number> => {
     const m = (await registry.getMetricsAsJSON())
@@ -225,15 +222,13 @@ test("a site that cannot park under a usable key says so rather than skipping", 
       { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope",
-    // Well-formed, and simply not the one the ledger was begun under.
-    parkKey: "not-the-ledgers-key",
+    runIdentity: testRunIdentity("not-the-ledgers-key"),
   };
-  beginRun("gate-lock-key");
+  beginRun(RUN.key);
   try {
     await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
   } finally {
-    endRun("gate-lock-key");
+    endRun(RUN.key);
     setParkHooks(null);
   }
 
@@ -278,11 +273,8 @@ test("a sandbox that cannot be classified reads as running, so the wait still pa
 });
 
 test("the park uses the ledger's key, not the run's addressing scope", async () => {
-  // The two strings differ under the default gate configuration, so a site
-  // passing the addressing scope misses the ledger and never hands the slot
-  // back.
   const { router } = classifyingRouter("running");
-  const parked = await runWait(router, { parkKey: "gate-lock-key", runKey: "addressing-scope" });
+  const parked = await runWait(router, { runIdentity: RUN });
   assert.deepEqual(parked, ["park", "unpark"]);
 
   // Derived from the real distinction rather than a shared literal: a site
@@ -306,14 +298,13 @@ test("the park uses the ledger's key, not the run's addressing scope", async () 
       { content: [toolUse("t1", "wait", { shell_id: "bg-1" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope",
-    parkKey: "addressing-scope",
+    runIdentity: testRunIdentity("sess-1"),
   };
-  beginRun("gate-lock-key");
+  beginRun(RUN.key);
   try {
     await agentLoop([{ role: "user", content: "wait" }], TOOLS, opts);
   } finally {
-    endRun("gate-lock-key");
+    endRun(RUN.key);
     setParkHooks(null);
   }
   assert.deepEqual(parkEvents, [], "the wrong key finds no entry and parks nothing");
@@ -351,14 +342,13 @@ test("consecutive waits on two siblings each park", async () => {
       { content: [toolUse("t2", "wait", { shell_id: "monitor" })], stopReason: "tool_use" },
       { content: [textBlock("ok")], stopReason: "end_turn" },
     ]),
-    runKey: "addressing-scope",
-    parkKey: "gate-lock-key",
+    runIdentity: RUN,
   };
-  beginRun("gate-lock-key");
+  beginRun(RUN.key);
   try {
     await agentLoop([{ role: "user", content: "wait twice" }], TOOLS, opts);
   } finally {
-    endRun("gate-lock-key");
+    endRun(RUN.key);
     setParkHooks(null);
   }
 

@@ -41,7 +41,7 @@ WORKDIR /app
 # a working image.
 ARG EXTRA_CA_CERT_URLS=""
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates git openssl \
+ && apt-get install -y --no-install-recommends curl ca-certificates git openssl unzip \
  && rm -rf /var/lib/apt/lists/* \
  && if [ -n "$EXTRA_CA_CERT_URLS" ]; then \
       i=0; \
@@ -64,6 +64,17 @@ RUN apt-get update \
     else \
       echo "no extra CA anchors requested (EXTRA_CA_CERT_URLS empty)."; \
     fi
+
+# Debian 11's security metadata is no longer refreshed, so fetch the pinned
+# Bun toolchain in the supported Bookworm stage and only execute it under Bullseye.
+ARG BUN_VERSION=1.3.14
+ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
+RUN curl -fsSL -o /tmp/bun.zip \
+      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
+ && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
+ && unzip -q /tmp/bun.zip -d /tmp/bun \
+ && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
+ && rm -rf /tmp/bun.zip /tmp/bun
 
 # Copy only the manifests first so `npm ci` layer caches on deps.
 COPY package.json package-lock.json ./
@@ -104,21 +115,8 @@ RUN npm run build -w packages/utils \
 FROM debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd AS bun-builder
 WORKDIR /app
 
-# Bun is installed from a pinned release archive whose checksum is verified,
-# rather than by piping https://bun.sh/install into a shell. That installer is
-# unversioned, so the toolchain compiling the shipped Hands binary would
-# otherwise be whatever upstream published most recently.
-ARG BUN_VERSION=1.3.14
-ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
-RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
- && curl -fsSL -o /tmp/bun.zip \
-      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
- && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
- && unzip -q /tmp/bun.zip -d /tmp/bun \
- && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
- && rm -rf /tmp/bun.zip /tmp/bun \
- && bun --version \
- && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/bin/bun /usr/local/bin/bun
+RUN bun --version
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages ./packages

@@ -24,13 +24,14 @@ import {
   type RecreateHandsResult,
 } from "./index.js";
 import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
-import { isTrackedRun, whileWaiting } from "../tasks/run-phase.js";
+import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
@@ -223,18 +224,8 @@ export interface LoopOptions {
   hands?: HandsClient | null;
   /** Opens the sandbox for a run that deferred it; see ToolRouter.attachHands. */
   attachHands?: () => Promise<HandsClient>;
-  /**
-   * Key this run is tracked under while it waits on something external, so the
-   * time can be attributed to it (see tasks/run-phase.ts). Absent means the run is
-   * not tracked and the waits go uncounted.
-   */
-  runKey?: string;
-  /**
-   * Key the run-phase ledger is keyed by -- the run's gate/lock key, which is
-   * deliberately not its addressing scope. Parking under the wrong one misses
-   * the ledger silently and holds the execution slot for the whole wait.
-   */
-  parkKey?: string;
+  /** Identity this run is tracked under while it waits; see tasks/run-phase.ts. */
+  runIdentity?: RunIdentity;
   /** Platform MCP clients (same map the parent is using), so sub-agents can
    *  reuse the parent's MCP connections without reconnecting. */
   platformMcpClients?: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
@@ -595,6 +586,9 @@ class AgentLoopRunner {
   private readonly userId?: string;
   private readonly sessionId?: string;
   private readonly depth: number;
+  /** A sub-agent runs inside the slot its parent holds, so its waits must not
+   *  park: that would hand back a slot this loop never acquired. */
+  private readonly waitMode: WaitMode;
   private readonly rawMessageCount: number;
   private readonly session: LlmSession;
   /** Wire protocol this run's usage numbers were reported in — see the
@@ -727,6 +721,7 @@ class AgentLoopRunner {
     this.userId = userId;
     this.sessionId = sessionId;
     this.depth = opts.depth ?? 0;
+    this.waitMode = this.depth === 0 ? "timed+park" : "timed";
     this.rawMessageCount = messages.length;
 
     // --- Resume: pre-populate state from checkpoint ---
@@ -846,20 +841,9 @@ class AgentLoopRunner {
     return filtered;
   }
 
-  /**
-   * The key this site parks under, and the signal when it cannot be trusted.
-   *
-   * The ledger helper's own no-entry behaviour is left alone: a sub-agent runs
-   * inside its parent's slot and legitimately has no entry. The condition worth
-   * reporting is a site holding its own slot and passing a key the ledger does
-   * not know -- well-formed and simply the wrong one, which is how the slot came
-   * to be held for the whole of every wait with nothing recorded.
-   */
-  private parkKeyFor(site: "approval" | "background_command"): string | undefined {
-    const key = this.opts.parkKey;
-    // An unset depth is a top-level run, not a sub-agent: reading it as one
-    // silences the signal on exactly the loops that own their slot.
-    const ownsSlot = (this.opts.depth ?? 0) === 0;
+  private runIdentityKeyFor(site: "approval" | "background_command"): RunIdentity["key"] | undefined {
+    const key = this.opts.runIdentity?.key;
+    const ownsSlot = this.waitMode === "timed+park";
     if (!key) {
       if (ownsSlot) {
         metrics.onParkKeyUnusable(site, "absent");
@@ -1007,7 +991,7 @@ class AgentLoopRunner {
       await this.noteRecoveryExhausted(results, exhausted);
       return;
     }
-    await this.performSandboxRecovery(results);
+    await whileRecovering(this.opts.runIdentity?.key, () => this.performSandboxRecovery(results));
   }
 
   /** Stop before probing only when neither kind of recovery remains available. */
@@ -1740,7 +1724,7 @@ class AgentLoopRunner {
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
       const hitlResult = this.opts.hitl.willAsk(toolName)
-        ? await whileWaiting(this.parkKeyFor("approval"), "approval", decide)
+        ? await whileWaiting(this.runIdentityKeyFor("approval"), "approval", this.waitMode, decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
           const reason = `Error: ${hitlResult.reason}`;
@@ -1878,7 +1862,7 @@ class AgentLoopRunner {
       // it moves no output offset.
       const parks = WAITING_TOOLS.has(toolName) && await this.waitCanBlock(finalInput);
       resultText = parks
-        ? await whileWaiting(this.parkKeyFor("background_command"), "background_command", () =>
+        ? await whileWaiting(this.runIdentityKeyFor("background_command"), "background_command", this.waitMode, () =>
             this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
         : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
       toolOutcome = outcome;
@@ -2049,6 +2033,7 @@ class AgentLoopRunner {
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,
+        runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";

@@ -27,8 +27,7 @@ import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
 import { buildRenderContext, renderBackendTemplates } from "./template-renderer.js";
-import { getTask, transitionStatus, updateTask } from "./db.js";
-import { RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
+import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
 import { resolveToolMeta } from "./dags/admission.js";
 import type { ClawTaskRow } from "./types.js";
 import {
@@ -478,16 +477,11 @@ async function resolveDispatchFailure(
  * holder alone.
  */
 async function putBackUnclaimedChatRun(taskId: string): Promise<void> {
-  await db.query(
-    `UPDATE claw_tasks
-        SET status = 'queued',
-            ${RUN_REQUEUE_RESET_SQL}
-      WHERE task_id = $1
-        AND status = 'preparing'
-        AND origin = 'chat'
-        AND lease_owner IS NULL`,
-    [taskId],
-  );
+  await applyTaskStatusTransition("queued", {
+    extra: { started_at: null },
+    where: "task_id = $1 AND status = 'preparing' AND origin = 'chat' AND lease_owner IS NULL",
+    params: [taskId],
+  });
 }
 
 /**

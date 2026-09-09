@@ -2,52 +2,64 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * How much of a run is spent executing, and how much waiting.
+ * How much of a run is spent executing, and how much doing something else.
  *
- * A run holds an execution slot from the moment it starts until the moment it
- * ends, whether it is calling the model or sitting on a background command
- * that has two hours left to run. A pod can be idle and full at the same time.
+ * A run holds an execution slot whether it is calling the model or sitting on a
+ * background command with two hours left, so a pod can be idle and full at
+ * once. Knowing which buys two things: the slot goes back to the pod for the
+ * duration, and the time is reported with each lease renewal as a running total
+ * per state -- see @claw/protocol's run-time module for what it means there.
  *
- * Two things come out of knowing when a run is waiting. The slot goes back to
- * the pod for the duration, which is what stops a queue from standing still
- * behind runs that are not running. And the fraction of a run spent waiting
- * gets reported with each lease renewal, which is the number that decides
- * whether the deeper version of this -- suspending a run mid-turn and letting
- * the sandbox go too -- is worth building at all. If runs turn out to spend
- * nearly all their time executing, that work buys nothing and the answer is
- * more capacity rather than a new execution model.
- *
+ * A run is in exactly one state at a time and entering a new one closes the
+ * previous, so the totals sum to the run's own wall clock rather than past it.
  * What is not handed back is the sandbox, so parking is bounded by a resident
- * ceiling in the gate rather than being free. See tasks/execution-gate.ts.
- *
- * Waits are recorded here and keyed by the run's key rather than held on the
- * runner, because the two places that know a wait is happening -- the approval
- * gate and the tool router -- are several layers below it, and passing a
- * handle down to each would put this concern into signatures that have nothing
- * else to do with it.
+ * ceiling in the gate. See tasks/execution-gate.ts.
  */
-import type { RunWaitReason } from "@claw/protocol";
+import {
+  REASON_STATE,
+  RUN_TIME_KNOWN_STATES,
+  type RunTimeKnownState,
+  type RunWaitReason,
+} from "@claw/protocol";
+import pino from "pino";
+
+import type { RunIdentityKey } from "./run-identity.js";
+
+const logger = pino({ name: "run-phase" });
+
+/**
+ * Whether a wait may hand the pod's execution slot back for its duration.
+ *
+ * Required and undefaulted at every call site: a slot belongs to whoever
+ * acquired it, and a sub-agent waiting inside its parent's slot would be
+ * handing back one it does not own, admitting work the pod never intended.
+ */
+export type WaitMode = "timed" | "timed+park";
 
 interface RunPhaseState {
-  /** Why the run is currently waiting, or null while it is executing. */
-  waitingOn: RunWaitReason | null;
-  /** When the current wait started; meaningless while executing. */
-  waitStartedAt: number;
-  /** Wall-clock milliseconds spent in finished waits. */
-  waitedMs: number;
+  /** The one state accumulating right now. */
+  activeState: RunTimeKnownState;
+  /** Why, when the active state is a wait; null otherwise. */
+  activeReason: RunWaitReason | null;
+  /** When the active state was entered. */
+  activeSince: number;
+  stateMs: Record<RunTimeKnownState, number>;
+  reasonMs: Partial<Record<RunWaitReason, number>>;
   /** Waits entered, so an average wait length can be derived. */
   waits: number;
 }
 
-const runs = new Map<string, RunPhaseState>();
+const runs = new Map<RunIdentityKey, RunPhaseState>();
+
+/** States that mean the run is not executing, for the two-value wire phase. */
+const WAITING_STATES: readonly RunTimeKnownState[] = [
+  "waiting_human", "waiting_background", "waiting_resource", "waiting_external",
+];
 
 /**
- * What to do with the pod's execution slot when a run starts and stops
- * waiting.
- *
- * Injected rather than imported so this module stays a plain ledger: tests
- * drive an isolated gate, and the sub-agent path -- which runs inside a slot
- * its parent already holds -- can leave the hooks unset and only be measured.
+ * What to do with the pod's execution slot around a wait. Injected rather than
+ * imported so this module stays a plain ledger and a timing-only call site
+ * never reads it at all.
  */
 export interface ParkHooks {
   /** @returns whether a slot was actually given back. */
@@ -62,48 +74,69 @@ export function setParkHooks(next: ParkHooks | null): void {
   hooks = next;
 }
 
+function zeroStates(): Record<RunTimeKnownState, number> {
+  return Object.fromEntries(
+    RUN_TIME_KNOWN_STATES.map((state) => [state, 0]),
+  ) as Record<RunTimeKnownState, number>;
+}
+
 /** Start tracking a run. Idempotent: a redelivery re-enters the same key. */
-export function beginRun(key: string): void {
-  runs.set(key, { waitingOn: null, waitStartedAt: 0, waitedMs: 0, waits: 0 });
+export function beginRun(key: RunIdentityKey): void {
+  runs.set(key, {
+    activeState: "executing",
+    activeReason: null,
+    activeSince: Date.now(),
+    stateMs: zeroStates(),
+    reasonMs: {},
+    waits: 0,
+  });
 }
 
 /** Whether the ledger holds this key. Read by a park site checking its own. */
-export function isTrackedRun(key: string): boolean {
+export function isTrackedRun(key: RunIdentityKey): boolean {
   return runs.has(key);
 }
 
 /** Stop tracking a run. Every beginRun needs exactly one endRun. */
-export function endRun(key: string): void {
+export function endRun(key: RunIdentityKey): void {
   runs.delete(key);
 }
 
-/**
- * Run `fn` with the run marked as waiting.
- *
- * Nested waits keep the outermost reason: an approval that happens to be
- * requested while a background command is outstanding is still one stretch of
- * the run not executing, and counting it twice would put the waiting fraction
- * above one. That also makes the slot change hands once per stretch rather
- * than once per nested wait.
- *
- * The slot is reacquired before the caller continues, and that reacquisition
- * can block: the pod may have given the slot to something else while this run
- * was waiting. Which is the intended behaviour -- a run coming back from an
- * approval takes its turn -- but it means the time between "the user clicked
- * approve" and "the tool ran" now includes a queue, and it is still counted as
- * waiting, because from the run's point of view that is what it is.
- */
-export async function whileWaiting<T>(
-  key: string | undefined,
-  reason: RunWaitReason,
+/** Close the interval the run is in and open one in `next`. */
+function switchTo(
+  state: RunPhaseState,
+  next: RunTimeKnownState,
+  reason: RunWaitReason | null,
+): void {
+  const now = Date.now();
+  const elapsed = now - state.activeSince;
+  state.stateMs[state.activeState] += elapsed;
+  if (state.activeReason) {
+    state.reasonMs[state.activeReason] = (state.reasonMs[state.activeReason] ?? 0) + elapsed;
+  }
+  state.activeState = next;
+  state.activeReason = reason;
+  state.activeSince = now;
+}
+
+async function whileInState<T>(
+  key: RunIdentityKey | undefined,
+  next: RunTimeKnownState,
+  reason: RunWaitReason | null,
+  mode: WaitMode,
   fn: () => Promise<T>,
 ): Promise<T> {
   const state = key ? runs.get(key) : undefined;
-  if (!state || state.waitingOn) return fn();
-  state.waitingOn = reason;
-  state.waitStartedAt = Date.now();
-  state.waits++;
-  const parked = hooks;
+  if (!state) {
+    logger.warn({ state: next, reason, mode, keyed: key !== undefined }, "run_phase.ledger_miss");
+    return fn();
+  }
+  // Exclusivity: a run already out of `executing` is in one stretch of not
+  // executing, and opening a second would count the same interval twice.
+  if (state.activeState !== "executing") return fn();
+  switchTo(state, next, reason);
+  if (reason) state.waits++;
+  const parked = mode === "timed+park" ? hooks : null;
   // A run that had no slot to give back must not come back holding one, so the
   // answer travels with the pair rather than being inferred on return.
   const gaveSlotBack = parked?.park() ?? false;
@@ -115,10 +148,38 @@ export async function whileWaiting<T>(
     try {
       await parked?.unpark(gaveSlotBack);
     } finally {
-      state.waitedMs += Date.now() - state.waitStartedAt;
-      state.waitingOn = null;
+      switchTo(state, "executing", null);
     }
   }
+}
+
+/**
+ * Run `fn` with the run marked as waiting on `reason`.
+ *
+ * The slot is reacquired before the caller continues, and that can block: the
+ * queue for it is counted as waiting, because from the run's point of view that
+ * is what it is.
+ */
+export function whileWaiting<T>(
+  key: RunIdentityKey | undefined,
+  reason: RunWaitReason,
+  mode: WaitMode,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return whileInState(key, REASON_STATE[reason], reason, mode, fn);
+}
+
+/**
+ * Run `fn` with the run marked as recovering its sandbox.
+ *
+ * Timing only: the run is repairing what it needs to keep executing, and it
+ * has no idle slot to lend out while it does.
+ */
+export function whileRecovering<T>(
+  key: RunIdentityKey | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return whileInState(key, "recovering", null, "timed", fn);
 }
 
 export interface RunPhaseReport {
@@ -129,15 +190,41 @@ export interface RunPhaseReport {
   waits: number;
 }
 
+/** The running per-state totals a lease renewal reports as its coverage. */
+export interface RunTimeSnapshot {
+  stateMs: Partial<Record<RunTimeKnownState, number>>;
+  reasonMs: Partial<Record<RunWaitReason, number>>;
+}
+
+/** The entry's totals with the interval in progress folded in. */
+function totalsOf(state: RunPhaseState): RunTimeSnapshot {
+  const inFlight = Date.now() - state.activeSince;
+  const stateMs = { ...state.stateMs };
+  stateMs[state.activeState] += inFlight;
+  const reasonMs = { ...state.reasonMs };
+  if (state.activeReason) {
+    reasonMs[state.activeReason] = (reasonMs[state.activeReason] ?? 0) + inFlight;
+  }
+  return { stateMs, reasonMs };
+}
+
 /** What to report with the next lease renewal. */
-export function phaseOf(key: string): RunPhaseReport {
+export function phaseOf(key: RunIdentityKey): RunPhaseReport {
   const state = runs.get(key);
   if (!state) return { phase: "executing", waitedMs: 0, waits: 0 };
-  const inFlight = state.waitingOn ? Date.now() - state.waitStartedAt : 0;
+  const { stateMs } = totalsOf(state);
+  const waitedMs = WAITING_STATES.reduce((sum, s) => sum + stateMs[s]!, 0);
   return {
-    phase: state.waitingOn ? "waiting" : "executing",
-    ...(state.waitingOn ? { waitReason: state.waitingOn } : {}),
-    waitedMs: state.waitedMs + inFlight,
+    phase: state.activeReason ? "waiting" : "executing",
+    ...(state.activeReason ? { waitReason: state.activeReason } : {}),
+    waitedMs,
     waits: state.waits,
   };
+}
+
+/** Running totals, not deltas: the merge on the row banks the difference, so a
+ *  lost or duplicated report costs nothing. */
+export function runTimeOf(key: RunIdentityKey): RunTimeSnapshot | null {
+  const state = runs.get(key);
+  return state ? totalsOf(state) : null;
 }

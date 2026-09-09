@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { ExecuteRequest, ExecuteResult, EventCallback, TokenUsage, Message } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import type { HandsClient } from "../clients/hands.js";
 import pino from "pino";
 
@@ -170,14 +171,8 @@ export interface ExecuteExtras {
    * reach /workspace, and never for a turn the model answers on its own.
    */
   attachHands?: () => Promise<HandsClient>;
-  /**
-   * The key the run-phase ledger is keyed by, which is the run's gate/lock key
-   * and not its addressing scope. The two differ under the default gate
-   * configuration, and parking under the addressing scope missed the ledger
-   * silently -- no park, no log, no counter, and the execution slot held for
-   * the whole of every wait.
-   */
-  parkKey?: string;
+  /** Optional only because this interface is: TaskRunner always sets it. */
+  runIdentity?: RunIdentity;
 }
 
 export interface Engine {
