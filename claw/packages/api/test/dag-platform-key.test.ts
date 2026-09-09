@@ -78,8 +78,7 @@ async function dispatchWith(config: Record<string, unknown> | null): Promise<Cap
       return { rows: [{ user_id: "u-1", config }], rowCount: 1 };
     }
     if (/^UPDATE claw_tasks SET status/.test(sql)) {
-      const to = String(params[0] ?? "");
-      captured.transitions.push(to);
+      captured.transitions.push(/SET status = '(\w+)'/.exec(sql)?.[1] ?? "");
       const reason = params.find(
         (p) => typeof p === "string" && /missing_platform_key|agent_error|workspace_bind_failed/.test(p),
       );

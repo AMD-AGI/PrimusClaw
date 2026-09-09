@@ -23,7 +23,7 @@
 import { db } from "../infra/db.js";
 import pino from "pino";
 import { dispatchTask } from "./dispatcher.js";
-import { listDownstream, transitionStatus, updateTask } from "./db.js";
+import { applyTaskStatusTransition, listDownstream, transitionStatus, updateTask } from "./db.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-scheduler" });
@@ -40,17 +40,15 @@ let timer: NodeJS.Timeout | null = null;
  * Returns the number of promoted rows; useful in tests.
  */
 export async function promoteReadyTasks(): Promise<number> {
-  const r = await db.query(
-    `UPDATE claw_tasks t
-     SET status = 'queued', queued_at = NOW()
-     WHERE t.status = 'waiting_deps'
+  const rows = await applyTaskStatusTransition("queued", {
+    where: `status = 'waiting_deps'
        AND NOT EXISTS (
-         SELECT 1 FROM unnest(t.depends_on) dep
+         SELECT 1 FROM unnest(claw_tasks.depends_on) dep
          JOIN claw_tasks p ON p.task_id = dep
          WHERE p.status <> 'completed'
-       )
-     RETURNING task_id`,
-  );
+       )`,
+  });
+  const r = { rows, rowCount: rows.length };
   return r.rowCount ?? 0;
 }
 
@@ -68,16 +66,17 @@ export async function cascadeFailures(): Promise<number> {
   for (const row of failed.rows as Array<{ task_id: string }>) {
     const downs = await listDownstream(row.task_id);
     if (downs.length === 0) continue;
-    const r = await db.query(
-      `UPDATE claw_tasks
-       SET status = 'failed', failure_reason = 'deps_failed',
-           error_message = $1, completed_at = NOW()
-       WHERE task_id = ANY($2)
+    const cascadedRows = await applyTaskStatusTransition("failed", {
+      extra: {
+        failure_reason: "deps_failed",
+        error_message: `upstream ${row.task_id} failed`,
+      },
+      where: `task_id = ANY($1)
          AND status IN ('waiting_deps','waiting_external','queued')
          AND COALESCE(metadata->'derived'->>'on_failure','cascade_fail') = 'cascade_fail'`,
-      [`upstream ${row.task_id} failed`, downs],
-    );
-    cascaded += r.rowCount ?? 0;
+      params: [downs],
+    });
+    cascaded += cascadedRows.length;
   }
   return cascaded;
 }

@@ -214,7 +214,7 @@ test("a cancelled run's two columns agree about what happened to it", async () =
   stubBus();
   await reapStaleTasks();
 
-  const errorMessage = /error_message = CASE (.*?) END, completed_at/.exec(seen[0]!.sql)?.[1];
+  const errorMessage = /error_message = CASE ([\s\S]*?) END/.exec(seen[0]!.sql)?.[1];
   assert.ok(errorMessage, "the error_message CASE has moved; this test is reading the wrong text");
   // Position, not prose. Asserting how the branch is introduced pins the
   // comment above it as well, so deleting a comment fails a test about

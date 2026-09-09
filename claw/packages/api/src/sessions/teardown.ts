@@ -59,6 +59,7 @@ import { cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome
 import pino from "pino";
 
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
 import { getS3Client } from "../infra/s3-client.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
@@ -572,16 +573,16 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
   try {
     await inTransaction(async (query: Querier) => {
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
-      await query(
-        `UPDATE claw_tasks
-            SET status = 'cancelled',
-                failure_reason = 'session_deleted',
-                error_message = 'the session this run belonged to was deleted',
-                completed_at = NOW()
-          WHERE session_id = $1
-            AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')`,
-        [sessionId],
-      );
+      await applyTaskStatusTransition("cancelled", {
+        extra: {
+          failure_reason: "session_deleted",
+          error_message: "the session this run belonged to was deleted",
+        },
+        where: "session_id = $1 AND status IN "
+          + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
+        params: [sessionId],
+        query,
+      });
       for (const table of CONTENT_TABLES) {
         await query(
           `UPDATE ${table} SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL`,

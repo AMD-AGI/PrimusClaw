@@ -6,6 +6,8 @@ export * from "./subjects.js";
 export * from "./user-env.js";
 export * from "./task-consumer.js";
 export * from "./run-lease.js";
+export * from "./run-identity.js";
+export * from "./run-time.js";
 export * from "./topology.js";
 export * from "./run-doorbell.js";
 export {

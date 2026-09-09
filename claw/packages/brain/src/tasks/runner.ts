@@ -60,8 +60,14 @@ import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
 import { runScript } from "./script-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning,
+  type RunAttemptToken,
 } from "./callback.js";
-import { beginRun, endRun, phaseOf } from "./run-phase.js";
+import type { RunTimeReport } from "@claw/protocol";
+import { randomUUID } from "node:crypto";
+import { declareFinalReport } from "../delivery/doorbell-delivery.js";
+import { settleClaimedRun } from "../clients/run-claim.js";
+import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
+import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
@@ -197,14 +203,16 @@ async function deliverAgentDone(
   kvCkpt: KV,
   request: ExecuteRequest,
   result: ExecuteResult,
+  runTime?: RunTimeReport,
 ): Promise<void> {
   if (!request.task_id) {
-    await fx().postAgentDone(request, result);
+    await fx().postAgentDone(request, result, runTime);
     return;
   }
   const key = pendingCallbackKey(request.task_id);
-  await kvCkpt.put(key, sc.encode(JSON.stringify(result)));
-  await fx().postAgentDone(request, result);
+  const pending = runTime ? { ...result, run_time: runTime } : result;
+  await kvCkpt.put(key, sc.encode(JSON.stringify(pending)));
+  await fx().postAgentDone(request, result, runTime);
 }
 
 async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteRequest): Promise<void> {
@@ -351,6 +359,7 @@ export interface TaskRunnerSideEffects {
   postAgentDone: typeof postAgentDone;
   postTaskRunning: typeof postTaskRunning;
   postRunLease: typeof postRunLease;
+  settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
   refreshTaskLock: typeof refreshTaskLock;
   releaseTaskLock: typeof releaseTaskLock;
@@ -378,6 +387,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postAgentDone,
   postTaskRunning,
   postRunLease,
+  settleRunAttempt: settleClaimedRun,
   runScript,
   refreshTaskLock,
   releaseTaskLock,
@@ -734,8 +744,9 @@ async function replayPendingCallback(
   if (!entry) return false;
 
   try {
-    const result = JSON.parse(sc.decode(entry.value)) as ExecuteResult;
-    await fx().postAgentDone(request, result);
+    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
+      ExecuteResult & { run_time?: RunTimeReport };
+    await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
   } catch (err) {
@@ -840,6 +851,14 @@ type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
  * decision, engine dispatch, checkpointing, and all terminal-state
  * handling). One instance per task; never reused across tasks.
  */
+/**
+ * The claim a doorbell run holds, or null for a fat delivery that took none.
+ *
+ * Its generation is the discriminator the fat path gets from the delivery pair
+ * instead; a row only ever has one of the two advancing.
+ */
+export type RunClaim = { claimCount: number } | null;
+
 class TaskRunner {
   // Injected singletons (bound once via bindTaskRunnerDeps in main()).
   private readonly kv: KV;
@@ -863,6 +882,29 @@ class TaskRunner {
    * message id for the legacy chat path, which dispatches without a task row.
    */
   private readonly runId: string;
+
+  /**
+   * This run in the phase ledger.
+   *
+   * Deliberately a second value beside {@link runId} rather than a derivation
+   * of it: that one decides which sandbox shells a redelivered attempt
+   * re-adopts, and the lease and message tiers here would silently change that
+   * answer. Neither is computed from the other.
+   */
+  private readonly runIdentity: RunIdentity;
+
+  /**
+   * Which attempt of this run the row should accept reports from. Minted here,
+   * so a lost allocation write costs a row update rather than a lease: the
+   * row's first renewal adopts the token instead.
+   */
+  private readonly attempt: RunAttemptToken;
+
+  /** Whether this attempt has issued the identity-only report that opens it. */
+  private coverageOpened = false;
+
+  /** A claimed run settles on its ack; a fat one settles through `agent_done`. */
+  private readonly claimed: boolean;
 
   /**
    * The scope those shells are addressable in: this DAG, or this conversation.
@@ -1020,6 +1062,7 @@ class TaskRunner {
     messageId: string,
     userId: string,
     abortCtrl: AbortController,
+    claim: RunClaim,
   ) {
     const deps = getDeps();
     this.kv = deps.kv;
@@ -1035,6 +1078,35 @@ class TaskRunner {
     this.userId = userId;
     this.abortCtrl = abortCtrl;
     this.runId = request.task_id || messageId;
+    // A claimed doorbell has no delivery to count -- its wakeup was acked at
+    // claim time -- and a fat delivery takes no claim, so each path presents
+    // the row's true value for the half it does not have.
+    this.claimed = claim !== null;
+    this.attempt = claim
+      ? { attemptId: randomUUID(), claimCount: claim.claimCount, deliverySeq: 0, deliveryCount: 0 }
+      : {
+          attemptId: randomUUID(),
+          claimCount: 0,
+          deliverySeq: msg.seq,
+          deliveryCount: msg.info.deliveryCount,
+        };
+    const resolved = resolveRunIdentity(request, messageId);
+    this.runIdentity = resolved.identity;
+    if (resolved.leaseShapeMiss) {
+      logger.warn(
+        { sessionId, messageId, leaseUrl: request.run_lease?.url },
+        "run_identity.lease_shape_miss",
+      );
+    }
+    // Distinct from the event above: a run with nothing to identify it is a
+    // degradation this design expects, while an unrecognised lease URL is an
+    // upstream regression, and folding the two would let the second hide.
+    if (this.runIdentity.source === "unknown") {
+      logger.warn(
+        { sessionId, messageId, runIdentityKey: this.runIdentity.key },
+        "run_identity.unknown",
+      );
+    }
     this.handsOwner = pickRunScope(request);
 
     this.userIdHex = /^[0-9a-f]{32}$/.test(userId) ? userId : null;
@@ -1388,6 +1460,7 @@ class TaskRunner {
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
+      attempt: this.attempt,
     });
     return { hands: newHands, action: "rebuilt" };
   }
@@ -1891,7 +1964,7 @@ class TaskRunner {
       message: "this turn has not opened a sandbox; one opens on the first tool call",
       message_id: this.messageId,
     }).catch(() => { /* a status event must not fail the run */ });
-    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID });
+    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
   }
 
   /**
@@ -1957,6 +2030,7 @@ class TaskRunner {
     await fx().postTaskRunning(this.request, {
       brainId: BRAIN_ID,
       sandboxWorkloadId: this.handsWorkloadId,
+      attempt: this.attempt,
     });
     this.hands = fx().makeHandsClient(handsUrl, handsToken, this.handsOwner, this.runId);
     // ensureHands returns only after bootstrap and the health check, so this
@@ -2203,6 +2277,7 @@ class TaskRunner {
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
+          runIdentity: this.runIdentity,
         });
       }
     } finally {
@@ -2457,13 +2532,14 @@ class TaskRunner {
         this.withPlatformFacts(result),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     // Ack BEFORE logging task.completed: if the process is killed by a hot-
     // reload between the log line and msg.ack(), NATS redelivers the task after
     // ack_wait and the entire execution repeats from scratch. Since exec_complete
     // is already persisted in JetStream, the event-consumer can handle post-
     // completion logic (pending messages, summaries) even if Brain dies here.
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
     logger.info({
       sessionId: this.sessionId, messageId: this.messageId, turns: result.turns, elapsedMs: result.elapsedMs,
       // A completed run always has both -- the loop that produced this result
@@ -2745,7 +2821,7 @@ class TaskRunner {
       (Date.now() - sigtermStartedAt) / 1000,
       sigtermSyncResult,
     );
-    this.msg.nak(0);
+    await this.nakAfterAttempt(0);
   }
 
   // ── User interrupt (existing behavior) ─────────────────────────────
@@ -2879,9 +2955,10 @@ class TaskRunner {
         }),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
   }
 
   private async handleRetryableError(err: any): Promise<void> {
@@ -2966,7 +3043,7 @@ class TaskRunner {
       retryPendingDeadlineMs,
       retryPendingGraceSec: RETRY_PENDING_KEEPALIVE_GRACE_SEC,
     });
-    this.msg.nak(5000);
+    await this.nakAfterAttempt(5000);
   }
 
   private async handleFatalError(err: any): Promise<void> {
@@ -3108,9 +3185,10 @@ class TaskRunner {
         }),
         runtimeSecrets(this.request, this.platformKey),
       ),
+      this.coverageReport()?.runTime,
     );
     await this.releaseAfterTerminal();
-    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+    await this.ackTerminal();
   }
 
   /**
@@ -3210,14 +3288,85 @@ class TaskRunner {
    * something external, which is the measurement that decides whether handing
    * the slot back during waits is worth building (see tasks/run-phase.ts).
    */
+  /**
+   * This attempt's coverage, or nothing when it has none to report yet.
+   *
+   * The opening tick carries no covering field, whatever the clock did between
+   * `beginRun` and it: a report that measured nothing must not advance the
+   * row's watermark, and the interval stays visibly unbanked.
+   */
+  private coverageReport(): { runTime: RunTimeReport } | null {
+    if (!this.coverageOpened) return null;
+    const snapshot = runTimeOf(this.runIdentity.key);
+    if (!snapshot) return null;
+    const covered = Object.values(snapshot.stateMs).some((ms) => (ms ?? 0) > 0);
+    if (!covered) return null;
+    return {
+      runTime: {
+        key: this.runIdentity.key,
+        attemptId: this.attempt.attemptId,
+        claimCount: this.attempt.claimCount,
+        deliverySeq: this.attempt.deliverySeq,
+        deliveryCount: this.attempt.deliveryCount,
+        // Differences, never instants, so the database's own budget bounds them.
+        basis: { kind: "same_domain", domain: "brain" },
+        cumulativeStateMs: snapshot.stateMs,
+        cumulativeReasonMs: snapshot.reasonMs,
+      },
+    };
+  }
+
+  /**
+   * Hand this attempt's coverage to the release about to be issued: it goes out
+   * from the delivery loop, which has the task id and nothing else.
+   */
+  private declareCoverage(): void {
+    declareFinalReport(this.request.task_id ?? "", this.coverageReport()?.runTime);
+  }
+
+  /**
+   * End this attempt, then ask for the redelivery that follows it.
+   *
+   * A claimed run's wrapper takes the declaration and settles the row from the
+   * delivery loop. A fat delivery's nak is a real JetStream nak that takes
+   * nothing, so its attempt is settled here instead: otherwise its coverage is
+   * never reported at all, and the row keeps this attempt's token and a live
+   * lease that refuses the redelivery's first heartbeat until it lapses.
+   */
+  private async nakAfterAttempt(delayMs: number): Promise<void> {
+    if (this.claimed) this.declareCoverage();
+    else if (this.request.task_id) {
+      await fx().settleRunAttempt(
+        this.request.task_id, this.attempt.claimCount, this.coverageReport()?.runTime, true,
+      );
+    }
+    this.msg.nak(delayMs);
+  }
+
+  /**
+   * Ack this delivery, having first handed the ack what the attempt covered.
+   *
+   * Only for a claimed run: a fat delivery's ack is a real JetStream ack that
+   * takes no declaration, and its coverage has already gone out on `agent_done`.
+   * Declaring there would leave an entry nothing ever takes.
+   */
+  private async ackTerminal(): Promise<void> {
+    if (this.claimed) this.declareCoverage();
+    await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
+  }
+
   private startLeaseHeartbeat(): ReturnType<typeof setInterval> | null {
     // Tracked whether or not there is anywhere to report it to. The ledger is
     // what hands the execution slot back during a wait, and a run dispatched
     // by a path that does not issue leases waits exactly as long as any other.
-    beginRun(this.lockKey);
+    beginRun(this.runIdentity.key);
     if (!this.request.run_lease?.url) return null;
     const tick = () => {
-      const phase = phaseOf(this.lockKey);
+      const phase = phaseOf(this.runIdentity.key);
+      const coverage = this.coverageReport();
+      // Only from the second tick onward, by construction rather than because
+      // the clock happened not to advance since `beginRun`.
+      this.coverageOpened = true;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
@@ -3225,6 +3374,8 @@ class TaskRunner {
         waitReason: phase.waitReason,
         waitedMs: phase.waitedMs,
         waits: phase.waits,
+        attempt: this.attempt,
+        ...(coverage ?? {}),
       }).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
         // two workers driving one sandbox, or a run writing a workspace a
@@ -3474,7 +3625,7 @@ class TaskRunner {
       cancelDeadline();
       clearInterval(this.keepAlive);
       if (leaseTimer) clearInterval(leaseTimer);
-      endRun(this.lockKey);
+      endRun(this.runIdentity.key);
       activeAbort.delete(this.lockKey);
       await fx().releaseTaskLock(this.lockKey);
       // The transport, not the sandbox: the pod is parked for the next message
@@ -3503,8 +3654,11 @@ export async function runHandleTask(
   messageId: string,
   userId: string,
   abortCtrl: AbortController,
+  claim: RunClaim = null,
 ): Promise<void> {
   if (await replayPendingCallback(msg, request, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
-  await new TaskRunner(msg, request, sessionId, lockKey, messageId, userId, abortCtrl).run();
+  await new TaskRunner(
+    msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,
+  ).run();
 }

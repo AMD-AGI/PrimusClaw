@@ -12,8 +12,9 @@
  * The legacy chat path (no `task_id`) is unaffected.
  */
 import type {
-  ExecuteRequest, ExecuteResult, RunPhase, RunWaitReason,
+  ExecuteRequest, ExecuteResult, RunPhase, RunTimeReport, RunWaitReason,
 } from "@claw/protocol";
+import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
 
 const logger = pino({ name: "task-callback" });
@@ -24,6 +25,7 @@ export class AgentDoneDeliveryError extends Error {
 
 interface AgentDoneBody {
   task_id?: string;
+  run_time?: RunTimeReport;
   final_text?: string;
   captures?: Record<string, string>;
   artifacts?: Array<Record<string, unknown>>;
@@ -58,6 +60,8 @@ export interface RunOwnership {
   brainId?: string;
   /** The Hands workload serving it, as named by the sandbox provider. */
   sandboxWorkloadId?: string;
+  /** This attempt, so the row can tell it from the one it superseded. */
+  attempt?: RunAttemptToken;
 }
 
 /**
@@ -100,6 +104,12 @@ export async function postTaskRunning(
         // that never reports running has no sandbox to attribute anyway.
         brain_id: ownership.brainId || undefined,
         sandbox_workload_id: ownership.sandboxWorkloadId || undefined,
+        // Best-effort like the write around it: a lost allocation is adopted
+        // by the first renewal rather than costing the run its execution.
+        attempt_id: ownership.attempt?.attemptId,
+        claim_count: ownership.attempt?.claimCount,
+        delivery_seq: ownership.attempt?.deliverySeq,
+        delivery_count: ownership.attempt?.deliveryCount,
       }),
       signal: controller.signal,
     });
@@ -119,6 +129,18 @@ export async function postTaskRunning(
   }
 }
 
+/**
+ * Which attempt of a run is speaking. Neither half is monotone alone: a claim
+ * advances `claimCount`, a fat redelivery advances the delivery pair.
+ */
+export interface RunAttemptToken {
+  /** Minted by this attempt, so the row can fence a heartbeat that outlived it. */
+  attemptId: string;
+  claimCount: number;
+  deliverySeq: number;
+  deliveryCount: number;
+}
+
 /** What a lease renewal tells the row, beyond "the worker is still here". */
 export interface LeaseRenewal {
   brainId: string;
@@ -129,6 +151,10 @@ export interface LeaseRenewal {
   /** Cumulative wall-clock the run has spent waiting rather than executing. */
   waitedMs: number;
   waits: number;
+  /** Fences this renewal against the attempt the row currently holds. */
+  attempt: RunAttemptToken;
+  /** Absent for the opening tick, which has closed no interval to report. */
+  runTime?: RunTimeReport;
 }
 
 /**
@@ -200,6 +226,11 @@ export async function postRunLease(
         wait_reason: renewal.waitReason,
         waited_ms: renewal.waitedMs,
         waits: renewal.waits,
+        attempt_id: renewal.attempt.attemptId,
+        claim_count: renewal.attempt.claimCount,
+        delivery_seq: renewal.attempt.deliverySeq,
+        delivery_count: renewal.attempt.deliveryCount,
+        run_time: renewal.runTime,
       }),
       signal: controller.signal,
     });
@@ -276,6 +307,31 @@ function truncateFinalText(text: string): string {
   return truncate(text, MAX_FINAL_TEXT_BYTES, "final text");
 }
 
+function boundedAttemptReport(raw: unknown): RunTimeReport | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object") {
+    throw new AgentDoneDeliveryError("run_time: expected an object with an attempt token");
+  }
+  const report = raw as Partial<RunTimeReport>;
+  for (const field of ["key", "attemptId"] as const) {
+    const value = report[field];
+    if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > MAX_DOWNGRADED_FIELD_BYTES) {
+      throw new AgentDoneDeliveryError(`run_time.${field}: expected a non-empty string of at most ${MAX_DOWNGRADED_FIELD_BYTES} bytes`);
+    }
+  }
+  // Identity survives verbatim; an identity-only report attributes no duration.
+  const decoded = decodeRunTimeReport({
+    key: report.key,
+    attemptId: report.attemptId,
+    claimCount: report.claimCount,
+    deliverySeq: report.deliverySeq,
+    deliveryCount: report.deliveryCount,
+    basis: { kind: "same_domain", domain: "brain" },
+  });
+  if (!decoded.ok) throw new AgentDoneDeliveryError(`run_time.${decoded.rejected}`);
+  return decoded.report;
+}
+
 /**
  * The body with everything optional taken out of it.
  *
@@ -298,6 +354,7 @@ function withoutPayload(body: AgentDoneBody): AgentDoneBody {
   // function instead of a property of the input.
   const downgraded: AgentDoneBody = {
     task_id: body.task_id ? truncateField(body.task_id, "task id") : body.task_id,
+    run_time: boundedAttemptReport(body.run_time),
     final_text: "[dropped: the callback body exceeded the size the API accepts]",
     captures: {},
     artifacts: [],
@@ -368,6 +425,7 @@ function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
 export async function postAgentDone(
   request: ExecuteRequest,
   result: ExecuteResult,
+  runTime?: RunTimeReport,
 ): Promise<void> {
   if (!request.task_id || !request.callback_url) return;
   const url = `${request.callback_url}/agent_done`;
@@ -383,6 +441,9 @@ export async function postAgentDone(
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
+    // Merged in the same transaction as the terminal transition; what no
+    // report covered stays unbanked rather than attributed to a state.
+    run_time: runTime,
     ...platformFields(result),
   };
   const headers: Record<string, string> = {
@@ -410,8 +471,8 @@ export async function postAgentDone(
       // and will be exactly as large next time. Shed it once and retry that,
       // rather than spending the remaining attempts proving the point.
       if (resp.status === 413 && !shed) {
-        shed = true;
         payload = withoutPayload(body);
+        shed = true;
         // Ordinary failures get three attempts. If the first size answer only
         // arrives on the third, grant the newly-built lean payload one distinct
         // send rather than constructing it and immediately leaving the loop.
@@ -420,6 +481,7 @@ export async function postAgentDone(
       }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
     } catch (error) {
+      if (error instanceof AgentDoneDeliveryError) throw error;
       lastError = error instanceof Error ? error : new Error(String(error));
     } finally {
       clearTimeout(timeout);

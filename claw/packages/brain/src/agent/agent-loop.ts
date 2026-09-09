@@ -24,13 +24,14 @@ import {
   type RecreateHandsResult,
 } from "./index.js";
 import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
-import { whileWaiting } from "../tasks/run-phase.js";
+import { whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
@@ -221,12 +222,8 @@ export interface LoopOptions {
   hands?: HandsClient | null;
   /** Opens the sandbox for a run that deferred it; see ToolRouter.attachHands. */
   attachHands?: () => Promise<HandsClient>;
-  /**
-   * Key this run is tracked under while it waits on something external, so the
-   * time can be attributed to it (see tasks/run-phase.ts). Absent means the run is
-   * not tracked and the waits go uncounted.
-   */
-  runKey?: string;
+  /** Identity this run is tracked under while it waits; see tasks/run-phase.ts. */
+  runIdentity?: RunIdentity;
   /** Platform MCP clients (same map the parent is using), so sub-agents can
    *  reuse the parent's MCP connections without reconnecting. */
   platformMcpClients?: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
@@ -587,6 +584,9 @@ class AgentLoopRunner {
   private readonly userId?: string;
   private readonly sessionId?: string;
   private readonly depth: number;
+  /** A sub-agent runs inside the slot its parent holds, so its waits must not
+   *  park: that would hand back a slot this loop never acquired. */
+  private readonly waitMode: WaitMode;
   private readonly rawMessageCount: number;
   private readonly session: LlmSession;
   /** Wire protocol this run's usage numbers were reported in — see the
@@ -708,6 +708,7 @@ class AgentLoopRunner {
     this.userId = userId;
     this.sessionId = sessionId;
     this.depth = opts.depth ?? 0;
+    this.waitMode = this.depth === 0 ? "timed+park" : "timed";
     this.rawMessageCount = messages.length;
 
     // --- Resume: pre-populate state from checkpoint ---
@@ -939,7 +940,7 @@ class AgentLoopRunner {
       await this.noteRecoveryExhausted(results, exhausted);
       return;
     }
-    await this.performSandboxRecovery(results);
+    await whileRecovering(this.opts.runIdentity?.key, () => this.performSandboxRecovery(results));
   }
 
   /** Stop before probing only when neither kind of recovery remains available. */
@@ -1672,7 +1673,7 @@ class AgentLoopRunner {
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
       const hitlResult = this.opts.hitl.willAsk(toolName)
-        ? await whileWaiting(this.opts.runKey, "approval", decide)
+        ? await whileWaiting(this.opts.runIdentity?.key, "approval", this.waitMode, decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
           const reason = `Error: ${hitlResult.reason}`;
@@ -1796,7 +1797,7 @@ class AgentLoopRunner {
       // sitting still rather than working -- the case the whole waiting/
       // executing split exists to measure.
       resultText = WAITING_TOOLS.has(toolName)
-        ? await whileWaiting(this.opts.runKey, "background_command", () =>
+        ? await whileWaiting(this.opts.runIdentity?.key, "background_command", this.waitMode, () =>
             this.router.route(toolName, finalInput, this.signal))
         : await this.router.route(toolName, finalInput, this.signal);
         // A sandbox tool that answered is the only evidence the sandbox is up,
@@ -1955,6 +1956,7 @@ class AgentLoopRunner {
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,
+        runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";

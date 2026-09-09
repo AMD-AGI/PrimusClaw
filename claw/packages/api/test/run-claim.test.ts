@@ -33,19 +33,43 @@ function withCrypto(): string {
   return sealRunCredentials({ llm_api_key: "sk-live", platform_key: "pk-live" });
 }
 
+/**
+ * Statements this run issued, in order.
+ *
+ * Release and fail settle the attempt's ledger in the same transaction as the
+ * status change, so the status UPDATE is no longer the first statement and the
+ * transaction takes its own connection. Both paths are recorded, and
+ * {@link statusUpdate} finds the one an assertion means.
+ */
 function stubQueries(
   replies: Array<() => unknown>,
 ): Array<{ sql: string; params: unknown[] }> {
   const seen: Array<{ sql: string; params: unknown[] }> = [];
   let i = 0;
-  db.query = (async (text: string, params: unknown[] = []) => {
+  const answer = async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
+    if (/^(BEGIN|COMMIT|ROLLBACK)/i.test(sql)) return { rows: [], rowCount: 0 };
+    // The ledger read the settlement makes is infrastructure rather than the
+    // subject of any assertion here, so it answers itself and consumes no
+    // scripted reply.
+    if (/run_phase/.test(sql)) return { rows: [], rowCount: 0 };
     seen.push({ sql, params });
     const reply = replies[i++];
     if (!reply) return { rows: [], rowCount: 0 };
     return reply();
-  }) as typeof db.query;
+  };
+  db.query = answer as typeof db.query;
+  db.pool.connect = (async () => ({ query: answer, release: () => {} })) as never;
   return seen;
+}
+
+/** The statement that wrote the row's status, whatever else ran beside it. */
+function statusUpdate(
+  seen: Array<{ sql: string; params: unknown[] }>,
+): { sql: string; params: unknown[] } {
+  const found = seen.find((q) => /^UPDATE claw_tasks SET status/.test(q.sql));
+  assert.ok(found, `no status UPDATE among:\n${seen.map((q) => q.sql).join("\n")}`);
+  return found!;
 }
 
 function row(blob: string) {
@@ -140,7 +164,7 @@ test("a missing blob fails the row rather than handing a worker an empty key", a
       () => ({ rows: [{ ...row("x"), input: { prompt: "hello", session_id: "s-1" }, metadata: { message_id: "m-1" } }], rowCount: 1 }),
     ]);
     assert.equal(await claimRunById("ktsk_1", "brain-7"), "unclaimable");
-    assert.ok(seen.some((q) => /failure_reason = 'unclaimable'/.test(q.sql)));
+    assert.ok(seen.some((q) => q.params.includes("unclaimable")));
     assert.ok(events.some((e) => e.type === "exec_complete" && e.failure_reason === "unclaimable"));
   } finally {
     runClaimPorts.publishSessionEvent = originalPublish;
@@ -175,8 +199,9 @@ test("unclaim returns the row to queued for the holder only", async () => {
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
-  assert.match(seen[0].sql, /SET status = 'queued'/);
-  assert.equal(seen[0].params[1], "brain-7");
+  const update = statusUpdate(seen);
+  assert.match(update.sql, /SET status = 'queued'/);
+  assert.equal(update.params[update.params.length - 2], "brain-7");
 });
 
 test("a row that is not there is missing, not busy", async () => {
@@ -197,10 +222,11 @@ test("failing a held claim ends the row instead of returning it to the queue", a
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await failHeldClaim("ktsk_1", "brain-7"), true);
-  assert.match(seen[0].sql, /SET status = 'failed'/);
-  assert.equal(seen[0].params[2], "session_deleted");
-  assert.match(seen[0].sql, /origin = 'chat'/);
-  assert.equal(seen[0].params[1], "brain-7");
+  const update = statusUpdate(seen);
+  assert.match(update.sql, /SET status = 'failed'/);
+  assert.equal(update.params[0], "session_deleted");
+  assert.match(update.sql, /origin = 'chat'/);
+  assert.ok(update.params.includes("brain-7"));
   assert.ok(!seen.some((q) => /SET status = 'queued'/.test(q.sql)));
 });
 
@@ -209,8 +235,8 @@ test("a doorbell term fails the held claim as claim_abandoned, not session_delet
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await failHeldClaim("ktsk_1", "brain-7", "claim_abandoned"), true);
-  assert.equal(seen[0].params[2], "claim_abandoned");
-  assert.match(String(seen[0].params[3]), /without completing it/);
+  assert.equal(statusUpdate(seen).params[0], "claim_abandoned");
+  assert.match(String(statusUpdate(seen).params[1]), /without completing it/);
 });
 
 test("an unbound claimed run fails the row as workspace_unbound", async () => {
@@ -218,8 +244,8 @@ test("an unbound claimed run fails the row as workspace_unbound", async () => {
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await failHeldClaim("ktsk_1", "brain-7", "workspace_unbound"), true);
-  assert.equal(seen[0].params[2], "workspace_unbound");
-  assert.match(String(seen[0].params[3]), /not bound to a workspace/);
+  assert.equal(statusUpdate(seen).params[0], "workspace_unbound");
+  assert.match(String(statusUpdate(seen).params[1]), /not bound to a workspace/);
 });
 
 test("failing a held claim is a no-op for a brain that does not hold it", async () => {
@@ -253,7 +279,7 @@ test("claim-next skips an unclaimable row and takes the next chat run", async ()
   assert.ok(claimed);
   assert.equal(claimed.request.task_id, "ktsk_good");
   assert.equal(claimed.request.llm_api_key, "sk-live");
-  assert.ok(seen.some((q) => /failure_reason = 'unclaimable'/.test(q.sql)));
+  assert.ok(seen.some((q) => q.params.includes("unclaimable")));
   const peekAfterSkip = seen.find((q, i) => i > 2 && /NOT \(task_id = ANY/.test(q.sql));
   assert.ok(peekAfterSkip);
   assert.deepEqual(peekAfterSkip!.params[0], ["ktsk_bad"]);
@@ -278,7 +304,7 @@ test("too many claims fail the row as max_retries_exceeded", async () => {
     // lock, and max_retries_exceeded otherwise.
     const closing = seen.find((q) => /status = 'failed'/.test(q.sql) && /completed_at = NOW\(\)/.test(q.sql));
     assert.ok(closing, "the row is closed");
-    assert.equal(closing?.params[1], "max_retries_exceeded");
+    assert.equal(closing?.params[0], "max_retries_exceeded");
     assert.deepEqual(taken, { kind: "exhausted", reason: "max_retries_exceeded" },
       "the caller is told the same cause the row records");
     assert.ok(events.some((e) => e.type === "exec_complete" && e.failure_reason === "max_retries_exceeded"));
@@ -345,7 +371,7 @@ test("a blob that will not open fails the row instead of being retried", async (
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await claimRunById("ktsk_1", "brain-7"), "unclaimable");
-  assert.ok(seen.some((q) => /failure_reason = 'unclaimable'/.test(q.sql)), "the row is closed");
+  assert.ok(seen.some((q) => q.params.includes("unclaimable")), "the row is closed");
 });
 
 test("an unknown version byte is terminal too, not just a bad tag", async () => {
@@ -362,7 +388,7 @@ test("an unknown version byte is terminal too, not just a bad tag", async () => 
     () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
   ]);
   assert.equal(await claimRunById("ktsk_1", "brain-7"), "unclaimable");
-  assert.ok(seen.some((q) => /failure_reason = 'unclaimable'/.test(q.sql)));
+  assert.ok(seen.some((q) => q.params.includes("unclaimable")));
 });
 
 test("the claim reports the row's own claim count, not a placeholder", () => {
@@ -408,7 +434,7 @@ test("a budget spent waiting on a lock is reported as that, not as generic retri
       const taken = await claimRunById("ktsk_1", "brain-7");
       assert.deepEqual(taken, { kind: "exhausted", reason: "lock_contention_exhausted" });
       const closing = seen.find((q) => /status = 'failed'/.test(q.sql) && /completed_at = NOW\(\)/.test(q.sql));
-      assert.equal(closing?.params[1], "lock_contention_exhausted", "and the row records it too");
+      assert.equal(closing?.params[0], "lock_contention_exhausted", "and the row records it too");
       assert.ok(events.some((e) => e.failure_reason === "lock_contention_exhausted"),
         "and the reader is told the same");
     } finally {
