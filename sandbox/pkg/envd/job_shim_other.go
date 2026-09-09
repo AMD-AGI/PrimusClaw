@@ -6,7 +6,6 @@
 package envd
 
 import (
-	"context"
 	"io"
 	"os/exec"
 )
@@ -16,13 +15,12 @@ func runJobShim() {}
 
 // startTrackedCommand preserves basic execute behavior outside Linux.
 func (s *Server) startTrackedCommand(
-	ctx context.Context,
 	command []string,
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
 ) (int, <-chan int, func(), error) {
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = workDir
 	cmd.Env = env
 	cmd.Stdout = stdout
@@ -32,8 +30,15 @@ func (s *Server) startTrackedCommand(
 	if err := cmd.Start(); err != nil {
 		return 0, nil, func() {}, err
 	}
+	s.jobs.add(cmd.Process.Pid, command)
 	go func() {
 		err := cmd.Wait()
+		if err != nil {
+			if _, ok := err.(*exec.ExitError); !ok {
+				s.jobs.markLost()
+			}
+		}
+		s.jobs.remove(cmd.Process.Pid)
 		code := 0
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
@@ -44,5 +49,9 @@ func (s *Server) startTrackedCommand(
 		}
 		ch <- code
 	}()
-	return cmd.Process.Pid, ch, func() {}, nil
+	return cmd.Process.Pid, ch, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}, nil
 }

@@ -498,6 +498,14 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     return null;
   }
 
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info(
+      { sessionId, workloadId: info.workloadId, status: info.status },
+      "ensureHands.closing_not_reusable",
+    );
+    return null;
+  }
+
   if (info.status !== "ready") {
     logger.warn(
       { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)" },
@@ -602,8 +610,13 @@ async function clearIdleMarkers(
     logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
     return;
   }
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+    return;
+  }
   delete info.keepalive;
   delete info.idleSince;
+  delete info.quiescedAt;
   const key = `hands.${sessionId}`;
   const payload = sc.encode(JSON.stringify(info));
   try {
@@ -624,15 +637,13 @@ async function clearIdleMarkers(
     // The markers are not part of the identity HandsProbeEntry describes, but
     // they live on the same value and this is the writer that removes them.
     const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
-      & { keepalive?: boolean; idleSince?: unknown; sessionDeleted?: boolean };
-    // Parked by a session delete while we were losing the race. Same sandbox,
-    // so the identity check below would pass -- but clearing `keepalive:false`
-    // here un-parks it, and eligibleForClusterReclaim refuses any entry whose
-    // keepalive is not false, so the session's GPU clusters would never be
-    // reclaimed. The single-shot CAS this retry replaced simply lost and left
-    // it alone; the retry has to do the same deliberately.
+      & { keepalive?: boolean; idleSince?: unknown; sessionDeleted?: boolean; status?: string };
     if (current.sessionDeleted === true) {
       logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
+      return;
+    }
+    if (current.status === "closing" || current.status === "reclaiming") {
+      logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
       return;
     }
     if (!sameHandsSandbox(identity, current)) {
@@ -644,7 +655,7 @@ async function clearIdleMarkers(
     }
     if (current.keepalive === undefined && current.idleSince == null) return;
     await kv.update(key, sc.encode(JSON.stringify({
-      ...current, keepalive: undefined, idleSince: undefined,
+      ...current, keepalive: undefined, idleSince: undefined, quiescedAt: undefined,
     })), latest.revision);
   } catch (err) {
     // Left parked at worst: the ticker will not ping it, and the next request

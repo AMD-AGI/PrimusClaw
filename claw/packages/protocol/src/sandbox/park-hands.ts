@@ -145,6 +145,7 @@ export function applyRunEndedIdleFields(
   delete info.bgIdleRev;
   delete info.bgRev;
   delete info.workSeenAt;
+  delete info.quiescedAt;
 }
 
 /**

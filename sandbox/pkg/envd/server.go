@@ -57,6 +57,8 @@ type Server struct {
 	auditReporter *egressAuditReporter
 	drainTimeout  time.Duration
 	jobs          *jobRegistry
+	podUID        string
+	instanceID    string
 }
 
 // Config holds EnvD configuration.
@@ -109,6 +111,8 @@ func New(cfg Config) (*Server, error) {
 		egressEnabled: cfg.EgressEnabled,
 		drainTimeout:  cfg.ShutdownDrainTimeout,
 		jobs:          newJobRegistry(),
+		podUID:        strings.TrimSpace(os.Getenv("POD_UID")),
+		instanceID:    newEnvDInstanceID(),
 	}
 
 	if cfg.EgressEnabled {

@@ -15,8 +15,11 @@ import { destroyHands } from "./reaper.js";
 import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import {
-  countSandboxUserProcesses,
+  inspectSandboxJobs,
+  SandboxJobsUnavailableError,
   SandboxTerminalProbeError,
+  SandboxTrackingLostError,
+  type JobsProbeResult,
 } from "./job-probe.js";
 import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 import pino from "pino";
@@ -37,7 +40,7 @@ export interface SandboxEntry {
 }
 
 interface HandsKvEntry {
-  status?: "pending" | "ready" | "reclaiming";
+  status?: "pending" | "ready" | "reclaiming" | "closing";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
   sessionId?: string;
@@ -68,6 +71,13 @@ interface HandsKvEntry {
    * starts at the later of this and `idleSince`.
    */
   workSeenAt?: number;
+  /**
+   * Epoch ms when jobs first became empty with no in-flight message.
+   * The 15-minute idle clock starts here and is cleared by new work.
+   */
+  quiescedAt?: number;
+  podUid?: string;
+  envdInstanceId?: string;
   /**
    * Identifies the idle period opened by `markHandsIdle`; unlike `idleSince`, it
    * does not move while background work remains active.
@@ -183,9 +193,17 @@ function probeUserProcesses(
   info: HandsKvEntry,
   sessionId: string,
 ): Promise<number> {
-  return deps.countActiveShells
-    ? deps.countActiveShells(info.handsUrl!, info.token!, sessionId)
-    : countSandboxUserProcesses(info);
+  if (deps.countActiveShells) {
+    return deps.countActiveShells(info.handsUrl!, info.token!, sessionId);
+  }
+  return inspectSandboxJobs(info).then(async (result) => {
+    await persistJobsIdentity(deps, sessionId, result);
+    return result.count;
+  });
+}
+
+function isClosingStatus(status: HandsKvEntry["status"]): boolean {
+  return status === "closing" || status === "reclaiming";
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -382,6 +400,7 @@ export function markHandsIdle(
       }
       // Only keep a READY handle that still points at the workload we ran on.
       if (info.status !== "ready") return { outcome: "skipped", reason: "not_ready" };
+      if (isClosingStatus(info.status)) return { outcome: "skipped", reason: "not_ready" };
       const sameTarget = typeof known === "string"
         ? !(known && info.workloadId && info.workloadId !== known)
         : sameRegisteredSandbox(known, info);
@@ -402,6 +421,7 @@ export function markHandsIdle(
         Date.now(),
         entry.revision,
       );
+      delete info.quiescedAt;
       // Conditional update prevents resurrecting a concurrently deleted handle.
       const witness = nextEntryToken();
       info.idleWriter = witness;
@@ -655,10 +675,9 @@ function measuredUnderThisIdlePeriod(
  * sweep that observed work.
  */
 function reuseWindowStart(info: HandsKvEntry): number {
-  return Math.max(
-    typeof info.idleSince === "number" ? info.idleSince : 0,
-    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
-  );
+  if (typeof info.quiescedAt === "number") return info.quiescedAt;
+  if (typeof info.workSeenAt === "number") return info.workSeenAt;
+  return typeof info.idleSince === "number" ? info.idleSince : 0;
 }
 
 /** This replica's own last answer, if it is fresh enough to reuse and still
@@ -806,6 +825,30 @@ async function releaseProbe(
     if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
     await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
   } catch { /* best effort: the deadline is the backstop */ }
+}
+
+/** Bind jobs answers to the EnvD process that produced them. */
+async function persistJobsIdentity(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  result: JobsProbeResult,
+): Promise<void> {
+  if (!result.podUid && !result.instanceId) return;
+  try {
+    const key = `hands.${sessionId}`;
+    const entry = await deps.kv.get(key);
+    if (!entry) return;
+    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    const next: HandsKvEntry = {
+      ...info,
+      podUid: info.podUid || result.podUid,
+      envdInstanceId: info.envdInstanceId || result.instanceId,
+    };
+    if (next.podUid === info.podUid && next.envdInstanceId === info.envdInstanceId) return;
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), entry.revision);
+  } catch {
+    // The next successful probe retries the bind.
+  }
 }
 
 /** Preserve a terminal SaFE verdict so the next message returns it to the UI. */
@@ -962,6 +1005,21 @@ function dispatchProbes(
           void reportTerminalFailure(deps, sessionId, identity, err.reason);
           return;
         }
+        if (err instanceof SandboxRuntimeTerminalError) {
+          void reportTerminalFailure(deps, sessionId, identity, err.reason);
+          return;
+        }
+        if (err instanceof SandboxTrackingLostError) {
+          logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+          return;
+        }
+        if (err instanceof SandboxJobsUnavailableError) {
+          logger.info(
+            { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+            "keepalive.jobs_api_absent",
+          );
+          return;
+        }
         if (!deps.countActiveShells) {
           logger.warn(
             { err: (err as Error)?.message ?? err, sessionId },
@@ -1085,11 +1143,10 @@ async function persistVerdict(
       }
       const next = sc.encode(JSON.stringify({
         ...info,
-        // Start the reuse window when EnvD first confirms that the task tree
-        // is empty, not when the task was parked while background work ran.
         ...(running === 0 && usableSharedVerdict(info)?.state !== "idle"
-          ? { workSeenAt: measuredAt }
+          ? { quiescedAt: info.quiescedAt ?? measuredAt }
           : {}),
+        ...(running > 0 ? { quiescedAt: undefined } : {}),
         bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,
@@ -1141,7 +1198,11 @@ async function refreshIdleSince(
       seenAt,
     );
     // The reuse clock reflects when this sweep acted on the running verdict.
-    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: Date.now() }));
+    const next = sc.encode(JSON.stringify({
+      ...info,
+      idleSince,
+      quiescedAt: undefined,
+    }));
     await deps.kv.update(key, next, revision);
     // Keep the scan copy aligned for probes dispatched later in this tick.
     info.idleSince = idleSince;
@@ -1202,6 +1263,12 @@ async function collectTargets(
       if (!e) continue;
       try {
         const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+        if (isClosingStatus(info.status)) {
+          await destroyHands(sessionId, info).catch((err) => {
+            logger.warn({ err, sessionId }, "keepalive.closing_stop_retry");
+          });
+          continue;
+        }
         if (info.status && info.status !== "ready") continue;
         if (info.terminalReason) {
           logger.error(
@@ -1313,7 +1380,7 @@ async function collectTargets(
               // reactivated this handle wins the CAS and prevents the stop.
               await deps.kv.update(
                 key,
-                sc.encode(JSON.stringify({ ...info, status: "reclaiming" })),
+                sc.encode(JSON.stringify({ ...info, status: "closing" })),
                 e.revision,
               );
               claimed = true;
@@ -1330,6 +1397,24 @@ async function collectTargets(
                   { sessionId, workloadId: info.workloadId, reason: err.reason },
                   "keepalive.sandbox_terminal",
                 );
+              } else if (err instanceof SandboxRuntimeTerminalError) {
+                await reportTerminalFailure(deps, sessionId, identity, err.reason);
+              } else if (err instanceof SandboxTrackingLostError) {
+                logger.warn(
+                  { sessionId, workloadId: info.workloadId },
+                  "keepalive.idle_reclaim_tracking_lost",
+                );
+                if (!claimed) {
+                  await deps.kv.update(key, value, e.revision).catch(() => {});
+                }
+              } else if (err instanceof SandboxJobsUnavailableError) {
+                logger.info(
+                  { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+                  "keepalive.idle_reclaim_jobs_api_absent",
+                );
+                if (!claimed) {
+                  await deps.kv.update(key, value, e.revision).catch(() => {});
+                }
               } else {
                 logger.warn(
                   { err, sessionId, workloadId: info.workloadId },

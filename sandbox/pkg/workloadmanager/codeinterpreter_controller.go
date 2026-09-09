@@ -370,6 +370,12 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		Name:  "PATH",
 		Value: "/shared/bin:/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin:/sbin",
 	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "POD_UID",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
+		},
+	})
 
 	// Inject Router public key for EnvD JWT validation (authMode=envd, default)
 	if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {

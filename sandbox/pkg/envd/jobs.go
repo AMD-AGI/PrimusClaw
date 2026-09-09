@@ -4,10 +4,21 @@
 package envd
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"sync"
 )
+
+// newEnvDInstanceID identifies this EnvD process for jobs-probe binding.
+func newEnvDInstanceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "envd"
+	}
+	return hex.EncodeToString(b[:])
+}
 
 const handsBinaryMark = "hands-binary"
 
@@ -19,11 +30,22 @@ type trackedJob struct {
 type jobRegistry struct {
 	mu   sync.Mutex
 	jobs map[int]trackedJob
+	lost bool
 }
 
 // newJobRegistry creates an empty per-EnvD job registry.
 func newJobRegistry() *jobRegistry {
 	return &jobRegistry{jobs: make(map[int]trackedJob)}
+}
+
+// markLost records that a supervisor died before its tree could be accounted for.
+func (r *jobRegistry) markLost() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.lost = true
+	r.mu.Unlock()
 }
 
 // isHandsCommand identifies the infrastructure execute that starts Hands.
@@ -56,20 +78,28 @@ func (r *jobRegistry) remove(shimPID int) {
 	r.mu.Unlock()
 }
 
-// userProcessCount returns the number of tracked user processes. A non-Hands
-// execute counts as one job because the shim itself proves that tree is live.
-func (r *jobRegistry) userProcessCount() (int, error) {
+type jobSnapshot struct {
+	count int
+	lost  bool
+}
+
+// snapshot returns the current user-process count. lost means a supervisor
+// exited unexpectedly, so an empty count is not evidence of idle.
+func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 	if r == nil {
-		return 0, nil
+		return jobSnapshot{}, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.lost {
+		return jobSnapshot{lost: true}, nil
+	}
 	count := 0
 	for _, j := range r.jobs {
 		if j.hands {
 			n, err := countUserDescendants(j.shimPID)
 			if err != nil {
-				return 0, err
+				return jobSnapshot{}, err
 			}
 			count += n
 			continue
@@ -77,7 +107,7 @@ func (r *jobRegistry) userProcessCount() (int, error) {
 		// A non-Hands shim exits once its tree is empty, so a live shim is user work.
 		count++
 	}
-	return count, nil
+	return jobSnapshot{count: count}, nil
 }
 
 // handleJobs reports whether any tracked user task process remains.
@@ -86,13 +116,16 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	count, err := s.jobs.userProcessCount()
+	snap, err := s.jobs.snapshot()
 	if err != nil {
 		httpError(w, "failed to inspect tracked jobs: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, JobsResponse{
-		UserProcesses:    count > 0,
-		UserProcessCount: count,
+		UserProcesses:    snap.count > 0 && !snap.lost,
+		UserProcessCount: snap.count,
+		TrackingLost:     snap.lost,
+		PodUID:           s.podUID,
+		InstanceID:       s.instanceID,
 	})
 }

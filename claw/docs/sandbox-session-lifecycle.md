@@ -1,22 +1,31 @@
-# Sandbox 会话生命周期与用户进程判定
+# Sandbox session lifecycle and user-process detection
 
-本文说明 Claw 会话如何使用 sandbox、当前 Pod 如何管理，以及 Claw 如何判定 sandbox 内已无用户任务进程。判定不依赖 Hyperloom、Ray、进程名白名单，也不依赖 sandbox idle-GC 的文件戳。
+This document describes how a Claw session uses a sandbox, how the Pod is managed, and how Claw decides that no user task process remains in the sandbox. Detection does not use Hyperloom, process-name allowlists, InferaDeployment or RayJob phase, or the sandbox idle-GC file stamp.
 
-## 拓扑
+## Keepalive contract
 
-一个 Claw sandbox Workload 对应一个 Pod：
+Brain decides idle reclaim from **user tasks registered in the sandbox Pod through Claw `POST /api/execute`**.
 
-- Init 容器 `envd-injector` 将 `envd` 及相关二进制拷到共享卷后退出。
-- 运行时只有容器 `codeinterpreter`。其命令 `exec` `/shared/bin/envd`。容器存活期间 EnvD 为 PID 1。
-- 注解 `primus-safe.main.container=codeinterpreter`。`RestartPolicy` 为 `Never`。
+- **Tracked**: EnvD `POST /api/execute` invoked by Claw via the Router (Hands start, Hands `spawn`, and `setsid` / `nohup` under that tree).
+- **Not tracked**: other EnvD HTTP APIs (`/api/session` tmux, `/api/terminal`, files, GPU query), processes that never went through execute, and processes started by the image entrypoint. Work on those paths does not block the 15-minute idle reclaim.
+- **Multi-node**: only whether the launch script in the sandbox (and descendants registered through execute) is still running. InferaDeployment and RayJob status are not read. After the launch script exits, local jobs are empty even if the remote cluster is still running.
+- **Cluster teardown**: a multi-node GPU workload is still released on **message terminal** (complete / failed / cancelled). Remote phase does not extend the sandbox idle clock.
 
-Agent（prompt）跑在 **brain** 里，不在容器内。Brain 经 sandbox Router 访问 Pod，Router 将 `POST /api/execute` 代理到 EnvD。Hands 同样经 execute 拉起（`/tmp/.hands-binary`）后常驻。用户命令是这条 execute 路径上的子进程（Hands `spawn`，或 shell 里的 `setsid` / `nohup`）。
+## Topology
 
-EnvD 是常驻 HTTP 服务（`/health`、`/api/execute`、tmux session、文件、GPU）。用户命令结束不会让 EnvD 退出。`codeinterpreter` 容器停止表示 EnvD 自身退出（崩溃、OOM、节点丢失），不表示用户任务已完成。
+One Claw sandbox Workload maps to one Pod:
 
-多节点 GPU 工作是 **另一份** SaFE Workload（InferaDeployment 或 RayJob），仅当 prompt 含 `--nodes >= 2` 且明确指定 `--mn-backend` 时创建。容器内 `ray.init()` 不是平台 RayJob，也不作为存活信号。
+- The `envd-injector` init container copies `envd` and related binaries onto a shared volume and exits.
+- The only runtime container is `codeinterpreter`. Its command `exec`s `/shared/bin/envd`. EnvD is PID 1 for the life of the container.
+- Annotation `primus-safe.main.container=codeinterpreter`. `RestartPolicy` is `Never`.
 
-## 当前管理流程
+The agent (prompt) runs in **brain**, not in the container. Brain reaches the Pod through the sandbox Router, which proxies `POST /api/execute` to EnvD. Hands is started the same way (`/tmp/.hands-binary`) and stays resident. User commands are children on that execute path (Hands `spawn`, or `setsid` / `nohup` in a shell).
+
+EnvD is a long-lived HTTP server. User commands exiting does not stop EnvD. The `codeinterpreter` container stopping means EnvD itself exited (crash, OOM, node loss), not that user work finished.
+
+Multi-node GPU work is a **separate** SaFE Workload (InferaDeployment or RayJob), created only when the prompt has `--nodes >= 2` and an explicit `--mn-backend`. `ray.init()` inside the container is not a platform RayJob. Idle detection does not use that Workload's phase.
+
+## Current management flow
 
 ```mermaid
 sequenceDiagram
@@ -26,183 +35,205 @@ sequenceDiagram
     participant EnvD
     participant Hands
 
-    Brain->>SaFE: 创建 sandbox Workload
-    SaFE->>SaFE: Pod Running，phase Running
-    Brain->>Router: POST /api/execute 启动 Hands
+    Brain->>SaFE: create sandbox Workload
+    SaFE->>SaFE: Pod Running, phase Running
+    Brain->>Router: POST /api/execute start Hands
     Router->>EnvD: execute
     EnvD->>Hands: /tmp/.hands-binary
-    Brain->>Brain: hands.<sid> ready，keepalive true
-    loop keepalive 为 true
-        Brain->>Router: exec 或 GET session
-        Router->>EnvD: 请求
-        Note over Router: 代理时刷新 LastActivity
+    Brain->>Brain: hands.<sid> ready, keepalive true
+    loop keepalive is true
+        Brain->>Router: exec or GET session
+        Router->>EnvD: request
+        Note over Router: proxy refreshes LastActivity
     end
-    Brain->>Brain: park Hands，keepalive false
+    Brain->>Brain: park Hands, keepalive false
 ```
 
-### 创建
+### Create
 
-1. Brain 解析任务（workspace、镜像、timeout、可选多节点标志）。
-2. Brain 创建 SaFE sandbox Workload。SaFE 创建 Sandbox CR 和 Pod。
-3. Brain 等待 Workload phase 变为 `Running`。
-4. Brain 经 Router → EnvD execute 启动 Hands，并在 KV 中写入 `hands.<sid>`。
+1. Brain parses the task (workspace, image, timeout, optional multi-node flags).
+2. Brain creates a SaFE sandbox Workload. SaFE creates the Sandbox CR and Pod.
+3. Brain waits until Workload phase is `Running`.
+4. Brain starts Hands through Router → EnvD execute and writes `hands.<sid>` in KV.
 
-### 会话使用 sandbox 期间
+### While the session uses the sandbox
 
-- 工具调用和 shell 走 Router → EnvD `/api/execute`（Hands 起来之后也可在容器内 `spawn`）。
-- EnvD `execute` 使用 `Setpgid`，避免 HTTP 结束时 `CommandContext` 取消杀掉整个 `setsid` 进程组。
-- 一次 HTTP execute 进行中，Router 在请求未结束时刷新 Redis `LastActivity`。
+- Tool calls and shells go Router → EnvD `/api/execute` (after Hands is up, also `spawn` inside the container).
+- EnvD `execute` uses `Setpgid` so HTTP `CommandContext` cancellation does not kill the whole `setsid` process group.
+- While an HTTP execute is in flight, the Router refreshes Redis `LastActivity`.
 
-### Keepalive 与 idle-GC（当前）
+### Keepalive and idle-GC (current)
 
-Brain keepalive（默认间隔 60s）对 `keepalive: true` 的 sandbox 发 ping：
+Brain keepalive (default interval 60s) pings sandboxes with `keepalive: true`:
 
-- agent-sandbox：`GET` session，从而更新 `LastActivity`。
-- safe-workload：`exec` 一条短命令（历史上会写 `/tmp/keepalive_ts`）。该文件不是控制面输入；刷新 `LastActivity` 的是这次代理请求。
+- agent-sandbox: `GET` session, which updates `LastActivity`.
+- safe-workload: `exec` a short command (historically wrote `/tmp/keepalive_ts`). That file is not a control-plane input; the proxy request is what refreshes `LastActivity`.
 
-Sandbox idle-GC 在 Redis `LastActivity` 超过 15 分钟时删除 Sandbox（可用注解覆盖）。SaFE `timeout` 仍会停止仍在运行的 Workload。
+Sandbox idle-GC deletes a Sandbox when Redis `LastActivity` is older than 15 minutes (overridable by annotation). SaFE `timeout` still stops a Workload that is still running.
 
-任务 park 后 `keepalive` 置为 false。Keepalive 随后探测 Hands `/internal/shells/active`。该计数只包含 Hands `spawnBackground` 登记的任务。`setsid` 进程不在其中。
+After a task parks, `keepalive` is set false. Keepalive then probes EnvD `GET /api/jobs`. That count includes only user tasks registered through `/api/execute`. Hands `/internal/shells/active` is not the authority for idle.
 
-### 停止
+### Stop
 
-Brain `destroyHands` 停止 SaFE sandbox Workload 并清理 KV。若存在多节点 Infera/RayJob，在同一会话路径上拆除。
+Brain `destroyHands` stops the SaFE sandbox Workload and clears KV. The same message-terminal path tears down that message's multi-node Infera/RayJob. Teardown follows message terminal, not whether the remote Workload is still Running.
 
-## 「没有任务进程」指什么
+## What "no user task process" means
 
-| 类型 | 算作用户任务进程 | 不算 |
-|------|------------------|------|
-| 仍在运行的 Hands 工具（前台或 Hands 后台） | 是 | |
-| 经该会话 execute/Hands 树启动的 `setsid` / `nohup` | 是 | |
-| EnvD（PID 1） | | 基础设施 |
-| Hands 二进制 | | 基础设施 |
-| Router 短健康检查 / keepalive execute | | 非用户 job |
-| 僵尸进程（`Z`） | | 忽略 |
-| 从未经 EnvD/Hands 启动的进程 | | 不在契约内，不保活 |
-| 按名称识别的 Hyperloom / `ray.init()` / RayJob CR | | 不用作信号 |
+| Kind | User task process | Not counted |
+|------|-------------------|-------------|
+| Running Hands tools (foreground or Hands background) | yes | |
+| `setsid` / `nohup` started under this session's `/api/execute` tree | yes | |
+| Multi-node launch script and descendants registered through execute | yes | |
+| EnvD (PID 1) | | infrastructure |
+| Hands binary | | infrastructure |
+| Router health check / keepalive execute | | not a user job |
+| Zombie (`Z`) | | ignored |
+| EnvD `/api/session`, `/api/terminal`, and other non-execute APIs | | out of contract; not kept alive |
+| Processes not started through `/api/execute` | | out of contract; not kept alive |
+| InferaDeployment / RayJob phase, replicas still running on the cluster | | not a signal |
+| Hyperloom / `ray.init()` identified by name | | not a signal |
 
-Agent 进程在 brain。「sandbox 里 prompt 结束」表示：**本会话已无用户任务 PID**，此时 EnvD 仍可在运行。
+The agent process lives in brain. "User work in the sandbox has ended" means **every user-task PID registered through `/api/execute` has exited** (for multi-node, the launch script has exited). EnvD may still be running. A remote GPU Workload may still be running.
 
-## EnvD 如何跟踪这些 PID
+## How EnvD tracks those PIDs
 
-### 为何 execute 的子进程 PID 不够
+### Why the execute child PID is not enough
 
-每次 `/api/execute` 启动一条命令并等待 **该** 进程。`setsid` 之后 shell 可以退出，HTTP 返回，脱离的工作被收编到 PID 1。EnvD 不再持有这些 PID 的按次请求句柄。`Setpgid` 只避免请求 context 结束时 Go 杀掉脱离的进程组，并不维护 job 名单。
+Each `/api/execute` starts one command and waits for **that** process. After `setsid` the shell can exit, HTTP returns, and detached work is reparented to PID 1. EnvD no longer holds a per-request handle for those PIDs. `Setpgid` only stops the Go runtime from killing the detached group when the request context ends; it does not keep a job list.
 
-PID 1 本来就会接收孤儿。把各次会话的孤儿、Hands、探针混在一份名单里，无法按 job 结账，因此 EnvD 不按进程名对整个 PID namespace 分类。
+PID 1 already reaps orphans. Mixing every session's orphans, Hands, and probes into one list cannot close out jobs, so EnvD does not classify the whole PID namespace by process name.
 
-### 每次 execute 的 subreaper shim
+### Per-execute subreaper shim
 
-Linux `PR_SET_CHILD_SUBREAPER` 使一个进程成为其子孙树中孤儿的收割者。EnvD 为每次 `/api/execute` 套一层 shim：
-
-```
-envd（PID 1，一直运行）
-  └── job shim（CHILD_SUBREAPER）
-        ├── 用户命令或 Hands
-        └── setsid 子进程（挂到 shim，不挂到 PID 1）
-```
-
-- shell 退出后 HTTP 仍可立即返回。
-- shim 一直存活，直到该 job 的用户子孙进程都退出。
-- EnvD 记录 **shim PID**（Hands 启动那次 job 上将 Hands PID 标为基础设施）。
-
-**仍有用户任务进程**：Hands 那个 job shim 下，除 Hands 外还有非僵尸 PID。
-
-**已无用户任务进程**：只剩 Hands（以及空闲 shim）。
-
-EnvD 以只读接口暴露（例如 `GET /api/jobs`）。Brain 只使用该接口，不扫描整个容器的 `/proc`。
-
-探测失败（超时、502）为 **unknown**：不回收，也不将会话标为失败。
-
-`Setpgid` 保留：仍用于防止 HTTP 取消误杀脱离的工作。shim 补上缺失的名单。
-
-## 回收与失败
-
-Brain 负责 sandbox 生命周期。Sandbox idle-GC 不是闲置策略（关闭 / 待移除）。`/tmp/keepalive_ts` 和 Redis `LastActivity` 不是用户进程信号。
-
-### SaFE 失败 = 整个 sandbox 失败，回前端
-
-SaFE Workload 一旦进入终态（Failed / Stopped / Succeeded / Terminated / Cancelled，含 OOM、容器非 0 退出、平台 `timeout`），**整次 sandbox 按失败处理**，不是闲置回收：
-
-- Brain 抛 `SandboxProvisionTerminalError`（或 keepalive 探测到 `terminal` 后走同一失败路径）。
-- 发出 `sandboxStatus`（`status: failed` + 稳定 `reason`）。
-- 会话 `exec_complete` 带 `failed: true` 和 `failure_reason`，聊天流写入可读失败文案。
-
-创建等待阶段已有这条路径。Running 之后容器异常同样走这条路径，不进入 QUIESCED。
-
-### 15 分钟闲置只扫 Running
-
-`GET /api/jobs` 与 15 分钟无新 message **只在 Workload 已是 Running 之后** 才扫描。
-
-- **Pending**（排队、未调度）：不做 15 分钟释放。
-- 尚未 Running 的 sandbox 不进入 DRAINING / QUIESCED。
-- Pending 期间的结束条件只有：变成 Running、SaFE 终态失败、或下面的 Pending 超时。
+Linux `PR_SET_CHILD_SUBREAPER` makes a process the reaper of orphans in its descendant tree. EnvD wraps each `/api/execute` in a shim:
 
 ```
-Pending      排队；不扫 jobs、不跑 15 分钟闲置
+envd (PID 1, always running)
+  └── job shim (CHILD_SUBREAPER)
+        ├── user command or Hands
+        └── setsid children (adopted by the shim, not PID 1)
+```
+
+- HTTP can return as soon as the shell exits. Request cancellation does not stop the shim or its descendants. A command timeout sends SIGTERM to the shim, which stops only the primary process group.
+- The shim stays alive until every user descendant of that job has exited.
+- EnvD records the **shim PID** (the Hands start job marks the Hands PID as infrastructure).
+- `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty.
+
+**User work remains**: a live non-Hands shim exists, or the Hands job shim still has a non-zombie PID other than Hands.
+
+**No user work remains**: only Hands (and idle shims) remain.
+
+EnvD exposes a read-only `GET /api/jobs`. Brain uses only that API. It does not scan the container `/proc` and does not query InferaDeployment / RayJob.
+
+A probe failure (timeout, 502) is **unknown**: no reclaim, and the session is not marked failed.
+
+HTTP 404 / 405 / 501 on `GET /api/jobs` means this EnvD has no jobs roster (typical of a sandbox started before this change). Brain does not idle-reclaim that sandbox. The workload `timeout` stops it.
+
+`Setpgid` remains so HTTP cancellation does not kill detached work. The shim supplies the missing roster.
+
+## Reclaim and failure
+
+Brain owns sandbox lifetime. Sandbox idle-GC is not the idle policy (off / to be removed). `/tmp/keepalive_ts` and Redis `LastActivity` are not user-process signals.
+
+### SaFE failure is sandbox failure, returned to the frontend
+
+When the SaFE **sandbox** Workload reaches a terminal phase (Failed / Stopped / Succeeded / Terminated / Cancelled, including OOM, non-zero container exit, platform `timeout`), the **sandbox is failed**, not idle-reclaimed:
+
+- Brain raises `SandboxProvisionTerminalError` (or the keepalive probe takes the same failure path after `terminal`).
+- It emits `sandboxStatus` (`status: failed` plus a stable `reason`).
+- Session `exec_complete` carries `failed: true` and `failure_reason`, and the chat stream gets readable failure text.
+
+That terminal phase is the sandbox Pod / codeinterpreter, not InferaDeployment or RayJob. The create-wait path already does this. A container fault after Running takes the same path and does not enter QUIESCED.
+
+### The 15-minute idle clock scans only Running
+
+`GET /api/jobs` and the 15-minute idle clock run **only after the sandbox Workload is Running**.
+
+- **Pending** (queued, unschedulable): no 15-minute release.
+- A sandbox that is not yet Running does not enter DRAINING / QUIESCED.
+- Pending ends only by becoming Running, a SaFE sandbox terminal failure, or the Pending timeout below.
+
+When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain records `quiescedAt` and keeps the sandbox for 15 minutes. A new message or a new execute job clears that clock. Probes continue during QUIESCED. `unknown` and `tracking_lost` do not trigger reclaim.
+
+Reclaim and reuse compete on one CAS: `ready` → `closing`. A handle in `closing` is not reused. Stale jobs answers are discarded when the sandbox identity or idle generation changes.
+
+```
+Pending      queued; no jobs scan; no 15-minute idle
   │ Running
   ▼
-ACTIVE       有进行中的 message，或 Hands 已注册
-  │ 本轮结束后 park
+ACTIVE       in-flight message, or jobs non-empty
+  │ park after the turn
   ▼
-DRAINING     轮询 EnvD GET /api/jobs（仅 Running）
-  │ 为空 → QUIESCED
-  │ SaFE/容器终态 → 会话失败回前端
-  │ unknown → 留在 DRAINING
+DRAINING     poll EnvD GET /api/jobs (Running only)
+  │ empty → record quiescedAt, enter QUIESCED
+  │ sandbox terminal → session failure to the frontend
+  │ unknown / tracking_lost → stay DRAINING
   ▼
-QUIESCED     从 lastMessageAt 起 15 分钟
-  │ 本 sandbox 上有新 message → 回 ACTIVE，时钟清零
-  │ 15 分钟到 → destroyHands，停止 sandbox Workload，
-  │            若有则停止本会话的 Infera/RayJob
+QUIESCED     15 minutes from quiescedAt
+  │ new message CAS-es keepalive on → ACTIVE, clock cleared
+  │ 15 minutes elapsed → CAS to CLOSING, then destroyHands
+  ▼
+CLOSING      not reusable; retry stop until the workload is gone
 ```
 
-这 15 分钟表示 **已经 Running，且已无用户任务 PID，且没有新 message**。
-`ttlSecondsAfterFinished` 不实现该时钟。SaFE `timeout` 是 Running Workload 的硬上限。
+Those 15 minutes mean the **sandbox is Running, every user-task PID registered through `/api/execute` has exited, and there is no new message**. A still-running remote cluster does not extend this clock. `ttlSecondsAfterFinished` does not implement it. SaFE `timeout` is a hard cap on a Running Workload.
 
-### Pending 超时（已有，不是 15 分钟）
+### Pending timeout (existing; not the 15-minute idle)
 
-Claw 对排队另有上限，与闲置 15 分钟无关：
+Claw has a separate queue cap, unrelated to idle 15 minutes:
 
-| 配置 | 默认 | 作用 |
-|------|------|------|
-| `SANDBOX_PENDING_TIMEOUT_SECONDS` | **3 小时** | Workload **phase=Pending** 连续排队超过此时长 → 终态失败 `sandbox_pending_timeout`，回前端。离开 Pending（已调度）后此时钟停止；拉镜像等不再算 Pending。`0` 表示一直等排队。 |
-| `SANDBOX_POLL_TIMEOUT_MS` | 1 小时 | 仅当 SaFE **状态读不到**（持续 5xx、网络失败、无 phase）时结束，原因 `sandbox_status_unreadable`。可读的 Pending 不会触发它。 |
-| SaFE Workload `timeout` | 任务请求里的值（如 46800s） | 从 **StartTime / Running** 起算的硬上限，不含排队。 |
-| `RUN_QUEUE_MAX_SEC`（API） | 2 小时 | 任务行一直没被 worker claim 的排队，不是 sandbox Workload Pending。 |
+| Config | Default | Role |
+|--------|---------|------|
+| `SANDBOX_PENDING_TIMEOUT_SECONDS` | **3 hours** | Sandbox Workload **phase=Pending** queued longer than this → terminal failure `sandbox_pending_timeout` to the frontend. The clock stops after leaving Pending (scheduled). Image pull is not Pending. `0` waits on the queue indefinitely. |
+| `SANDBOX_POLL_TIMEOUT_MS` | 1 hour | Ends only when SaFE **status is unreadable** (sustained 5xx, network failure, no phase), reason `sandbox_status_unreadable`. Readable Pending does not trigger it. |
+| SaFE Workload `timeout` | value on the task request (e.g. 46800s) | Hard cap from **StartTime / Running**, excluding queue time. |
+| `RUN_QUEUE_MAX_SEC` (API) | 2 hours | Task row never claimed by a worker; not sandbox Workload Pending. |
 
-### 容器退出视为失败
+### Container exit is failure
 
-EnvD 退出即停止 `codeinterpreter`。这是 sandbox 异常死亡，按上一节回前端失败。
+EnvD exiting stops `codeinterpreter`. That is an abnormal sandbox death and fails to the frontend as above.
 
-| 观察 | 会话结果 |
-|------|----------|
-| Pending | 不 15 分钟释放；最长等到 Pending 超时或 SaFE 失败 |
-| jobs 为空，Workload Running | 闲置路径，15 分钟，非失败 |
-| 15 分钟内有新 message | 时钟重置 |
-| jobs 非空，Running | 保留 sandbox |
-| Pod/容器 Failed、OOMKilled、非 0 退出 | **失败回前端**（`sandbox_container_failed`） |
-| SaFE timeout 停止仍在运行的 Workload | **失败回前端**（`sandbox_timed_out`） |
-| EnvD jobs API 不可达 | unknown，等待（且须已是 Running） |
-| Pending 超过 `SANDBOX_PENDING_TIMEOUT_SECONDS` | **失败回前端**（`sandbox_pending_timeout`） |
+| Observation | Session result |
+|-------------|----------------|
+| Pending | no 15-minute release; wait until Pending timeout or SaFE sandbox failure |
+| jobs empty, sandbox Workload Running | idle path, 15 minutes from `quiescedAt`, not failure |
+| new message or new execute within 15 minutes | clock reset |
+| jobs non-empty, Running | keep the sandbox |
+| launch script exited, Infera/RayJob still running | same as jobs empty; not kept alive |
+| work only on `/api/session` or other non-execute APIs | same as jobs empty; not kept alive |
+| Pod/container Failed, OOMKilled, non-zero exit | **failure to the frontend** (`sandbox_container_failed`) |
+| SaFE timeout stops a still-running sandbox Workload | **failure to the frontend** (`sandbox_timed_out`) |
+| EnvD jobs API unreachable | unknown, wait (and only if already Running) |
+| `GET /api/jobs` is 404 / 405 / 501 | no Brain idle reclaim; workload timeout stops the sandbox |
+| jobs `tracking_lost` | unknown, wait; not idle |
+| Pod UID or EnvD instance id changed | **failure to the frontend** (`sandbox_instance_replaced`) |
+| EnvD exited 0 without Brain stop | **failure to the frontend** (`sandbox_envd_exited`) |
+| Pending longer than `SANDBOX_PENDING_TIMEOUT_SECONDS` | **failure to the frontend** (`sandbox_pending_timeout`) |
 
-失败时：会话终态 ack、稳定的 `failure_reason`、停止 Workload、清理 `hands.<sid>`。不进入 QUIESCED。
+On failure: session terminal ack, a stable `failure_reason`, stop the sandbox Workload, clear `hands.<sid>`. Do not enter QUIESCED.
 
-## SaFE 映射（容器终态）
+## SaFE mapping (container terminal)
 
-Sandbox ResourceTemplate 必须将 Sandbox 的 `Succeeded` / `Failed` condition **排在** `Ready=False` **之前**，使已死 Pod 成为 Workload 的 `K8sSucceeded` / `K8sFailed`，而不是停留在 `NotReady`。Brain `get()` 将 failed/stopped/succeeded/completed/cancelled/terminated 视为 `terminal`。
+The Sandbox ResourceTemplate must list Sandbox `Succeeded` / `Failed` conditions **before** `Ready=False`, so a dead Pod becomes Workload `K8sSucceeded` / `K8sFailed` rather than staying `NotReady`. Brain `get()` treats failed/stopped/succeeded/completed/cancelled/terminated as `terminal`.
 
-OOM 与崩溃原因应写在 Workload 上，供 brain 区分 `sandbox_container_failed` 与 `sandbox_timed_out`。较长或为 0 的 `ttlSecondsAfterFinished` 仅作泄漏清理，不用作 15 分钟闲置钟。
+OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_container_failed` from `sandbox_timed_out`. A long or zero `ttlSecondsAfterFinished` is leak cleanup only, not the 15-minute idle clock.
 
-## 验收
+## Acceptance
 
-| 状态 | jobs API | Workload | 动作 |
-|------|----------|----------|------|
-| 排队 / 未调度 | 不扫 | Pending | 不 15 分钟释放 |
-| Pending 超过 3 小时（默认） | — | Pending | 失败回前端 `sandbox_pending_timeout` |
-| 对话轮次已 park，Hands 空闲 | 空 | Running | 15 分钟闲置回收 |
-| 窗口内到达新 message | — | Running | ACTIVE |
-| 脱离的命令仍在运行 | 非空 | Running | 保留 |
-| 该命令的 PID 已退出 | 空 | Running | 开始 15 分钟 |
-| SaFE 识别 Failed / OOM / 容器退出 | — | Failed | 失败回前端 |
-| 平台 timeout | — | Stopped（timeout） | 失败回前端 |
-| Router 短暂不可达 | unknown | Running | 等待 |
+| State | jobs API | sandbox Workload | Action |
+|-------|----------|------------------|--------|
+| queued / unschedulable | not scanned | Pending | no 15-minute release |
+| Pending longer than 3 hours (default) | — | Pending | failure to the frontend `sandbox_pending_timeout` |
+| turn parked, execute tree empty | empty | Running | record `quiescedAt`, 15-minute idle reclaim |
+| new message inside the window | — | Running | ACTIVE, clock cleared |
+| detached command still running via execute | non-empty | Running | keep |
+| launch-script PID exited | empty | Running | start 15 minutes; do not query Infera/RayJob |
+| work only on the tmux session API | empty | Running | 15-minute idle reclaim |
+| SaFE reports sandbox Failed / OOM / container exit | — | Failed | failure to the frontend |
+| platform timeout | — | Stopped (timeout) | failure to the frontend |
+| Router briefly unreachable | unknown | Running | wait, do not reclaim |
+| jobs API 404 / 405 / 501 | absent | Running | no Brain reclaim; workload timeout |
+| jobs tracking_lost | unknown | Running | wait, do not reclaim |
+| Pod replaced under the same name | — | Running or terminal | failure `sandbox_instance_replaced` |
+| EnvD exit 0 without Brain stop | — | Succeeded | failure `sandbox_envd_exited` |
+| reclaim vs new message | empty | Running | CAS `closing`; loser does not reuse |

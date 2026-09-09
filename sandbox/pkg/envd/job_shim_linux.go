@@ -4,8 +4,8 @@
 package envd
 
 import (
-	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -109,9 +109,8 @@ func reapOrphans() {
 	}
 }
 
-// startTrackedCommand starts a shim and exposes the primary command result.
+// startTrackedCommand starts a shim independent of the HTTP request lifetime.
 func (s *Server) startTrackedCommand(
-	ctx context.Context,
 	command []string,
 	workDir string,
 	env []string,
@@ -155,7 +154,6 @@ func (s *Server) startTrackedCommand(
 	s.jobs.add(shim.Process.Pid, command)
 
 	ch := make(chan int, 1)
-	primaryDone := make(chan struct{})
 	go func() {
 		var buf [4]byte
 		code := 1
@@ -163,7 +161,6 @@ func (s *Server) startTrackedCommand(
 			code = int(int32(binary.LittleEndian.Uint32(buf[:])))
 		}
 		_ = exitR.Close()
-		close(primaryDone)
 		ch <- code
 	}()
 	done := make(chan struct{})
@@ -179,16 +176,29 @@ func (s *Server) startTrackedCommand(
 		}
 	}
 	go func() {
-		select {
-		case <-ctx.Done():
-			cancel()
-		case <-primaryDone:
+		waitErr := shim.Wait()
+		if supervisorDiedUnexpectedly(waitErr) {
+			s.jobs.markLost()
 		}
-	}()
-	go func() {
-		_ = shim.Wait()
 		s.jobs.remove(shim.Process.Pid)
 		close(done)
 	}()
 	return primaryPID, ch, cancel, nil
+}
+
+// supervisorDiedUnexpectedly is true when the shim was signaled or failed
+// without a normal exit, so remaining descendants are no longer tracked.
+func supervisorDiedUnexpectedly(err error) bool {
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return true
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		return false
+	}
+	return status.Signaled() && status.Signal() != syscall.SIGTERM
 }

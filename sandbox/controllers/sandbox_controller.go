@@ -209,7 +209,7 @@ func applyPodTerminalConditions(sandbox *sandboxv1alpha1.Sandbox, pod *corev1.Po
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: sandbox.Generation,
 			Reason:             sandboxv1alpha1.SandboxReasonPodSucceeded,
-			Message:            "Pod phase is Succeeded",
+			Message:            "Pod phase is Succeeded; EnvD exited 0 without an explicit Brain stop",
 		})
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
 	case corev1.PodFailed:

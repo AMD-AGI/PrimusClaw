@@ -6,7 +6,6 @@ package envd
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -64,23 +63,29 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		workDir = abs
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
 	var stdout, stderr synchronizedBuffer
 
 	startTime := time.Now()
 	_, exitCh, stop, err := s.startTrackedCommand(
-		ctx, req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
 	)
 	exitCode := 0
 	if err == nil {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
 		select {
 		case exitCode = <-exitCh:
-		case <-ctx.Done():
+		case <-timer.C:
 			stop()
-			exitCode = 124
+			select {
+			case exitCode = <-exitCh:
+			case <-time.After(time.Second):
+				exitCode = 124
+			}
 			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
+		case <-r.Context().Done():
+			// HTTP cancellation does not stop the tracked tree.
+			return
 		}
 	}
 	endTime := time.Now()
@@ -156,12 +161,8 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
 	stream := &sseCommandStream{w: w, flusher: flusher, active: true}
 	pid, exitCh, stop, err := s.startTrackedCommand(
-		ctx,
 		req.Command,
 		workDir,
 		s.buildChildEnv(req.Env),
@@ -177,11 +178,20 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	sseWrite(w, flusher, "start", map[string]interface{}{"pid": pid})
 
 	exitCode := 0
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case exitCode = <-exitCh:
-	case <-ctx.Done():
+	case <-timer.C:
 		stop()
-		exitCode = 124
+		select {
+		case exitCode = <-exitCh:
+		case <-time.After(time.Second):
+			exitCode = 124
+		}
+	case <-r.Context().Done():
+		stream.deactivate()
+		return
 	}
 	stream.deactivate()
 

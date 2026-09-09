@@ -84,6 +84,9 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
   if (/oomkilled|container .*terminated|pod phase is failed|exitcode=/.test(text)) {
     return "sandbox_container_failed";
   }
+  if (/pod phase is succeeded|envd exited 0/.test(text)) {
+    return "sandbox_envd_exited";
+  }
   return "sandbox_workload_terminal";
 }
 
