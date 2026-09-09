@@ -641,14 +641,8 @@ export class HandsClient {
   }
 
   /**
-   * `owner` is the scope a background shell is addressable in: the DAG root for
-   * a DAG node, else the session. It outlives one run on purpose, so a shell
-   * started in one turn is still pollable in the next turn of the same
-   * conversation, which is the whole point of starting it in the background.
-   *
-   * `run` is the one execution making these calls, and is what lets a run that
-   * ends take its own shells with it (see `reapShells`). Empty means the shells
-   * this client starts belong to no run and are only stopped when Hands stops.
+   * `run` keys durable start rows; `shellRun` files shells within `owner`.
+   * An empty `shellRun` shares shells across turns of the same conversation.
    */
   constructor(
     private url: string,
@@ -656,6 +650,7 @@ export class HandsClient {
     private owner: string = "",
     private run: string = "",
     private deadlineAt: string = "",
+    private shellRun: string = run,
   ) {
     this.client = new Client(
       { name: "brain", version: "1.0.0" },
@@ -678,7 +673,7 @@ export class HandsClient {
           headers: {
             Authorization: `Bearer ${this.token}`,
             ...(this.owner ? { [OWNER_HEADER]: this.owner } : {}),
-            ...(this.run ? { [RUN_HEADER]: this.run } : {}),
+            ...(this.shellRun ? { [RUN_HEADER]: this.shellRun } : {}),
             ...(this.deadlineAt ? { [DEADLINE_HEADER]: this.deadlineAt } : {}),
           },
           // undici-only escape hatch: attach a long-lived Agent that disables
@@ -726,8 +721,8 @@ export class HandsClient {
    * applied at this boundary and undone on the way back.
    */
   private async wireShellId(id: string): Promise<string> {
-    if (!this.run || await this.filesShellRecords()) return id;
-    return runQualifiedShellId(this.run, id);
+    if (!this.shellRun || await this.filesShellRecords()) return id;
+    return runQualifiedShellId(this.shellRun, id);
   }
 
   /** Rewrite the `shell_id` argument for the wire, leaving everything else. */
@@ -748,7 +743,7 @@ export class HandsClient {
    * read, so a proof reaching one authorises that scope and nothing else.
    */
   private scopedCredential(): string {
-    return mintScopeCredential({ owner: this.owner, run: this.run || null }, this.token);
+    return mintScopeCredential({ owner: this.owner, run: this.shellRun || null }, this.token);
   }
 
   /**
@@ -1081,7 +1076,7 @@ export class HandsClient {
    * common case for a run that ended without touching a sandbox.
    */
   async reapShells(cause: ReclaimCause, reclaimOp: string, graceMs = BG_SHELL_REAP_GRACE_MS): Promise<ReapReport> {
-    if (!this.run) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
+    if (!this.shellRun) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
     const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
       method: "POST",
       headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },

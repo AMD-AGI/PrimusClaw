@@ -78,9 +78,9 @@ afterEach(() => {
  * One Brain pod's client. `dieOnHandoff` is the crash this exists for: the row
  * has been written and the transport call throws before anything is sent.
  */
-function pod(options: { dieOnHandoff?: boolean; slowHandoff?: boolean } = {}) {
+function pod(options: { dieOnHandoff?: boolean; slowHandoff?: boolean; shellRun?: string } = {}) {
   const sent: Array<Record<string, unknown>> = [];
-  const hands = new HandsClient(URL, "tok", OWNER, RUN);
+  const hands = new HandsClient(URL, "tok", OWNER, RUN, undefined, options.shellRun);
   (hands as unknown as { connected: boolean }).connected = true;
   (hands as unknown as { client: unknown }).client = {
     callTool: async ({ arguments: args }: { arguments: Record<string, unknown> }) => {
@@ -202,6 +202,30 @@ test("a start under a replaced sandbox is answered from the row, not dispatched"
 const NO_ID_START = { command: "train.sh", run_in_background: true };
 /** The call site a start came from, as the agent loop supplies it. */
 const STEP = (id: string) => ({ stepIdentity: id });
+
+for (const filesRecords of [true, false]) {
+  test(`conversation starts allocate and deduplicate rows with shell records ${filesRecords}`, async () => {
+    restoreCapability?.();
+    restoreCapability = bindShellRecordsCapabilityForTest(async () => filesRecords);
+    const first = pod({ shellRun: "" });
+    await first.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_chat"));
+
+    assert.equal(first.sent.length, 1);
+    const shellId = String(first.sent[0].shell_id);
+    assert.match(shellId, /^bg-[0-9a-f]{16}$/);
+    const address = { ownerScope: OWNER, runIdentity: RUN, shellId };
+    assert.equal((await readRow(bgRowStore()!, address))?.state, "spawn_confirmed");
+    assert.equal(await readRow(bgRowStore()!, { ...address, runIdentity: "" }), null);
+
+    const replay = pod({ shellRun: "" });
+    const answer = await replay.hands.callTool("bash", NO_ID_START, undefined, STEP("toolu_chat"));
+    assert.equal(replay.sent.length, 0);
+    assert.match(answer, /nothing was run a second time/);
+    assert.deepEqual(await replay.hands.reapShells("run_cancelled", "chat-cancel"), {
+      stopped: 0, escalated: 0, surviving: 0, shells: [],
+    });
+  });
+}
 
 test("a start naming no id recovers its own id on the replay, not a fresh one", async () => {
   // The common start names nothing. An id minted fresh per call means the

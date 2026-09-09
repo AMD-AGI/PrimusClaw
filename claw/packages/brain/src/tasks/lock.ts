@@ -249,27 +249,8 @@ export function pickRunScope(request: ExecuteRequest): string {
 }
 
 /**
- * The run identity a background shell is filed under, which is not the run's
- * own id for a conversation.
- *
- * `pickRunScope` above decides who may address a shell; this decides which
- * shells a finishing run takes with it. A DAG node's are its own: a sibling
- * under the same graph root arrives as its own run and is not entitled to them,
- * and the node reporting is what reaps them. A conversation's are the opposite
- * case -- they are expected to outlive the turn, and the next turn is meant to
- * poll them, which is the whole point of starting one in the background.
- *
- * Filed under the turn's own task id they never were. Every turn is a new run,
- * so the next one addressed a bucket its shell had never been in and was
- * answered `not found` over a process that was still running and still
- * recorded -- reachable by nobody, unkillable, and holding the sandbox open
- * against the idle sweep until its own deadline days later.
- *
- * Empty is not a gap but the third state Hands already documents: shells that
- * belong to no run and are stopped only when Hands stops. That is a
- * conversation's, exactly. The run id the API reports, the background-handle
- * rows and their per-run cleanup are all unaffected -- they key on the task,
- * and only the shell's filing moves.
+ * Shell-filing key within the owner scope: a DAG node's task id, or empty so
+ * conversation shells remain addressable across turns.
  */
 export function pickShellRun(request: ExecuteRequest): string {
   const isDagNode = !!(request.dag_root_task_id || request.dag_node_id);

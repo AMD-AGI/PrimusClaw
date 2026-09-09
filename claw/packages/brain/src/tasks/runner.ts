@@ -372,7 +372,7 @@ export interface TaskRunnerSideEffects {
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
   makeHandsClient: (
-    url: string, token: string, owner: string, run: string, deadlineAt?: string,
+    url: string, token: string, owner: string, run: string, deadlineAt: string | undefined, shellRun: string,
   ) => HandsClient;
 }
 
@@ -401,8 +401,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
-  makeHandsClient: (url, token, owner, run, deadlineAt) =>
-    new HandsClient(url, token, owner, run, deadlineAt),
+  makeHandsClient: (url, token, owner, run, deadlineAt, shellRun) =>
+    new HandsClient(url, token, owner, run, deadlineAt, shellRun),
 };
 
 let _deps: TaskRunnerDeps | null = null;
@@ -884,21 +884,14 @@ class TaskRunner {
   private readonly abortCtrl: AbortController;
 
   /**
-   * This one execution, as Hands files background shells under it.
-   *
-   * The task id, so a redelivered attempt of the same run re-adopts the shells
-   * the previous attempt started rather than orphaning them. Falls back to the
-   * message id for the legacy chat path, which dispatches without a task row.
+   * Identity for background-start rows and deduplication across redeliveries.
+   * Uses the task id, or the message id for chat without a task row.
    */
   private readonly runId: string;
 
   /**
-   * This run in the phase ledger.
-   *
-   * Deliberately a second value beside {@link runId} rather than a derivation
-   * of it: that one decides which sandbox shells a redelivered attempt
-   * re-adopts, and the lease and message tiers here would silently change that
-   * answer. Neither is computed from the other.
+   * Phase-ledger identity, whose lease and message fallbacks differ from the
+   * background-start row identity in {@link runId}.
    */
   private readonly runIdentity: RunIdentity;
 
@@ -924,25 +917,7 @@ class TaskRunner {
    */
   private readonly handsOwner: string;
 
-  /**
-   * The run identity background shells are filed under, which is not this run's
-   * id for a conversation.
-   *
-   * A DAG node's shells are its own: a sibling node under the same graph root
-   * arrives as its own run and is not entitled to them, and the node's terminal
-   * state reaps them. A conversation's are the opposite case -- they are
-   * expected to outlive the turn, and the next turn of the same conversation is
-   * meant to poll them, which is the whole point of starting one in the
-   * background. Filing them under the turn's own task id made every turn a
-   * stranger to the last: the next one addressed a bucket its shell was never
-   * in and was answered `not found` over a process still running, by then
-   * reachable by nobody and holding the sandbox open until its deadline.
-   *
-   * Empty is not a gap here but the documented third state -- shells that
-   * belong to no run and are stopped only when Hands stops, which is exactly a
-   * conversation's. `runId` is untouched: the handle rows, their per-run
-   * cleanup and the run id the API reports all still key on the turn.
-   */
+  /** Shell-filing key: the DAG node's task id, or empty across conversation turns. */
   private readonly shellRun: string;
 
   // userIdHex: only sessions whose user_id matches /^[0-9a-f]{32}$/ go
@@ -1451,7 +1426,7 @@ class TaskRunner {
       { skipSessionReuse: true, signal: this.abortCtrl.signal },
     );
     const newHands = fx().makeHandsClient(
-      newUrl, newToken, this.handsOwner, this.shellRun, this.request.deadline_at,
+      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     // Fold the newest in-flight snapshot into the session prefix *before*
     // restoring from it. The session prefix only advances on a successful
@@ -1589,7 +1564,7 @@ class TaskRunner {
   private replaceHandsClient(): HandsClient {
     this.hands?.close().catch(() => {});
     const fresh = fx().makeHandsClient(
-      this.handsUrl, this.handsToken, this.handsOwner, this.shellRun, this.request.deadline_at,
+      this.handsUrl, this.handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     this.hands = fresh;
     return fresh;
@@ -1945,10 +1920,7 @@ class TaskRunner {
    * where the answer came back rather than where the attempt was made.
    */
   private async reapBackgroundShells(cause?: ReclaimCause): Promise<void> {
-    // A DAG node's shells have nobody left to read them once the node reports;
-    // a conversation's are expected to outlive the turn, so its terminal state
-    // reclaims nothing. Cancellation is the exception on both: the run is over
-    // by the user's decision, whichever kind it is.
+    // DAG shells end with the node; conversation shells survive turns and cancellations.
     const isDagNode = !!(this.request.dag_root_task_id || this.request.dag_node_id);
     const reason: ReclaimCause | null = cause ?? (isDagNode ? "dag_node_terminal" : null);
     if (this.shellsReaped || !reason || !this.hands) return;
@@ -2097,7 +2069,7 @@ class TaskRunner {
       attempt: this.attempt,
     });
     this.hands = fx().makeHandsClient(
-      handsUrl, handsToken, this.handsOwner, this.shellRun, this.request.deadline_at,
+      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     // ensureHands returns only after bootstrap and the health check, so this
     // is the first moment a sandbox can actually be used -- unlike the
@@ -2164,7 +2136,7 @@ class TaskRunner {
     // never opens the MCP transport, so there is nothing holding a connection.
     return fx().makeHandsClient(
       info.handsUrl, typeof info.token === "string" ? info.token : "",
-      this.handsOwner, this.shellRun, this.request.deadline_at,
+      this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
   }
 
@@ -3118,8 +3090,7 @@ class TaskRunner {
       ),
       this.coverageReport()?.runTime,
     );
-    // Cancellation ends the run whichever kind it is, so its shells go with it
-    // -- a conversation's survive its turns, never its cancellation.
+    // Hands reaps run-scoped shells; conversation shells survive cancellation.
     await this.reapBackgroundShells("run_cancelled");
     await this.releaseAfterTerminal();
     await this.ackTerminal();

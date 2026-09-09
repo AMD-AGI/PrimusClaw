@@ -90,8 +90,10 @@ async function seedOrphanedDispatch(generation: string): Promise<void> {
   }), null);
 }
 
-function handsClient(url: string): HandsClient {
-  const hands = new HandsClient(url, "tok", SESSION, RUN);
+function handsClient(
+  url: string, token = "tok", owner = SESSION, run = RUN, deadlineAt = "", shellRun = run,
+): HandsClient {
+  const hands = new HandsClient(url, token, owner, run, deadlineAt, shellRun);
   (hands as unknown as { connected: boolean }).connected = true;
   (hands as unknown as { client: unknown }).client = {
     callTool: async () => { throw new Error("the resumed run issued nothing"); },
@@ -182,6 +184,25 @@ test("the resumed run reconciles when it attaches too", async () => {
   assert.equal(rowDuringRun, null);
 });
 
+test("a completed chat turn deletes its own handle rows and preserves another turn's rows", async () => {
+  recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  await seedOrphanedDispatch(GENERATION);
+  const other = { ...ORPHAN, runIdentity: "msg-other" };
+  await bgRowStore()!.write(rowKey(other), JSON.stringify({
+    ...other, generation: GENERATION, state: "dispatched",
+  }), null);
+  let stateDuringRun: string | undefined;
+
+  await runResumedTask(async () => {
+    stateDuringRun = (await readRow(bgRowStore()!, ORPHAN))?.state;
+    return runResult();
+  });
+
+  assert.equal(stateDuringRun, "spawn_confirmed");
+  assert.equal(await readRow(bgRowStore()!, ORPHAN), null);
+  assert.equal((await readRow(bgRowStore()!, other))?.state, "dispatched");
+});
+
 test("the model is told the call did not go through, not left to find out", async () => {
   // Releasing the commitment is what stops the request being stranded; on its
   // own it is a deletion nothing hears about, and the call simply never happens
@@ -264,7 +285,7 @@ async function runResumedTask(
     refreshTaskLock: (async () => {}) as never,
     releaseTaskLock: (async () => {}) as never,
     flushTranscript: (async () => {}) as never,
-    makeHandsClient: ((url: string) => handsClient(url)) as never,
+    makeHandsClient: handsClient,
   } as unknown as TaskRunnerSideEffects;
 
   const engine: Engine = {
