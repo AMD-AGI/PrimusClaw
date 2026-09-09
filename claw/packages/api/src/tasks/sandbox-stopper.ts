@@ -21,43 +21,25 @@ import type { KVStore } from "@claw/utils";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
-import { dagHandlesBucket } from "../infra/dag-handles.js";
+import { kv as natsKv } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
 const logger = pino({ name: "sandbox-stopper" });
 
 let _handleMap: DagHandleMap | null = null;
 
-/**
- * The bucket the map is built over, injectable because which one it is *is*
- * the defect this seam exists for: built over the registry bucket the map
- * enumerated an empty set and every sweep walking it reaped nothing.
- */
-export const stopperPorts = { dagHandlesBucket };
-
-/** Drop the memoised map so a test can rebind the bucket. */
-export function resetHandleMapForTest(): void { _handleMap = null; }
-
-/**
- * Build the DagHandleMap over the bucket Brain actually writes.
- *
- * `DAG_HANDLES`, not the registry bucket this process's own KV handle points
- * at: Brain never writes `dag-handles.*` keys there, so a map built over the
- * registry enumerates an empty set and every sweep that walks it reaps nothing
- * -- silently, because finding no rows is indistinguishable from finding no
- * orphans. Rows then accumulate for the life of the cluster.
- */
-async function handleMap(): Promise<DagHandleMap> {
+/** Build the DagHandleMap on demand using the existing NATS KV bucket. */
+function handleMap(): DagHandleMap {
   if (_handleMap) return _handleMap;
-  const bucket = await stopperPorts.dagHandlesBucket();
-  // We rely on the same encoding contract Brain uses to write handle entries:
-  // a JSON object payload.
+  // Adapt the in-process NATS KV (which the API already owns) into the
+  // KVStore interface DagHandleMap expects. We rely on the same encoding
+  // contract Brain uses to write handle entries: a JSON object payload.
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   const ks: KVStore = {
     async get(key) {
       try {
-        const entry = await bucket.get(key);
+        const entry = await natsKv.get(key);
         if (!entry) return null;
         return JSON.parse(dec.decode(entry.value)) as Record<string, unknown>;
       } catch {
@@ -65,18 +47,18 @@ async function handleMap(): Promise<DagHandleMap> {
       }
     },
     async put(key, value) {
-      await bucket.put(key, enc.encode(JSON.stringify(value)));
+      await natsKv.put(key, enc.encode(JSON.stringify(value)));
     },
     async delete(key) {
-      await bucket.delete(key);
+      await natsKv.delete(key);
     },
     async scanPrefix(prefix) {
       const filter = prefix.endsWith(".") ? `${prefix}>` : `${prefix}.>`;
-      const iter = await bucket.keys(filter);
+      const iter = await natsKv.keys(filter);
       const out: Array<[string, Record<string, unknown>]> = [];
       for await (const key of iter) {
         if (!key.startsWith(prefix)) continue;
-        const entry = await bucket.get(key);
+        const entry = await natsKv.get(key);
         if (!entry) continue;
         try {
           out.push([key, JSON.parse(dec.decode(entry.value))]);
@@ -121,7 +103,7 @@ export async function stopSandboxByHandle(
   handleName: string,
   sessionId: string,
 ): Promise<void> {
-  const wid = await (await handleMap()).destroy(dagRootTaskId, handleName);
+  const wid = await handleMap().destroy(dagRootTaskId, handleName);
   if (!wid) return;
   const platformKey = await loadPlatformKeyForSession(sessionId);
   await safeStopWorkload(wid, platformKey);
@@ -130,7 +112,7 @@ export async function stopSandboxByHandle(
 
 /** Tear down every handle currently registered for the given DAG. */
 export async function stopAllHandlesForDag(dagRootTaskId: string, sessionId: string): Promise<void> {
-  const entries = await (await handleMap()).listForDag(dagRootTaskId);
+  const entries = await handleMap().listForDag(dagRootTaskId);
   for (const handle of Object.keys(entries)) {
     await stopSandboxByHandle(dagRootTaskId, handle, sessionId);
   }

@@ -25,11 +25,10 @@ import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import { interruptSubject } from "@claw/protocol";
 import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../config.js";
-import { kv as registryKv, nc } from "../infra/nats.js";
+import { nc } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
-import type { HandleInfo } from "@claw/protocol";
 import { handleMap } from "./sandbox-stopper.js";
 import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC, RUN_REQUEUE_RESET_SQL } from "./run-budget.js";
 import {
@@ -72,14 +71,6 @@ const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 /** Injection seam for the terminal events a reap has to announce. */
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
-  /**
-   * The two reads `reapOrphanHandles` decides on, injectable because the
-   * decision it reaches is destructive and neither source can be stood up in a
-   * unit test: the handle rows it walks, and the workloads Brain still holds.
-   */
-  listDagHandles: async (): Promise<Array<[string, Record<string, HandleInfo>]>> =>
-    (await handleMap()).listAll(),
-  liveWorkloadIds,
 };
 
 let stopped = false;
@@ -1048,49 +1039,11 @@ export async function reapStuckSessions(): Promise<number> {
   return r.rowCount;
 }
 
-/**
- * Workload ids Brain's registry still names, as positive evidence of life.
- *
- * The reap below decides a DAG is over from the task table alone, and that is
- * not the same question as whether its sandbox is in use: a chat run's sandbox
- * is held warm for reuse after the run completes, so a handle whose DAG root
- * reads `completed` -- or whose root row was never written at all, which reads
- * as `missing` -- can still name a sandbox serving traffic. Brain writes
- * `hands.<session>` for every sandbox it holds and renews it each sweep, so
- * the set below is what is live, read from a bucket this process already owns.
- */
-async function liveWorkloadIds(): Promise<Set<string>> {
-  const live = new Set<string>();
-  const dec = new TextDecoder();
-  for await (const key of await registryKv.keys("hands.*")) {
-    const entry = await registryKv.get(key);
-    if (!entry) continue;
-    try {
-      const info = JSON.parse(dec.decode(entry.value)) as { workloadId?: unknown };
-      if (typeof info.workloadId === "string" && info.workloadId) live.add(info.workloadId);
-    } catch { /* a row this cannot read names nothing, and claims nothing */ }
-  }
-  return live;
-}
-
 /** Reconcile DagHandleMap: drop entries for terminal DAG roots. */
 export async function reapOrphanHandles(): Promise<number> {
-  const all = await sweeperPorts.listDagHandles();
-  if (!all.length) return 0;
-  const live = await sweeperPorts.liveWorkloadIds();
-  // No live sandbox anywhere is not evidence that none is running: the registry
-  // bucket expires its rows, so a Brain that has stopped renewing them looks
-  // exactly like a fleet at rest -- and the two want opposite actions here.
-  // Skipping costs a delayed cleanup; acting costs every sandbox in the fleet.
-  if (!live.size) {
-    logger.warn({ handles: all.length }, "sweeper.orphan_handles_no_live_evidence");
-    return 0;
-  }
+  const all = await handleMap().listAll();
   let dropped = 0;
-  for (const [dagRoot, handles] of all) {
-    // A handle naming a sandbox Brain still holds is not an orphan, whatever
-    // the task table says about the DAG that created it.
-    if (Object.values(handles).some((h) => h?.workload_id && live.has(h.workload_id))) continue;
+  for (const [dagRoot] of all) {
     const r = await db.query(
       `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
       [dagRoot],
