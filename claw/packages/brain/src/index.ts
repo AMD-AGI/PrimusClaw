@@ -851,10 +851,12 @@ async function main() {
   // alert; see brain/src/infra/watchdog.ts for the two-timer rationale.
   startWatchdog();
 
-  // Sandbox keepalive: periodically `exec date > /tmp/keepalive_ts` inside
-  // every active Hands sandbox so SaFE doesn't reclaim the workload while
-  // the parent agent is mid-LLM-call. See sandbox-keepalive.ts for details.
-  startSandboxKeepalive({ kv });
+  // Sandbox lifecycle: active handles are health-checked; parked handles query
+  // EnvD's tracked jobs and are reclaimed only after their idle reuse window.
+  startSandboxKeepalive({
+    kv,
+    emitSandboxFailure: (sessionId, event) => emitter.emit(sessionId, event),
+  });
 
   // Background sweeper: evict stale Hands KV entries whose workloads died
   // outside an active task (covers sessions idle longer than the KV TTL

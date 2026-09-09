@@ -21,6 +21,10 @@ import (
 )
 
 func main() {
+	if envd.MaybeRunJobShim() {
+		return
+	}
+
 	// One handler for slog, klog and controller-runtime.
 	log.Install()
 

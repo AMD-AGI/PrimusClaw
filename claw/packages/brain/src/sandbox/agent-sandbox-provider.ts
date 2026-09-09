@@ -297,9 +297,19 @@ export class AgentSandboxProvider implements SandboxProvider {
 
   async get(inst: SandboxInstance): Promise<SandboxStatus> {
     const resp = await this.routerFetch(`/v1/code-interpreter/sessions/${inst.id}`, { timeoutMs: 15_000, userId: inst.userId });
-    if (!resp.ok) return { running: false, healthy: false };
+    if (resp.status === 404 || resp.status === 410) {
+      return { running: false, healthy: false, state: "absent" };
+    }
+    if (!resp.ok) return { running: false, healthy: false, state: "unknown" };
     const d = (await resp.json()) as { status?: string; healthy?: boolean; podIp?: string };
-    return { running: d.status === "running", healthy: !!d.healthy, podIp: d.podIp };
+    const status = String(d.status ?? "").toLowerCase();
+    if (status === "running") {
+      return { running: true, healthy: !!d.healthy, podIp: d.podIp, state: "running" };
+    }
+    if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(status)) {
+      return { running: false, healthy: false, podIp: d.podIp, state: "terminal" };
+    }
+    return { running: false, healthy: false, podIp: d.podIp, state: "unknown" };
   }
 
   async exec(

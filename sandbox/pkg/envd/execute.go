@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
@@ -66,32 +67,27 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
-	cmd.Dir = workDir
-	cmd.Env = s.buildChildEnv(req.Env)
-	stripEnvDProxyGroup(cmd)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var stdout, stderr synchronizedBuffer
 
 	startTime := time.Now()
-	err := cmd.Run()
+	_, exitCh, stop, err := s.startTrackedCommand(
+		ctx, req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+	)
+	exitCode := 0
+	if err == nil {
+		select {
+		case exitCode = <-exitCh:
+		case <-ctx.Done():
+			stop()
+			exitCode = 124
+			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
+		}
+	}
 	endTime := time.Now()
 
-	exitCode := 0
 	if err != nil {
-		// Check context timeout FIRST — exec.CommandContext kills the process and
-		// returns *exec.ExitError(-1), so ctx.Err() must be checked before ExitError.
-		// Use exit code 124 — GNU timeout standard.
-		if ctx.Err() != nil {
-			exitCode = 124
-			stderr.WriteString(fmt.Sprintf("command timed out after %s", timeout))
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+		exitCode = 1
+		stderr.appendString(err.Error())
 	}
 
 	resp := ExecuteResponse{
@@ -163,62 +159,31 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
-	cmd.Dir = workDir
-	cmd.Env = s.buildChildEnv(req.Env)
-	stripEnvDProxyGroup(cmd)
-
-	stdoutPipe, err := cmd.StdoutPipe()
+	stream := &sseCommandStream{w: w, flusher: flusher, active: true}
+	pid, exitCh, stop, err := s.startTrackedCommand(
+		ctx,
+		req.Command,
+		workDir,
+		s.buildChildEnv(req.Env),
+		stream.writer("stdout"),
+		stream.writer("stderr"),
+	)
 	if err != nil {
-		httpError(w, "failed to create stdout pipe: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		httpError(w, "failed to create stderr pipe: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Send start event
-	sseWrite(w, flusher, "start", map[string]interface{}{"pid": cmd.Process.Pid})
-
-	// Stream stdout and stderr concurrently
-	done := make(chan struct{}, 2)
-
-	streamPipe := func(pipe interface{ Read([]byte) (int, error) }, key string) {
-		buf := make([]byte, 4096)
-		for {
-			n, err := pipe.Read(buf)
-			if n > 0 {
-				sseWrite(w, flusher, "data", map[string]string{key: string(buf[:n])})
-			}
-			if err != nil {
-				break
-			}
-		}
-		done <- struct{}{}
-	}
-
-	go streamPipe(stdoutPipe, "stdout")
-	go streamPipe(stderrPipe, "stderr")
-
-	// Wait for both streams to finish
-	<-done
-	<-done
+	sseWrite(w, flusher, "start", map[string]interface{}{"pid": pid})
 
 	exitCode := 0
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	select {
+	case exitCode = <-exitCh:
+	case <-ctx.Done():
+		stop()
+		exitCode = 124
 	}
+	stream.deactivate()
 
 	sseWrite(w, flusher, "end", map[string]interface{}{
 		"exit_code": exitCode,
@@ -261,6 +226,66 @@ func exitStatusString(code int) string {
 		return "completed"
 	}
 	return "failed"
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+// Write appends command output while permitting detached descendants to drain.
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+// appendString appends an EnvD-generated error message.
+func (b *synchronizedBuffer) appendString(s string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, _ = b.b.WriteString(s)
+}
+
+// String returns a stable output snapshot.
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+type sseCommandStream struct {
+	mu      sync.Mutex
+	w       http.ResponseWriter
+	flusher http.Flusher
+	active  bool
+}
+
+// writer creates one stdout or stderr field writer.
+func (s *sseCommandStream) writer(key string) *sseFieldWriter {
+	return &sseFieldWriter{stream: s, key: key}
+}
+
+// deactivate stops writes after the HTTP response has ended.
+func (s *sseCommandStream) deactivate() {
+	s.mu.Lock()
+	s.active = false
+	s.mu.Unlock()
+}
+
+type sseFieldWriter struct {
+	stream *sseCommandStream
+	key    string
+}
+
+// Write emits one synchronized SSE data event while the response is active.
+func (w *sseFieldWriter) Write(p []byte) (int, error) {
+	w.stream.mu.Lock()
+	defer w.stream.mu.Unlock()
+	if w.stream.active {
+		sseWrite(w.stream.w, w.stream.flusher, "data", map[string]string{w.key: string(p)})
+	}
+	return len(p), nil
 }
 
 // stripEnvDProxyGroup sets the child process's supplementary groups to only

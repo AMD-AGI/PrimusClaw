@@ -67,6 +67,7 @@ export type ContainerProbeReason =
   | "exec_nonzero"
   | "exec_no_exit_code"
   | "exec_sandbox_gone"
+  | "exec_sandbox_terminal"
   | "exec_unreachable"
   | "exec_deadline"
   | "kv_unreachable"
@@ -81,6 +82,7 @@ export const HANDS_ENTRY_CORRUPT = "hands_entry_corrupt";
 export interface ContainerProbeOutcome {
   verdict: ContainerProbeVerdict;
   reason: ContainerProbeReason;
+  failureReason?: string;
 }
 
 export interface HandsProbeEntry {
@@ -92,6 +94,7 @@ export interface HandsProbeEntry {
   sandboxName?: string;
   namespace?: string;
   userId?: string;
+  terminalReason?: string;
 }
 
 export interface ContainerProbeEffects {
@@ -397,6 +400,13 @@ async function classify(
     const msg = String((err as Error)?.message ?? err);
     if (msg === PROBE_ABORTED_ERROR) return { verdict: "unknown", reason: "aborted" };
     if (msg === PROBE_DEADLINE_ERROR) return { verdict: "unknown", reason: "exec_deadline" };
+    if ((err as { sandboxTerminal?: boolean })?.sandboxTerminal === true) {
+      return {
+        verdict: "dead",
+        reason: "exec_sandbox_terminal",
+        failureReason: (err as { reason?: string }).reason ?? "sandbox_workload_terminal",
+      };
+    }
     if (execFailureMeansGone(err, inst.provider)) {
       return { verdict: "dead", reason: "exec_sandbox_gone" };
     }

@@ -52,6 +52,7 @@ import {
 } from "./container-probe.js";
 import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
+import { SandboxProvisionTerminalError } from "./errors.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -286,6 +287,15 @@ export async function assertDagHandleAlive(
   if (health.ok) return;
   if (identity && token) {
     const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+    if (probe.reason === "exec_sandbox_terminal") {
+      await reuseEffects.destroyHands(sessionId, identity, token).catch((err) => {
+        logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+      });
+      throw new SandboxProvisionTerminalError(
+        probe.failureReason ?? "sandbox_workload_terminal",
+        `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
+      );
+    }
     if (probe.verdict === "alive") {
       const restarted = await reuseEffects.restartHandsInSandbox({
         sessionId,
@@ -354,6 +364,19 @@ async function recoverUnhealthyReuse(
   signal?: AbortSignal,
 ): Promise<EnsureHandsResult | null> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+  if (probe.reason === "exec_sandbox_terminal") {
+    await reuseEffects.destroyHands(
+      sessionId,
+      identity,
+      typeof info.token === "string" ? info.token : undefined,
+    ).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    throw new SandboxProvisionTerminalError(
+      probe.failureReason ?? "sandbox_workload_terminal",
+      `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
+    );
+  }
   if (probe.verdict === "dead") return null;
   if (probe.verdict === "unknown") {
     logger.warn(
@@ -445,6 +468,19 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   );
   const identity = reuseIdentity(info);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
+  if (typeof info.terminalReason === "string" && info.terminalReason) {
+    await reuseEffects.destroyHands(
+      sessionId,
+      identity,
+      hasToken ? info.token : undefined,
+    ).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    throw new SandboxProvisionTerminalError(
+      info.terminalReason,
+      `sandbox workload entered terminal phase (${info.terminalReason})`,
+    );
+  }
 
   // Multi-node bakes cluster env at sandbox create; hands never reloads env.
   // Always replace any prior sandbox (single- or multi-node) with a fresh one.

@@ -213,18 +213,44 @@ func applyPodTerminalConditions(sandbox *sandboxv1alpha1.Sandbox, pod *corev1.Po
 		})
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
 	case corev1.PodFailed:
+		reason, message := podFailureDetail(pod)
 		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
 			Type:               string(sandboxv1alpha1.SandboxConditionFailed),
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: sandbox.Generation,
-			Reason:             sandboxv1alpha1.SandboxReasonPodFailed,
-			Message:            "Pod phase is Failed",
+			Reason:             reason,
+			Message:            message,
 		})
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
 	default:
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
 	}
+}
+
+// podFailureDetail preserves the container termination reason for SaFE and
+// Brain instead of reducing every sandbox crash to a generic PodFailed.
+func podFailureDetail(pod *corev1.Pod) (string, string) {
+	for _, status := range pod.Status.ContainerStatuses {
+		terminated := status.State.Terminated
+		if terminated == nil {
+			continue
+		}
+		reason := terminated.Reason
+		if reason == "" {
+			reason = sandboxv1alpha1.SandboxReasonPodFailed
+		}
+		return reason, fmt.Sprintf(
+			"Container %s terminated: reason=%s exitCode=%d",
+			status.Name,
+			reason,
+			terminated.ExitCode,
+		)
+	}
+	if pod.Status.Message != "" {
+		return sandboxv1alpha1.SandboxReasonPodFailed, pod.Status.Message
+	}
+	return sandboxv1alpha1.SandboxReasonPodFailed, "Pod phase is Failed"
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1alpha1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {

@@ -81,6 +81,9 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
   if (/timed out|timeout/.test(text)) {
     return "sandbox_timed_out";
   }
+  if (/oomkilled|container .*terminated|pod phase is failed|exitcode=/.test(text)) {
+    return "sandbox_container_failed";
+  }
   return "sandbox_workload_terminal";
 }
 
@@ -98,6 +101,18 @@ export class SandboxGoneError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SandboxGoneError";
+  }
+}
+
+/** The backing workload reached a terminal phase after it had been usable. */
+export class SandboxRuntimeTerminalError extends SandboxGoneError {
+  readonly sandboxTerminal = true;
+  readonly reason: string;
+
+  constructor(reason: string, message: string) {
+    super(message);
+    this.name = "SandboxRuntimeTerminalError";
+    this.reason = reason;
   }
 }
 

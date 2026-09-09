@@ -14,7 +14,11 @@ import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../ta
 import { destroyHands } from "./reaper.js";
 import { sessionHasActiveRunLease } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { countActiveShells } from "../clients/hands.js";
+import {
+  countSandboxUserProcesses,
+  SandboxTerminalProbeError,
+} from "./job-probe.js";
+import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 import pino from "pino";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -33,7 +37,7 @@ export interface SandboxEntry {
 }
 
 interface HandsKvEntry {
-  status?: "pending" | "ready";
+  status?: "pending" | "ready" | "reclaiming";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
   sessionId?: string;
@@ -153,6 +157,8 @@ interface HandsKvEntry {
    * while any unexpired reservation remains; each probe releases only its token.
    */
   bgProbes?: Record<string, number>;
+  /** SaFE terminal reason observed after the sandbox had reached Running. */
+  terminalReason?: string;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -161,10 +167,25 @@ interface HandsKvEntry {
 
 interface KeepaliveDeps {
   kv: KV;
-  /** Test seam for the background-work probe. */
+  /** Legacy test seam; production probes EnvD's per-job process registry. */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /** Publish a terminal sandbox event to the session event stream. */
+  emitSandboxFailure?: (
+    sessionId: string,
+    event: Record<string, unknown>,
+  ) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
+}
+
+function probeUserProcesses(
+  deps: KeepaliveDeps,
+  info: HandsKvEntry,
+  sessionId: string,
+): Promise<number> {
+  return deps.countActiveShells
+    ? deps.countActiveShells(info.handsUrl!, info.token!, sessionId)
+    : countSandboxUserProcesses(info);
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -787,6 +808,51 @@ async function releaseProbe(
   } catch { /* best effort: the deadline is the backstop */ }
 }
 
+/** Preserve a terminal SaFE verdict so the next message returns it to the UI. */
+async function persistTerminalFailure(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  identity: string,
+  reason: string,
+): Promise<boolean> {
+  try {
+    const key = `hands.${sessionId}`;
+    const entry = await deps.kv.get(key);
+    if (!entry) return false;
+    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    if (entryIdentity(sessionId, info) !== identity) return false;
+    if (info.terminalReason) return false;
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...info, terminalReason: reason })),
+      entry.revision,
+    );
+    return true;
+  } catch {
+    // The workload remains terminal; a later provider check reaches the same result.
+    return false;
+  }
+}
+
+/** Persist and publish one terminal verdict for a sandbox identity. */
+async function reportTerminalFailure(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  identity: string,
+  reason: string,
+): Promise<void> {
+  if (!await persistTerminalFailure(deps, sessionId, identity, reason)) return;
+  if (!deps.emitSandboxFailure) return;
+  await deps.emitSandboxFailure(sessionId, {
+    type: "sandboxStatus",
+    status: "failed",
+    reason,
+    message: `Sandbox workload entered terminal phase (${reason})`,
+  }).catch((err) => {
+    logger.warn({ err, sessionId, reason }, "keepalive.terminal_event_failed");
+  });
+}
+
 /**
  * Start up to BG_PROBE_MAX_IN_FLIGHT probes, resuming where the last sweep left
  * off.
@@ -801,7 +867,8 @@ function dispatchProbes(
   }>,
 ): number {
   if (candidates.length === 0) return 0;
-  const probe = deps.countActiveShells ?? countActiveShells;
+  const probe = (info: HandsKvEntry, owner: string) =>
+    probeUserProcesses(deps, info, owner);
   const start = bgProbeCursor % candidates.length;
 
   let started = 0;
@@ -829,7 +896,7 @@ function dispatchProbes(
     void reserveProbe(deps, sessionId, identity, token)
       // Do not send an unreserved probe that another replica cannot see.
       .then((reserved) => (
-        reserved ? probe(info.handsUrl!, info.token!, sessionId) : undefined
+        reserved ? probe(info, sessionId) : undefined
       ))
       .then(async (running) => {
         if (running === undefined) {
@@ -887,6 +954,21 @@ function dispatchProbes(
       })
       .catch((err) => {
         if (stale()) return;
+        if (err instanceof SandboxTerminalProbeError) {
+          logger.error(
+            { sessionId, workloadId: info.workloadId, state: err.state, reason: err.reason },
+            "keepalive.sandbox_terminal",
+          );
+          void reportTerminalFailure(deps, sessionId, identity, err.reason);
+          return;
+        }
+        if (!deps.countActiveShells) {
+          logger.warn(
+            { err: (err as Error)?.message ?? err, sessionId },
+            "keepalive.user_process_check_unknown",
+          );
+          return;
+        }
         const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
         bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
         logger.warn(
@@ -1003,6 +1085,11 @@ async function persistVerdict(
       }
       const next = sc.encode(JSON.stringify({
         ...info,
+        // Start the reuse window when EnvD first confirms that the task tree
+        // is empty, not when the task was parked while background work ran.
+        ...(running === 0 && usableSharedVerdict(info)?.state !== "idle"
+          ? { workSeenAt: measuredAt }
+          : {}),
         bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,
@@ -1116,6 +1203,13 @@ async function collectTargets(
       try {
         const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
         if (info.status && info.status !== "ready") continue;
+        if (info.terminalReason) {
+          logger.error(
+            { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
+            "keepalive.sandbox_terminal_recorded",
+          );
+          continue;
+        }
         // Idle handles with running or unknown work are pinged; only confirmed
         // idle handles may expire. Probes run behind the sweep by sandbox identity.
         const identity = entryIdentity(sessionId, info);
@@ -1205,16 +1299,47 @@ async function collectTargets(
             continue;
           }
           if (expired) {
-            // Report a reclaim only after the conditional delete succeeds.
-            await deps.kv.delete(key, { previousSeq: e.revision })
-              .then(() => {
-                stats.expired += 1;
-                logger.info(
-                  { sessionId, workloadId: info.workloadId },
-                  "keepalive.idle_handle_expired",
+            // Reconfirm both Running and an empty task tree at the destructive
+            // boundary. Cached idle cannot turn a later SaFE failure into an
+            // ordinary reclaim, and an unreachable control plane stays unknown.
+            let claimed = false;
+            try {
+              const running = await probeUserProcesses(deps, info, sessionId);
+              if (running > 0) {
+                await refreshIdleSince(deps, key, e.revision, info, Date.now());
+                continue;
+              }
+              // Claim the exact idle revision first. A concurrent message that
+              // reactivated this handle wins the CAS and prevents the stop.
+              await deps.kv.update(
+                key,
+                sc.encode(JSON.stringify({ ...info, status: "reclaiming" })),
+                e.revision,
+              );
+              claimed = true;
+              await destroyHands(sessionId, info);
+              stats.expired += 1;
+              logger.info(
+                { sessionId, workloadId: info.workloadId },
+                "keepalive.idle_handle_expired",
+              );
+            } catch (err) {
+              if (err instanceof SandboxTerminalProbeError) {
+                await reportTerminalFailure(deps, sessionId, identity, err.reason);
+                logger.error(
+                  { sessionId, workloadId: info.workloadId, reason: err.reason },
+                  "keepalive.sandbox_terminal",
                 );
-              })
-              .catch(() => {});
+              } else {
+                logger.warn(
+                  { err, sessionId, workloadId: info.workloadId },
+                  "keepalive.idle_reclaim_deferred",
+                );
+                if (!claimed) {
+                  await deps.kv.update(key, value, e.revision).catch(() => {});
+                }
+              }
+            }
           } else {
             stats.withinWindow += 1;
             // Conditional TTL refresh must yield to concurrent reactivation.
@@ -1256,10 +1381,7 @@ async function collectTargets(
   return targets;
 }
 
-/**
- * Periodically exec a no-op inside every active sandbox to refresh the
- * SaFE Workload Manager's lastActivity timestamp, preventing idle GC.
- */
+/** Periodically check active sandboxes and reclaim confirmed-idle handles. */
 /** One sweep, exported so its decisions can be tested without an interval. */
 export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void> {
   return tick(deps);
@@ -1412,15 +1534,22 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
           userId: entry.userId,
         });
       } else {
-        // safe-workload: exec a no-op to refresh SaFE Workload Manager lastActivity.
-        await getSafeWorkloadProvider().exec({
+        // safe-workload: read the control-plane phase. Brain owns idle reclaim,
+        // so keepalive no longer executes a file-stamp command for sandbox GC.
+        const status = await getSafeWorkloadProvider().get({
           provider: "safe-workload",
           id: entry.workloadId!,
           sandboxName: entry.workloadId!,
           namespace: entry.namespace ?? "",
           handsBaseUrl: "",
           platformKey: entry.platformKey!,
-        }, "date -Iseconds > /tmp/keepalive_ts", "15s");
+        });
+        if (status.state === "terminal" || status.state === "absent") {
+          throw new SandboxGoneError(`sandbox workload state=${status.state}`);
+        }
+        if (status.state !== "running") {
+          throw new Error(`sandbox workload state=${status.state ?? "unknown"}`);
+        }
       }
       failCounts.delete(targetKey);
       // Refresh KV TTL so the entry survives across Brain restarts.
@@ -1438,6 +1567,9 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       }
       logger.info({ sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId }, "keepalive.ping");
     } catch (err: any) {
+      if (err instanceof SandboxRuntimeTerminalError) {
+        await reportTerminalFailure(deps, sessionId, targetKey, err.reason);
+      }
       if (err?.sandboxConfirmedRunning === true) {
         failCounts.delete(targetKey);
         logger.error(
