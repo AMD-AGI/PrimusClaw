@@ -452,6 +452,7 @@ export function eligibleForClusterReclaim(
     sessionDeleted?: unknown;
     idleSince?: unknown;
     workSeenAt?: unknown;
+    quiescedAt?: unknown;
   },
   now: number,
 ): boolean {
