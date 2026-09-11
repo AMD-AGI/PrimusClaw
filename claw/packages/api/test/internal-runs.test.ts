@@ -368,10 +368,13 @@ for (const route of ["unclaim", "fail-claim"] as const) {
 }
 
 test("unclaim passes an integer claim_count through to the fence", async () => {
-  let seen: unknown;
+  // `applyTaskStatusTransition` builds its own values first and appends the
+  // caller's after them, so the fence's position is the writer's business.
+  // What this test is about is that an integer reaches the CAS at all.
+  let seen: unknown[] = [];
   db.query = (async (text: string, params: unknown[] = []) => {
     if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
-      seen = params[2];
+      seen = params;
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -383,7 +386,7 @@ test("unclaim passes an integer claim_count through to the fence", async () => {
     payload: { brain_id: "brain-7", claim_count: 3, reason: "retry" },
   });
   assert.equal(res.statusCode, 200);
-  assert.equal(seen, 3);
+  assert.ok(seen.includes(3), `the fence took no integer: ${JSON.stringify(seen)}`);
 });
 
 // `unspecified` is a metric label for a body that named no reason. A body that
@@ -512,6 +515,8 @@ test("the claim route reports the row's generation, and the settle routes read i
   const upd = seen.find((q) => /SET status = 'queued'/.test(q.sql));
   assert.ok(upd, "the release ran");
   assert.ok(upd?.params.includes(4), "and it carried the parsed generation into the CAS");
-  assert.match(String(upd?.params.find((p) => typeof p === "string" && p.includes("last_release"))),
-    /lock_contention/, "and the reason");
+  // The key is spelled in the statement and the reason is bound beside it, so
+  // that the same UPDATE can also restamp `queued_since`.
+  assert.match(upd!.sql, /last_release/, "the statement records the reason under that key");
+  assert.ok(upd?.params.includes("lock_contention"), "and the reason reached it");
 });

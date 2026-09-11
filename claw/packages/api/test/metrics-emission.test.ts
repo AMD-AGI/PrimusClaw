@@ -878,19 +878,14 @@ function claimRowFor(shape: ClaimShape, taskId: string): Record<string, unknown>
     task_id: taskId,
     session_id: "s-1",
     status: "preparing",
-    prior_status: "preparing",
-    queued_since: null,
     deadline_at: null,
     claim_count: 1,
     metadata: { message_id: `m-${taskId}` },
     input: { prompt: "hello", session_id: "s-1", user_id: "u-1", credentials: blob },
   };
-  if (shape === "claimed_from_queue") {
-    return {
-      ...row, prior_status: "queued",
-      queued_since: new Date(Date.now() - 5_000).toISOString(),
-    };
-  }
+  // `claimed_from_queue` differs from `claimed` only in where the row came
+  // from, which is the prior read's answer rather than the claim's -- see
+  // priorStateFor.
   if (shape === "unclaimable") {
     return { ...row, input: { prompt: "hello", session_id: "s-1", user_id: "u-1" } };
   }
@@ -914,9 +909,34 @@ interface ClaimStub {
   failClaimRows?: number;
 }
 
+/**
+ * The pre-claim state, which the claim reads under its own lock.
+ *
+ * It cannot come off the claim's own UPDATE: `RETURNING` answers with what the
+ * row became, and whether this was a queue exit is a fact about what it was.
+ */
+function priorStateFor(shape: ClaimShape): Record<string, unknown> {
+  return shape === "claimed_from_queue"
+    ? { prior_status: "queued", queued_since: new Date(Date.now() - 5_000).toISOString() }
+    : { prior_status: "preparing", queued_since: null };
+}
+
+/**
+ * The task id a statement names.
+ *
+ * `applyTaskStatusTransition` numbers its own values before the caller's, so
+ * `$1` is the writer's first value rather than the call site's. Read the
+ * placeholder the predicate actually uses instead of a fixed index.
+ */
+function taskIdOf(sql: string, params: unknown[]): string {
+  const at = sql.match(/task_id = \$(\d+)/);
+  return String((at ? params[Number(at[1]) - 1] : params[0]) ?? "");
+}
+
 /** Answer the claim path's statements the way a database holding those rows would. */
 function stubClaims(opts: ClaimStub = {}): DbStub {
   const shapeOf = opts.shape ?? (() => "claimed" as ClaimShape);
+  const claimShape = new Map<string, ClaimShape>();
   return stubDb((sql, params) => {
     if (opts.fail?.test(sql)) throw new Error("pg down");
     if (sql.startsWith("SELECT task_id FROM claw_tasks")) {
@@ -924,22 +944,38 @@ function stubClaims(opts: ClaimStub = {}): DbStub {
       const next = (opts.queue ?? []).find((id) => !skip.includes(id));
       return next ? [{ task_id: next }] : [];
     }
-    const taskId = String(params[0] ?? "");
-    const shape = shapeOf(taskId);
-    if (sql.startsWith("WITH prior AS")) {
-      return shape === "missing" || shape === "busy" ? [] : [claimRowFor(shape, taskId)];
+    const taskId = taskIdOf(sql, params);
+    // One claim sees one row state. The prior read takes the lock and the
+    // write and the diagnostic that follow it report under that same lock, so
+    // the shape is decided once per claim rather than once per statement --
+    // otherwise a `shape` callback that advances, which is how a race is
+    // written here, advances twice for a single claim and the claimer that
+    // won reads as the one that lost.
+    if (sql.startsWith("SELECT status AS prior_status")) {
+      const fresh = shapeOf(taskId);
+      claimShape.set(taskId, fresh);
+      return fresh === "missing" ? [] : [priorStateFor(fresh)];
+    }
+    const shape = () => claimShape.get(taskId) ?? shapeOf(taskId);
+    if (sql.startsWith("UPDATE claw_tasks SET status = 'preparing'")) {
+      const s = shape();
+      return s === "missing" || s === "busy" ? [] : [claimRowFor(s, taskId)];
     }
     if (sql.startsWith("SELECT status, lease_expires_at")) {
-      return shape === "missing" ? [] : [{ status: "preparing", lease_expires_at: null }];
+      return shape() === "missing" ? [] : [{ status: "preparing", lease_expires_at: null }];
     }
     if (sql.includes("SET status = 'queued'")) {
       return (opts.releaseRows ?? 1) > 0 ? [{ task_id: taskId }] : [];
     }
-    if (sql.includes("failure_reason = $3")) {
-      return (opts.failClaimRows ?? 1) > 0 ? [{ task_id: taskId }] : [];
-    }
-    if (sql.includes("failure_reason = $2") || sql.includes("failure_reason = 'unclaimable'")) {
-      return [{ task_id: taskId }];
+    // One writer means one spelling, so the three ways a claim can end in
+    // `failed` are told apart by the fence each carries rather than by which
+    // `$n` the reason took: only the held-claim path asks whether this brain
+    // is still the holder. `lease_owner` appears in every SET, so the match
+    // has to be on the predicate.
+    if (sql.includes("SET status = 'failed'")) {
+      return /WHERE .*lease_owner = \$\d+/.test(sql)
+        ? ((opts.failClaimRows ?? 1) > 0 ? [{ task_id: taskId }] : [])
+        : [{ task_id: taskId }];
     }
     return [];
   });
@@ -1046,7 +1082,7 @@ test("an empty queue counts empty rather than all_skipped", async () => {
 const CLAIM_FAULTS = [
   {
     what: "a by-id claim", url: "/v1/internal/tasks/ktsk_1/claim",
-    fail: /^WITH prior AS/, mode: "by_id", other: "next",
+    fail: /^SELECT status AS prior_status/, mode: "by_id", other: "next",
   },
   {
     what: "the claim-next peek", url: "/v1/internal/runs/claim-next",
@@ -1231,7 +1267,8 @@ const GUARDED_WRITES = [
   {
     what: "a fail-claim", url: "/v1/internal/tasks/ktsk_1/fail-claim",
     body: { reason: "claim_abandoned" }, name: FAILCLAIM, label: "claim_abandoned",
-    stub: { failClaimRows: 0 } as ClaimStub, fail: /failure_reason = \$3/,
+    stub: { failClaimRows: 0 } as ClaimStub,
+    fail: /SET status = 'failed'.*WHERE .*lease_owner = \$\d+/,
   },
 ] as const;
 

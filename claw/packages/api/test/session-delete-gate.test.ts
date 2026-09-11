@@ -74,7 +74,9 @@ test("D3 the runs are cancelled before the row is hidden", async () => {
   stub.restore();
   const seen = stub.seen;
 
-  const cancel = seen.findIndex((q) => /UPDATE claw_tasks t SET status = 'cancelled'/.test(q.sql));
+  // The cancel is written by `applyTaskStatusTransition`, the one status
+  // writer, whose statement needs no join and so carries no table alias.
+  const cancel = seen.findIndex((q) => /UPDATE claw_tasks SET status = 'cancelled'/.test(q.sql));
   const hide = seen.findIndex((q) => q.sql.startsWith("UPDATE claw_sessions SET deleted_at"));
   assert.ok(cancel >= 0, "the session's runs were not cancelled");
   assert.ok(hide >= 0, "the session row was never hidden");

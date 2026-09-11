@@ -113,6 +113,8 @@ test("names the session gate owner column before a request tries to write it", (
     without([["claw_sessions", "agent_gate_message_id"]]),
   );
   assert.deepEqual(problems, ["claw_sessions is missing column(s): agent_gate_message_id"]);
+});
+
 for (const column of [
   "attempt_id",
   "attempt_generation",

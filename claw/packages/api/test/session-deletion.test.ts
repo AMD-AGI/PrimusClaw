@@ -170,14 +170,19 @@ test("the deletion is one transaction, on one connection", async () => {
   assert.equal(sql[0], "BEGIN");
   assert.equal(sql.at(-1), "COMMIT");
   assert.ok(dbStub.ran(/DELETE FROM claw_pending_messages/));
-  assert.ok(dbStub.ran(/UPDATE claw_tasks t SET status = 'cancelled'/));
+  // Unaliased, because the one status writer builds it without a join -- and
+  // it banks the queue segment it closes, which the hand-written UPDATE this
+  // replaced did not.
+  assert.ok(dbStub.ran(/UPDATE claw_tasks SET status = 'cancelled'[\s\S]*queued_ms_accrued/));
   assert.ok(dbStub.ran(/UPDATE claw_conversation_turns SET deleted_at/));
   assert.ok(dbStub.ran(/UPDATE claw_sessions SET deleted_at = COALESCE/));
 });
 
 test("a committed deletion records every queued doorbell it cancelled", async () => {
   dbStub = stubDb((sql) => {
-    if (/UPDATE claw_tasks t SET status = 'cancelled'/.test(sql)) {
+    // The prior state comes off its own locking read now, not off the
+    // UPDATE's RETURNING: RETURNING can only report what a row became.
+    if (/SELECT status AS prior_status/.test(sql)) {
       return [
         { prior_status: "queued", origin: "chat", dispatch: "doorbell", queued_since: null },
         { prior_status: "preparing", origin: "chat", dispatch: "doorbell", queued_since: null },
@@ -194,7 +199,9 @@ test("a committed deletion records every queued doorbell it cancelled", async ()
 
 test("a rolled-back deletion records no queue exit", async () => {
   dbStub = stubDb((sql) => {
-    if (/UPDATE claw_tasks t SET status = 'cancelled'/.test(sql)) {
+    // Same read as the committed case, so that a delta of 0 here means the
+    // rollback suppressed the metric rather than that nothing was ever counted.
+    if (/SELECT status AS prior_status/.test(sql)) {
       return [{ prior_status: "queued", origin: "chat", dispatch: "doorbell", queued_since: null }];
     }
     if (/UPDATE claw_conversation_turns/.test(sql)) throw new Error("write failed");

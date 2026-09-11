@@ -53,6 +53,10 @@ function stubQueries(
     // subject of any assertion here, so it answers itself and consumes no
     // scripted reply.
     if (/run_phase/.test(sql)) return { rows: [], rowCount: 0 };
+    // Nor does the prior-state read the claim takes before it writes: the
+    // queue-exit metric is measured from what the row was, and a scripted
+    // reply consumed here would shift every later one by a statement.
+    if (/^SELECT status AS prior_status/.test(sql)) return { rows: [], rowCount: 0 };
     seen.push({ sql, params });
     const reply = replies[i++];
     if (!reply) return { rows: [], rowCount: 0 };
@@ -201,7 +205,13 @@ test("unclaim returns the row to queued for the holder only", async () => {
   assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
   const update = statusUpdate(seen);
   assert.match(update.sql, /SET status = 'queued'/);
-  assert.equal(update.params[update.params.length - 2], "brain-7");
+  // The one status writer numbers its own values before the caller's, so the
+  // holder's position is the writer's business. Read the placeholder the
+  // predicate uses -- `lease_owner` is in the SET too, so it has to be the one
+  // after WHERE.
+  const holder = update.sql.match(/WHERE .*lease_owner = \$(\d+)/);
+  assert.ok(holder, `no holder fence in:\n${update.sql}`);
+  assert.equal(update.params[Number(holder![1]) - 1], "brain-7");
 });
 
 test("a row that is not there is missing, not busy", async () => {
@@ -301,7 +311,9 @@ test("too many claims fail the row as max_retries_exceeded", async () => {
       () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
     ]);
     const taken = await claimRunById("ktsk_1", "brain-7");
-    assert.ok(seen.some((q) => /claim_count = COALESCE\(claw_tasks\.claim_count, 0\) \+ 1/.test(q.sql)));
+    // Unqualified: the claim's UPDATE has no FROM clause, so there is nothing
+  // for `claw_tasks.` to disambiguate it from.
+  assert.ok(seen.some((q) => /claim_count = COALESCE\((?:claw_tasks\.)?claim_count, 0\) \+ 1/.test(q.sql)));
     // The reason is a bind parameter now: the poison guard reports
     // lock_contention_exhausted when the last holder said it was waiting on a
     // lock, and max_retries_exceeded otherwise.
