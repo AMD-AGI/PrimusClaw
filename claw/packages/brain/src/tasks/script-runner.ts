@@ -353,7 +353,11 @@ export async function runScript(
             );
             handsArgs = { ...args, [timeoutField]: timeoutSec };
           }
-          const out = await ctx.hands.callToolFull(step.name, handsArgs, attemptSignal);
+          // The step's position: a replay re-enters at the same one, which is
+          // what lets a background start there recognise its own retry.
+          const out = await ctx.hands.callToolFull(
+            step.name, handsArgs, attemptSignal, { stepIdentity: `script:${i}` },
+          );
           resultText = out.text;
           structured = out.structured;
           if (out.isError) stepError = out.text || "hands tool returned isError";

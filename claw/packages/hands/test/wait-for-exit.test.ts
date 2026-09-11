@@ -17,6 +17,10 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 
+import { isolatingSandbox } from "./support/sandbox-isolation.js";
+
+isolatingSandbox();
+
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 // Production keeps a finished shell readable for a minute after it exits. Here
@@ -25,6 +29,7 @@ process.env.BG_SHELL_REAP_DELAY_MS = "10";
 // Read after the env is set: the flag is resolved at module load.
 const { spawnBackground, waitForShellExit, shutdownAllShells } =
   await import("../src/tools/shell/bg-manager.js");
+type Resolution = Exclude<ReturnType<typeof waitForShellExit>, Promise<unknown>>;
 
 // Without this the run sits until the longest sleep below finishes on its own.
 after(() => shutdownAllShells(50));
@@ -37,7 +42,7 @@ const promised = (v: ReturnType<typeof waitForShellExit>) => {
 test("the wait ends when the shell does, not when the timeout does", async () => {
   spawnBackground("owner-a", "run-a", "sleep 0.3; exit 7", "quick");
   const startedAt = Date.now();
-  const shell = await promised(waitForShellExit("owner-a", "quick", 30_000));
+  const shell = await promised(waitForShellExit("owner-a", "run-a", "quick", 30_000));
   const elapsed = Date.now() - startedAt;
 
   assert.equal(shell?.exitCode, 7, "the exit code is readable by the time the wait resolves");
@@ -47,19 +52,18 @@ test("the wait ends when the shell does, not when the timeout does", async () =>
 
 test("a wait that runs out reports the shell is still going, and does not kill it", async () => {
   spawnBackground("owner-b", "run-b", "sleep 20", "slow");
-  const result = await promised(waitForShellExit("owner-b", "slow", 150));
+  const result = await promised(waitForShellExit("owner-b", "run-b", "slow", 150));
 
   assert.equal(result, null, "null is how the caller learns to say 'still running'");
 });
 
-test("waiting on a shell that already finished returns at once", async () => {
+test("waiting on a shell that already finished is answered by its class, not waited on", async () => {
   spawnBackground("owner-c", "run-c", "exit 0", "done");
-  await promised(waitForShellExit("owner-c", "done", 30_000));
+  await promised(waitForShellExit("owner-c", "run-c", "done", 30_000));
 
-  const startedAt = Date.now();
-  const again = await promised(waitForShellExit("owner-c", "done", 30_000));
-  assert.equal(again?.status, "exited");
-  assert.ok(Date.now() - startedAt < 100, "no second wait for an exit that already happened");
+  const again = waitForShellExit("owner-c", "run-c", "done", 30_000);
+  assert.ok(!(again instanceof Promise), "an exit that already happened is not waited for again");
+  assert.equal((again as Resolution).cls, "finished");
 });
 
 test("waiting in slices does not pile up listeners on the shell", async () => {
@@ -69,11 +73,11 @@ test("waiting in slices does not pile up listeners on the shell", async () => {
   // own left them all attached: Node warns at eleven with a
   // MaxListenersExceededWarning, which reads as a leak and is the last thing
   // anybody wants to be diagnosing mid-training-run.
-  const shell = spawnBackground("owner-g", "run-g", "sleep 20", "sliced");
+  const shell = spawnBackground("owner-g", "run-g", "sleep 20", "sliced").shell!;
   const before = shell.process.listenerCount("exit");
 
   for (let i = 0; i < 12; i++) {
-    assert.equal(await promised(waitForShellExit("owner-g", "sliced", 5)), null);
+    assert.equal(await promised(waitForShellExit("owner-g", "run-g", "sliced", 5)), null);
   }
 
   assert.equal(
@@ -88,14 +92,26 @@ test("a wait cannot reach another owner's shell", async () => {
   // run, and the next occupant must not be able to block on -- or learn the
   // existence of -- the previous one's processes.
   spawnBackground("owner-d", "run-d", "sleep 20", "private");
-  const refused = waitForShellExit("owner-e", "private", 100);
+  const refused = waitForShellExit("owner-e", "run-e", "private", 100);
 
   assert.ok(!(refused instanceof Promise));
-  assert.match((refused as { error: string }).error, /not found/);
+  assert.equal((refused as Resolution).cls, "unknown");
 });
 
 test("an unknown shell is refused rather than waited on", async () => {
-  const refused = waitForShellExit("owner-f", "never-existed", 100);
+  const refused = waitForShellExit("owner-f", "run-f", "never-existed", 100);
   assert.ok(!(refused instanceof Promise));
-  assert.match((refused as { error: string }).error, /not found/);
+  assert.equal((refused as Resolution).cls, "unknown");
+});
+
+test("another scope's id and an id never issued are answered identically", async () => {
+  // The two answers are the whole of what a caller sees, so differencing them
+  // is the leak: an id belonging to somebody else must be indistinguishable
+  // from one that was never issued to anyone.
+  spawnBackground("owner-h", "run-h", "sleep 20", "someone-elses");
+  const foreign = waitForShellExit("owner-i", "run-i", "someone-elses", 100);
+  const absent = waitForShellExit("owner-i", "run-i", "never-issued", 100);
+
+  assert.ok(!(foreign instanceof Promise) && !(absent instanceof Promise));
+  assert.deepEqual(foreign, absent);
 });

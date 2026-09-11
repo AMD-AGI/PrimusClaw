@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import { z } from "zod";
-import { currentOwner } from "../../runtime/owner-context.js";
-import { waitForShellExit, pollOutput, BG_SHELL_DISABLED_MESSAGE } from "./bg-manager.js";
+import { currentOwner, currentRun } from "../../runtime/owner-context.js";
+import {
+  waitForShellExit, pollOutput, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
+} from "./bg-manager.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
 /**
@@ -58,9 +60,33 @@ export const wait = {
     const timeoutSec = Math.min(requested, WAIT_MAX_SEC);
 
     const owner = currentOwner();
-    const pending = waitForShellExit(owner, args.shell_id, timeoutSec * 1000);
+    const run = currentRun();
+    const pending = waitForShellExit(owner, run, args.shell_id, timeoutSec * 1000);
+    // Not a wait at all: the class already settles the question, so the caller
+    // is answered now rather than held for the timeout on a shell that can
+    // never produce an exit event.
     if (!(pending instanceof Promise)) {
-      return { content: [{ type: "text" as const, text: `Error: ${pending.error}` }], isError: true };
+      if (pending.cls === "unknown") {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${UNKNOWN_SHELL_MESSAGE}` }],
+          isError: true,
+          structuredContent: { shell_class: "unknown" as const },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Shell ${args.shell_id} is ${pending.cls}; nothing was waited for` }],
+        structuredContent: {
+          shell_id: args.shell_id,
+          shell_class: pending.cls,
+          // What this call did, so a caller that decided whether to hand back
+          // its execution slot can be checked against it rather than trusted.
+          blocking: false,
+          finished: pending.cls === "finished",
+          status: pending.status ?? null,
+          exit_code: pending.exitCode ?? null,
+          waited_sec: 0,
+        },
+      };
     }
 
     const startedAt = Date.now();
@@ -70,14 +96,14 @@ export const wait = {
     // The output is read through the ordinary poll so that a wait and a
     // bash_output leave the read offset in the same place: whichever the model
     // used, it has seen the same bytes and the next call continues after them.
-    const output = pollOutput(owner, args.shell_id, undefined);
+    const polled = pollOutput(owner, run, args.shell_id, undefined);
 
     const header = shell
       ? `Shell ${args.shell_id} finished after ~${waitedSec}s (status=${shell.status}, exit_code=${shell.exitCode ?? "?"})`
       : `Shell ${args.shell_id} is still running after ${waitedSec}s. Call wait again to keep waiting, or kill_shell to stop it.`;
 
     return {
-      content: [{ type: "text" as const, text: `${header}\n\n${output}` }],
+      content: [{ type: "text" as const, text: `${header}\n\n${polled.text}` }],
       // The same answer as a field rather than a sentence.
       //
       // The text above has always said whether the shell finished, and a caller
@@ -86,6 +112,8 @@ export const wait = {
       // is what a repeat step's `until` reads.
       structuredContent: {
         shell_id: args.shell_id,
+        shell_class: polled.structured.shell_class,
+        blocking: true,
         finished: !!shell,
         status: shell?.status ?? "running",
         exit_code: shell?.exitCode ?? null,

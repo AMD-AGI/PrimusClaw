@@ -20,6 +20,10 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 
+import { isolatingSandbox } from "./support/sandbox-isolation.js";
+
+isolatingSandbox();
+
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 // Long enough that an exited shell is still in the registry when it is counted.
@@ -47,12 +51,12 @@ async function until(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 afterEach(async () => { await shutdownAllShells(200); });
 
 test("a shell that has exited is still readable but no longer counts as work", async () => {
-  const quick = spawnBackground(OWNER, RUN, "echo done", "quick");
+  const quick = spawnBackground(OWNER, RUN, "echo done", "quick").shell!;
   assert.ok(await until(() => quick.status !== "running"), "sanity: it ends on its own");
 
   // Still in the registry -- this is the window the production delay keeps open,
   // and the reason counting registry entries rather than running ones is wrong.
-  assert.match(pollOutput(OWNER, "quick"), /done/,
+  assert.match(pollOutput(OWNER, RUN, "quick").text, /done/,
     "sanity: a finished shell is retained so its output survives into the next turn");
 
   assert.equal(runningShellCount(OWNER), 0,
@@ -60,16 +64,16 @@ test("a shell that has exited is still readable but no longer counts as work", a
 });
 
 test("an exited shell does not mask a running one, or inflate the count beside it", async () => {
-  const quick = spawnBackground(OWNER, RUN, "echo done", "quick2");
-  const long = spawnBackground(OWNER, RUN, "sleep 60", "long2");
+  const quick = spawnBackground(OWNER, RUN, "echo done", "quick2").shell!;
+  const long = spawnBackground(OWNER, RUN, "sleep 60", "long2").shell!;
 
   assert.ok(await until(() => quick.status !== "running"));
-  assert.match(pollOutput(OWNER, "quick2"), /done/, "sanity: still retained");
+  assert.match(pollOutput(OWNER, RUN, "quick2").text, /done/, "sanity: still retained");
 
   assert.equal(runningShellCount(OWNER), 1,
     "exactly the running one: the exited neighbour is retained, not counted");
 
-  killShell(OWNER, "long2");
+  killShell(OWNER, RUN, "long2");
   assert.ok(await until(() => long.status !== "running"));
   assert.equal(runningShellCount(OWNER), 0,
     "with the last running shell gone the handle is free, whatever is still retained");

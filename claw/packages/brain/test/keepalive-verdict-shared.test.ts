@@ -23,7 +23,7 @@ import { StringCodec } from "nats";
 import type { KV } from "nats";
 import {
   runKeepaliveTickForTest, unregisterSandbox, resetBackgroundWorkStateForTest,
-  backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest, markHandsIdle,
+  backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest, markHandsIdle, registerSandbox,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -55,12 +55,13 @@ afterEach(() => {
   restoreProviders = null;
 });
 
-function stubPingableProvider(): void {
+function stubPingableProvider(overrides: Partial<SandboxProvider> = {}): void {
   const provider = {
     kind: "safe-workload",
     async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     async get() { return { running: true, healthy: true }; },
     async stop() {},
+    ...overrides,
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
 }
@@ -94,7 +95,12 @@ function fakeKv(): {
       if (key !== KEY || deleted.includes(key)) return null;
       return { key, value, revision };
     },
-    async delete(key: string) { deleted.push(key); },
+    async delete(key: string, opts?: { previousSeq?: number }) {
+      if (opts?.previousSeq !== undefined && opts.previousSeq !== revision) {
+        throw new Error("revision conflict");
+      }
+      deleted.push(key);
+    },
     async put() { return ++revision; },
     async update(_k: string, v: unknown, rev: number) {
       if (rev !== revision) throw new Error("revision conflict");
@@ -151,7 +157,8 @@ test("a sweep that does not see the handle does not discard its verdict", async 
   );
 });
 
-test("the verdict is on the handle, so another replica can read it", async () => {
+test("the verdict is on the handle, so another replica can read it", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
   stubPingableProvider();
 
@@ -165,6 +172,8 @@ test("the verdict is on the handle, so another replica can read it", async () =>
     typeof k.current().bgCheckedAt, "number",
     "and stamped, because it is believed for a bounded time rather than forever",
   );
+
+  t.mock.timers.tick(16 * 60_000);
 
   // A different replica: same bucket, no memory of any of this, and a probe that
   // would fail if it were reached at all. The decision has to come off the
@@ -205,20 +214,18 @@ test("a handle carrying running work is kept by a replica that never probed it",
   );
 });
 
-// --- the give-up path, under the same rotation ---
+const CLEAR_WORK = 'MARKER {"epoch":"e1","bearer":{"pid":7,"startToken":"t7"}}\nSUBTREE ok\nPROCS 7';
 
-test("a run of failed probes is not restarted by the sweeps that walk elsewhere", async () => {
-  // `unknown` holds the handle, which is right for a blip and wrong forever, so
-  // a run longer than the tolerance of five -- the sixth consecutive failure --
-  // settles it to idle locally. A failed probe caches
-  // nothing on purpose -- only a measured answer is worth reusing -- and the
-  // streak used to be reaped whenever no cached answer accompanied it. Under the
-  // rotation this module runs under that is most ticks, so the count restarted
-  // at one every time, the tolerance was never reached, and a Hands that had
-  // stopped answering held its handle to the CR's absolute deadline: the same
-  // failure this file is about, one map over.
+function stubClearWork(): void {
+  stubPingableProvider({
+    async exec() { return { exitCode: 0, stdout: CLEAR_WORK, stderr: "" }; },
+  });
+}
+
+test("positive idle evidence reclaims a handle despite failed Hands probes and rotating sweeps", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
-  stubPingableProvider();
+  stubClearWork();
   const deps = {
     kv: k.kv,
     countActiveShells: async () => { throw new Error("hands unreachable"); },
@@ -226,17 +233,14 @@ test("a run of failed probes is not restarted by the sweeps that walk elsewhere"
 
   for (let i = 0; i < 8 && !k.deleted.includes(KEY); i++) {
     await sweep(deps);
-    // The walk rotates away, and comes back. Nothing about the sandbox changed.
     k.setVisible(false);
     await sweep(deps);
     k.setVisible(true);
+    t.mock.timers.tick(3 * 60_000);
   }
 
-  assert.ok(
-    k.deleted.includes(KEY),
-    "the failures were consecutive; only the ticks that did not look at this "
-      + "handle came between them, and those must not be what resets the count",
-  );
+  assert.equal(k.current().bgRunning, 0, "the complete record read supplies positive idle evidence");
+  assert.ok(k.deleted.includes(KEY), "observed idle work is reclaimed after the reuse window");
 });
 
 test("a streak nothing adds to is still eventually forgotten", async () => {
@@ -305,54 +309,22 @@ test("a verdict is not stamped onto whatever took the key while the probe was ou
   );
 });
 
-// The interval between two probes of the same identity is the interval the
-// streak has to survive, and it is not the one the shared verdict is sized for.
-// A verdict is read by whichever replica sweeps next; a streak is in-process, so
-// only the replica that failed can add to it, and it waits out the rotation
-// multiplied by the replica count -- tens of minutes even on a small fleet, and
-// longer on a bigger one. Against a thirty-minute memory that is the bug: every
-// failure aged out before the same replica could fail again, the count never
-// left one, and the give-up path existed without ever being able to fire.
-//
-// The interval below stands for that scale rather than for any one deployment's
-// number. What the test pins is the ordering -- a memory shorter than the
-// revisit interval can never accumulate a streak -- not the value.
 const SAME_REPLICA_REVISIT_MS = 36 * 60_000;
 
-test("a run of failures accumulates across the interval the same replica returns on", async () => {
+test("repeated failures across long revisit intervals never authorize reclaim", async () => {
   const k = fakeKv();
   stubPingableProvider();
   const deps = {
     kv: k.kv,
     countActiveShells: async () => { throw new Error("hands unreachable"); },
   };
-
-  // Each pass is one visit by this replica; the clock moves by a whole revisit
-  // interval before the next one, which is the gap the real cadence has.
   for (let i = 0; i < 12; i++) {
     await sweep(deps);
-    // Stop the clock once the give-up has settled: the answer it caches is
-    // believed for the short in-process TTL, and another revisit interval on top
-    // of it would age out the very thing the next sweep has to read.
-    if (backgroundWorkStateSizesForTest().cache > 0) break;
     ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
+    assert.equal(backgroundWorkStateSizesForTest().streaks, 1);
   }
-
-  assert.ok(
-    backgroundWorkStateSizesForTest().cache > 0,
-    "six failures spaced by the interval this replica actually returns on are "
-      + "still six consecutive failures; a memory shorter than that gap forgets "
-      + "each one before the next arrives and the tolerance is never reached",
-  );
-
-  // And the give-up has to be readable by the sweep that follows it, which is
-  // the point of settling to idle at all.
-  await sweep(deps);
-  assert.ok(
-    k.deleted.includes(KEY),
-    "a Hands that has stopped answering entirely must eventually give its pod "
-      + "back rather than hold it to the CR's absolute deadline",
-  );
+  assert.equal(k.current().bgRunning, undefined, "a failure count cannot supply evidence");
+  assert.ok(!k.deleted.includes(KEY));
 });
 
 test("a streak is not dropped by an unrelated verdict aging out", async () => {
@@ -397,7 +369,7 @@ test("a streak is not dropped by an unrelated verdict aging out", async () => {
   assert.equal(
     backgroundWorkStateSizesForTest().streaks, 1,
     "the run of failures is fresh and unrelated to the answer that expired; "
-      + "reaping it here restarts the count and the give-up never arrives",
+      + "reaping it here loses the recent failures needed for reporting",
   );
 });
 
@@ -1023,18 +995,8 @@ test("a `running` on the handle is not outranked by a local `idle` with a later 
   );
 });
 
-test("an `idle` answer landing late does not overwrite a `running` one from the same period", async () => {
-  // The read side prefers `running` from either copy, and that only decides
-  // anything while both answers exist to be compared. One verdict is kept per
-  // handle, so the write side is where an answer can be made to stop existing:
-  // whichever probe persists last is what every later sweep reads, and the two
-  // probes are on different replicas with no ordering between them.
-  //
-  // Nothing above catches it. The identity check says the entry still names the
-  // sandbox that was probed, and the period checks say it is still in the idle
-  // period that was probed. Both are true of the loser of this race -- it is the
-  // same sandbox and the same period; it is simply the less authoritative answer
-  // about them, and it arrives second.
+test("an `idle` answer landing late does not overwrite a `running` one from the same period", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1125,7 +1087,8 @@ test("an `idle` answer landing late does not overwrite a `running` one from the 
   );
 });
 
-test("a `running` answer is not dropped by an `idle` one decided against the same revision", async () => {
+test("a `running` answer is not dropped by an `idle` one decided against the same revision", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   // The guard above settles the race it can see: an answer already published on
   // the entry against one that arrives after it. This is the same race one step
   // earlier, where there is nothing published for the guard to compare against.
@@ -1210,21 +1173,8 @@ test("a `running` answer is not dropped by an `idle` one decided against the sam
   );
 });
 
-test("a `running` answer is not given up on because the contention outlasted its retries", async () => {
-  // The retry above settles the same-revision race by re-reading and insisting.
-  // The retries are counted, though, and the count was the whole guarantee: an
-  // `idle` that keeps arriving for as long as the `running` keeps trying wins by
-  // outlasting it, and giving up is the one outcome a `running` answer may not
-  // have. Losing the update is cheap for `idle` -- another sweep files it again
-  // -- and terminal for `running`, because what it leaves behind is not "no
-  // answer" but the contending `idle`, and the next replica to read that
-  // reclaims a sandbox with a shell in it. So the retries have to outlast the
-  // contention rather than the other way round.
-  //
-  // Sustained, and against a live period the whole time: every contending write
-  // here leaves the period's name exactly as it found it, so nothing this
-  // replica re-asks on the way round ever tells it to stop for a legitimate
-  // reason. The only thing standing between it and the write is the counter.
+test("a `running` answer is not given up on because the contention outlasted its retries", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1312,23 +1262,8 @@ test("a `running` answer is not given up on because the contention outlasted its
 });
 
 
-test("a `running` answer is not lost to a reclaim decided on the `idle` it is contesting", async () => {
-  // The retry settles the same-revision race by insisting: the `idle` that won
-  // the conditional update is re-read and overwritten. That works only for as
-  // long as there is an entry to overwrite.
-  //
-  // Which is not something the retry controls. The `idle` it lost to is a
-  // published verdict the moment it lands, and any replica that reads it sees a
-  // spare handle past its reuse window with no registration and no run lease
-  // behind it -- so it reclaims. The reclaim does not merely beat the `running`
-  // answer to the entry; it removes the entry both answers are about, and the
-  // retry then finds no key, has nothing to insist against, and drops a
-  // measurement of live background work on the floor. The budget it had left is
-  // beside the point, which is why more of it is not the repair.
-  //
-  // Nothing tied the reclaim to the question still being asked. A verdict is
-  // published where every replica can read it; the probe that is still deciding
-  // it was not.
+test("a `running` answer is not lost to a reclaim decided on the `idle` it is contesting", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
   stubPingableProvider();
 
@@ -1437,7 +1372,8 @@ function idlePeriodWithNothingOutstanding(k: ReturnType<typeof fakeKv>): Record<
   return stamped;
 }
 
-test("a reservation that loses a revision is republished before Hands is asked", async () => {
+test("a reservation that loses a revision is republished before Hands is asked", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   // The reservation was written the way every other value in this sweep is:
   // one read, one conditional update, and silence if it did not land. That is
   // the right shape for a verdict, where losing means somebody else's answer is
@@ -1586,58 +1522,24 @@ test("a probe nothing can reserve is not asked at all", async () => {
   );
 });
 
-// --- an inference has to survive long enough to be read ---
-
-test("giving up on an unreachable Hands releases the handle rather than repeating", async () => {
-  // The give-up answer is kept in this process only, which is right -- it is a
-  // statement about one replica's reach, not a measurement to publish. But that
-  // makes the replica that inferred it the only one that can read it, so it has
-  // to survive until THAT replica walks the handle again: the same
-  // rotation-times-replica-count gap the streak above is sized for, not the five
-  // minutes a measured answer is reused for.
-  //
-  // Under the short lifetime the inference expired unread every time. The
-  // handle was probed again, the probes failed again, the streak gave up again
-  // -- six, seven, eight failures deep -- and the pod was never released, which
-  // is the one thing the give-up path exists to do.
+test("shared idle evidence survives a local cache expiring between visits", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
-  stubPingableProvider();
+  stubClearWork();
   const deps = {
     kv: k.kv,
     countActiveShells: async () => { throw new Error("hands unreachable"); },
   };
-
-  for (let visit = 0; visit < 10 && !k.deleted.includes(KEY); visit++) {
+  for (let visit = 0; visit < 5 && !k.deleted.includes(KEY); visit++) {
     await sweep(deps);
-    // One whole revisit interval before this replica sees the handle again --
-    // the cadence the give-up answer actually has to live through, rather than
-    // a second sweep arriving while it is still warm.
-    ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
+    t.mock.timers.tick(6 * 60_000);
   }
-
-  assert.ok(
-    k.deleted.includes(KEY),
-    "the give-up settled to `idle` and then expired before the sweep that would "
-      + "have acted on it; a Hands that has stopped answering holds its pod to "
-      + "the CR's absolute deadline and the tolerance means nothing",
-  );
+  assert.ok(k.deleted.includes(KEY), "positive idle evidence permits eventual reclamation");
 });
 
-test("a give-up is revised by the Hands that comes back before the window ends", async () => {
-  // What the longer life may not cost. The lifetime of a cached answer was also
-  // how long this replica stopped asking -- `needsProbe` reads the same rule --
-  // so an inference believed for hours would be an inference nothing could
-  // revise: a handle inside its reuse window is not deleted and opens no new
-  // idle period, so no probe means no correction. A Hands that blipped for six
-  // probes and came straight back would then have its pod reclaimed at the end
-  // of the window with a background shell still running in it, which is the
-  // reclaim this whole file exists to prevent.
+test("idle record evidence is revised when Hands returns with running work", async () => {
   const k = fakeKv();
-  stubPingableProvider();
-  // Freshly idled, so the give-up does not immediately delete the handle and
-  // there is a window left for the recovery to matter in.
-  k.replace({ ...ENTRY, idleSince: Date.now() });
-
+  stubClearWork();
   let reachable = false;
   let probes = 0;
   const deps = {
@@ -1648,84 +1550,34 @@ test("a give-up is revised by the Hands that comes back before the window ends",
       return 1;
     },
   };
-
-  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
-    await sweep(deps);
-  }
-  assert.equal(
-    backgroundWorkStateSizesForTest().cache, 1,
-    "sanity: the streak gave up and inferred `idle` while the window is still open",
-  );
-  const gaveUpAfter = probes;
-
-  // Hands comes back, with a background shell running in the pod, and the
-  // inference is older than the interval a probe is skipped for.
+  await sweep(deps);
+  assert.equal(k.current().bgRunning, 0);
   reachable = true;
   ageBackgroundWorkCacheForTest(6 * 60_000);
   await sweep(deps);
-
-  assert.ok(
-    probes > gaveUpAfter,
-    "believing an inference for longer is not a reason to stop asking; a "
-      + "replica that never asks again can never find out it was wrong",
-  );
-  assert.equal(
-    k.current().bgRunning, 1,
-    "and the measurement that came back replaces the guess, so the shell keeps "
-      + "its pod",
-  );
-  assert.ok(!k.deleted.includes(KEY), "sanity: nothing was reclaimed here");
+  assert.equal(probes, 2, "cached evidence must not prevent a later measurement");
+  assert.equal(k.current().bgRunning, 1);
+  assert.ok(!k.deleted.includes(KEY));
 });
 
-test("a give-up inference is not reaped before the visit it exists for", async () => {
-  // The reap is the other place a lifetime is decided, and it had one floor for
-  // every entry. Left at the measured floor it discards the inference at thirty
-  // minutes -- inside the gap the longer life was given for -- so the give-up
-  // expires unread after all and the loop it was meant to break resumes one
-  // level down.
+test("an evidence verdict is not reaped while a rotating sweep walks elsewhere", async () => {
   const k = fakeKv();
-  stubPingableProvider();
+  stubClearWork();
   const deps = {
     kv: k.kv,
     countActiveShells: async () => { throw new Error("hands unreachable"); },
   };
-
-  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
-    await sweep(deps);
-  }
-  assert.equal(
-    backgroundWorkStateSizesForTest().cache, 1,
-    "sanity: there is an inference to reap",
-  );
-
-  // Walked elsewhere, so nothing can re-probe and quietly rewrite what the reap
-  // removes -- the assertion is about the reap and only about the reap.
-  k.setVisible(false);
-  ageBackgroundWorkCacheForTest(SAME_REPLICA_REVISIT_MS);
   await sweep(deps);
-
-  assert.equal(
-    backgroundWorkStateSizesForTest().cache, 1,
-    "the answer this replica is still meant to be reading cannot be reaped out "
-      + "from under it by a floor sized for a different kind of answer",
-  );
+  assert.equal(k.current().bgRunning, 0);
+  k.setVisible(false);
+  ageBackgroundWorkCacheForTest(6 * 60_000);
+  await sweep(deps);
+  assert.equal(backgroundWorkStateSizesForTest().cache, 1);
 });
 
-test("a give-up does not delete the handle in the same sweep it re-asks", async () => {
-  // The give-up answer decides the one irreversible thing in this file, and the
-  // sweep decides it during the walk -- before the probes it dispatches at the
-  // end of the same tick. So an inference old enough that this very tick has
-  // judged it worth re-asking was still good enough to delete on: the handle
-  // was gone by the time the answer came back, and `persistVerdict` dropped a
-  // measurement of live background work onto a key that no longer existed.
-  //
-  // A guess this replica is in the act of doubting may not reclaim a pod. It
-  // has to be refused twice, one visit apart, with the handle kept and pinged
-  // in between -- which costs a ping and buys the answer that makes the delete
-  // correct.
+test("a refresh can revise idle evidence before the reuse window ends", async () => {
   const k = fakeKv();
-  stubPingableProvider();
-
+  stubClearWork();
   let reachable = false;
   const deps = {
     kv: k.kv,
@@ -1734,32 +1586,203 @@ test("a give-up does not delete the handle in the same sweep it re-asks", async 
       return 3;
     },
   };
-
-  for (let visit = 0; visit < 10 && backgroundWorkStateSizesForTest().cache === 0; visit++) {
-    await sweep(deps);
-  }
-  assert.equal(
-    backgroundWorkStateSizesForTest().cache, 1,
-    "sanity: the streak gave up and inferred `idle` for a handle already past "
-      + "its reuse window",
-  );
-  assert.ok(!k.deleted.includes(KEY), "sanity: the first give-up does not reclaim on its own");
-
-  // Hands is back, with three background shells in it, and the inference is old
-  // enough that this sweep re-arms a probe for it.
+  await sweep(deps);
+  assert.equal(k.current().bgRunning, 0);
   reachable = true;
   ageBackgroundWorkCacheForTest(6 * 60_000);
   await sweep(deps);
+  assert.ok(!k.deleted.includes(KEY));
+  assert.equal(k.current().bgRunning, 3);
+});
 
-  assert.ok(
-    !k.deleted.includes(KEY),
-    "the sweep that re-asks cannot also act on the answer it is replacing; "
-      + "deleting first means the measurement lands on a deleted key and three "
-      + "live shells go down with the pod",
-  );
-  assert.equal(
-    k.current().bgRunning, 3,
-    "and the probe that tick dispatched is filed against a handle that is still "
-      + "there to carry it",
-  );
+test("positive provider absence releases a gone identity without idle aging", async (t) => {
+  for (const state of ["absent", "terminal"] as const) {
+    await t.test(state, async () => {
+      resetBackgroundWorkStateForTest();
+      restoreProviders?.();
+      const k = fakeKv();
+      let statusReads = 0;
+      let workReads = 0;
+      stubPingableProvider({
+        async get(inst) {
+          assert.equal(inst.id, ENTRY.workloadId);
+          statusReads += 1;
+          return { state, running: false, healthy: false };
+        },
+        async exec(_inst, command) {
+          if (command.includes("epoch.json")) workReads += 1;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      });
+      const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
+      await sweep(deps);
+      assert.ok(!k.deleted.includes(KEY), "the first sweep holds unknown until evidence arrives");
+      assert.ok(Date.now() - Number(k.current().idleSince) < 60_000);
+      await sweep(deps);
+      assert.equal(statusReads, 1);
+      assert.equal(workReads, 0, "positive absence does not require a container read");
+      assert.ok(k.deleted.includes(KEY), "gone bypasses the ordinary idle reuse window");
+    });
+  }
+});
+
+test("a failed evidence read stays unknown even when provider running is false", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  let reads = 0;
+  stubPingableProvider({
+    async get() { return { running: false, healthy: false }; },
+    async exec(_inst, command) {
+      if (!command.includes("epoch.json")) return { exitCode: 0, stdout: "", stderr: "" };
+      reads += 1;
+      return { exitCode: 1, stdout: CLEAR_WORK, stderr: "record read failed" };
+    },
+  });
+  const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
+  await sweep(deps);
+  t.mock.timers.tick(16 * 60_000);
+  await sweep(deps);
+  assert.equal(reads, 2, "each failed Hands probe reaches the independent record reader");
+  assert.equal(k.current().bgRunning, undefined, "partial stdout is not a zero count");
+  assert.equal(k.current().idleSince, Date.now(), "unknown resets the idle clock");
+  assert.ok(!k.deleted.includes(KEY));
+});
+
+test("evidence arriving after local reuse cannot publish idle or gone", async (t) => {
+  for (const channel of ["provider", "records"] as const) {
+    await t.test(channel, async () => {
+      resetBackgroundWorkStateForTest();
+      restoreProviders?.();
+      const k = fakeKv();
+      const pending = Promise.withResolvers<void>();
+      let reading = false;
+      stubPingableProvider({
+        async get() {
+          if (channel === "provider") {
+            reading = true;
+            await pending.promise;
+            return { running: false, healthy: false, state: "absent" };
+          }
+          return { running: true, healthy: true, state: "running" };
+        },
+        async exec(_inst, command) {
+          if (command.includes("epoch.json")) {
+            reading = true;
+            await pending.promise;
+          }
+          return { exitCode: 0, stdout: CLEAR_WORK, stderr: "" };
+        },
+      });
+      const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
+      await sweep(deps);
+      assert.ok(reading);
+      registerSandbox(SESSION, { provider: "safe-workload", workloadId: ENTRY.workloadId });
+      pending.resolve();
+      await new Promise((r) => setImmediate(r));
+      assert.equal(backgroundWorkStateSizesForTest().cache, 0);
+      assert.equal(k.current().bgRunning, undefined);
+      unregisterSandbox(SESSION);
+    });
+  }
+});
+
+test("gone reclamation respects an active run lease and a competing revision", async (t) => {
+  for (const guard of ["lease", "revision"] as const) {
+    await t.test(guard, async () => {
+      resetBackgroundWorkStateForTest();
+      restoreProviders?.();
+      const k = fakeKv();
+      stubPingableProvider({
+        async get() { return { running: false, healthy: false, state: "absent" }; },
+      });
+      const countActiveShells = async () => { throw new Error("unreachable"); };
+      await sweep({ kv: k.kv, countActiveShells });
+      const kv = {
+        ...k.kv,
+        async get(key: string) {
+          if (guard === "lease" && key === `lock.${SESSION}`) {
+            return { value: sc.encode("{}"), revision: 1 };
+          }
+          return k.kv.get(key);
+        },
+        async delete(key: string, opts: { previousSeq?: number }) {
+          k.replace({ ...k.current(), keepalive: true });
+          return k.kv.delete(key, opts);
+        },
+      } as unknown as KV;
+      await sweep({ kv, countActiveShells });
+      assert.ok(!k.deleted.includes(KEY), `${guard} must prevent a gone verdict from deleting ownership`);
+    });
+  }
+});
+
+test("positive verdicts refresh before expiry without restarting the idle window", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  let probes = 0;
+  const refresh = Promise.withResolvers<void>();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      probes += 1;
+      if (probes === 2) await refresh.promise;
+      return 0;
+    },
+  };
+  await sweep(deps);
+  const idleSince = k.current().idleSince;
+  const firstMeasurement = k.current().bgCheckedAt;
+  t.mock.timers.tick(4 * 60_000);
+  try {
+    await sweep(deps);
+    assert.equal(probes, 2, "refresh must start while the five-minute verdict is still valid");
+    assert.equal(k.current().bgCheckedAt, firstMeasurement, "the asynchronous refresh is pending");
+    t.mock.timers.tick(30_000);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, idleSince, "pending refresh keeps a valid positive verdict");
+  } finally {
+    refresh.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(k.current().bgCheckedAt, Date.now());
+  for (let minute = 0; minute < 12 && !k.deleted.includes(KEY); minute++) {
+    t.mock.timers.tick(60_000);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, idleSince);
+  }
+  assert.ok(k.deleted.includes(KEY), "repeated zero replies must complete the fifteen-minute window");
+});
+
+test("a failed refresh invalidates local and shared idle evidence immediately", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  await sweep({ kv: k.kv, countActiveShells: async () => 0 });
+  assert.equal(k.current().bgRunning, 0);
+  t.mock.timers.tick(4 * 60_000);
+  const pendingEvidence = Promise.withResolvers<void>();
+  restoreProviders?.();
+  stubPingableProvider({
+    async get() {
+      await pendingEvidence.promise;
+      return { running: false, healthy: false, state: "unknown" };
+    },
+  });
+  const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("refresh failed"); } };
+  try {
+    await sweep(deps);
+    assert.equal(k.current().bgRunning, undefined, "the failed refresh invalidates the shared zero");
+    assert.equal(k.current().bgCheckedAt, undefined);
+    await sweep(deps);
+    assert.equal(k.current().idleSince, Date.now(), "the local zero cannot survive a failed refresh");
+    assert.ok(!k.deleted.includes(KEY));
+  } finally {
+    pendingEvidence.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
+  resetBackgroundWorkStateForTest();
+  t.mock.timers.tick(16 * 60_000);
+  await sweep(deps);
+  assert.ok(!k.deleted.includes(KEY), "a restarted replica must also see the failure as unknown");
 });

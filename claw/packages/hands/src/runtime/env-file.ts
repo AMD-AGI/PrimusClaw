@@ -25,7 +25,6 @@ import { readFileSync, unlinkSync } from "node:fs";
 
 /** Names this process was started with, which the file must not overrule. */
 const BOOTSTRAP_OWNED = new Set([
-  "HANDS_ENV_FILE",
   // The token this launch was given. The file carries the same value today,
   // and if it ever did not, the file's copy would leave Hands rejecting the
   // Brain that started it.
@@ -33,12 +32,27 @@ const BOOTSTRAP_OWNED = new Set([
   "CLAW_SESSION_ID",
   "MCP_PORT",
   "WORKSPACE_PATH",
-  "BG_SHELL_ENABLED",
   "BASH_MAX_TIMEOUT_SEC",
   "BASH_DEFAULT_TIMEOUT_SEC",
   "WAIT_MAX_SEC",
   "WAIT_DEFAULT_SEC",
 ]);
+
+/**
+ * Whether a name belongs to this service's own configuration rather than to
+ * the request.
+ *
+ * Reserved by prefix and not by enumeration, because the file is built from
+ * user and session environment and an omission here is a request choosing how
+ * the sandbox is configured: `HANDS_CHILD_ISOLATION` and the child identity
+ * range decide whether a command runs under an identity of its own, and
+ * `HANDS_STATE_DIR` decides where the records that address background shells
+ * live. Both are read after this file is applied, so a name that slipped
+ * through would be indistinguishable from one an operator set.
+ */
+function bootstrapOwned(key: string): boolean {
+  return key.startsWith("HANDS_") || key.startsWith("BG_SHELL_") || BOOTSTRAP_OWNED.has(key);
+}
 
 /**
  * @returns the names applied, for the caller to log. Values are not returned:
@@ -63,9 +77,7 @@ export function applyEnvFile(path: string | undefined = process.env.HANDS_ENV_FI
     if (typeof value !== "string") continue;
     // The file is the per-request answer and outranks whatever the image or a
     // pooled pod's template happened to set -- that is the case it exists for.
-    // The handful of names the launch command set are the exception: those are
-    // this process's own configuration, decided after the file was written.
-    if (BOOTSTRAP_OWNED.has(key)) continue;
+    if (bootstrapOwned(key)) continue;
     process.env[key] = value;
     applied.push(key);
   }

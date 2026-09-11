@@ -12,18 +12,162 @@
  *     auth check.
  */
 import { LRUCache } from "lru-cache";
-import type { KV } from "nats";
+import type { KV, KvEntry } from "nats";
 import { isTombstone } from "../tasks/lock.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
+import {
+  assertRetentionSeparation, handsSessionKey, legacyHandsKey,
+  migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
+} from "./hands-key.js";
+import type { RetentionStore } from "./retain-container.js";
+import { isRevisionConflict } from "@claw/utils";
+import pino from "pino";
 
 const sc = StringCodec();
+const logger = pino({ name: "sandbox-registry" });
 
 let _kv: KV | null = null;
 
 /** Bind the BRAIN_REGISTRY KV bucket. Called once from index.ts main() boot. */
 export function bindHandsKv(kv: KV): void {
   _kv = kv;
+}
+
+function reservedKeyStore(kv: KV): HandsKeyStore {
+  return {
+    keys: async (filter) => {
+      const out: string[] = [];
+      for await (const key of await kv.keys(filter)) out.push(key);
+      return out;
+    },
+    read: async (key) => {
+      const entry = await kv.get(key);
+      return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
+    },
+    create: async (key, value) => {
+      try {
+        await kv.create(key, sc.encode(value));
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+    replace: async (key, value, expectedRevision) => {
+      try {
+        await kv.update(key, sc.encode(value), expectedRevision);
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+    delete: async (key, expectedRevision) => {
+      try {
+        await kv.delete(key, { previousSeq: expectedRevision });
+        return true;
+      } catch (err) {
+        if (isRevisionConflict(err)) return false;
+        throw err;
+      }
+    },
+  };
+}
+
+/**
+ * The two conditional writes and the two deletes a retention needs, and nothing
+ * else in the bucket.
+ *
+ * Built here rather than at each call site so the retention path and the sweep
+ * that releases it cannot come to disagree about what a write to the reserved
+ * key means.
+ */
+export function retentionStore(kv: KV): RetentionStore & {
+  keys(filter: string): Promise<string[]>;
+} {
+  const reserved = reservedKeyStore(kv);
+  return {
+    keys: reserved.keys,
+    read: reserved.read,
+    create: reserved.create,
+    replace: reserved.replace,
+    delete: (key) => kv.delete(key),
+  };
+}
+
+/**
+ * The key a session's binding was found under, and the revision read from it.
+ *
+ * The two travel together: a conditional write derived from the canonical key
+ * while the revision came from the legacy one is a guaranteed conflict, and the
+ * write is then silently dropped.
+ */
+export interface HandsBinding {
+  key: string;
+  revision: number;
+}
+
+/**
+ * Every key a session's binding can sit under, canonical first.
+ *
+ * Both can hold one at once for the length of a rolling upgrade, so a caller
+ * that has to act on a *particular* generation has to look at all of them
+ * rather than take the first that answers.
+ */
+export function handsEntryKeys(sessionId: string): string[] {
+  const canonical = handsSessionKey(sessionId);
+  const legacy = legacyHandsKey(sessionId);
+  return canonical === legacy ? [canonical] : [canonical, legacy];
+}
+
+export async function readHandsEntry(
+  kv: KV, sessionId: string,
+): Promise<(HandsBinding & { value: string; entry: KvEntry }) | null> {
+  // Errors are not caught: an unavailable store is not a session with no
+  // sandbox, and reading it as one is how a live workload gets replaced.
+  for (const key of handsEntryKeys(sessionId)) {
+    const entry = await kv.get(key);
+    if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision, entry };
+  }
+  return null;
+}
+
+/**
+ * Move strays out of the legacy namespace, every sweep.
+ *
+ * Once at boot is not enough: new replicas start alongside old ones, and an old
+ * one writes the legacy key throughout the rollout -- after every new replica
+ * has already scanned. Repeating on the sweep's own cadence bounds that to one
+ * interval, and the read-through above covers the interval itself.
+ */
+export async function reconcileReservedKeys(kv: KV): Promise<void> {
+  const result = await migrateReservedSessionKeys(reservedKeyStore(kv));
+  if (result.migrated.length || result.resumed.length
+    || result.converged.length || result.conflicted.length) {
+    logger.warn(result, "hands.reserved_key_reconciled");
+  }
+}
+
+/**
+ * Move any session binding already sitting in the reserved retention namespace
+ * out of it, at boot and before anything can mint a retention.
+ *
+ * Refusing to mint new colliding keys protects a fresh deployment and nothing
+ * else: a session whose id already begins with the reserved marker is
+ * indistinguishable from a retention by key shape, so the first retention under
+ * a matching generation would write over a live session's binding.
+ */
+export async function assertReservedKeysFree(kv: KV): Promise<void> {
+  const store = reservedKeyStore(kv);
+  const moved = await migrateReservedSessionKeys(store);
+  if (moved.migrated.length || moved.resumed.length || moved.converged.length) {
+    logger.warn(
+      { migrated: moved.migrated, resumed: moved.resumed, converged: moved.converged },
+      "hands.reserved_key_migration",
+    );
+  }
+  await assertRetentionSeparation(store);
 }
 
 /** Read back the bound KV bucket. Throws if bindHandsKv() was never called. */
@@ -173,7 +317,7 @@ export async function isValidHandsToken(token: string): Promise<boolean> {
           // Memoize against the owning session, not just the token: a token
           // learned here must still be revocable by teardown, which only has
           // the session id to go on. The key carries it.
-          handsTokens.set(token, key.slice("hands.".length));
+          handsTokens.set(token, sessionIdFromHandsKey(key));
           return true;
         }
       } catch { /* malformed — skip */ }

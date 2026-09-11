@@ -8,11 +8,24 @@ import { APPLIED_ENV_KEYS } from "./runtime/env-file.js";
 import Fastify from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, verifyScopeCredential, type CredentialScope } from "@claw/utils";
+import { RECLAIM_CAUSES, isReclaimCause, isReapGrace } from "@claw/protocol";
 import { tools } from "./tools/index.js";
-import { shutdownAllShells, shutdownRunShells, runningShellCount } from "./tools/shell/bg-manager.js";
-import { OWNER_HEADER, RUN_HEADER, UNOWNED, normalizeOwner, normalizeRun, withCaller } from "./runtime/owner-context.js";
-import { INTERNAL_TOKEN, MCP_PORT } from "./config.js";
+import {
+  MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, REAP_GRACE_MS,
+  UnreadableRecords,
+  resolveShell, runningShellCount, shutdownAllShells, shutdownRunShells,
+} from "./tools/shell/bg-manager.js";
+import {
+  DEADLINE_HEADER, NO_RUN, OWNER_HEADER, RUN_HEADER,
+  normalizeDeadline, normalizeOwner, normalizeRun, withCaller,
+} from "./runtime/owner-context.js";
+import {
+  mintEpoch, processStartToken, readEpochMarker, readRecord, stateRoot, subtreeReadable,
+} from "./runtime/shell-records.js";
+import { assertChildBoundaryForBackgroundShells } from "./runtime/child-privilege.js";
+import { MAX_TIMEOUT_SEC } from "./tools/shell/bash.js";
+import { BG_SHELL_ENABLED, INTERNAL_TOKEN, MCP_PORT } from "./config.js";
 
 /**
  * Exported so route tests can reach the routes with `app.inject()` instead of
@@ -27,9 +40,41 @@ export const app = Fastify({ logger: true });
  */
 function authFailure(req: { headers: Record<string, unknown> }): { status: number; error: string } | null {
   if (!INTERNAL_TOKEN) return { status: 401, error: "auth_failed_missing_internal_token" };
-  const presented = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-  if (!constantTimeEquals(presented, INTERNAL_TOKEN)) return { status: 401, error: "unauthorized" };
+  if (!constantTimeEquals(presentedCredential(req), INTERNAL_TOKEN)) {
+    return { status: 401, error: "unauthorized" };
+  }
   return null;
+}
+
+function presentedCredential(req: { headers: Record<string, unknown> }): string {
+  return String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+}
+
+type ScopeFailure = { status: number; error: string; field?: string };
+
+/**
+ * Which scope this caller has proved, taken from the credential alone.
+ *
+ * The routes below used to read the owner from one body field and the run from
+ * another behind a token bound to no scope, so any holder could count another
+ * owner's shells or terminate another run's. A request still carrying either
+ * field is refused naming it rather than quietly ignored, because a caller that
+ * believes it is addressing a scope must not be answered about a different one.
+ */
+function callerScope(
+  req: { headers: Record<string, unknown>; body?: Record<string, unknown> },
+): { scope: CredentialScope } | { failure: ScopeFailure } {
+  for (const field of ["owner", "run"]) {
+    if (req.body && field in req.body) {
+      return { failure: { status: 400, error: "scope_not_in_body", field } };
+    }
+  }
+  if (!INTERNAL_TOKEN) {
+    return { failure: { status: 401, error: "auth_failed_missing_internal_token" } };
+  }
+  const verified = verifyScopeCredential(presentedCredential(req), INTERNAL_TOKEN);
+  if (!verified.ok) return { failure: { status: 401, error: verified.error } };
+  return { scope: verified.scope };
 }
 
 /** Create a fresh McpServer with all tools — one per request to avoid shared state. */
@@ -45,7 +90,83 @@ app.get("/health", async () => ({
   status: "ok",
   service: "hands",
   tools: tools.map((t) => t.name),
+  // What this sandbox actually booted with. The tool list above is identical
+  // in both switch states, so it is not a capability signal and a gate reading
+  // it would pass on a sandbox with the feature off. A running sandbox's
+  // environment is not visible from outside any other way.
+  bgShellEnabled: BG_SHELL_ENABLED,
+  bashMaxTimeoutSec: MAX_TIMEOUT_SEC,
+  // Whether this process files durable shell records, which is what decides
+  // how Brain addresses it: a process that files none partitions its shells by
+  // owner alone, and the run half of the address has to travel inside the id
+  // instead. Absent on every build predating the records, which is exactly the
+  // population that needs the other treatment.
+  bgShellRecords: readEpochMarker() !== null,
 }));
+
+/**
+ * What the records say about one shell, for a Brain resolving a possible replay.
+ *
+ * Read-only and starts nothing, so it is safe to ask before deciding whether a
+ * start is a first call. The three answers are kept apart deliberately: a
+ * determinate absence beneath a readable marker says no claim landed, while an
+ * unreadable subtree or a missing marker says nothing was observed at all, and
+ * only the first of those may lead to a start being sent.
+ */
+app.post<{ Body?: Record<string, unknown> }>(
+  "/internal/shells/record",
+  async (req, reply) => {
+    const resolved = callerScope(req);
+    if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
+
+    const shellId = typeof req.body?.shell_id === "string" ? req.body.shell_id : "";
+    if (!shellId) return reply.status(400).send({ error: "shell_id_required" });
+
+    const marker = readEpochMarker() !== null;
+    const readable = subtreeReadable();
+    let present = false;
+    if (marker && readable) {
+      try {
+        present = readRecord(resolved.scope.owner, resolved.scope.run, shellId) !== null;
+      } catch {
+        return { marker, subtreeReadable: false, present: false };
+      }
+    }
+    return { marker, subtreeReadable: readable, present };
+  },
+);
+
+/**
+ * The class of one shell, without touching a byte of its output.
+ *
+ * A caller deciding whether to block on a `wait` has to know first: parking a
+ * run for a shell that can never produce an exit event costs the pod's
+ * execution slot for the whole timeout. Separate from the poll for that reason
+ * -- the poll advances the read offset, and a preflight that consumed the
+ * bytes the wait owes its caller would be worse than no preflight at all.
+ */
+app.post<{ Body?: Record<string, unknown> }>(
+  "/internal/shells/class",
+  async (req, reply) => {
+    const resolved = callerScope(req);
+    if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
+
+    const shellId = typeof req.body?.shell_id === "string" ? req.body.shell_id : "";
+    if (!shellId) return reply.status(400).send({ error: "shell_id_required" });
+
+    const answer = resolveShell(resolved.scope.owner, resolved.scope.run ?? NO_RUN, shellId);
+    return { shell_class: answer.cls, collector_live: answer.collectorLive };
+  },
+);
+
+function sendScopeFailure(
+  reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+  failure: ScopeFailure,
+): unknown {
+  return reply.status(failure.status).send(
+    failure.field ? { error: failure.error, field: failure.field } : { error: failure.error },
+  );
+}
 
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);
@@ -70,7 +191,11 @@ app.all("/mcp", async (req, reply) => {
   // handed it. An absent or malformed owner collapses to the shared `unowned`
   // bucket, and an absent run means no run will reap what this call starts.
   await withCaller(
-    { owner: normalizeOwner(req.headers[OWNER_HEADER]), run: normalizeRun(req.headers[RUN_HEADER]) },
+    {
+      owner: normalizeOwner(req.headers[OWNER_HEADER]),
+      run: normalizeRun(req.headers[RUN_HEADER]),
+      deadline: normalizeDeadline(req.headers[DEADLINE_HEADER]),
+    },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );
 });
@@ -87,26 +212,18 @@ app.all("/mcp", async (req, reply) => {
  * is: this is Brain's bookkeeping, not something the model should be able to ask
  * on its own behalf or about another caller.
  */
-app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, reply) => {
-  const denied = authFailure(req);
-  if (denied) return reply.status(denied.status).send({ error: denied.error });
+app.post<{ Body?: Record<string, unknown> }>("/internal/shells/active", async (req, reply) => {
+  const resolved = callerScope(req);
+  if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
 
-  // `!owner` would never fire: normalizeOwner substitutes the shared `unowned`
-  // bucket for everything it cannot use -- absent, blank, over-long, control
-  // characters -- and that string is truthy. Answering anyway is the part that
-  // matters: `unowned` holds the shells of every caller that sent no owner
-  // header, so a malformed question would be answered with somebody else's
-  // work, and a pod kept alive for a session that has nothing running in it.
-  //
-  // A caller naming the bucket explicitly is asking a real question and is
-  // answered; a value that only landed there by failing normalization is not.
-  const raw = req.body?.owner;
-  const owner = normalizeOwner(raw);
-  if (owner === UNOWNED && raw !== UNOWNED) {
-    return reply.status(400).send({ error: "owner_required" });
+  const running = runningShellCount(resolved.scope.owner);
+  if (running === null) {
+    // The durable state this process files could not be read, so how much work
+    // is live is unknown. Answering zero here is what marks a sandbox full of
+    // orphaned work idle; the caller's own unanswered-probe path keeps it.
+    return reply.status(503).send({ error: "shell_liveness_indeterminate" });
   }
-
-  return { running: runningShellCount(owner) };
+  return { running };
 });
 
 /**
@@ -117,17 +234,69 @@ app.post<{ Body?: { owner?: unknown } }>("/internal/shells/active", async (req, 
  * the decision is Brain's: a batch node's shells go, a conversation's stay. Not
  * an MCP tool, so the model cannot invoke it on itself or on another run.
  */
-app.post<{ Body?: { run?: unknown } }>("/internal/shells/reap", async (req, reply) => {
-  const denied = authFailure(req);
-  if (denied) return reply.status(denied.status).send({ error: denied.error });
+app.post<{ Body?: Record<string, unknown> }>("/internal/shells/reap", async (req, reply) => {
+  const resolved = callerScope(req);
+  if ("failure" in resolved) return sendScopeFailure(reply, resolved.failure);
 
-  const run = normalizeRun(req.body?.run);
+  // A credential proving no run identity authorises no reap: the absent-run
+  // bucket holds every shell started without one, which is precisely the set
+  // nothing is entitled to end by run.
+  const run = resolved.scope.run;
   if (!run) return reply.status(400).send({ error: "run_required" });
 
-  const stopped = await shutdownRunShells(run);
-  app.log.info({ run, stopped }, "hands.reap_run_shells");
-  return { stopped };
+  // Every action that ends background work carries why, and which operation it
+  // belongs to. Refused rather than defaulted: a reclaim nobody can attribute is
+  // indistinguishable afterwards from work that ended on its own.
+  if (!isReclaimCause(req.body?.cause)) {
+    return reply.status(400).send({
+      error: "cause_required",
+      field: "cause",
+      accepted: RECLAIM_CAUSES,
+    });
+  }
+  if (typeof req.body?.reclaim_op !== "string" || !req.body.reclaim_op) {
+    return reply.status(400).send({ error: "reclaim_op_required", field: "reclaim_op" });
+  }
+  const grace = reapGrace(req.body?.grace_ms);
+  if (grace === null) {
+    // Never clamped: a silently shortened grace destroys work about to flush,
+    // and a lengthened one stalls a terminal path.
+    return reply.status(400).send({
+      error: "grace_out_of_range",
+      field: "grace_ms",
+      accepted: `integer milliseconds in [${MIN_REAP_GRACE_MS}, ${MAX_REAP_GRACE_MS}]`,
+    });
+  }
+
+  let report;
+  try {
+    report = await shutdownRunShells(resolved.scope.owner, run, grace);
+  } catch (e) {
+    if (!(e instanceof UnreadableRecords)) throw e;
+    // An all-clear this reap could not establish is the one answer a caller
+    // must not receive: it retires the run's shells on paper while they run on.
+    return reply.status(503).send({ error: "shell_records_unreadable", detail: (e as Error).message });
+  }
+  app.log.info(
+    {
+      run,
+      cause: req.body?.cause,
+      reclaimOp: req.body?.reclaim_op,
+      graceMs: grace,
+      stopped: report.stopped,
+      escalated: report.escalated,
+      surviving: report.surviving,
+    },
+    "hands.reap_run_shells",
+  );
+  return report;
 });
+
+/** The effective grace, or null where the caller named one outside the domain. */
+function reapGrace(raw: unknown): number | null {
+  if (raw === undefined) return REAP_GRACE_MS;
+  return isReapGrace(raw) ? raw : null;
+}
 
 /**
  * Take the background shells down with us.
@@ -154,6 +323,25 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 if (process.argv.includes("--self-check")) {
   process.stdout.write(`hands self-check ok (${tools.length} tools)\n`);
 } else {
+  try {
+    assertChildBoundaryForBackgroundShells(BG_SHELL_ENABLED);
+  } catch (e) {
+    app.log.fatal({ err: (e as Error).message }, "hands.child_boundary_unenforced");
+    process.exit(1);
+  }
+  // Minted before anything can be started, and fatal when it cannot be: the
+  // marker is what says this process files durable records, and a Hands
+  // serving shells it files no record of would leave every later destroy gate
+  // reading an empty count as an empty sandbox.
+  try {
+    mintEpoch({ pid: process.pid, startToken: processStartToken(process.pid) });
+  } catch (e) {
+    app.log.fatal(
+      { err: (e as Error).message, stateRoot: stateRoot() },
+      "hands.epoch_mint_failed",
+    );
+    process.exit(1);
+  }
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
   app.listen({ host: "0.0.0.0", port: MCP_PORT }, (err) => {

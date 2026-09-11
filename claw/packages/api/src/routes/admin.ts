@@ -9,6 +9,9 @@ import { interruptUnstartedChatRuns } from "../tasks/chat-run.js";
 import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
+import { collectSandboxInventory } from "./sandbox-inventory.js";
+import { sessionIdFromHandsKey } from "@claw/protocol";
+import { listDagHandles } from "../infra/dag-handles.js";
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -36,54 +39,40 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, key, value: minVersion, previous };
   });
 
-  // Sandbox status (ops debug). Admin only — scans NATS KV for all Hands
-  // entries and health-checks each endpoint. Mirrors V1 get_executor_sandbox_status.
+  // Sandbox status (ops debug). Admin only — the authoritative fleet census
+  // every rollout gate and every rollback step iterates, which is why an
+  // unreadable half fails the whole answer rather than shrinking it.
   app.get("/v1/internal/sandbox/status", { preHandler: internalAuth }, async () => {
-    const sessions: Array<Record<string, unknown>> = [];
     try {
-      const iter = await kv.keys("hands.*");
-      for await (const key of iter) {
-        const sessionId = key.slice("hands.".length);
-        const entry = await kv.get(key);
-        if (!entry) continue;
-        let info: Record<string, unknown>;
-        try {
-          info = JSON.parse(new TextDecoder().decode(entry.value));
-        } catch {
-          continue;
-        }
-
-        const handsUrl = (info.handsUrl as string) || "";
-        const healthUrl = handsUrl.replace(/\/mcp\/?$/, "") + "/health";
-        let healthy = false;
-        if (handsUrl) {
+      const inventory = await collectSandboxInventory({
+        handsKeys: async (filter) => {
+          const out: string[] = [];
+          for await (const key of await kv.keys(filter)) out.push(key);
+          return out;
+        },
+        handsGet: async (key) => {
+          const entry = await kv.get(key);
+          return entry ? new TextDecoder().decode(entry.value) : null;
+        },
+        dagHandles: listDagHandles,
+        probeHealth: async (handsUrl) => {
           try {
-            const r = await fetch(healthUrl, { signal: AbortSignal.timeout(3000) });
-            healthy = r.ok;
-          } catch { /* unhealthy */ }
-        }
-
-        sessions.push({
-          session_id: sessionId,
-          workload_id: info.workloadId || "",
-          hands_url: handsUrl,
-          sandbox_image: info.sandboxImage || null,
-          created_at: info.createdAt || null,
-          has_platform_key: Boolean(info.platformKey),
-          healthy,
-        });
-      }
+            const r = await fetch(`${handsUrl.replace(/\/mcp\/?$/, "")}/health`, {
+              signal: AbortSignal.timeout(3000),
+            });
+            return r.ok;
+          } catch {
+            return false;
+          }
+        },
+        // Decoded, not sliced: a re-keyed session would otherwise be reported
+        // under the encoded form, which names nothing an operator can act on.
+        sessionIdFromKey: sessionIdFromHandsKey,
+      });
+      return { ...inventory, config: { SAFE_API_URL: SAFE_API_URL || "(not set)" } };
     } catch (e: any) {
-      return { ok: false, error: `kv scan failed: ${e?.message || e}` };
+      return { ok: false, error: `sandbox inventory unreadable: ${e?.message || e}` };
     }
-    return {
-      ok: true,
-      count: sessions.length,
-      sessions,
-      config: {
-        SAFE_API_URL: SAFE_API_URL || "(not set)",
-      },
-    };
   });
 
   // Interrupt

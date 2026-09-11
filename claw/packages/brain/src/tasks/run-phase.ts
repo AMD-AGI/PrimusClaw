@@ -92,6 +92,11 @@ export function beginRun(key: RunIdentityKey): void {
   });
 }
 
+/** Whether the ledger holds this key. Read by a park site checking its own. */
+export function isTrackedRun(key: RunIdentityKey): boolean {
+  return runs.has(key);
+}
+
 /** Stop tracking a run. Every beginRun needs exactly one endRun. */
 export function endRun(key: RunIdentityKey): void {
   runs.delete(key);

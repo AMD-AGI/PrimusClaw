@@ -1,9 +1,10 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
-import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
+import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -12,10 +13,27 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { destroyHands } from "./reaper.js";
-import { sessionHasActiveRunLease } from "./registry.js";
+import {
+  handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
+  sessionHasActiveRunLease,
+} from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { countActiveShells } from "../clients/hands.js";
+import { listAllDagHandles } from "./handles.js";
+import type { HandleInfo } from "@claw/protocol";
+import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
+import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
+import {
+  latchRosterStale, markCensusReconciled, markRosterStale, releaseAdmission,
+} from "./admission.js";
+import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
+import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
+import { instanceFromEntry } from "./container-probe.js";
+import { countLiveWork } from "./live-work-gate.js";
+import {
+  ledgerKeyForRetention, reassertRetentions, releaseRetention,
+} from "./retain-container.js";
+import { HANDS_STATE_DIR } from "./bootstrap.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -163,8 +181,29 @@ interface KeepaliveDeps {
   kv: KV;
   /** Test seam for the background-work probe. */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
+  listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
+  /**
+   * Test seam for the clock the ping deadline is measured against.
+   *
+   * The budget is what makes a sweep defer, and deferral is what the refresh
+   * bound is stated over -- so a test that cannot move this clock cannot
+   * exercise the bound at all, whatever it does to the pings themselves.
+   * Never set in production.
+   */
+  now?: () => number;
+  /**
+   * The fleet-wide admission roster, where one is bound.
+   *
+   * Every distinct target a sweep may face holds a slot, including one reached
+   * only through a handle record another replica wrote or one recovered after a
+   * restart. An un-admitted target is reconciled in before this sweep serves
+   * it, because the alternative is serving it from whatever capacity the
+   * admitted ones leave -- which starves exactly the target holding live work.
+   */
+  roster?: { store: RosterStore; config: RosterConfig };
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -183,10 +222,164 @@ interface RegisteredSandbox {
 
 const localRegistry = new Map<string, RegisteredSandbox>();
 
-function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
+
+/**
+ * One retained container's turn in the sweep.
+ *
+ * It is a target like any other -- pinged, its lifetime refreshed -- and it is
+ * never probed for a shell count: its key names no session, so the owner a
+ * probe would ask about owns nothing, and the zero that came back would file
+ * the container idle and reclaim the very work the retention protects.
+ *
+ * What ends a retention is the evidence that caused it reaching zero, read the
+ * same way it was taken. Without this the entry is permanent and the container
+ * never returns to the ordinary lifetime machinery.
+ *
+ * @returns false where the sweep could not complete this entry, which is not
+ * the same as an entry it completed and found nothing in.
+ */
+async function sweepRetention(
+  deps: KeepaliveDeps,
+  key: string,
+  entry: { value: Uint8Array; revision: number },
+  info: HandsKvEntry,
+  targets: Map<string, RegisteredSandbox>,
+  seenIdentities: Set<string>,
+): Promise<boolean> {
+  const held = sandboxEntryFrom(info);
+  if (!held) {
+    logger.error({ key }, "keepalive.retention_unaddressable");
+    return false;
+  }
+  const sessionId = sessionIdFromHandsKey(key);
+  // Under the same physical identity as every other target: a retention names
+  // its own key and no session, so keying by it would give a container already
+  // reached through a session binding or a DAG handle a second roster slot and
+  // a second ping a sweep.
+  const identity = sandboxRegistryKey(held);
+  seenIdentities.add(identity);
+  if (!targets.has(identity)) targets.set(identity, { sessionId, entry: held });
+
+  const inst = instanceFromEntry(sessionId, info as never);
+  const live = inst
+    ? await countLiveWork(inst, HANDS_STATE_DIR)
+    : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
+  if (live.verdict === "clear") {
+    await releaseRetention(retentionStore(deps.kv), key, ledgerKeyForRetention(key));
+    return true;
+  }
+
+  try {
+    await deps.kv.update(key, entry.value, entry.revision);
+  } catch (err) {
+    // This bucket expires entries on its own, so a refresh that failed and was
+    // swallowed is a retained container that silently falls out of the sweep.
+    logger.error({ err: (err as Error)?.message, key }, "keepalive.retention_refresh_failed");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The sandbox an entry names, or null where it names none this can address.
+ *
+ * safe-workload needs a workload id and platform key; agent-sandbox needs a
+ * session id. An entry short of either is not a sandbox with no work in it --
+ * it is one nothing can be sent to, which is a different answer.
+ */
+function sandboxEntryFrom(info: HandsKvEntry): SandboxEntry | null {
+  const provider = info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload";
+  const usable = provider === "agent-sandbox"
+    ? !!info.sessionId
+    : !!(info.workloadId && info.platformKey);
+  if (!usable) return null;
+  return {
+    provider,
+    workloadId: info.workloadId,
+    platformKey: info.platformKey,
+    sessionId: info.sessionId,
+    sandboxName: info.sandboxName,
+    namespace: info.namespace,
+    userId: info.userId,
+  };
+}
+
+/**
+ * The identity of one ping target.
+ *
+ * Exported because admission reserves a slot per target and has to name the
+ * same thing the sweep pings: a slot bound to anything else would leave the
+ * target un-admitted and reconciled in later, which is the ceiling being
+ * enforced after the fact rather than before provisioning.
+ */
+export function pingTargetIdentity(entry: SandboxEntry): string {
+  return sandboxRegistryKey(entry);
+}
+
+/**
+ * What the provider assigned, and nothing logical.
+ *
+ * One physical sandbox is reachable under more than one logical name -- a
+ * session binding and a DAG handle map naming the same container under
+ * different roots -- and keying by the name it was reached through counts it
+ * twice: two admission slots against one ceiling and two pings a sweep, which
+ * understates the deferral count the idle-GC deadline is proven against by
+ * exactly the number of doubly-named sandboxes.
+ */
+function sandboxRegistryKey(entry: SandboxEntry): string {
   return entry.provider === "agent-sandbox"
-    ? `${sessionId}:agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`
-    : `${sessionId}:safe:${entry.workloadId || ""}`;
+    ? `agent:${entry.sessionId || ""}:${entry.namespace || ""}:${entry.sandboxName || ""}`
+    : `safe:${entry.workloadId || ""}`;
+}
+
+/**
+ * The key holding the generation `entry` names.
+ *
+ * A canonical-first read returns whichever key exists, which is the wrong
+ * record when both do: the local registry names one particular generation, and
+ * its sibling under the other key belongs to a different, live one. Matching on
+ * identity is the only way to tell them apart, so an unreadable or
+ * non-matching record is passed over rather than guessed at.
+ */
+async function recordKeyNamingSandbox(
+  kv: KV, sessionId: string, entry: SandboxEntry,
+): Promise<string | null> {
+  for (const key of handsEntryKeys(sessionId)) {
+    const found = await kv.get(key).catch(() => null);
+    if (!found) continue;
+    try {
+      if (sameRegisteredSandbox(entry, JSON.parse(sc.decode(found.value)) as HandsKvEntry)) {
+        return key;
+      }
+    } catch { /* unreadable is not evidence that this is the record we want */ }
+  }
+  return null;
+}
+
+/**
+ * Delete the binding this decision was taken on.
+ *
+ * Not a key re-derived from the session id: during a rolling upgrade the
+ * binding can sit under the legacy name, and the canonical key can hold a
+ * different generation of the same session -- so re-deriving either leaves the
+ * orphan behind or deletes a live sibling.
+ *
+ * Deleting nothing is the safe end of that: an orphan costs a sandbox until the
+ * bucket TTL takes it, while deleting a sibling strands a running workload.
+ */
+async function deleteExpiredRetryRecord(
+  kv: KV, sessionId: string, recordKey?: string, entry?: SandboxEntry,
+): Promise<void> {
+  const key = recordKey
+    ?? (entry ? await recordKeyNamingSandbox(kv, sessionId, entry) : null);
+  if (!key) {
+    logger.warn({ sessionId, workloadId: entry?.workloadId },
+      "keepalive.retry_pending_record_unresolved");
+    return;
+  }
+  await kv.delete(key).catch((err) => logger.warn(
+    { err: String(err), sessionId, key }, "keepalive.retry_pending_record_not_deleted",
+  ));
 }
 
 /**
@@ -194,8 +387,8 @@ function sandboxRegistryKey(sessionId: string, entry: SandboxEntry): string {
  * A session key may point to different pods over time, so probe results are
  * matched against this identity before being persisted.
  */
-function entryIdentity(sessionId: string, info: HandsKvEntry): string {
-  return sandboxRegistryKey(sessionId, {
+function entryIdentity(info: HandsKvEntry): string {
+  return sandboxRegistryKey({
     provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
     workloadId: info.workloadId,
     sessionId: info.sessionId,
@@ -210,6 +403,7 @@ async function shouldSkipExpiredRetry(
   sessionId: string,
   source: "local" | "kv",
   entry?: SandboxEntry,
+  recordKey?: string,
 ): Promise<boolean> {
   const pending = await getRetryPending(deps.kv, sessionId);
   const nowMs = Date.now();
@@ -235,7 +429,7 @@ async function shouldSkipExpiredRetry(
   }
 
   unregisterSandbox(sessionId, entry);
-  await deps.kv.delete(`hands.${sessionId}`).catch(() => {});
+  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
   await clearRetryPending(deps.kv, sessionId, pending.lockKey);
   logger.warn(
     {
@@ -262,7 +456,7 @@ async function shouldSkipExpiredRetry(
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
 export function registerSandbox(sessionId: string, entry: SandboxEntry): void {
-  const key = sandboxRegistryKey(sessionId, entry);
+  const key = sandboxRegistryKey(entry);
   // A new task invalidates verdicts measured before it took the sandbox.
   forgetBackgroundWork(key);
   localRegistry.set(key, { sessionId, entry });
@@ -288,9 +482,23 @@ function sameRegisteredSandbox(a: SandboxEntry, b: SandboxEntry): boolean {
  * Unregister a sandbox. With `known`, only remove that exact registration;
  * a DAG sibling may have replaced the session-keyed local entry meanwhile.
  */
-export function unregisterSandbox(sessionId: string, known?: SandboxEntry): void {
+export function unregisterSandbox(
+  sessionId: string,
+  known?: SandboxEntry,
+  /**
+   * Whether this sandbox is finished with.
+   *
+   * A turn that ends stops pinging its sandbox but keeps the handle for the
+   * next message, and a background shell started in that turn is expected to
+   * still be there. Releasing the slot then hands the ceiling to somebody else
+   * while the sandbox is still a target the sweep will reconcile back in --
+   * which is the over-cap state admission exists to prevent, reached through
+   * ordinary use.
+   */
+  opts: { releaseSlot?: boolean } = { releaseSlot: true },
+): void {
   const keys = known
-    ? [sandboxRegistryKey(sessionId, known)]
+    ? [sandboxRegistryKey(known)]
     : [...localRegistry.entries()]
       .filter(([, value]) => value.sessionId === sessionId)
       .map(([key]) => key);
@@ -298,6 +506,14 @@ export function unregisterSandbox(sessionId: string, known?: SandboxEntry): void
   for (const key of keys) {
     had = localRegistry.delete(key) || had;
     failCounts.delete(key);
+    // The slot goes with the target where the target is gone. Held past that,
+    // it counts against the ceiling for a sandbox that no longer exists and an
+    // ordinary teardown becomes a capacity refusal for the next request.
+    if (opts.releaseSlot !== false) {
+      void releaseAdmission(key).then((ok) => {
+        if (!ok) logger.error({ sessionId, key }, "keepalive.admission_release_unconfirmed");
+      });
+    }
   }
   if (had) {
     logger.info({ sessionId }, "keepalive.unregistered");
@@ -344,13 +560,13 @@ export function markHandsIdle(
   sessionId: string,
   known: SandboxEntry | string,
 ): Promise<RunEndedParkResult> {
-  const kvKey = `hands.${sessionId}`;
-  return kv.get(kvKey)
+  return readHandsEntry(kv, sessionId)
     .then(async (entry): Promise<RunEndedParkResult> => {
       if (!entry) return { outcome: "gone" };
+      const kvKey = entry.key;
       let info: HandsKvEntry;
       try {
-        info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+        info = JSON.parse(entry.value) as HandsKvEntry;
       } catch (err) {
         // Preserve unreadable ownership data for repair or natural TTL expiry.
         logger.warn(
@@ -367,7 +583,7 @@ export function markHandsIdle(
       if (!sameTarget) return { outcome: "skipped", reason: "other_sandbox" };
 
       // Verdicts measured while the task held the sandbox cannot cross re-idling.
-      forgetBackgroundWork(sandboxRegistryKey(sessionId, {
+      forgetBackgroundWork(sandboxRegistryKey({
         provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
         workloadId: info.workloadId,
         sessionId: info.sessionId,
@@ -408,16 +624,16 @@ export function markHandsIdle(
 
 /**
  * What a probe of Hands' background-shell registry can tell us.
- * `unknown` must keep the sandbox; only a measured `idle` may permit reclaim.
+ * Only positive idle or gone evidence may permit reclaim.
  */
-type BackgroundWork = "running" | "idle" | "unknown";
+type BackgroundWork = "running" | "idle" | "gone" | "unknown";
 
 /** Local measured-verdict reuse interval. */
 const BG_PROBE_TTL_MS = 5 * 60_000;
+const BG_PROBE_REFRESH_MS = 4 * 60_000;
 
 /**
- * Consecutive failures tolerated before inferring idle. A transient failure
- * keeps the sandbox, while a permanently unreachable one is eventually released.
+ * Consecutive unanswered probes before reporting an unreconciled handle.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
 /**
@@ -431,12 +647,6 @@ const BG_VERDICT_TTL_MS = 30 * 60_000;
  * revisits an identity, which can span several fleet rotations.
  */
 const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
-
-/**
- * Local inferred-idle lifetime. It shares the streak horizon so the same replica
- * can act on it, but `needsProbe` still retries at BG_PROBE_TTL_MS.
- */
-const BG_GIVEUP_TTL_MS = BG_UNKNOWN_STREAK_TTL_MS;
 
 /**
  * Fleet probe concurrency cap per replica. Deferred candidates remain `unknown`
@@ -471,29 +681,26 @@ const PING_MAX_IN_FLIGHT = 16;
  * record and lead the next rotated sweep.
  */
 const PING_PHASE_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 2));
-/** Where the last sweep stopped handing out pings. */
-let pingCursor = 0;
+/**
+ * Every target the last sweep left unserved, in the order it deferred them.
+ *
+ * The whole list rather than a resume point: the target set is rebuilt each
+ * sweep, so a position moves under arrivals and departures and a single
+ * identity vanishes when its sandbox does -- and either way an already-served
+ * target can be carried back ahead of one still waiting, repeatedly, which is
+ * what makes the deferral count unbounded and the refresh gap with it.
+ */
+let pingDeferred: string[] = [];
 
 
-/** Keyed by sandbox identity, not by session: see refreshBackgroundWork. */
 const bgProbeCache = new Map<
   string,
   {
     at: number; state: BackgroundWork; epoch?: number; idleSince?: number; idleRev?: number;
-    /** The give-up path inferred this verdict rather than measuring it. */
-    inferred?: boolean;
-    /**
-     * A later probe also failed, so reclaim may act on an aged inference instead
-     * of indefinitely deferring for another retry.
-     */
-    retested?: boolean;
+    verdictAtStart?: VerdictWitness;
   }
 >();
 
-/** How long this particular cached answer may be reused. */
-function cachedVerdictTtlMs(cached: { inferred?: boolean }): number {
-  return cached.inferred ? BG_GIVEUP_TTL_MS : BG_PROBE_TTL_MS;
-}
 const bgUnknownStreak = new Map<string, { count: number; at: number }>();
 const bgProbeInFlight = new Set<string>();
 /**
@@ -501,6 +708,38 @@ const bgProbeInFlight = new Set<string>();
  * whose captured generation no longer matches.
  */
 const bgGeneration = new Map<string, number>();
+/**
+ * How many pings one sweep is guaranteed to start, from this build's own
+ * concurrency and budgets. Read at startup to prove the refresh-gap relation.
+ */
+export function keepalivePingsPerSweep(): number {
+  return pingsPerSweep(PING_MAX_IN_FLIGHT, PING_PHASE_BUDGET_MS, HANDS_PING_CEILING_MS);
+}
+
+/**
+ * The longest the ping phase can run: its budget bars the *starting* of a ping,
+ * so the pings already in flight when it expires run on for their own ceiling.
+ */
+export function keepalivePingPhaseCeilingSec(): number {
+  return Math.ceil((PING_PHASE_BUDGET_MS + HANDS_PING_CEILING_MS) / 1000);
+}
+
+/**
+ * The whole guarded tick's worst case: the ping phase, plus the failure phase
+ * and the one eviction its budget lets start. Fleet-size independent, which is
+ * the property the declared span has to have.
+ */
+export function keepaliveSweepCeilingSec(): number {
+  return keepalivePingPhaseCeilingSec()
+    + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
+}
+
+/** Longest one started eviction may take, stop and retries together. */
+const HANDS_STOP_CEILING_MS = 30_000;
+
+/** Longest one ping may take before its own timeout ends it. */
+const HANDS_PING_CEILING_MS = 15_000;
+
 /** Where the last sweep stopped handing out probe slots. */
 let bgProbeCursor = 0;
 
@@ -551,7 +790,7 @@ export function ageBackgroundWorkCacheForTest(ms: number): void {
  */
 interface TickStats {
   /** Idle handles by background-work answer. */
-  bgRunning: number; bgUnknown: number; bgIdle: number;
+  bgRunning: number; bgUnknown: number; bgIdle: number; bgGone: number;
   /** Where those answers came from; see VerdictSource. */
   fromMem: number; fromHandle: number; fromNone: number; fromNoHands: number;
   /** What happened to the handles answered `idle`. */
@@ -564,7 +803,7 @@ interface TickStats {
 
 function newTickStats(): TickStats {
   return {
-    bgRunning: 0, bgUnknown: 0, bgIdle: 0,
+    bgRunning: 0, bgUnknown: 0, bgIdle: 0, bgGone: 0,
     fromMem: 0, fromHandle: 0, fromNone: 0, fromNoHands: 0,
     expired: 0, withinWindow: 0, keptLocal: 0, keptRunLease: 0, keptProbe: 0,
     probes: 0,
@@ -645,15 +884,17 @@ function reuseWindowStart(info: HandsKvEntry): number {
 function usableCachedVerdict(
   identity: string,
   info: HandsKvEntry,
-): { at: number; state: BackgroundWork; inferred?: boolean; retested?: boolean } | null {
+): { at: number; state: BackgroundWork } | null {
   const cached = bgProbeCache.get(identity);
   if (!cached) return null;
-  if (Date.now() - cached.at >= cachedVerdictTtlMs(cached)) return null;
+  if (Date.now() - cached.at >= BG_PROBE_TTL_MS) return null;
   if (!sameIdlePeriod(cached.epoch, info)) return null;
   // Another replica can reactivate the handle without bumping this process's generation.
   if (!measuredUnderThisIdlePeriod(
     cached.at, cached.idleSince, cached.idleRev, info, cached.state,
   )) return null;
+  if ((cached.state === "gone" || cached.state === "unknown")
+    && (!cached.verdictAtStart || !sameVerdict(cached.verdictAtStart, info))) return null;
   return cached;
 }
 
@@ -681,12 +922,11 @@ function peekBackgroundWork(
   info: HandsKvEntry,
 ): { state: BackgroundWork; source: VerdictSource; at?: number } {
   if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
-  // An aged inference must survive one failed re-test before it can permit reclaim.
-  const local = usableCachedVerdict(identity, info);
-  const beingReasked = !!local?.inferred && !local.retested
-    && Date.now() - local.at >= BG_PROBE_TTL_MS;
-  const cached = beingReasked ? null : local;
+  const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
+  if (cached?.state === "gone" || cached?.state === "unknown") {
+    return { state: cached.state, source: "mem", at: cached.at };
+  }
   // Cross-replica timestamps are not ordered. `running` therefore wins any
   // disagreement; when both say `running`, the later stamp only advances an anchor.
   if (cached?.state === "running" && shared?.state === "running") {
@@ -707,15 +947,14 @@ function needsProbe(identity: string, info: HandsKvEntry): boolean {
   if (!info.handsUrl || !info.token) return false;
   // A verdict from another idle period cannot suppress a fresh probe.
   const cached = usableCachedVerdict(identity, info);
-  // Inferred verdicts remain readable longer than they suppress probing.
-  if (cached && Date.now() - cached.at < BG_PROBE_TTL_MS) return false;
+  if (cached && cached.state !== "unknown" && Date.now() - cached.at < BG_PROBE_REFRESH_MS) return false;
   return !bgProbeInFlight.has(identity);
 }
 
 /**
  * Fleet-unique token for probe reservations and idle-write acknowledgement.
  */
-const entryTokenPrefix = Math.random().toString(36).slice(2, 10);
+const entryTokenPrefix = randomBytes(16).toString("hex");
 let entryTokenSeq = 0;
 function nextEntryToken(): string {
   entryTokenSeq += 1;
@@ -745,15 +984,14 @@ function probeOutstanding(info: HandsKvEntry): boolean {
  * sandbox identity.
  */
 async function reserveProbe(
-  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+  deps: KeepaliveDeps, key: string, identity: string, token: string,
 ): Promise<boolean> {
-  const key = `hands.${sessionId}`;
   for (let attempt = 1; attempt <= BG_PROBE_RESERVE_ATTEMPTS; attempt++) {
     try {
       const e = await deps.kv.get(key);
       if (!e) return false;
       const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-      if (entryIdentity(sessionId, info) !== identity) return false;
+      if (entryIdentity(info) !== identity) return false;
       const now = Date.now();
       const bgProbes = { ...liveProbeReservations(info, now), [token]: now + BG_PROBE_RESERVE_MS };
       await deps.kv.update(key, sc.encode(JSON.stringify({ ...info, bgProbes })), e.revision);
@@ -770,14 +1008,13 @@ async function reserveProbe(
  * replicas' reservations. The deadline remains the failure backstop.
  */
 async function releaseProbe(
-  deps: KeepaliveDeps, sessionId: string, identity: string, token: string,
+  deps: KeepaliveDeps, key: string, identity: string, token: string,
 ): Promise<void> {
   try {
-    const key = `hands.${sessionId}`;
     const e = await deps.kv.get(key);
     if (!e) return;
     const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-    if (entryIdentity(sessionId, info) !== identity) return;
+    if (entryIdentity(info) !== identity) return;
     if (!info.bgProbes || !(token in info.bgProbes)) return;
     const bgProbes = liveProbeReservations(info, Date.now());
     delete bgProbes[token];
@@ -787,137 +1024,177 @@ async function releaseProbe(
   } catch { /* best effort: the deadline is the backstop */ }
 }
 
-/**
- * Start up to BG_PROBE_MAX_IN_FLIGHT probes, resuming where the last sweep left
- * off.
- *
- * The rotating cursor prevents timeouts early in the list from monopolizing the
- * cap. Probes run behind the sweep; pending answers leave handles `unknown`.
- */
-function dispatchProbes(
-  deps: KeepaliveDeps,
-  candidates: Array<{
-    identity: string; sessionId: string; info: HandsKvEntry; generation: number;
-  }>,
-): number {
-  if (candidates.length === 0) return 0;
-  const probe = deps.countActiveShells ?? countActiveShells;
-  const start = bgProbeCursor % candidates.length;
+interface ProbeCandidate {
+  key: string;
+  identity: string;
+  sessionId: string;
+  info: HandsKvEntry;
+  generation: number;
+}
 
+interface BackgroundProbe extends ProbeCandidate {
+  token: string;
+  verdictAtStart: VerdictWitness;
+}
+
+function probeIsStale(probe: ProbeCandidate): boolean {
+  return (bgGeneration.get(probe.identity) ?? 0) !== probe.generation;
+}
+
+/** Start bounded asynchronous probes, rotating deferred candidates into later sweeps. */
+function dispatchProbes(deps: KeepaliveDeps, candidates: ProbeCandidate[]): number {
+  if (candidates.length === 0) return 0;
+  const start = bgProbeCursor % candidates.length;
   let started = 0;
   for (let n = 0; n < candidates.length; n++) {
     if (bgProbeInFlight.size >= BG_PROBE_MAX_IN_FLIGHT) break;
-    const { identity, sessionId, info, generation } =
-      candidates[(start + n) % candidates.length];
-    // Capture the complete idle-period witness used to validate the answer.
-    const epoch = info.idleEpoch;
-    const idleSinceAtStart = info.idleSince;
-    const idleRevAtStart = info.idleRev;
-    // Detect a competing verdict published while this probe is in flight.
-    const verdictAtStart = verdictWitness(info);
-    if (bgProbeInFlight.has(identity)) continue;
-
-    // The scan-time generation invalidates results after any intervening reuse.
-    bgProbeInFlight.add(identity);
+    const candidate = candidates[(start + n) % candidates.length];
+    if (bgProbeInFlight.has(candidate.identity)) continue;
+    const probe: BackgroundProbe = {
+      ...candidate, info: { ...candidate.info }, token: nextEntryToken(),
+      verdictAtStart: verdictWitness(candidate.info),
+    };
+    bgProbeInFlight.add(probe.identity);
     started += 1;
-    // The fleet-visible reservation must land before the probe is dispatched.
-    const token = nextEntryToken();
-
-    // Re-check after suspension points where another task can reuse the sandbox.
-    const stale = () => (bgGeneration.get(identity) ?? 0) !== generation;
-
-    void reserveProbe(deps, sessionId, identity, token)
-      // Do not send an unreserved probe that another replica cannot see.
-      .then((reserved) => (
-        reserved ? probe(info.handsUrl!, info.token!, sessionId) : undefined
-      ))
-      .then(async (running) => {
-        if (running === undefined) {
-          logger.info(
-            { sessionId, workloadId: info.workloadId },
-            "keepalive.background_work_probe_unreserved",
-          );
-          return;
-        }
-        if (stale()) {
-          logger.info(
-            { sessionId, workloadId: info.workloadId },
-            "keepalive.background_work_answer_stale",
-          );
-          return;
-        }
-        // A live registration or run lease prevents publishing an idle verdict.
-        const held = localRegistry.has(identity)
-          || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope).catch(() => false);
-
-        // The lease lookup can race with reuse, so validate again before writing.
-        if (stale()) {
-          logger.info(
-            { sessionId, workloadId: info.workloadId },
-            "keepalive.background_work_answer_stale",
-          );
-          return;
-        }
-        if (held && running === 0) {
-          logger.info(
-            { sessionId, workloadId: info.workloadId },
-            "keepalive.background_work_answer_held",
-          );
-          return;
-        }
-        const state: BackgroundWork = running > 0 ? "running" : "idle";
-        // A newer shared timestamp would invalidate this probe's local cache.
-        const measuredAt = Date.now();
-        bgProbeCache.set(identity, {
-          at: measuredAt, state, epoch,
-          idleSince: idleSinceAtStart, idleRev: idleRevAtStart,
-        });
-        bgUnknownStreak.delete(identity);
-        // Share measured answers; inferred idle remains local to this replica.
-        await persistVerdict(
-          deps, sessionId, identity, running, measuredAt,
-          epoch, idleSinceAtStart, idleRevAtStart, verdictAtStart,
-        );
-        if (state === "running") {
-          logger.info(
-            { sessionId, workloadId: info.workloadId, running },
-            "keepalive.idle_handle_kept_background_work",
-          );
-        }
-      })
-      .catch((err) => {
-        if (stale()) return;
-        const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
-        bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
-        logger.warn(
-          { err: (err as Error)?.message ?? err, sessionId, streak },
-          "keepalive.background_work_check_failed",
-        );
-        if (streak > BG_UNKNOWN_TOLERANCE) {
-          bgProbeCache.set(identity, {
-            at: Date.now(),
-            state: "idle",
-            epoch,
-            idleSince: idleSinceAtStart,
-            idleRev: idleRevAtStart,
-            // Local inference uses the longer give-up lifetime.
-            inferred: true,
-            // Reclaim requires a failed probe after the first inference.
-            retested: bgProbeCache.get(identity)?.inferred === true,
-          });
-          logger.warn(
-            { sessionId, workloadId: info.workloadId, streak },
-            "keepalive.background_work_unknown_giving_up",
-          );
-        }
-      })
-      .finally(async () => {
-        bgProbeInFlight.delete(identity);
-        await releaseProbe(deps, sessionId, identity, token);
-      });
+    void runBackgroundProbe(deps, probe).finally(() => bgProbeInFlight.delete(probe.identity));
   }
   bgProbeCursor = start + started;
   return started;
+}
+
+async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): Promise<void> {
+  const { key, identity, sessionId, info, token } = probe;
+  try {
+    const reserved = await reserveProbe(deps, key, identity, token);
+    if (!reserved || probeIsStale(probe)) return;
+    try {
+      const running = await (deps.countActiveShells ?? countActiveShells)(
+        info.handsUrl!, info.token!, sessionId,
+      );
+      await recordProbeVerdict(deps, probe, running > 0 ? "running" : "idle", running);
+    } catch (err) {
+      if (probeIsStale(probe)) return;
+      await invalidateProbeVerdict(deps, probe);
+      if (probeIsStale(probe)) return;
+      const evidence = await readProbeEvidence(probe);
+      if (probeIsStale(probe)) return;
+      if (evidence.state === "unknown") reportUnknownProbe(probe, err);
+      else await recordProbeVerdict(deps, probe, evidence.state, evidence.running);
+    }
+  } catch (err) {
+    if (!probeIsStale(probe)) {
+      await invalidateProbeVerdict(deps, probe);
+      if (!probeIsStale(probe)) reportUnknownProbe(probe, err);
+    }
+  } finally {
+    await releaseProbe(deps, key, identity, token);
+  }
+}
+
+async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProbe): Promise<void> {
+  const { key, identity, info, verdictAtStart } = probe;
+  bgProbeCache.set(identity, {
+    at: Date.now(), state: "unknown", epoch: info.idleEpoch,
+    idleSince: info.idleSince, idleRev: info.idleRev, verdictAtStart,
+  });
+  try {
+    const e = await deps.kv.get(key);
+    if (!e || probeIsStale(probe)) return;
+    const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+    if (entryIdentity(current) !== identity || !sameIdlePeriod(info.idleEpoch, current)
+      || info.idleSince !== current.idleSince || info.idleRev !== current.idleRev
+      || !sameVerdict(verdictAtStart, current)) return;
+    if (current.bgCheckedAt === undefined && current.bgRunning === undefined) {
+      bgProbeCache.delete(identity);
+      return;
+    }
+    for (const field of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"] as const) {
+      delete current[field];
+    }
+    await deps.kv.update(key, sc.encode(JSON.stringify(current)), e.revision);
+    if (!probeIsStale(probe)) bgProbeCache.delete(identity);
+    probe.verdictAtStart = verdictWitness(current);
+  } catch (err) {
+    logger.warn({ err, sessionId: probe.sessionId }, "keepalive.verdict_invalidation_failed");
+  }
+}
+
+async function readProbeEvidence(
+  probe: BackgroundProbe,
+): Promise<{ state: BackgroundWork; running?: number }> {
+  const inst = instanceFromEntry(probe.sessionId, probe.info);
+  if (!inst) return { state: "unknown" };
+  const provider = inst.provider === "agent-sandbox"
+    ? getAgentSandboxProvider() : getSafeWorkloadProvider();
+  try {
+    const status = await provider.get(inst);
+    if (probeIsStale(probe)) return { state: "unknown" };
+    if (status.state === "absent" || status.state === "terminal") return { state: "gone" };
+  } catch (err) {
+    logger.warn({ err, sessionId: probe.sessionId }, "keepalive.provider_evidence_failed");
+  }
+  if (probeIsStale(probe)) return { state: "unknown" };
+  const live = await countLiveWork(inst, HANDS_STATE_DIR);
+  if (probeIsStale(probe)) return { state: "unknown" };
+  if (live.verdict === "clear") return { state: "idle", running: 0 };
+  if (live.verdict === "protected") {
+    const running = PROTECTED_CLASSES.reduce((sum, cls) => sum + (live.classes[cls] ?? 0), 0);
+    return { state: "running", running };
+  }
+  logger.warn({ sessionId: probe.sessionId, reason: live.reason }, "keepalive.work_evidence_unknown");
+  return { state: "unknown" };
+}
+
+async function recordProbeVerdict(
+  deps: KeepaliveDeps,
+  probe: BackgroundProbe,
+  state: BackgroundWork,
+  running?: number,
+): Promise<void> {
+  if (probeIsStale(probe)) return;
+  const { key, identity, sessionId, info, verdictAtStart } = probe;
+  const held = localRegistry.has(identity)
+    || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope);
+  if (probeIsStale(probe)) return;
+  if (held && state !== "running") return;
+  const measuredAt = Date.now();
+  bgProbeCache.set(identity, {
+    at: measuredAt, state, epoch: info.idleEpoch,
+    idleSince: info.idleSince, idleRev: info.idleRev, verdictAtStart,
+  });
+  bgUnknownStreak.delete(identity);
+  if (running !== undefined) {
+    await persistVerdict(
+      deps, key, sessionId, identity, running, measuredAt,
+      info.idleEpoch, info.idleSince, info.idleRev, verdictAtStart, () => probeIsStale(probe),
+    );
+  }
+  if (state === "running") {
+    logger.info(
+      { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, running },
+      "keepalive.idle_handle_kept_background_work",
+    );
+  }
+}
+
+function reportUnknownProbe(probe: BackgroundProbe, err: unknown): void {
+  const { identity, sessionId, info } = probe;
+  if (err instanceof HandsLivenessIndeterminate) {
+    logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.background_work_indeterminate");
+    return;
+  }
+  const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
+  bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
+  logger.warn(
+    { err: (err as Error)?.message ?? err, sessionId, streak },
+    "keepalive.background_work_check_failed",
+  );
+  if (streak > BG_UNKNOWN_TOLERANCE) {
+    logger.error(
+      { sessionId, workloadId: info.workloadId, streak },
+      "keepalive.background_work_unreconciled",
+    );
+  }
 }
 
 /**
@@ -948,6 +1225,7 @@ function sameVerdict(witness: VerdictWitness, info: HandsKvEntry): boolean {
  */
 async function persistVerdict(
   deps: KeepaliveDeps,
+  key: string,
   sessionId: string,
   identity: string,
   running: number,
@@ -956,18 +1234,18 @@ async function persistVerdict(
   idleSinceAtStart: number | undefined,
   idleRevAtStart: number | undefined,
   verdictAtStart: VerdictWitness,
+  stale: () => boolean,
 ): Promise<void> {
   try {
-    const key = `hands.${sessionId}`;
     // Re-read all guards after contention; `idle` yields after one attempt.
     let workloadId: string | undefined;
     const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const e = await deps.kv.get(key);
-      if (!e) return;
+      if (!e || stale()) return;
       const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
       workloadId = info.workloadId;
-      if (entryIdentity(sessionId, info) !== identity) {
+      if (entryIdentity(info) !== identity) {
         // Never apply a verdict to a replacement sandbox under the same key.
         logger.info(
           { sessionId, workloadId: info.workloadId },
@@ -1054,7 +1332,7 @@ async function refreshIdleSince(
       seenAt,
     );
     // The reuse clock reflects when this sweep acted on the running verdict.
-    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: Date.now() }));
+    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: (deps.now ?? Date.now)() }));
     await deps.kv.update(key, next, revision);
     // Keep the scan copy aligned for probes dispatched later in this tick.
     info.idleSince = idleSince;
@@ -1078,182 +1356,184 @@ async function forEachWithLimit<T>(
   await Promise.all(workers);
 }
 
-/**
- * Build the merged ping target list: in-memory registry (primary) + NATS KV
- * (secondary, for crash-recovery of sessions created by a previous Brain pod).
- */
+interface TargetCensus {
+  targets: Map<string, RegisteredSandbox>;
+  seenIdentities: Set<string>;
+  probeCandidates: ProbeCandidate[];
+  stats: TickStats;
+}
+
+type HandsRecord = { value: Uint8Array; revision: number };
+
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
   stats: TickStats,
-): Promise<Map<string, RegisteredSandbox>> {
-  const targets = new Map<string, RegisteredSandbox>();
-  const probeCandidates: Array<{
-    identity: string; sessionId: string; info: HandsKvEntry; generation: number;
-  }> = [];
-
-  // 1. In-memory registry — always authoritative for this process.
+): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
+  const census: TargetCensus = { targets: new Map(), seenIdentities, probeCandidates: [], stats };
   for (const [key, registered] of localRegistry) {
-    if (await shouldSkipExpiredRetry(
-      deps,
-      registered.sessionId,
-      "local",
-      registered.entry,
-    )) continue;
-    targets.set(key, registered);
+    if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
+    census.targets.set(key, registered);
   }
+  const kvComplete = await collectKvTargets(deps, census);
+  const dagComplete = await collectDagTargets(deps, census);
+  stats.probes += dispatchProbes(deps, census.probeCandidates);
+  return { targets: census.targets, complete: kvComplete && dagComplete };
+}
 
-  // 2. NATS KV — pick up sessions from previous Brain runs that are still alive.
+async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
+  let complete = true;
   try {
-    // Filtered server-side: this bucket also holds `lock.*`, `deleted.*` and
-    // `brain.min_version`, and this runs every SANDBOX_KEEPALIVE_INTERVAL_SEC --
-    // the most frequent of the three walks over these keys.
     const keys = await deps.kv.keys("hands.*");
     for await (const key of keys) {
-      const sessionId = key.slice("hands.".length);
-      const e = await deps.kv.get(key).catch(() => null);
+      let e: Awaited<ReturnType<typeof deps.kv.get>>;
+      try {
+        e = await deps.kv.get(key);
+      } catch (err) {
+        complete = false;
+        logger.warn({ err: (err as Error)?.message, key }, "keepalive.entry_read_failed");
+        continue;
+      }
       if (!e) continue;
       try {
-        const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-        if (info.status && info.status !== "ready") continue;
-        // Idle handles with running or unknown work are pinged; only confirmed
-        // idle handles may expire. Probes run behind the sweep by sandbox identity.
-        const identity = entryIdentity(sessionId, info);
-        seenIdentities.add(identity);
-        // Give an unstamped idle handle its epoch here, not only in
-        // markHandsIdle. Handles that idled before this shipped never pass
-        // through that function again until their session gets another message,
-        // and until they are stamped no verdict about them can be trusted (see
-        // sameIdlePeriod) -- so without this they would be re-probed on every
-        // sweep for as long as they exist, which is the cost of the strictness
-        // above paid forever rather than once.
-        //
-        // `idleSince` is the value, because that is when the period being
-        // stamped actually began; a fresh timestamp would name a period that
-        // starts in the middle of one. It rides along on whichever write this
-        // tick was already going to make, so it costs no extra round trip.
-        //
-        // `idleRev` is backfilled on the same terms and for the same reason --
-        // a handle with no revision half to its name can hold no witnessed
-        // `idle` verdict, so an unstamped one is re-probed every sweep until it
-        // is stamped. The value is the revision this tick's write is
-        // conditioned on, which is exactly what markHandsIdle records and is
-        // unique for the same reason: one write per revision.
-        let value = e.value;
-        if (info.keepalive === false
-          && (typeof info.idleEpoch !== "number" || typeof info.idleRev !== "number")) {
-          if (typeof info.idleEpoch !== "number") {
-            info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
-          }
-          if (typeof info.idleRev !== "number") info.idleRev = e.revision;
-          value = sc.encode(JSON.stringify(info));
-        }
-        const peeked = info.keepalive === false
-          ? peekBackgroundWork(identity, info)
-          : { state: "idle" as BackgroundWork, source: null, at: undefined };
-        const bgWork = peeked.state;
-        if (info.keepalive === false) {
-          if (bgWork === "running") stats.bgRunning += 1;
-          else if (bgWork === "unknown") stats.bgUnknown += 1;
-          else stats.bgIdle += 1;
-          if (peeked.source === "mem") stats.fromMem += 1;
-          else if (peeked.source === "handle") stats.fromHandle += 1;
-          else if (peeked.source === "none") stats.fromNone += 1;
-          else if (peeked.source === "no-hands") stats.fromNoHands += 1;
-        }
-        if (info.keepalive === false && needsProbe(identity, info)) {
-          // Capture generation during the scan so reuse before dispatch is visible.
-          probeCandidates.push({
-            identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0,
-          });
-        }
-        if (info.keepalive === false && bgWork === "running") {
-          await refreshIdleSince(deps, key, e.revision, info, peeked.at ?? Date.now());
-        } else if (info.keepalive === false && bgWork === "unknown") {
-          await deps.kv.update(key, value, e.revision).catch(() => {});
-        }
-        if (info.keepalive === false && bgWork === "idle") {
-          const expired = Date.now() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
-          // Local registrations and fleet run leases both block reclaim.
-          if (expired && registeredSandboxCount(sessionId) > 0) {
-            // The local ping path refreshes this entry's TTL.
-            logger.info(
-              { sessionId, workloadId: info.workloadId },
-              "keepalive.idle_handle_kept_locally_active",
-            );
-            stats.keptLocal += 1;
-            continue;
-          }
-          if (expired && await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
-            // The run lease protects work owned by another replica.
-            logger.info(
-              { sessionId, workloadId: info.workloadId },
-              "keepalive.idle_handle_kept_run_in_flight",
-            );
-            stats.keptRunLease += 1;
-            continue;
-          }
-          if (expired && probeOutstanding(info)) {
-            // Do not reclaim while a fleet-visible answer is still in flight.
-            // The reservation is released on completion or expires by deadline.
-            logger.info(
-              { sessionId, workloadId: info.workloadId },
-              "keepalive.idle_handle_kept_probe_outstanding",
-            );
-            stats.keptProbe += 1;
-            await deps.kv.update(key, value, e.revision).catch(() => {});
-            continue;
-          }
-          if (expired) {
-            // Report a reclaim only after the conditional delete succeeds.
-            await deps.kv.delete(key, { previousSeq: e.revision })
-              .then(() => {
-                stats.expired += 1;
-                logger.info(
-                  { sessionId, workloadId: info.workloadId },
-                  "keepalive.idle_handle_expired",
-                );
-              })
-              .catch(() => {});
-          } else {
-            stats.withinWindow += 1;
-            // Conditional TTL refresh must yield to concurrent reactivation.
-            await deps.kv.update(key, value, e.revision).catch(() => {});
-          }
-          continue;
-        }
-        const provider = info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload";
-        // safe-workload needs workloadId+platformKey; agent-sandbox needs sessionId.
-        const usable = provider === "agent-sandbox"
-          ? !!info.sessionId
-          : !!(info.workloadId && info.platformKey);
-        if (!usable) continue;
-        const entry: SandboxEntry = {
-          provider,
-          workloadId: info.workloadId,
-          platformKey: info.platformKey,
-          sessionId: info.sessionId,
-          sandboxName: info.sandboxName,
-          namespace: info.namespace,
-          userId: info.userId,
-        };
-        if (await shouldSkipExpiredRetry(deps, sessionId, "kv", entry)) continue;
-
-        // Renew before queueing so bounded ping concurrency cannot exhaust the TTL.
-        await deps.kv.update(key, e.value, e.revision).catch(() => {});
-
-        const targetKey = sandboxRegistryKey(sessionId, entry);
-        if (!targets.has(targetKey)) targets.set(targetKey, { sessionId, entry });
-      } catch { /* malformed — skip */ }
+        if (!await collectKvTarget(deps, census, key, e)) complete = false;
+      } catch (err) {
+        complete = false;
+        logger.warn({ err: (err as Error)?.message, key }, "keepalive.entry_unreadable");
+      }
     }
   } catch (err) {
+    complete = false;
     logger.warn({ err }, "keepalive.kv_scan_failed");
   }
+  return complete;
+}
 
-  // Dispatch after the full walk so the global cap and rotation are applied fairly.
-  stats.probes += dispatchProbes(deps, probeCandidates);
+async function collectKvTarget(
+  deps: KeepaliveDeps, census: TargetCensus, key: string, e: HandsRecord,
+): Promise<boolean> {
+  const sessionId = sessionIdFromHandsKey(key);
+  const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+  if (info.status && info.status !== "ready") return true;
+  if (isRetentionEntry(info)) {
+    return sweepRetention(deps, key, e, info, census.targets, census.seenIdentities);
+  }
+  const identity = entryIdentity(info);
+  census.seenIdentities.add(identity);
+  if (info.keepalive === false && await collectIdleTarget(deps, census, key, e, info)) return true;
+  const entry = sandboxEntryFrom(info);
+  if (!entry || await shouldSkipExpiredRetry(deps, sessionId, "kv", entry, key)) return true;
+  // Renew before queueing so bounded ping concurrency cannot exhaust the TTL.
+  await deps.kv.update(key, e.value, e.revision).catch(() => {});
+  if (!census.targets.has(identity)) census.targets.set(identity, { sessionId, entry });
+  return true;
+}
 
-  return targets;
+function stampIdlePeriod(info: HandsKvEntry, e: HandsRecord): Uint8Array {
+  if (typeof info.idleEpoch === "number" && typeof info.idleRev === "number") return e.value;
+  if (typeof info.idleEpoch !== "number") {
+    info.idleEpoch = typeof info.idleSince === "number" ? info.idleSince : Date.now();
+  }
+  if (typeof info.idleRev !== "number") info.idleRev = e.revision;
+  return sc.encode(JSON.stringify(info));
+}
+
+async function collectIdleTarget(
+  deps: KeepaliveDeps, census: TargetCensus, key: string, e: HandsRecord, info: HandsKvEntry,
+): Promise<boolean> {
+  const identity = entryIdentity(info);
+  const sessionId = sessionIdFromHandsKey(key);
+  const value = stampIdlePeriod(info, e);
+  const peeked = peekBackgroundWork(identity, info);
+  const bgWork = peeked.state;
+  const stats = census.stats;
+  if (bgWork === "running") stats.bgRunning += 1;
+  else if (bgWork === "unknown") stats.bgUnknown += 1;
+  else if (bgWork === "gone") stats.bgGone += 1;
+  else stats.bgIdle += 1;
+  if (peeked.source === "mem") stats.fromMem += 1;
+  else if (peeked.source === "handle") stats.fromHandle += 1;
+  else if (peeked.source === "none") stats.fromNone += 1;
+  else if (peeked.source === "no-hands") stats.fromNoHands += 1;
+  const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
+  if (needsProbe(identity, info)) census.probeCandidates.push(candidate);
+  if (bgWork === "running" || bgWork === "unknown") {
+    const seenAt = bgWork === "running" ? peeked.at ?? Date.now() : (deps.now ?? Date.now)();
+    await refreshIdleSince(deps, key, e.revision, info, seenAt);
+    return false;
+  }
+  const expired = bgWork === "gone"
+    || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
+  if (expired) await expireIdleTarget(deps, candidate, { ...e, value }, stats);
+  else {
+    stats.withinWindow += 1;
+    await deps.kv.update(key, value, e.revision).catch(() => {});
+  }
+  return true;
+}
+
+async function expireIdleTarget(
+  deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
+): Promise<void> {
+  const { key, identity, sessionId, info } = candidate;
+  if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
+    stats.keptLocal += 1;
+    return;
+  }
+  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
+    stats.keptRunLease += 1;
+    return;
+  }
+  if (probeIsStale(candidate) || localRegistry.has(identity) || registeredSandboxCount(sessionId) > 0) {
+    stats.keptLocal += 1;
+    return;
+  }
+  if (probeOutstanding(info)) {
+    stats.keptProbe += 1;
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    return;
+  }
+  // Release only after the conditional delete wins against any reactivation.
+  const deleted = await deps.kv.delete(key, { previousSeq: e.revision })
+    .then(() => true).catch(() => false);
+  if (deleted) {
+    stats.expired += 1;
+    if (!await releaseAdmission(identity)) {
+      logger.error({ sessionId, identity }, "keepalive.admission_release_unconfirmed");
+    }
+  }
+  logger.info(
+    { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, deleted },
+    "keepalive.idle_handle_expired",
+  );
+}
+
+async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
+  try {
+    for (const [dagRoot, handles] of await (deps.listDagHandles ?? listAllDagHandles)()) {
+      for (const info of Object.values(handles)) {
+        const entry: SandboxEntry = {
+          provider: info.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+          workloadId: info.workload_id,
+          platformKey: info.platform_key,
+          sessionId: info.session_id,
+          sandboxName: info.sandbox_name,
+          namespace: info.namespace,
+          userId: info.user_id,
+        };
+        const usable = entry.provider === "agent-sandbox"
+          ? !!entry.sessionId : !!(entry.workloadId && entry.platformKey);
+        if (!usable) continue;
+        const key = sandboxRegistryKey(entry);
+        census.seenIdentities.add(key);
+        if (!census.targets.has(key)) census.targets.set(key, { sessionId: dagRoot, entry });
+      }
+    }
+    return true;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, "keepalive.dag_handle_scan_failed");
+    return false;
+  }
 }
 
 /**
@@ -1273,9 +1553,23 @@ interface KeepaliveFailure {
   gone: boolean;
 }
 
+/**
+ * How long the failure-handling phase may spend starting evictions.
+ *
+ * A budget rather than a count, and independent of how many targets failed:
+ * evictions run serially and each awaits a stop, so a fleet-sized failure
+ * makes this phase fleet-sized and the declared sweep span -- which every
+ * refresh gap is derived from -- becomes a number the sweep routinely exceeds.
+ * An eviction not started inside it is deferred, which costs nothing: a handle
+ * that stays unreachable keeps failing and is evicted on a later sweep, and no
+ * deferral expires a handle or reclaims anything.
+ */
+const FAILURE_PHASE_BUDGET_MS = 30_000;
+
 async function handleKeepaliveFailures(
   failures: KeepaliveFailure[],
   targetCount: number,
+  now: () => number = Date.now,
 ): Promise<void> {
   // More than one independently "gone" result in one tick is more likely to be
   // a shared routing/control-plane fault than simultaneous sandbox loss. Delay
@@ -1289,6 +1583,8 @@ async function handleKeepaliveFailures(
     );
   }
 
+  const phaseDeadline = now() + FAILURE_PHASE_BUDGET_MS;
+  let deferredEvictions = 0;
   for (const failure of failures) {
     const { targetKey, sessionId, entry, error } = failure;
     const goneCircuitOpen = suppressImmediateGone && failure.gone;
@@ -1311,6 +1607,12 @@ async function handleKeepaliveFailures(
     );
     // Automatic eviction is opt-in; the default leaves recovery to platform
     // idle/TTL GC rather than acting on an unavailable control plane.
+    if (now() >= phaseDeadline) {
+      // Counted and left for the next sweep. The fail count is already
+      // recorded, so nothing is forgotten -- only postponed.
+      deferredEvictions += 1;
+      continue;
+    }
     if (
       SANDBOX_KEEPALIVE_FAIL_LIMIT > 0
       && fails >= SANDBOX_KEEPALIVE_FAIL_LIMIT
@@ -1323,34 +1625,161 @@ async function handleKeepaliveFailures(
       );
       failCounts.delete(targetKey);
       localRegistry.delete(targetKey);
+      await releaseAdmission(targetKey);
       logger.error(
         { sessionId, workloadId: entry.workloadId, fails },
         "keepalive.sandbox_evicted",
       );
     }
   }
+  if (deferredEvictions > 0) {
+    logger.warn(
+      { deferred: deferredEvictions, budgetMs: FAILURE_PHASE_BUDGET_MS },
+      "keepalive.failure_budget_exhausted",
+    );
+  }
+}
+
+/**
+ * Take every target of this sweep onto the roster, and renew what this replica
+ * already holds, before any of them is pinged.
+ *
+ * The ceiling is held against ordinary admission, never against work already
+ * running: a target the sweep faces is never a confirmed-idle handle, so it is
+ * either working or unaccounted for, and refusing it here would leave it
+ * unpinged rather than keeping the fleet small.
+ */
+async function admitTargets(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+  censusComplete: boolean,
+): Promise<Set<string> | null> {
+  if (!deps.roster) return null;
+  const identities = [...targets.keys()];
+  try {
+    const result = await reconcileTargets(
+      deps.roster.store, deps.roster.config, identities, censusComplete,
+    );
+    if (result.admitted.length) {
+      logger.info({ admitted: result.admitted.length }, "keepalive.roster_reconciled");
+    }
+    if (result.breach) {
+      logger.error(
+        { rosterSize: result.rosterSize, ceiling: deps.roster.config.ceiling,
+          beyondCeiling: result.beyondCeiling },
+        "keepalive.roster_capacity_breach",
+      );
+    }
+    await renewAndReap(
+      deps.roster.store, deps.roster.config, new Set(identities), Date.now(), censusComplete,
+    );
+    if (censusComplete) {
+      // Only a sweep that reconciled a complete census may lift the local
+      // latch, or report the fleet counted: anything less returns the replica
+      // to apparent health on the strength of a reading it could not take.
+      latchRosterStale(false);
+      markCensusReconciled();
+    } else {
+      latchRosterStale(true);
+      logger.error({ targets: identities.length }, "keepalive.census_incomplete");
+    }
+    return null;
+  } catch (err) {
+    // If the marker itself cannot be written, the shared roster still looks
+    // healthy -- so this replica latches locally as well and every claim it
+    // sees is refused until a sweep completes clean. A neighbour that can write
+    // is unaffected; one that cannot is at least not the one admitting.
+    await markRosterStale((err as Error)?.message ?? "reconcile failed")
+      .catch((markErr) => {
+        latchRosterStale(true);
+        logger.error(
+          { err: (markErr as Error)?.message },
+          "keepalive.roster_stale_marker_unwritten",
+        );
+      });
+    logger.error(
+      { err: (err as Error)?.message, targets: identities.length },
+      "keepalive.roster_reconcile_failed",
+    );
+    // Targets the roster already holds keep being pinged -- refusing those is
+    // how a sandbox with live work in it is reclaimed. The rest are not served:
+    // reconcile-before-serving is what makes the deferral count every handle's
+    // refresh gap rests on a number the fleet agrees on, and pinging a target
+    // no roster holds spends this sweep's budget against that number.
+    return await heldIdentities(deps.roster.store);
+  }
+}
+
+/**
+ * The identities the roster is known to hold, or none where it cannot be read.
+ *
+ * An unreadable roster is not an empty one, but it is equally not evidence that
+ * any particular target was admitted -- and this set is only ever used to decide
+ * what may be served without reconciliation having succeeded.
+ */
+async function heldIdentities(store: RosterStore): Promise<Set<string>> {
+  const current = await store.read().catch(() => null);
+  return new Set(
+    (current?.roster.entries ?? [])
+      .map((e) => e.identity)
+      .filter((i): i is string => !!i),
+  );
+}
+
+/**
+ * Take the targets reconciliation could not admit out of this sweep.
+ *
+ * Reported at error level rather than dropped quietly: an un-admitted target
+ * that is also unserved is a sandbox whose refresh is not happening, and the
+ * failure it precedes -- a handle expiring un-pinged -- looks like nothing at
+ * all from the outside.
+ */
+function dropUnadmitted(
+  targets: Map<string, RegisteredSandbox>, servable: Set<string>,
+): void {
+  const refused: string[] = [];
+  for (const key of [...targets.keys()]) {
+    if (servable.has(key)) continue;
+    targets.delete(key);
+    refused.push(key);
+  }
+  if (refused.length) {
+    logger.error({ refused }, "keepalive.unadmitted_targets_unserved");
+  }
 }
 
 /** The verdict the last sweep reached for a target, for tests. */
 const lastVerdict = new Map<string, { fails: number; gone: boolean }>();
-export function lastVerdictForTest(sessionId: string): { fails: number; gone: boolean } | null {
-  for (const [key, v] of lastVerdict) if (key.includes(sessionId)) return v;
+export function lastVerdictForTest(identityPart: string): { fails: number; gone: boolean } | null {
+  for (const [key, v] of lastVerdict) if (key.includes(identityPart)) return v;
   return null;
 }
 
-async function tick(deps: KeepaliveDeps): Promise<void> {
-  const seenIdentities = new Set<string>();
-  const stats = newTickStats();
-  const targets = await collectTargets(deps, seenIdentities, stats);
+async function reconcileKeepaliveKeyspaces(kv: KV): Promise<void> {
+  // Every sweep, not only at boot: an old replica writes the legacy key
+  // throughout a rolling upgrade, after every new one has already scanned.
+  await reconcileReservedKeys(kv).catch((err) => logger.error(
+    { err: (err as Error)?.message }, "keepalive.reserved_key_reconcile_failed",
+  ));
+  // After that migration and not before it: a pre-scheme replica's binding
+  // sitting on a retention's key is moved to its canonical name there, which is
+  // what frees the key this puts the retention back under.
+  await reassertRetentions(retentionStore(kv)).catch((err) => logger.error(
+    { err: (err as Error)?.message }, "keepalive.retention_reassert_failed",
+  ));
+}
 
-  // Reap stale failCounts for sessions no longer tracked.
+function pruneSweepState(
+  targets: Map<string, RegisteredSandbox>,
+  seenIdentities: Set<string>,
+): void {
   for (const key of failCounts.keys()) {
     if (!targets.has(key)) failCounts.delete(key);
   }
   // Reap by each verdict's lifetime; absence from one rotating sweep is not stale.
   const now = Date.now();
   for (const [identity, cached] of [...bgProbeCache.entries()]) {
-    const floor = now - Math.max(BG_VERDICT_TTL_MS, cachedVerdictTtlMs(cached));
+    const floor = now - Math.max(BG_VERDICT_TTL_MS, BG_PROBE_TTL_MS);
     if (cached.at < floor) forgetBackgroundWork(identity);
   }
   // Failure streaks must also survive rotating sweeps and expire by age.
@@ -1364,6 +1793,121 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
       bgGeneration.delete(identity);
     }
   }
+}
+
+function orderedPingTargets(
+  targets: Map<string, RegisteredSandbox>,
+): Array<readonly [string, RegisteredSandbox]> {
+  // Deferred targets lead the next sweep so repeated budget exhaustion stays fair.
+  const waiting = pingDeferred.filter((key) => targets.has(key));
+  const waitingSet = new Set(waiting);
+  return [
+    ...waiting.map((key) => [key, targets.get(key)!] as const),
+    ...[...targets.entries()].filter(([key]) => !waitingSet.has(key)),
+  ];
+}
+
+async function pingSandbox(
+  deps: KeepaliveDeps,
+  targetKey: string,
+  target: RegisteredSandbox,
+): Promise<KeepaliveFailure | null> {
+  const { sessionId, entry } = target;
+  const isAgent = entry.provider === "agent-sandbox";
+  if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return null;
+
+  try {
+    if (isAgent) {
+      await getAgentSandboxProvider().get({
+        provider: "agent-sandbox",
+        id: entry.sessionId!,
+        sandboxName: entry.sandboxName ?? "",
+        namespace: entry.namespace ?? "",
+        handsBaseUrl: "",
+        userId: entry.userId,
+      });
+    } else {
+      await getSafeWorkloadProvider().exec({
+        provider: "safe-workload",
+        id: entry.workloadId!,
+        sandboxName: entry.workloadId!,
+        namespace: entry.namespace ?? "",
+        handsBaseUrl: "",
+        platformKey: entry.platformKey!,
+      }, "date -Iseconds > /tmp/keepalive_ts", "15s");
+    }
+    failCounts.delete(targetKey);
+    const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
+    if (existing) {
+      try {
+        const recorded = JSON.parse(existing.value) as HandsKvEntry;
+        if (sameRegisteredSandbox(entry, recorded)) {
+          await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+        }
+      } catch (err) {
+        logger.warn({ err, sessionId }, "keepalive.kv_refresh_failed");
+      }
+    }
+    logger.info(
+      { sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId },
+      "keepalive.ping",
+    );
+    return null;
+  } catch (error: any) {
+    if (error?.sandboxConfirmedRunning === true) {
+      failCounts.delete(targetKey);
+      logger.error(
+        { err: error?.message || String(error), sessionId, workloadId: entry.workloadId },
+        "keepalive.router_failed_for_running_sandbox",
+      );
+      return null;
+    }
+    return { targetKey, sessionId, entry, error, gone: error?.sandboxGone === true };
+  }
+}
+
+interface PingPhaseResult {
+  deferred: number;
+  deferredNow: string[];
+  failures: KeepaliveFailure[];
+  orderedCount: number;
+  pinged: number;
+}
+
+async function runPingPhase(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<PingPhaseResult> {
+  const ordered = orderedPingTargets(targets);
+  const clock = deps.now ?? Date.now;
+  const pingDeadline = clock() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
+  let pinged = 0;
+  let deferred = 0;
+  const failures: KeepaliveFailure[] = [];
+  const deferredNow: string[] = [];
+  await forEachWithLimit(ordered, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
+    if (clock() >= pingDeadline) {
+      deferred += 1;
+      deferredNow.push(targetKey);
+      return;
+    }
+    pinged += 1;
+    const failure = await pingSandbox(deps, targetKey, target);
+    if (failure) failures.push(failure);
+  });
+
+  return { deferred, deferredNow, failures, orderedCount: ordered.length, pinged };
+}
+
+async function tick(deps: KeepaliveDeps): Promise<void> {
+  const seenIdentities = new Set<string>();
+  await reconcileKeepaliveKeyspaces(deps.kv);
+  const stats = newTickStats();
+  const census = await collectTargets(deps, seenIdentities, stats);
+  const targets = census.targets;
+  const servable = await admitTargets(deps, targets, census.complete);
+  if (servable) dropUnadmitted(targets, servable);
+  pruneSweepState(targets, seenIdentities);
 
   // Emit scan stats even when every target was reclaimed before the ping phase.
   const localCount = localRegistry.size;
@@ -1379,101 +1923,35 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
 
   if (!targets.size) return;
 
-  // Rotate deferred targets to the front of the next sweep.
-  const ordered = [...targets.entries()];
-  const pingStart = pingCursor % ordered.length;
-  const rotated = ordered.slice(pingStart).concat(ordered.slice(0, pingStart));
-  const pingDeadline = Date.now() + (deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS);
-  let pinged = 0;
-  let deferred = 0;
-  const failures: KeepaliveFailure[] = [];
+  const clock = deps.now ?? Date.now;
+  const phase = await runPingPhase(deps, targets);
 
-  await forEachWithLimit(rotated, PING_MAX_IN_FLIGHT, async ([targetKey, target]) => {
-    // The deadline bounds ping starts; already-running pings may finish after it.
-    if (Date.now() >= pingDeadline) {
-      deferred += 1;
-      return;
-    }
-    pinged += 1;
-    const { sessionId, entry } = target;
-    const isAgent = entry.provider === "agent-sandbox";
-    if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return;
+  await handleKeepaliveFailures(phase.failures, targets.size, clock);
 
-    try {
-      if (isAgent) {
-        // agent-sandbox: GET /sessions/{id} refreshes lastActivity (design §16.6),
-        // preventing the sandbox's idle GC from reaping an active session.
-        await getAgentSandboxProvider().get({
-          provider: "agent-sandbox",
-          id: entry.sessionId!,
-          sandboxName: entry.sandboxName ?? "",
-          namespace: entry.namespace ?? "",
-          handsBaseUrl: "",
-          userId: entry.userId,
-        });
-      } else {
-        // safe-workload: exec a no-op to refresh SaFE Workload Manager lastActivity.
-        await getSafeWorkloadProvider().exec({
-          provider: "safe-workload",
-          id: entry.workloadId!,
-          sandboxName: entry.workloadId!,
-          namespace: entry.namespace ?? "",
-          handsBaseUrl: "",
-          platformKey: entry.platformKey!,
-        }, "date -Iseconds > /tmp/keepalive_ts", "15s");
-      }
-      failCounts.delete(targetKey);
-      // Refresh KV TTL so the entry survives across Brain restarts.
-      const kvKey = `hands.${sessionId}`;
-      const existing = await deps.kv.get(kvKey).catch(() => null);
-      if (existing) {
-        try {
-          const recorded = JSON.parse(sc.decode(existing.value)) as HandsKvEntry;
-          if (sameRegisteredSandbox(entry, recorded)) {
-            await deps.kv.update(kvKey, existing.value, existing.revision);
-          }
-        } catch (err) {
-          logger.warn({ err, sessionId }, "keepalive.kv_refresh_failed");
-        }
-      }
-      logger.info({ sessionId, provider: entry.provider ?? "safe-workload", workloadId: entry.workloadId }, "keepalive.ping");
-    } catch (err: any) {
-      if (err?.sandboxConfirmedRunning === true) {
-        failCounts.delete(targetKey);
-        logger.error(
-          { err: err?.message || String(err), sessionId, workloadId: entry.workloadId },
-          "keepalive.router_failed_for_running_sandbox",
-        );
-        return;
-      }
-      // Decide `gone` eviction after the sweep reveals any correlated failures.
-      failures.push({
-        targetKey, sessionId, entry, error: err,
-        gone: err?.sandboxGone === true,
-      } satisfies KeepaliveFailure);
-    }
-  });
-
-  // Advance by completed work so the deferred tail leads the next sweep.
-  await handleKeepaliveFailures(failures, targets.size);
-
-  pingCursor = (pingStart + pinged) % ordered.length;
-  if (deferred > 0) {
+  pingDeferred = phase.deferredNow;
+  if (phase.deferred > 0) {
     logger.warn(
-      { pinged, deferred, total: ordered.length,
+      { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
         budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
       "keepalive.ping_budget_exhausted",
     );
   }
 }
 
-/** Start the periodic keepalive. Idempotent. */
-export function startSandboxKeepalive(deps: KeepaliveDeps): void {
+/**
+ * Start the periodic keepalive. Idempotent.
+ *
+ * @returns the first sweep, which admission waits on: the roster is stamped
+ * empty at boot, so a claim committed before the running fleet has been
+ * reconciled onto it is checked against a count that omits every sandbox this
+ * replica did not create.
+ */
+export function startSandboxKeepalive(deps: KeepaliveDeps): Promise<void> {
   if (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0) {
     logger.info("keepalive.disabled (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0)");
-    return;
+    return Promise.resolve();
   }
-  if (timer) return;
+  if (timer) return Promise.resolve();
   logger.info(
     {
       intervalSec: SANDBOX_KEEPALIVE_INTERVAL_SEC,
@@ -1481,23 +1959,24 @@ export function startSandboxKeepalive(deps: KeepaliveDeps): void {
     },
     "keepalive.start",
   );
-  runGuardedSweep(deps);
+  const census = runGuardedSweep(deps);
   // A sweep may outlast the interval, so interval invocations share the guard.
-  timer = setInterval(() => runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
+  timer = setInterval(() => void runGuardedSweep(deps), SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000);
   timer.unref?.();
+  return census;
 }
 
 /**
  * One sweep, never two at once.
  * Overlap would duplicate writes and race conditional updates.
  */
-function runGuardedSweep(deps: KeepaliveDeps): void {
+function runGuardedSweep(deps: KeepaliveDeps): Promise<void> {
   if (sweeping) {
     logger.warn({}, "keepalive.tick_still_running");
-    return;
+    return Promise.resolve();
   }
   sweeping = true;
-  tick(deps)
+  return tick(deps)
     .catch((err) => logger.warn({ err }, "keepalive.tick_unhandled"))
     .finally(() => { sweeping = false; });
 }

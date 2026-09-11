@@ -49,6 +49,7 @@ bash "$repo_root/scripts/release-tests/deploy-auth-forwarding.sh"
 bash "$repo_root/scripts/release-tests/installer-behavior.sh"
 bash "$repo_root/scripts/release-tests/dry-run-no-side-effects.sh"
 bash "$repo_root/scripts/release-tests/deploy-values-persistence.sh"
+bash "$repo_root/scripts/release-tests/background-flag-persistence.sh"
 
 require_tool helm
 echo "==> deployment security behavior"
@@ -62,7 +63,8 @@ helm lint "$repo_root/sandbox/deploy/helm" \
 sandbox_render="$(mktemp)"
 claw_render="$(mktemp)"
 memory_render="$(mktemp)"
-trap 'rm -f "$sandbox_render" "$claw_render" "$memory_render"' EXIT
+background_render="$(mktemp)"
+trap 'rm -f "$sandbox_render" "$claw_render" "$memory_render" "$background_render"' EXIT
 helm template sandbox-release "$repo_root/sandbox/deploy/helm" \
   --namespace agent-sandbox-system \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml" >"$sandbox_render"
@@ -86,6 +88,74 @@ if rg '^[[:space:]]*image:' "$claw_render" | rg -v '@sha256:'; then
   echo "Claw release render contains a mutable image reference" >&2
   exit 1
 fi
+
+# Background shells, which ship off. The release profile above keeps exercising
+# that default, so the enabled state gets a profile of its own rather than a
+# flag flipped on the one asserting the shipped posture.
+background_values="$repo_root/scripts/release-tests/values/claw-background.yaml"
+
+# One env entry, asserted as the pair it is rendered as: `name:` and `value:`
+# are separate lines, so matching either alone passes on a render carrying the
+# other key's value.
+assert_rendered_env() {
+  local render="$1" key="$2" want="$3"
+  rg -N -A1 "^[[:space:]]*- name: $key\$" "$render" | rg -q "^[[:space:]]*value: \"$want\"\$" || {
+    echo "$render: $key did not render as \"$want\"" >&2
+    exit 1
+  }
+}
+
+assert_rendered_env "$claw_render" BG_SHELL_ENABLED false
+# The template rendering false is not the default being false: a values edit
+# moves the default while every template still renders whatever it was handed.
+rg -q '^  backgroundShell: false$' "$repo_root/claw/deploy/charts/claw/values.yaml"
+
+helm lint "$repo_root/claw/deploy/charts/claw" --values "$background_values"
+helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+  --namespace primus-claw \
+  --values "$background_values" >"$background_render"
+assert_rendered_env "$background_render" BG_SHELL_ENABLED true
+if [ "$(rg -c '^[[:space:]]*- name: BG_SHELL_ENABLED$' "$background_render")" != 1 ]; then
+  echo "background render does not carry exactly one BG_SHELL_ENABLED entry" >&2
+  exit 1
+fi
+if rg '^[[:space:]]*image:' "$background_render" | rg -v '@sha256:'; then
+  echo "Claw background render contains a mutable image reference" >&2
+  exit 1
+fi
+
+# Honoured in both directions: a key whose only rendered value is its profile's
+# is indistinguishable from one the template quietly ignores.
+helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+  --namespace primus-claw --values "$background_values" \
+  --set-string features.backgroundShell=false >"$background_render"
+assert_rendered_env "$background_render" BG_SHELL_ENABLED false
+
+# The ceiling pin is what lets a deployment take the background tools without
+# the tightened foreground ceiling, so the two keys have to be settable apart.
+helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+  --namespace primus-claw --values "$background_values" \
+  --set-string brain.bashMaxTimeoutSec=600 >"$background_render"
+assert_rendered_env "$background_render" BASH_MAX_TIMEOUT_SEC 600
+assert_rendered_env "$background_render" BG_SHELL_ENABLED true
+
+# values.schema.json is what turns a typo in either key into a refused upgrade
+# instead of a crash-looping pod, so both sides of it are exercised: zero and a
+# negative ceiling are refused here because Brain refuses them at startup.
+for rejected in features.backgroundShell=yes brain.bashMaxTimeoutSec=-5 brain.bashMaxTimeoutSec=0; do
+  if helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+      --values "$background_values" --set-string "$rejected" >/dev/null 2>&1; then
+    echo "values.schema.json accepted $rejected" >&2
+    exit 1
+  fi
+done
+# Both shapes the persistence path can produce: --set yields a boolean, and the
+# --set-string every deploy entrypoint uses yields a string.
+helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+  --values "$background_values" --set features.backgroundShell=true >/dev/null
+helm template claw-background "$repo_root/claw/deploy/charts/claw" \
+  --values "$background_values" --set-string features.backgroundShell=true >/dev/null
+
 helm lint "$repo_root/memory/memory-service/deploy/helm" \
   --set-string 'postgres.auth.password=p@ss/word'
 helm template memory-release "$repo_root/memory/memory-service/deploy/helm" \

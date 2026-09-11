@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claw chart values (background-shell keys only)",
+  "description": "Scoped deliberately: helm applies a schema to the whole merged values document, so anything not named here stays unconstrained.",
+  "type": "object",
+  "properties": {
+    "features": {
+      "type": "object",
+      "properties": {
+        "backgroundShell": {
+          "description": "Enable background shell tools. Also tightens the foreground bash ceiling; pin brain.bashMaxTimeoutSec to decouple them.",
+          "default": false,
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["true", "false", ""] }
+          ]
+        },
+        "keepaliveTargetCeiling": {
+          "description": "Largest number of distinct keepalive ping targets one Brain replica may face. Required when backgroundShell is true; Brain refuses to start without it rather than substituting a number the refresh-gap relation was never proven at.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
+        "keepaliveIdleDeadlineSec": {
+          "description": "Shortest idle reclaim in force, in seconds. Required when backgroundShell is true: Brain proves the worst-case refresh gap against it at startup and refuses to start if the gap is not under it.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
+        "keepaliveReconcileReserve": {
+          "description": "Slots held back from ordinary admission so a target another replica created can be taken on before it is served. Required when backgroundShell is true, and must be below keepaliveTargetCeiling.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        }
+      }
+    },
+    "brain": {
+      "type": "object",
+      "properties": {
+        "bashMaxTimeoutSec": {
+          "description": "Foreground bash ceiling in seconds. Empty means the code default, which depends on features.backgroundShell. Zero is excluded because Brain refuses a ceiling below 1 at startup, so admitting it here moves the failure from helm to a crash-looping pod.",
+          "oneOf": [
+            { "type": "string", "pattern": "^$|^[1-9][0-9]*$" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        }
+      }
+    }
+  }
+}

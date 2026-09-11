@@ -1,0 +1,25 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Background-shell rendering profile. Enabled here ONLY so the render
+# assertions can compare on-vs-off. Not a recommended configuration and not
+# derived from any deployment. Separate from claw-release.yaml because that
+# profile keeps asserting the shipped default posture, which a profile turning
+# the flag on cannot.
+
+image:
+  registry: example.invalid
+  repository: claw
+  tag: bg-test@sha256:5555555555555555555555555555555555555555555555555555555555555555
+secret:
+  create: false
+ingress:
+  enabled: false
+postgres:
+  enabled: false
+features:
+  backgroundShell: true
+brain:
+  # Left empty so the flag-derived ceiling is what renders; the pinned variant
+  # is a --set-string overlay rather than a second file.
+  bashMaxTimeoutSec: ""

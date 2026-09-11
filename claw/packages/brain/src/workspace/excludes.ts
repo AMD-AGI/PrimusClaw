@@ -79,11 +79,10 @@ export const WORKSPACE_EXCLUDES = [
   // Hands binary into /workspace. Current Brain puts it under /tmp; kept
   // because old workspaces still have one.
   ".hands-binary",
-  // Where bootstrap redirects the Hands process's own output. It is Brain's
-  // log that happens to live in the user's directory, and bootstrap truncates
-  // it at every launch -- so a snapshot carrying it forward preserves whatever
-  // fragment the previous sandbox had reached, under a name that reads like
-  // the current one's.
+  // Where bootstrap used to redirect the Hands process's own output. Kept so a
+  // workspace snapshotted before the log moved into the Hands-owned state area
+  // does not carry the old file forward, under a name that reads like a current
+  // one's.
   "hands.log",
 ] as const;
 

@@ -39,7 +39,7 @@ const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "12
  * model is shown is the number enforced here; this fallback is for a Hands
  * started without it.
  */
-const MAX_TIMEOUT_SEC = parseInt(
+export const MAX_TIMEOUT_SEC = parseInt(
   process.env.BASH_MAX_TIMEOUT_SEC || (BG_SHELL_ENABLED ? "120" : "36000"),
   10,
 );
@@ -72,10 +72,31 @@ export const bash = {
   }) => {
     if (args.run_in_background) {
       try {
-        const shell = spawnBackground(
-          currentOwner(), currentRun(), args.command, args.shell_id, args.background_kind ?? "background",
+        const start = spawnBackground(
+          currentOwner(), currentRun(), args.command, args.shell_id,
+          args.background_kind ?? "background",
         );
-        return { content: [{ type: "text" as const, text: `Started background shell ${shell.id}. Poll output with bash_output, terminate with kill_shell.` }] };
+        const id = start.shell?.id ?? start.shellId!;
+        if (start.resolution === "retry_expired") {
+          // The outcome this replay would have resolved against is past the
+          // window its run's deadline fixed, so what happened is no longer
+          // knowable. Running the command again is the one answer the scheme
+          // exists to avoid, so nothing was run and the caller is told why.
+          return {
+            content: [{ type: "text" as const, text: `Background shell ${id} was started earlier and its outcome is no longer retained, so nothing was run a second time.` }],
+            structuredContent: { shell_id: id, resolution: start.resolution, shell_class: "unknown" },
+          };
+        }
+        const already = start.resolution === "deduplicated"
+          ? " This start was already committed to, so nothing was run a second time."
+          : "";
+        return {
+          content: [{ type: "text" as const, text: `Started background shell ${id}. Poll output with bash_output, terminate with kill_shell.${already}` }],
+          // The same answer as a field: a caller that has to match prose to
+          // tell a first call from a replay is one reword away from running
+          // the command twice.
+          structuredContent: { shell_id: id, resolution: start.resolution },
+        };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -95,6 +116,8 @@ export const bash = {
     const result = await runForegroundShell(args.command, {
       timeoutMs,
       bufferBytes: MAX_OUTPUT_BYTES,
+      owner: currentOwner(),
+      run: currentRun(),
     });
 
     if (result.timedOut) {
@@ -121,6 +144,12 @@ export const bash = {
             + `\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
         }],
         isError: true,
+        // The same fact as a field. A tightened ceiling shows up nowhere in a
+        // run's own terminal state -- a clamped command is answered, not ended
+        // -- so an operator watching for the regression has nothing to read
+        // unless the timeout says so itself, and matching the prose above is
+        // one reword away from silence.
+        structuredContent: { outcome: "foreground_timeout", granted_sec: grantedSec, clamped },
       };
     }
     if (result.exitCode === 0) {

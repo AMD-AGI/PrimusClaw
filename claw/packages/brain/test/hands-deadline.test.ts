@@ -35,6 +35,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { callDeadlineMs, explainHandsError } from "../src/clients/hands.js";
+import { MCP_DEADLINE_SLACK_MS, toolTimeoutCeilingSec } from "../src/tools/hands.js";
 import { WAIT_MAX_SEC } from "../src/config.js";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -183,4 +184,45 @@ test("a tool name off the prototype chain does not become a NaN deadline", () =>
 
 test("anything else is passed through rather than dressed up", () => {
   assert.equal(explainHandsError(new Error("file not found"), "read"), "Error: file not found");
+});
+
+test("the deadline is the ceiling the one source states, not a number of its own", () => {
+  // Computed from the function rather than written down, so a surface holding
+  // its own copy fails here instead of agreeing with itself.
+  for (const [tool, field] of [["bash", "timeout"], ["wait", "timeout_sec"]] as const) {
+    const held = toolTimeoutCeilingSec(tool);
+    assert.equal(
+      callDeadlineMs(tool, { [field]: held * 10 }),
+      held * 1000 + MCP_DEADLINE_SLACK_MS,
+      `${tool} is deadlined at its own ceiling`,
+    );
+  }
+});
+
+test("a transport timeout cannot be mistaken for a command timeout or a refusal", () => {
+  // The three classes are kept apart by the tokens each one may not carry.
+  // Collapsed into one another, a model told "the command was killed" re-runs
+  // work that is still writing, and one told "disabled" stops asking about a
+  // shell that exists.
+  const text = explainHandsError(toolTimeout(), "bash", { command: "make", timeout: 300 });
+
+  assert.match(text, /360s deadline/, "the deadline that stopped this call");
+  assert.match(text, /may still be running/);
+  assert.match(text, /unlikely to be the repair/);
+  assert.doesNotMatch(text, /killed/, "that is the command-timeout class's claim");
+  assert.doesNotMatch(text, /process group/);
+  assert.doesNotMatch(text, /disabled/, "and that is the refusal class's");
+  assert.ok(!text.includes("-32001"));
+  assert.doesNotMatch(text, /not found|unknown shell|no longer available/,
+    "a bare absence phrase would also be satisfied by a lost-registry answer, "
+      + "which is a different class this suite does not assert");
+});
+
+test("a non-sandbox tool's story names no sandbox at all", () => {
+  const text = explainHandsError(toolTimeout(), "mcp__github__create_issue", {});
+  assert.doesNotMatch(text, /\/workspace/,
+    "there is no workspace behind this transport, and a model sent looking in "
+      + "one waits out a rebuild that is not coming");
+  assert.doesNotMatch(text, /still be running/);
+  assert.doesNotMatch(text, /\d+s deadline/);
 });

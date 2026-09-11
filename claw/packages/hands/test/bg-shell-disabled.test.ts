@@ -25,6 +25,9 @@ const { bash } = await import("../src/tools/shell/bash.js");
 const { bash_output } = await import("../src/tools/shell/bash-output.js");
 const { kill_shell } = await import("../src/tools/shell/kill-shell.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 /** The flag is off by default; leaving it unset must not leave it on. */
 test("the default is off", () => {
   assert.throws(() => bg.spawnBackground("someone", "run-1", "sleep 30"), /disabled/);
@@ -37,8 +40,8 @@ test("nothing is spawned when the feature is off", () => {
 });
 
 test("polling and killing refuse too, so a stale transcript gets an answer", () => {
-  assert.match(bg.pollOutput("someone", "bg-1"), /disabled/);
-  assert.match(bg.killShell("someone", "bg-1"), /disabled/);
+  assert.match(bg.pollOutput("someone", "run-1", "bg-1").text, /disabled/);
+  assert.match(bg.killShell("someone", "run-1", "bg-1").text, /disabled/);
 });
 
 test("the refusal tells the caller what to do instead", () => {
@@ -70,4 +73,27 @@ test("bash reports the refusal as a tool error, not as success", async () => {
 test("the background tools are still reachable and still say no", async () => {
   assert.match((await bash_output.execute({ shell_id: "bg-1" })).content[0]!.text!, /disabled/);
   assert.match((await kill_shell.execute({ shell_id: "bg-1" })).content[0]!.text!, /disabled/);
+});
+
+test("wait refuses too, and reports the refusal as a tool error", async () => {
+  // Not parity with bash_output and kill_shell, which return the refusal as
+  // plain content: the three are pinned to their own current shapes, and
+  // nothing here requires a shared result envelope. What matters is that the
+  // fourth entry point refuses at all -- a replayed transcript reaches it
+  // exactly as it reaches the other three.
+  const { wait } = await import("../src/tools/shell/wait.js");
+  const res = await wait.execute({ shell_id: "bg-1" });
+  assert.match(res.content[0]!.text!, /disabled/);
+  assert.equal((res as { isError?: boolean }).isError, true);
+});
+
+test("the registry still advertises all four names with the feature off", async () => {
+  // Registration is not a capability signal, and Brain must not read it as one.
+  // Unregistering would turn a legible refusal for a replayed transcript into
+  // an unknown-tool error, so the tools stay and say no.
+  const { tools } = await import("../src/tools/index.js");
+  const names = tools.map((t) => t.name);
+  for (const name of ["bash", "bash_output", "kill_shell", "wait"]) {
+    assert.ok(names.includes(name), `${name} must stay registered`);
+  }
 });

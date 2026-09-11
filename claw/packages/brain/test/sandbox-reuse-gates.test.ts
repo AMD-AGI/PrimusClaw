@@ -107,14 +107,18 @@ function stubEffects(
   restartOk = true,
   /** When set, the restart refuses (never attempts) with this detail. */
   refusal?: string,
+  /** What the record-derived gate answers. Default: nothing left running. */
+  liveWork: "clear" | "protected" | "unknown" = "clear",
 ): {
   destroyed: string[];
   registered: Registration[];
   restartCalls: number[];
+  retained: string[];
 } {
   const destroyed: string[] = [];
   const registered: Registration[] = [];
   const restartCalls: number[] = [];
+  const retained: string[] = [];
   restoreEffects = bindSandboxReuseEffects({
     destroyHands: async (sessionId: string) => { destroyed.push(sessionId); },
     registerSandbox: ((sessionId: string, target: Record<string, unknown>) => {
@@ -126,8 +130,10 @@ function stubEffects(
       if (refusal) return { ok: false, detail: refusal, refused: true };
       return { ok: restartOk, detail: restartOk ? "healthy" : "started_but_unhealthy" };
     },
+    countLiveWork: async () => ({ verdict: liveWork, classes: {}, reason: liveWork }),
+    retainContainer: async (input) => { retained.push(input.generation); return "retained"; },
   });
-  return { destroyed, registered, restartCalls };
+  return { destroyed, registered, restartCalls, retained };
 }
 
 /** The session ids passed to `registerSandbox`, for the cases that only count. */
@@ -555,21 +561,60 @@ test("the SaFE handle records the namespace keepalive will poll", () => {
     "keepalive has to poll the namespace the request named");
 });
 
-test("a refused in-place restart falls back to rebuilding, it does not wedge the turn", async () => {
+test("a refused in-place restart releases the claim, and destroys only an empty container", async () => {
   // `restart_disabled` and `env_not_reproducible` mean this deployment will
-  // never repair this sandbox in place. Treating that as a failed repair kept
-  // the container and threw, so every later turn on the session threw the same
-  // way with no path back -- the operator who turned the kill switch off got a
-  // dead session rather than the replace-and-rebuild it used to do.
-  const { destroyed, restartCalls } = stubEffects("alive", false, "restart_disabled");
+  // never repair this sandbox in place, so the session's claim on it has to go
+  // or every later turn fails the same way. What happens to the container is a
+  // separate question, answered by what is still running in it.
+  const { destroyed, restartCalls, retained } = stubEffects("alive", false, "restart_disabled");
   stubHealth("down");
   const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
 
   const reused = await tryReuseSessionSandbox(a);
 
-  assert.equal(reused, null, "null is how this function asks the caller to rebuild");
+  assert.equal(reused, null, "null is how this function asks the caller to build a fresh one");
   assert.equal(restartCalls.length, 1, "the refusal still comes from the restart path");
-  assert.deepEqual(destroyed, ["s-1"], "the caller tears the old sandbox down before rebuilding");
+  assert.deepEqual(destroyed, ["s-1"], "nothing was running, so the container is the caller's to reap");
+  assert.deepEqual(retained, [], "and nothing was retained");
+});
+
+test("a refusal over live work retains the container instead of replacing it", async () => {
+  // A fresh Hands reads an empty registry, so a rebuild that asks nothing about
+  // what is running reads empty as "destroying this is harmless".
+  for (const verdict of ["protected", "unknown"] as const) {
+    const { destroyed, retained } = stubEffects("alive", false, "env_not_reproducible", verdict);
+    stubHealth("down");
+    const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+    const reused = await tryReuseSessionSandbox(a);
+
+    assert.equal(reused, null, `${verdict}: the caller still gets a fresh sandbox`);
+    assert.deepEqual(destroyed, [], `${verdict}: the live container was destroyed`);
+    assert.equal(retained.length, 1, `${verdict}: the binding was not moved into the retention namespace`);
+    restoreEffects?.();
+    restoreEffects = null;
+  }
+});
+
+test("an unanswerable gate keeps the container, exactly as a nonzero count does", async () => {
+  // The caller-visible outcome is one acquisition either way: the count decides
+  // which container it gets, never what it is told, so no response and no
+  // combination of responses is a function of what was found.
+  const held = stubEffects("alive", false, "env_not_reproducible", "unknown");
+  stubHealth("down");
+  const { a: unknownAttempt } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const unknownResult = await tryReuseSessionSandbox(unknownAttempt);
+  restoreEffects?.();
+  restoreEffects = null;
+
+  const busy = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a: protectedAttempt } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const protectedResult = await tryReuseSessionSandbox(protectedAttempt);
+
+  assert.deepEqual(unknownResult, protectedResult, "the two are indistinguishable to a caller");
+  assert.deepEqual(held.destroyed, []);
+  assert.deepEqual(busy.destroyed, []);
 });
 
 test("a restart that was attempted and failed still keeps the container", async () => {
@@ -638,4 +683,62 @@ test("a session whose sandbox was torn down builds a new one instead of failing"
   assert.equal(reused, null,
     "no entry means no reuse -- and the caller builds a sandbox, which is what "
     + "the turn needs");
+});
+
+test("a retention is keyed by the generation its shells' rows record", async () => {
+  // A per-shell reference row records the endpoint its shell ran under, and a
+  // query resolves the container by matching that against the retention's key
+  // part. A key built from a workload id or a sandbox name is a container no
+  // poll, wait or kill can route back to.
+  const { retained } = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(retained, [LIVE.handsUrl],
+    "the retention key part must be the generation the rows carry, not another identifier");
+});
+
+test("a binding naming no endpoint is refused rather than retained under an address nothing resolves", async () => {
+  // Deriving a key part here would produce a container that is swept and pinged
+  // and that no reference row can name -- protected on paper only.
+  const { destroyed, retained } = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a } = attempt({ ...LIVE, handsUrl: "", specFingerprint: specOf() });
+
+  await assert.rejects(() => tryReuseSessionSandbox(a), /names no endpoint/);
+  assert.deepEqual(destroyed, [], "nothing was destroyed on the way out");
+  assert.deepEqual(retained, [], "and nothing was retained under an unresolvable key");
+});
+
+test("reuse is refused while the fleet is uncounted, and registers nothing", async () => {
+  // Reuse makes no admission claim -- the container is already in the fleet --
+  // but it does register a ping target, and a target this replica serves while
+  // its roster does not hold it is the ceiling enforced after the fact rather
+  // than before. Provisioning is refused in the same window, so reuse falling
+  // through to it would only meet the same answer one pod later.
+  const {
+    SandboxCapacityRefused, bindAdmission, markCensusReconciled,
+  } = await import("../src/sandbox/admission.js");
+  const { registered } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+  const rosterKv = {
+    async get() { return null; },
+    async create() { return 1; },
+    async update() { return 1; },
+  } as unknown as KV;
+
+  await bindAdmission(rosterKv, { ceiling: 8, reconciliationReserve: 2 });
+  try {
+    await assert.rejects(() => tryReuseSessionSandbox(a), SandboxCapacityRefused);
+    assert.deepEqual(registered, [], "nothing is pinged on the strength of an uncounted fleet");
+
+    markCensusReconciled();
+    assert.ok(await tryReuseSessionSandbox(a), "and reuse resumes once a sweep has counted it");
+    assert.deepEqual(registeredIds(registered), ["s-1"]);
+  } finally {
+    // A ceiling of zero binds no roster, which is this module's off state.
+    await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
+  }
 });

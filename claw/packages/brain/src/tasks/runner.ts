@@ -13,7 +13,10 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { NatsEmitter } from "../events/emitter.js";
-import { HandsClient, isHandsNetworkError } from "../clients/hands.js";
+import {
+  HandsClient, isHandsNetworkError,
+  type OutstandingReconciliation, type ReclaimCause,
+} from "../clients/hands.js";
 import {
   syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
@@ -26,7 +29,7 @@ import { isRetryable } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
-import { classifyResumeOutcome } from "./resume-outcome.js";
+import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
 import {
   sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
   decodeAeadKey,
@@ -72,7 +75,7 @@ import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
-import { pickRunScope, refreshTaskLock, releaseTaskLock } from "./lock.js";
+import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
@@ -81,6 +84,9 @@ import {
 } from "./checkpoint-codec.js";
 import pino from "pino";
 import { metrics, type TerminalRefusalReason, type TaskOutcome } from "../infra/metrics.js";
+import { deleteRunRows } from "../sandbox/bg-handle-rows.js";
+import { bgRowStore } from "../sandbox/bg-row-store.js";
+import { readHandsEntry } from "../sandbox/registry.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
@@ -365,7 +371,9 @@ export interface TaskRunnerSideEffects {
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
-  makeHandsClient: (url: string, token: string, owner: string, run: string) => HandsClient;
+  makeHandsClient: (
+    url: string, token: string, owner: string, run: string, deadlineAt: string | undefined, shellRun: string,
+  ) => HandsClient;
 }
 
 const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
@@ -393,7 +401,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
-  makeHandsClient: (url, token, owner, run) => new HandsClient(url, token, owner, run),
+  makeHandsClient: (url, token, owner, run, deadlineAt, shellRun) =>
+    new HandsClient(url, token, owner, run, deadlineAt, shellRun),
 };
 
 let _deps: TaskRunnerDeps | null = null;
@@ -875,21 +884,14 @@ class TaskRunner {
   private readonly abortCtrl: AbortController;
 
   /**
-   * This one execution, as Hands files background shells under it.
-   *
-   * The task id, so a redelivered attempt of the same run re-adopts the shells
-   * the previous attempt started rather than orphaning them. Falls back to the
-   * message id for the legacy chat path, which dispatches without a task row.
+   * Identity for background-start rows and deduplication across redeliveries.
+   * Uses the task id, or the message id for chat without a task row.
    */
   private readonly runId: string;
 
   /**
-   * This run in the phase ledger.
-   *
-   * Deliberately a second value beside {@link runId} rather than a derivation
-   * of it: that one decides which sandbox shells a redelivered attempt
-   * re-adopts, and the lease and message tiers here would silently change that
-   * answer. Neither is computed from the other.
+   * Phase-ledger identity, whose lease and message fallbacks differ from the
+   * background-start row identity in {@link runId}.
    */
   private readonly runIdentity: RunIdentity;
 
@@ -915,6 +917,9 @@ class TaskRunner {
    */
   private readonly handsOwner: string;
 
+  /** Shell-filing key: the DAG node's task or node id, or empty for a conversation. */
+  private readonly shellRun: string;
+
   // userIdHex: only sessions whose user_id matches /^[0-9a-f]{32}$/ go
   // through the Plan Y v2 workspace-sync path (shared-filesystem restore
   // requires a hex user id; see workspace/sync.ts assertSafeIds). Other
@@ -926,6 +931,7 @@ class TaskRunner {
   private readonly transcriptStartedAt: number;
 
   private keepAlive!: ReturnType<typeof setInterval>;
+  private cancelDeadline: () => void = () => {};
   private readonly transcriptLog: Array<Record<string, unknown>> = [];
 
   // Mutable checkpoint state (updated by onCheckpoint callback).
@@ -1108,6 +1114,7 @@ class TaskRunner {
       );
     }
     this.handsOwner = pickRunScope(request);
+    this.shellRun = pickShellRun(request);
 
     this.userIdHex = /^[0-9a-f]{32}$/.test(userId) ? userId : null;
     this.userIdForSync = request.user_id || "default";
@@ -1418,7 +1425,9 @@ class TaskRunner {
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal },
     );
-    const newHands = fx().makeHandsClient(newUrl, newToken, this.handsOwner, this.runId);
+    const newHands = fx().makeHandsClient(
+      newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
+    );
     // Fold the newest in-flight snapshot into the session prefix *before*
     // restoring from it. The session prefix only advances on a successful
     // terminal sync, so mid-run it holds the state from before this run
@@ -1555,7 +1564,7 @@ class TaskRunner {
   private replaceHandsClient(): HandsClient {
     this.hands?.close().catch(() => {});
     const fresh = fx().makeHandsClient(
-      this.handsUrl, this.handsToken, this.handsOwner, this.runId,
+      this.handsUrl, this.handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
     );
     this.hands = fresh;
     return fresh;
@@ -1614,9 +1623,12 @@ class TaskRunner {
   private async resolvePlatformKey(): Promise<void> {
     if (this.platformKey) return;
     try {
-      const e = await this.kv.get(`hands.${this.sessionId}`);
+      // Read-through: an old replica in a rolling upgrade writes only the
+      // legacy key, and looking at the canonical one alone would lose the
+      // platform key this session's sandbox was created with.
+      const e = await readHandsEntry(this.kv, this.sessionId);
       if (e) {
-        const info = JSON.parse(sc.decode(e.value));
+        const info = JSON.parse(e.value);
         this.platformKey = info.platformKey || "";
         if (this.platformKey) {
           logger.info({ sessionId: this.sessionId }, "task.platform_key.recovered_from_kv");
@@ -1841,10 +1853,16 @@ class TaskRunner {
    * the idle-skip-ping + expiry side of this.
    */
   private stopKeepaliveAfterTask(): void {
+    // The handle is kept for the next message, so the sandbox is still a target
+    // the sweep can reconcile back in. Its admission slot stays with it: given
+    // up here, the ceiling is handed to another provisioning while this sandbox
+    // is still counted, which is the over-cap state reached through ordinary
+    // use rather than through a race.
+    const keepSlot = { releaseSlot: false };
     if (this.handsIdentity) {
-      fx().unregisterSandbox(this.sessionId, this.handsIdentity);
+      fx().unregisterSandbox(this.sessionId, this.handsIdentity, keepSlot);
     } else if (this.handsWorkloadId) {
-      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId });
+      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId }, keepSlot);
     }
     void this.parkHandsForIdleReuse().then((outcome) => {
       logger.info(
@@ -1901,21 +1919,39 @@ class TaskRunner {
    * and the release is the run's last chance to reach them, so the flag is set
    * where the answer came back rather than where the attempt was made.
    */
-  private async reapBackgroundShells(): Promise<void> {
+  private async reapBackgroundShells(cause?: ReclaimCause): Promise<void> {
+    // DAG shells end with the node; conversation shells survive turns and cancellations.
     const isDagNode = !!(this.request.dag_root_task_id || this.request.dag_node_id);
-    if (this.shellsReaped || !isDagNode || !this.hands) return;
+    const reason: ReclaimCause | null = cause ?? (isDagNode ? "dag_node_terminal" : null);
+    if (this.shellsReaped || !reason || !this.hands) return;
+    // Names the operation this reap belongs to, so every shell it ends is
+    // attributable to one decision rather than to a class of them.
+    const reclaimOp = `${this.request.task_id ?? this.sessionId}:${reason}`;
     try {
-      const stopped = await this.hands.reapShells();
+      const report = await this.hands.reapShells(reason, reclaimOp);
       this.shellsReaped = true;
-      if (stopped > 0) {
-        logger.info(
-          { sessionId: this.sessionId, taskId: this.request.task_id, stopped },
+      if (report.shells.length > 0) {
+        // `surviving` is the honest half: a shell that ignored both signals is
+        // still running, and reporting the addressed count as stopped is how a
+        // run came to be reported finished over work that had not ended.
+        const log = report.surviving > 0 ? logger.warn : logger.info;
+        log.call(
+          logger,
+          {
+            sessionId: this.sessionId,
+            taskId: this.request.task_id,
+            cause: reason,
+            reclaimOp,
+            stopped: report.stopped,
+            escalated: report.escalated,
+            surviving: report.surviving,
+          },
           "task.background_shells_reaped",
         );
       }
     } catch (e) {
       logger.warn(
-        { err: (e as Error)?.message ?? e, sessionId: this.sessionId, taskId: this.request.task_id },
+        { err: (e as Error)?.message ?? e, sessionId: this.sessionId, taskId: this.request.task_id, cause: reason },
         "task.background_shells_reap_failed",
       );
     }
@@ -2032,7 +2068,9 @@ class TaskRunner {
       sandboxWorkloadId: this.handsWorkloadId,
       attempt: this.attempt,
     });
-    this.hands = fx().makeHandsClient(handsUrl, handsToken, this.handsOwner, this.runId);
+    this.hands = fx().makeHandsClient(
+      handsUrl, handsToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
+    );
     // ensureHands returns only after bootstrap and the health check, so this
     // is the first moment a sandbox can actually be used -- unlike the
     // provider's own `running`, which fires when the pod is scheduled. The
@@ -2047,6 +2085,83 @@ class TaskRunner {
 
     await this.resolveResumeState(this.pendingResumeCkpt, created);
     return this.hands;
+  }
+
+  /**
+   * Settle the background starts a previous attempt committed to and never
+   * confirmed, before this one issues anything.
+   *
+   * A crash between the durable dispatched write and the transport handoff
+   * leaves a commitment for a request that may never have gone out. Left to the
+   * dispatch path it is closed only if the model happens to re-emit that exact
+   * call; and left to the sandbox attach it is not reached at all by the run
+   * that most needs it -- a redelivery with no checkpoint, which opens a sandbox
+   * only if some tool asks for one.
+   *
+   * A failure is logged, not raised: nothing here is a precondition for running,
+   * and an unsettled row still answers every replay fail-closed.
+   */
+  private async reconcileBackgroundStarts(): Promise<void> {
+    // Not gated on the feature flag: rows written before it was turned off are
+    // still commitments, and nothing else would ever settle them.
+    if (this.msg.info.deliveryCount <= 1 && !this.pendingResumeCkpt) return;
+    try {
+      const client = await this.reconcilingClient();
+      if (!client) return;
+      this.reportOutstandingStarts(await client.reconcileOutstandingStarts());
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: this.sessionId, runId: this.runId },
+        "task.bg_starts_reconcile_failed",
+      );
+    }
+  }
+
+  /**
+   * The client to reconcile against, without provisioning one.
+   *
+   * A run that has not attached is not a run with no sandbox: the binding of
+   * the one its predecessor used is still in the registry, and it is the
+   * generation the outstanding rows name. Provisioning here instead would open
+   * a pod for a turn that may never need one, and against a *new* generation,
+   * which resolves every outstanding row to unknown by construction.
+   */
+  private async reconcilingClient(): Promise<HandsClient | null> {
+    if (this.hands) return this.hands;
+    const entry = await readHandsEntry(this.kv, this.sessionId).catch(() => null);
+    if (!entry) return null;
+    const info = JSON.parse(entry.value) as { handsUrl?: unknown; token?: unknown };
+    if (typeof info.handsUrl !== "string" || !info.handsUrl) return null;
+    // Not closed afterwards: the reconciliation reads two plain HTTP routes and
+    // never opens the MCP transport, so there is nothing holding a connection.
+    return fx().makeHandsClient(
+      info.handsUrl, typeof info.token === "string" ? info.token : "",
+      this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
+    );
+  }
+
+  /**
+   * Tell the resumed conversation which of its background starts did not
+   * finish, so the model can decide rather than discover.
+   *
+   * Releasing a commitment on positive evidence that nothing ran is what stops
+   * the request being stranded, but on its own it is a deletion the model never
+   * hears about: the call simply never happens unless the same tool use is
+   * re-emitted by chance.
+   */
+  private reportOutstandingStarts(settled: OutstandingReconciliation): void {
+    if (!settled.released.length && !settled.unresolved.length) return;
+    logger.warn(
+      { sessionId: this.sessionId, runId: this.runId, ...settled },
+      "task.bg_starts_unfinished",
+    );
+    const hint = buildOutstandingStartHint(settled);
+    if (!hint || !this.resumeCheckpoint) return;
+    const already = this.resumeCheckpoint.messages.some(
+      (m) => m.role === "user" && m.content === hint.content,
+    );
+    if (already) return;
+    this.resumeCheckpoint.messages = [...this.resumeCheckpoint.messages, hint];
   }
 
   /**
@@ -2186,11 +2301,11 @@ class TaskRunner {
       this.resumeMode, ckpt, isPartialAssistantTail, this.msg.info.deliveryCount,
     );
     if (resumeOutcome.hint && this.resumeCheckpoint) {
+      // By content, not by the prefix: other notices share it -- an unfinished
+      // background start says so through the same channel -- and matching the
+      // prefix would let one of those suppress this one on the next resume.
       const alreadyInjected = this.resumeCheckpoint.messages.some(
-        (m) =>
-          m.role === "user"
-          && typeof m.content === "string"
-          && m.content.startsWith("[system-notice]:"),
+        (m) => m.role === "user" && m.content === resumeOutcome.hint!.content,
       );
       if (!alreadyInjected) {
         this.resumeCheckpoint.messages = [
@@ -2355,11 +2470,29 @@ class TaskRunner {
   private async releaseAfterTerminal(): Promise<void> {
     await this.releaseStep("rayjob", () => this.teardownRayJob());
     await this.releaseStep("background_shells", () => this.reapBackgroundShells());
+    await this.releaseStep("bg_handle_rows", () => this.dropBackgroundHandleRows());
     await this.releaseStep("keepalive", () => this.stopKeepaliveAfterTask());
   }
 
   /**
-   * Run one release step, isolated from the other two.
+   * Drop this run's background-shell reference rows.
+   *
+   * Only from here, and only because this path means the run is over: a
+   * termination checkpoint, a lost lease or a retryable error all mean the run
+   * will be picked up again, and its rows are what stop the resumed attempt
+   * executing a command that already ran.
+   */
+  private async dropBackgroundHandleRows(): Promise<void> {
+    const store = bgRowStore();
+    if (!store || !this.handsOwner || !this.runId) return;
+    const dropped = await deleteRunRows(store, this.handsOwner, this.runId);
+    if (dropped) {
+      logger.info({ sessionId: this.sessionId, runId: this.runId, dropped }, "task.bg_rows_dropped");
+    }
+  }
+
+  /**
+   * Run one release step, isolated from the others.
    *
    * Each of the three is independently worth doing, and each can fail on its
    * own: the cluster release inspects the request's topology and reaches SaFE,
@@ -2957,6 +3090,8 @@ class TaskRunner {
       ),
       this.coverageReport()?.runTime,
     );
+    // Hands reaps run-scoped shells; conversation shells survive cancellation.
+    await this.reapBackgroundShells("run_cancelled");
     await this.releaseAfterTerminal();
     await this.ackTerminal();
   }
@@ -3404,39 +3539,9 @@ class TaskRunner {
     return timer;
   }
 
-  async run(): Promise<void> {
-    // Every terminal branch below sets this; the `finally` reports it once.
-    // Recording at each branch instead would mean nine call sites and a silent
-    // gap the first time a tenth is added -- and the gap would read as "no
-    // tasks ran", which is the same shape as an outage.
-    const runStartedAt = Date.now();
-    let outcome: TaskOutcome | null = null;
-    // Armed below, once the resume checkpoint has been read. A deadline that is
-    // already past on arrival -- a redelivery of a run whose budget expired
-    // while it was queued, which is the resumed case this reports on -- fires
-    // on the next tick, and armed from here that tick lands before
-    // `pendingResumeCkpt` is assigned, so the run's turn count reads as zero in
-    // the one log line that exists to say how far it had got. What this gives
-    // up is the deadline's cover over three awaits, not one -- the taskResumed
-    // emit, the platform-key fetch and the checkpoint read. None of them
-    // observes the abort signal, so arming earlier could not have cut any of
-    // them short, and both KV reads are inside try/catch behind the client's
-    // own request timeout.
-    let cancelDeadline: () => void = () => {};
-    const leaseTimer = this.startLeaseHeartbeat();
-    // keepAlive must be much shorter than the consumer's ack_wait to avoid
-    // redelivery while a task is still making progress. That is
-    // TASK_CONSUMER_ACK_WAIT_NS, two minutes, against the ten seconds here.
+  private startDeliveryHeartbeat(): void {
     this.keepAlive = setInterval(() => {
       try { this.msg.working(); } catch {}
-      // A lost lease means a second replica is already running this task. Both
-      // would then be driving the same sandbox and writing the same workspace
-      // and checkpoint key, and the loser is the one that has to yield.
-      //
-      // `expired` is the same conclusion reached without a witness: renewals
-      // have been failing for long enough that the lock may already have gone,
-      // and a run that cannot prove it holds the lock has to stop rather than
-      // wait to be told by a second worker turning up in its workspace.
       fx().refreshTaskLock(this.lockKey).then((renewal) => {
         const yielding = renewal === "lost" || renewal === "expired";
         if (!yielding || this.abortCtrl.signal.aborted) return;
@@ -3446,197 +3551,155 @@ class TaskRunner {
         );
         this.abortCtrl.abort(LEASE_LOST_ABORT_REASON);
       }).catch(() => {});
-      // Conditional on the revision just read, not a plain put. This writes the
-      // same bytes back purely to push the TTL out, so it has no opinion about
-      // the contents -- but an unconditional put still bumps the revision, and
-      // ensureHands' reuse path holds a revision across a health check, a probe
-      // and a Hands restart. At one of these every ten seconds it was the
-      // reason those CAS writes lost. A lost race here needs no handling: the
-      // writer that beat us refreshed the same TTL.
-      this.kv.get(`hands.${this.sessionId}`).then(e => {
-        if (e) this.kv.update(`hands.${this.sessionId}`, e.value, e.revision).catch((err) => {
+      readHandsEntry(this.kv, this.sessionId).then(e => {
+        if (e) this.kv.update(e.key, sc.encode(e.value), e.revision).catch((err) => {
           logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_refresh_failed");
         });
       }).catch((err) => {
         logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_get_failed");
       });
     }, LOCK_REFRESH_INTERVAL_MS);
+  }
 
-    // Everything from here is inside the try whose finally hands back the
-    // timers, the ledger entry, the abort registration and the lock. Two
-    // statements used to sit in the gap between arming them and entering it,
-    // and a throw from either -- resolvePlatformKey reaches the API -- left the
-    // whole set behind. Not merely leaked: the abandoned keepalive goes on
-    // telling the queue this delivery is being worked on and goes on renewing
-    // the lock, so the message is never redelivered and the session's lock is
-    // never released. The run is gone and nothing can replace it until the pod
-    // restarts.
-    try {
-      // INV-8 state-machine closure (checkpoint-architecture-redesign §5.3):
-      // any redelivery (whether the previous attempt hit SIGTERM, ack_wait
-      // timeout, or a hard crash) must announce that the brain is taking the
-      // task back over so the api-side event-consumer can transition the
-      // session row from 'interrupted' back to 'running'. Fired before any
-      // expensive work so the UI clears its toast promptly.
-      if (this.msg.info.deliveryCount > 1) {
-        await this.onEvent({
-          type: "taskResumed",
-          delivery_count: this.msg.info.deliveryCount,
-          wallclock_ms: Date.now(),
-        }).catch((e) =>
-          logger.warn({ err: e, sessionId: this.sessionId }, "task.resumed_event_failed"),
-        );
-      }
+  private async executeRun(): Promise<void> {
+    if (this.msg.info.deliveryCount > 1) {
+      await this.onEvent({
+        type: "taskResumed",
+        delivery_count: this.msg.info.deliveryCount,
+        wallclock_ms: Date.now(),
+      }).catch((e) =>
+        logger.warn({ err: e, sessionId: this.sessionId }, "task.resumed_event_failed"),
+      );
+    }
 
-      await this.resolvePlatformKey();
+    await this.resolvePlatformKey();
 
-      // 2. Resume decision comes before any provisioning: the checkpoint lives
-      // in KV, and whether one exists decides whether this run needs a sandbox
-      // up front (a resumed run had one, and its /workspace has to be back
-      // before the first turn) or can wait until a tool asks for one.
-      this.pendingResumeCkpt = await this.readKvCheckpoint();
-      cancelDeadline = this.armDeadline();
-      if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
-        await this.attachHands();
-      } else {
-        await this.startWithoutSandbox();
-      }
+    this.pendingResumeCkpt = await this.readKvCheckpoint();
+    this.cancelDeadline = this.armDeadline();
+    if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
+      await this.attachHands();
+    } else {
+      await this.startWithoutSandbox();
+    }
+    await this.reconcileBackgroundStarts();
 
-      const result = await this.executeEngine();
+    const result = await this.executeEngine();
 
-      // NP1-7 (2026-05-20): MCP SDK 1.12 doesn't propagate
-      // AbortSignal through hands.callTool (see clients/hands.ts:212-216), so a
-      // long bash/read/glob tool that's mid-RPC when SIGTERM fires finishes on
-      // its own and returns a NORMAL ExecuteResult instead of throwing —
-      // which would otherwise fall through to the happy path and delete the
-      // v3 checkpoint, permanently stranding the session (breaking the
-      // SIGTERM invariants INV-7/INV-8, checkpoint-architecture-redesign §5.3).
-      //
-      // Force the SIGTERM catch branch by re-raising the same abort reason
-      // the signal handler set; the catch block below runs the full
-      // SIGTERM-correct sequence (priority workspace_sync, KV PUT,
-      // taskInterrupted emit, NAK).
-      if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
-        logger.info(
-          { sessionId: this.sessionId, messageId: this.messageId, engineAbortReason: result.abortReason ?? "completed",
-            turns: result.turns },
-          "task.engine_execute_done.sigterm_detour",
-        );
-        throw SIGTERM_ABORT_REASON;
-      }
-      if (this.abortCtrl.signal.aborted) {
-        throw this.abortCtrl.signal.reason ?? new Error("cancelled by user");
-      }
+    // MCP SDK 1.12 does not propagate AbortSignal through callTool.
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
+      logger.info(
+        { sessionId: this.sessionId, messageId: this.messageId,
+          engineAbortReason: result.abortReason ?? "completed", turns: result.turns },
+        "task.engine_execute_done.sigterm_detour",
+      );
+      throw SIGTERM_ABORT_REASON;
+    }
+    if (this.abortCtrl.signal.aborted) {
+      throw this.abortCtrl.signal.reason ?? new Error("cancelled by user");
+    }
 
-      outcome = "ok";
-      await this.finalizeSuccess(result);
-    } catch (err: any) {
-      if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
-        // Checkpointed and re-queued: this pod did not finish it, another will.
-        outcome = "retryable";
-        await this.handleSigtermAbort();
-        return;
-      }
+    await this.finalizeSuccess(result);
+  }
 
-      if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
-        // A second replica already holds the lock and is running this task.
-        outcome = "retryable";
-        this.handleLeaseLost();
-        return;
-      }
+  private failureOutcome(err: unknown): TaskOutcome {
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) return "retryable";
+    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) return "retryable";
+    if (this.abortCtrl.signal.reason === RUN_ROW_TERMINAL_ABORT_REASON) return "failed";
+    if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) return "failed";
+    if (this.abortCtrl.signal.aborted) return "interrupted";
+    if (err instanceof AgentDoneDeliveryError) return "retryable";
+    if (err instanceof SandboxProvisionTerminalError) return "failed";
+    return isRetryable(err) ? "retryable" : "failed";
+  }
 
-      if (this.abortCtrl.signal.reason === RUN_ROW_TERMINAL_ABORT_REASON) {
-        outcome = "failed";
-        await this.handleRunRowTerminal();
-        return;
-      }
+  private async handleRunFailure(err: any): Promise<void> {
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
+      await this.handleSigtermAbort();
+      return;
+    }
+    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+      this.handleLeaseLost();
+      return;
+    }
+    if (this.abortCtrl.signal.reason === RUN_ROW_TERMINAL_ABORT_REASON) {
+      await this.handleRunRowTerminal();
+      return;
+    }
 
-      // Ahead of the generic aborted branch, which would otherwise file this as
-      // a user interrupt -- the transcript would read "Interrupted by user" for
-      // a run nobody touched.
-      if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
-        outcome = "failed";
-        await this.settleTerminal(
-          () => this.handleFatalError(
-            new Error(
-              `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
-              // Not this attempt's count: a deadline is spent across resumes,
-              // and handleFatalError records this sentence beside a `turns`
-              // field that counts the whole run. Two numbers for one thing in
-              // one transcript entry, and the smaller one is the wrong one.
-              + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
-            ),
+    if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
+      await this.settleTerminal(
+        () => this.handleFatalError(
+          new Error(
+            `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
+            + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
           ),
-          "task.deadline_agent_done_delivery_exhausted",
-        );
-        return;
-      }
+        ),
+        "task.deadline_agent_done_delivery_exhausted",
+      );
+      return;
+    }
 
-      if (this.abortCtrl.signal.aborted) {
-        outcome = "interrupted";
-        await this.settleTerminal(
-          () => this.handleUserInterrupt(),
-          "task.cancelled_agent_done_delivery_exhausted",
-        );
-      } else if (err instanceof AgentDoneDeliveryError) {
-        // Thrown by finalizeSuccess rather than by a handler called from here,
-        // so there is no handler to wrap: the run finished and only the handoff
-        // failed. Settled and released the same way regardless, release first
-        // for the reason releaseAfterTerminal gives.
-        logger.error(
-          { err, sessionId: this.sessionId, taskId: this.request.task_id },
-          "task.agent_done_delivery_exhausted",
-        );
-        // The run finished; only the handoff failed, and the nak redelivers it.
-        outcome = "retryable";
-        await this.releaseAfterTerminal();
-        this.msg.nak(5_000);
-      } else if (err instanceof SandboxProvisionTerminalError) {
-        // Terminal sandbox-provisioning outcome (SaFE workload Failed/Stopped,
-        // pod died before ready, workload gone, or status unreadable past the
-        // deadline). Never retry: fail the session terminally so it is
-        // queryable/replayable instead of a zombie launching/active session.
-        // Checked before isRetryable so a terminal reason cannot be misrouted
-        // into the retry loop.
-        //
-        // Settled like the other terminal branches, because it reports through
-        // the same handler: an AgentDoneDeliveryError raised in the middle of
-        // handleFatalError has to be turned into a nak and a release here, or it
-        // leaves the catch chain with the message neither acked nor nak'd.
-        outcome = "failed";
-        await this.settleTerminal(
-          () => this.handleFatalError(err),
-          "task.provision_terminal_agent_done_delivery_exhausted",
-        );
-      } else if (isRetryable(err)) {
-        outcome = "retryable";
-        await this.handleRetryableError(err);
-      } else {
-        outcome = "failed";
-        await this.settleTerminal(
-          () => this.handleFatalError(err),
-          "task.failed_agent_done_delivery_exhausted",
-        );
-      }
+    if (this.abortCtrl.signal.aborted) {
+      await this.settleTerminal(
+        () => this.handleUserInterrupt(),
+        "task.cancelled_agent_done_delivery_exhausted",
+      );
+      return;
+    }
+    if (err instanceof AgentDoneDeliveryError) {
+      logger.error(
+        { err, sessionId: this.sessionId, taskId: this.request.task_id },
+        "task.agent_done_delivery_exhausted",
+      );
+      await this.releaseAfterTerminal();
+      this.msg.nak(5_000);
+      return;
+    }
+    if (err instanceof SandboxProvisionTerminalError) {
+      await this.settleTerminal(
+        () => this.handleFatalError(err),
+        "task.provision_terminal_agent_done_delivery_exhausted",
+      );
+      return;
+    }
+    if (isRetryable(err)) {
+      await this.handleRetryableError(err);
+      return;
+    }
+    await this.settleTerminal(
+      () => this.handleFatalError(err),
+      "task.failed_agent_done_delivery_exhausted",
+    );
+  }
+
+  private async finishRun(
+    outcome: TaskOutcome | null,
+    runStartedAt: number,
+    leaseTimer: ReturnType<typeof setInterval> | null,
+  ): Promise<void> {
+    if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
+    this.cancelDeadline();
+    clearInterval(this.keepAlive);
+    if (leaseTimer) clearInterval(leaseTimer);
+    endRun(this.runIdentity.key);
+    activeAbort.delete(this.lockKey);
+    await fx().releaseTaskLock(this.lockKey);
+    await this.hands?.close().catch(() => {});
+  }
+
+  async run(): Promise<void> {
+    const runStartedAt = Date.now();
+    let outcome: TaskOutcome | null = null;
+    const leaseTimer = this.startLeaseHeartbeat();
+    this.startDeliveryHeartbeat();
+    try {
+      await this.executeRun();
+      outcome = "ok";
+    } catch (err) {
+      outcome = this.failureOutcome(err);
+      await this.handleRunFailure(err);
     } finally {
-      // `outcome` is null only if a branch was added above without setting it;
-      // reporting a made-up value there would be worse than the missing sample.
-      if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
-      cancelDeadline();
-      clearInterval(this.keepAlive);
-      if (leaseTimer) clearInterval(leaseTimer);
-      endRun(this.runIdentity.key);
-      activeAbort.delete(this.lockKey);
-      await fx().releaseTaskLock(this.lockKey);
-      // The transport, not the sandbox: the pod is parked for the next message
-      // by markHandsIdle, which is what reuse reads, and that message builds a
-      // client of its own against it. executeEngine closes this on every path
-      // that reaches the engine, so what is left here is a failure between
-      // makeHandsClient and that call. Last in the block because a close
-      // against a sandbox that is already gone can hang, and none of the
-      // releases above may wait on it; idempotent, so the ordinary path pays
-      // nothing for the second call.
-      await this.hands?.close().catch(() => {});
+      await this.finishRun(outcome, runStartedAt, leaseTimer);
     }
   }
 }

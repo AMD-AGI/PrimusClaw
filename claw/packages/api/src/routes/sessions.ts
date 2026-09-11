@@ -38,6 +38,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
+import { handsSessionKey } from "@claw/protocol";
 
 const logger = pino({ name: "sessions" });
 
@@ -1020,7 +1021,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!row) return reply;
     const session = mapSessionForDisplay(row);
     try {
-      const kvEntry = await kv.get(`hands.${req.params.id}`);
+      const kvEntry = await kv.get(handsSessionKey(req.params.id));
       if (kvEntry) {
         const info = JSON.parse(new TextDecoder().decode(kvEntry.value));
         if (info.workloadId) (session as any).sandbox_workload_id = info.workloadId;

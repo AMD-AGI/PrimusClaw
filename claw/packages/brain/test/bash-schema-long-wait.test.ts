@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 
 process.env.BG_SHELL_ENABLED = "false";
 const { ToolRouter } = await import("../src/tools/router.js");
-const { BASH_FOREGROUND_DEFAULT_SEC } = await import("../src/config.js");
+const { BASH_FOREGROUND_DEFAULT_SEC, BASH_FOREGROUND_MAX_SEC } = await import("../src/config.js");
 const { toolTimeoutCeilingSec } = await import("../src/tools/hands.js");
 const BASH_TIMEOUT_CEILING_SEC = toolTimeoutCeilingSec("bash");
 type HandsClient = import("../src/clients/hands.js").HandsClient;
@@ -38,6 +38,9 @@ test("the timeout description states the real ceiling, not a hardcoded number", 
   const desc = String((bashSchema().input_schema as any).properties.timeout.description);
   assert.match(desc, new RegExp(String(BASH_TIMEOUT_CEILING_SEC)));
   assert.match(desc, new RegExp(String(BASH_FOREGROUND_DEFAULT_SEC)));
+  assert.doesNotMatch(desc, new RegExp(String(BASH_FOREGROUND_MAX_SEC)),
+    "the raw setting is not a timeout any single call can be granted, so no "
+      + "public surface may state it");
 });
 
 test("the schema tells the model a long wait belongs in one call", () => {

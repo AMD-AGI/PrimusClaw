@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { WORKSPACE } from "../../config.js";
+import { resolveChildPrivilege } from "../../runtime/child-privilege.js";
 
 export type ManagedShellKind = "foreground" | "background" | "monitor";
 export type ManagedShellStatus = "running" | "exited" | "killed" | "timed_out" | "error";
@@ -48,6 +50,9 @@ interface SpawnManagedShellOptions {
   kind: ManagedShellKind;
   bufferBytes: number;
   unref?: boolean;
+  /** The pair the child runs as. Both forms supply it; neither may omit it. */
+  owner: string;
+  run: string;
 }
 
 interface RunForegroundOptions {
@@ -55,6 +60,8 @@ interface RunForegroundOptions {
   bufferBytes: number;
   terminateGraceMs?: number;
   forceResolveMs?: number;
+  owner: string;
+  run: string;
 }
 
 /** Write a compact structured lifecycle log to stdout. */
@@ -81,12 +88,20 @@ export function logShellEvent(event: string, shell: ManagedShell, extra: Record<
   }));
 }
 
-/** Spawn a managed shell as a detached process group. */
+/**
+ * Spawn a managed shell as a detached process group, under its run's own
+ * unprivileged identity and with an environment built from an allow-list.
+ *
+ * @throws ChildPrivilegeUnavailable where the sandbox declares an identity
+ * range and cannot partition the process view to go with it.
+ */
 export function spawnManagedShell(command: string, options: SpawnManagedShellOptions): ManagedShell {
   const id = options.id || `${options.kind}-${randomUUID().slice(0, 8)}`;
+  const privilege = resolveChildPrivilege(options.owner, options.run);
   const proc = spawn("/bin/sh", ["-c", command], {
     cwd: WORKSPACE,
-    env: process.env,
+    env: privilege.env,
+    ...(privilege.uid === undefined ? {} : { uid: privilege.uid, gid: privilege.gid }),
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -142,9 +157,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   });
 
   if (options.unref) proc.unref();
-  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell, {
-    command: command.slice(0, 500),
-  });
+  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell);
   return shell;
 }
 
@@ -156,6 +169,8 @@ export async function runForegroundShell(
   const shell = spawnManagedShell(command, {
     kind: "foreground",
     bufferBytes: options.bufferBytes,
+    owner: options.owner,
+    run: options.run,
   });
   const terminateGraceMs = options.terminateGraceMs ?? 5_000;
   const forceResolveMs = options.forceResolveMs ?? 10_000;
@@ -214,6 +229,61 @@ export async function runForegroundShell(
       }, options.timeoutMs);
     }
   });
+}
+
+/**
+ * Whether anything in the shell's process group is still running.
+ *
+ * The leader's own exit status is not the answer: a descendant that stayed in
+ * the group outlives it, and reading the leader alone reports the group gone
+ * while a detached child still holds the sandbox's CPU.
+ *
+ * Signal 0 is not the answer either. A terminated leader whose parent has not
+ * yet collected it keeps a process-table entry, so the whole group answers
+ * deliverable for as long as that lasts -- which would report a shell that did
+ * stop as surviving. Membership is read from the process table instead, and a
+ * member in the terminated state is not a member that is running.
+ */
+export function processGroupAlive(shell: ManagedShell): boolean {
+  if (!shell.pid) return false;
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    // Unreadable is not empty: signal 0 is the coarser answer, and its bias is
+    // towards reporting the group alive, which is the safe direction here.
+    return groupSignalable(shell.pid);
+  }
+  for (const entry of entries) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const member = readProcessGroupState(pid);
+    if (member && member.pgrp === shell.pid && member.state !== "Z") return true;
+  }
+  return false;
+}
+
+function groupSignalable(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM is a group alive and not ours to signal, which is still alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The state letter and process-group of one entry, or null where unreadable. */
+function readProcessGroupState(pid: number): { state: string; pgrp: number } | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Fields after the command, which is parenthesised and may itself contain
+    // spaces: state is the first, process-group the third.
+    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { state: after[0], pgrp: Number(after[2]) };
+  } catch {
+    return null;
+  }
 }
 
 /** Terminate the full process group, falling back to the direct child PID. */
