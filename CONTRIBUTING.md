@@ -44,22 +44,24 @@ to every tree in the repository.
 
 ## CI and documentation-only changes
 
-This repository treats **documentation-only** pushes and pull requests the same way across automation: when **every** changed file in that event matches **only** the [canonical paths-ignore list](#canonical-paths-ignore-list) below, matching GitHub Actions workflows **do not** start (no workflow run is created for that event).
+This repository treats **documentation-only** pushes and pull requests cheaply: when **every** changed file matches **only** the [canonical paths-ignore list](#canonical-paths-ignore-list) below, expensive jobs do not run. How that skip is implemented depends on the check.
+
+The coverage workflow is different from the others, because branch protection requires a check named `test` — the job in [`.github/workflows/tests-coverage.yml`](.github/workflows/tests-coverage.yml). Where a workflow skipped by `paths-ignore` never reports at all, and so blocks the merge on "Waiting for status to be reported", a job skipped by a conditional reports as success. That workflow therefore **always starts**, and a small `changes` job decides whether `test` runs at all: on a documentation-only change `test` is skipped, which satisfies the required check.
 
 ### What is skipped today on GitHub Actions
 
 | Check (concept) | Implemented in Actions | Skipped for doc-only events? |
 |-----------------|------------------------|------------------------------|
-| **Pytest** (full suite with coverage reporting) | [`.github/workflows/tests-coverage.yml`](.github/workflows/tests-coverage.yml) | Yes (`paths-ignore` on `push` / `pull_request` for all branches) |
+| **Pytest** (full suite with coverage reporting) | [`.github/workflows/tests-coverage.yml`](.github/workflows/tests-coverage.yml) | Yes — the `test` job is skipped by a conditional, which satisfies the required check |
 | **CodeQL** | [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) | Yes on **PR and push** when doc-only (`paths-ignore`); **no** — the **weekly schedule** on the default branch still runs a full analysis |
 | **Claw shell lint scripts** | [`.github/workflows/lint.yaml`](.github/workflows/lint.yaml) | Yes (`paths-ignore` on `push` / `pull_request` for all branches) |
 | **Build** (container images on `main` / tags) | [`.github/workflows/build.yaml`](.github/workflows/build.yaml) | Yes on **push to `main`** when doc-only (`paths-ignore`); tag pushes use the same list |
 
-If you add workflows for **pytest**, **ruff**, or similar, copy the **same** `paths-ignore` blocks as in `tests-coverage.yml` / `codeql.yml` / `lint.yaml` so documentation-only PRs stay consistent and cheap.
+If you add workflows for **ruff** or similar that are **not** required status checks, copy the **same** `paths-ignore` blocks as in `codeql.yml` / `lint.yaml`. Do not put `paths-ignore` on a workflow whose job name is required to merge.
 
 ### Canonical paths-ignore list
 
-Use this list (or keep it in sync) for any workflow that should skip on documentation-only changes:
+Use this list (or keep it in sync) for any workflow that should skip on documentation-only changes. The coverage workflow's `changes` job applies the same patterns through [`.github/scripts/is_doc_only_change.sh`](.github/scripts/is_doc_only_change.sh):
 
 - `**/*.md`
 - `docs/**`
@@ -70,7 +72,7 @@ Use this list (or keep it in sync) for any workflow that should skip on document
 
 If **any** changed file falls **outside** these patterns (for example `.py`, `pyproject.toml`, or `.github/workflows/*.yml`), the workflows that declare this list run as usual.
 
-These GitHub jobs are optional from a default merge-policy perspective; skipping them on doc-only PRs saves runner time. You should still run **local** `pytest` and Claw lint scripts when your edits are not purely cosmetic (for example, Markdown that embeds commands, code blocks, or configuration snippets).
+Lint, CodeQL, and image builds are optional from a merge-policy perspective; skipping them on doc-only PRs saves runner time. The coverage job named `test` is required, so it skips through a conditional rather than a path filter. You should still run **local** `pytest` and Claw lint scripts when your edits are not purely cosmetic (for example, Markdown that embeds commands, code blocks, or configuration snippets).
 
 ## Development setup
 - Python 3.10+ for the Python services (`requires-python = ">=3.10"`). CI runs
