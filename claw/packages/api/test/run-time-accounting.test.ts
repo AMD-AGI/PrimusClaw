@@ -1354,8 +1354,15 @@ test("AC4 a renewal the database could not answer banks nothing", async () => {
     db.query = realQuery;
   }
 
-  assert.equal(res!.statusCode, 200, "a database hiccup is not evidence the run has ended");
-  assert.equal(res!.json().status, "unknown");
+  // A database hiccup is still not evidence the run has ended -- but that is
+  // carried by the classification, not by the status code. `askRunLease` reads
+  // a 5xx as `unresolved`, which is documented to say nothing about who holds
+  // the row, so the worker neither stands down nor treats the lease as held.
+  // A 200 would instead be read as `{kind: "granted"}`, asserting a lease this
+  // request never took.
+  assert.equal(res!.statusCode, 503, "the write threw, so the request did not succeed");
+  assert.equal(res!.json().status, "unknown", "and the body still says the outcome is undecided");
+  assert.equal(res!.json().ok, false);
   assert.deepEqual((await ledgerOf("ktsk-dberr"))!.knownMsByState, before!.knownMsByState,
     "but the fence never ran, so nothing may be banked against it");
 });

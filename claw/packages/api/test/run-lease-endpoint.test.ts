@@ -269,16 +269,31 @@ test("an expired lease may change hands, which is what a takeover is", async () 
   assert.match(acquisition().sql, /lease_expires_at < NOW\(\)/);
 });
 
-test("a renewal may not write the owner, the generation or the receipt", async () => {
-  // The reason the two statements exist. `brain_id` is a pod name rather than
-  // a per-claim identity, so a statement that could both renew and open a
-  // generation would let a redelivery landing on the incumbent pod be read as
-  // a fresh claim on the row its own previous attempt is still running.
+test("a renewal takes the owner only from a lease that is free, and opens a generation only for a new attempt", async () => {
+  // `brain_id` is a pod name rather than a per-claim identity, which is why
+  // renew and acquire were once two statements: one that could do both would
+  // let a redelivery landing on the incumbent pod read as a fresh claim on the
+  // row its own previous attempt is still running. `attempt_id` is that
+  // identity now, so the guarantee moved rather than went away -- the owner is
+  // written, but only onto a lease no live worker holds, and the generation
+  // opens on the attempt differing rather than on the renewal happening.
   updateRows = [{ status: "running" }];
   await renew({ brain_id: "brain-7", lease_seconds: 45 });
 
-  const assignments = leaseUpdate().sql.split(/\bWHERE\b/)[0];
-  assert.doesNotMatch(assignments, /lease_owner\s+=/);
+  const [assignments, predicate] = leaseUpdate().sql.split(/\bWHERE\b/);
+  assert.match(assignments, /lease_owner = COALESCE\(\$\d+, lease_owner\)/);
+  // ...and every way that write is allowed to land is a lease nobody holds.
+  assert.match(predicate, /lease_owner IS NULL/);
+  assert.match(predicate, /lease_owner = \$\d+/);
+  assert.match(predicate, /lease_expires_at IS NULL/);
+  assert.match(predicate, /lease_expires_at < NOW\(\)/);
+  assert.match(
+    assignments,
+    /attempt_generation = CASE WHEN attempt_id IS DISTINCT FROM \$\d+/,
+    "the generation opens on a new attempt, not on a renewal",
+  );
+  // Still never written by a renewal: the claim count is the claim's to move,
+  // and a v1 receipt is not this statement's to clear.
   assert.doesNotMatch(assignments, /claim_count\s+=/);
   assert.doesNotMatch(assignments, /dispatch_compensation/);
 });
@@ -319,6 +334,48 @@ for (const [label, runClaim] of [
     assert.equal(seen.some((q) => /UPDATE claw_tasks/.test(q.sql)), false);
   });
 }
+
+// The attempt token's `claim_count` binds the same column as `run_claim`, and
+// `Number.isFinite` is not a bound: MAX_SAFE_INTEGER reaches `claim_count = $n`
+// and Postgres raises 22003, which the route can only report as a failure to
+// answer -- a stale generation reading as a hiccup rather than as a bad body.
+for (const [label, claimCount] of [
+  ["one past int4", PG_INT4_MAX + 1],
+  ["Number.MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
+  ["a negative", -1],
+  ["a fraction", 1.5],
+] as const) {
+  test(`an attempt token quoting ${label} is refused before anything is written`, async () => {
+    updateRows = [{ status: "running" }];
+    stubDb();
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/internal/tasks/t-1/lease",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { ...TOKEN_FIELDS, brain_id: "brain-7", lease_seconds: 45, claim_count: claimCount },
+    });
+
+    assert.equal(res.statusCode, 400);
+    assert.match(res.json().error, /claim_count/);
+    assert.equal(seen.some((q) => /UPDATE claw_tasks/.test(q.sql)), false);
+  });
+}
+
+test("a generation the column can hold is carried, token and all", async () => {
+  updateRows = [{ status: "running" }];
+  stubDb();
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/t-1/lease",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { ...TOKEN_FIELDS, brain_id: "brain-7", lease_seconds: 45, claim_count: PG_INT4_MAX },
+  });
+
+  assert.equal(res.statusCode, 200);
+  const update = seen.find((q) => /UPDATE claw_tasks/.test(q.sql));
+  assert.ok(update, "the renewal reached its statement");
+  assert.ok(update.params.includes(PG_INT4_MAX), "and bound the generation it quoted");
+});
 
 test("the largest generation the column can hold is a generation, not a bad body", async () => {
   updateRows = [{ status: "running", claim_count: PG_INT4_MAX }];

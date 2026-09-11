@@ -18,6 +18,7 @@
 
 import test, { after, before, beforeEach, describe } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import type pg from "pg";
 
@@ -55,15 +56,21 @@ async function seed(row: SeedRow): Promise<void> {
   await observer.query(
     `INSERT INTO claw_tasks (
        task_id, session_id, name, status, origin, executor, metadata,
-       claim_count, lease_owner, lease_expires_at
+       claim_count, lease_owner, lease_expires_at, internal_token_hash
      ) VALUES (
        $1, $2, 'chat turn', $3, $4, 'brain', $5::jsonb, $6, $7,
-       CASE WHEN $8::int IS NULL THEN NULL ELSE NOW() + ($8::int * INTERVAL '1 second') END
+       CASE WHEN $8::int IS NULL THEN NULL ELSE NOW() + ($8::int * INTERVAL '1 second') END,
+       $9
      )`,
     [
       row.taskId, row.sessionId ?? "s-1", row.status ?? "preparing", row.origin ?? "chat",
       JSON.stringify(metadata), row.claimCount ?? 0, row.leaseOwner ?? null,
       row.leaseIn ?? null,
+      // Every path that dispatches or claims a run writes this, and the
+      // legacy bridge fences the bearer against it. A row seeded without it
+      // matches nothing, so a suite that omitted it proved its refusals with
+      // a column rather than with the predicate each test names.
+      createHash("sha256").update(TOKEN).digest("hex"),
     ],
   );
 }
@@ -326,6 +333,22 @@ describe("the generation fence", () => {
       "the stale attempt must not have extended its successor's lease");
     assert.equal((await renew("t-1", "brain-7", 2)).status, 200,
       "the successor's own renewal still has to work");
+  });
+
+  it_("a heartbeat quoting a generation the row has moved past is still refused", async () => {
+    // The other half of the same fence: honouring `run_claim` must not mean
+    // honouring any caller that sends one.
+    await seed({ taskId: "t-1", leaseOwner: "brain-7", leaseIn: -30, fenced: true, claimCount: 1 });
+    assert.equal((await accept("t-1", "brain-7")).body.claim_count, 2);
+
+    const stale = await lease("t-1", {
+      brain_id: "brain-7", lease_seconds: 45,
+      run_claim: 1,
+      attempt_id: "att-old", claim_count: 0, delivery_seq: 1, delivery_count: 1,
+    });
+
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.reason, "superseded");
   });
 
   it_("an old API's acceptance leaves a row no successor can be created on", async () => {
