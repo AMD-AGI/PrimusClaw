@@ -874,7 +874,9 @@ type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
  * The claim a doorbell run holds, or null for a fat delivery that took none.
  *
  * Its generation is the discriminator the fat path gets from the delivery pair
- * instead; a row only ever has one of the two advancing.
+ * instead, so the attempt is minted with a zero there. That zero is not the
+ * row's generation: a fat acceptance does issue one, and the runner quotes it
+ * back in `run_claim` beside this token rather than folding it in here.
  */
 export type RunClaim = { claimCount: number } | null;
 

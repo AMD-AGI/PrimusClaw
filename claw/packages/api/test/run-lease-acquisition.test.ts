@@ -102,6 +102,23 @@ const renew = (taskId: string, brainId: string, runClaim?: number) =>
     ...(runClaim === undefined ? {} : { run_claim: runClaim }),
   });
 
+/**
+ * The heartbeat a fat holder actually sends.
+ *
+ * A fat delivery takes no claim, so the Brain mints its attempt with
+ * `claim_count: 0` and discriminates it by the delivery pair; the generation
+ * the acceptance issued travels beside it in `run_claim`. Both halves are on
+ * the one body -- see brain `runner.ts` `this.attempt` and the tick that posts
+ * it -- and a fence that reads the attempt's zero instead of the quoted
+ * generation refuses the holder its own heartbeat.
+ */
+const fatHeartbeat = (taskId: string, brainId: string, runClaim?: number) =>
+  lease(taskId, {
+    brain_id: brainId, lease_seconds: 45,
+    attempt_id: "att-fat-1", claim_count: 0, delivery_seq: 7, delivery_count: 1,
+    ...(runClaim === undefined ? {} : { run_claim: runClaim }),
+  });
+
 /** An old Brain's first lease: no flag, no generation, nothing held yet. */
 const flaglessFirstLease = (taskId: string, brainId: string) => renew(taskId, brainId);
 
@@ -312,6 +329,32 @@ describe("renewal", () => {
 });
 
 describe("the generation fence", () => {
+  it_("a fat holder's own heartbeat is fenced on the generation it quotes", async () => {
+    // The row this makes is the one a real acceptance leaves: generation 1,
+    // fenced, held. The heartbeat that follows carries an attempt minted with
+    // a zero, because a fat delivery took no claim -- fencing on that zero
+    // refuses the live worker mid-turn and hands its delivery back to be run
+    // a second time.
+    await seed({ taskId: "t-1" });
+    const accepted = await accept("t-1", "brain-7");
+    assert.equal(accepted.body.claim_count, 1);
+
+    assert.equal((await fatHeartbeat("t-1", "brain-7", 1)).status, 200,
+      "the holder quoted the generation the acceptance issued");
+  });
+
+  it_("that heartbeat is still refused when it quotes the wrong generation", async () => {
+    // The other half: reading `run_claim` must not mean the fence stopped
+    // discriminating. Without this a fix for the case above could simply drop
+    // the predicate and both would pass.
+    await seed({ taskId: "t-1" });
+    await accept("t-1", "brain-7");
+
+    assert.equal((await fatHeartbeat("t-1", "brain-7", 99)).status, 409);
+    assert.equal((await fatHeartbeat("t-1", "brain-7")).status, 409,
+      "and quoting none at all is not a way past a fenced row");
+  });
+
   it_("a stale attempt cannot renew the lease its own pod took over", async () => {
     // `BRAIN_ID` is a pod name reused across claims, so after this pod takes a
     // lapsed row over from itself the previous attempt's heartbeat names the
@@ -333,6 +376,30 @@ describe("the generation fence", () => {
       "the stale attempt must not have extended its successor's lease");
     assert.equal((await renew("t-1", "brain-7", 2)).status, 200,
       "the successor's own renewal still has to work");
+  });
+
+  it_("a fat acceptance's own heartbeat is honoured when it carries an attempt token too", async () => {
+    // What the real Brain sends, and what no other case here sends: the fat
+    // path mints an attempt whose `claim_count` is 0 -- its discriminator is
+    // the delivery pair, because a fat row was never claimed -- and quotes the
+    // generation the acceptance issued beside it in `run_claim`. Fencing on
+    // the attempt's zero instead of on the quoted generation refuses the
+    // holder its own lease: the worker stands down mid-turn, the delivery is
+    // redelivered, and the turn restarts for as long as the budget lasts.
+    await seed({ taskId: "t-1" });
+    const accepted = await accept("t-1", "brain-7");
+    assert.equal(accepted.body.claim_count, 1);
+    const held = (await taskRow("t-1")).lease_expires_at as Date;
+
+    const beat = await lease("t-1", {
+      brain_id: "brain-7", lease_seconds: 45,
+      run_claim: 1,
+      attempt_id: "att-1", claim_count: 0, delivery_seq: 3, delivery_count: 1,
+    });
+
+    assert.equal(beat.status, 200, "the holder's own heartbeat has to renew its lease");
+    assert.ok((await taskRow("t-1")).lease_expires_at as Date > held,
+      "and the renewal has to have moved the expiry it matched");
   });
 
   it_("a heartbeat quoting a generation the row has moved past is still refused", async () => {

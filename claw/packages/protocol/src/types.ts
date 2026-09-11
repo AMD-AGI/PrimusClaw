@@ -203,10 +203,17 @@ export interface RunLeaseRequest {
    * Which attempt this renewal speaks for, and how many the row has seen.
    *
    * Beside `run_claim` rather than instead of it: the generation fences a
-   * doorbell delivery against a stale acceptance, while these fence one
-   * attempt against its own successor -- `brain_id` is a pod name and cannot
-   * tell the two apart, and a fat row takes no claim at all, so the delivery
-   * pair below is the only value on it that advances.
+   * delivery against a stale acceptance, while these fence one attempt
+   * against its own successor -- `brain_id` is a pod name and cannot tell the
+   * two apart.
+   *
+   * On the fat path the two are carried by different fields of the same body.
+   * A fat delivery takes no claim, so its attempt is minted with `claim_count`
+   * zero and discriminated by the delivery pair; the generation the acceptance
+   * issued travels in `run_claim`. A renewal is therefore fenced on
+   * `run_claim` whenever it sends one, and on the attempt's own `claim_count`
+   * only when it does not -- fencing a fat holder on its attempt's zero
+   * refuses it its own heartbeat.
    */
   attempt_id?: string;
   claim_count?: number;

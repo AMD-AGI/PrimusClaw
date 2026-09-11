@@ -405,7 +405,14 @@ async function renewRunLease(
         runPhasePatch(body),
         RENEWABLE_STATUSES,
         token.attemptId,
-        token.claimCount,
+        // The generation this caller quotes, which is `run_claim` whenever it
+        // sends one. The attempt token's own `claim_count` is the claim path's
+        // answer, and on the fat path there is no claim to count: the Brain
+        // mints that attempt with a zero and carries the generation the
+        // acceptance issued in `run_claim` instead. Fencing on the zero
+        // refuses the holder its own heartbeat, which stands the worker down
+        // mid-turn and hands the delivery back to be run again.
+        generationOf(body.run_claim) ?? token.claimCount,
         token.deliverySeq,
         token.deliveryCount,
       ],
