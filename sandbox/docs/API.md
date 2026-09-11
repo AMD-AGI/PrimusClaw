@@ -85,7 +85,7 @@ Content-Type: application/json
 Returns:
 
 ```json
-{ "sessionId": "sess_6c0405b00854b1f80edbbd543493c834",
+{ "sessionId": "sess_xxx",
   "sandboxName": "python-311-runc-a3f8k2m1",
   "namespace": "default",
   "entryPoints": { "default": "http://...svc.cluster.local:8080" } }
