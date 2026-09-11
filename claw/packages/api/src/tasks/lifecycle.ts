@@ -235,42 +235,58 @@ type CancellationTransition = ClawTaskRow & {
   prior_queued_since: string | null;
 };
 
+const CANCELLABLE_STATUSES = [
+  "waiting_deps", "waiting_external", "queued", "preparing", "running",
+];
+/** The ones a Stop parks rather than ends: their worker has to confirm. */
+const PARKED_BY_STOP = ["preparing", "running"];
+
+/**
+ * Move one row to `cancelling` or `cancelled`, and say what it was before.
+ *
+ * Through the one writer of `status`, because the queue accrual rides on that
+ * statement: an UPDATE of its own takes the row off the queue and drops the
+ * segment it was closing, which is that run's whole recorded wait.
+ *
+ * The prior state cannot come off `RETURNING`, which answers with what the row
+ * became. It is read under the row's own lock in the same transaction, the way
+ * every other caller needing it does. The dispatch marker and the sojourn mark
+ * would survive in `RETURNING` -- the UPDATE does not touch `metadata` -- but
+ * the status would not, so all three are taken from the one read.
+ */
 async function transitionCancellation(
   taskId: string,
 ): Promise<CancellationTransition | null> {
-  const r = await db.query(
-    `WITH prior AS (
-       SELECT * FROM claw_tasks
-        WHERE task_id = $1
-          AND status = ANY($2::text[])
-        FOR UPDATE
-     ), updated AS (
-       UPDATE claw_tasks t
-          SET status = CASE
-                WHEN prior.status = ANY($3::text[]) THEN $4
-                ELSE $5
-              END,
-              completed_at = CASE
-                WHEN prior.status = ANY($3::text[]) THEN t.completed_at
-                ELSE NOW()
-              END
-         FROM prior
-        WHERE t.task_id = prior.task_id
-       RETURNING t.*
-     )
-     SELECT updated.*, prior.status AS prior_status,
-            prior.metadata->>'dispatch' AS prior_dispatch,
-            prior.metadata->>'queued_since' AS prior_queued_since
-       FROM updated JOIN prior USING (task_id)`,
-    [
-      taskId,
-      ["waiting_deps", "waiting_external", "queued", "preparing", "running"],
-      ["preparing", "running"],
-      "cancelling",
-      "cancelled",
-    ],
-  );
-  return (r.rows[0] as CancellationTransition | undefined) ?? null;
+  return inTransaction(async (query) => {
+    const before = await query(
+      `SELECT status AS prior_status,
+              metadata->>'dispatch' AS prior_dispatch,
+              metadata->>'queued_since' AS prior_queued_since
+         FROM claw_tasks
+        WHERE task_id = $1 AND status = ANY($2::text[])
+        FOR UPDATE`,
+      [taskId, CANCELLABLE_STATUSES],
+    );
+    const prior = before.rows[0] as {
+      prior_status: TaskStatus;
+      prior_dispatch: string | null;
+      prior_queued_since: string | null;
+    } | undefined;
+    if (!prior) return null;
+    const rows = await applyTaskStatusTransition(
+      {
+        sql: "CASE WHEN status = ANY($3::text[]) THEN 'cancelling' ELSE 'cancelled' END",
+        terminal: true,
+      },
+      {
+        where: "task_id = $1 AND status = ANY($2::text[])",
+        params: [taskId, CANCELLABLE_STATUSES, PARKED_BY_STOP],
+        query,
+      },
+    );
+    const row = rows[0];
+    return row ? { ...row, ...prior } as CancellationTransition : null;
+  });
 }
 
 /**
