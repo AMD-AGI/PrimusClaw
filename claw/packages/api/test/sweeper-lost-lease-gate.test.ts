@@ -116,9 +116,12 @@ function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
 
 /** The statement that closes the rows a retried dispatch left unclaimed. */
 function siblingClose(seen: SeenQuery[]): SeenQuery | undefined {
-  // Identified by the predicate that pairs the two id arrays: both reaps go
-  // through the one statement that writes a status.
-  return seen.find((q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
+  // Identified by the predicate that pairs the two id arrays -- and by being
+  // the statement that WRITES, because the pass reads the same predicate first
+  // to learn which of these rows were still on the queue.
+  return seen.find((q) =>
+    /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql)
+    && /^UPDATE claw_tasks SET status/.test(q.sql));
 }
 
 test("a conversation whose run was given up on can be spoken to again", async () => {

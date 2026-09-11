@@ -171,3 +171,53 @@ test("a replayed dispatch's spare row is recorded as the duplicate exit it is", 
   );
   assert.equal((await runRow(h, "spare")).failure_reason, "duplicate_dispatch_row");
 });
+
+test("the budget sweep counts only the rows it took off the queue", async () => {
+  // `queuedExits` reads `prior_status`, and `claw_tasks` has no such column:
+  // fed the rows an UPDATE returned it matches none of them and the exit
+  // counter never moves, while the entry counter does. The rollout gate
+  // balances one against the other, so a counter frozen at zero reads as a
+  // queue that keeps filling and never drains.
+  const { reapExpiredDoorbellRuns } = await import("../src/tasks/sweeper.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "budget-queued", "s1", {
+    status: "queued", dispatch: "doorbell", messageId: "m-q",
+    deadlineInSec: -3600, queuedAgoSec: 30,
+  });
+  // Beside it, one the sweep also closes but which was never waiting: the
+  // count has to be 1, not 2, or "how many left the queue" means nothing.
+  await seedRun(h, "budget-running", "s1", {
+    status: "running", dispatch: "doorbell", messageId: "m-r",
+    deadlineInSec: -3600, claimCount: 1,
+  });
+
+  assert.equal(
+    await delta(() => reapExpiredDoorbellRuns(), EXITED, { outcome: "budget_exhausted" }),
+    1,
+    "one of the two rows was on the queue",
+  );
+  assert.equal((await runRow(h, "budget-queued")).failure_reason, "run_budget_exhausted");
+  assert.equal((await runRow(h, "budget-running")).failure_reason, "run_budget_exhausted");
+});
+
+test("the sibling sweep counts only the spare that was still queued", async () => {
+  // Driven through `reapLostLeases`, which is the only way in: a reaped chat
+  // row hands its message id to the sibling close, and the spare that was
+  // still waiting is the one that left the queue.
+  const { reapLostLeases } = await import("../src/tasks/sweeper.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "sib-lost", "s1", {
+    status: "running", dispatch: "fat", messageId: "m-1",
+    leaseOwner: "brain-9", leaseExpiresInSec: -3600, claimCount: 1,
+  });
+  await seedRun(h, "sib-spare", "s1", {
+    status: "queued", dispatch: "doorbell", messageId: "m-1", queuedAgoSec: 20,
+  });
+
+  assert.equal(
+    await delta(() => reapLostLeases(), EXITED, { outcome: "duplicate_closed" }),
+    1,
+    "the spare was on the queue; the row that lost its lease was not",
+  );
+  assert.equal((await runRow(h, "sib-spare")).failure_reason, "dispatch_retried");
+});

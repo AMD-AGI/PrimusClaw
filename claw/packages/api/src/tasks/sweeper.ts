@@ -502,6 +502,34 @@ interface ExpiredQueuedRow {
   /** When this row's current wait began, which is not when the row was written. */
   queued_since: string | null;
   user_id: string | null;
+  /** What the row was before the sweep wrote over it. See priorStatuses. */
+  prior_status?: string;
+}
+
+/**
+ * The statuses a sweep's rows held before it wrote over them.
+ *
+ * `RETURNING` answers with what a row became, and whether a sweep took a row
+ * off the QUEUE is a fact about what it was: `queuedExits` counts rows whose
+ * `prior_status` was `queued`, and `claw_tasks` has no such column. Fed the
+ * post-update rows it matches none of them, and the exit counter the rollout
+ * gate balances against the entry counter never moves at all.
+ *
+ * Read with the pass's own predicate, immediately before it. A row entering or
+ * leaving the set between the two statements mis-counts one metric and nothing
+ * else, which is the same bargain `closeDuplicateChatRuns` already makes.
+ */
+async function priorStatuses(where: string, params: unknown[]): Promise<Map<string, string>> {
+  const r = await db.query(`SELECT task_id, status FROM claw_tasks WHERE ${where}`, params);
+  return new Map((r.rows as Array<{ task_id: string; status: string }>)
+    .map((row) => [row.task_id, row.status]));
+}
+
+/** Those rows, each carrying the status it is leaving. */
+function withPriorStatus<T extends { task_id: string }>(
+  rows: T[], prior: Map<string, string>,
+): Array<T & { prior_status?: string }> {
+  return rows.map((row) => ({ ...row, prior_status: prior.get(row.task_id) }));
 }
 
 async function announceQueueTimeout(row: ExpiredQueuedRow): Promise<void> {
@@ -599,7 +627,30 @@ async function announceRunFailure(
  * The grace matches the deadline backstop's, so a run that is about to report
  * its own timeout is given the same chance to do it first.
  */
+const UNCLAIMED_SIBLING_WHERE = `EXISTS (
+          SELECT 1 FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
+           WHERE claw_tasks.session_id = sibling.session_id
+             AND claw_tasks.metadata->>'message_id' = sibling.message_id
+        )
+        AND origin = 'chat'
+        -- A doorbell spare actually sits at queued. The rest of this list is
+        -- the world before the doorbell, when every row a dispatch opened went
+        -- straight to preparing.
+        AND status IN ('queued','preparing','running','cancelling')
+        AND lease_expires_at IS NULL
+        -- Never claimed, which is what this row's own error message says about
+        -- it: a spare no worker ever took is 0, a requeued row is at least 1.
+        AND COALESCE(claim_count, 0) = 0`;
+
+const EXPIRED_DOORBELL_WHERE = `origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND status IN ('queued','preparing','running')
+        AND deadline_at IS NOT NULL
+        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())`;
+
 export async function reapExpiredDoorbellRuns(): Promise<number> {
+  const prior = await priorStatuses(EXPIRED_DOORBELL_WHERE, [RUN_BUDGET_BACKSTOP_GRACE_SEC]);
   const reaped = await applyTaskStatusTransition("failed", {
     extra: {
       failure_reason: "run_budget_exhausted",
@@ -612,15 +663,13 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
       "error_message = 'run budget exhausted at ' || deadline_at"
       + " || '; the lease lapsed after the deadline, so no worker could take it again'",
     ],
-    where: `origin = 'chat'
-        AND metadata->>'dispatch' = 'doorbell'
-        AND status IN ('queued','preparing','running')
-        AND deadline_at IS NOT NULL
-        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())`,
+    where: EXPIRED_DOORBELL_WHERE,
     params: [RUN_BUDGET_BACKSTOP_GRACE_SEC],
   });
-  const r = { rows: reaped.map(expiredRowOf), rowCount: reaped.length };
+  const r = {
+    rows: withPriorStatus(reaped.map(expiredRowOf), prior),
+    rowCount: reaped.length,
+  };
   if (!r.rowCount) return 0;
   logger.warn({ reaped: r.rowCount, ids: idsOf(r.rows) }, "sweeper.reaped_expired_doorbell_runs");
   for (const row of r.rows as ExpiredQueuedRow[]) {
@@ -843,6 +892,7 @@ async function closeUnclaimedDispatchSiblings(
     messageIds.push(row.message_id);
   }
   if (!sessionIds.length) return;
+  const prior = await priorStatuses(UNCLAIMED_SIBLING_WHERE, [sessionIds, messageIds]);
   const closed = await applyTaskStatusTransition("failed", {
     extra: {
       failure_reason: "dispatch_retried",
@@ -852,23 +902,10 @@ async function closeUnclaimedDispatchSiblings(
     // The pairing arrives as a predicate: two arrays zipped by unnest, so a
     // sibling is matched on session and message id together rather than on
     // either alone.
-    where: `EXISTS (
-          SELECT 1 FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
-           WHERE claw_tasks.session_id = sibling.session_id
-             AND claw_tasks.metadata->>'message_id' = sibling.message_id
-        )
-        AND origin = 'chat'
-        -- A doorbell spare actually sits at queued. The rest of this list is
-        -- the world before the doorbell, when every row a dispatch opened went
-        -- straight to preparing.
-        AND status IN ('queued','preparing','running','cancelling')
-        AND lease_expires_at IS NULL
-        -- Never claimed, which is what this row's own error message says about
-        -- it: a spare no worker ever took is 0, a requeued row is at least 1.
-        AND COALESCE(claim_count, 0) = 0`,
+    where: UNCLAIMED_SIBLING_WHERE,
     params: [sessionIds, messageIds],
   });
-  const r = { rowCount: closed.length, rows: closed };
+  const r = { rowCount: closed.length, rows: withPriorStatus(closed, prior) };
   if (!r.rowCount) return;
   metrics.onQueueExited("duplicate_closed", queuedExits(r.rows));
   logger.warn(
