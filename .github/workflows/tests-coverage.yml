@@ -3,37 +3,79 @@
 
 name: Tests with Coverage
 
-# Runs on push and pull_request for all branches. Skips when every changed file
-# matches paths-ignore (documentation-only and repo-metadata edits).
+# No workflow-level paths-ignore: a workflow skipped that way never reports,
+# and `test` is a required status check, so documentation-only pull requests
+# would stay merge-blocked on "Waiting for status to be reported". The path
+# list moved into the `changes` job instead, which lets `test` be skipped by a
+# conditional — GitHub reports a conditionally skipped job as success.
 #
 # Single workflow for test + coverage: one pytest run (--cov=.) produces one
 # .coverage file. The job Summary lists a whole-repo total plus per-tree totals
 # for the three Python trees exercised in CI (see CONTRIBUTING.md).
 on:
   push:
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE*"
-      - "COPYRIGHT"
-      - "CODEOWNERS"
-      - ".gitattributes"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE*"
-      - "COPYRIGHT"
-      - "CODEOWNERS"
-      - ".gitattributes"
 
 permissions:
   contents: read
   checks: write
+  pull-requests: read
 
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_suite: ${{ steps.gate.outputs.run_suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Decide whether the coverage suite applies
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/is_doc_only_change.sh --self-test
+          run_suite=true
+          changed=""
+          case "$EVENT_NAME" in
+            pull_request)
+              if changed=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename'); then
+                if printf '%s\n' "$changed" | bash .github/scripts/is_doc_only_change.sh; then
+                  run_suite=false
+                fi
+              fi
+              ;;
+            push)
+              zero=0000000000000000000000000000000000000000
+              if [ "$BEFORE_SHA" != "$zero" ] \
+                && git fetch --no-tags --depth=1 origin "$BEFORE_SHA" \
+                && changed=$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA"); then
+                if printf '%s\n' "$changed" | bash .github/scripts/is_doc_only_change.sh; then
+                  run_suite=false
+                fi
+              fi
+              ;;
+          esac
+          {
+            echo "Changed files:"
+            printf '%s\n' "${changed:-<unavailable; running the suite>}"
+            echo "run_suite=${run_suite}"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "run_suite=${run_suite}" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: changes
+    # Anything other than a confirmed doc-only verdict runs the suite: a
+    # `changes` job that errored leaves the output empty, and skipping on that
+    # would satisfy the required check without a single test having run.
+    if: always() && needs.changes.outputs.run_suite != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
