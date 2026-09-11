@@ -291,3 +291,46 @@ test("the session a settled publish failure deletes is counted as nothing", asyn
     await app.close();
   }
 });
+
+/**
+ * A queued row reconciliation took while this dispatch was still deciding.
+ *
+ * No publish is involved -- an admitted-to-queue run puts nothing on the stream
+ * -- but the outcome is undecided in the same way: the reconcile claim this
+ * replica was holding is gone, so whatever becomes of the row now is not this
+ * caller's to report or to unwind.
+ */
+async function queuedRowTakenByReconciliation(): Promise<void> {
+  const sessionDispatchPorts = await freshPorts();
+  const realOpen = sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.publishTask = async () => 1;
+  sessionDispatchPorts.admit = async () => ({ kind: "queue", position: 3 });
+  sessionDispatchPorts.openChatRun = async (args) => {
+    const run = await realOpen(args);
+    if (run) {
+      await h.sql(
+        "UPDATE claw_tasks SET dispatch_reconcile_at = NULL WHERE task_id = $1",
+        [run.taskId],
+      );
+    }
+    return run;
+  };
+}
+
+test("a queued create whose reconcile claim was taken answers 503 rather than success", async () => {
+  await queuedRowTakenByReconciliation();
+  const app = await appAs(registerSessionRoutes);
+  try {
+    const res = await createWithMessage(app);
+
+    assert.equal(
+      res.statusCode, 503,
+      "reporting the turn as handed off would let the caller act on an outcome reconciliation owns",
+    );
+    assert.equal((await sessionRows()).length, 1, "and the session the row needs is still here");
+  } finally {
+    await app.close();
+  }
+});

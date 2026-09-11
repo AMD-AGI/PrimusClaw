@@ -221,3 +221,29 @@ test("a holder that drains and unclaims never lets the precondition read clear",
     "and it is outstanding again the instant the last capable replica goes away",
   );
 });
+
+test("the horizon an insert stamps is what keeps a live dispatch off the first sweep", async () => {
+  // The case above drives the sweep from a marker this file wrote. This one is
+  // the marker `insertTask` writes on the way to the stream: without the lease
+  // interval on it the row is reconcilable the instant it exists, so the very
+  // first tick terminalizes a healthy dispatch mid-publish and idles or
+  // deletes the session under a live run.
+  const { openChatRun } = await import("../src/tasks/chat-run.js");
+  const { reconcileAmbiguousDispatches } = await import("../src/tasks/sweeper.js");
+  await seedSession(h, "s1");
+
+  const run = await openChatRun({
+    sessionId: "s1", userId: "u-1", dispatch: "doorbell", taskId: "in-flight",
+    messageId: "m-in-flight", prompt: "hello", status: "queued",
+    recordWorkspaceUse: false, reconcileAction: "delete_created_session",
+  } as never);
+  assert.ok(run, "the row the publish is about to be made under");
+
+  assert.equal(
+    await reconcileAmbiguousDispatches(), 0,
+    "the publish has not been given its horizon to land in yet",
+  );
+  const row = await runRow(h, "in-flight");
+  assert.equal(row.status, "queued", "so the row is left to the dispatch that owns it");
+  assert.notEqual(row.dispatch_reconcile_at, null, "and it keeps the marker it was inserted with");
+});

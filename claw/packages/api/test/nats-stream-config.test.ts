@@ -625,3 +625,52 @@ test("the refusal reaches the log rather than being computed and dropped", () =>
     /if \(refusal\) logger\.warn\(refusal, "nats\.kv_bucket_ttl_narrowing_refused"\)/,
   );
 });
+
+/**
+ * The body of a top-level function in `source`, comments removed.
+ *
+ * Same reason as `ensureStreamSites` above: an identifier written in prose is
+ * not code that runs, and the question here is about one function rather than
+ * about the file, so the scan walks from that function's opening brace to its
+ * match instead of searching the whole source.
+ */
+function functionBody(source: string, name: string): string {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+  const at = code.search(new RegExp(`function\\s+${name}\\s*\\(`));
+  assert.notEqual(at, -1, `could not find ${name} in the source`);
+  const open = code.indexOf("{", code.indexOf(")", at));
+  let depth = 0;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === "{") depth += 1;
+    else if (code[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return code.slice(open + 1, i);
+    }
+  }
+  throw new Error(`${name} is never closed`);
+}
+
+test("initNats starts the floor watch on the bucket it just provisioned", () => {
+  // The doorbell latch has exactly one writer in this process, and it is the
+  // watch: nothing else ever calls `setDoorbellLatch`. Provisioning the bucket
+  // and not watching it is therefore silent -- no error, no warning, and a
+  // gauge that reads `unknown` for the life of the pod, which is
+  // indistinguishable from a fleet that never asserted a floor. Every doorbell
+  // is declined against that latch, so the whole capability is off and nothing
+  // says so.
+  //
+  // Read off the source for the same reason the two `ensureStream` sites are:
+  // `startDoorbellSemanticsWatch` is module-private and `initNats` is the only
+  // caller, and `initNats` connects to a live NATS server, opens a JetStream
+  // manager and provisions a consumer and five buckets before it returns. There
+  // is no seam, and the `nats` package's `connect` is an ESM binding no test in
+  // this suite can substitute.
+  const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
+
+  assert.match(
+    functionBody(src, "initNats"),
+    /startDoorbellSemanticsWatch\(kvDoorbellFloor\)/,
+    "start-up provisions the doorbell floor bucket and never watches it, so the "
+    + "latch stays at unknown, every doorbell is declined, and no error is raised",
+  );
+});

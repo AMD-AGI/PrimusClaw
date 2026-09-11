@@ -18,6 +18,7 @@
  * nothing. What is under test here is the other two arms.
  */
 
+import { closedDoorbellBarrier } from "./doorbell-barrier-stub.js";
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
@@ -144,4 +145,64 @@ test("a publish that never began is reapable from row state alone", async () => 
   } finally {
     sweeperPorts.deliverySettlement = original;
   }
+});
+
+test("a fat dispatch records the sequence its own publish returned, so the settled delivery behind it can be closed", async () => {
+  // The consumer cases above hand the row a sequence by hand. This one is the
+  // producer: the number has to come off the publish itself, because a row that
+  // records nothing is answerable only on the whole stream -- and a run whose
+  // message was delivered, acked and then abandoned by its worker sits at
+  // `preparing` for ever while the user's turn never finishes.
+  const { dispatchTaskToBrain, sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
+  const { reapOrphanedFatRuns, sweeperPorts } = await import("../src/tasks/sweeper.js");
+  const originalPorts = { ...sessionDispatchPorts };
+  const originalSettlement = sweeperPorts.deliverySettlement;
+
+  await seedSession(h, "s1", { gateOwner: "m-1" });
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.publishTask = async () => 90;
+
+  let taskId: string;
+  try {
+    const dispatched = await dispatchTaskToBrain(
+      {
+        sessionId: "s1", userId: "u-1", user: null, content: "hello", messageType: "text",
+        toolIds: [], pluginId: undefined, requestImage: undefined, requestResource: undefined,
+        requestTimeout: undefined, workspaceId: undefined, mcpServers: undefined,
+        capturedUserEnvSnapshot: {}, capturedSessionEnv: {}, messageId: "m-1",
+      },
+      async () => { throw new Error("a dispatched turn must not roll back"); },
+    );
+    assert.equal(dispatched.kind, "dispatched");
+    taskId = dispatched.kind === "dispatched" ? dispatched.runId! : "";
+  } finally {
+    Object.assign(sessionDispatchPorts, originalPorts);
+  }
+
+  // Old enough for the orphan scan to consider it at all; nothing else about
+  // the row changes.
+  await h.sql(
+    "UPDATE claw_tasks SET started_at = NOW() - INTERVAL '99999 seconds' WHERE task_id = $1",
+    [taskId],
+  );
+  try {
+    sweeperPorts.deliverySettlement = async () => ({ ackFloor: 50, lastSeq: 200 });
+    assert.equal(await reapOrphanedFatRuns(), 0, "its own message is still outstanding");
+    assert.equal((await runRow(h, taskId)).status, "preparing");
+
+    sweeperPorts.deliverySettlement = async () => ({ ackFloor: 150, lastSeq: 200 });
+    assert.equal(
+      await reapOrphanedFatRuns(), 1,
+      "the durable settled this row's own message, so the abandoned turn is closed",
+    );
+    assert.equal((await runRow(h, taskId)).status, "failed");
+  } finally {
+    sweeperPorts.deliverySettlement = originalSettlement;
+  }
+
+  assert.equal(
+    Number((await receipt(taskId)).dispatch_seq), 90,
+    "and the number it was answered on is the one the publisher returned",
+  );
 });

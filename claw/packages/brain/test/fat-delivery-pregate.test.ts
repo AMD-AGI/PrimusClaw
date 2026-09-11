@@ -24,6 +24,8 @@
  *   F9  a Stop taken while queued settles visibly and leaks no slot
  *   F10 the accepted generation reaches the run's own heartbeat and completion
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { JsMsg, KV } from "nats";
@@ -450,3 +452,35 @@ function fakeKv(): KV {
     async delete(key: string) { store.delete(key); },
   } as unknown as KV;
 }
+
+/**
+ * F11 the entrypoint hands the delivery loop a real pre-gate.
+ *
+ * Everything above builds its own `DeliveryDeps` and puts a `createFatPreGate`
+ * in it, so all of it stays green if the pod stops supplying one. The field is
+ * optional and every use site inside `runDelivery` is guarded, which is what
+ * makes its absence silent: no error, no refusal, no log line -- fat chat
+ * deliveries simply queue for a slot with no lease row behind them, and a Stop
+ * aimed at the row finds nothing to cancel while the turn goes on to run.
+ *
+ * Read off the source because `main()` is the only place the wiring exists and
+ * it connects to NATS, opens a durable consumer and starts the claim loop
+ * before it reaches this object. Same shape as
+ * metrics-helpers-wired.test.ts: what cannot be reached by a seam is asserted
+ * against the text, with the comments taken out first so that prose about the
+ * pre-gate cannot satisfy it.
+ */
+describe("the pre-gate as the pod wires it", () => {
+  it("F11 the brain entrypoint puts a real pre-gate in the delivery deps", () => {
+    const source = readFileSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf-8")
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/\/\/[^\n]*/g, " ");
+
+    assert.match(
+      source,
+      /fatPreGate:\s*createFatPreGate\(/,
+      "the delivery loop is started without a pre-gate, so a queued fat chat turn "
+      + "holds no lease, a Stop has no row to reach, and the turn runs anyway",
+    );
+  });
+});

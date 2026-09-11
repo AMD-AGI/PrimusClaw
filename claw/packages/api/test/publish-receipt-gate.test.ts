@@ -217,3 +217,52 @@ test("a queued drain whose receipt a holder disarmed publishes nothing", async (
     "and the holder that disarmed the receipt keeps its row; only it may settle one",
   );
 });
+
+test("a drain that published leaves the receipt that keeps a Stop off the row", async () => {
+  // The receipt is not a note about what happened; it is what every later
+  // reader consults to decide whether a message for this row can exist. Written
+  // as `refused` -- or anything else that proves no delivery -- the Stop below
+  // stops treating the row as live and closes it outright, while the message it
+  // denies is already on the stream and a worker is about to answer the turn.
+  await pendingPorts();
+  await seedSession(h, "s1", { agentStatus: "idle" });
+  await h.sql(
+    "INSERT INTO claw_pending_messages (id, session_id, user_id, content) VALUES (7, 's1', 'u-1', 'hello')",
+  );
+
+  await drainQueued();
+  assert.equal(published.length, 1, "the message reached the stream");
+
+  const { interruptSessionRuns } = await import("../src/tasks/chat-run.js");
+  await interruptSessionRuns("s1");
+
+  assert.deepEqual(
+    await runStates(), ["cancelling"],
+    "a row whose message may be in flight is asked to stop, not declared never dispatched",
+  );
+});
+
+test("a dispatched message leaves the gate naming the turn the caller was told about", async () => {
+  // The marker is the turn, not the session: every owner-matched release --
+  // the A3 disconnect rollback, the publish-failure rollback, the Stop timer
+  // and the completion -- CASes on it, so a gate marked with anything else is
+  // a gate no release can ever match and a session that stays busy forever.
+  await sessionPorts();
+  await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
+  const app = await appAs(registerSessionRoutes);
+  try {
+    const res = await sendMessage(app);
+
+    assert.equal(res.statusCode, 200, res.body);
+    const [session] = await h.sql(
+      "SELECT agent_status, agent_gate_message_id FROM claw_sessions WHERE session_id = 's1'",
+    );
+    assert.equal(session.agent_status, "running");
+    assert.equal(
+      session.agent_gate_message_id, res.json().message_id,
+      "the holder has to be the turn, or no release names it and the session never reopens",
+    );
+  } finally {
+    await app.close();
+  }
+});

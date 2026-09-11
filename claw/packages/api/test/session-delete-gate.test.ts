@@ -15,6 +15,7 @@
  * Harmless to dispatch, which cannot reach a deleted session at all. Not
  * harmless to anything that reads the column and believes it.
  */
+import { seedSession, startHarness } from "./scenario-harness.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -81,4 +82,37 @@ test("D3 the runs are cancelled before the row is hidden", async () => {
   assert.ok(cancel >= 0, "the session's runs were not cancelled");
   assert.ok(hide >= 0, "the session row was never hidden");
   assert.ok(cancel < hide, "the gate was rewritten before the runs it describes were closed");
+});
+
+/**
+ * D4 the other half of the gate: which turn is holding it.
+ *
+ * `agent_status` alone does not open the gate. `agent_gate_message_id` names
+ * the turn that took it, and every surface that hands the gate back does so
+ * only for the turn that owns it -- so a deleted session left pointing at a
+ * message that is gone is a latch nobody is left to release. The three cases
+ * above read the statement off a stub, which cannot tell a column named in the
+ * SET list from one that reaches the row, so this one runs it against Postgres
+ * and reads the row back.
+ */
+test("D4 a deleted session lets go of the turn it was gating, not just of running", async () => {
+  const h = await startHarness();
+  try {
+    await seedSession(h, "s-del", { agentStatus: "running", gateOwner: "m-gone" });
+
+    await commitSessionDeletion("s-del");
+
+    const [row] = await h.sql(
+      "SELECT agent_status, agent_gate_message_id FROM claw_sessions WHERE session_id = $1",
+      ["s-del"],
+    );
+    assert.equal(row.agent_status, "idle");
+    assert.equal(
+      row.agent_gate_message_id, null,
+      "the gate is still latched on a message the delete removed, so a sibling flow "
+      + "waits behind a turn that no longer exists and nothing will ever clear it",
+    );
+  } finally {
+    await h.close();
+  }
 });

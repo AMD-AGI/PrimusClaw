@@ -191,3 +191,45 @@ test("the gate names only the ceiling that is non-zero", { timeout: CASE_TIMEOUT
   assert.ok(result.out.includes(`${ROLLOUT_REFUSAL} ADMIT_TREE_MAX_DEPTH are non-zero.`));
   assert.ok(!result.out.includes("ADMIT_SOFT_RUNS"), "a zero ceiling is not an offender");
 });
+
+test("a soft ceiling above its hard ceiling is refused at boot by the admission assertion", { timeout: CASE_TIMEOUT_MS }, async () => {
+  // The rollout gate has nothing to say about this pair -- the doorbell is on,
+  // so every ceiling it looks at is legal -- and the in-process cases in
+  // admission-settings.test.ts call `assertAdmissionSettings()` themselves, so
+  // all of them stay green if `main()` stops calling it. The database is a
+  // closed port, which is where an accepted configuration dies: reaching it is
+  // how a boot says the assertion was not there.
+  const apiPort = await reserveFreePort();
+  const deadDbPort = await reserveFreePort();
+
+  const result = await boot({
+    RUN_DOORBELL_DISPATCH: "true",
+    ADMIT_SOFT_RUNS: "9",
+    ADMIT_HARD_RUNS: "5",
+    API_PORT: String(apiPort),
+    DATABASE_URL: `postgres://claw:claw@127.0.0.1:${deadDbPort}/none`,
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.out, /"msg":"api\.startup_failed"/);
+  assert.match(
+    result.out,
+    /"msg":"startup\.admission_settings_refused"/,
+    "the boot failed without the record naming which settings were refused",
+  );
+  assert.ok(
+    result.out.includes(
+      `${ADMISSION_REFUSAL} ADMIT_SOFT_RUNS=9 is above ADMIT_HARD_RUNS=5,`
+      + " so it can never defer a run the hard ceiling admits",
+    ),
+    "an unenforceable soft ceiling was not refused by the admission assertion --"
+      + " main() may no longer call assertAdmissionSettings()",
+  );
+  assert.ok(
+    !result.out.includes(`ECONNREFUSED 127.0.0.1:${deadDbPort}`),
+    "startup reached initDb, so the pair was accepted and the pod is running"
+      + " admission behaviour nobody configured",
+  );
+  assert.ok(!result.out.includes(ROLLOUT_REFUSAL), "the rollout gate has no quarrel with this pair");
+  assert.equal(await connectRefused(apiPort), true);
+});

@@ -10,6 +10,7 @@
  * entry, claim, close or interrupt and reads the rendered exposition.
  */
 
+import { db } from "../src/infra/db.js";
 import "./reconcile-on-env.js";
 
 import test, { after, before, beforeEach } from "node:test";
@@ -259,4 +260,107 @@ test("and an ordinary release still books one", async () => {
 
   assert.equal(moved, 1);
   assert.equal((await runRow(h, "cycled")).status, "queued");
+});
+
+test("a Stop counts every row a claim took between the status read and the write", async () => {
+  // The read that captures each row's prior status is its own statement, so
+  // the `FOR UPDATE` it takes is gone before the write runs. A claim landing
+  // in that window leaves a row whose Stop is still a queue exit, and one
+  // increment for the whole batch loses every row after the first.
+  const { interruptSessionRuns } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "raced-1", "s1", { status: "queued", dispatch: "fat", messageId: "m-1" });
+  await seedRun(h, "raced-2", "s1", { status: "queued", dispatch: "fat", messageId: "m-2" });
+
+  const inner = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    const r = await inner(text, params);
+    if (/status AS prior_status\s+FROM claw_tasks/.test(text)) {
+      await h.sql(
+        `UPDATE claw_tasks
+            SET status = 'preparing', lease_owner = 'brain-a', claim_count = 1,
+                lease_expires_at = NOW() + INTERVAL '60 seconds'
+          WHERE session_id = 's1' AND status = 'queued'`,
+      );
+    }
+    return r;
+  }) as typeof db.query;
+
+  try {
+    assert.equal(
+      await delta(() => interruptSessionRuns("s1"), EXITED, { outcome: "cancelled" }),
+      2,
+      "both rows were on the queue when the Stop read them",
+    );
+  } finally {
+    db.query = inner;
+  }
+  assert.equal((await runRow(h, "raced-1")).status, "cancelling");
+  assert.equal((await runRow(h, "raced-2")).status, "cancelling");
+});
+
+test("a requeued row waits again from the requeue, not from its first entry", async () => {
+  // Three trips round the loop are three waits. A marker left at the first
+  // entry reports one that only grows, so the queue-wait percentiles and any
+  // timeout keyed on it are wrong for every run that was ever retried.
+  const { claimRunById, releaseClaim } = await import("../src/tasks/run-claim.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "recycled", "s1", {
+    status: "preparing", dispatch: "doorbell", prompt: "hello", claimable: true,
+    leaseOwner: "brain-a", leaseExpiresInSec: 600, claimCount: 1,
+  });
+  await h.sql(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(metadata, '{queued_since}',
+              to_jsonb((NOW() - INTERVAL '600 seconds')::text))
+      WHERE task_id = 'recycled'`,
+  );
+
+  await releaseClaim("recycled", "brain-a", 1, "lock_contention");
+  const waited = await delta(
+    () => claimRunById("recycled", "brain-b", 1),
+    "claw_api_run_queue_wait_seconds_sum", { origin: "chat", outcome: "claimed" },
+  );
+
+  assert.ok(
+    waited < 5,
+    `the second sojourn began at the requeue, so it is seconds and not minutes; got ${waited}`,
+  );
+  assert.equal((await runRow(h, "recycled")).status, "preparing");
+});
+
+test("a requeued lost lease is measured as a fresh wait, not one that keeps growing", async () => {
+  // The row has already served a wait, been claimed, and lost its lease. If the
+  // requeue leaves the old marker in place, the next exit reports the whole
+  // time since the row first queued rather than the trip that just ended, and a
+  // p99 gate on bounded waits can never come down however fast each trip is
+  // served.
+  const { requeueLostDoorbellLeases } = await import("../src/tasks/sweeper.js");
+  const { claimRunById } = await import("../src/tasks/run-claim.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "recycled", "s1", {
+    status: "running", dispatch: "doorbell", messageId: "m-recycled",
+    prompt: "hello", claimable: true,
+    leaseOwner: "brain-a", leaseExpiresInSec: -3_600, claimCount: 1,
+  });
+  await h.sql(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb), '{queued_since}', to_jsonb($2::text)
+            )
+      WHERE task_id = $1`,
+    ["recycled", new Date(Date.now() - 3_600_000).toISOString()],
+  );
+
+  assert.equal(await requeueLostDoorbellLeases(), 1);
+
+  const waited = await delta(
+    () => claimRunById("recycled", "brain-b"),
+    "claw_api_run_queue_wait_seconds_sum", { origin: "chat", outcome: "claimed" },
+  );
+  assert.equal((await runRow(h, "recycled")).status, "preparing");
+  assert.ok(
+    waited < 60,
+    `the exit measures the trip that just ended, not the hour before it (got ${waited}s)`,
+  );
 });

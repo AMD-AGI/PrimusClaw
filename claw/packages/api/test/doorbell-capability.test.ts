@@ -122,3 +122,20 @@ test("the barrier does not flicker open while the latch is closed", () => {
   assert.equal(beginDoorbellDispatch(), null);
   assert.equal(beginDoorbellDispatch(), null);
 });
+
+test("the floor a latch carries is the number the operator wrote, not one near it", () => {
+  // The gate is `latch.version >= this binary's own`, so a floor read one step
+  // off the assertion opens the gate for a fleet that never claimed it can take
+  // a doorbell -- and a Brain that cannot parse this binary's semantics is
+  // handed one. Nothing downstream can recover the operator's number, so it is
+  // pinned at the only place it is produced.
+  for (const asserted of [1, 2, 7, 64]) {
+    assert.deepEqual(
+      latchFromOperation("PUT", String(asserted)),
+      { state: "floor", version: asserted },
+      `a floor of ${asserted} has to be read back as exactly ${asserted}`,
+    );
+  }
+  setDoorbellLatch(latchFromOperation("PUT", String(SUPPORTED)));
+  assert.equal(doorbellGateOpen(), true, "and the asserted floor is what opens the gate");
+});

@@ -10,6 +10,8 @@
  * at all, so a full fleet keeps taking work.
  */
 
+import type pg from "pg";
+import Fastify from "fastify";
 import assert from "node:assert/strict";
 import test, { after, before, describe } from "node:test";
 
@@ -147,5 +149,114 @@ describe("the soft ceiling declines to hand a queued row to a worker", { skip },
     assert.equal(await resumeFromExternal("ext-1"), 1);
     await seedRun(q, { taskId: "running-3", sessionId: "s-drain", status: "running" });
     assert.equal(await harness.app.admission.deferQueuedBySoftCeiling("parked"), true);
+  });
+});
+
+/**
+ * Cancel the candidate's parent the moment the selection has read it.
+ *
+ * The selection takes `FOR UPDATE` on the candidates and nothing at all on
+ * their parents, so the graph can be abandoned underneath a decision that has
+ * already been made. Driven from the pool rather than from a timer, because a
+ * window measured in awaits is not a window a sleep can aim at.
+ */
+function abandonGraphAfterSelection(pool: pg.Pool, other: pg.Client, parentId: string): () => void {
+  const connect = pool.connect.bind(pool) as (...args: unknown[]) => unknown;
+  let armed = true;
+  (pool as { connect: unknown }).connect = (...args: unknown[]) => {
+    if (args.length) return connect(...args);
+    return (connect() as Promise<pg.PoolClient>).then((client) => {
+      const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>;
+      (client as { query: unknown }).query = async (text: unknown, ...rest: unknown[]) => {
+        const result = await query(text, ...rest);
+        if (armed && typeof text === "string" && /FOR UPDATE SKIP LOCKED/.test(text)) {
+          armed = false;
+          await other.query("UPDATE claw_tasks SET status = 'cancelled' WHERE task_id = $1", [parentId]);
+        }
+        return result;
+      };
+      return client;
+    });
+  };
+  return () => { (pool as { connect: unknown }).connect = connect; };
+}
+
+describe("a promotion writes only the rows that are still ready", { skip }, () => {
+  test("a candidate whose graph is abandoned after selection is left where it is", async () => {
+    // The admission lock serialises admission decisions, not the task
+    // lifecycle: between choosing this row and writing it, the parent it
+    // depends on is cancelled. An unconditional write by id would queue the
+    // child anyway, and a worker would then run a node of a graph nobody is
+    // waiting for any more.
+    await harness.app.db.db.query("DELETE FROM claw_tasks");
+    const q = await harness.connect();
+    await seedRun(q, { taskId: "abandoned-parent", sessionId: "s-drain", status: "completed" });
+    await seedRun(q, {
+      taskId: "orphan", sessionId: "s-drain", status: "waiting_deps",
+      dependsOn: ["abandoned-parent"],
+    });
+
+    const restore = abandonGraphAfterSelection(
+      harness.app.db.db.pool, q, "abandoned-parent",
+    );
+    let promoted: number;
+    try {
+      promoted = await harness.app.scheduler.promoteReadyTasks();
+    } finally {
+      restore();
+    }
+
+    assert.equal(promoted, 0, "the row stopped being ready before it was written");
+    const r = await harness.app.db.db.query(
+      "SELECT status FROM claw_tasks WHERE task_id = 'orphan'",
+    );
+    assert.equal(
+      (r.rows[0] as { status: string }).status, "waiting_deps",
+      "a node of an abandoned graph must not be resurrected to queued",
+    );
+  });
+});
+
+describe("the claim route answers a deferral as a retry, not as a dead row", { skip }, () => {
+  test("a claim with no executing headroom is a 409 the worker may come back from", async () => {
+    // The refusal a worker acts on. `deferred` and `unclaimable` are both
+    // refusals of one claim, and only one of them says the row is finished:
+    // reported as 422 the worker stops asking, and a row nothing is wrong with
+    // waits for the queue timeout with a free slot in front of it.
+    await harness.app.db.db.query("DELETE FROM claw_tasks");
+    const q = await harness.connect();
+    await seedRun(q, { taskId: "http-running", sessionId: "s-drain", status: "running" });
+    await seedRun(q, { taskId: "http-waiting", sessionId: "s-drain", status: "queued" });
+
+    const token = "cluster-internal-token";
+    const previousToken = process.env.AUTH_INTERNAL_TOKEN;
+    process.env.AUTH_INTERNAL_TOKEN = token;
+    const app = Fastify();
+    let res;
+    try {
+      const { registerInternalRunRoutes } = await import("../src/routes/internal-runs.js");
+      await registerInternalRunRoutes(app);
+      await app.ready();
+      res = await app.inject({
+        method: "POST",
+        url: "/v1/internal/tasks/http-waiting/claim",
+        headers: { authorization: `Bearer ${token}` },
+        payload: { brain_id: "brain-http" },
+      });
+    } finally {
+      await app.close();
+      if (previousToken === undefined) delete process.env.AUTH_INTERNAL_TOKEN;
+      else process.env.AUTH_INTERNAL_TOKEN = previousToken;
+    }
+
+    assert.equal(res.statusCode, 409, "no headroom yet is a retry, not a verdict on the row");
+    assert.equal(res.json().error, "deferred");
+    const row = (await harness.app.db.db.query(
+      "SELECT status, lease_owner, claim_count FROM claw_tasks WHERE task_id = $1",
+      ["http-waiting"],
+    )).rows[0] as { status: string; lease_owner: string | null; claim_count: number };
+    assert.equal(row.status, "queued", "the row the worker was refused is still runnable");
+    assert.equal(row.lease_owner, null);
+    assert.equal(row.claim_count, 0, "a deferral spends no generation");
   });
 });

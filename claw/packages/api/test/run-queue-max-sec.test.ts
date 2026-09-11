@@ -214,3 +214,33 @@ test("a reaped queue timeout is counted as one, split by whether a worker ever h
   assert.equal(moved(TIMEOUTS, { ever_held: "true" }), 1);
   assert.equal(moved(EXITED, { outcome: "timed_out" }), 2);
 });
+
+test("a queue timeout nobody ever claimed is booked against the starved-queue series", async () => {
+  const { reapExpiredQueuedRuns } = await import("../src/tasks/sweeper.js");
+  await seedRun(h, "never", "s1", { status: "queued", queuedAgoSec: SPENT, claimCount: 0 });
+
+  const TIMEOUTS = "claw_api_run_queue_timeout_total";
+  const before = await registry.metrics();
+  assert.equal(await reapExpiredQueuedRuns(), 1);
+  const after = await registry.metrics();
+
+  const moved = (everHeld: string) =>
+    sample(after, TIMEOUTS, { ever_held: everHeld }) - sample(before, TIMEOUTS, { ever_held: everHeld });
+  assert.equal(moved("false"), 1, "a row no worker ever took is the queue nobody is draining");
+  assert.equal(moved("true"), 0, "nothing here lost a worker, so the dying-worker series must not move");
+});
+
+test("a queue timeout a worker had already held is booked against the lost-worker series", async () => {
+  const { reapExpiredQueuedRuns } = await import("../src/tasks/sweeper.js");
+  await seedRun(h, "held", "s1", { status: "queued", queuedAgoSec: SPENT, claimCount: 2 });
+
+  const TIMEOUTS = "claw_api_run_queue_timeout_total";
+  const before = await registry.metrics();
+  assert.equal(await reapExpiredQueuedRuns(), 1);
+  const after = await registry.metrics();
+
+  const moved = (everHeld: string) =>
+    sample(after, TIMEOUTS, { ever_held: everHeld }) - sample(before, TIMEOUTS, { ever_held: everHeld });
+  assert.equal(moved("true"), 1, "a row with a claim behind it is a worker that died mid-run");
+  assert.equal(moved("false"), 0, "the queue was drained for this row, so the starved series must not move");
+});

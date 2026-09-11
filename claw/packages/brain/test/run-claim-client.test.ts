@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
@@ -121,4 +122,29 @@ test("the claim count travels with a claim-next handoff", async () => {
   const request = { session_id: "s-2", task_id: "ktsk_2" };
   globalThis.fetch = (async () => jsonResp(200, { ok: true, request, claim_count: 7 })) as typeof fetch;
   assert.deepEqual(await claimNextRun(), { request, claimCount: 7 });
+});
+
+test("every claim declares the doorbell semantics this binary implements", async () => {
+  // One body serves the by-id and the claim-next route, and it is the only
+  // thing in the request that records what this binary can interpret. Absent or
+  // overstated, the API hands an old brain a row written under newer semantics
+  // and the brain mishandles it.
+  withApiUrl();
+  const request = { session_id: "s-1", task_id: "ktsk_1", llm_api_key: "sk-live" };
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url, init) => {
+    bodies.push(JSON.parse(String((init as RequestInit).body)));
+    return jsonResp(200, { ok: true, request, claim_count: 1 });
+  }) as typeof fetch;
+
+  await claimRun("ktsk_1");
+  await claimNextRun();
+
+  assert.equal(bodies.length, 2);
+  for (const body of bodies) {
+    assert.equal(
+      body.doorbell_semantics, DOORBELL_SEMANTICS_VERSION,
+      "a claim may only ask for rows this binary knows how to read",
+    );
+  }
 });

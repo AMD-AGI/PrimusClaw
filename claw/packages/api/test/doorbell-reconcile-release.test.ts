@@ -212,3 +212,44 @@ test("a doorbell create stays ambiguous after reconciliation clears the marker",
   assert.equal(row.status, "failed");
   assert.equal(row.dispatch_reconcile_at, null);
 });
+
+test("a doorbell turn into a session that already existed owes an idle, not a delete", { skip }, async () => {
+  // The create path is the only one that may delete: it minted the session, so
+  // nothing is lost by removing it. A turn sent into a session the user has
+  // been talking to owes the opposite cleanup, and the difference is a stored
+  // string rather than a reconstructed closure -- so the row's own value is
+  // what decides whether reconciliation hands that session back or deletes it.
+  const created = await app.inject({
+    method: "POST", url: "/v1/sessions", payload: { name: "reconcile" },
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const sessionId = created.json().data.session_id;
+
+  const publish = ports.publishTask;
+  let owedAction: unknown;
+  ports.publishTask = async (...args) => {
+    await publish(...args);
+    owedAction = (await runRow(published[0].task_id)).dispatch_reconcile_action;
+    await expireDispatch(published[0].task_id);
+    assert.equal(await sweeper.reconcileAmbiguousDispatches(), 1);
+    return 1;
+  };
+
+  const response = await app.inject({
+    method: "POST", url: `/v1/sessions/${sessionId}/messages`, payload: { content: "carry on" },
+  });
+
+  assert.equal(response.statusCode, 503, response.body);
+  const { rows: [session] } = await client.query(
+    "SELECT agent_status, deleted_at FROM claw_sessions WHERE session_id = $1", [sessionId],
+  );
+  assert.equal(
+    session.deleted_at, null,
+    "the session the user was talking to may not be removed by the repair of one failed turn",
+  );
+  assert.equal(session.agent_status, "idle", "and is handed back rather than left running");
+  assert.equal(
+    owedAction, "idle_existing_session",
+    "which is only true while the row records the cleanup this path actually owes",
+  );
+});

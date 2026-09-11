@@ -237,3 +237,35 @@ test("the backstop leaves the run time to report its own ending first", () => {
   assert.ok(RUN_BUDGET_BACKSTOP_GRACE_SEC > 0,
     "with no gap the sweeper races the run and wins, and it cannot say what the run had done");
 });
+
+test("an a2a execution is stamped with the chat budget, not the DAG node's", async () => {
+  // Which arm of the CASE an a2a row lands on is the whole of what its deadline
+  // means. Pointed at the DAG-node bucket it is killed hours early, or left
+  // running hours past where it should be, under a ceiling nobody set for it --
+  // and the row says nothing about which budget it was given, so the only place
+  // the choice is visible is the deadline itself.
+  const h = await startHarness();
+  try {
+    const stamp = deadlineStampSql(1, 2);
+    const CHAT_SEC = 4 * 60 * 60;
+    const DAG_SEC = 60;
+    await h.sql(
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata)
+       VALUES ('a2a-budget','s','n','preparing','a2a','{}'::jsonb)`,
+    );
+    await h.sql(
+      `UPDATE claw_tasks SET ${stamp} WHERE task_id = 'a2a-budget'`, [CHAT_SEC, DAG_SEC],
+    );
+    const [row] = await h.sql(
+      `SELECT EXTRACT(EPOCH FROM (deadline_at - NOW()))::int AS remaining
+         FROM claw_tasks WHERE task_id = 'a2a-budget'`,
+    );
+
+    assert.ok(
+      Math.abs(Number(row.remaining) - CHAT_SEC) < 60,
+      `an a2a execution runs on the chat budget; this one was given ${String(row.remaining)}s`,
+    );
+  } finally {
+    await h.close();
+  }
+});

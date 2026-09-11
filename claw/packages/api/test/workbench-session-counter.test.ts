@@ -216,3 +216,52 @@ test("a run whose commit fails books nothing, though it wrote and decided", asyn
   assert.equal(ok, 0, "but nothing durable came of it");
   assert.equal(error, 0);
 });
+
+/**
+ * The workbench surface's own spelling of the malformed-topology refusal.
+ *
+ * `92cc1dcb` gated every path that creates a run, this one included, and then
+ * nothing in the tree ever registered a workbench -- `workbenches/<id>/index.ts`
+ * is the documented seam and no such file exists -- so `sendRunRefusal`'s 400
+ * arm had no caller and no test. It is not dead code though: the route is wired
+ * into `index.ts` at boot, and this file's own registration is proof that one
+ * `register()` call away it is live. Without this, deleting the arm, or letting
+ * it answer 429, is a change no test in the repo notices, and the first
+ * workbench anybody adds persists a node count `int4` cannot hold.
+ *
+ * `normaliseInput` here is a pass-through, which is what lets a caller's
+ * `topology` reach the validator at all -- a workbench that builds its input
+ * from a fixed template would never produce this refusal.
+ */
+test("a workbench run naming a topology int4 cannot hold is refused 400, not 429", async () => {
+  seedReads();
+
+  const { res } = await moved(() => postRun({
+    prompt: "go",
+    topology: { nodes: 1e30, backend: "rayjob" },
+  }));
+
+  const body = JSON.parse(res.body) as { ok?: boolean; error?: string; errors?: unknown };
+  assert.equal(res.statusCode, 400, "a malformed topology is not a ceiling refusal");
+  assert.equal(body.ok, false);
+  assert.equal(body.error, "invalid_topology");
+  assert.ok(
+    Array.isArray(body.errors) && body.errors.length > 0,
+    "the validator's own messages reach the caller",
+  );
+  assert.equal(
+    dbStub!.ran(/^INSERT INTO claw_tasks/), false,
+    "and it wrote no run on the way to saying so",
+  );
+});
+
+test("and the same run without that topology is admitted", async () => {
+  // The positive control: without it the case above holds just as well against
+  // a route that refuses everything, or one this fixture can no longer reach.
+  seedReads();
+
+  const { res } = await moved(() => postRun({ prompt: "go" }));
+
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(JSON.parse(res.body).ok, true);
+});

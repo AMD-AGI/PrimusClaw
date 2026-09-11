@@ -11,6 +11,7 @@
  * through the window between the row insert and the publish.
  */
 
+import { doorbellSemanticsOf } from "@claw/protocol";
 import "./doorbell-dispatch-on-env.js";
 
 import test, { after, afterEach, before } from "node:test";
@@ -419,4 +420,41 @@ test("neither branch re-reads the gate after the branch", async () => {
   reads = countedReads();
   await dispatchTaskToBrain(INPUT, async () => {});
   assert.equal(reads(), 1);
+});
+
+test("the doorbell on the wire declares the same contract the row was stamped with", async () => {
+  // The two halves of a dispatch can disagree in a second way: the row says
+  // which contract this API wrote it under, and the payload says which one the
+  // claimer must speak. What this pins is that the payload declares one at all:
+  // `doorbellSemanticsOf` answers 1 for an absent field, so a dispatch that
+  // stopped stamping it reads as a v1 doorbell to every Brain, and the row's
+  // own marker is the only place left that says otherwise.
+  //
+  // It does not pin the field's provenance. `DOORBELL_SEMANTICS_VERSION` is 1
+  // today, so writing the literal 1 here is an equivalent mutant -- the bytes
+  // on the wire are identical and no runtime assertion can tell them apart.
+  // That drift only becomes observable once the constant moves, and the test
+  // that would catch it has to compare against something other than the
+  // constant the production line already reads.
+  setDoorbellLatch(FLOOR);
+  sessionDispatchPorts.admit = async () => ({ kind: "admit" });
+  const seen = stubDb();
+  const published = recordPublishes();
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {});
+
+  assert.equal(result.kind, "dispatched");
+  const { metadata } = taskInsert(seen);
+  assert.equal(published.length, 1);
+  const payload = JSON.parse(published[0].payload) as { semantics?: number };
+  // The raw field, not `doorbellSemanticsOf(payload)`: that guard's fallback is
+  // exactly what hides a dispatch that stopped declaring a contract.
+  assert.equal(
+    payload.semantics, SUPPORTED,
+    "a doorbell that declares nothing is read as v1 by every Brain in the fleet",
+  );
+  assert.equal(
+    doorbellSemanticsOf(payload), metadata.doorbell_semantics,
+    "the row and the payload must name one contract, not two",
+  );
 });

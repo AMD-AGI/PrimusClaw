@@ -15,6 +15,7 @@
  * reached neither half must not be answered as one that did.
  */
 
+import { registerSessionRoutes } from "../src/routes/sessions.js";
 import "./reconcile-on-env.js";
 
 import test, { after, before, beforeEach } from "node:test";
@@ -379,3 +380,50 @@ test("the Anthropic archive endpoint settles the fat row before it drops the que
     await app.close();
   }
 });
+
+/**
+ * The V1 control-channel Stop, which shares the `/messages` endpoint.
+ *
+ * The two surfaces above are separate handlers, each with its own copy of the
+ * refusal, so neither of them says anything about this one. Answering ok here
+ * is worse than answering ok anywhere else: the forced-idle timer immediately
+ * below this line is armed on the strength of the interrupt having been
+ * recorded, so a Stop that reached neither half hands back a gate nothing
+ * cancelled while the run it named is still preparing.
+ */
+const V1_MESSAGES = (sid: string) => `/v1/sessions/${sid}/messages`;
+
+for (const [half, arrange] of [
+  ["the durable half fails while NATS is healthy", () => {
+    const wire = healthyInterruptPublisher();
+    const durable = breakDurableStop();
+    return () => { durable(); wire(); };
+  }],
+  ["both halves fail", () => breakDurableStop()],
+] as Array<[string, () => () => void]>) {
+  test(`the v1 messages interrupt refuses to answer ok when ${half}`, async () => {
+    await seedSession(h, "s1", { gateOwner: "m-1" });
+    await gateWaiter("s1", "gate-waiter", "m-1");
+    const restore = arrange();
+    const app = await appAs(registerSessionRoutes);
+    try {
+      const res = await app.inject({
+        method: "POST", url: V1_MESSAGES("s1"), payload: { messageType: "interrupt" },
+      });
+
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.json(), { ok: false, error: "interrupt_not_recorded" });
+    } finally {
+      restore();
+      await app.close();
+    }
+    assert.equal(
+      (await runRow(h, "gate-waiter")).status, "preparing",
+      "the row really was not cancelled, which is what the refusal reports",
+    );
+    assert.equal(
+      (await sessionRow(h, "s1")).agent_gate_message_id, "m-1",
+      "an interrupt answered ok would arm the forced-idle timer over a gate still held",
+    );
+  });
+}

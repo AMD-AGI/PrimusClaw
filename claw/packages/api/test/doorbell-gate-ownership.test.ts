@@ -148,3 +148,32 @@ test("an old Stop timer with no marker cannot idle a newer turn that is preparin
   assert.equal(await forceIdleAfterInterrupt("s1", null), false);
   assert.equal((await sessionRow(h, "s1")).agent_status, "running");
 });
+
+test("a lost run's reaper hands its own session's gate back unowned", async () => {
+  // The pair matched, so the gate does open -- and it must stop naming the turn
+  // that died holding it. A marker left behind answers for the next turn: an
+  // old writer flips the column without touching it, and the dead turn's late
+  // completion then matches and opens a gate it does not hold.
+  const { reapLostLeases } = await import("../src/tasks/sweeper.js");
+  const { releaseSessionGateIfLastRun } = await import("../src/events/consumer.js");
+  await seedSession(h, "s1", { gateOwner: "m-1" });
+  await seedRun(h, "lost", "s1", {
+    status: "running", dispatch: "fat", leaseOwner: "brain-a",
+    leaseExpiresInSec: -3600, messageId: "m-1",
+  });
+
+  await reapLostLeases();
+  const reaped = await sessionRow(h, "s1");
+  assert.equal(reaped.agent_status, "idle", "the reaped run's own gate is handed back");
+  assert.equal(
+    reaped.agent_gate_message_id, null,
+    "a dead turn must not still name itself as the holder",
+  );
+
+  await oldReplicaTakesGate("s1");
+  assert.equal(
+    await releaseSessionGateIfLastRun("s1", "m-1", false), false,
+    "the reaped turn's completion cannot open the gate the next turn took",
+  );
+  assert.equal((await sessionRow(h, "s1")).agent_status, "running");
+});

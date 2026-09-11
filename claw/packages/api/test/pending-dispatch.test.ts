@@ -627,3 +627,56 @@ test("P13 a refused turn names the row it terminalized", async () => {
   );
   assert.equal(rec.failed[0].runId, "ktsk_1", "and it is the row this refusal closed");
 });
+
+test("P7b the gate the replay takes names the turn that took it", async () => {
+  // A gate held under nobody's name is one no run-scoped release can open: the
+  // completion of this very turn compares the marker against its own message
+  // id, matches nothing, and leaves the session busy for ever.
+  const rec = harness();
+  await dispatchPendingMessage(input({ messageId: "claw-1700000000042" }));
+
+  const gate = rec.sql.find((q) => /agent_status = 'running'/.test(q.text));
+  assert.ok(gate, "the session is marked running");
+  assert.match(
+    gate!.text, /agent_gate_message_id = \$2/,
+    "the flip and the marker are one statement, so no window holds one without the other",
+  );
+  assert.deepEqual(
+    gate!.params, ["s-1", "claw-1700000000042"],
+    "the gate is taken under the id of the turn that was just published",
+  );
+});
+
+/** The publish-state receipts written on the run row, in the order they were written. */
+function publishStates(rec: Recorder): unknown[] {
+  return rec.sql.filter((q) => /dispatch_compensation/.test(q.text)).map((q) => q.params[1]);
+}
+
+test("P6c a publish the server refused leaves the row denying any message exists", async () => {
+  // The receipt, not just the row: `attempted` is what every reconciler reads
+  // as "a message may be on the stream", and a publish the server itself
+  // refused has to withdraw that admission here, where the failure is still
+  // known to be certain.
+  const rec = harness({ publishThrows: refusal("no responders") });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /no responders/);
+
+  assert.deepEqual(
+    publishStates(rec), ["attempted", "refused"],
+    "left at attempted, the reapers have no proof the row is orphaned and never close it",
+  );
+});
+
+test("P6d a publish that only timed out leaves the row admitting a message may exist", async () => {
+  // The other half of the same guard: a timeout says the reply is missing, not
+  // the message, so withdrawing the admission here would have the row deny a
+  // turn that is already executing against it.
+  const rec = harness({ publishThrows: new Error("TIMEOUT") });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /TIMEOUT/);
+
+  assert.deepEqual(
+    publishStates(rec), ["attempted"],
+    "a refused receipt over an uncertain publish is a row that denies its own live turn",
+  );
+});
