@@ -26,6 +26,7 @@ import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
+import { releaseSessionGateIfUnoccupied } from "./chat-run.js";
 import { applyTaskStatusTransition } from "./db.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { requeueSojournSql } from "./run-budget.js";
@@ -537,35 +538,75 @@ export async function releaseClaim(
   reason?: string,
   settlement?: RunSettlement,
 ): Promise<boolean> {
+  // What the row became, read back from the one statement that decided it: a
+  // release is two outcomes now and only the requeue re-enters the queue.
+  // Tested for the closed arm rather than the open one, so a caller whose
+  // RETURNING does not carry the column keeps counting its requeue: the
+  // counter is suppressed only where the row is known to have been closed.
+  let became: string | undefined;
+  let closedSession: string | undefined;
   // `setSql` rather than `extra.metadata`: one statement may assign a column
   // once, and this assignment does two things -- carry the release reason and
   // restamp the sojourn marker, so a row going round the requeue loop three
   // times is measured as three waits rather than one that keeps growing.
-  const released = await settleAndTransition(taskId, settlement, (query) =>
-    applyTaskStatusTransition("queued", {
-      extra: {
-        lease_owner: null,
-        lease_expires_at: null,
-        heartbeat_at: null,
-        internal_token_hash: null,
-        // Cleared with the status, so a heartbeat racing this release cannot
-        // find the row still holding the attempt it is reporting for.
-        attempt_id: null,
-        started_at: null,
+  const released = await settleAndTransition(taskId, settlement, async (query) => {
+    const rows = await applyTaskStatusTransition(
+      // A row the user stopped is closed here rather than put back. Releasing
+      // it to `queued` is what let a Stop be erased instead of merely missed:
+      // `peekNextQueued` would match it again within the same second and the
+      // turn ran on a second replica. Ending it here is also what keeps the
+      // wait short -- `cancelling` is outside `requeueLostDoorbellLeases`'
+      // statuses, so the only other pass that would reach the row is
+      // `reapLostLeases`, a whole `LEASE_LOST_GRACE_SEC` later with the
+      // session's gate shut for all of it.
+      { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END", terminal: true },
+      {
+        extra: {
+          lease_owner: null,
+          lease_expires_at: null,
+          heartbeat_at: null,
+          internal_token_hash: null,
+          // Cleared with the status, so a heartbeat racing this release cannot
+          // find the row still holding the attempt it is reporting for.
+          attempt_id: null,
+          started_at: null,
+        },
+        setSql: [
+          // The writer re-stamps `queued_at` for the literal status "queued"
+          // and this is an expression, so the requeue arm has to say it. Losing
+          // it would not fail anything loudly: the row still goes back on the
+          // queue, and every trip round the loop after the first would be
+          // measured from the first one's stamp, so one requeued run would
+          // report a wait that grows without bound.
+          `queued_at = CASE WHEN status = 'cancelling'
+                            THEN queued_at ELSE clock_timestamp() END`,
+          `failure_reason = CASE WHEN status = 'cancelling'
+                                 THEN 'cancelled' ELSE failure_reason END`,
+          `metadata = ${requeueSojournSql(`CASE
+                           WHEN $4::text IS NULL THEN COALESCE(metadata, '{}'::jsonb)
+                           ELSE COALESCE(metadata, '{}'::jsonb)
+                                || jsonb_build_object('last_release', $4::text)
+                         END`)}`,
+        ],
+        where: `task_id = $1
+          AND lease_owner = $2
+          AND status IN ('queued','preparing','running','cancelling')
+          AND ($3::int IS NULL OR claim_count = $3)`,
+        params: [taskId, brainId, claimCount ?? null, reason ?? null],
+        query,
       },
-      setSql: [`metadata = ${requeueSojournSql(`CASE
-                         WHEN $4::text IS NULL THEN COALESCE(metadata, '{}'::jsonb)
-                         ELSE COALESCE(metadata, '{}'::jsonb)
-                              || jsonb_build_object('last_release', $4::text)
-                       END`)}`],
-      where: `task_id = $1
-        AND lease_owner = $2
-        AND status IN ('queued','preparing','running')
-        AND ($3::int IS NULL OR claim_count = $3)`,
-      params: [taskId, brainId, claimCount ?? null, reason ?? null],
-      query,
-    }));
-  if (released) metrics.onQueueEntered("requeue");
+    );
+    became = rows[0]?.status;
+    closedSession = rows[0]?.session_id ?? undefined;
+    return rows;
+  });
+  if (released && became !== "cancelled") metrics.onQueueEntered("requeue");
+  // A closed row may have been the last thing occupying its session, and the
+  // Stop that parked it could not say so: it left the gate shut deliberately,
+  // for a turn that was still winding down. This is where it stops winding.
+  if (released && became === "cancelled" && closedSession) {
+    await releaseSessionGateIfUnoccupied(closedSession);
+  }
   return released;
 }
 

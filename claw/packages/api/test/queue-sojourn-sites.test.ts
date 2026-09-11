@@ -221,3 +221,42 @@ test("the sibling sweep counts only the spare that was still queued", async () =
   );
   assert.equal((await runRow(h, "sib-spare")).failure_reason, "dispatch_retried");
 });
+
+test("a release that closes a stopped row books no re-entry to the queue", async () => {
+  // The release has two outcomes and only one of them is a requeue. Counting
+  // both would report a queue the row never rejoined, and the gap is silent:
+  // the counter is what the queue's depth is reconciled against.
+  const { interruptSessionRuns } = await import("../src/tasks/chat-run.js");
+  const { releaseClaim } = await import("../src/tasks/run-claim.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "stopped", "s1", {
+    status: "preparing", dispatch: "doorbell", prompt: "hello", claimable: true,
+    leaseOwner: "brain-a", leaseExpiresInSec: 600, claimCount: 1,
+  });
+  await interruptSessionRuns("s1");
+
+  const moved = await delta(
+    () => releaseClaim("stopped", "brain-a", 1, "lock_contention"),
+    ENTERED, { cause: "requeue" },
+  );
+
+  assert.equal(moved, 0);
+  assert.equal((await runRow(h, "stopped")).status, "cancelled");
+});
+
+test("and an ordinary release still books one", async () => {
+  const { releaseClaim } = await import("../src/tasks/run-claim.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "cycled", "s1", {
+    status: "preparing", dispatch: "doorbell", prompt: "hello", claimable: true,
+    leaseOwner: "brain-a", leaseExpiresInSec: 600, claimCount: 1,
+  });
+
+  const moved = await delta(
+    () => releaseClaim("cycled", "brain-a", 1, "lock_contention"),
+    ENTERED, { cause: "requeue" },
+  );
+
+  assert.equal(moved, 1);
+  assert.equal((await runRow(h, "cycled")).status, "queued");
+});

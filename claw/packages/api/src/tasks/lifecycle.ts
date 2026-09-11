@@ -18,7 +18,7 @@ import {
   acquireAdmissionLock, anyAdmissionCeilingSet, askFromRow, decideAdmission, envAdmitLimits,
   withOwnedAdmissionLock, type AdmissionRefusal,
 } from "./admission.js";
-import { cancelUnheldFatRun } from "./chat-run.js";
+import { cancelUnheldRun } from "./chat-run.js";
 import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
@@ -312,7 +312,7 @@ export async function cancelTask(
   }
 
   if ((task.status === "preparing" || task.status === "running")
-      && task.origin === "chat" && await cancelUnheldFatRun(task.task_id)) {
+      && task.origin === "chat" && await cancelUnheldRun(task.task_id)) {
     return { ok: true, cancelled: 1, interrupt_key: task.session_id ?? undefined };
   }
 

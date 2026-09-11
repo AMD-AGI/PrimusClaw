@@ -512,7 +512,9 @@ test("the claim route reports the row's generation, and the settle routes read i
     payload: { brain_id: "brain-7", claim_count: 4, reason: "lock_contention" },
   });
   assert.equal(released.statusCode, 200);
-  const upd = seen.find((q) => /SET status = 'queued'/.test(q.sql));
+  const upd = seen.find((q) => q.sql.includes(
+    "SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END",
+  ));
   assert.ok(upd, "the release ran");
   assert.ok(upd?.params.includes(4), "and it carried the parsed generation into the CAS");
   // The key is spelled in the statement and the reason is bound beside it, so

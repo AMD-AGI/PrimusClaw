@@ -13,6 +13,17 @@ import { db } from "../src/infra/db.js";
 import { claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim, runClaimPorts } from "../src/tasks/run-claim.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
+/**
+ * The release statement's own status expression.
+ *
+ * Matching `SET status = 'queued'` stopped naming this statement once a
+ * release grew a second outcome, and an absence assertion written that way
+ * passes for the wrong reason -- the literal is gone from every release, so
+ * the test would hold even if the release it forbids were issued.
+ */
+const RELEASE_STATUS =
+  /SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END/;
+
 const originalQuery = db.query;
 // These tests reply to queries positionally, so the claim's history rebuild --
 // several reads of its own -- would eat the replies meant for the user-env
@@ -204,7 +215,7 @@ test("unclaim returns the row to queued for the holder only", async () => {
   ]);
   assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
   const update = statusUpdate(seen);
-  assert.match(update.sql, /SET status = 'queued'/);
+  assert.match(update.sql, RELEASE_STATUS);
   // The one status writer numbers its own values before the caller's, so the
   // holder's position is the writer's business. Read the placeholder the
   // predicate uses -- `lease_owner` is in the SET too, so it has to be the one
@@ -237,7 +248,7 @@ test("failing a held claim ends the row instead of returning it to the queue", a
   assert.equal(update.params[0], "session_deleted");
   assert.match(update.sql, /origin = 'chat'/);
   assert.ok(update.params.includes("brain-7"));
-  assert.ok(!seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+  assert.ok(!seen.some((q) => RELEASE_STATUS.test(q.sql)));
 });
 
 test("a doorbell term fails the held claim as claim_abandoned, not session_deleted", async () => {
@@ -343,7 +354,7 @@ test("exhausted claims put the row back when it was not actually failed", async 
     ]);
     assert.equal(await claimRunById("ktsk_1", "brain-7"), "busy");
     assert.equal(events.length, 0);
-    assert.ok(seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+    assert.ok(seen.some((q) => RELEASE_STATUS.test(q.sql)));
   } finally {
     runClaimPorts.publishSessionEvent = originalPublish;
   }
@@ -364,7 +375,7 @@ test("exhausted claims put the row back when marking the row throws", async () =
     ]);
     assert.equal(await claimRunById("ktsk_1", "brain-7"), "busy");
     assert.equal(events.length, 0);
-    assert.ok(seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+    assert.ok(seen.some((q) => RELEASE_STATUS.test(q.sql)));
   } finally {
     runClaimPorts.publishSessionEvent = originalPublish;
   }

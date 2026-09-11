@@ -964,7 +964,9 @@ function stubClaims(opts: ClaimStub = {}): DbStub {
     if (sql.startsWith("SELECT status, lease_expires_at")) {
       return shape() === "missing" ? [] : [{ status: "preparing", lease_expires_at: null }];
     }
-    if (sql.includes("SET status = 'queued'")) {
+    if (sql.includes(
+      "SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END",
+    )) {
       return (opts.releaseRows ?? 1) > 0 ? [{ task_id: taskId }] : [];
     }
     // One writer means one spelling, so the three ways a claim can end in
@@ -1262,7 +1264,8 @@ const GUARDED_WRITES = [
   {
     what: "an unclaim", url: "/v1/internal/tasks/ktsk_1/unclaim",
     body: { reason: "retry" }, name: UNCLAIM, label: "retry",
-    stub: { releaseRows: 0 } as ClaimStub, fail: /SET status = 'queued'/,
+    stub: { releaseRows: 0 } as ClaimStub,
+    fail: /SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END/,
   },
   {
     what: "a fail-claim", url: "/v1/internal/tasks/ktsk_1/fail-claim",

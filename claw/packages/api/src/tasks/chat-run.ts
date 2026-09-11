@@ -1262,11 +1262,30 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
     await releaseRunUse(row.task_id, false);
     await announceInterruptedUnstarted(sessionId, row);
   }
-  // Anything non-terminal left on this session keeps the gate shut, whether or
-  // not it carries a lease. `lease_owner IS NOT NULL` used to stand in for "a
-  // Brain has this", which is the same mistake as the predicate above: it does
-  // not see a fat row that is executing but has not renewed yet, and idling the
-  // session under one lets the next message dispatch on top of a live run.
+  await releaseSessionGateIfUnoccupied(sessionId);
+  return rows.length;
+}
+
+/**
+ * Hand the session back, if this was the last thing on it.
+ *
+ * Anything non-terminal left on this session keeps the gate shut, whether or
+ * not it carries a lease. `lease_owner IS NOT NULL` used to stand in for "a
+ * Brain has this", which is the same mistake as the queued predicate above: it
+ * does not see a fat row that is executing but has not renewed yet, and idling
+ * the session under one lets the next message dispatch on top of a live run.
+ *
+ * Shared with the release rather than restated there, because the two callers
+ * are the two ways a stopped turn ends and they have to agree on what counts
+ * as still occupying the session. A Stop that parks a held row at `cancelling`
+ * deliberately leaves the gate shut -- the turn is winding down, not over --
+ * and it is the release that closes the row afterwards, so without this call
+ * the gate would wait out `reapStuckSessions` with every later message parked
+ * behind it. Before such a row could be parked at all, this same case reopened
+ * the session by running the turn a second time, which released the gate for
+ * the wrong reason.
+ */
+export async function releaseSessionGateIfUnoccupied(sessionId: string): Promise<void> {
   const stillHeld = await db.query(
     `SELECT 1 FROM claw_tasks
       WHERE session_id = $1
@@ -1275,15 +1294,13 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
       LIMIT 1`,
     [sessionId],
   );
-  if ((stillHeld.rowCount ?? 0) === 0) {
-    await db.query(
-      `UPDATE claw_sessions
-          SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
-        WHERE session_id = $1 AND agent_status = 'running' AND deleted_at IS NULL`,
-      [sessionId],
-    );
-  }
-  return rows.length;
+  if ((stillHeld.rowCount ?? 0) > 0) return;
+  await db.query(
+    `UPDATE claw_sessions
+        SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
+      WHERE session_id = $1 AND agent_status = 'running' AND deleted_at IS NULL`,
+    [sessionId],
+  );
 }
 
 /**
@@ -1305,7 +1322,7 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
  */
 export async function interruptSessionRuns(sessionId: string): Promise<number> {
   const cancelled = await interruptUnstartedChatRuns(sessionId);
-  return cancelled + await cancelUnheldFatRuns(sessionId);
+  return cancelled + await cancelUnheldRuns(sessionId);
 }
 
 /**
@@ -1327,25 +1344,48 @@ export async function stopSessionRuns(sessionId: string): Promise<number> {
 }
 
 /**
- * Terminalize the fat rows on this session that no worker holds.
+ * Settle the executing rows on this session, by whether a worker holds them.
  *
- * Held rows keep today's `cancelling` handshake and their existing reapers.
- * While no arm of the shared guard holds, every fat row reads as held, so this
- * reproduces today's transition exactly.
+ * Held rows take the `cancelling` handshake and their existing reapers;
+ * unheld ones are closed outright with the receipt saying so.
+ *
+ * Both dispatch shapes come through here. The fat half is what a Stop could
+ * not reach at all. The doorbell half could not be reached either, for the
+ * opposite reason: a claimed doorbell row is `preparing` or `running` with a
+ * lease, so `interruptUnstartedChatRuns` -- which wants `queued`, or
+ * `preparing` with no holder -- steps over it, and until this pass covered it
+ * a Stop landing there wrote nothing at all. The wire interrupt was the whole
+ * of the durable half, and it is dropped by every Brain with no abort
+ * registered for the address yet: `claimDoorbell` returns once the API has
+ * written the lease, and `activeAbort.set` happens two NATS KV round trips
+ * later, so the row is already out of the queued pass's reach before anything
+ * can honour a stop. That is narrow. The lock-contention arm is not: it
+ * returns without registering an abort at all and naks, and the claimed
+ * wrapper's nak sleeps the whole backoff -- five seconds doubling to five
+ * minutes -- before unclaiming. For all of it the row read as unstoppable.
+ *
+ * Leaving the row at `preparing` is what made that silence destructive rather
+ * than merely late. The unclaim returns it to `queued`, and `peekNextQueued`
+ * has no cancellation term to consult -- there was nothing written for one to
+ * read -- so the next replica claims it and runs the turn the user stopped.
+ * `cancelling` is the state the rest of the system already reads as "the user
+ * asked this to end": `CLAIMABLE` and `peekNextQueued` both exclude it, and so
+ * does `ACQUIRABLE_STATUSES` on the lease endpoint, whose comment had been
+ * describing this exact row for as long as nothing could put one there.
  */
-async function cancelUnheldFatRuns(sessionId: string): Promise<number> {
-  return cancelUnheldFat("session_id = $1", sessionId);
+async function cancelUnheldRuns(sessionId: string): Promise<number> {
+  return cancelUnheld("session_id = $1", sessionId);
 }
 
 /**
  * The same terminalization for one named row, for the cancel that names a task
  * rather than a session.
  */
-export async function cancelUnheldFatRun(taskId: string): Promise<boolean> {
-  return (await cancelUnheldFat("task_id = $1", taskId)) > 0;
+export async function cancelUnheldRun(taskId: string): Promise<boolean> {
+  return (await cancelUnheld("task_id = $1", taskId)) > 0;
 }
 
-async function cancelUnheldFat(scope: string, scopeValue: string): Promise<number> {
+async function cancelUnheld(scope: string, scopeValue: string): Promise<number> {
   const held = `(
     lease_owner IS NOT NULL
     OR lease_expires_at IS NOT NULL
@@ -1384,9 +1424,16 @@ async function cancelUnheldFat(scope: string, scopeValue: string): Promise<numbe
                 )
               END`,
         ],
+        // Every executing chat row, whichever way it was dispatched. The
+        // dispatch test that used to stand here read as a scoping detail and
+        // was the whole of the doorbell hole: a claimed doorbell is `preparing`
+        // or `running` with a lease, so it is held, and the branch above moves
+        // it to `cancelling` exactly as it does a held fat row. Nothing here
+        // decides on the third arm of `held` for such a row -- a doorbell opens
+        // at `queued` and only a claim can put it in these two statuses, and a
+        // claim writes the lease -- so the delivery probe stays a fat question.
         where: `${scope}
           AND origin = 'chat'
-          AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
           AND status IN ('preparing','running')`,
         params: [
           scopeValue, RUN_FAT_PREPARING_RECONCILE, false,
