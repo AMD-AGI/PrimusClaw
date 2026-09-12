@@ -18,6 +18,8 @@
  * nothing. What is under test here is the other two arms.
  */
 
+import "./reconcile-off-env.js";
+
 import { closedDoorbellBarrier } from "./doorbell-barrier-stub.js";
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";

@@ -10,6 +10,8 @@
  * the regex the unit tests assert on. What was wrong was which rows they
  * matched. See README.md.
  */
+import "./reconcile-off-env.js";
+
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 

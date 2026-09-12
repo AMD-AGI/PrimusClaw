@@ -341,14 +341,24 @@ export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
  * The deployment's assertion that every Brain able to receive `tasks.execute`
  * takes a durable SQL holder before its execution gate.
  *
- * Not a switch over one sweeper pass: it is the single evidence arm that makes
- * a fat row's null holder columns trustworthy, so every no-holder terminalizer
- * of a fat row is gated on it. Off by default, and enabling it before every
- * API replica and every Brain is new -- and before the longest delayed
- * in-process callback an old replica can have armed has expired -- would let a
- * reaper close a delivery that is about to execute.
+ * Not a switch over one sweeper pass: it is the first evidence arm of the
+ * shared no-delivery guard, and asserting it does not adjust the other arms but
+ * makes them irrelevant -- every unheld fat row becomes eligible on the
+ * assertion alone, whatever its receipt says and whether or not the durable can
+ * be read. `reconcile-on-fleet-arm.test.ts` is what that means, stated.
+ *
+ * On by default, which is a statement about the deployment this default is
+ * written for and not about any deployment. Enabling it before every API
+ * replica and every Brain is new -- and before the longest delayed in-process
+ * callback an old replica can have armed has expired -- lets a reaper close a
+ * delivery that is about to execute. A fleet rolling up from a release that
+ * predates the durable holder must therefore set this to `false` for the
+ * duration of the rollout and unset it afterwards; the off-side suites
+ * (`reconcile-off-*.test.ts`, `doorbell-gate-ownership-legacy.test.ts`, and the
+ * receipt and settlement suites that name it in their headers) are what that
+ * configuration still owes, and they declare it rather than inherit it.
  */
-export const RUN_FAT_PREPARING_RECONCILE = envBool("RUN_FAT_PREPARING_RECONCILE", false);
+export const RUN_FAT_PREPARING_RECONCILE = envBool("RUN_FAT_PREPARING_RECONCILE", true);
 
 /**
  * Cluster-wide admission ceilings. Zero means that dimension is not enforced.

@@ -16,6 +16,8 @@
  * disarmed it in between -- against both fat publishers.
  */
 
+import "./reconcile-off-env.js";
+
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Fastify, { type FastifyInstance } from "fastify";

@@ -12,6 +12,8 @@
  * they do today. The enforcing half is doorbell-gate-ownership.test.ts.
  */
 
+import "./reconcile-off-env.js";
+
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 

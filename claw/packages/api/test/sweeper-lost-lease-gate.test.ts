@@ -17,6 +17,8 @@
  * dispatch -- two rows for one message, only one of them ever leased -- put the
  * hour back that this release exists to remove.
  */
+import "./reconcile-off-env.js";
+
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
