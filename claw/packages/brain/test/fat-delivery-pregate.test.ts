@@ -358,6 +358,40 @@ describe("a Stop taken while the delivery is queued", () => {
     assert.deepEqual(h.errors, []);
     h.finish();
   });
+
+  it("F9b names the row it stopped even when only the lease URL carries its id", async () => {
+    // F13's legacy shape on the stop path. `settleStopped` emits the only
+    // completion this delivery will ever produce -- the handler never runs --
+    // so an unnamed one leaves the `cancelling` row with nothing to settle it:
+    // the user's interrupt is acked on the wire and the row waits out the
+    // lost-lease reaper instead of reaching `cancelled`.
+    const legacy = fatRequest({
+      task_id: undefined,
+      run_lease: { url: "http://api.test/v1/internal/tasks/t-legacy/lease", token: "tok" },
+    } as Partial<ExecuteRequest>);
+    const h = harness({
+      answers: (_n, _renewal, request) => (
+        request.run_lease?.url?.includes("t-legacy")
+          ? granted("cancelling", 4)
+          : granted("preparing", 4)
+      ),
+      max: 1,
+    });
+    void runDelivery(msgFor(fatRequest()), h.deps);
+    await settle();
+
+    await runDelivery(msgFor(legacy), h.deps);
+
+    assert.equal(h.handled.length, 1, "the stopped delivery never entered the handler");
+    const completion = h.events.find((e) => e.type === "exec_complete");
+    assert.ok(completion, "the stop is reported");
+    assert.equal(completion.interrupted, true);
+    assert.equal(
+      completion.task_id, "t-legacy",
+      "recovered from the only place this payload says it",
+    );
+    h.finish();
+  });
 });
 
 describe("the accepted generation", () => {

@@ -228,7 +228,8 @@ test("D5b the same refusal holds when the capability gate is shut", async () => 
   // Seen on the cluster at ADMIT_HARD_RUNS=1 with one run already occupying
   // it: gate open, three turns answered 1x200 and 2x429; gate revoked, the
   // same three all answered 200 and ran, four live against a ceiling of one.
-  const seen = stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  // Not bound: this one asserts on what was refused, not on what was queried.
+  stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
   sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
@@ -270,6 +271,89 @@ test("D5c a shut gate still dispatches the turn the ceiling admits", async () =>
 
   assert.equal(result.kind, "dispatched");
   assert.deepEqual(published, ["task"], "the fat fallback still publishes what it admitted");
+});
+
+test("D5d a shut gate's refusal also takes the user's message out of history", async () => {
+  // D5 asserts this for the doorbell branch. The fat branch is the one that
+  // learned to refuse late, and it rolled the session back without deleting
+  // the event -- so a turn the fleet had refused stayed in the transcript,
+  // replayed as history by the next send and shown in the UI as a message
+  // nothing ever answered.
+  const seen = stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  sessionDispatchPorts.publishTask = async () => {};
+  sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {});
+
+  assert.equal(result.kind, "rejected");
+  assert.ok(
+    seen.some((qr) => /DELETE FROM claw_session_events/.test(qr.sql)
+      && qr.params[0] === (result.kind === "rejected" ? result.messageId : null)),
+    "the refused turn's UserMessage is deleted by id, as the doorbell branch deletes it",
+  );
+});
+
+test("D5e a fat run persists the topology admission counts it by", async () => {
+  // `usageFor` sums `input->'topology'->'nodes'` over live rows. The fat insert
+  // passed no spec at all, so `input` was `{}` and a fat GPU run counted zero
+  // nodes against every later decision for its whole life -- the GPU ceiling
+  // admitted past itself for as long as one was executing.
+  stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => ({ kind: "admit" });
+  sessionDispatchPorts.publishTask = async () => {};
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
+  let spec: Record<string, unknown> | undefined;
+  sessionDispatchPorts.openChatRun = (async (arg: { spec?: Record<string, unknown> }) => {
+    spec = arg.spec;
+    return { taskId: "ktsk_1" };
+  }) as unknown as typeof sessionDispatchPorts.openChatRun;
+
+  const result = await dispatchTaskToBrain(
+    { ...INPUT, topology: { nodes: 4, backend: "rayjob" } } as typeof INPUT,
+    async () => {},
+  );
+
+  assert.equal(result.kind, "dispatched");
+  assert.deepEqual(spec?.topology, { nodes: 4, backend: "rayjob" }, "the figure admission reads");
+  assert.equal(spec?.dispatch, "fat", "and the row names the path that opened it");
+  for (const secret of ["llm_api_key", "platform_key", "user_env", "session_env", "run_lease"]) {
+    assert.ok(!(secret in (spec ?? {})), `nothing rehydrates a fat row, so ${secret} is not stored`);
+  }
+});
+
+test("D6b a soft queue on the fat fallback publishes rather than parking the row", async () => {
+  // Deliberately not the deferral D6 makes, and asserted so it cannot be
+  // "fixed" into one. Deferring means leaving the row at `queued` for a
+  // claimer, and on this path there is none: `peekNextQueued` and
+  // `reapExpiredQueuedRuns` both filter `metadata->>'dispatch' = 'doorbell'`,
+  // and the session-stuck reaper refuses to reopen a session holding a
+  // `queued` chat row. A deferred fat turn would be run by nobody, reaped by
+  // nobody, and hold its gate shut forever. The hard ceiling still refuses
+  // (D5b), so the fleet limit holds; only the smoothing threshold is skipped.
+  stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => ({ kind: "queue", position: 3 });
+  const published: string[] = [];
+  sessionDispatchPorts.publishTask = async () => { published.push("task"); };
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
+  sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_q" })) as typeof sessionDispatchPorts.openChatRun;
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {
+    throw new Error("an admitted turn keeps the session gate");
+  });
+
+  assert.equal(result.kind, "dispatched", "the turn runs; it is not parked where nothing runs it");
+  assert.deepEqual(published, ["task"]);
 });
 
 test("D6 a doorbell soft queue returns a position and does not publish a wakeup", async () => {

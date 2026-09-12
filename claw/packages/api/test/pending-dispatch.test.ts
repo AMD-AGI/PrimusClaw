@@ -101,6 +101,10 @@ function harness(opts: {
   countThrows?: Error;
   /** What the queue row's delete does, when the database refuses it. */
   deleteThrows?: Error;
+  /** Whether this message already has a completion event at all, processed or not. */
+  completionPublished?: boolean;
+  /** What publishing the refusal's events does, when the stream is gone. */
+  publishEventThrows?: Error;
 } = {}): Recorder {
   const rec: Recorder = {
     calls: [], sql: [], published: [], failed: [], opened: [], events: [],
@@ -120,6 +124,7 @@ function harness(opts: {
   ) => {
     rec.calls.push("event");
     rec.events.push(event);
+    if (opts.publishEventThrows) throw opts.publishEventThrows;
   }) as unknown as typeof pendingDispatchPorts.publishSessionEvent;
 
   pendingDispatchPorts.bindWorkspace = (async () => {
@@ -169,6 +174,11 @@ function harness(opts: {
       rec.calls.push("inspect-handoff");
       rec.sql.push({ text, params });
       return { rows: [], rowCount: 0 };
+    }
+    if (/FROM claw_session_events/.test(text)) {
+      rec.calls.push("completion-probe");
+      rec.sql.push({ text, params });
+      return { rows: opts.completionPublished ? [{ "?column?": 1 }] : [], rowCount: opts.completionPublished ? 1 : 0 };
     }
     if (/SET dispatch_task_id = NULL/.test(text)) {
       rec.calls.push("clear-handoff");
@@ -519,9 +529,13 @@ test("P7 a published turn clears the queue row, then marks the session running",
   // Found by what the statement is, not by how many precede it: the receipt
   // and sequence writes sit between them.
   const deleted = rec.sql.find((q) => /DELETE FROM claw_pending_messages/.test(q.text));
-  const gate = rec.sql.find((q) => /agent_status = 'running'/.test(q.text));
+  // Parameterised since the write moved behind `applySessionGateTransition`;
+  // the status is params[2] rather than a literal.
+  const gate = rec.sql.find((q) =>
+    /UPDATE claw_sessions/.test(q.text) && /agent_gate_message_id = \$2/.test(q.text));
   assert.deepEqual(deleted?.params, [42], "the row deleted is the one that was replayed");
   assert.ok(gate, "the session is marked running");
+  assert.equal(gate!.params[2], "running");
   assert.match(
     gate!.text, /deleted_at IS NULL/,
     "a session deleted mid-replay must not be resurrected as running",
@@ -613,6 +627,138 @@ test("P12 a hard admission refusal abandons the pending row", async () => {
 });
 
 
+test("P12b the same refusal holds when the capability gate is shut", async () => {
+  // The fallback. `beginDoorbellDispatch` declines for an operator revocation
+  // and for a KV watch that merely died, and this branch opened and published
+  // without consulting admission at all -- so a transient watch failure
+  // disabled every configured ceiling for exactly the turns a full fleet most
+  // needs to meter: a message is pending because its session was already busy.
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, null, "a shut gate is slower, never a way past the ceiling");
+  assert.equal(rec.published.length, 0);
+  assert.ok(!rec.calls.includes("open"), "and nothing is written for a run that was refused");
+  assert.ok(rec.calls.includes("delete-pending"), "the queue row does not retry a hard refusal");
+  assert.ok(rec.events.some((e) => e.type === "exec_complete" && e.failure_reason === "runs_hard_limit"));
+});
+
+test("P12c a shut gate still dispatches the turn the ceiling admits", async () => {
+  // The positive control. Without it P12b holds just as well against a fat
+  // branch that refuses every pending replay once the gate is shut.
+  pendingDispatchPorts.admit = async () => ({ kind: "admit" });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, "ktsk_1");
+  assert.equal(rec.published.length, 1, "the fat fallback still publishes what it admitted");
+});
+
+test("P12d a soft queue on the fat fallback publishes rather than parking the row", async () => {
+  // Deliberately not P11's deferral, and asserted so it cannot be "fixed" into
+  // one: deferring leaves the row at `queued` for a claimer, and no claimer
+  // takes a fat row -- `peekNextQueued` and `reapExpiredQueuedRuns` both filter
+  // `metadata->>'dispatch' = 'doorbell'`. It would be run by nobody and reaped
+  // by nobody, with the session's gate shut behind it.
+  pendingDispatchPorts.admit = async () => ({ kind: "queue", position: 2 });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, "ktsk_1", "the turn runs; it is not parked where nothing runs it");
+  assert.equal(rec.published.length, 1);
+});
+
+test("P12e a fat pending run persists the topology admission counts it by", async () => {
+  // `usageFor` sums `input->'topology'->'nodes'` over live rows. With no spec
+  // the column is `{}`, so a fat GPU run counted zero nodes against every
+  // later decision for the whole time it executed.
+  pendingDispatchPorts.admit = async () => ({ kind: "admit" });
+  const rec = harness();
+
+  await dispatchPendingMessage({
+    ...input(),
+    task: { ...input().task, topology: { nodes: 4, backend: "rayjob" }, llm_api_key: "sk-secret" },
+  } as Parameters<typeof dispatchPendingMessage>[0]);
+
+  const spec = rec.opened[0]?.spec as Record<string, unknown> | undefined;
+  assert.deepEqual(spec?.topology, { nodes: 4, backend: "rayjob" }, "the figure admission reads");
+  assert.equal(spec?.dispatch, "fat", "and the row names the path that opened it");
+  assert.ok(!("llm_api_key" in (spec ?? {})), "nothing rehydrates a fat row, so no secret is stored");
+});
+
+test("P12f a refusal names itself on the gate so its own completion drains the queue", async () => {
+  // The refusal publishes a completion, and `releaseSessionGateIfLastRun`
+  // matches that completion's message against the marker once ownership is
+  // enforced. Against a null marker it matches nothing, so the release returns
+  // false and `handleComplete` skips the drain -- the next parked message waits
+  // for an event that never comes, and the session is left `failed`, which is
+  // not a state `drainOrphanedPendingMessages` picks up either.
+  //
+  // Conditional, so a drain racing a turn that already holds the gate does not
+  // rename it: that is the same defect moved onto a run that is executing.
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  const rec = harness();
+
+  await dispatchPendingMessage(input());
+
+  const take = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = \$2/.test(s.text));
+  assert.ok(take, "the refusal claims the gate before it publishes");
+  assert.match(
+    take.text, /agent_gate_message_id IS NULL/,
+    "and only where no turn is named already",
+  );
+  assert.equal(take.params[1], input().messageId, "under the refused message's own name");
+});
+
+test("P12g but not when this message already has a completion the consumer will discard", async () => {
+  // The gate a refusal takes is released by the completion it publishes, and
+  // `completionAlreadyProcessed` keys on (session, message) -- so a second
+  // refusal of the same message publishes an event the consumer discards. A
+  // gate taken under it has no releaser left, and the session sits `running`
+  // with every later message queued behind it.
+  //
+  // The state is reachable from one swallowed delete: the first refusal's
+  // completion reopens the session, and the drain finds the row still queued.
+  const rec = harness({ completionPublished: true });
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+
+  await dispatchPendingMessage(input());
+
+  const take = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = \$2/.test(s.text));
+  assert.equal(take, undefined, "no gate is taken for a refusal nothing will release");
+  assert.ok(rec.calls.includes("delete-pending"), "and the queue row is still cleared");
+});
+
+test("P12h a refusal that cannot publish gives back the gate it took", async () => {
+  // Taking the gate is a promise that something hands it back. When the publish
+  // throws there is no completion at all, so the promise has to be kept here:
+  // otherwise the message stays queued behind a gate held under its own name,
+  // and the completion that opened the session can no longer match it either.
+  const rec = harness({ publishEventThrows: new Error("nats down") });
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /nats down/);
+
+  const release = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = NULL/.test(s.text));
+  assert.ok(release, "the gate it took is handed back");
+  assert.match(
+    release.text, /agent_gate_message_id IS NOT DISTINCT FROM \$3/,
+    "and only while it still names this turn",
+  );
+  assert.equal(
+    release.params[3], false,
+    "with the backstop escape off, so it cannot open a gate it does not hold",
+  );
+  assert.equal(release.params[2], input().messageId, "the turn it names is this one");
+});
+
 test("P13 a refused turn names the row it terminalized", async () => {
   // The refusal's `exec_complete` is what the consumer routes on. Without the
   // row's id, a message-scoped terminal event can be read as belonging to a
@@ -635,14 +781,19 @@ test("P7b the gate the replay takes names the turn that took it", async () => {
   const rec = harness();
   await dispatchPendingMessage(input({ messageId: "claw-1700000000042" }));
 
-  const gate = rec.sql.find((q) => /agent_status = 'running'/.test(q.text));
+  // Written through `applySessionGateTransition`, so the status is a parameter
+  // rather than a literal. The property is unchanged and still the point: one
+  // statement sets both, so no window holds the status without the marker.
+  const gate = rec.sql.find((q) =>
+    /UPDATE claw_sessions/.test(q.text) && /agent_gate_message_id = \$2/.test(q.text));
   assert.ok(gate, "the session is marked running");
   assert.match(
-    gate!.text, /agent_gate_message_id = \$2/,
+    gate!.text, /SET agent_status = \$3, agent_gate_message_id = \$2/,
     "the flip and the marker are one statement, so no window holds one without the other",
   );
+  assert.equal(gate!.params[2], "running", "and the status it writes is running");
   assert.deepEqual(
-    gate!.params, ["s-1", "claw-1700000000042"],
+    gate!.params.slice(0, 2), ["s-1", "claw-1700000000042"],
     "the gate is taken under the id of the turn that was just published",
   );
 });

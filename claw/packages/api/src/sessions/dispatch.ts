@@ -28,6 +28,7 @@ import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js
 import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
+import { stripRunSecrets } from "../tasks/run-spec.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -287,6 +288,24 @@ export async function dispatchTaskToBrain(
     task.files_workspace_id = filesWorkspaceId;
     task.files_workspace_required = true;
 
+    // The delete is the whole rollback. Nothing is announced on purpose:
+    // `publishSse` writes to a core-NATS subject no SSE route subscribes to,
+    // and announcing through `publishEvent` instead would persist an assistant
+    // reply beside the UserMessage this statement removes.
+    //
+    // Shared with the fat fallback below deliberately. A refusal there used to
+    // roll the session back without removing the event, so the transcript kept
+    // a user turn the fleet had refused: the next send replayed it as history
+    // and the UI showed a message that was never answered and never will be.
+    // The refusal is the same refusal, so the rollback is the same rollback.
+    const rollbackRefusedTurn = async (): Promise<void> => {
+      await db.query(
+        "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
+        [messageId, sessionId],
+      );
+      await onPublishFailure();
+    };
+
     const doorbellToken = sessionDispatchPorts.doorbellDispatch();
     if (doorbellToken) {
       try {
@@ -304,15 +323,7 @@ export async function dispatchTaskToBrain(
           rememberTaskId: (taskId) => { runTaskId = taskId; },
         });
         if (result.kind === "rejected") {
-          // The delete is the whole rollback. Nothing is announced on purpose:
-          // `publishSse` writes to a core-NATS subject no SSE route subscribes
-          // to, and announcing through `publishEvent` instead would persist an
-          // assistant reply beside the UserMessage this statement removes.
-          await db.query(
-            "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
-            [messageId, sessionId],
-          );
-          await onPublishFailure();
+          await rollbackRefusedTurn();
         }
         return result;
       } finally {
@@ -354,13 +365,40 @@ export async function dispatchTaskToBrain(
           filesWorkspaceId,
           pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
           sandboxImage: finalSandboxImage,
+          // Secret-free, and narrower than the doorbell path's spec on purpose:
+          // nothing rehydrates a fat row from `input` -- it is published on the
+          // wire -- so sealing credentials into it would store a secret no
+          // reader wants. What admission does read is `input->'topology'`, and
+          // with no spec at all that read returns nothing for the whole life of
+          // the run: a fat GPU run counted zero nodes against every later
+          // decision, so the GPU ceiling admitted past itself for as long as
+          // any fat run was executing.
+          spec: { ...stripRunSecrets(task), dispatch: "fat" },
           client,
         }),
       } as const;
     });
     if (fatOpen.admission.kind === "reject") {
-      await onPublishFailure();
+      await rollbackRefusedTurn();
       return { kind: "rejected", messageId, reason: fatOpen.admission.reason };
+    }
+    // A soft ceiling is deliberately not honoured here, and the log line says
+    // so rather than the queueing happening silently.
+    //
+    // Deferring means leaving the row at `queued` unpublished for a claimer to
+    // take, and on this path no claimer exists: `peekNextQueued` and
+    // `reapExpiredQueuedRuns` both filter `metadata->>'dispatch' = 'doorbell'`,
+    // and the session-stuck reaper refuses to reopen a session that still has a
+    // `queued` chat row. A deferred fat turn would therefore be run by nobody,
+    // reaped by nobody, and hold its session's gate shut forever -- strictly
+    // worse than exceeding a threshold whose whole purpose is smoothing. The
+    // hard ceiling above still refuses, so the fleet limit is enforced; it is
+    // only the queueing threshold that this path cannot implement.
+    if (fatOpen.admission.kind === "queue") {
+      logger.warn(
+        { sessionId, messageId, position: fatOpen.admission.position },
+        "message.fat_soft_admission_not_deferred",
+      );
     }
     const run = fatOpen.run;
     // Publishing without a row leaves a session `running` with no deadline,

@@ -20,6 +20,8 @@
 
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   startHarness, seedSession, runRow, sessionRow, type Harness,
@@ -185,4 +187,82 @@ test("an unknown compensation leaves the queue alone for as long as the row is o
 
   assert.deepEqual(await sweepRepair(), [SESSION]);
   assert.deepEqual(await sweepRepair(), [], "exactly once, however many ticks follow");
+});
+
+test("a message parked behind a failed turn is drained too, not only an idle one", async () => {
+  // The backstop used to look only at `idle`, while the consumer it backs up
+  // drains on a failed completion as well -- `releaseSessionGateIfLastRun`
+  // writes `failed` and still reports the gate open. So the queue behind
+  // exactly the completions most likely to need recovery was the queue it
+  // could not reach. One way in: a refusal publishes its completion but its
+  // queue row survives; that completion drains the row again, the second
+  // refusal's completion is discarded as a duplicate, and the session is left
+  // `failed` with everything behind it waiting on an event already spent.
+  await h.reset();
+  await seedTurnWithMessageBehindIt();
+  await h.sql(
+    "UPDATE claw_sessions SET agent_status = 'failed', agent_gate_message_id = NULL WHERE session_id = $1",
+    [SESSION],
+  );
+
+  assert.deepEqual(await sweepRepair(), [SESSION], "the parked message is picked up");
+});
+
+test("but not while that session still has a turn of its own running", async () => {
+  // What actually holds the queue shut here is the occupancy test -- the live
+  // chat row -- not the status list: widening the list to include `running`
+  // leaves this green, because the NOT EXISTS still excludes the session. That
+  // is the guard worth pinning, since it is the one standing between a
+  // backstop and a second turn stacked onto a live one. The status list is
+  // pinned by the case above, which goes red the moment `failed` leaves it.
+  await h.reset();
+  await seedTurnWithMessageBehindIt();
+  await h.sql(
+    "UPDATE claw_sessions SET agent_status = 'failed', agent_gate_message_id = NULL WHERE session_id = $1",
+    [SESSION],
+  );
+  await h.sql(
+    `INSERT INTO claw_tasks (task_id, session_id, name, origin, executor, mode, status, metadata)
+     VALUES ('ktsk-live-behind', $1, 'chat', 'chat', 'brain', 'llm', 'running',
+             jsonb_build_object('message_id','m-live'))`,
+    [SESSION],
+  );
+
+  assert.deepEqual(await sweepRepair(), [], "a live turn still holds the queue shut");
+});
+
+test("a session acquired between the sweep's read and its dispatch is skipped", () => {
+  // The SELECT is a snapshot of a batch; a send can take any of those sessions
+  // before the loop reaches it. Asked again immediately before dispatching, so
+  // the window is one statement rather than the whole batch.
+  //
+  // Pinned on the statement because the race needs two transactions interleaved
+  // at a point this harness cannot hold open. What is asserted is that the
+  // question is asked at all, and that it asks about occupancy rather than
+  // only about status -- a status test alone would still admit a session whose
+  // run had just been opened.
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/tasks/sweeper.ts", import.meta.url)), "utf8",
+  );
+  const fn = src.slice(src.indexOf("export async function drainOrphanedPendingMessages"));
+  const body = fn.slice(0, fn.indexOf("\nexport "));
+  const recheck = body.slice(body.indexOf("drained = 0"));
+  assert.match(recheck, /SELECT 1 FROM claw_sessions/, "eligibility is re-read in the loop");
+  assert.match(recheck, /NOT EXISTS\s*\(\s*SELECT 1 FROM claw_tasks/, "and it asks about occupancy");
+  assert.ok(
+    recheck.indexOf("stillFree") < recheck.indexOf("drainPendingMessage"),
+    "the question comes before the dispatch it gates",
+  );
+  // And the comment states the limit rather than a bound that is not there. An
+  // earlier version cited the admission lock as serialising creation; that lock
+  // is skipped when every ceiling is zero, which is the default, so it
+  // serialises nothing on a default deployment.
+  //
+  // Asserted as what the comment now says, not as what it must not say: the
+  // correction quotes the claim it is correcting, and a pattern looking for the
+  // claim cannot tell the two apart.
+  assert.match(
+    recheck, /skipped when every ceiling is zero/,
+    "the residual window is described as open, with the reason the old bound did not hold",
+  );
 });

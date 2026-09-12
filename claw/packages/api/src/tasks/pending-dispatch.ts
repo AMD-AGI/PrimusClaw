@@ -39,15 +39,19 @@ import pino from "pino";
 import { envInt } from "../config.js";
 import { beginDoorbellDispatch } from "./doorbell-gate.js";
 import { db } from "../infra/db.js";
-import { publishEvent } from "../events/store.js";
+import { completionAlreadyPublished, publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import {
   failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
-  SWEEPABLE_RUN_STATUSES, takeSessionGate,
+  SWEEPABLE_RUN_STATUSES, takeSessionGate, takeSessionGateIfUnowned,
+  releaseSessionGateForTurn,
 } from "./chat-run.js";
+import type { PoolClient } from "pg";
 import { decideAdmission } from "./admission.js";
+import { withOwnedAdmissionLock } from "./admission.js";
 import { newTaskId } from "./ids.js";
-import { handOffAssembledRun, publishRunMessage } from "./run-dispatch.js";
+import { admissionAskFor, handOffAssembledRun, publishRunMessage } from "./run-dispatch.js";
+import { stripRunSecrets } from "./run-spec.js";
 import { injectLiveUserEnv } from "./run-claim.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 
@@ -291,7 +295,40 @@ async function refusePendingAdmission(
     { sessionId: input.sessionId, pendingId: input.pendingId, err: reason },
     "pending.admission_rejected",
   );
-  await publishRefusedTurn(input, reason, taskId);
+  // Named before the refusal is published, or the completion below releases
+  // nothing and the drain stops here: the next parked message waits for an
+  // event that is never coming. Pre-existing on the doorbell branch that shares
+  // this function, and reachable from the fat branch too now that it admits.
+  //
+  // Taking a gate is a promise that something will hand it back, and the only
+  // thing that can hand this one back is the completion published below. So it
+  // is taken exactly when that completion will be processed, and given back
+  // whenever it will not:
+  //
+  //  - Not taken at all when this message already has a completion published
+  //    for it. A second refusal of the same message publishes an event the
+  //    consumer discards -- a gate taken under it would have no releaser left.
+  //    That is the state a swallowed delete below leads to: the first
+  //    refusal's completion reopens the session, and the drain finds the row
+  //    still queued and refuses again.
+  //
+  //    Existence, not `completionAlreadyProcessed`. That one requires
+  //    `processed_at`, which the consumer writes only after `handleComplete`
+  //    returns -- and the drain that reaches this second refusal runs inside
+  //    `handleComplete`. The first completion is therefore mid-flight with a
+  //    NULL `processed_at` at exactly this moment, and the processed-only test
+  //    answers "no" for the completion that is about to discard ours.
+  //  - Given back when the publish throws, which leaves the message queued with
+  //    no completion coming at all.
+  const releasable = !await completionAlreadyPublished(input.sessionId, input.messageId);
+  const took = releasable
+    && await takeSessionGateIfUnowned(input.sessionId, input.messageId);
+  try {
+    await publishRefusedTurn(input, reason, taskId);
+  } catch (err) {
+    if (took) await releaseSessionGateForTurn(input.sessionId, input.messageId);
+    throw err;
+  }
   forgetUncountedAttempts(input.pendingId);
   try {
     await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
@@ -514,17 +551,61 @@ export async function dispatchPendingMessage(
     await injectLiveUserEnv(task as unknown as ExecuteRequest);
   }
 
-  const run = await pendingDispatchPorts.openChatRun({
-    dispatch: "fat",
-    sessionId,
-    userId: input.userId,
-    messageId: input.messageId,
-    prompt: input.prompt,
-    workspaceId: input.workspaceId,
-    filesWorkspaceId,
-    pluginId: input.pluginId,
-    sandboxImage: input.sandboxImage,
+  // Admitted here for the reason the immediate path is: this branch is the
+  // fallback `beginDoorbellDispatch` declines into, which includes a revoked
+  // capability floor and a KV watch that merely died, and it used to open and
+  // publish without consulting any ceiling at all. A pending message is the
+  // worse half of that asymmetry -- the queue exists because the session was
+  // busy, so these are precisely the turns a full fleet should be metering.
+  //
+  // Decided and inserted under one lock, as `handOffUncounted` requires:
+  // creation order and commit order must be the same order, or two creates
+  // that each cleared the check are both admitted against one slot.
+  const fatAsk = await admissionAskFor({
+    task, sessionId, userId: input.userId, messageId: input.messageId, prompt: input.prompt,
+    publish: async () => undefined,
+  } as Parameters<typeof admissionAskFor>[0]);
+  const fatOpen = await withOwnedAdmissionLock(async (client: PoolClient) => {
+    const admission = await pendingDispatchPorts.admit(fatAsk, client);
+    if (admission.kind === "reject") return { admission } as const;
+    return {
+      admission,
+      run: await pendingDispatchPorts.openChatRun({
+        dispatch: "fat",
+        sessionId,
+        userId: input.userId,
+        messageId: input.messageId,
+        prompt: input.prompt,
+        workspaceId: input.workspaceId,
+        filesWorkspaceId,
+        pluginId: input.pluginId,
+        sandboxImage: input.sandboxImage,
+        // Secret-free: nothing rehydrates a fat row from `input`. What does
+        // read it is admission's GPU aggregate, over `input->'topology'`, and
+        // with no spec a fat GPU run counts zero nodes against every later
+        // decision for its whole life.
+        spec: { ...stripRunSecrets(task), dispatch: "fat" },
+        client,
+      }),
+    } as const;
   });
+  if (fatOpen.admission.kind === "reject") {
+    await refusePendingAdmission(input, fatOpen.admission.reason);
+    return { runId: null };
+  }
+  // Deliberately not deferred, and logged rather than queued silently: a
+  // deferral means leaving the row at `queued` for a claimer, and no claimer
+  // takes a fat row -- `peekNextQueued` and `reapExpiredQueuedRuns` both
+  // filter `metadata->>'dispatch' = 'doorbell'`. It would be run by nobody and
+  // reaped by nobody. The hard ceiling above still refuses, so the fleet limit
+  // holds; only the smoothing threshold is out of this path's reach.
+  if (fatOpen.admission.kind === "queue") {
+    logger.warn(
+      { sessionId, pendingId: input.pendingId, position: fatOpen.admission.position },
+      "pending.fat_soft_admission_not_deferred",
+    );
+  }
+  const run = fatOpen.run;
   // Same rule as the immediate path: a turn with no row has no lease, no
   // deadline, and nothing a sweeper can close. Publishing it anyway is how
   // sessions sat at `running` with no worker and no error. Retry instead --

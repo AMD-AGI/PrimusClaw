@@ -586,6 +586,24 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       // `FOR UPDATE` is what makes the two statements one decision: the rows
       // the transition then matches are exactly these, held for the
       // transaction.
+      // The session lock, in a statement of its own.
+      //
+      // It was a CTE at first, on the argument that `live`'s scalar dependency
+      // forces the session to be locked before any task it returns. True, and
+      // not enough: when the task scan returns nothing the planner never
+      // executes the CTE's LockRows at all -- Postgres reports it as `never
+      // executed` -- so a deletion whose tasks are all invisible took no
+      // session lock, and the UPDATE that follows then locked a task that had
+      // committed in the meantime while holding nothing. Restore, holding the
+      // session and waiting for that task, closed the cycle; 40P01 was
+      // reproduced from exactly that.
+      //
+      // A separate statement cannot be optimised away, which is the whole
+      // point: the order has to hold when there is nothing to find.
+      await query(
+        `SELECT 1 FROM claw_sessions WHERE session_id = $1 FOR UPDATE`,
+        [sessionId],
+      );
       const cancelled = await query(
         `SELECT status AS prior_status, origin,
                 metadata->>'dispatch' AS dispatch,

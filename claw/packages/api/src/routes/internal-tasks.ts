@@ -446,11 +446,44 @@ async function renewLegacyRunLease(
           AND status = ANY($5::text[])
           -- Claim rotation can race authentication; fence the bearer again here.
           AND internal_token_hash = $6
-          -- Generation never clears, so entering the attempt protocol closes this bridge.
-          AND attempt_generation = 0
-          AND attempt_id IS NULL
-          AND settled_attempt_id IS NULL
-          AND (delivery_seq, delivery_count) = (0, 0)
+          -- Generation never clears, so entering the attempt protocol closes this
+          -- bridge -- except for the holder an acceptance just installed.
+          --
+          -- A pre-gate renewal carries no attempt token (the acceptance does not
+          -- issue one; the first in-run heartbeat opens it), so every one of them
+          -- arrives here. On a row acquireFatLease took over from a worker that
+          -- had run an attempt, the counters below are all non-zero and none of
+          -- them is cleared by the takeover: the new holder is refused 409 on its
+          -- very first heartbeat, and a 409 is the one answer the pre-gate stands
+          -- down on -- so the redelivery that just took the row walks away from it
+          -- and the row waits out its whole lease with nobody executing.
+          --
+          -- The second arm is that window and only that window. What keeps it
+          -- narrow is attempt_id IS NULL: the counters it skips are the attempt
+          -- protocol's fences, and a worker holding a live attempt must not
+          -- renew in a shape that checks none of them. Between an acceptance and
+          -- the first in-run heartbeat no attempt is open, which is exactly when
+          -- a pre-gate renewal is legitimate and no other caller is in it.
+          --
+          -- The owner and generation conjuncts are written out for a reader, not
+          -- because this arm is where they bite: the fenced claim_count test and
+          -- the ownership block below already refuse every caller they would.
+          -- Deleting either from here changes no outcome; deleting attempt_id
+          -- IS NULL opens the bridge to a live attempt.
+          AND (
+            (
+              attempt_generation = 0
+              AND attempt_id IS NULL
+              AND settled_attempt_id IS NULL
+              AND (delivery_seq, delivery_count) = (0, 0)
+            )
+            OR (
+              lease_owner = $2
+              AND $7::int IS NOT NULL
+              AND COALESCE(claim_count, 0) = $7::int
+              AND attempt_id IS NULL
+            )
+          )
           -- A fenced row admits no renewal that omits the generation. Only
           -- acquireFatLease sets the flag, so a row that never went through an
           -- acceptance renews exactly as it did before.
@@ -736,12 +769,43 @@ async function acquireFatLease(
            OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
                AND lease_expires_at < NOW()
                AND metadata->>'lease_fenced' = 'true' AND $6::boolean)
+           -- A lease its own holder gave back. settleFinishedClaim with
+           -- release_lease writes exactly this -- owner null, expiry stamped in
+           -- the past -- and it is what every fat retry leaves behind, because
+           -- nakAfterAttempt settles and releases before naking. Without an
+           -- arm for it the shape matches neither of the two above: the first
+           -- wants a null expiry and a zero generation, the second wants an
+           -- owner. So the redelivery's acceptance answered 409 for good and
+           -- the turn could never resume. The row is unheld by the same
+           -- evidence the first arm trusts; what tells it apart is a generation
+           -- already spent, which is a released lease and not a fresh row.
+           --
+           -- Gated on the acceptance flag, like the takeover arm beside it.
+           -- Taking a lease is a deliberate act and a redelivery says so: the
+           -- pre-gate declares accept on the one POST that opens it.
+           --
+           -- Ungated, this arm is reachable by any caller whose renewal matched
+           -- nothing -- including a late legacy callback from the brain whose
+           -- own settlement released this lease. The settled-token fence below
+           -- does not stop it: that fence compares the token the caller quotes,
+           -- and a legacy renewal quotes none, so it passes trivially and the
+           -- callback restores an attempt the row had already settled. The flag
+           -- is the only thing on the wire that separates a redelivery taking
+           -- an unheld row from a straggler still talking about a finished one.
+           OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < NOW() AND $6::boolean)
         )
+        -- Whatever arm matched, a caller quoting a token this row has already
+        -- settled is the one caller settled_attempt_id exists to turn away. The
+        -- pre-gate's acceptance carries no token at all, so this costs a real
+        -- one nothing; it is here so the fence does not depend on nobody
+        -- thinking to send one.
+        AND ($8::text IS NULL OR $8 IS DISTINCT FROM settled_attempt_id)
         AND NOT ${SIBLING_HOLDER_SQL}
       RETURNING status, claim_count`,
     [
       taskId, body.brain_id, leaseSec, runPhasePatch(body), true, declaredAccept,
-      ACQUIRABLE_STATUSES,
+      ACQUIRABLE_STATUSES, body.attempt_id ?? null,
     ],
   );
   return grantFrom(r.rows);

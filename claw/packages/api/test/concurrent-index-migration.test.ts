@@ -142,6 +142,26 @@ test("the reconcile and the build share one exclusive hold of the claim fence", 
   assert.match(CHAT_TURN_FN, /finally \{/, "and the fence is released whatever happens");
 });
 
+test("but an already-valid index is recognised before the fence is taken", () => {
+  // The hold above is exclusive and every claim takes the fence shared, so a
+  // boot that takes it stalls the fleet's claims until it lets go. This
+  // function runs on every boot -- restart, scale-up, rolling deploy -- and on
+  // all but the migration boot it has nothing to build. Probing first keeps
+  // the stall on the boots that are actually building something.
+  //
+  // A source assertion, as the rest of this file is: the function is internal
+  // to db.ts and its cost is an ordering, not a return value.
+  const probeAt = CHAT_TURN_FN.indexOf("readIndexValidity");
+  const lockAt = CHAT_TURN_FN.indexOf("pg_advisory_lock");
+  assert.ok(probeAt >= 0, "the validity of the index is read");
+  assert.ok(probeAt < lockAt, "and read before the fence, or the probe saves nothing");
+  assert.match(
+    CHAT_TURN_FN.slice(probeAt, lockAt),
+    /indisvalid\) return;/,
+    "a valid index ends the call rather than falling through to the fence",
+  );
+});
+
 test("the claim path's fence is shared and statement-scoped", () => {
   // takeClaim opens no transaction of its own, so a lock taken by a preceding
   // statement would already be released by the time its UPDATE runs.

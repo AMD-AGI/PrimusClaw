@@ -1269,7 +1269,13 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
     await releaseRunUse(row.task_id, false);
     await announceInterruptedUnstarted(sessionId, row);
   }
-  await releaseSessionGateIfUnoccupied(sessionId);
+  // On behalf of the turns just interrupted, one at a time and each by name.
+  // Passing the session alone would open whichever gate the session happened to
+  // hold, including one a send took after these rows were read -- and that send
+  // has a marker before it has a row, so occupancy cannot see it.
+  for (const row of rows) {
+    await releaseSessionGateIfUnoccupied(sessionId, row.message_id ?? null);
+  }
   return rows.length;
 }
 
@@ -1292,21 +1298,54 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
  * the session by running the turn a second time, which released the gate for
  * the wrong reason.
  */
-export async function releaseSessionGateIfUnoccupied(sessionId: string): Promise<void> {
-  const stillHeld = await db.query(
-    `SELECT 1 FROM claw_tasks
-      WHERE session_id = $1
-        AND origin = 'chat'
-        AND status IN ('queued','preparing','running','cancelling')
-      LIMIT 1`,
-    [sessionId],
-  );
-  if ((stillHeld.rowCount ?? 0) > 0) return;
+export async function releaseSessionGateIfUnoccupied(
+  sessionId: string,
+  /**
+   * The turn this release is on behalf of. Required to open the gate.
+   *
+   * Occupancy alone is not evidence that nobody owns the gate: a send commits
+   * its marker *before* it inserts its run row, so between those two writes the
+   * session has an owner and no rows. A Stop cleanup arriving in that window
+   * found nothing occupying the session, opened the gate, and the turn that had
+   * just taken it went on to dispatch under an open session -- letting the next
+   * message dispatch alongside it. Fusing the check into the statement removed
+   * a different race and not this one; the owner is what removes this one.
+   */
+  owner: string | null,
+): Promise<void> {
+  // The occupancy test and the release are one statement, which is the whole
+  // of the fix here. Asking first and writing second left a window a Stop makes
+  // ordinary: the read finds nothing left, the cancelled turn's completion
+  // releases the gate and drains the next message, and then this write -- which
+  // named no owner -- cleared the marker of the turn that had just started and
+  // called the session idle underneath it. The next message then dispatched
+  // alongside a live run.
+  //
+  // Not routed through applySessionGateTransition: this release is conditional
+  // on something the three intents do not express -- that no turn occupies the
+  // session at all, rather than that a particular one does. It is a fourth
+  // shape, and putting it in the transition function would widen that
+  // function's contract to fit one caller. The guard test names this function
+  // instead of the file it lives in, so the exemption covers the statement it
+  // is about and nothing else.
   await db.query(
     `UPDATE claw_sessions
         SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
-      WHERE session_id = $1 AND agent_status = 'running' AND deleted_at IS NULL`,
-    [sessionId],
+      WHERE session_id = $1 AND agent_status = 'running' AND deleted_at IS NULL
+        -- Unowned, or owned by the turn this release is for. A NULL marker
+        -- cannot be the competing send this scoping exists to protect: a send
+        -- writes its name when it takes the gate, so the window being guarded
+        -- always has a name in it. NULL is the older shape -- a session gated
+        -- before the column existed -- and refusing to release that would hand
+        -- it to reapStuckSessions an hour later for no gain.
+        AND (agent_gate_message_id IS NULL OR agent_gate_message_id = $2)
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_tasks t
+           WHERE t.session_id = $1
+             AND t.origin = 'chat'
+             AND t.status IN ('queued','preparing','running','cancelling')
+        )`,
+    [sessionId, owner],
   );
 }
 
@@ -1555,18 +1594,256 @@ export function gateOwnershipEnforced(): boolean {
 }
 
 /** Take the session gate for one turn, naming the turn that holds it. */
+/**
+ * The one statement that may write `agent_gate_message_id`.
+ *
+ * The column is a mutex whose holder is named by a message id, and until this
+ * function existed every writer maintained the invariant on its own. Three
+ * consecutive review rounds found nine defects in that arrangement, all the
+ * same shape and none of them local: a writer that took the gate correctly for
+ * its own path took it over another path's holder, or released one it did not
+ * hold, or put back a snapshot that had stopped being true. Each fix was right
+ * where it was written and created the conditions for the next one, because the
+ * property that was broken -- *every gated session has exactly one live thing
+ * that will release it* -- is about all the writers at once and so could not be
+ * enforced by any of them.
+ *
+ * It is enforced here. Three intents, each with its own precondition, all
+ * decided inside one statement so there is no window between the check and the
+ * write:
+ *
+ *  - `take`     name this turn as the holder. Refused when someone else holds
+ *               the gate, unless `force` says the caller is the backstop.
+ *  - `release`  hand the gate back. Scoped to `owner` so a late caller cannot
+ *               open a gate a later turn has since taken.
+ *  - `restore`  put a previous holder back, for a turn that undid itself.
+ *               Refused when that holder has no run left, because a marker
+ *               naming nothing is a gate no completion can ever open -- and
+ *               then the status goes with it, since a gated status with no
+ *               owner strands the session just as badly.
+ *
+ * `expectReleaser` is the half that is easy to forget: taking the gate is a
+ * promise that something will hand it back, so a caller that cannot keep that
+ * promise must not take it. Passed explicitly rather than inferred, because the
+ * two callers that got this wrong both looked correct locally.
+ *
+ * @returns whether the transition was applied.
+ */
+export async function applySessionGateTransition(input: {
+  sessionId: string;
+  /** The turn acting. Names the holder for `take`, and scopes the others. */
+  actor: string | null;
+  intent: "take" | "release" | "restore";
+  /** `take`/`restore`: the status to write. `release`: idle unless failed. */
+  status: string;
+  /** `release`/`restore`: only act while the gate names this. */
+  owner?: string | null;
+  /** `restore`: the holder to put back, if it still has a turn. */
+  priorOwner?: string | null;
+  /** `take`: a gate already held by somebody else may be taken anyway. */
+  force?: boolean;
+  /** `take`: whether a completion for `actor` is expected to release this. */
+  expectReleaser?: boolean;
+  /**
+   * Non-gate columns to set in the same statement.
+   *
+   * Here rather than in a second UPDATE so a caller that writes session
+   * metadata alongside the gate still writes both or neither: a window with
+   * the metadata moved and the gate not taken is a state no reader expects.
+   * Keys are column names and must not name a gate column or `updated_at`,
+   * both of which every intent assigns itself -- Postgres refuses two
+   * assignments to one column, so accepting them here would turn a caller's
+   * mistake into a runtime error on a path that may only run during a rollback.
+   *
+   * Honoured by all three intents. It was `take`-only at first, which made
+   * `restore` silently drop what its caller handed it: the A2A rollback passes
+   * the snapshot's context id through here, and a restore that ignored it put
+   * the gate back while leaving the failed send's context in place.
+   */
+  also?: Record<string, unknown>;
+  /**
+   * `restore`: the `updated_at` the snapshot carried.
+   *
+   * Restoring means putting the row back as it was, and the timestamp is part
+   * of that: A2A reports it as the task's public status time, so stamping NOW()
+   * on a rollback moves a task's clock for a send that did not happen.
+   */
+  restoredAt?: unknown;
+  q?: { query: (text: string, params?: unknown[]) => Promise<{ rowCount: number | null }> };
+}): Promise<boolean> {
+  const q = input.q ?? db;
+  const alsoCols = Object.keys(input.also ?? {});
+  for (const c of alsoCols) {
+    if (!/^[a-z_][a-z0-9_]*$/.test(c)
+        || c === "agent_status" || c === "agent_gate_message_id" || c === "updated_at") {
+      throw new Error(`applySessionGateTransition: unsafe extra column ${c}`);
+    }
+  }
+  const alsoVals = alsoCols.map((c) => input.also![c]);
+  /** Extra assignments, numbered after this intent's own parameters. */
+  const extra = (base: number): string =>
+    alsoCols.map((c, i) => `, ${c} = $${base + i + 1}`).join("");
+  if (input.intent === "take") {
+    // A promise nobody will keep is not a promise. The caller says whether a
+    // completion is coming; without one the gate is simply not taken, and the
+    // session stays open for whatever comes next.
+    if (input.expectReleaser === false) return false;
+    const r = await q.query(
+      `UPDATE claw_sessions
+          SET agent_status = $3, agent_gate_message_id = $2, updated_at = NOW()${extra(4)}
+        WHERE session_id = $1 AND deleted_at IS NULL
+          AND ($4::boolean
+               OR agent_gate_message_id IS NULL
+               OR agent_gate_message_id = $2)`,
+      [input.sessionId, input.actor, input.status, input.force === true, ...alsoVals],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+  if (input.intent === "release") {
+    const r = await q.query(
+      `UPDATE claw_sessions
+          SET agent_status = $2, agent_gate_message_id = NULL, updated_at = NOW()${extra(4)}
+        WHERE session_id = $1 AND deleted_at IS NULL
+          AND ($4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3)`,
+      [input.sessionId, input.status, input.owner ?? null, input.force === true, ...alsoVals],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+  // restore. The gate goes back to whoever still owes this session a
+  // completion -- which is what a holder *is*, and is not the same question as
+  // either of the two this used to ask.
+  //
+  // It asked whether the previous holder's row existed. A row that has already
+  // completed exists and owes nothing: its completion was spent trying to
+  // release a gate a later send had taken, so reinstating that name leaves a
+  // task submitted with nothing left to answer for it.
+  //
+  // And when the previous holder was gone it opened the gate, reading "the
+  // predecessor is not here" as "the session is free". A third turn may have
+  // started in between and be running still; opening the gate under it lets
+  // the next message dispatch alongside it.
+  //
+  // So the owner is selected rather than assumed: the live turn on this
+  // session, preferring the snapshot's own holder when that is still one of
+  // them, and no owner at all when there are none. The status follows the same
+  // answer, because a gated status with no owner strands a session exactly as
+  // badly as a marker naming nothing.
+  const r = await q.query(
+    `WITH
+     -- The session row first, and only then the candidate task.
+     --
+     -- Locking the task first was a deadlock: this rollback took the task and
+     -- waited for the session, while a duplicate send on the same session
+     -- already held the session from resolveSendTarget and then asked for
+     -- that same task. Postgres aborted one of them with 40P01, and this path
+     -- logs its failure rather than retrying -- so the rollback it was doing
+     -- simply did not happen. Every other writer here starts from the session,
+     -- so starting from the session is what makes the order consistent.
+     --
+     -- A CTE is enough here and is not enough in teardown, which is worth
+     -- saying because the two look alike. This is one statement: the task scan
+     -- cannot qualify a row without the session id, so either the session is
+     -- locked first or no task is locked at all. Teardown locks its tasks in
+     -- one statement and updates the session in a later one, so an empty task
+     -- scan there skipped the CTE entirely -- Postgres reports LockRows as
+     -- never executed -- and left the next statement free to lock a task
+     -- holding nothing. Its lock is a statement of its own for that reason.
+     gate AS (
+       SELECT session_id FROM claw_sessions
+        WHERE session_id = $1 AND deleted_at IS NULL
+        FOR UPDATE
+     ),
+     live AS (
+       SELECT t.metadata->>'message_id' AS owner
+         FROM claw_tasks t
+        WHERE t.session_id = (SELECT session_id FROM gate)
+          AND t.status IN ('queued','preparing','running','cancelling')
+          AND t.metadata->>'message_id' IS NOT NULL
+        -- Deterministic, so two restores of the same state choose the same
+        -- owner: created_at can tie, and task_id cannot.
+        ORDER BY (t.metadata->>'message_id' IS NOT DISTINCT FROM $4) DESC,
+                 t.created_at DESC, t.task_id DESC
+        LIMIT 1
+        -- Held to this statement's commit. Without the lock the row is read
+        -- from a snapshot that can go stale while the session row's own lock is
+        -- waited on: the turn chosen as owner completes in that window, its
+        -- completion cannot release a marker this transaction has not written
+        -- yet, and the restore then installs a name that owes nothing. The
+        -- session is left gated on a finished turn, which is the state this
+        -- intent exists to prevent.
+        FOR UPDATE
+     )
+     UPDATE claw_sessions
+        SET agent_status = CASE
+              WHEN (SELECT owner FROM live) IS NOT NULL THEN $2
+              -- Nobody owes a completion, so the status may not be one that
+              -- waits for one. Only the gated statuses are rewritten: a
+              -- snapshot resting at input_required is already open, and
+              -- forcing idle there would tell an A2A caller its task had
+              -- completed when it is waiting on them.
+              WHEN $2 IN ('pending','running') THEN 'idle'
+              ELSE $2
+            END,
+            agent_gate_message_id = (SELECT owner FROM live),
+            updated_at = COALESCE($5::timestamptz, NOW())${extra(5)}
+      WHERE session_id = $1 AND deleted_at IS NULL
+        AND agent_gate_message_id IS NOT DISTINCT FROM $3`,
+    [
+      input.sessionId, input.status, input.owner ?? null, input.priorOwner ?? null,
+      input.restoredAt ?? null, ...alsoVals,
+    ],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 export async function takeSessionGate(
   sessionId: string,
   messageId: string,
   client?: { query: (text: string, params?: unknown[]) => Promise<unknown> },
 ): Promise<void> {
-  const q = client ?? db;
-  await q.query(
-    `UPDATE claw_sessions
-        SET agent_status = 'running', agent_gate_message_id = $2, updated_at = NOW()
-      WHERE session_id = $1 AND deleted_at IS NULL`,
-    [sessionId, messageId],
-  );
+  await applySessionGateTransition({
+    sessionId,
+    actor: messageId,
+    intent: "take",
+    status: "running",
+    // Unconditional, as it has always been: this runs after the turn is
+    // published, so the run it names exists and its completion is the releaser.
+    // (That it can still write over an owner installed in between is recorded
+    // as a separate pre-existing issue; the chokepoint is what makes it one
+    // line to change when that is addressed.)
+    force: true,
+    expectReleaser: true,
+    ...(client ? { q: client as { query: (t: string, p?: unknown[]) => Promise<{ rowCount: number | null }> } } : {}),
+  });
+}
+
+/**
+ * Name this turn on the gate, but only where no turn is named already.
+ *
+ * A refusal has to be named or it cannot be released. `releaseSessionGateIfLastRun`
+ * matches the completion's message against the marker once ownership is
+ * enforced, so a refusal published against a null marker releases nothing --
+ * and a release is what drains the next parked message. The queue then stops
+ * on a message that was refused, with the session left `failed`, which is not
+ * a state `drainOrphanedPendingMessages` picks up either.
+ *
+ * Conditional rather than unconditional, unlike `takeSessionGate`: this runs on
+ * a drain, and a drain can race a turn that has already taken the gate. Writing
+ * over that turn's marker would leave it unable to release its own gate -- the
+ * exact failure this function exists to prevent, moved onto a run that is
+ * actually executing. When the gate is already owned there is nothing to fix:
+ * the owner's completion drains the queue.
+ *
+ * @returns whether this turn now owns the gate.
+ */
+export async function takeSessionGateIfUnowned(
+  sessionId: string,
+  messageId: string,
+): Promise<boolean> {
+  return await applySessionGateTransition({
+    sessionId, actor: messageId, intent: "take", status: "running",
+    expectReleaser: true,
+  });
 }
 
 /**
@@ -1580,16 +1857,12 @@ export async function releaseSessionGateForTurn(
   sessionId: string,
   messageId: string,
 ): Promise<void> {
-  await db.query(
-    `UPDATE claw_sessions
-        SET agent_status = 'idle',
-            agent_gate_message_id = NULL,
-            updated_at = NOW()
-      WHERE session_id = $1
-        AND deleted_at IS NULL
-        AND (NOT $3::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $2)`,
-    [sessionId, messageId, gateOwnershipEnforced()],
-  );
+  await applySessionGateTransition({
+    sessionId, actor: messageId, intent: "release", status: "idle",
+    owner: messageId,
+    // Ownership enforcement off means the old behaviour: release regardless.
+    force: !gateOwnershipEnforced(),
+  });
 }
 
 async function announceInterruptedUnstarted(

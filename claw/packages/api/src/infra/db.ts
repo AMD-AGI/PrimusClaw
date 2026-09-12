@@ -605,6 +605,21 @@ async function reconcileDuplicateChatTurns(client: pg.PoolClient): Promise<void>
  * them writes a fresh duplicate and the build then arrives INVALID.
  */
 async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
+  // Probed before the fence, not under it. The fence is exclusive and every
+  // claim takes it shared, so holding it across a concurrent build stalls the
+  // fleet's claims for as long as the build runs -- and this function runs on
+  // every boot: every restart, every scale-up, every rolling deploy pays that
+  // wait even though there is nothing to build. The work below is needed only
+  // when the index is absent or INVALID, which is the migration boot and the
+  // boot after an interrupted one; those are the only boots that should be
+  // able to block a claim, and they are the ones where blocking is the point.
+  //
+  // Racing two boots into the same conclusion is safe: the loser takes the
+  // fence, re-reads, and returns. The window cannot turn a valid index invalid
+  // -- only a build can, and no build starts without the fence held.
+  const valid = await readIndexValidity(client, CHAT_TURN_CLAIM_INDEX);
+  if (valid.rowCount && valid.rows[0].indisvalid) return;
+
   await client.query("SELECT pg_advisory_lock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
   try {
     await reconcileDuplicateChatTurns(client);

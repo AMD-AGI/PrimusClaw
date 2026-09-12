@@ -34,10 +34,14 @@ import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
+import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import { recordCompletionTurns } from "./completion-turns.js";
 
 export { recordCompletionTurns } from "./completion-turns.js";
+// Re-exported: this predicate lived here until it gained a second caller, and
+// moving it to the event store it queries would otherwise break its importers.
+export { completionAlreadyProcessed } from "./store.js";
 
 const logger = pino({ name: "event-consumer" });
 
@@ -127,44 +131,6 @@ function makeEventId(seq: unknown): string {
   return `claw-${randomUUID()}`;
 }
 
-/**
- * Whether this turn's completion has already been handled, under any delivery.
- *
- * The `processed_at` gate keys on the event id, which is derived from the
- * JetStream sequence, so it recognises redeliveries of one published message and
- * nothing else. Brain publishes the same completion more than once: a run picked
- * back up after being interrupted emits exec_complete again, under a new
- * sequence and therefore a new event id, which conflicts with nothing and is
- * handled from scratch. What that repeated is not only the conversation turn --
- * the queued message waiting behind this one was dispatched a second time as
- * well, as a second run.
- *
- * The message id is what stays the same across all of it, because it names the
- * user's message rather than the delivery. An event without one falls back to
- * the per-delivery gate: the answer here would be "some other completion of this
- * session was processed", which is true of nearly every event and would drop
- * real work.
- *
- * Only a row marked processed counts. An attempt that died half way through
- * leaves `processed_at` NULL deliberately, and the retry has to finish it.
- */
-export async function completionAlreadyProcessed(
-  sessionId: string,
-  messageId: string,
-): Promise<boolean> {
-  if (!messageId) return false;
-  const r = await db.query(
-    `SELECT 1 FROM claw_session_events
-      WHERE session_id = $1
-        AND event = 'exec_complete'
-        AND data->>'message_id' = $2
-        AND processed_at IS NOT NULL
-        AND deleted_at IS NULL
-      LIMIT 1`,
-    [sessionId, messageId],
-  );
-  return !!r.rowCount;
-}
 
 /**
  * Background durable consumer: listens to all events, persists to DB,

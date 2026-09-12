@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
-import { db, MarketplaceDb, type StatementRunner } from "../infra/db.js";
+import { db, MarketplaceDb, type Querier, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
@@ -14,7 +14,7 @@ import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
 } from "../tasks/admission.js";
-import { openChatRun } from "../tasks/chat-run.js";
+import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
@@ -235,13 +235,60 @@ interface SendTarget {
   contextId: string;
   created: boolean;
   preImage?: Record<string, unknown>;
+  /** The marker this send wrote, and the only one it may put back. */
+  markerWritten?: string;
 }
 
 // The pre-image SELECT and the rollback UPDATE are generated from this list.
-const TOUCHED_TARGET_COLUMNS = ["agent_status", "context_id", "updated_at"] as const;
+// Every column resolveSendTarget writes on an existing session, and the only
+// source of truth for what a rollback has to put back. The marker belongs here
+// for the same reason agent_status does: a send that replaces a live turn's
+// marker and then fails to publish must not leave the session naming a run its
+// own compensation deleted -- the turn still running could never hand the gate
+// back, and the task would poll pending for ever.
+const MARKER_COLUMN = "agent_gate_message_id";
+const TOUCHED_TARGET_COLUMNS = [
+  "agent_status", "context_id", "updated_at", "agent_gate_message_id",
+] as const;
 
 function hasUnsupportedPushConfig(configuration: SendMessageRequest["configuration"]): boolean {
   return configuration?.taskPushNotificationConfig !== undefined;
+}
+
+/**
+ * Put back every column `resolveSendTarget` wrote on an existing session.
+ *
+ * Two callers, one rule: a send that changed the session and then turned out to
+ * execute nothing must leave the session as it found it. The marker is the
+ * column that makes this load-bearing -- it names the turn whose completion may
+ * release the gate, so a stale one is a gate no completion can open.
+ */
+async function restoreTouchedTarget(q: Querier, target: SendTarget): Promise<void> {
+  if (!target.preImage) return;
+  // Through the one writer of the column. The restore intent carries the rule
+  // this used to spell here: put the previous holder back only while it still
+  // has a turn, and when it does not, open the gate outright -- status and
+  // marker together, because a gated status with no owner strands the session
+  // exactly as badly as a marker naming nothing.
+  await applySessionGateTransition({
+    sessionId: target.taskId,
+    actor: target.markerWritten ?? null,
+    intent: "restore",
+    status: String(target.preImage.agent_status ?? "idle"),
+    owner: target.markerWritten ?? null,
+    priorOwner: (target.preImage[MARKER_COLUMN] as string | null) ?? null,
+    also: { context_id: target.preImage.context_id },
+    // The snapshot's own timestamp, not NOW(): A2A reports updated_at as the
+    // task's public status time, and a rollback is the undoing of a send, not
+    // an event in the task's life.
+    restoredAt: target.preImage.updated_at,
+    q: { query: (t: string, p?: unknown[]) => q(t, p) },
+  });
+}
+
+/** Test seam: the rollback's restore, driven directly against a seeded row. */
+export async function restoreForTest(target: SendTarget): Promise<void> {
+  await restoreTouchedTarget(db.query.bind(db) as Querier, target);
 }
 
 async function resolveSendTarget(
@@ -253,9 +300,17 @@ async function resolveSendTarget(
 ): Promise<{ target?: SendTarget; error?: JsonRpcResponse }> {
   if (message.taskId) {
     const result = await q.query(
+      // FOR UPDATE: this row is read to build a pre-image and written a few
+      // lines below, and a duplicate resend puts the pre-image back. Without
+      // the lock a live turn's completion can commit between the read and the
+      // write -- the restore then reinstates a gate the completion had already
+      // released, and the task is submitted for ever with nothing left to
+      // release it. The lock is held to the end of the admission transaction,
+      // which is the same transaction that decides the duplicate.
       `SELECT session_id, agent_status, context_id, ${TOUCHED_TARGET_COLUMNS.join(", ")}
        FROM claw_sessions
-       WHERE session_id = $1 AND deleted_at IS NULL AND a2a_caller_id = $2`,
+       WHERE session_id = $1 AND deleted_at IS NULL AND a2a_caller_id = $2
+       FOR UPDATE`,
       [message.taskId, callerId],
     );
     if (!result.rows?.length) {
@@ -280,21 +335,39 @@ async function resolveSendTarget(
 
     const preImage = Object.fromEntries(TOUCHED_TARGET_COLUMNS.map((c) => [c, row[c]]));
     const contextId = existingContextId || message.contextId || `ctx-${randomUUID()}`;
-    await q.query(
-      `UPDATE claw_sessions
-       SET agent_status = 'pending', context_id = $2, updated_at = NOW()
-       WHERE session_id = $1 AND deleted_at IS NULL`,
-      [message.taskId, contextId],
-    );
-    return { target: { taskId: message.taskId, contextId, created: false, preImage } };
+    // The marker goes with the gate. `releaseSessionGateIfLastRun` matches on
+    // it once ownership is enforced, and null matches nothing -- so an A2A
+    // session gated without one is one no completion can hand back, and the
+    // caller polls a task that stays pending for ever. Through the one writer,
+    // with the context id carried in the same statement so the two cannot
+    // disagree. Still unconditional, which is what it has always been; that a
+    // send can take a gate another send holds is recorded separately, and the
+    // chokepoint is what makes it one line to change.
+    await applySessionGateTransition({
+      sessionId: message.taskId,
+      actor: message.messageId,
+      intent: "take",
+      status: "pending",
+      force: true,
+      expectReleaser: true,
+      also: { context_id: contextId },
+      q: { query: (t: string, p?: unknown[]) => q.query(t, p) },
+    });
+    return {
+      target: {
+        taskId: message.taskId, contextId, created: false, preImage,
+        markerWritten: message.messageId,
+      },
+    };
   }
 
   const taskId = `a2a-${randomUUID()}`;
   const contextId = message.contextId || `ctx-${randomUUID()}`;
   await q.query(
-    `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [taskId, text.slice(0, 80), "a2a", "claw", "pending", contextId, callerId],
+    `INSERT INTO claw_sessions
+       (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id, agent_gate_message_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [taskId, text.slice(0, 80), "a2a", "claw", "pending", contextId, callerId, message.messageId],
   );
   return { target: { taskId, contextId, created: true } };
 }
@@ -495,7 +568,17 @@ async function admitAndOpenA2ASend(
     }
     await attachA2AParent(target, auth, spec, client);
     const taskId = await openA2ARun(target, text, auth, spec, client);
-    return taskId ? { kind: "opened", target, taskId } : { kind: "duplicate", target };
+    if (!taskId) {
+      // A resend of a message this task already executed. resolveSendTarget has
+      // already written this message's marker over whatever the session was
+      // gated on, on this very transaction -- so committing as-is renames the
+      // gate after a turn that is still running, and that turn's completion no
+      // longer matches. Both runs finish and the task polls pending for ever.
+      // Nothing executed, so nothing about the session should have moved.
+      await restoreTouchedTarget(client.query.bind(client) as Querier, target);
+      return { kind: "duplicate", target };
+    }
+    return { kind: "opened", target, taskId };
   }));
 }
 
@@ -606,12 +689,7 @@ async function rollbackA2AAdmission(
       await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [target.taskId]);
       return;
     }
-    if (!target.preImage) return;
-    const assignments = TOUCHED_TARGET_COLUMNS.map((c, i) => `${c} = $${i + 2}`).join(", ");
-    await db.query(
-      `UPDATE claw_sessions SET ${assignments} WHERE session_id = $1`,
-      [target.taskId, ...TOUCHED_TARGET_COLUMNS.map((c) => target.preImage![c])],
-    );
+    await restoreTouchedTarget(db.query.bind(db) as Querier, target);
   } catch (rollbackErr) {
     logger.error({ err: rollbackErr, taskId }, "a2a.publish_rollback_failed");
   }

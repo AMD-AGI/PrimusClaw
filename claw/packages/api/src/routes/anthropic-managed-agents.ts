@@ -30,7 +30,7 @@ import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { stopSessionRuns } from "../tasks/chat-run.js";
+import { applySessionGateTransition, stopSessionRuns } from "../tasks/chat-run.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import {
   createSessionSubscriptionReady, sanitizeSessionEvent, type SessionSubscription,
@@ -1248,11 +1248,19 @@ async function gateUserMessageTurn(
       await client.query("COMMIT");
       return { kind: "queued", messageId };
     }
-    await client.query(
-      "UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2, "
-      + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-      [sessionId, messageId],
-    );
+    // On this transaction, and through the one writer. Unconditional as it has
+    // always been -- the caller has just decided to dispatch and the run it
+    // names is about to exist -- which is the same posture `takeSessionGate`
+    // holds on the native path.
+    await applySessionGateTransition({
+      sessionId,
+      actor: messageId,
+      intent: "take",
+      status: "running",
+      force: true,
+      expectReleaser: true,
+      q: { query: (t: string, p?: unknown[]) => client.query(t, p) },
+    });
     await client.query("COMMIT");
     return { kind: "dispatch", messageId, userEnv };
   } catch (error) {
@@ -1304,11 +1312,19 @@ async function dispatchUserMessageTurn(input: {
       messageId: input.messageId,
     },
     async () => {
-      await db.query(
-        "UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL, "
-        + "updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-        [input.sessionId],
-      );
+      // Scoped to this request's own turn. Unconditional, this callback opened
+      // whichever gate the session happened to hold: a publish whose ack is
+      // merely late lets its turn finish and a queued turn start, and the
+      // timeout that arrives afterwards then cleared the *new* turn's marker
+      // and set the session idle underneath it -- so the next message
+      // dispatched alongside a run that was still going.
+      await applySessionGateTransition({
+        sessionId: input.sessionId,
+        actor: input.messageId,
+        intent: "release",
+        status: "idle",
+        owner: input.messageId,
+      });
     },
   );
   if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {

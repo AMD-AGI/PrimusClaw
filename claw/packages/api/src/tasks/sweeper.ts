@@ -1491,13 +1491,23 @@ async function clearReconcileMarker(taskId: string): Promise<boolean> {
  * publish-failure cleanup with a row still in the queue has no trigger left and
  * that turn is parked for ever. The occupancy test is the one the consumer
  * already applies, so this cannot stack a second turn onto a live session.
+ *
+ * `failed` counts as handed back, the same as `idle`. The consumer drains on a
+ * failed completion too -- `releaseSessionGateIfLastRun` writes `failed` and
+ * still reports the gate open -- so a backstop that looked only at `idle` was
+ * narrower than the path it backs up, and left a queue parked behind exactly
+ * the completions most likely to need it. One shape that reaches it: a refusal
+ * publishes its completion but its queue row is not deleted; that completion
+ * drains the row again, the second refusal's own completion is discarded as a
+ * duplicate, and everything behind it waits on an event that has already been
+ * spent.
  */
 export async function drainOrphanedPendingMessages(limit = 20): Promise<number> {
   const r = await db.query(
     `SELECT DISTINCT ON (p.session_id) p.id, p.session_id, p.user_id
        FROM claw_pending_messages p
        JOIN claw_sessions s ON s.session_id = p.session_id
-      WHERE s.agent_status = 'idle'
+      WHERE s.agent_status IN ('idle','failed')
         AND s.deleted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
@@ -1513,6 +1523,41 @@ export async function drainOrphanedPendingMessages(limit = 20): Promise<number> 
   let drained = 0;
   for (const row of r.rows as Array<{ id: number; session_id: string; user_id: string | null }>) {
     try {
+      // Re-asked immediately before dispatching, because the SELECT above is a
+      // snapshot of the whole batch: a send can acquire any of these sessions
+      // between that read and this call, and dispatching then puts a second
+      // turn onto a live one.
+      //
+      // This narrows the window to a single statement; it does not close it.
+      // Closing it needs an atomic claim on the session, which this path has no
+      // field for -- the gate marker names a turn, and the drain has no turn to
+      // name until `drainOldestPendingMessage` has read one. Recorded as a
+      // follow-up rather than invented here.
+      //
+      // There is no standing bound to lean on in the meantime, and an earlier
+      // version of this comment claimed one: it said the dispatch below decides
+      // admission under `withOwnedAdmissionLock`, which serialises creation.
+      // That lock is skipped when every ceiling is zero, which is the default,
+      // so on a default deployment it serialises nothing. Saying so mattered --
+      // a reader who believed it would treat the window as covered.
+      const stillFree = await db.query(
+        `SELECT 1 FROM claw_sessions s
+          WHERE s.session_id = $1
+            AND s.agent_status IN ('idle','failed')
+            AND s.deleted_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM claw_tasks t
+               WHERE t.session_id = s.session_id
+                 AND t.origin = 'chat'
+                 AND t.status IN ('queued','preparing','running','cancelling')
+            )
+          LIMIT 1`,
+        [row.session_id],
+      );
+      if (!stillFree.rowCount) {
+        logger.info({ sessionId: row.session_id }, "sweeper.orphaned_pending_drain_taken");
+        continue;
+      }
       await sweeperPorts.drainPendingMessage(row.session_id, row.user_id ?? "default");
       drained += 1;
     } catch (err) {

@@ -545,6 +545,7 @@ export async function releaseClaim(
   // counter is suppressed only where the row is known to have been closed.
   let became: string | undefined;
   let closedSession: string | undefined;
+  let closedMessageId: string | undefined;
   // `setSql` rather than `extra.metadata`: one statement may assign a column
   // once, and this assignment does two things -- carry the release reason and
   // restamp the sojourn marker, so a row going round the requeue loop three
@@ -598,6 +599,7 @@ export async function releaseClaim(
     );
     became = rows[0]?.status;
     closedSession = rows[0]?.session_id ?? undefined;
+    closedMessageId = (rows[0]?.metadata as { message_id?: string } | undefined)?.message_id;
     return rows;
   });
   if (released && became !== "cancelled") metrics.onQueueEntered("requeue");
@@ -605,7 +607,9 @@ export async function releaseClaim(
   // Stop that parked it could not say so: it left the gate shut deliberately,
   // for a turn that was still winding down. This is where it stops winding.
   if (released && became === "cancelled" && closedSession) {
-    await releaseSessionGateIfUnoccupied(closedSession);
+    // Named, so this cannot open a gate a later send has taken in the window
+    // between its marker and its run row.
+    await releaseSessionGateIfUnoccupied(closedSession, closedMessageId ?? null);
   }
   return released;
 }

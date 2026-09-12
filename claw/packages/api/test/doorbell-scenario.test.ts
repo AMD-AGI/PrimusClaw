@@ -1017,3 +1017,25 @@ test("N the settle and the check read the same list of open states", async () =>
     "a state the settle will not close from is not an open state to the check either",
   );
 });
+
+test("#1 a Stop does not open a gate a later send has taken", async () => {
+  // Occupancy is not evidence that nobody owns the gate: a send commits its
+  // marker before it inserts its run row, so between those two writes the
+  // session has an owner and no rows. A Stop cleanup arriving in that window
+  // used to find nothing occupying the session and open the gate, and the send
+  // that had just taken it then dispatched under an open session.
+  const { interruptUnstartedChatRuns } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s-late", { gateOwner: "m-later-send" });
+  await seedRun(h, "stopped", "s-late", { status: "queued", dispatch: "doorbell" });
+
+  assert.equal(await interruptUnstartedChatRuns("s-late"), 1);
+  assert.equal((await runRow(h, "stopped")).status, "cancelled", "the Stop still does its work");
+  assert.equal(
+    (await sessionRow(h, "s-late")).agent_status, "running",
+    "but the gate stays with the send that owns it",
+  );
+  assert.equal(
+    (await sessionRow(h, "s-late")).agent_gate_message_id, "m-later-send",
+    "and still names it, so its completion can still hand it back",
+  );
+});

@@ -72,6 +72,7 @@ import type { JsMsg } from "nats";
 
 import { BRAIN_ID, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS } from "../config.js";
 import { askRunLease, type LeaseRenewal } from "../tasks/callback.js";
+import { taskIdFromLease } from "../tasks/run-identity.js";
 
 /**
  * How long a delivery refused during a drain waits before coming back.
@@ -502,6 +503,9 @@ export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
     ...(accept ? { accept } : {}),
   });
 
+  const runTaskIdOf = (request: ExecuteRequest): string =>
+    request.task_id || taskIdFromLease(request).id || "";
+
   return {
     target(msg) {
       let payload: unknown;
@@ -564,7 +568,15 @@ export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
         interrupted: true,
         failed: false,
         turns: 0,
-        ...(target.task_id ? { task_id: target.task_id } : {}),
+        // Recovered from the lease URL when the message does not carry one.
+        // A fat message published before `task_id` was added to the wire has
+        // only the lease, and this completion is how the API settles the row:
+        // emitted without an id it routes by session and message alone, which
+        // the stopped row's own `cancelling` status is not enough to match --
+        // so the interrupt the user asked for lands nowhere and the row waits
+        // for a reaper. `run_lease.url` names the task in its path, which is
+        // the same recovery the runner makes for the same legacy shape.
+        ...(runTaskIdOf(target) ? { task_id: runTaskIdOf(target) } : {}),
         ...(runClaim === undefined ? {} : { run_claim: runClaim }),
       });
     },
