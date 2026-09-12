@@ -43,6 +43,7 @@ import type { UserInfo } from "../src/auth/models.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { registerSessionRoutes } from "../src/routes/sessions.js";
 import { sessionDispatchPorts } from "../src/sessions/dispatch.js";
+import { closedDoorbellBarrier } from "./doorbell-barrier-stub.js";
 import { stubDb, type Answer, type DbStub } from "./support/db-stub.js";
 
 const SID = "sess-1";
@@ -106,9 +107,12 @@ function dispatchOpensRun(): void {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun =
     (async () => ({ taskId: OPENED_RUN })) as typeof sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
   sessionDispatchPorts.publishTask = async () => {};
 }
 

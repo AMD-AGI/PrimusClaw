@@ -10,6 +10,8 @@
  * the regex the unit tests assert on. What was wrong was which rows they
  * matched. See README.md.
  */
+import "./reconcile-off-env.js";
+
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
@@ -76,15 +78,15 @@ test("#1 a cancelled doorbell does not idle a session that still holds a live fa
 
 const WEEK = 7 * 24 * 3600;
 
-test("#2 a wedged fat row no longer blocks the last-resort gate release", async () => {
+test("#2 an unsettled fat delivery still holds the last-resort gate", async () => {
   const { reapStuckSessions } = await import("../src/tasks/sweeper.js");
   await seedSession(h, "s1", { updatedAgoSec: WEEK });
   // Reapable by nothing: chat is exempt from reapStaleTasks without
   // RUN_ROWS_SWEEPABLE, and reapLostLeases needs a lease that was written.
   await seedRun(h, "fat", "s1", { status: "preparing", dispatch: "fat", leaseOwner: null });
 
-  assert.equal(await reapStuckSessions(), 1);
-  assert.equal((await sessionRow(h, "s1")).agent_status, "idle");
+  assert.equal(await reapStuckSessions(), 0);
+  assert.equal((await sessionRow(h, "s1")).agent_status, "running");
 });
 
 test("#2 a doorbell whose lease lapsed after its deadline is releasable too", async () => {
@@ -427,7 +429,7 @@ test("the ordinal recheck sheds the excess rather than every racer", async () =>
     softRuns: 0, hardRuns: 2, softSandboxes: 0, hardSandboxes: 0,
     softGpuNodes: 0, hardGpuNodes: 0, treeMaxNodes: 0, treeMaxDepth: 0,
   };
-  const ask = { origin: "chat" as const, wantsSandbox: false, gpuNodes: 0 };
+  const ask = { origin: "chat" as const, newRunRoots: 1, sandboxes: 0, gpuNodes: 0 };
   // Two creates race the last slot with one run already occupying. Comparing
   // totals refused both; counting what came first keeps the one inside the
   // ceiling and sheds only the one past it.
@@ -773,8 +775,7 @@ test("J reaping a lost lease closes the queued doorbell spare beside it", async 
   // The spare a retried dispatch opened for the same message.
   await seedRun(h, "spare", "s1", { status: "queued", dispatch: "doorbell", messageId: "m-dup" });
 
-  const n = await reapLostLeases();
-  console.log("DBGJ reaped=", n, JSON.stringify(await h.sql("SELECT task_id,status,failure_reason FROM claw_tasks ORDER BY task_id")));
+  await reapLostLeases();
 
   const spare = await runRow(h, "spare");
   assert.equal(spare.status, "failed", "queued is the shape a doorbell retry leaves");
@@ -994,7 +995,7 @@ test("N an open row the settle could not match establishes nothing", async () =>
   const real = db.query;
   db.query = (async (t: string, p?: unknown[]) => {
     // The settle finds nothing; the row it names is still open and unheld.
-    if (/SET status = 'failed'/.test(t)) return { rows: [], rowCount: 0 };
+    if (/SET status = CASE WHEN status = 'cancelling'/.test(t)) return { rows: [], rowCount: 0 };
     return (real as never as (a: string, b?: unknown[]) => Promise<unknown>)(t, p);
   }) as typeof db.query;
   let verdict;

@@ -602,10 +602,21 @@ features:
   # background tools.
   backgroundShell: false
   # Chat dispatch publishes a doorbell and injects credentials at claim time
-  # instead of putting the full execute request on the shared durable. Off
-  # until every Brain replica understands the doorbell: a mixed fleet must
-  # keep serving fat messages.
-  runDoorbellDispatch: false
+  # instead of putting the full execute request on the shared durable. On by
+  # default, while the runtime gate stays closed until the fleet explicitly
+  # asserts a capability floor at least as high as the API's semantics version.
+  # Set false to roll Doorbell back, and leave brainDoorbellExecution true so
+  # Brain keeps draining the rows already queued.
+  runDoorbellDispatch: true
+  # Whether a Brain replica executes doorbell runs at all: with this false it
+  # declines a doorbell on the wire and its claim-next loop takes no doorbell
+  # row. On by default -- a kill-switch that ships killed is not a kill-switch.
+  #
+  # This and the value above render the same RUN_DOORBELL_DISPATCH environment
+  # variable, one per deployment, because they answer different questions. A
+  # rollback sets runDoorbellDispatch false and needs Brain to keep draining the
+  # rows already queued, which one shared Secret key cannot express.
+  brainDoorbellExecution: true
 
 # Fallback sandbox for sessions that name neither an image nor a size. The API
 # migration seeds these into the resources table as the type='default' row when

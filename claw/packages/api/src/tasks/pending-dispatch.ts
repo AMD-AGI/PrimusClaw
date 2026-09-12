@@ -33,16 +33,21 @@
  * connection, a marketplace, an LLM and a skill store before it gets this far.
  */
 
-import { taskSubject, type ExecuteRequest } from "@claw/protocol";
+import { doorbellDedupId, taskSubject, type ExecuteRequest } from "@claw/protocol";
 import pino from "pino";
 
-import { envInt, RUN_DOORBELL_DISPATCH } from "../config.js";
+import { envInt } from "../config.js";
+import { beginDoorbellDispatch } from "./doorbell-gate.js";
 import { db } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
-import { openChatRun, failChatRunDispatch } from "./chat-run.js";
+import {
+  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
+  SWEEPABLE_RUN_STATUSES, takeSessionGate,
+} from "./chat-run.js";
 import { decideAdmission } from "./admission.js";
-import { handOffAssembledRun } from "./run-dispatch.js";
+import { newTaskId } from "./ids.js";
+import { handOffAssembledRun, publishRunMessage } from "./run-dispatch.js";
 import { injectLiveUserEnv } from "./run-claim.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 
@@ -157,14 +162,14 @@ export interface PendingDispatchResult {
 export const pendingDispatchPorts = {
   openChatRun,
   failChatRunDispatch,
-  doorbellDispatch: RUN_DOORBELL_DISPATCH,
+  doorbellDispatch: beginDoorbellDispatch,
   admit: decideAdmission,
   requireWorkspaceBinding,
   async bindWorkspace(sessionId: string, userId: string): Promise<string | undefined> {
     return (await ensureSessionWorkspace(sessionId, userId))?.workspace_id;
   },
-  async publish(subject: string, payload: string, msgId: string): Promise<void> {
-    await js.publish(subject, sc.encode(payload), { msgID: msgId });
+  async publish(subject: string, payload: string, msgId: string): Promise<number> {
+    return (await js.publish(subject, sc.encode(payload), { msgID: msgId })).seq;
   },
   publishSessionEvent: publishEvent,
 };
@@ -242,6 +247,12 @@ async function countBindAttempt(
 export async function publishRefusedTurn(
   input: PendingDispatchInput,
   failureReason = "workspace_bind_failed",
+  /**
+   * The row this refusal terminalized, when it opened one. Supplied rather
+   * than inferred: without it a message-scoped terminal event can be read as
+   * belonging to a sibling row that carries holder evidence.
+   */
+  taskId?: string,
 ): Promise<void> {
   const finalText = failureReason === "workspace_bind_failed"
     ? "This message was not started: its workspace could not be prepared. "
@@ -251,6 +262,7 @@ export async function publishRefusedTurn(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: input.sessionId,
     message_id: input.messageId,
+    ...(taskId ? { task_id: taskId } : {}),
     ...event,
   });
   await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
@@ -273,12 +285,13 @@ export async function publishRefusedTurn(
 async function refusePendingAdmission(
   input: PendingDispatchInput,
   reason: string,
+  taskId?: string,
 ): Promise<void> {
   logger.error(
     { sessionId: input.sessionId, pendingId: input.pendingId, err: reason },
     "pending.admission_rejected",
   );
-  await publishRefusedTurn(input, reason);
+  await publishRefusedTurn(input, reason, taskId);
   forgetUncountedAttempts(input.pendingId);
   try {
     await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
@@ -324,6 +337,10 @@ async function abandonPendingMessage(
     "pending.workspace_bind_abandoned",
   );
   const run = await pendingDispatchPorts.openChatRun({
+    // Fat-shaped, though nothing will be dispatched: an undispatched refusal
+    // record that must stay eligible for fat reconciliation if its immediate
+    // compensation returns an unknown outcome.
+    dispatch: "fat",
     sessionId: input.sessionId,
     userId: input.userId,
     messageId: input.messageId,
@@ -370,7 +387,7 @@ async function abandonPendingMessage(
   // and opens a second run row for the same message, one per attempt for as
   // long as the event bus is down. Bounded by the event's own retention, and
   // the alternative is the message itself being the thing that goes missing.
-  await publishRefusedTurn(input);
+  await publishRefusedTurn(input, "workspace_bind_failed", run?.taskId);
   // Settled here, whatever the delete below does: the turn is written and the
   // run row is terminal, so nothing more is owed to this attempt. A tally kept
   // past that point has the next drain of this session abandon the row on
@@ -474,8 +491,23 @@ export async function dispatchPendingMessage(
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
 
-  if (pendingDispatchPorts.doorbellDispatch) {
-    return finishPendingDoorbell(input, task);
+  const handoff = await preparePendingHandoff(input);
+  if (handoff.kind === "settled") return handoff.result;
+
+  const doorbellToken = pendingDispatchPorts.doorbellDispatch();
+  if (doorbellToken) {
+    // The token is released when this dispatch stops being able to publish a
+    // doorbell, on every path out -- the publish resolving, the publish
+    // throwing and its compensation returning, or any early return between.
+    try {
+      return await finishPendingDoorbell(input, task, handoff.taskId);
+    } finally {
+      doorbellToken.release();
+    }
+  }
+
+  if (!await clearReservedDispatchTaskId(input.pendingId, handoff.taskId)) {
+    return handedOffElsewhere(input);
   }
 
   if (!task.user_env || typeof task.user_env !== "object" || !Object.keys(task.user_env).length) {
@@ -483,6 +515,7 @@ export async function dispatchPendingMessage(
   }
 
   const run = await pendingDispatchPorts.openChatRun({
+    dispatch: "fat",
     sessionId,
     userId: input.userId,
     messageId: input.messageId,
@@ -501,6 +534,7 @@ export async function dispatchPendingMessage(
     logger.error({ sessionId, pendingId: input.pendingId }, "pending.open_failed");
     throw new Error("chat_run.open_failed");
   }
+  task.task_id = run.taskId;
   task.run_lease = run.lease;
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
@@ -513,18 +547,24 @@ export async function dispatchPendingMessage(
     // redelivery that will find no message on the stream and nothing to
     // resolve it with.
     const payload = JSON.stringify(task);
+    // A gate, not a note: an unrecorded `attempted` leaves a row denying a
+    // message already on the stream, so a throw here must stop the publish.
+    await recordPublishState(run.taskId, "attempted");
     // Published under the queued row's id, so a drain that reaches this line
     // twice puts one task on the stream rather than two.
     publishAttempted = true;
-    await pendingDispatchPorts.publish(subject, payload, input.messageId);
+    const seq = await publishRunMessage(() => pendingDispatchPorts.publish(
+      subject, payload, doorbellDedupId(sessionId, input.messageId),
+    ));
+    await recordDispatchSeq(run.taskId, seq);
   } catch (err) {
     // `certain` says whether the run row was torn down, which is the difference
     // between "this turn has not started" and "this turn may be running
-    // already" when someone reads this line afterwards. The one step above the
-    // publish is certain by construction: a payload that would not serialise
-    // never reached the stream, and leaving its row open would leave one nobody
-    // closes.
+    // already" when someone reads this line afterwards. Every step above the
+    // publish is certain by construction: neither a payload that would not
+    // serialise nor a receipt that would not commit ever reached the stream.
     const certain = !publishAttempted || publishCertainlyFailed(err);
+    if (certain) await noteRefusedPublish(run.taskId);
     logger.error(
       { err, sessionId, pendingId: input.pendingId, certain },
       "pending.publish_failed",
@@ -542,6 +582,8 @@ export async function dispatchPendingMessage(
       await pendingDispatchPorts.failChatRunDispatch(
         run.taskId,
         String((err as Error)?.message ?? err),
+        undefined,
+        { statuses: SWEEPABLE_RUN_STATUSES },
       );
     }
     throw err; // bubble up so the outer event-consumer nak'd retry can rerun
@@ -551,19 +593,135 @@ export async function dispatchPendingMessage(
   // The row is gone, so any tally kept for it while the counter was failing is
   // about a message that has now been dispatched.
   forgetUncountedAttempts(input.pendingId);
-  await db.query(
-    "UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1 AND deleted_at IS NULL",
-    [sessionId],
-  );
+  await takeSessionGate(sessionId, input.messageId);
   logger.info({ sessionId }, "pending.dispatched");
   return { runId: run.taskId };
+}
+
+/**
+ * The run id this queued message is handed off under, decided once.
+ *
+ * Compare-and-set rather than a plain write, so concurrent drains of one queue
+ * row converge on the same id instead of each minting its own. This statement
+ * is the only serialisation point they share: the selection that found the row
+ * takes no lock, so a second drainer can resume after the first has published
+ * and deleted it.
+ *
+ * @returns null when no queue row matched, which means the message was handed
+ *   off and its row deleted while this drainer was assembling. Answering with
+ *   the fresh candidate instead let that drainer publish a second turn under an
+ *   identity nothing had recorded.
+ */
+async function reserveDispatchTaskId(pendingId: unknown): Promise<string | null> {
+  const candidate = newTaskId();
+  const r = await db.query(
+    `UPDATE claw_pending_messages
+        SET dispatch_task_id = COALESCE(dispatch_task_id, $2)
+      WHERE id = $1
+      RETURNING dispatch_task_id`,
+    [pendingId, candidate],
+  );
+  return (r.rows[0] as { dispatch_task_id?: string } | undefined)?.dispatch_task_id ?? null;
+}
+
+/**
+ * Whether the run this queue row already opened has consumed the turn.
+ *
+ * A row that is still open owns the message: the drain finishes without
+ * publishing again, and claim-next plus the queue reaper are its wakeup and its
+ * bound. Only a compensated dispatch -- terminal, never claimed -- may be
+ * retried, because nothing executed under it.
+ */
+async function recordedHandoffState(
+  taskId: string,
+): Promise<"absent" | "open" | "retryable" | "consumed"> {
+  const r = await db.query(
+    "SELECT status, failure_reason, COALESCE(claim_count, 0) AS claims FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const row = r.rows[0] as
+    { status?: string; failure_reason?: string | null; claims?: number } | undefined;
+  if (!row) return "absent";
+  if (["queued", "preparing", "running", "cancelling"].includes(String(row.status))) return "open";
+  return row.failure_reason === "dispatch_failed" && Number(row.claims ?? 0) === 0
+    ? "retryable"
+    : "consumed";
+}
+
+async function clearReservedDispatchTaskId(
+  pendingId: unknown,
+  taskId: string,
+): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_pending_messages
+        SET dispatch_task_id = NULL
+      WHERE id = $1 AND dispatch_task_id = $2
+      RETURNING id`,
+    [pendingId, taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Stand down: the queue row this drain was assembling is already gone.
+ *
+ * Whoever deleted it published the turn, so there is nothing left to hand off
+ * and nothing to compensate -- the one thing this drainer must not do is open a
+ * run of its own.
+ */
+function handedOffElsewhere(input: PendingDispatchInput): PendingDispatchResult {
+  forgetUncountedAttempts(input.pendingId);
+  logger.info(
+    { sessionId: input.sessionId, pendingId: input.pendingId },
+    "pending.handoff_row_gone",
+  );
+  return { runId: null };
+}
+
+type PreparedPendingHandoff =
+  | { kind: "ready"; taskId: string }
+  | { kind: "settled"; result: PendingDispatchResult };
+
+async function preparePendingHandoff(
+  input: PendingDispatchInput,
+): Promise<PreparedPendingHandoff> {
+  let handoffId = await reserveDispatchTaskId(input.pendingId);
+  if (!handoffId) return { kind: "settled", result: handedOffElsewhere(input) };
+  while (true) {
+    const recorded = await recordedHandoffState(handoffId);
+    if (recorded === "retryable") {
+      if (!await clearReservedDispatchTaskId(input.pendingId, handoffId)) {
+        return { kind: "settled", result: handedOffElsewhere(input) };
+      }
+      handoffId = await reserveDispatchTaskId(input.pendingId);
+      if (!handoffId) return { kind: "settled", result: handedOffElsewhere(input) };
+      continue;
+    }
+    if (recorded === "open" || recorded === "consumed") {
+      await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
+      forgetUncountedAttempts(input.pendingId);
+      if (recorded === "open") await takeSessionGate(input.sessionId, input.messageId);
+      logger.info(
+        { sessionId: input.sessionId, pendingId: input.pendingId, taskId: handoffId, recorded },
+        "pending.handoff_already_recorded",
+      );
+      return {
+        kind: "settled",
+        result: { runId: recorded === "open" ? handoffId : null },
+      };
+    }
+    return { kind: "ready", taskId: handoffId };
+  }
 }
 
 async function finishPendingDoorbell(
   input: PendingDispatchInput,
   task: Record<string, unknown>,
+  handoffId: string,
 ): Promise<PendingDispatchResult> {
   const result = await handOffAssembledRun({
+    taskId: handoffId,
+    path: "pending",
     task,
     sessionId: input.sessionId,
     userId: input.userId,
@@ -573,10 +731,14 @@ async function finishPendingDoorbell(
     filesWorkspaceId: typeof task.files_workspace_id === "string" ? task.files_workspace_id : undefined,
     pluginId: input.pluginId,
     sandboxImage: input.sandboxImage,
-    publish: (subject, payload, msgId) =>
-      pendingDispatchPorts.publish(subject, payload, msgId ?? input.messageId),
+    publish: (subject, payload, msgId) => pendingDispatchPorts.publish(subject, payload, msgId),
     openRun: pendingDispatchPorts.openChatRun,
-    failRun: pendingDispatchPorts.failChatRunDispatch,
+    failRun: (taskId, reason, failureReason) => pendingDispatchPorts.failChatRunDispatch(
+      taskId,
+      reason,
+      failureReason,
+      { statuses: SWEEPABLE_RUN_STATUSES },
+    ),
     admit: pendingDispatchPorts.admit,
   });
   if (result.kind === "open_failed") {
@@ -584,15 +746,12 @@ async function finishPendingDoorbell(
     throw new Error("chat_run.open_failed");
   }
   if (result.kind === "rejected") {
-    await refusePendingAdmission(input, result.reason);
+    await refusePendingAdmission(input, result.reason, result.taskId);
     return { runId: null };
   }
   await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [input.pendingId]);
   forgetUncountedAttempts(input.pendingId);
-  await db.query(
-    "UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1 AND deleted_at IS NULL",
-    [input.sessionId],
-  );
+  await takeSessionGate(input.sessionId, input.messageId);
   logger.info(
     { sessionId: input.sessionId, kind: result.kind, runId: result.taskId },
     "pending.dispatched",

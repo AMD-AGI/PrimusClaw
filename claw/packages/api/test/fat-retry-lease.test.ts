@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import "./reconcile-off-env.js";
+
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";

@@ -63,7 +63,6 @@ function stubLockPool(): LockState {
 before(async () => {
   h = await startHarness();
   await h.sql(`ALTER TABLE claw_pending_messages
-    ADD COLUMN user_id TEXT DEFAULT 'default',
     ADD COLUMN plugin_id INTEGER,
     ADD COLUMN tool_ids JSONB DEFAULT '[]'::jsonb,
     ADD COLUMN workspace_id TEXT,
@@ -100,7 +99,7 @@ after(async () => {
 
 function completion(messageId: string | null = MESSAGE): Record<string, unknown> {
   return {
-    type: "exec_complete", session_id: SESSION, user_id: "u-1",
+    type: "exec_complete", session_id: SESSION, task_id: "run-original", user_id: "u-1",
     ...(messageId ? { message_id: messageId } : {}),
     prompt: "Inspect the original work", final_text: "The worker finished the original work.",
     failed: false, error_count: 0, skills_used: {},

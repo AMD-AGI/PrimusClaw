@@ -62,6 +62,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
 import { getS3Client } from "../infra/s3-client.js";
+import { metrics } from "../infra/metrics.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
 import { sc, nc, kv, kvTombstones, jsm, EVENT_STREAM } from "../infra/nats.js";
 import { rememberSessionDeleted } from "./deleted-cache.js";
@@ -570,9 +571,34 @@ export interface TeardownInput {
  *         the session and every row it has are exactly as they were.
  */
 export async function commitSessionDeletion(sessionId: string): Promise<void> {
+  let queueExits: Array<{
+    prior_status: string;
+    origin: string | null;
+    dispatch: string | null;
+    queued_since: string | null;
+  }>;
   try {
-    await inTransaction(async (query: Querier) => {
+    queueExits = await inTransaction(async (query: Querier) => {
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
+      // The prior state, locked before the transition writes over it. The
+      // doorbell queue-exit metric below is taken from what these rows were,
+      // and an UPDATE's RETURNING can only answer with what they became.
+      // `FOR UPDATE` is what makes the two statements one decision: the rows
+      // the transition then matches are exactly these, held for the
+      // transaction.
+      const cancelled = await query(
+        `SELECT status AS prior_status, origin,
+                metadata->>'dispatch' AS dispatch,
+                metadata->>'queued_since' AS queued_since
+           FROM claw_tasks
+          WHERE session_id = $1
+            AND status IN ('waiting_deps','waiting_external','queued','preparing','running','cancelling')
+          FOR UPDATE`,
+        [sessionId],
+      );
+      // Through the shared transition rather than its own UPDATE, so a run
+      // cancelled by a delete accrues its queued time and stamps its run-time
+      // epoch like every other ending does.
       await applyTaskStatusTransition("cancelled", {
         extra: {
           failure_reason: "session_deleted",
@@ -607,6 +633,7 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
                 -- Only the claim that something is still going is false here.
                 agent_status = CASE WHEN agent_status = 'running'
                                     THEN 'idle' ELSE agent_status END,
+                agent_gate_message_id = NULL,
                 updated_at = NOW(),
                 cleanup_state = 'pending',
                 cleanup_attempts = 0,
@@ -615,6 +642,7 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
           WHERE session_id = $1`,
         [sessionId, INLINE_CLEANUP_BUDGET_MS],
       );
+      return cancelled.rows as typeof queueExits;
     });
   } catch (err) {
     throw new TeardownRefused(
@@ -623,6 +651,11 @@ export async function commitSessionDeletion(sessionId: string): Promise<void> {
       + "either nothing has been changed and the retry does the work, or the commit "
       + "landed and the retry says so with a 404.",
     );
+  }
+  for (const row of queueExits) {
+    if (row.prior_status === "queued" && row.origin === "chat" && row.dispatch === "doorbell") {
+      metrics.observeQueueExit("chat", row.queued_since, "cancelled");
+    }
   }
 }
 
@@ -951,7 +984,14 @@ export async function recordCleanupOutcome(
  */
 export async function teardownSession(input: TeardownInput): Promise<string[]> {
   const { sessionId } = input;
-  await commitSessionDeletion(sessionId);
+  // Counted here rather than at the two routes, for the reason this module
+  // exists: a second copy of the accounting is a second thing to drift.
+  try {
+    await commitSessionDeletion(sessionId);
+  } catch (err) {
+    metrics.onSessionDeleted("error");
+    throw err;
+  }
   const incomplete = await runSessionCleanup(input, { budgetMs: INLINE_CLEANUP_BUDGET_MS });
   await recordCleanupOutcome(sessionId, incomplete);
   if (incomplete.length) {
@@ -961,6 +1001,7 @@ export async function teardownSession(input: TeardownInput): Promise<string[]> {
     // a slow one from a stuck one.
     logger.warn({ sessionId, incomplete }, "session.cleanup_deferred");
   }
+  metrics.onSessionDeleted("ok");
   return incomplete;
 }
 

@@ -25,6 +25,7 @@ import {
   closeChatRun,
   failChatRunDispatch,
   interruptUnstartedChatRuns,
+  parseDispatchCompensationRecord,
   queuedMessageId,
 } from "../src/tasks/chat-run.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../src/tasks/run-budget.js";
@@ -47,6 +48,7 @@ function stubDb(behaviour?: (sql: string) => unknown): SeenQuery[] {
 }
 
 const INPUT = {
+  dispatch: "fat" as const,
   sessionId: "s-1",
   userId: "u-1",
   messageId: "claw-1700000000000",
@@ -78,6 +80,84 @@ test("opening a run records what it is and what it owns", async () => {
     params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
   );
   assert.equal(metadata.message_id, INPUT.messageId, "how Brain refers to this run");
+});
+
+test("a fat run is marked as one and opens with an armed receipt", async () => {
+  // The marker is positive rather than inferred: it decides which reapers may
+  // touch the row, and a fat row that carried no marker would be
+  // indistinguishable from a legacy one.
+  const seen = stubDb();
+  await openChatRun(INPUT);
+
+  const metadata = JSON.parse(
+    seen[0].params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
+  );
+  assert.equal(metadata.dispatch, "fat");
+  assert.deepEqual(metadata.dispatch_compensation, {
+    version: 1, state: "armed", publish: "not_attempted",
+  });
+  assert.equal(
+    metadata.doorbell_semantics, undefined,
+    "the required-semantics key belongs to a doorbell row",
+  );
+});
+
+test("a doorbell run carries its required semantics and owes no receipt", async () => {
+  // The compensation receipt is the fat path's retry record; a doorbell row is
+  // reclaimed by the queue reapers instead.
+  const seen = stubDb();
+  await openChatRun({
+    ...INPUT, dispatch: "doorbell", spec: { prompt: "hello" }, issueLease: false, status: "queued",
+  });
+
+  const metadata = JSON.parse(
+    seen[0].params.find((p) => typeof p === "string" && p.includes("message_id")) as string,
+  );
+  assert.equal(metadata.dispatch, "doorbell");
+  assert.equal(typeof metadata.doorbell_semantics, "number");
+  assert.equal(metadata.dispatch_compensation, undefined);
+});
+
+test("the receipt parser is the only reader, and it fails closed both ways", async () => {
+  const armed = { version: 1, state: "armed", publish: "not_attempted" };
+  assert.deepEqual(
+    parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: armed }),
+    { kind: "valid", record: armed },
+  );
+  // A newer deployment owns this row's contract, so no writer here may touch it.
+  assert.deepEqual(
+    parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: { version: 2, state: "armed" } }),
+    { kind: "unsupported", version: 2 },
+  );
+  // A legacy row with no dispatch key legitimately has no receipt.
+  assert.deepEqual(parseDispatchCompensationRecord({}), { kind: "absent" });
+  // A row that says it is fat owes one, so its absence is a broken invariant.
+  assert.deepEqual(parseDispatchCompensationRecord({ dispatch: "fat" }), { kind: "invalid" });
+  for (const bad of [
+    "armed",
+    [],
+    { version: 1, state: "armed" },
+    { version: 1, state: "armed", publish: "sent" },
+    { version: 1, state: "terminal", failure_reason: "x" },
+    { version: 1, state: "elsewhere" },
+    { state: "armed", publish: "not_attempted" },
+  ]) {
+    assert.deepEqual(
+      parseDispatchCompensationRecord({ dispatch: "fat", dispatch_compensation: bad }),
+      { kind: "invalid" },
+      `expected ${JSON.stringify(bad)} to be invalid`,
+    );
+  }
+  // A terminal receipt keeps both keys even when both are null.
+  assert.deepEqual(
+    parseDispatchCompensationRecord({
+      dispatch_compensation: { version: 1, state: "complete", failure_reason: null, error_message: null },
+    }),
+    {
+      kind: "valid",
+      record: { version: 1, state: "complete", failure_reason: null, error_message: null },
+    },
+  );
 });
 
 test("a run bound by its caller is not bound again here", async () => {
@@ -183,14 +263,31 @@ test("starting the engine moves the session's open run, and only that", async ()
   assert.equal(seen[0].params[2], "s-1");
 });
 
+/**
+ * The statement that moved the row, not whichever ran first.
+ *
+ * Closing reads the prior state before it writes -- the queue-exit metric is
+ * measured from what the row was -- so the transition is no longer `seen[0]`,
+ * and an index would silently start asserting against the read instead.
+ */
+function transitionOf(seen: SeenQuery[]): SeenQuery {
+  // `SET status = '...'` for a fixed status, `SET status = CASE ...` for the
+  // per-row ones the compensation paths use.
+  const q = seen.find((s) => /^UPDATE claw_tasks SET status/.test(s.sql));
+  assert.ok(q, "no status transition was issued");
+  return q;
+}
+
 test("closing prefers the run the completion event names", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "completed");
 
-  assert.match(seen[0].sql, /metadata->>'message_id' = \$5/);
-  assert.match(seen[0].sql, /SET status = 'completed'/);
-  assert.equal(seen[0].params[4], "claw-42");
-  assert.equal(seen[0].params[0], null, "a run that completed has no failure reason");
+  const t = transitionOf(seen);
+  assert.match(t.sql, /metadata->>'message_id' = \$\d+/,
+    "the completion names its message, and that is what the row is matched on");
+  assert.match(t.sql, /SET status = 'completed'/);
+  assert.ok(t.params.includes("claw-42"), "the named run is the one it closes");
+  assert.ok(t.params.includes(null), "a run that completed has no failure reason");
 });
 
 test("closing falls back to the only open run when the event names none", async () => {
@@ -200,25 +297,26 @@ test("closing falls back to the only open run when the event names none", async 
   // idle. The statement therefore insists there is no other open row.
   const seen = stubDb();
   await closeChatRun("s-1", undefined, "completed");
-  assert.equal(seen[0].params[4], null);
-  assert.match(seen[0].sql, /\$5::text IS NULL/);
-  assert.match(seen[0].sql, /NOT EXISTS/,
+  const t = transitionOf(seen);
+  assert.match(t.sql, /\$\d+::text IS NULL/,
+    "an event naming no message falls back on the sole-open-row arm");
+  assert.match(t.sql, /NOT EXISTS/,
     "two open rows are not both the run that just ended");
 });
 
 test("an interrupted run is recorded as cancelled, not failed", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "cancelled");
-  assert.match(seen[0].sql, /SET status = 'cancelled'/);
+  assert.match(transitionOf(seen).sql, /SET status = 'cancelled'/);
 });
 
 test("a failure reason is recorded and bounded", async () => {
   const seen = stubDb();
   await closeChatRun("s-1", "claw-42", "failed", "x".repeat(5000));
 
-  assert.match(seen[0].sql, /SET status = 'failed'/);
-  assert.equal(
-    (seen[0].params[1] as string).length, 2000,
+  assert.match(transitionOf(seen).sql, /SET status = 'failed'/);
+  assert.ok(
+    transitionOf(seen).params.some((v) => typeof v === "string" && v.length === 2000),
     "failure paths are where oversized strings come from",
   );
 });
@@ -232,12 +330,23 @@ test("a publish failure closes the row describing the run that never ran", async
   const seen = stubDb();
   await failChatRunDispatch("ktsk_x", "nats unreachable");
 
-  assert.match(seen[0].sql, /UPDATE claw_tasks SET status = 'failed'/);
-  assert.deepEqual(seen[0].params, ["dispatch_failed", "nats unreachable", "ktsk_x"]);
+  const t = transitionOf(seen);
+  // A row already told to cancel ends `cancelled`; anything else `failed`. One
+  // expression, so the two cannot disagree about which ending this was.
+  assert.match(t.sql, /SET status = CASE WHEN status = 'cancelling'/);
+  assert.match(t.sql, /ELSE 'failed' END/);
+  for (const v of ["nats unreachable", "ktsk_x"]) {
+    assert.ok(t.params.includes(v), `the statement carries ${v}`);
+  }
   assert.match(
-    seen[0].sql,
-    /status IN \('queued','preparing','running'\)/,
-    "a CAS, so a run that has since been swept or cancelled is left alone",
+    t.sql,
+    /metadata->'dispatch_compensation' IS NOT DISTINCT FROM \$\d+::jsonb/,
+    "a receipt rewritten between the read and the write matches nothing and is retried",
+  );
+  assert.match(
+    t.sql,
+    /'state', 'terminal'/,
+    "the close writes its own durable receipt, so the cleanup it owes survives this process",
   );
   assert.ok(seen.some((q) => /claw_workspace_refs|workspace/i.test(q.sql)),
     "and an unclaimed row's workspace reference is handed back");
@@ -253,7 +362,7 @@ test("a publish failure leaves a row a Brain has already claimed alone", async (
   const seen = stubDb(() => ({ rows: [], rowCount: 0 }));
   await failChatRunDispatch("ktsk_held", "nats unreachable");
 
-  assert.match(seen[0].sql, /lease_owner IS NULL/, "the settle is holder-guarded");
+  assert.match(transitionOf(seen).sql, /lease_owner IS NULL/, "the settle is holder-guarded");
   // What follows is a read, not a write: matching no row is two situations --
   // a holder, or a row already terminal -- and the caller is told which. The
   // property this test is here for is that neither of them hands the
@@ -262,8 +371,12 @@ test("a publish failure leaves a row a Brain has already claimed alone", async (
     seen.every((q) => !/claw_workspace/.test(q.sql)),
     "no workspace release follows a settle that matched nothing",
   );
+  // From the settle onward rather than from index 1: the settle now reads the
+  // prior state first, so the write is no longer the first statement.
+  const settleAt = seen.findIndex((q) => /^UPDATE claw_tasks SET status/.test(q.sql));
+  assert.ok(settleAt >= 0, "the settle was issued");
   assert.ok(
-    seen.slice(1).every((q) => /^\s*SELECT/i.test(q.sql)),
+    seen.slice(settleAt + 1).every((q) => /^\s*SELECT/i.test(q.sql)),
     "and nothing after the settle writes",
   );
 });
@@ -293,7 +406,9 @@ test("two queued turns are never dispatched under one id", async () => {
 
 test("the doorbell path opens without a lease token, because claim mints it", async () => {
   const seen = stubDb();
-  const run = await openChatRun({ ...INPUT, spec: { prompt: "hello" }, issueLease: false, status: "queued" });
+  const run = await openChatRun({
+    ...INPUT, dispatch: "doorbell", spec: { prompt: "hello" }, issueLease: false, status: "queued",
+  });
 
   assert.equal(run?.lease, undefined);
   const meta = seen[0].params.find((p) => typeof p === "string" && p.includes("doorbell"));
@@ -316,8 +431,10 @@ test("interrupt cancels a queued doorbell the worker never claimed", async () =>
     return { rows: [], rowCount: 0 };
   });
   assert.equal(await interruptUnstartedChatRuns("s-1"), 1);
-  assert.match(seen[0].sql, /status = 'queued'/);
-  assert.match(seen[0].sql, /lease_owner IS NULL/);
+  const t = transitionOf(seen);
+  assert.match(t.sql, /status = 'queued'/);
+  assert.match(t.sql, /lease_owner IS NULL/,
+    "a queued doorbell nobody claimed, and only that");
 });
 
 test("Stop only reaches doorbell rows, and asks the right question about what is left", async () => {

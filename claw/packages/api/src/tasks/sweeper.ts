@@ -19,6 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
 import { publishEvent } from "../events/store.js";
@@ -28,19 +29,31 @@ import {
   noteAttemptRenewal, openAttemptRecord,
   type AttemptRecord,
 } from "@claw/protocol";
-import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../config.js";
-import { nc } from "../infra/nats.js";
+import {
+  envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
+} from "../config.js";
+import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
+import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { handleMap } from "./sandbox-stopper.js";
-import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC } from "./run-budget.js";
+import {
+  DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
+  RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
+} from "./run-budget.js";
 import { applyTaskStatusTransition } from "./db.js";
 import type { ClawTaskRow } from "./types.js";
 import { applyToLedger, settleTerminalRuns } from "./run-time-ledger.js";
 import {
   releaseRefsOfDeletedSessions, releaseRefsOfFinishedRuns, releaseRefsOfIdleSessions, releaseRunUse,
+  releaseRunUseStrict,
 } from "../workspace/store.js";
+import {
+  ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
+  noDeliveryInFlightSql,
+  parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
+} from "./chat-run.js";
 
 const logger = pino({ name: "task-sweeper" });
 
@@ -78,6 +91,8 @@ const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 /** Injection seam for the terminal events a reap has to announce. */
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
+  drainPendingMessage: drainOldestPendingMessage,
+  deliverySettlement: taskDeliverySettlement,
 };
 
 let stopped = false;
@@ -155,7 +170,9 @@ export async function reapStaleTasks(): Promise<number> {
          -- accepted the run.
          (lease_expires_at IS NULL
             AND started_at IS NOT NULL
-            AND started_at < NOW() - ($1::int * INTERVAL '1 second'))
+            AND started_at < NOW() - ($1::int * INTERVAL '1 second')
+            -- a2a rows are closed by their own protocol, not by this backstop.
+            AND origin IS DISTINCT FROM 'a2a')
        )`,
       params: [
         BRAIN_TASK_TIMEOUT_SEC,
@@ -367,6 +384,8 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
       attempt_id: null,
       started_at: null,
     },
+    // Each trip round the requeue loop is measured as its own wait.
+    setSql: [`metadata = ${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")}`],
     where: `status IN ('preparing','running')
         AND origin = 'chat'
         AND metadata->>'dispatch' = 'doorbell'
@@ -381,6 +400,8 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
       rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
     "sweeper.requeued_lost_doorbell_leases",
   );
+  metrics.onDoorbellLeaseRequeued(rows.length);
+  metrics.onQueueEntered("requeue", rows.length);
   return rows.length;
 }
 
@@ -437,8 +458,10 @@ export async function reapExpiredQueuedRuns(): Promise<number> {
     // which for this class would read as "nothing was lost".
     await recordSlotlessAttempt(row.task_id);
   }
-  const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
-  await releaseSessionsOfLostRuns(ids);
+  await releaseSessionsOfLostRuns(
+    (r.rows as Array<{ session_id: string; message_id?: string | null }>)
+      .map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
+  );
   return r.rowCount;
 }
 
@@ -459,6 +482,11 @@ function expiredRowOf(row: ClawTaskRow): ExpiredQueuedRow {
     claim_count: (row as ClawTaskRow & { claim_count?: number }).claim_count ?? null,
     message_id: (row.metadata?.message_id as string | undefined)
       ?? (row as ClawTaskRow & { message_id?: string | null }).message_id ?? null,
+    // Restamped on every requeue, so this is when the current wait began rather
+    // than when the row was first written -- which is what the exit metric
+    // measures against.
+    queued_since: (row.metadata?.queued_since as string | undefined)
+      ?? (row as ClawTaskRow & { queued_since?: string | null }).queued_since ?? null,
     user_id: (row.metadata?.user_id as string | undefined)
       ?? (row.input?.user_id as string | undefined)
       ?? (row as ClawTaskRow & { user_id?: string | null }).user_id ?? null,
@@ -471,11 +499,46 @@ interface ExpiredQueuedRow {
   prompt: string | null;
   claim_count: number | null;
   message_id: string | null;
+  /** When this row's current wait began, which is not when the row was written. */
+  queued_since: string | null;
   user_id: string | null;
+  /** What the row was before the sweep wrote over it. See priorStatuses. */
+  prior_status?: string;
+}
+
+/**
+ * The statuses a sweep's rows held before it wrote over them.
+ *
+ * `RETURNING` answers with what a row became, and whether a sweep took a row
+ * off the QUEUE is a fact about what it was: `queuedExits` counts rows whose
+ * `prior_status` was `queued`, and `claw_tasks` has no such column. Fed the
+ * post-update rows it matches none of them, and the exit counter the rollout
+ * gate balances against the entry counter never moves at all.
+ *
+ * Read with the pass's own predicate, immediately before it. A row entering or
+ * leaving the set between the two statements mis-counts one metric and nothing
+ * else, which is the same bargain `closeDuplicateChatRuns` already makes.
+ */
+async function priorStatuses(where: string, params: unknown[]): Promise<Map<string, string>> {
+  const r = await db.query(`SELECT task_id, status FROM claw_tasks WHERE ${where}`, params);
+  return new Map((r.rows as Array<{ task_id: string; status: string }>)
+    .map((row) => [row.task_id, row.status]));
+}
+
+/** Those rows, each carrying the status it is leaving. */
+function withPriorStatus<T extends { task_id: string }>(
+  rows: T[], prior: Map<string, string>,
+): Array<T & { prior_status?: string }> {
+  return rows.map((row) => ({ ...row, prior_status: prior.get(row.task_id) }));
 }
 
 async function announceQueueTimeout(row: ExpiredQueuedRow): Promise<void> {
   const everHeld = Number(row.claim_count ?? 0) > 0;
+  // Per row rather than once from the row count: whether a worker ever held it
+  // is a per-row fact, and it is the difference between a queue nobody is
+  // draining and one whose workers keep dying.
+  metrics.onQueueTimeout(everHeld ? "true" : "false");
+  metrics.observeQueueExit("chat", row.queued_since ?? null, "timed_out");
   const finalText = everHeld
     ? "This run lost its worker and no replacement claimed it before the queue "
       + "wait ran out. It may have partly run; check the session before resending."
@@ -500,6 +563,7 @@ async function announceRunFailure(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: row.session_id,
     message_id: row.message_id ?? undefined,
+    task_id: row.task_id,
     ...event,
   });
   try {
@@ -563,7 +627,30 @@ async function announceRunFailure(
  * The grace matches the deadline backstop's, so a run that is about to report
  * its own timeout is given the same chance to do it first.
  */
+const UNCLAIMED_SIBLING_WHERE = `EXISTS (
+          SELECT 1 FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
+           WHERE claw_tasks.session_id = sibling.session_id
+             AND claw_tasks.metadata->>'message_id' = sibling.message_id
+        )
+        AND origin = 'chat'
+        -- A doorbell spare actually sits at queued. The rest of this list is
+        -- the world before the doorbell, when every row a dispatch opened went
+        -- straight to preparing.
+        AND status IN ('queued','preparing','running','cancelling')
+        AND lease_expires_at IS NULL
+        -- Never claimed, which is what this row's own error message says about
+        -- it: a spare no worker ever took is 0, a requeued row is at least 1.
+        AND COALESCE(claim_count, 0) = 0`;
+
+const EXPIRED_DOORBELL_WHERE = `origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND status IN ('queued','preparing','running')
+        AND deadline_at IS NOT NULL
+        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())`;
+
 export async function reapExpiredDoorbellRuns(): Promise<number> {
+  const prior = await priorStatuses(EXPIRED_DOORBELL_WHERE, [RUN_BUDGET_BACKSTOP_GRACE_SEC]);
   const reaped = await applyTaskStatusTransition("failed", {
     extra: {
       failure_reason: "run_budget_exhausted",
@@ -576,15 +663,13 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
       "error_message = 'run budget exhausted at ' || deadline_at"
       + " || '; the lease lapsed after the deadline, so no worker could take it again'",
     ],
-    where: `origin = 'chat'
-        AND metadata->>'dispatch' = 'doorbell'
-        AND status IN ('queued','preparing','running')
-        AND deadline_at IS NOT NULL
-        AND deadline_at < NOW() - ($1::int * INTERVAL '1 second')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())`,
+    where: EXPIRED_DOORBELL_WHERE,
     params: [RUN_BUDGET_BACKSTOP_GRACE_SEC],
   });
-  const r = { rows: reaped.map(expiredRowOf), rowCount: reaped.length };
+  const r = {
+    rows: withPriorStatus(reaped.map(expiredRowOf), prior),
+    rowCount: reaped.length,
+  };
   if (!r.rowCount) return 0;
   logger.warn({ reaped: r.rowCount, ids: idsOf(r.rows) }, "sweeper.reaped_expired_doorbell_runs");
   for (const row of r.rows as ExpiredQueuedRow[]) {
@@ -599,8 +684,10 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
     await releaseRunUse(row.task_id, false);
   }
   await releaseSessionsOfLostRuns(
-    r.rows.map((row) => (row as { session_id: string }).session_id),
+    (r.rows as Array<{ session_id: string; message_id?: string | null }>)
+      .map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
   );
+  metrics.onQueueExited("budget_exhausted", queuedExits(r.rows));
   return r.rowCount;
 }
 
@@ -727,7 +814,7 @@ export async function reapLostLeases(): Promise<number> {
   // After the sibling close, whose rows are non-terminal until it runs and each
   // of which is enough on its own to make this release match nothing.
   await releaseSessionsOfLostRuns(
-    chatRows.map((row) => row.session_id),
+    chatRows.map((row) => ({ sessionId: row.session_id, messageId: row.message_id ?? null })),
     chatRows.reduce((bySession, row) => {
       const workloadIds = bySession.get(row.session_id) ?? new Set<string>();
       if (row.sandbox_workload_id) workloadIds.add(row.sandbox_workload_id);
@@ -805,6 +892,7 @@ async function closeUnclaimedDispatchSiblings(
     messageIds.push(row.message_id);
   }
   if (!sessionIds.length) return;
+  const prior = await priorStatuses(UNCLAIMED_SIBLING_WHERE, [sessionIds, messageIds]);
   const closed = await applyTaskStatusTransition("failed", {
     extra: {
       failure_reason: "dispatch_retried",
@@ -814,24 +902,12 @@ async function closeUnclaimedDispatchSiblings(
     // The pairing arrives as a predicate: two arrays zipped by unnest, so a
     // sibling is matched on session and message id together rather than on
     // either alone.
-    where: `EXISTS (
-          SELECT 1 FROM unnest($1::text[], $2::text[]) AS sibling(session_id, message_id)
-           WHERE claw_tasks.session_id = sibling.session_id
-             AND claw_tasks.metadata->>'message_id' = sibling.message_id
-        )
-        AND origin = 'chat'
-        -- A doorbell spare actually sits at queued. The rest of this list is
-        -- the world before the doorbell, when every row a dispatch opened went
-        -- straight to preparing.
-        AND status IN ('queued','preparing','running','cancelling')
-        AND lease_expires_at IS NULL
-        -- Never claimed, which is what this row's own error message says about
-        -- it: a spare no worker ever took is 0, a requeued row is at least 1.
-        AND COALESCE(claim_count, 0) = 0`,
+    where: UNCLAIMED_SIBLING_WHERE,
     params: [sessionIds, messageIds],
   });
-  const r = { rowCount: closed.length, rows: closed };
+  const r = { rowCount: closed.length, rows: withPriorStatus(closed, prior) };
   if (!r.rowCount) return;
+  metrics.onQueueExited("duplicate_closed", queuedExits(r.rows));
   logger.warn(
     { closed: r.rowCount, ids: r.rows.map((row) => (row as { task_id: string }).task_id) },
     "sweeper.closed_unclaimed_dispatch_siblings",
@@ -898,25 +974,49 @@ async function countPendingBySession(
  * next message, dispatch behind it, and arrive out of order. They are counted
  * in the log below so that wait stays visible.
  */
+/** One run's claim on the gate: the session it holds, and the turn that took it. */
+export interface LostRunGate {
+  sessionId: string;
+  messageId: string | null;
+}
+
+/**
+ * Hand back the gates of runs this tick closed, and only those.
+ *
+ * Keyed by the turn as well as the session because occupancy alone answers a
+ * different question: the immediate path commits `agent_status = 'running'` and
+ * inserts the run row several awaits later, so a release evaluated in that
+ * window opens the gate under a live turn. Timestamps cannot close it either --
+ * NOW() is transaction-start time, so a newer turn's flip can carry a stamp
+ * older than the compensated row's completed_at.
+ */
 async function releaseSessionsOfLostRuns(
-  sessionIds: string[],
+  gates: LostRunGate[],
   workloadIdsBySession?: ReadonlyMap<string, ReadonlySet<string>>,
 ): Promise<void> {
-  if (!sessionIds.length) return;
+  if (!gates.length) return;
+  const sessionIds = gates.map((gate) => gate.sessionId);
   const r = await db.query(
     `UPDATE claw_sessions s
         SET agent_status = 'idle',
+            agent_gate_message_id = NULL,
             updated_at = NOW()
-      WHERE s.session_id = ANY($1::text[])
+       FROM UNNEST($1::text[], $2::text[]) AS g(session_id, message_id)
+      WHERE s.session_id = g.session_id
         AND s.agent_status = 'running'
         AND s.deleted_at IS NULL
+        AND (NOT $3::boolean OR s.agent_gate_message_id = g.message_id)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = s.session_id
              AND t.status IN ('queued','preparing','running','cancelling')
         )
-      RETURNING session_id`,
-    [sessionIds],
+      RETURNING s.session_id`,
+    [
+      gates.map((g) => g.sessionId),
+      gates.map((g) => g.messageId),
+      gateOwnershipEnforced(),
+    ],
   );
   // Parking is judged on the same question as the gate -- is anything still
   // running in this session -- but not on the same answer. The UPDATE above
@@ -932,6 +1032,483 @@ async function releaseSessionsOfLostRuns(
     { released: r.rowCount, ids, orphanedPending: await countPendingBySession(ids) },
     "sweeper.released_sessions_of_lost_runs",
   );
+}
+
+/**
+ * What this tick can prove about deliveries still on the durable.
+ *
+ * Read once per tick rather than once per row, and fails closed: an unreadable
+ * consumer or stream answers "not settled", which keeps a session gate shut
+ * rather than handing it back under a delivery that may still execute.
+ */
+async function deliveryObservations(): Promise<DeliveryObservations> {
+  const settlement = await sweeperPorts.deliverySettlement();
+  if (settlement === null) return { wholeStream: false, ackFloor: null };
+  // Two forms, because a row that recorded which message carries it can be
+  // answered on its own sequence, while one whose receipt says a publish was
+  // attempted but carries no sequence has only the whole-stream form: any
+  // message for it was published before this read, so a floor past `last_seq`
+  // is past that message too.
+  return {
+    wholeStream: settlement.ackFloor >= settlement.lastSeq,
+    ackFloor: settlement.ackFloor,
+  };
+}
+
+interface DeliveryObservations {
+  /** Every message published before this tick has been settled. */
+  wholeStream: boolean;
+  /** How far the durable has settled, or null when it could not be read. */
+  ackFloor: number | null;
+}
+
+/** Whether this row's own message is at or below the durable's ack floor. */
+function rowDeliverySettled(
+  observations: DeliveryObservations,
+  dispatchSeq: unknown,
+): boolean {
+  if (observations.wholeStream) return true;
+  if (observations.ackFloor === null) return false;
+  const seq = Number(dispatchSeq);
+  return Number.isFinite(seq) && seq > 0 && seq <= observations.ackFloor;
+}
+
+/**
+ * Close fat and legacy-fat chat rows no Brain ever took a durable lease on.
+ *
+ * Inert while no evidence arm of the shared guard holds, by construction: the
+ * guard is a term of the candidate scan, so the pass finds nothing rather than
+ * being switched off somewhere else. `cancelling` is in the status list for the
+ * debris of a Stop taken before cancellation became holder-aware, and `running`
+ * because `markChatRunRunning` is session-scoped -- a later turn can move an
+ * older holderless row out of `preparing`. Status is not holder evidence.
+ *
+ * An unsupported receipt is excluded from the scan rather than fetched and
+ * declined: a limit's worth of undeclinable rows would otherwise starve every
+ * actionable orphan behind them.
+ */
+export async function reapOrphanedFatRuns(limit = 200): Promise<number> {
+  const settled = await deliveryObservations();
+  const r = await db.query(
+    `SELECT task_id, session_id, metadata
+       FROM claw_tasks
+      WHERE origin = 'chat'
+        AND executor = 'brain'
+        AND status IN ('preparing','running','cancelling')
+        AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND started_at IS NOT NULL
+        AND started_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND NOT (${UNSUPPORTED_RECEIPT_SQL})
+        AND (${noDeliveryInFlightSql("$2", deliverySettledSql("$3", "$4"))})
+      ORDER BY started_at, task_id
+      LIMIT $5`,
+    [
+      BRAIN_TASK_TIMEOUT_SEC, RUN_FAT_PREPARING_RECONCILE,
+      settled.wholeStream, settled.ackFloor, limit,
+    ],
+  );
+  if (!r.rowCount) return 0;
+  let closed = 0;
+  for (const row of r.rows as Array<{
+    task_id: string; session_id: string; metadata: Record<string, unknown> | null;
+  }>) {
+    // The same CAS the request path uses, not a second UPDATE with subtly
+    // different holder rules: a row accepted between the SELECT and the write
+    // classifies as held, and one another replica already closed as closed.
+    const verdict = await failChatRunDispatch(
+      row.task_id,
+      `no Brain established the first durable lease within ${BRAIN_TASK_TIMEOUT_SEC}s`,
+      "dispatch_unconfirmed",
+      {
+        statuses: SWEEPABLE_RUN_STATUSES,
+        observedReceipt: row.metadata?.dispatch_compensation,
+        fleetAsserted: RUN_FAT_PREPARING_RECONCILE,
+        deliverySettled: rowDeliverySettled(settled, row.metadata?.dispatch_seq),
+      },
+    );
+    if (verdict === "closed") closed += 1;
+  }
+  if (closed) logger.warn({ closed }, "sweeper.reaped_orphaned_fat_runs");
+  return closed;
+}
+
+/**
+ * Finish the cleanup a terminal fat row is still owed.
+ *
+ * Existing terminal writers do not all know about the receipt -- a sibling
+ * close can fail an armed duplicate, a session deletion can cancel one -- so
+ * this pass owns adoption of a terminal never-held armed record, cleanup of one
+ * already marked terminal, and the resources of a never-held terminal fat row
+ * whose terminalizer left no receipt at all. Every fetched row is one this
+ * deployment can act on, so each acted row leaves the set and a bounded batch
+ * progresses by construction.
+ */
+export async function finalizeDispatchCompensations(limit = 200): Promise<number> {
+  const r = await db.query(
+    `SELECT task_id, session_id, status, failure_reason, error_message, metadata,
+            metadata->>'message_id' AS message_id
+       FROM claw_tasks
+      WHERE status IN ('completed','failed','cancelled')
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND (
+             (${ACTIONABLE_RECEIPT_SQL}
+              AND metadata->'dispatch_compensation'->>'state' IN ('armed','terminal'))
+             OR (
+                  metadata->'dispatch_compensation' IS NULL
+                  AND origin = 'chat'
+                  AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)
+                  AND ${OWED_RESOURCE_SQL}
+             )
+        )
+      ORDER BY completed_at NULLS FIRST, task_id
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  let completed = 0;
+  for (const row of r.rows as FinalizableRow[]) {
+    try {
+      if (await finalizeOneCompensation(row)) completed += 1;
+    } catch (err) {
+      // One row's failure leaves it in the arm it was in for the next tick and
+      // must not stop the rest of the batch.
+      logger.warn({ err, taskId: row.task_id }, "sweeper.finalize_compensation_failed");
+    }
+  }
+  if (completed) logger.info({ completed }, "sweeper.finalized_dispatch_compensations");
+  return completed;
+}
+
+interface FinalizableRow {
+  task_id: string;
+  session_id: string;
+  status: string;
+  failure_reason: string | null;
+  error_message: string | null;
+  message_id: string | null;
+  metadata: Record<string, unknown> | null;
+}
+
+/** A terminal row still naming a workspace it has not let go of. */
+const OWED_RESOURCE_SQL = `(
+  EXISTS (
+    SELECT 1 FROM claw_workspace_refs wr
+     WHERE wr.ref_kind = 'run' AND wr.ref_id = claw_tasks.task_id AND wr.released_at IS NULL
+  )
+  OR EXISTS (
+    SELECT 1 FROM claw_workspaces w WHERE w.writer_run_id = claw_tasks.task_id
+  )
+)`;
+
+/**
+ * Adopt, release, verify, offer the gate, then mark complete -- in that order,
+ * each step idempotent, so a failure anywhere leaves the row eligible next tick
+ * rather than half-finished.
+ */
+async function finalizeOneCompensation(row: FinalizableRow): Promise<boolean> {
+  const parsed = parseDispatchCompensationRecord(row.metadata);
+  if (parsed.kind === "unsupported" || parsed.kind === "invalid") {
+    logger.warn(
+      { taskId: row.task_id, kind: parsed.kind },
+      "sweeper.invalid_dispatch_compensation",
+    );
+    return false;
+  }
+  const adopting = parsed.kind === "absent" || parsed.record.state === "armed";
+  if (adopting && !await adoptTerminalReceipt(row, parsed)) return false;
+  // A completed run's result is evidence that work changed the workspace; a
+  // never-held failed or cancelled row changed nothing, and marking it changed
+  // would bump the workspace version for a run that never wrote a byte.
+  // Strict here, unlike every other release: the receipt only reaches
+  // `complete` once the cleanup it records actually happened, so a failure or
+  // an ambiguous resolution has to leave the row for the next tick.
+  const release = await releaseRunUseStrict(row.task_id, row.status === "completed");
+  if (release === "ambiguous" || release === "failed") {
+    logger.warn({ taskId: row.task_id, release }, "sweeper.compensation_release_failed");
+    return false;
+  }
+  if (await stillOwesResources(row.task_id)) {
+    logger.warn({ taskId: row.task_id }, "sweeper.compensation_cleanup_incomplete");
+    return false;
+  }
+  await releaseSessionsOfLostRuns([{ sessionId: row.session_id, messageId: row.message_id }]);
+  return await markReceiptComplete(row.task_id);
+}
+
+async function adoptTerminalReceipt(
+  row: FinalizableRow,
+  parsed: ReturnType<typeof parseDispatchCompensationRecord>,
+): Promise<boolean> {
+  if ((row.failure_reason === null) !== (row.error_message === null)) {
+    logger.warn({ taskId: row.task_id }, "sweeper.terminal_row_missing_reason");
+  }
+  const observed = parsed.kind === "absent"
+    ? null
+    : JSON.stringify((row.metadata ?? {}).dispatch_compensation);
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              metadata, '{dispatch_compensation}',
+              jsonb_build_object(
+                'version', 1, 'state', 'terminal',
+                'failure_reason', to_jsonb($2::text), 'error_message', to_jsonb($3::text)
+              )
+            )
+      WHERE task_id = $1
+        AND status IN ('completed','failed','cancelled')
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL
+        AND COALESCE(claim_count, 0) = 0
+        AND metadata->'dispatch_compensation' IS NOT DISTINCT FROM $4::jsonb
+      RETURNING task_id`,
+    [row.task_id, row.failure_reason, row.error_message, observed],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+async function stillOwesResources(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `SELECT 1
+       WHERE EXISTS (
+         SELECT 1 FROM claw_workspace_refs
+          WHERE ref_kind = 'run' AND ref_id = $1 AND released_at IS NULL
+       ) OR EXISTS (
+         SELECT 1 FROM claw_workspaces WHERE writer_run_id = $1
+       )`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+async function markReceiptComplete(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(
+              metadata, '{dispatch_compensation,state}', '"complete"'::jsonb
+            )
+      WHERE task_id = $1
+        AND metadata->'dispatch_compensation'->>'version' = '1'
+        AND metadata->'dispatch_compensation'->>'state' = 'terminal'
+      RETURNING task_id`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Report every receipt no pass in this deployment will act on.
+ *
+ * Write-free and bounded separately from the writing passes, so a refusal can
+ * never delay a receipt this deployment can finish. This is how an operator
+ * sees a rollout-order violation.
+ */
+export async function auditRefusedCompensations(limit = 20): Promise<number> {
+  const r = await db.query(
+    `SELECT task_id, status,
+            metadata->'dispatch_compensation'->>'version' AS version,
+            metadata->'dispatch_compensation'->>'state' AS state
+       FROM claw_tasks
+      WHERE (
+             (status IN ('completed','failed','cancelled')
+              AND metadata->'dispatch_compensation' IS NOT NULL
+              AND metadata->'dispatch_compensation'->>'state' IS DISTINCT FROM 'complete'
+              AND NOT (${ACTIONABLE_RECEIPT_SQL}))
+             OR (status IN ('preparing','running','cancelling')
+                 AND origin = 'chat'
+                 AND (${UNSUPPORTED_RECEIPT_SQL}))
+      )
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  for (const row of r.rows as Array<{ task_id: string; version: string | null; state: string | null }>) {
+    const event = row.version !== null && row.version !== "1"
+      ? "sweeper.unsupported_dispatch_compensation"
+      : "sweeper.invalid_dispatch_compensation";
+    logger.warn({ taskId: row.task_id, version: row.version, state: row.state }, event);
+  }
+  return r.rowCount;
+}
+
+/** Retry unsettled dispatch cleanup after its reconciliation deadline. */
+export async function reconcileAmbiguousDispatches(limit = 100): Promise<number> {
+  // Revoke the publisher's token atomically with taking the row, before cleanup can yield.
+  const taken = await db.query(
+    `WITH due AS (
+       SELECT task_id FROM claw_tasks
+        WHERE dispatch_reconcile_at IS NOT NULL
+          AND dispatch_reconcile_at < NOW()
+        ORDER BY dispatch_reconcile_at
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE claw_tasks t
+        SET dispatch_reconcile_at = NOW() + ($2::int * INTERVAL '1 second'),
+            metadata = t.metadata - 'dispatch_reconcile_token'
+       FROM due
+      WHERE t.task_id = due.task_id
+      RETURNING t.task_id, t.session_id, t.status, t.failure_reason,
+                COALESCE(t.claim_count, 0) AS claim_count,
+                t.dispatch_reconcile_action AS action,
+                t.metadata->>'message_id' AS message_id`,
+    [limit, DISPATCH_RECONCILE_LEASE_SEC],
+  );
+  if (!taken.rowCount) return 0;
+  let resolved = 0;
+  for (const row of taken.rows as AmbiguousDispatch[]) {
+    try {
+      if (await resolveAmbiguousDispatch(row)) resolved += 1;
+    } catch (err) {
+      logger.warn({ err, taskId: row.task_id }, "sweeper.dispatch_reconcile_failed");
+    }
+  }
+  if (resolved) logger.warn({ resolved }, "sweeper.reconciled_ambiguous_dispatches");
+  return resolved;
+}
+
+interface AmbiguousDispatch {
+  task_id: string;
+  session_id: string;
+  status: string;
+  failure_reason: string | null;
+  claim_count: number;
+  action: string | null;
+  message_id: string | null;
+}
+
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * Settle one such row, then clear the marker -- in that order, so a throw or a
+ * process death leaves the same row eligible on the next tick.
+ *
+ * A row that is held, or was ever claimed, belongs to execution: it loses the
+ * marker without any session rollback, because rolling one back would idle or
+ * delete a session whose turn is running.
+ */
+async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean> {
+  const executed = row.claim_count > 0;
+  if (!executed && !TERMINAL_STATUSES.has(row.status)) {
+    const verdict = await failChatRunDispatch(
+      row.task_id,
+      "the dispatch never reported whether its message was published",
+      "dispatch_failed",
+      { statuses: SWEEPABLE_RUN_STATUSES, fleetAsserted: RUN_FAT_PREPARING_RECONCILE },
+    );
+    if (verdict !== "closed") return false;
+  }
+  const refused = !executed
+    && row.failure_reason === "dispatch_failed"
+    && TERMINAL_STATUSES.has(row.status);
+  if (refused || !executed) {
+    await releaseRunUse(row.task_id, false);
+    if (!await runCleanupAction(row)) return false;
+  }
+  return await clearReconcileMarker(row.task_id);
+}
+
+/**
+ * The cleanup the request path would have run, replayed from a stored value
+ * rather than a reconstructed closure.
+ *
+ * Both actions check occupancy first: later work may have adopted the session,
+ * and preserving that work is what stops the repair pairing a claimable row
+ * with an idle or missing session.
+ */
+async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
+  if (row.action === "idle_existing_session") {
+    await db.query(
+      `UPDATE claw_sessions s
+          SET agent_status = 'idle', agent_gate_message_id = NULL, updated_at = NOW()
+        WHERE s.session_id = $1
+          AND s.agent_status = 'running'
+          AND s.deleted_at IS NULL
+          AND (NOT $3::boolean OR s.agent_gate_message_id IS NOT DISTINCT FROM $2)
+          AND NOT EXISTS (
+            SELECT 1 FROM claw_tasks t
+             WHERE t.session_id = s.session_id
+               AND t.origin = 'chat'
+               AND t.status IN ('queued','preparing','running','cancelling')
+          )`,
+      [row.session_id, row.message_id, gateOwnershipEnforced()],
+    );
+    return true;
+  }
+  if (row.action === "delete_created_session") {
+    const occupied = await db.query(
+      `SELECT 1 FROM claw_tasks
+        WHERE session_id = $1 AND origin = 'chat'
+          AND status IN ('queued','preparing','running','cancelling') LIMIT 1`,
+      [row.session_id],
+    );
+    if (occupied.rowCount) return true;
+    await db.query(
+      "UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+      [row.session_id],
+    );
+    return true;
+  }
+  return true;
+}
+
+async function clearReconcileMarker(taskId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
+      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+      RETURNING task_id`,
+    [taskId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Drain a message parked behind a gate that was handed back without one.
+ *
+ * `dispatchPendingMessage` is reached from exactly one place, the completion
+ * consumer, and only when that completion opened the gate. A dispatch that
+ * fails before execution emits no completion, so a session idled by
+ * publish-failure cleanup with a row still in the queue has no trigger left and
+ * that turn is parked for ever. The occupancy test is the one the consumer
+ * already applies, so this cannot stack a second turn onto a live session.
+ */
+export async function drainOrphanedPendingMessages(limit = 20): Promise<number> {
+  const r = await db.query(
+    `SELECT DISTINCT ON (p.session_id) p.id, p.session_id, p.user_id
+       FROM claw_pending_messages p
+       JOIN claw_sessions s ON s.session_id = p.session_id
+      WHERE s.agent_status = 'idle'
+        AND s.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_tasks t
+           WHERE t.session_id = p.session_id
+             AND t.origin = 'chat'
+             AND t.status IN ('queued','preparing','running','cancelling')
+        )
+      ORDER BY p.session_id, p.created_at
+      LIMIT $1`,
+    [limit],
+  );
+  if (!r.rowCount) return 0;
+  let drained = 0;
+  for (const row of r.rows as Array<{ id: number; session_id: string; user_id: string | null }>) {
+    try {
+      await sweeperPorts.drainPendingMessage(row.session_id, row.user_id ?? "default");
+      drained += 1;
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: row.session_id, pendingId: row.id },
+        "sweeper.orphaned_pending_drain_failed",
+      );
+    }
+  }
+  if (drained) logger.warn({ drained }, "sweeper.drained_orphaned_pending");
+  return drained;
 }
 
 /** Fail `waiting_external` rows past their per-node timeout. */
@@ -1005,6 +1582,7 @@ export async function reapWaitExternal(): Promise<number> {
  * joining them.
  */
 export async function reapStuckSessions(): Promise<number> {
+  const settled = await deliveryObservations();
   const r = await db.query(
     `UPDATE claw_sessions s
         SET agent_status = 'idle',
@@ -1022,10 +1600,16 @@ export async function reapStuckSessions(): Promise<number> {
            WHERE t.session_id = s.session_id
              AND t.origin = 'chat'
              AND t.status IN ('queued','preparing','running','cancelling')
-             AND (t.status = 'queued' OR t.lease_expires_at > NOW())
+             AND (
+               t.status = 'queued'
+               OR t.lease_expires_at > NOW()
+               OR NOT COALESCE((
+                 ${noDeliveryInFlightSql("false", deliverySettledSql("$2", "$3"))}
+               ), false)
+             )
         )
       RETURNING session_id`,
-    [SESSION_STUCK_TIMEOUT_SEC],
+    [SESSION_STUCK_TIMEOUT_SEC, settled.wholeStream, settled.ackFloor],
   );
   if (!r.rowCount) return 0;
   const ids = r.rows.map((row) => (row as { session_id: string }).session_id);
@@ -1097,6 +1681,18 @@ export async function sweeperTick(): Promise<void> {
   // with the reason that explains it rather than the one that noticed second.
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
+  // After reapLostLeases, so an accepted row whose worker died is closed as
+  // worker_lost by its own reaper rather than reclassified as one that never
+  // executed. Each contained independently: a throw from one must not cost the
+  // later passes or the tick's final idempotency-key prune.
+  // Before the queue and session reapers, so a dispatch whose outcome was never
+  // decided is settled by the path that owns it rather than aged out by one
+  // that does not know what it was.
+  await runContained("sweeper.dispatch_reconcile_failed", reconcileAmbiguousDispatches);
+  await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
+  await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);
+  await runContained("sweeper.finalize_compensations_failed", finalizeDispatchCompensations);
+  await runContained("sweeper.audit_compensations_failed", auditRefusedCompensations);
   await runContained("sweeper.expired_queue_failed", reapExpiredQueuedRuns);
   // After the requeue pass: a row inside its deadline belongs to that pass,
   // and only what it declines is this one's.

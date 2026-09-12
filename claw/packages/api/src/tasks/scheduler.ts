@@ -20,10 +20,17 @@
  *   - Tick interval defaults to 2s and is configurable through
  *     `TASK_SCHEDULER_TICK_MS`.
  */
-import { db } from "../infra/db.js";
+import { db, type Querier, type StatementRunner } from "../infra/db.js";
 import pino from "pino";
-import { dispatchTask } from "./dispatcher.js";
-import { applyTaskStatusTransition, listDownstream, transitionStatus, updateTask } from "./db.js";
+import {
+  anySoftCeilingSet, askFromRow, chargeAccepted, envAdmitLimits, fillWithinCeiling,
+  hardOverflow, loadUsageWithRoots, reserveForExecution, softOverflow,
+  withOwnedAdmissionLock, type AdmissionUsage,
+} from "./admission.js";
+import { dispatchPreparedRow, dispatchTask } from "./dispatcher.js";
+import {
+  applyTaskStatusTransition, listDownstream, transitionStatus, updateTask,
+} from "./db.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 
 const logger = pino({ name: "task-scheduler" });
@@ -31,25 +38,105 @@ const logger = pino({ name: "task-scheduler" });
 const TICK_MS = Number(process.env.TASK_SCHEDULER_TICK_MS || 2000);
 const MAX_DISPATCH_PER_TICK = Number(process.env.TASK_SCHEDULER_MAX_DISPATCH || 8);
 const DISPATCH_TIMEOUT_MS = Number(process.env.TASK_SCHEDULER_DISPATCH_TIMEOUT_MS || 30_000);
+/** How many ready rows one promotion pass considers, paging past those that do not fit. */
+const MAX_PROMOTE_PAGE = Number(process.env.TASK_SCHEDULER_MAX_PROMOTE || 64);
 
 let stopped = false;
 let timer: NodeJS.Timeout | null = null;
 
-/**
- * Promote `waiting_deps` rows whose every dep is `completed` to `queued`.
- * Returns the number of promoted rows; useful in tests.
- */
-export async function promoteReadyTasks(): Promise<number> {
-  const rows = await applyTaskStatusTransition("queued", {
-    where: `status = 'waiting_deps'
+const READY_PREDICATE_SQL = `status = 'waiting_deps'
        AND NOT EXISTS (
          SELECT 1 FROM unnest(claw_tasks.depends_on) dep
          JOIN claw_tasks p ON p.task_id = dep
          WHERE p.status <> 'completed'
-       )`,
+       )`;
+
+async function readyCandidates(
+  client: StatementRunner,
+  skip: string[],
+  limit: number,
+): Promise<ClawTaskRow[]> {
+  const r = await client.query(
+    `SELECT * FROM claw_tasks
+      WHERE ${READY_PREDICATE_SQL}
+        AND NOT (task_id = ANY($1::text[]))
+      ORDER BY priority DESC, created_at ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED`,
+    [skip, limit],
+  );
+  return r.rows as ClawTaskRow[];
+}
+
+/**
+ * Greedily accept ready rows while cumulative demand stays under every ceiling.
+ *
+ * A row-count `LIMIT` cannot express this: one row may request many GPU nodes,
+ * and run-root headroom is a third dimension a row limit does not bound at all.
+ * Pure, so the accounting is testable without a database.
+ */
+export function acceptWithinHardHeadroom(
+  candidates: readonly ClawTaskRow[],
+  usage: AdmissionUsage,
+  roots: Set<string>,
+): ClawTaskRow[] {
+  return candidates.filter((row) => chargeIfWithinHardHeadroom(row, usage, roots));
+}
+
+/** One candidate's half of {@link acceptWithinHardHeadroom}, so paging can test as it reads. */
+function chargeIfWithinHardHeadroom(
+  row: ClawTaskRow,
+  usage: AdmissionUsage,
+  roots: Set<string>,
+): boolean {
+  const ask = askFromRow(row, roots);
+  if (hardOverflow(usage, ask, envAdmitLimits())) return false;
+  chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
+  return true;
+}
+
+/**
+ * Promote `waiting_deps` rows whose every dep is `completed` to `queued`.
+ *
+ * Entry into the committed set for a row whose graph was admitted at expansion,
+ * so a hard ceiling defers rather than refuses: a mid-flight node destroying
+ * completed upstream work to reclaim capacity the graph was already granted is
+ * the failure this shape avoids. Rows not accepted are reconsidered next tick.
+ *
+ * @returns the number of promoted rows; useful in tests.
+ */
+export async function promoteReadyTasks(): Promise<number> {
+  const limits = envAdmitLimits();
+  if (limits.hardRuns <= 0 && limits.hardSandboxes <= 0 && limits.hardGpuNodes <= 0) {
+    // Through the one writer of `status`, so a promotion banks the segment the
+    // row just spent and stamps its run-time epoch. Its own UPDATE dropped both.
+    const promoted = await applyTaskStatusTransition("queued", {
+      where: READY_PREDICATE_SQL,
+    });
+    return promoted.length;
+  }
+  return await withOwnedAdmissionLock(async (client) => {
+    const { usage, roots } = await loadUsageWithRoots("occupying", client);
+    const admitted = await fillWithinCeiling<ClawTaskRow>({
+      page: (skip) => readyCandidates(client, skip, MAX_PROMOTE_PAGE),
+      fits: (row) => chargeIfWithinHardHeadroom(row, usage, roots),
+      want: MAX_PROMOTE_PAGE,
+      idOf: (row) => row.task_id,
+    });
+    if (!admitted.length) return 0;
+    // The readiness predicate is repeated in the write: the advisory lock
+    // serialises admission decisions, not the whole task lifecycle, so
+    // `cascadeFailures` and cancellation may have failed one of these rows
+    // since it was selected, and an unconditional UPDATE would resurrect it.
+    // On the lock's own connection, and through the same writer: the ceiling
+    // decision is what this path adds, not a second way of writing a status.
+    const promoted = await applyTaskStatusTransition("queued", {
+      where: `task_id = ANY($1::text[]) AND ${READY_PREDICATE_SQL}`,
+      params: [admitted.map((row) => row.task_id)],
+      query: ((text, params) => client.query(text, params)) as Querier,
+    });
+    return promoted.length;
   });
-  const r = { rows, rowCount: rows.length };
-  return r.rowCount ?? 0;
 }
 
 /**
@@ -109,19 +196,24 @@ export async function aggregateDagRoots(): Promise<number> {
   return updated;
 }
 
-async function pickQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
+async function pickQueuedTasks(
+  limit: number,
+  skip: string[] = [],
+  client?: StatementRunner,
+): Promise<ClawTaskRow[]> {
   // Chat doorbell rows sit at `queued` until a Brain claims them. This loop
   // is the DAG publisher: if it takes those rows it CAS-es them to
   // `preparing` and puts a fat execute request on the same durable, which is
   // how a full replica ended up holding work that was supposed to wait on
   // the row.
-  const r = await db.query(
+  const r = await (client ?? db).query(
     `SELECT * FROM claw_tasks
      WHERE status = 'queued' AND executor = 'brain'
        AND origin IS DISTINCT FROM 'chat'
+       AND NOT (task_id = ANY($2::text[]))
      ORDER BY priority DESC, queued_at ASC NULLS LAST
      LIMIT $1`,
-    [limit],
+    [limit, skip],
   );
   return r.rows as ClawTaskRow[];
 }
@@ -132,6 +224,18 @@ async function pickQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
  * timeouts; this outer guard protects the scheduler itself.
  */
 async function dispatchWithTimeout(task: ClawTaskRow): Promise<void> {
+  await withDispatchTimeout(task, () => dispatchTask(task.task_id));
+}
+
+/** The reserved row's half: the CAS already ran on the admission transaction. */
+async function dispatchPreparedWithTimeout(task: ClawTaskRow): Promise<void> {
+  await withDispatchTimeout(task, () => dispatchPreparedRow(task));
+}
+
+async function withDispatchTimeout(
+  task: ClawTaskRow,
+  run: () => Promise<{ ok: boolean; reason?: string }>,
+): Promise<void> {
   const started = Date.now();
   logger.info(
     { taskId: task.task_id, dag_id: task.dag_id, dag_node_id: task.dag_node_id, mode: task.mode },
@@ -145,7 +249,7 @@ async function dispatchWithTimeout(task: ClawTaskRow): Promise<void> {
     );
   });
   try {
-    const result = await Promise.race([dispatchTask(task.task_id), timeout]);
+    const result = await Promise.race([run(), timeout]);
     logger.info(
       { taskId: task.task_id, ok: result.ok, reason: result.reason, elapsedMs: Date.now() - started },
       "scheduler.dispatch.done",
@@ -162,16 +266,61 @@ async function dispatchWithTimeout(task: ClawTaskRow): Promise<void> {
   }
 }
 
+/**
+ * Select and reserve queued rows the executing set still has room for.
+ *
+ * The usage read, the selection and the `queued → preparing` reservation are
+ * one transaction on one connection: a snapshot followed by an unlocked CAS is
+ * not a ceiling, every replica's tick otherwise admitting a full batch against
+ * the same free slot.
+ */
+async function reserveQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
+  const limits = envAdmitLimits();
+  if (!anySoftCeilingSet(limits)) return [];
+  return await withOwnedAdmissionLock(async (client) => {
+    const { usage, roots } = await loadUsageWithRoots("executing", client);
+    const accepted = await fillWithinCeiling<ClawTaskRow>({
+      page: (skip) => pickQueuedTasks(limit, skip, client),
+      fits: (row) => {
+        const ask = askFromRow(row, roots);
+        if (softOverflow(usage, ask, limits)) return false;
+        chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
+        return true;
+      },
+      want: limit,
+      idOf: (row) => row.task_id,
+    });
+    return await reserveForExecution(
+      client,
+      accepted,
+      // `transitionStatus` takes the querier as a function now; the reservation
+      // still hands out the connection object it holds the lock on.
+      (row, c) => transitionStatus(
+        row.task_id, ["queued"], "preparing", {},
+        ((text, params) => c.query(text, params)) as Querier,
+      ),
+    );
+  });
+}
+
 export async function schedulerTick(): Promise<void> {
   try {
     await promoteReadyTasks();
     await cascadeFailures();
     await aggregateDagRoots();
-    const queued = await pickQueuedTasks(MAX_DISPATCH_PER_TICK);
     // Dispatch in parallel within a tick. Each dispatch is independently
     // bounded by `dispatchWithTimeout`, so a single hang cannot stall the
     // tick — but successful dispatches happen concurrently so high-fan-out
     // DAG instances do not get serialised at MAX_DISPATCH_PER_TICK × stage.
+    if (anySoftCeilingSet(envAdmitLimits())) {
+      // Already `preparing`, and reserved before the lock was released: the
+      // render and publish stages take seconds and the slot they will use is
+      // taken, so they deliberately run outside the transaction.
+      const reserved = await reserveQueuedTasks(MAX_DISPATCH_PER_TICK);
+      await Promise.allSettled(reserved.map((t) => dispatchPreparedWithTimeout(t)));
+      return;
+    }
+    const queued = await pickQueuedTasks(MAX_DISPATCH_PER_TICK);
     await Promise.allSettled(queued.map((t) => dispatchWithTimeout(t)));
   } catch (e) {
     logger.error({ err: (e as Error).message }, "scheduler.tick_failed");

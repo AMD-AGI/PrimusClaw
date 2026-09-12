@@ -107,6 +107,14 @@ test("keeps claim_count required, since takeClaim increments it on every claim",
   assert.ok(tasks?.columns.includes("claim_count"));
 });
 
+test("names the session gate owner column before a request tries to write it", () => {
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_sessions", "agent_gate_message_id"]]),
+  );
+  assert.deepEqual(problems, ["claw_sessions is missing column(s): agent_gate_message_id"]);
+});
+
 for (const column of [
   "attempt_id",
   "attempt_generation",
@@ -145,4 +153,46 @@ test("names the throwaway-workspace column, which every task insert writes", () 
 test("keeps workspace_throwaway required, since insertTask names it on every row", () => {
   const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
   assert.ok(tasks?.columns.includes("workspace_throwaway"));
+});
+
+test("names the reconciliation marker, whose absence disarms the sweeper silently", () => {
+  // Nothing fails on the request path when this column is gone. The dispatch
+  // simply stops recording that its publish was ambiguous, and the rows nobody
+  // reconciles pair a claimable run with a session that was rolled back.
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_tasks", "dispatch_reconcile_at"]]),
+  );
+  assert.deepEqual(problems, ["claw_tasks is missing column(s): dispatch_reconcile_at"]);
+});
+
+test("names the reconciliation action, without which cleanup cannot be replayed", () => {
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_tasks", "dispatch_reconcile_action"]]),
+  );
+  assert.deepEqual(problems, ["claw_tasks is missing column(s): dispatch_reconcile_action"]);
+});
+
+test("names the queued message's durable run id, whose absence duplicates a turn", () => {
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([["claw_pending_messages", "dispatch_task_id"]]),
+  );
+  assert.deepEqual(problems, ["claw_pending_messages is missing column(s): dispatch_task_id"]);
+});
+
+test("reports all three dispatch columns at once, since one migration adds them", () => {
+  const problems = missingSchemaObjects(
+    REQUIRED_SCHEMA,
+    without([
+      ["claw_tasks", "dispatch_reconcile_at"],
+      ["claw_tasks", "dispatch_reconcile_action"],
+      ["claw_pending_messages", "dispatch_task_id"],
+    ]),
+  ).sort();
+  assert.deepEqual(problems, [
+    "claw_pending_messages is missing column(s): dispatch_task_id",
+    "claw_tasks is missing column(s): dispatch_reconcile_at, dispatch_reconcile_action",
+  ]);
 });

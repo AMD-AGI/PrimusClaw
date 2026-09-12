@@ -144,6 +144,10 @@ verify-lint:
 	@bash claw/scripts/lint-no-direct-hands-calltool-in-workspace.sh --all
 	@echo "==> lint: prom-client metric registration"
 	@bash claw/scripts/lint-metrics-must-register.sh --all
+	@bash claw/scripts/lint-metrics-must-register.sh --self-test
+	@echo "==> lint: startup asserts the rollout config before listening"
+	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --all
+	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --self-test
 	@echo "==> lint: session-event redaction"
 	@bash claw/scripts/lint-session-events-must-redact.sh --all
 	@echo "==> lint: checkpoints are sealed, not redacted"
@@ -162,6 +166,8 @@ verify-lint:
 	else \
 		echo "error: go is required for gofmt verification" >&2; exit 1; \
 	fi
+	@echo "==> lint: PromQL rollout gates"
+	@bash scripts/release-tests/promql-gates.sh
 	@# The last gate before anything reaches a public tree. It needs ripgrep with
 	@# PCRE2 and exits 2 rather than reporting a clean tree it never searched.
 	@echo "==> lint: public tree scan"

@@ -21,6 +21,7 @@ import {
   TASK_CONSUMER_ACK_WAIT_MS,
   TASK_CONSUMER_NAME, TASK_STREAM_NAME,
   isRunDoorbell,
+  DOORBELL_SEMANTICS_VERSION,
 } from "@claw/protocol";
 import {
   EXECUTOR_HOST, EXECUTOR_PORT, NATS_URL, BRAIN_ID,
@@ -44,6 +45,7 @@ import {
   LLM_CACHE_STYLE,
   openAiBaseUrlFellBack,
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
+  RUN_DOORBELL_DISPATCH,
 } from "./config.js";
 import { existsSync, createReadStream } from "fs";
 import { initDagHandles } from "./sandbox/handles.js";
@@ -65,12 +67,12 @@ import { bindTaskRunnerDeps } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest } from "./tasks/dispatch.js";
 import { claimNextRun } from "./clients/run-claim.js";
 import { flushPendingRetries } from "./delivery/doorbell-delivery.js";
-import { startClaimNextLoop } from "./delivery/claim-next-loop.js";
+import { claimNextEnabled, startClaimNextLoop } from "./delivery/claim-next-loop.js";
 import { taskExecutionGate } from "./tasks/execution-gate.js";
 import { setParkHooks } from "./tasks/run-phase.js";
 import { keepDeliveryAlive } from "./delivery/heartbeat.js";
 import {
-  runDelivery, DeliveryResidency, SURPLUS_REFUSALS, type DeliveryDeps,
+  runDelivery, createFatPreGate, DeliveryResidency, SURPLUS_REFUSALS, type DeliveryDeps,
 } from "./delivery/dispatch.js";
 import pino from "pino";
 import {
@@ -364,6 +366,16 @@ function validateStartupConfig(): void {
       "startup.workspace_persistence_disabled: WORKSPACE_PERSIST_BASE is empty; using S3-only durability",
     );
   }
+  // Not fatal: a fat-only deployment legitimately runs this way. But in this
+  // combination a doorbell this pod declines has no route through it at all --
+  // no claim from the message, and no claim-next loop to find the row later.
+  if (!RUN_DOORBELL_DISPATCH && !INTERNAL_BACKEND_URL) {
+    logger.warn(
+      "startup.doorbell_execution_unreachable: RUN_DOORBELL_DISPATCH is false and "
+      + "INTERNAL_BACKEND_URL is unset, so this pod declines every doorbell and runs no "
+      + "claim-next loop; any doorbell row it declines depends entirely on other replicas",
+    );
+  }
   // SANDBOX_POLL_TIMEOUT_MS kept its exact key and default but its meaning
   // changed: it now bounds ONLY an UNREADABLE SaFE status, not the whole
   // provisioning wait. A value tuned under the old "absolute ceiling" meaning
@@ -647,6 +659,9 @@ async function main() {
         return false;
       }
     },
+    // A fat chat delivery holds a durable SQL lease before it queues for a
+    // slot, so a Stop reaches it through the row while nothing else can.
+    fatPreGate: createFatPreGate({ emit: (sessionId, evt) => emitter.emit(sessionId, evt) }),
     handle: (m) => handleTask(m),
     onError: (err) => logger.error({ err }, "task.unhandled"),
     onRefuse: (kind) => {
@@ -671,9 +686,7 @@ async function main() {
   })();
 
   startClaimNextLoop({
-    // Flag-off still drains leftover doorbell rows; peekNextQueued ignores
-    // anything that is not a doorbell chat run.
-    enabled: Boolean(INTERNAL_BACKEND_URL),
+    enabled: claimNextEnabled(INTERNAL_BACKEND_URL, RUN_DOORBELL_DISPATCH),
     idleMs: CLAIM_NEXT_IDLE_MS,
     isDraining,
     isShuttingDown,
@@ -873,6 +886,9 @@ async function main() {
     engine: LLM_API_STYLE,
     brainId: BRAIN_ID,
     brainVersion: BRAIN_VERSION,
+    // The delivery-semantics contract this binary was built with, so an
+    // operator can read the fleet floor rather than assert it blind.
+    doorbellSemantics: DOORBELL_SEMANTICS_VERSION,
     // Whether this pod is still taking new work, and why not. Without this a
     // drain that silently failed to fire and one that fired correctly look
     // identical from outside -- the pod answers "ok" either way -- and a fleet

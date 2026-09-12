@@ -17,7 +17,8 @@
  * routes are for *catalog / list / aggregation* concerns only so the
  * generic task abstraction stays primary.
  */
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { PoolClient } from "pg";
 import pino from "pino";
 import { authMiddleware, getUser } from "../auth/middleware.js";
 import {
@@ -31,12 +32,16 @@ import {
   sessionCredentialPatch,
 } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { workbenchRegistry } from "./registry.js";
 import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
-import { expandDag } from "../tasks/dag-expander.js";
+import { withAdmissionTransaction, type AfterCommit } from "../tasks/admission.js";
+import {
+  expandDag, isCreateRefusal, isTopologyRefusal, type CreateRefusal,
+} from "../tasks/dag-expander.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { WorkbenchCtx, WorkbenchDef, RunsListItem } from "./types.js";
 
@@ -47,11 +52,19 @@ interface CreateRunBody {
   [key: string]: unknown;
 }
 
+/**
+ * The caller's session, or a fresh hidden one for this run.
+ *
+ * `created` is reported rather than counted here: the insert runs on the
+ * transaction a later refusal -- or a failing `COMMIT` -- undoes, so only the
+ * transaction itself knows whether a session outlived the request.
+ */
 async function ensureSession(
   workbench: WorkbenchDef,
   user: UserInfo,
   body: Record<string, unknown>,
-): Promise<string> {
+  client: PoolClient,
+): Promise<{ sessionId: string; created: boolean }> {
   assertSessionCredentialsForDispatch(
     (body.session_id as string | undefined) ?? "new workbench session",
     user,
@@ -62,7 +75,7 @@ async function ensureSession(
   const runConfigPatch = sessionCredentialPatch(user);
   const provided = (body.session_id as string | undefined) ?? undefined;
   if (provided) {
-    const r = await db.query(
+    const r = await client.query(
       `SELECT session_id, user_id
          FROM claw_sessions
         WHERE session_id = $1 AND deleted_at IS NULL`,
@@ -75,20 +88,20 @@ async function ensureSession(
       if (!canAccessSession(r.rows[0].user_id, user.userId)) {
         throw new Error("session_access_denied");
       }
-      await db.query(
+      await client.query(
         `UPDATE claw_sessions
             SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
           WHERE session_id = $1`,
         [provided, JSON.stringify(runConfigPatch)],
       );
-      return provided;
+      return { sessionId: provided, created: false };
     }
   }
   const sid = (await import("node:crypto")).randomUUID();
   const sessionName = workbench.runs.sessionName
     ? workbench.runs.sessionName(body)
     : `${workbench.id}-run`;
-  await db.query(
+  await client.query(
     `INSERT INTO claw_sessions (session_id, name, user_id, mode, config)
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
     [
@@ -110,7 +123,20 @@ async function ensureSession(
       }),
     ],
   );
-  return sid;
+  return { sessionId: sid, created: true };
+}
+
+/** The wording every gated creation surface uses, so one refusal reads the same everywhere. */
+async function sendRunRefusal(reply: FastifyReply, refusal: CreateRefusal): Promise<void> {
+  if (isTopologyRefusal(refusal)) {
+    await reply.status(400).send({
+      ok: false, error: "invalid_topology", errors: refusal.invalidTopology,
+    });
+    return;
+  }
+  await reply.status(429).send({
+    ok: false, error: "admission_rejected", reason: refusal.reason,
+  });
 }
 
 function buildCtx(req: FastifyRequest): WorkbenchCtx {
@@ -137,7 +163,7 @@ async function publicAgentOptions(d: WorkbenchDef) {
   }));
 }
 
-export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<void> {
+export async function registerWorkbenchCatalogRoutes(app: FastifyInstance): Promise<void> {
   // ── List + detail ────────────────────────────────────────────────────
   app.get("/v1/workbenches", { preHandler: authMiddleware }, async () => {
     return { workbenches: workbenchRegistry.list() };
@@ -202,7 +228,9 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
     },
   );
 
-  // ── Runs (create + list) ─────────────────────────────────────────────
+}
+
+export async function registerWorkbenchRunRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { workbenchId: string }; Body: CreateRunBody }>(
     "/v1/workbenches/:workbenchId/runs",
     { preHandler: authMiddleware },
@@ -232,19 +260,6 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
         return reply.status(400).send({ ok: false, error: String((e as Error)?.message || e) });
       }
 
-      let sessionId: string;
-      try {
-        sessionId = await ensureSession(d, user, body);
-      } catch (e) {
-        if ((e as Error)?.message === "session_access_denied") {
-          return reply.status(403).send({ ok: false, error: "session_access_denied" });
-        }
-        if (e instanceof MissingPlatformKeyError) {
-          return reply.status(403).send({ ok: false, error: "missing_platform_key" });
-        }
-        throw e;
-      }
-
       // Resolve plugin row referenced by the workbench. The expanded tasks
       // inherit sandbox image / resources / tool list from this row so DAG
       // JSON does not need to repeat them per node.
@@ -269,27 +284,79 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
         ? { ...normalised, user_env: userEnvSnapshot }
         : normalised;
 
-      const result = await expandDag({
-        session_id: sessionId,
-        user_id: user.userId,
-        dag: dagRow as unknown as TaskDagDef & { metadata: { derived: any } },
-        plugin,
-        input: inputWithEnv,
-      });
-      logger.info(
-        {
-          workbench_id: d.id,
-          run_id: result.dag_root_task_id,
-          session_id: sessionId,
-          plugin_id: plugin.id,
-          plugin_version: plugin.version,
-        },
-        "workbench.run.created",
+      // `ensureSession` may create a session outright, and a refusal must not
+      // leave it behind: it runs on the transaction the refusal rolls back,
+      // whose first statement is the admission lock.
+      return await withAdmissionTransaction<unknown>(
+        (client, afterCommit) => submitWorkbenchRun(client, {
+          workbench: d, user, body, reply, dagRow, plugin, input: inputWithEnv,
+        }, afterCommit),
       );
-      return { ok: true, run_id: result.dag_root_task_id, session_id: sessionId };
     },
   );
+}
 
+interface WorkbenchRunSubmission {
+  workbench: WorkbenchDef;
+  user: UserInfo;
+  body: CreateRunBody;
+  reply: FastifyReply;
+  dagRow: unknown;
+  plugin: { id: number; version: string; image: string; resource: Record<string, unknown>; tools: unknown[] };
+  input: Record<string, unknown>;
+}
+
+async function submitWorkbenchRun(
+  client: PoolClient,
+  run: WorkbenchRunSubmission,
+  afterCommit: AfterCommit,
+): Promise<{ commit: boolean; value: unknown }> {
+  const { reply } = run;
+  let session: { sessionId: string; created: boolean };
+  try {
+    session = await ensureSession(run.workbench, run.user, run.body, client);
+  } catch (e) {
+    if ((e as Error)?.message === "session_access_denied") {
+      await reply.status(403).send({ ok: false, error: "session_access_denied" });
+      return { commit: false, value: reply };
+    }
+    if (e instanceof MissingPlatformKeyError) {
+      await reply.status(403).send({ ok: false, error: "missing_platform_key" });
+      return { commit: false, value: reply };
+    }
+    throw e;
+  }
+  const { sessionId } = session;
+
+  const result = await expandDag({
+    session_id: sessionId,
+    user_id: run.user.userId,
+    dag: run.dagRow as TaskDagDef & { metadata: { derived: any } },
+    plugin: run.plugin,
+    input: run.input,
+  }, client);
+  if (isCreateRefusal(result)) {
+    await sendRunRefusal(reply, result);
+    return { commit: false, value: reply };
+  }
+  logger.info(
+    {
+      workbench_id: run.workbench.id,
+      run_id: result.dag_root_task_id,
+      session_id: sessionId,
+      plugin_id: run.plugin.id,
+      plugin_version: run.plugin.version,
+    },
+    "workbench.run.created",
+  );
+  if (session.created) afterCommit(() => metrics.onSessionCreated("ok"));
+  return {
+    commit: true,
+    value: { ok: true, run_id: result.dag_root_task_id, session_id: sessionId },
+  };
+}
+
+export async function registerWorkbenchRunListRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { workbenchId: string } }>(
     "/v1/workbenches/:workbenchId/runs",
     { preHandler: authMiddleware },
@@ -383,7 +450,9 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
     },
   );
 
-  // ── Leaderboard ──────────────────────────────────────────────────────
+}
+
+export async function registerWorkbenchLeaderboardRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { workbenchId: string } }>(
     "/v1/workbenches/:workbenchId/leaderboard",
     { preHandler: authMiddleware },
@@ -394,4 +463,11 @@ export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<voi
       return await d.leaderboard.query(buildCtx(req), filters);
     },
   );
+}
+
+export async function registerWorkbenchRoutes(app: FastifyInstance): Promise<void> {
+  await registerWorkbenchCatalogRoutes(app);
+  await registerWorkbenchRunRoutes(app);
+  await registerWorkbenchRunListRoutes(app);
+  await registerWorkbenchLeaderboardRoutes(app);
 }

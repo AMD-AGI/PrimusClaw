@@ -11,6 +11,7 @@
  * has. Getting this backwards is not a smaller version of the same mistake --
  * it terminates the message the live worker is running from.
  */
+import { askRunLease } from "../src/tasks/callback.js";
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { ExecuteRequest } from "@claw/protocol";
@@ -93,4 +94,65 @@ test("a run with no lease endpoint says nothing and calls nobody", async () => {
   globalThis.fetch = (async () => { called = true; throw new Error("unreachable"); }) as never;
   assert.equal(await postRunLease({ session_id: "s-1" } as ExecuteRequest, renewal), null);
   assert.equal(called, false);
+});
+
+test("every renewal quotes the generation the row fenced this attempt on", async () => {
+  // `brain_id` is a pod name, so a fenced row cannot tell this attempt from
+  // its successor without the generation. A renewal that arrives without one
+  // is refused as `superseded`, and the healthy owner aborts a run nobody
+  // took over.
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url: unknown, init: { body: string }) => {
+    bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+    return { ok: true, status: 200, async json() { return { ok: true, status: "running" }; } };
+  }) as unknown as typeof fetch;
+
+  assert.equal(await postRunLease(request, { ...renewal, runClaim: 6 }), "running");
+  assert.equal(bodies[0].run_claim, 6, "the row fences every later renewal on this");
+
+  // Absent stays absent: an API that issued no generation must not be quoted
+  // one this worker invented.
+  assert.equal(await postRunLease(request, renewal), "running");
+  assert.equal("run_claim" in bodies[1], false);
+});
+
+test("an acceptance says so on the wire, and an ordinary renewal does not", async () => {
+  // `accept` is the only thing on this body that tells the endpoint the POST is
+  // asking to OPEN a generation rather than renew one already held. Missing, a
+  // doorbell-claimed run's first lease POST is read as a renewal of a row
+  // nothing ever fenced, the run is refused as superseded, and the turn the
+  // user is waiting on never executes.
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+    return { ok: true, status: 200, async json() { return { ok: true, status: "running" }; } };
+  }) as unknown as typeof fetch;
+
+  assert.equal(await postRunLease(request, { ...renewal, accept: true }), "running");
+  assert.equal(await postRunLease(request, renewal), "running");
+
+  assert.equal(bodies[0].accept, true, "the acceptance is what opens the generation");
+  assert.equal(
+    "accept" in bodies[1], false,
+    "and a heartbeat that claimed to be one would re-open it on every tick",
+  );
+});
+
+test("a granted renewal carries back the generation the row is fenced on", async () => {
+  // The generation is what the fat acceptance stores as its run claim and
+  // quotes on every later renewal and completion. Dropped here, the worker
+  // believes it holds none, omits it downstream, and the row it is running
+  // refuses its own holder's heartbeat.
+  apiAnswers(200, { ok: true, status: "running", claim_count: 4 });
+
+  assert.deepEqual(
+    await askRunLease(request, renewal),
+    { kind: "granted", status: "running", claimCount: 4 },
+  );
+});
+
+test("a grant from an API that predates the generation carries none rather than inventing one", async () => {
+  apiAnswers(200, { ok: true, status: "running" });
+
+  assert.deepEqual(await askRunLease(request, renewal), { kind: "granted", status: "running" });
 });

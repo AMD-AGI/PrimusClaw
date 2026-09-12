@@ -2,13 +2,32 @@
 // SPDX-License-Identifier: MIT
 
 import type { FastifyInstance } from "fastify";
-import { nc, kv, sc } from "../infra/nats.js";
+import { nc, kv, kvDoorbellFloor, sc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
-import { interruptSubject } from "@claw/protocol";
-import { interruptUnstartedChatRuns } from "../tasks/chat-run.js";
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import { stopSessionRuns } from "../tasks/chat-run.js";
+import { countIncompatibleDoorbellRuns } from "../tasks/run-claim.js";
+import {
+  DOORBELL_SEMANTICS_KEY, doorbellGateOpen, doorbellInFlight, doorbellLatch,
+} from "../tasks/doorbell-gate.js";
 import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
+
+async function readKvString(key: string): Promise<string | null> {
+  try {
+    const entry = await kv.get(key);
+    return entry ? sc.decode(entry.value) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The floor lives in its own non-expiring bucket; see DOORBELL_FLOOR_BUCKET. */
+async function readFloorString(): Promise<string | null> {
+  const e = await kvDoorbellFloor.get(DOORBELL_SEMANTICS_KEY).catch(() => null);
+  return e ? sc.decode(e.value) : null;
+}
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -23,18 +42,67 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const key = "brain.min_version";
-    let previous: string | null = null;
-    try {
-      const prev = await kv.get(key);
-      previous = prev ? sc.decode(prev.value) : null;
-    } catch {
-      previous = null;
-    }
+    const previous = await readKvString(key);
 
     await kv.put(key, sc.encode(minVersion));
     req.log.info({ key, previous, current: minVersion }, "brain.min_version.updated");
     return { ok: true, key, value: minVersion, previous };
   });
+
+  // Not the min-version key: that names a deployment tag, this a contract version.
+  app.post("/v1/internal/brain/doorbell-semantics", { preHandler: internalAuth }, async (req, reply) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const semantics = body.semantics;
+    if (typeof semantics !== "number" || !Number.isInteger(semantics) || semantics < 1) {
+      return reply.status(400).send({
+        ok: false,
+        error: "semantics must be an integer of at least 1",
+      });
+    }
+    // A stored floor above this binary's own version has no reader that can act on it.
+    if (semantics > DOORBELL_SEMANTICS_VERSION) {
+      return reply.status(400).send({
+        ok: false,
+        error: `semantics must not exceed this API's own ${DOORBELL_SEMANTICS_VERSION}`,
+      });
+    }
+    const previous = await readFloorString();
+    await kvDoorbellFloor.put(DOORBELL_SEMANTICS_KEY, sc.encode(String(semantics)));
+    req.log.info(
+      { key: DOORBELL_SEMANTICS_KEY, previous, current: semantics },
+      "brain.doorbell_semantics.updated",
+    );
+    return { ok: true, key: DOORBELL_SEMANTICS_KEY, value: semantics, previous };
+  });
+
+  // The gate closing does not prove nothing more is coming; poll in-flight too.
+  app.delete("/v1/internal/brain/doorbell-semantics", { preHandler: internalAuth }, async (req) => {
+    const previous = await readFloorString();
+    await kvDoorbellFloor.delete(DOORBELL_SEMANTICS_KEY);
+    req.log.warn({ key: DOORBELL_SEMANTICS_KEY, previous }, "brain.doorbell_semantics.revoked");
+    return { ok: true, key: DOORBELL_SEMANTICS_KEY, previous };
+  });
+
+  // Every non-terminal state: a claimed row becomes queued again on the drain.
+  app.get<{ Querystring: { version?: string } }>(
+    "/v1/internal/brain/doorbell-gate",
+    { preHandler: internalAuth },
+    async (req, reply) => {
+      const raw = req.query.version;
+      const version = raw === undefined ? DOORBELL_SEMANTICS_VERSION : Number(raw);
+      if (!Number.isInteger(version) || version < 1) {
+        return reply.status(400).send({ ok: false, error: "version must be an integer of at least 1" });
+      }
+      return {
+        ok: true,
+        gate: doorbellGateOpen() ? 1 : 0,
+        in_flight: doorbellInFlight(),
+        latch: doorbellLatch().state,
+        supported: DOORBELL_SEMANTICS_VERSION,
+        incompatible_runs: await countIncompatibleDoorbellRuns(version),
+      };
+    },
+  );
 
   // Sandbox status (ops debug). Admin only — scans NATS KV for all Hands
   // entries and health-checks each endpoint. Mirrors V1 get_executor_sandbox_status.
@@ -96,8 +164,12 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!canWriteSessionAsOperator(session.user_id, user)) {
       return reply.status(403).send({ ok: false, error: "access denied" });
     }
-    nc.publish(interruptSubject(sessionId));
-    await interruptUnstartedChatRuns(sessionId);
+    // A caller told `ok` for a Stop that reached neither half never retries it.
+    try {
+      await stopSessionRuns(sessionId);
+    } catch {
+      return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+    }
     return { ok: true };
   });
 

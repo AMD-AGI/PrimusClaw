@@ -1,0 +1,40 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+  Refuse the two admission value combinations values.schema.json cannot see,
+  both of which are cross-key relations rather than per-key shapes: a soft
+  ceiling above its own hard ceiling, and admission configured while Doorbell
+  dispatch is off. The API refuses to start on the second, so without this the
+  operator learns of it as a CrashLoopBackOff mid-rollback.
+
+  Unlike preflight.yaml this reads values only and is not `lookup`-guarded: a
+  check that never runs under `helm template` cannot be render-tested.
+
+  This template intentionally emits no manifest.
+*/ -}}
+{{- $api := .Values.api | default dict }}
+{{- $ceilings := dict }}
+{{- range $key := list "admitSoftRuns" "admitHardRuns" "admitSoftSandboxes" "admitHardSandboxes" "admitSoftGpuNodes" "admitHardGpuNodes" "admitTreeMaxNodes" "admitTreeMaxDepth" }}
+{{-   $_ := set $ceilings $key (atoi (toString (get $api $key | default "0"))) }}
+{{- end }}
+{{- range $pair := list (list "admitSoftRuns" "admitHardRuns") (list "admitSoftSandboxes" "admitHardSandboxes") (list "admitSoftGpuNodes" "admitHardGpuNodes") }}
+{{-   $softKey := index $pair 0 }}
+{{-   $hardKey := index $pair 1 }}
+{{-   $soft := get $ceilings $softKey }}
+{{-   $hard := get $ceilings $hardKey }}
+{{-   if and (gt $soft 0) (gt $hard 0) (gt $soft $hard) }}
+{{-     fail (printf "api.%s is %d and api.%s is %d: a soft ceiling above its hard ceiling queues runs that the hard ceiling then refuses. Set api.%s at or below api.%s." $softKey $soft $hardKey $hard $softKey $hardKey) }}
+{{-   end }}
+{{- end }}
+{{- $configured := list }}
+{{- range $key := list "admitSoftRuns" "admitHardRuns" "admitSoftSandboxes" "admitHardSandboxes" "admitSoftGpuNodes" "admitHardGpuNodes" "admitTreeMaxNodes" "admitTreeMaxDepth" }}
+{{-   if gt (get $ceilings $key) 0 }}
+{{-     $configured = append $configured (printf "api.%s" $key) }}
+{{-   end }}
+{{- end }}
+{{- if $configured }}
+{{-   if ne true (get (.Values.features | default dict) "runDoorbellDispatch") }}
+{{-     fail (printf "%s is non-zero while features.runDoorbellDispatch is not true. Clear the admission ceilings first and disable Doorbell dispatch second, or apply one change that sets both together." (join ", " $configured)) }}
+{{-   end }}
+{{- end }}

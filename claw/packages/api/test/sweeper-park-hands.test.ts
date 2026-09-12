@@ -72,6 +72,9 @@ function stubDb(reaped: Array<Record<string, unknown>>, settled: string[]): void
     if (sql.startsWith("UPDATE claw_tasks SET")) {
       return { rows: reaped, rowCount: reaped.length };
     }
+    if (sql.includes("failure_reason = 'run_budget_exhausted'")) {
+      return { rows: reaped, rowCount: reaped.length };
+    }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
 }

@@ -25,11 +25,14 @@ import {
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { markChatRunRunning, closeChatRun, queuedMessageId } from "../tasks/chat-run.js";
+import {
+  markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+} from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import pino from "pino";
+import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { withCompletionLock } from "./completion-lock.js";
 import { recordCompletionTurns } from "./completion-turns.js";
@@ -258,13 +261,34 @@ async function processCompletionEvent(
     if (!current || !("processed_at" in current)) throw new Error("completion event row is missing");
     if (current.processed_at !== null) return;
 
-    if (await completionAlreadyProcessed(sessionId, messageId ?? "")) {
+    // A sweeper completion describes a row it already terminalized; its task id
+    // is context for the turn, not a worker-generation fence.
+    const provenance = event.completion_source === "sweeper"
+      ? null
+      : await resolveChatRunProvenance(event);
+    const namesChatRow = provenance !== null && provenance !== "foreign";
+    const messageAlreadyProcessed = await completionAlreadyProcessed(sessionId, messageId ?? "");
+    const alreadyProcessed = !namesChatRow && messageAlreadyProcessed;
+    if (alreadyProcessed) {
       if (messageId && event.completion_source !== "sweeper") {
         await recordCompletionTurns(sessionId, event, messageId);
       }
       logger.info({ sessionId, rowId, messageId }, "exec_complete.skipped_already_processed");
+    } else if (namesChatRow && messageAlreadyProcessed) {
+      const verdict = await completionAdmissibility(provenance, runClaimOf(event));
+      if (verdict === "active") {
+        await handleComplete(sessionId, event, rowId, provenance);
+      } else {
+        if (verdict === "settled" && messageId && event.completion_source !== "sweeper") {
+          await recordCompletionTurns(sessionId, event, messageId);
+        }
+        logger.info(
+          { sessionId, rowId, messageId, verdict },
+          "exec_complete.skipped_already_processed",
+        );
+      }
     } else {
-      await handleComplete(sessionId, event, rowId);
+      await handleComplete(sessionId, event, rowId, provenance);
     }
     await db.query("UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1", [rowId]);
   });
@@ -345,6 +369,7 @@ export async function consumeEventDelivery(msg: {
         [eventId, sessionId, (event.type as string) || "message", event],
       );
       if (insertResult.rowCount && insertResult.rows[0]) {
+        metrics.onEventPersisted("ok");
         rowId = insertResult.rows[0].id;
       } else {
         const existing = await db.query(
@@ -356,6 +381,7 @@ export async function consumeEventDelivery(msg: {
         }
       }
     } catch (e: any) {
+      metrics.onEventPersisted("error");
       const pgCode = e?.code || "";
       if (pgCode === "22P05" || pgCode === "22021") {
         logger.error({ err: e, sessionId, eventId }, "event-consumer.persist_poison_skipped");
@@ -483,11 +509,15 @@ export async function releaseSessionGateIfLastRun(
   messageId: string | null,
   failed: boolean,
 ): Promise<boolean> {
+  // A NULL marker fails closed rather than matching: a session gated before the
+  // column existed is released by no run-scoped caller, and reapStuckSessions
+  // is the backstop for that bounded population.
   const r = await db.query(
     `UPDATE claw_sessions
-        SET agent_status = $1, updated_at = NOW()
+        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
+        AND (NOT $4::boolean OR agent_gate_message_id = $3)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
@@ -495,7 +525,7 @@ export async function releaseSessionGateIfLastRun(
              AND t.status IN ('queued','preparing','running','cancelling')
              AND t.metadata->>'message_id' IS DISTINCT FROM $3
         )`,
-    [failed ? "failed" : "idle", sessionId, messageId],
+    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced()],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -538,7 +568,66 @@ export async function applyPendingCredentials(
   }
 }
 
-async function handleComplete(sessionId: string, event: Record<string, unknown>, eventRowId?: number | null): Promise<void> {
+/**
+ * Which chat row this completion belongs to, if any.
+ *
+ * Routing is by what the named row *is*, not by whether the field is present:
+ * DAG and standalone execute requests have always carried `task_id`, and their
+ * completions must keep doing exactly what they do today. A `task_id` naming a
+ * row that is not a chat row, or naming no row at all, is not a chat completion.
+ *
+ * @returns the chat row's id, `"foreign"` for a task id that names something
+ *   else, or null when the event names no task at all.
+ */
+export async function resolveChatRunProvenance(
+  event: Record<string, unknown>,
+): Promise<string | "foreign" | null> {
+  const taskId = typeof event.task_id === "string" && event.task_id ? event.task_id : null;
+  if (!taskId) return null;
+  const r = await db.query(
+    "SELECT origin FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const origin = (r.rows[0] as { origin?: string } | undefined)?.origin;
+  return origin === "chat" ? taskId : "foreign";
+}
+
+/**
+ * Whether the named row still admits this reporter, and whether it is active.
+ * Settled rows may accept a turn repair, but only active rows still owe the
+ * gate and queue side effects in `handleComplete`.
+ */
+async function completionAdmissibility(
+  taskId: string,
+  runClaim: number | undefined,
+): Promise<"missing" | "active" | "settled" | "superseded"> {
+  const r = await db.query(
+    "SELECT status, claim_count, metadata->>'lease_fenced' AS fenced FROM claw_tasks WHERE task_id = $1",
+    [taskId],
+  );
+  const row = r.rows[0] as {
+    status?: string; claim_count?: unknown; fenced?: string | null;
+  } | undefined;
+  if (!row) return "missing";
+  if (runClaim === undefined && row.fenced === "true") return "superseded";
+  if (runClaim !== undefined && Number(row.claim_count ?? 0) !== runClaim) return "superseded";
+  return ["completed", "failed", "cancelled"].includes(row.status ?? "")
+    ? "settled"
+    : "active";
+}
+
+/** The generation the reporter was issued, omitted rather than invented. */
+function runClaimOf(event: Record<string, unknown>): number | undefined {
+  const raw = event.run_claim;
+  return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
+}
+
+async function handleComplete(
+  sessionId: string,
+  event: Record<string, unknown>,
+  eventRowId?: number | null,
+  provenance: string | "foreign" | null = null,
+): Promise<void> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
   // Null rather than "" when absent: the unique index over the turns is partial
@@ -550,6 +639,10 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
     ? (event as any).message_id
     : null;
 
+  // A completion whose task id names a DAG or standalone row keeps every step
+  // below and touches no chat row: widening the close to it would terminalize
+  // that row before its own authoritative result applied.
+
   // 1. Close this turn's shadow row, saying how the run that was occupying the
   // session ended.
   //
@@ -558,12 +651,31 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
   // that question. `closeChatRun` is safe to run first: with no message id it
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
-  await closeChatRun(
-    sessionId,
-    messageId ?? undefined,
-    interrupted ? "cancelled" : failed ? "failed" : "completed",
-    failed ? String(failure_reason ?? "agent_error") : undefined,
-  );
+  if (provenance !== "foreign") {
+    const closed = await closeChatRun(
+      sessionId,
+      messageId ?? undefined,
+      interrupted ? "cancelled" : failed ? "failed" : "completed",
+      failed ? String(failure_reason ?? "agent_error") : undefined,
+      { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
+    );
+    // A zero match classifies the event; it is not a yes/no gate. This
+    // delivery may be its own redelivery, in which case every step below is
+    // still owed and each is idempotent -- but it may equally be a report the
+    // row's holder superseded, and then releasing the gate, recording a turn
+    // or draining the queue would overtake the holder whose own completion is
+    // still coming.
+    if (!closed.length && provenance) {
+      const verdict = await completionAdmissibility(provenance, runClaimOf(event));
+      if (verdict === "missing" || verdict === "superseded") {
+        logger.info(
+          { sessionId, messageId, taskId: provenance, verdict },
+          "exec_complete.not_admissible_for_row",
+        );
+        return;
+      }
+    }
+  }
 
   // 2. Hand the conversation back -- but only if this was the last run on it.
   //
@@ -701,127 +813,7 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
   if (!gateOpened) {
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
-  const pending = !gateOpened ? undefined : (await db.query(
-    "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
-    [sessionId],
-  )).rows[0];
-
-  if (pending) {
-    const pendingUserId = pending.user_id || userId;
-    const history = await buildMessages(sessionId, pending.content, pendingUserId);
-
-    // Load local active skills (with sub-files) so the queued message keeps skill context
-    let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
-    try {
-      const activeSkills = await selectSkillsForTask(pendingUserId, pending.content || "");
-      pendingSkills = {};
-      for (const [name, bundle] of Object.entries(activeSkills)) {
-        pendingSkills[name] = {
-          content: bundle.content,
-          description: bundle.description,
-          enabled: true,
-          version: bundle.version,
-          files: bundle.files,
-        };
-      }
-      if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
-    } catch {
-      pendingSkills = undefined;
-    }
-
-    const rawTools = pending.tool_ids;
-    const toolIds: number[] = Array.isArray(rawTools)
-      ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
-      : [];
-    const pid = pending.plugin_id;
-    const pluginId =
-      pid !== undefined && pid !== null && pid !== "" ? Number(pid) : undefined;
-    const wsidRaw = pending.workspace_id;
-    const workspaceId =
-      typeof wsidRaw === "string" && wsidRaw.trim() !== "" ? wsidRaw.trim() : undefined;
-
-    // Default resource row for cpu/memory/gpu/ephemeralStorage + image.
-    const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
-    const defaultResource = asJsonObject(defaultResourceRow?.resource);
-    const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
-    let pluginImage: string | undefined;
-    let pluginResource: Record<string, unknown> | undefined;
-    if (pluginId !== undefined && Number.isFinite(pluginId)) {
-      try {
-        const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-        if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
-          const formatted = await formatPluginRow(pluginRow, true);
-          const imageFromPlugin = pluginSandboxImage(formatted.images);
-          if (imageFromPlugin) pluginImage = imageFromPlugin;
-          const resourceFromPlugin = asJsonObject(formatted.resource);
-          if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-        }
-      } catch (err) {
-        logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
-      }
-    }
-    const requestImage =
-      typeof pending.image === "string" && pending.image.trim() !== "" ? pending.image.trim() : undefined;
-    // claw_pending_messages.resources column stores the request body's
-    // `resource` (object) field; the column name is preserved unchanged.
-    const requestResource = asJsonObject(pending.resources);
-    const pendingTimeoutNum =
-      pending.timeout !== undefined && pending.timeout !== null ? Number(pending.timeout) : NaN;
-    const pendingTimeout = Number.isFinite(pendingTimeoutNum) ? Math.trunc(pendingTimeoutNum) : undefined;
-    // Resolution chain: pending row > plugin row > DB default (resources table).
-    const finalSandboxImage = requestImage || pluginImage || defaultImage;
-    const finalResources = requestResource || pluginResource || defaultResource || {};
-
-    // Same pairing as routes/sessions.ts immediate dispatch: tool_ids vs plugin_id (XOR at runtime; both keys for compat).
-    // user_env snapshot frozen on the row at POST /messages time (see
-    // routes/sessions.ts). Forward verbatim to Brain via ExecuteRequest.user_env.
-    const pendingUserEnv =
-      pending.user_env && typeof pending.user_env === "object" && !Array.isArray(pending.user_env)
-        ? (pending.user_env as Record<string, string>)
-        : undefined;
-    const pendingSessionEnv =
-      pending.session_env && typeof pending.session_env === "object" && !Array.isArray(pending.session_env)
-        ? (pending.session_env as Record<string, string>)
-        : undefined;
-    const pendingMessageId = queuedMessageId(pending.id as number);
-    const task: Record<string, unknown> = {
-      session_id: sessionId,
-      message_id: pendingMessageId,
-      prompt: pending.content,
-      history,
-      user_id: pendingUserId,
-      llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
-      platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
-      skills: pendingSkills,
-      tool_ids: toolIds.length ? toolIds : undefined,
-      plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      workspace_id: workspaceId,
-      sandbox_image: finalSandboxImage,
-      resources: finalResources,
-      timeout: pendingTimeout,
-      user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
-      session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
-      topology: asJsonObject(pending.topology),
-    };
-    const credentialsReadable = await applyPendingCredentials(task, pending, {
-      sessionId, userId: pendingUserId, messageId: pendingMessageId,
-    });
-    // A queued turn is a run like any other, so it gets the same row, lease and
-    // workspace binding the immediate path gives one. Without them a replayed
-    // turn is invisible to lease-based recovery: its worker can die and no
-    // sweep reclaims it, because there is no row saying it was ever owned.
-    if (credentialsReadable) await dispatchPendingMessage({
-      sessionId,
-      pendingId: pending.id,
-      userId: pendingUserId,
-      messageId: pendingMessageId,
-      prompt: pending.content,
-      workspaceId,
-      pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      sandboxImage: finalSandboxImage,
-      task,
-    });
-  }
+  if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
 
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
@@ -951,6 +943,184 @@ async function handleComplete(sessionId: string, event: Record<string, unknown>,
 
 const SUMMARIZE_THRESHOLD = 80_000;
 const KEEP_RECENT = 50_000;
+
+/**
+ * What the queued row asked for, resolved against the plugin and the defaults.
+ *
+ * Resolution chain, in order: the pending row, then the plugin row, then the
+ * database default. `claw_pending_messages.resources` holds the request body's
+ * `resource` object; the column name is older than the field name.
+ */
+function resolvePendingRequestShape(
+  pending: Record<string, unknown>,
+  fallbacks: {
+    pluginImage: string | undefined;
+    pluginResource: Record<string, unknown> | undefined;
+    defaultImage: string | undefined;
+    defaultResource: Record<string, unknown> | undefined;
+  },
+): {
+  finalSandboxImage: string | undefined;
+  finalResources: Record<string, unknown>;
+  pendingTimeout: number | undefined;
+} {
+  const requestImage = typeof pending.image === "string" && pending.image.trim() !== ""
+    ? pending.image.trim()
+    : undefined;
+  const requestResource = asJsonObject(pending.resources);
+  const timeout = pending.timeout !== undefined && pending.timeout !== null
+    ? Number(pending.timeout)
+    : NaN;
+  return {
+    finalSandboxImage: requestImage || fallbacks.pluginImage || fallbacks.defaultImage,
+    finalResources: requestResource || fallbacks.pluginResource || fallbacks.defaultResource || {},
+    pendingTimeout: Number.isFinite(timeout) ? Math.trunc(timeout) : undefined,
+  };
+}
+
+/**
+ * The active skills a queued turn keeps, bundled the way a live turn gets them.
+ *
+ * Absent rather than empty when nothing is active, because an empty object and
+ * "no skills were resolved" mean different things downstream.
+ */
+async function pendingSkillBundle(
+  userId: string,
+  content: string,
+): Promise<Record<string, {
+  content: string; enabled: boolean; version?: number; description?: string;
+  files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+}> | undefined> {
+let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
+try {
+  const activeSkills = await selectSkillsForTask(userId, content);
+  pendingSkills = {};
+  for (const [name, bundle] of Object.entries(activeSkills)) {
+    pendingSkills[name] = {
+      content: bundle.content,
+      description: bundle.description,
+      enabled: true,
+      version: bundle.version,
+      files: bundle.files,
+    };
+  }
+  if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
+} catch {
+  pendingSkills = undefined;
+}
+
+  return pendingSkills;
+}
+
+/**
+ * Dispatch the oldest message parked behind this session, if there is one.
+ *
+ * Extracted from the completion handler rather than duplicated, because the
+ * sweeper has to be able to run exactly this path: a dispatch that fails
+ * before execution emits no completion, so a session idled by publish-failure
+ * cleanup with a row still in the queue has no trigger left and that turn is
+ * parked for ever. Callers are responsible for proving the session is free.
+ */
+export async function drainOldestPendingMessage(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  const pending = (await db.query(
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  [sessionId],
+)).rows[0];
+
+if (pending) {
+  const pendingUserId = pending.user_id || userId;
+  const history = await buildMessages(sessionId, pending.content, pendingUserId);
+
+  const pendingSkills = await pendingSkillBundle(pendingUserId, pending.content || "");
+  const rawTools = pending.tool_ids;
+  const toolIds: number[] = Array.isArray(rawTools)
+    ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
+    : [];
+  const pid = pending.plugin_id;
+  const pluginId =
+    pid !== undefined && pid !== null && pid !== "" ? Number(pid) : undefined;
+  const wsidRaw = pending.workspace_id;
+  const workspaceId =
+    typeof wsidRaw === "string" && wsidRaw.trim() !== "" ? wsidRaw.trim() : undefined;
+
+  // Default resource row for cpu/memory/gpu/ephemeralStorage + image.
+  const defaultResourceRow = await MarketplaceDb.resourceFirstByType("default");
+  const defaultResource = asJsonObject(defaultResourceRow?.resource);
+  const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
+  let pluginImage: string | undefined;
+  let pluginResource: Record<string, unknown> | undefined;
+  if (pluginId !== undefined && Number.isFinite(pluginId)) {
+    try {
+      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
+      if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
+        const formatted = await formatPluginRow(pluginRow, true);
+        const imageFromPlugin = pluginSandboxImage(formatted.images);
+        if (imageFromPlugin) pluginImage = imageFromPlugin;
+        const resourceFromPlugin = asJsonObject(formatted.resource);
+        if (resourceFromPlugin) pluginResource = resourceFromPlugin;
+      }
+    } catch (err) {
+      logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
+    }
+  }
+  const { finalSandboxImage, finalResources, pendingTimeout } = resolvePendingRequestShape(
+    pending, { pluginImage, pluginResource, defaultImage, defaultResource },
+  );
+
+  // Same pairing as routes/sessions.ts immediate dispatch: tool_ids vs plugin_id (XOR at runtime; both keys for compat).
+  // user_env snapshot frozen on the row at POST /messages time (see
+  // routes/sessions.ts). Forward verbatim to Brain via ExecuteRequest.user_env.
+  const pendingUserEnv =
+    pending.user_env && typeof pending.user_env === "object" && !Array.isArray(pending.user_env)
+      ? (pending.user_env as Record<string, string>)
+      : undefined;
+  const pendingSessionEnv =
+    pending.session_env && typeof pending.session_env === "object" && !Array.isArray(pending.session_env)
+      ? (pending.session_env as Record<string, string>)
+      : undefined;
+  const pendingMessageId = queuedMessageId(pending.id as number);
+  const task: Record<string, unknown> = {
+    session_id: sessionId,
+    message_id: pendingMessageId,
+    prompt: pending.content,
+    history,
+    user_id: pendingUserId,
+    llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
+    platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
+    skills: pendingSkills,
+    tool_ids: toolIds.length ? toolIds : undefined,
+    plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    workspace_id: workspaceId,
+    sandbox_image: finalSandboxImage,
+    resources: finalResources,
+    timeout: pendingTimeout,
+    user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
+    session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
+    topology: asJsonObject(pending.topology),
+  };
+  const credentialsReadable = await applyPendingCredentials(task, pending, {
+    sessionId, userId: pendingUserId, messageId: pendingMessageId,
+  });
+  // A queued turn is a run like any other, so it gets the same row, lease and
+  // workspace binding the immediate path gives one. Without them a replayed
+  // turn is invisible to lease-based recovery: its worker can die and no
+  // sweep reclaims it, because there is no row saying it was ever owned.
+  if (credentialsReadable) await dispatchPendingMessage({
+    sessionId,
+    pendingId: pending.id,
+    userId: pendingUserId,
+    messageId: pendingMessageId,
+    prompt: pending.content,
+    workspaceId,
+    pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    sandboxImage: finalSandboxImage,
+    task,
+  });
+}
+}
 
 async function maybeSummarize(sessionId: string, userId: string): Promise<void> {
   const totalTokens = (await db.query(

@@ -36,10 +36,22 @@ const sources = readdirSync(workspaceRoot)
   }));
 
 test("no source file but the transition function writes a task's status", () => {
+  // The alias is the hole this pattern used to have. A writer spelled
+  // `UPDATE claw_tasks t SET status` reads the same to Postgres and slipped
+  // past a pattern that demanded `SET` right after the table -- which is
+  // exactly how a cancel that banked no queued segment reached a merge with
+  // all three of these tests green.
   const writers = sources
-    .filter((s) => /UPDATE claw_tasks SET status/i.test(s.text))
+    .filter((s) => /UPDATE claw_tasks\s+(?:AS\s+)?(?!SET\b)\w+\s+SET status|UPDATE claw_tasks SET status/i
+      .test(s.text))
     .map((s) => s.file);
-  assert.deepEqual(writers, ["api/src/tasks/db.ts"],
+  // `infra/db.ts` is the migration that closes a chat turn's duplicate rows
+  // before the unique index forbidding them can be created. It is exempt
+  // because the rows it ends are ones no run ever waited as: it runs at boot,
+  // before this process serves anything, on rows the index exists to forbid.
+  // Listed rather than left unmatched, so the exemption is a decision on the
+  // record instead of a gap in a pattern.
+  assert.deepEqual(writers, ["api/src/infra/db.ts", "api/src/tasks/db.ts"],
     "a status UPDATE written anywhere else drops that run's queued segment");
 });
 

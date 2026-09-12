@@ -31,11 +31,18 @@ import { db } from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { dispatchTaskToBrain, sessionDispatchPorts } from "../src/sessions/dispatch.js";
 import { isWorkspaceBindingError } from "../src/workspace/store.js";
+import { closedDoorbellBarrier, openDoorbellBarrier } from "./doorbell-barrier-stub.js";
 
 interface SeenQuery { sql: string; params: unknown[] }
 
 const originalQuery = db.query;
-const originalPorts = { ...sessionDispatchPorts };
+// Doorbell closed unless a test opens it. These cases are about fat dispatch,
+// and they used to reach it by inheriting a default that was off -- so the day
+// dispatch shipped on, every one of them silently changed which branch it
+// exercised. Saying it here keeps each test's subject its own to declare; the
+// doorbell cases below still override this port explicitly.
+const originalPorts = { ...sessionDispatchPorts, doorbellDispatch: () => null };
+Object.assign(sessionDispatchPorts, originalPorts);
 afterEach(() => {
   db.query = originalQuery;
   Object.assign(sessionDispatchPorts, originalPorts);
@@ -187,7 +194,7 @@ function boundWorkspace() {
 test("D5 a doorbell hard refusal rolls the session back and does not open a row", async () => {
   const seen = stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
   const published: string[] = [];
   sessionDispatchPorts.publishTask = async () => { published.push("task"); };
@@ -216,7 +223,7 @@ test("D6 a doorbell soft queue returns a position and does not publish a wakeup"
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "queue", position: 3 });
   const published: string[] = [];
   sessionDispatchPorts.publishTask = async () => { published.push("task"); };
@@ -237,7 +244,7 @@ test("D7 a doorbell whose wakeup cannot be published closes the queued row", asy
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "admit" });
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
@@ -266,7 +273,7 @@ test("D7b a failed wakeup does not roll back a run claim-next already claimed", 
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = true;
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "admit" });
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
@@ -288,7 +295,7 @@ test("D8 the default path does not roll back a run a worker already holds", asyn
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("publish timed out"); };
   sessionDispatchPorts.failChatRunDispatch = (async () => "held") as typeof sessionDispatchPorts.failChatRunDispatch;
@@ -305,7 +312,7 @@ test("D8 it still rolls back when the row really was closed", async () => {
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("nats down"); };
   sessionDispatchPorts.failChatRunDispatch = (async () => "closed") as typeof sessionDispatchPorts.failChatRunDispatch;
@@ -317,16 +324,18 @@ test("D8 it still rolls back when the row really was closed", async () => {
   assert.ok(rolledBack, "nothing will execute it, so the turn is refused");
 });
 
-test("D9 a compensation that could not run rolls back rather than guessing", async () => {
-  // `unknown`, not `held`. Nothing established that a worker has the row, so
-  // the honest move is the rollback: it hands the session back. Treating this
-  // as "a worker is running it" left the row at `preparing` with no lease --
-  // invisible to every reaper, and occupying a fleet-wide admission slot.
+test("D9 a compensation that could not run settles nothing and rolls nothing back", async () => {
+  // `unknown`, not `held`, and not `closed` either. Nothing was established:
+  // the row may still be claimable and about to run, so rolling the session
+  // back here would delete the user's message out from under it. The row is
+  // left with its reconciliation marker, and the sweep that owns that marker
+  // is what eventually reaches a verdict -- which is also what keeps the row
+  // from sitting at `preparing` invisible to every reaper.
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = false;
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
   sessionDispatchPorts.publishTask = async () => { throw new Error("publish timed out"); };
   sessionDispatchPorts.failChatRunDispatch =
@@ -335,8 +344,8 @@ test("D9 a compensation that could not run rolls back rather than guessing", asy
   let rolledBack = false;
   const result = await dispatchTaskToBrain(INPUT, async () => { rolledBack = true; });
 
-  assert.equal(result.kind, "publish_failed");
-  assert.ok(rolledBack, "the session is handed back, which is the one thing still in reach");
+  assert.equal(result.kind, "publish_unknown");
+  assert.equal(rolledBack, false, "an undecided state is not a licence to unwind the turn");
 });
 
 // ── Which run the caller got ─────────────────────────────────────────────────
@@ -355,21 +364,35 @@ function readyToOpen(doorbell: boolean): void {
   initUserEnvCrypto();
   stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
   sessionDispatchPorts.publishSse = () => {};
-  sessionDispatchPorts.doorbellDispatch = doorbell;
+  sessionDispatchPorts.doorbellDispatch = doorbell ? openDoorbellBarrier : closedDoorbellBarrier;
   sessionDispatchPorts.openChatRun =
     (async () => ({ taskId: OPENED })) as typeof sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
   sessionDispatchPorts.publishTask = async () => {};
 }
 
 test("D10 the default path names the run row it opened", async () => {
   readyToOpen(false);
+  const published: Array<Record<string, unknown>> = [];
+  let dispatch: string | undefined;
+  sessionDispatchPorts.openChatRun = (async (input) => {
+    dispatch = input.dispatch;
+    return { taskId: OPENED };
+  }) as typeof sessionDispatchPorts.openChatRun;
+  sessionDispatchPorts.publishTask = async (_subject, payload) => {
+    published.push(JSON.parse(payload));
+  };
 
   const result = await dispatchTaskToBrain(INPUT, async () => {
     throw new Error("a dispatched turn must not roll back");
   });
 
+  assert.equal(dispatch, "fat");
   assert.equal(result.kind, "dispatched");
   assert.equal(result.kind === "dispatched" ? result.runId : "", OPENED);
+  assert.equal(published[0]?.task_id, OPENED);
 });
 
 test("D10b the doorbell path names the run row it opened", async () => {

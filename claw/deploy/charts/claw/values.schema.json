@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Claw chart values",
+  "description": "Constrains only the Doorbell dispatch switch and the eight admission ceilings. Every object here allows additional properties: a whitelist would reject every other value key and break the first upgrade after this schema shipped.",
+  "type": "object",
+  "additionalProperties": true,
+  "definitions": {
+    "admitCeiling": {
+      "description": "Admission ceiling. 0 disables the dimension.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,8})$"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        }
+      ]
+    }
+  },
+  "properties": {
+    "features": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "runDoorbellDispatch": {
+          "description": "Chat dispatch publishes a doorbell instead of a full execute request.",
+          "type": "boolean"
+        },
+        "brainDoorbellExecution": {
+          "description": "A Brain replica executes doorbell runs, on the wire and from claim-next.",
+          "type": "boolean"
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "admitSoftRuns": { "$ref": "#/definitions/admitCeiling" },
+        "admitHardRuns": { "$ref": "#/definitions/admitCeiling" },
+        "admitSoftSandboxes": { "$ref": "#/definitions/admitCeiling" },
+        "admitHardSandboxes": { "$ref": "#/definitions/admitCeiling" },
+        "admitSoftGpuNodes": { "$ref": "#/definitions/admitCeiling" },
+        "admitHardGpuNodes": { "$ref": "#/definitions/admitCeiling" },
+        "admitTreeMaxNodes": { "$ref": "#/definitions/admitCeiling" },
+        "admitTreeMaxDepth": { "$ref": "#/definitions/admitCeiling" }
+      }
+    }
+  }
+}

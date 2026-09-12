@@ -56,6 +56,12 @@ echo "==> deployment security behavior"
 # guards. After require_tool helm, because the guards are asserted by rendering.
 bash "$repo_root/scripts/release-tests/claw-deploy-security.sh"
 
+echo "==> chart values schema and rollout ordering"
+bash "$repo_root/scripts/release-tests/helm-values-schema.sh"
+
+echo "==> PromQL rollout gates"
+bash "$repo_root/scripts/release-tests/promql-gates.sh"
+
 echo "==> Helm lint and render"
 helm lint "$repo_root/sandbox/deploy/helm" \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml"

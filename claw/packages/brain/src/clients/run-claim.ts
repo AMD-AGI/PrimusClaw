@@ -1,7 +1,10 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest, RunTimeReport } from "@claw/protocol";
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import type {
+  ExecuteRequest, RunFailClaimReason, RunTimeReport, RunUnclaimReason,
+} from "@claw/protocol";
 import pino from "pino";
 
 import { AUTH_INTERNAL_TOKEN, BRAIN_ID } from "../config.js";
@@ -67,7 +70,7 @@ export async function claimNextRun(): Promise<ClaimedRun | null> {
 export async function unclaimRun(
   taskId: string,
   claimCount?: number,
-  reason?: "lock_contention" | "retry" | "drain" | "hydrate_failed",
+  reason?: RunUnclaimReason,
   runTime?: RunTimeReport,
 ): Promise<void> {
   await postHolderAction(taskId, "unclaim", "run.unclaim_failed", {
@@ -78,7 +81,7 @@ export async function unclaimRun(
 
 export async function failClaimedRun(
   taskId: string,
-  reason: "session_deleted" | "claim_abandoned" | "workspace_unbound" = "session_deleted",
+  reason: RunFailClaimReason = "session_deleted",
   claimCount?: number,
   runTime?: RunTimeReport,
 ): Promise<void> {
@@ -175,7 +178,9 @@ async function postClaim(url: string): Promise<ClaimedRun | null> {
   const resp = await fetch(url, {
     method: "POST",
     headers: claimHeaders(),
-    body: JSON.stringify({ brain_id: BRAIN_ID }),
+    // One body serves the by-id and claim-next routes, so the API refuses to
+    // hand either of them a row above what this binary implements.
+    body: JSON.stringify({ brain_id: BRAIN_ID, doorbell_semantics: DOORBELL_SEMANTICS_VERSION }),
     signal: AbortSignal.timeout(10_000),
   });
   // 422 is a settled row (unclaimable / retries exhausted), not a transport

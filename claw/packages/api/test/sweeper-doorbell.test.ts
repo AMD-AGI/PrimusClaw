@@ -150,9 +150,13 @@ test("a doorbell past its deadline is closed by a reaper of its own", async () =
   }]);
   const events = captureEvents();
   assert.equal(await reapExpiredDoorbellRuns(), 1);
-  assert.match(seen.params[0].join("|"), /run_budget_exhausted/);
-  assert.match(seen[0], /metadata->>'dispatch' = 'doorbell'/);
-  assert.match(seen[0], /deadline_at < NOW\(\)/);
+  // The pass reads its own predicate first, to learn which of the rows it is
+  // about to close were still on the queue, so the write is not seen[0].
+  const wrote = seen.findIndex((sql) => /^UPDATE claw_tasks SET status/.test(sql));
+  assert.ok(wrote >= 0, `no status UPDATE among:\n${seen.join("\n")}`);
+  assert.match(seen.params[wrote].join("|"), /run_budget_exhausted/);
+  assert.match(seen[wrote], /metadata->>'dispatch' = 'doorbell'/);
+  assert.match(seen[wrote], /deadline_at < NOW\(\)/);
   assert.deepEqual(events.map((e) => e.type), ["AssistantMessage", "ResultMessage", "exec_complete"]);
   assert.equal(events[2].failure_reason, "run_budget_exhausted");
 });

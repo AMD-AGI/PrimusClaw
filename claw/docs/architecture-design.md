@@ -369,7 +369,7 @@ losing it.
 Concurrency is controlled at three levels, each answering a different question, and
 recovery rests on being able to distinguish a slow run from an absent worker.
 
-### 8.1 Three gates
+### 8.1 Four gates
 
 **Session admission** decides whether a *user* may start another turn in a conversation.
 It serialises a conversation and queues rather than rejects (§7).
@@ -388,6 +388,15 @@ work.
 **The run gate** decides whether two *runs* may proceed at once. It is a distributed lock
 in NATS KV, created by compare-and-set, checked against its holder, and expiring on its
 own so a dead worker's claim does not persist.
+
+**Fleet admission** decides whether the cluster as a whole takes on more work. It is the
+API-side ceiling, configured through the `ADMIT_*` settings, and it is fleet-wide: there is
+no owner column on `claw_tasks`, so one tenant can consume all of it. Every path that
+creates a run consults its hard ceilings and may be refused; every path that promotes an
+already-committed run into execution consults its soft ceilings and may only be deferred.
+Brain's `MAX_CONCURRENT` and `MAX_RESIDENT` are per-pod and do not substitute for it: a
+fleet of ten pods each honouring its own execution gate still admits ten times whatever the
+cluster was sized for.
 
 ### 8.2 What the run gate is keyed on
 

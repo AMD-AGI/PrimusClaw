@@ -52,6 +52,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "session_id", "user_id", "agent_status", "status", "config", "created_at",
       "cleanup_state", "cleanup_attempts", "cleanup_next_at", "cleanup_error",
+      // Absent, every gate acquisition fails and no turn can start at all.
+      "agent_gate_message_id",
     ],
   },
   {
@@ -81,6 +83,13 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // that adds it discards its own error like the rest of setup, which is
       // exactly why the column has to be claimed here instead.
       "workspace_throwaway",
+      // Absent, dispatch reconciliation is disarmed: an ambiguous publish is
+      // never marked, so the sweeper never finds the row and the owed cleanup
+      // is never run.
+      "dispatch_reconcile_at",
+      // Absent, a reconciled row is found but nobody knows whether to idle the
+      // session it joined or delete the one it created.
+      "dispatch_reconcile_action",
       "platform_message", "platform_node", "platform_exit_code", "platform_container_reason",
       "platform_facts_resolved_at", "platform_facts_next_retry_at", "platform_facts_attempts",
       "created_at", "queued_at", "started_at", "completed_at",
@@ -113,6 +122,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "session_id", "content", "user_env", "session_env", "topology",
       "bind_attempts", "credentials_blob",
+      // Absent, a retried drain cannot recognise the run it already opened and
+      // executes the queued message a second time.
+      "dispatch_task_id",
     ],
   },
   {

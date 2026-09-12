@@ -11,21 +11,38 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import type { ExecuteRequest, RunLease } from "@claw/protocol";
+import type { ExecuteRequest, RunFailClaimReason, RunLease } from "@claw/protocol";
 import pino from "pino";
 
 import { RUN_LEASE_TTL_MS, TASK_POISON_DELIVERY_COUNT } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db, inTransaction, type Querier } from "../infra/db.js";
+import { db, inTransaction, RUN_CLAIM_FENCE_SQL, type Querier } from "../infra/db.js";
+import {
+  anySoftCeilingSet, askFromRow, chargeAccepted, deferQueuedBySoftCeiling, envAdmitLimits,
+  fillWithinCeiling, loadUsageWithRoots, runImmediately, softOverflow,
+  withOwnedAdmissionLock, type AfterCommit,
+} from "./admission.js";
+import { metrics } from "../infra/metrics.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { publishEvent } from "../events/store.js";
 import { releaseRunUse } from "../workspace/store.js";
+import { releaseSessionGateIfUnoccupied } from "./chat-run.js";
 import { applyTaskStatusTransition } from "./db.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
+import { requeueSojournSql } from "./run-budget.js";
 import { RUN_CREDENTIALS_FIELD } from "./run-spec.js";
 import { openRunCredentials, RunCredentialFault } from "./run-secrets.js";
 import { settleRunTime, type RunSettlement } from "./run-time-ledger.js";
 import type { ClawTaskRow } from "./types.js";
+
+/**
+ * Anything that can run a statement. The claim path takes one so a caller can
+ * drive it inside a transaction of its own; substituting the `db` singleton
+ * instead puts both transactions on one connection, which is no interleaving.
+ */
+export interface StatementSource {
+  query(text: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+}
 
 const logger = pino({ name: "run-claim" });
 
@@ -76,12 +93,74 @@ export interface ClaimedRun {
   claimCount: number;
 }
 
+/**
+ * Doorbell rows an incoming Brain at `version` could not run, in any
+ * non-terminal state.
+ *
+ * Counting only the queued ones reads zero while such a run is executing, and
+ * a draining pod puts its rows back exactly when the last compatible replica
+ * goes away -- so a queued-only precondition clears a rollback that is unsafe.
+ */
+export async function countIncompatibleDoorbellRuns(version: number): Promise<number> {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM claw_tasks
+      WHERE COALESCE(metadata->>'dispatch', '') = 'doorbell'
+        AND status IN ('queued','preparing','running','cancelling')
+        AND COALESCE((metadata->>'doorbell_semantics')::int, 1) > $1::int`,
+    [version],
+  );
+  return Number((r.rows[0] as { n?: number } | undefined)?.n ?? 0);
+}
+
+/** A row `takeClaim` matched, carrying the prior state only that statement sees. */
+type TakenRow = ClawTaskRow & { prior_status?: string; queued_since?: string | null };
+
+/**
+ * Read the soft-ceiling usage and take the row under one hold of the lock.
+ *
+ * Both must be in one transaction: two connections each holding a different
+ * queued row contend for headroom rather than for a row, so no CAS refuses
+ * them and both claim under a ceiling of one. A caller supplying its own
+ * querier owns that transaction; without a soft ceiling there is no lock to
+ * take. The queue exit rides `afterCommit` because a failed `COMMIT` leaves the
+ * row at `queued` and an emitted metric cannot be taken back.
+ */
+async function takeUnderSoftCeiling(
+  taskId: string,
+  brainId: string,
+  doorbellSemantics: number,
+  q: StatementSource | undefined,
+): Promise<TakenRow | "missing" | "busy" | "deferred"> {
+  const gated = async (on: StatementSource, afterCommit: AfterCommit) => {
+    if (await deferQueuedBySoftCeiling(taskId, on)) return "deferred" as const;
+    const taken = await takeClaimOrBusy(taskId, brainId, doorbellSemantics, on);
+    if (typeof taken !== "string" && taken.prior_status === "queued") {
+      const since = taken.queued_since ?? null;
+      afterCommit(() => metrics.observeQueueExit("chat", since, "claimed"));
+    }
+    return taken;
+  };
+  if (q) return await gated(q, runImmediately);
+  if (!anySoftCeilingSet(envAdmitLimits())) return await gated(db, runImmediately);
+  return await withOwnedAdmissionLock(gated);
+}
+
 export async function claimRunById(
   taskId: string,
   brainId: string,
-): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | ExhaustedClaim> {
-  const taken = await takeClaim(taskId, brainId);
-  if (taken === "missing" || taken === "busy") return taken;
+  doorbellSemantics = 1,
+  q?: StatementSource,
+): Promise<ClaimedRun | "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim> {
+  const taken = await takeUnderSoftCeiling(taskId, brainId, doorbellSemantics, q);
+  if (taken === "missing" || taken === "busy" || taken === "deferred") return taken;
+  return await finishClaim(taken, taskId, brainId);
+}
+
+async function finishClaim(
+  taken: TakenRow,
+  taskId: string,
+  brainId: string,
+): Promise<ClaimedRun | "busy" | "unclaimable" | ExhaustedClaim> {
   if (claimCountOf(taken) >= TASK_POISON_DELIVERY_COUNT) {
     const closed = await failExhaustedClaim(taken);
     if (!closed) {
@@ -114,11 +193,46 @@ export async function claimRunById(
 
 const CLAIM_NEXT_ATTEMPTS = 8;
 
-export async function claimNextRun(brainId: string): Promise<ClaimedRun | null> {
+/** A union, so the exhaustion reason is required exactly when the cause is `exhausted`. */
+export type ClaimNextSkip =
+  | { cause: "exhausted"; exhaustion: "lock_contention_exhausted" | "max_retries_exceeded" }
+  | { cause: "raced" | "unclaimable" | "error" | "deferred" };
+
+/** "No row" has three meanings, and collapsing them makes a stalled queue look idle. */
+export interface ClaimNextDiagnostics {
+  skipped: ClaimNextSkip[];
+  outcome: "claimed" | "empty" | "all_skipped" | "retry_limit";
+}
+
+export async function claimNextRun(
+  brainId: string,
+  doorbellSemantics = 1,
+  diag?: ClaimNextDiagnostics,
+): Promise<ClaimedRun | null> {
   const skip: string[] = [];
-  for (let i = 0; i < CLAIM_NEXT_ATTEMPTS; i++) {
-    const taskId = await peekNextQueued(skip);
-    if (!taskId) return null;
+  let failedAttempts = 0;
+  while (failedAttempts < CLAIM_NEXT_ATTEMPTS) {
+    let taskId: string;
+    let taken: TakenRow | "missing" | "busy" | undefined;
+    const softGated = anySoftCeilingSet(envAdmitLimits());
+    if (softGated) {
+      const selected = await takeNextWithinSoftCeiling(
+        brainId, doorbellSemantics, skip, diag,
+      );
+      if (!selected) {
+        if (diag) diag.outcome = diag.skipped.length || skip.length ? "all_skipped" : "empty";
+        return null;
+      }
+      taskId = selected.taskId;
+      taken = selected.taken;
+    } else {
+      const nextTaskId = await peekNextQueued(skip, doorbellSemantics);
+      if (!nextTaskId) {
+        if (diag) diag.outcome = skip.length ? "all_skipped" : "empty";
+        return null;
+      }
+      taskId = nextTaskId;
+    }
     // A hydrate failure that is not about credentials is rethrown by
     // claimRunById, and it used to leave through here: no catch on this loop
     // and none on the route, so the whole cycle answered 500. The row itself
@@ -128,22 +242,89 @@ export async function claimNextRun(brainId: string): Promise<ClaimedRun | null> 
     // ordinary database blip reaches here.
     let claimed: Awaited<ReturnType<typeof claimRunById>>;
     try {
-      claimed = await claimRunById(taskId, brainId);
+      claimed = softGated
+        ? (typeof taken === "string" ? taken : await finishClaim(taken!, taskId, brainId))
+        : await claimRunById(taskId, brainId, doorbellSemantics);
     } catch (err) {
       logger.warn({ err, taskId, brainId }, "run.claim_next.skipped_after_error");
+      diag?.skipped.push({ cause: "error" });
       skip.push(taskId);
+      failedAttempts++;
       continue;
     }
-    if (typeof claimed === "string" || "kind" in claimed) {
-      skip.push(taskId);
-      continue;
+    if (typeof claimed !== "string" && !("kind" in claimed)) {
+      if (diag) diag.outcome = "claimed";
+      return claimed;
     }
-    return claimed;
+    const cause = skipCauseOf(claimed);
+    diag?.skipped.push(cause);
+    skip.push(taskId);
+    if (cause.cause !== "deferred") failedAttempts++;
   }
+  if (diag) diag.outcome = "retry_limit";
   return null;
 }
 
-async function peekNextQueued(skip: string[]): Promise<string | null> {
+async function takeNextWithinSoftCeiling(
+  brainId: string,
+  doorbellSemantics: number,
+  alreadySkipped: readonly string[],
+  diag?: ClaimNextDiagnostics,
+): Promise<{ taskId: string; taken: TakenRow | "missing" | "busy" } | null> {
+  const limits = envAdmitLimits();
+  return await withOwnedAdmissionLock(async (client, afterCommit) => {
+    const { usage, roots } = await loadUsageWithRoots("executing", client);
+    const accepted = await fillWithinCeiling<ClawTaskRow>({
+      page: (skip) => peekNextQueuedRows(
+        [...alreadySkipped, ...skip], doorbellSemantics, client,
+      ),
+      fits: (row) => {
+        const ask = askFromRow(row, roots);
+        if (softOverflow(usage, ask, limits)) {
+          diag?.skipped.push({ cause: "deferred" });
+          return false;
+        }
+        chargeAccepted(usage, ask, row.dag_root_task_id ?? row.task_id, roots);
+        return true;
+      },
+      want: 1,
+      idOf: (row) => row.task_id,
+    });
+    const row = accepted[0];
+    if (!row) return null;
+    const taken = await takeClaimOrBusy(row.task_id, brainId, doorbellSemantics, client);
+    if (typeof taken !== "string" && taken.prior_status === "queued") {
+      const since = taken.queued_since ?? null;
+      afterCommit(() => metrics.observeQueueExit("chat", since, "claimed"));
+    }
+    return { taskId: row.task_id, taken };
+  });
+}
+
+/**
+ * `missing` and `busy` are both the queue moving under this pod, so they share
+ * one value; only the others are properties of the candidate, and only those
+ * can mean a queue that is stuck.
+ */
+function skipCauseOf(
+  claimed: "missing" | "busy" | "unclaimable" | "deferred" | ExhaustedClaim,
+): ClaimNextSkip {
+  if (typeof claimed !== "string") {
+    return { cause: "exhausted", exhaustion: claimed.reason };
+  }
+  if (claimed === "unclaimable" || claimed === "deferred") return { cause: claimed };
+  return { cause: "raced" };
+}
+
+/**
+ * A caller that implements less than the row requires is never offered it.
+ * Filtered server-side: claiming and releasing instead would burn a
+ * `claim_count` increment on every poll of every pod.
+ */
+const SEMANTICS_FITS_SQL =
+  "COALESCE((metadata->>'doorbell_semantics')::int, 1) <= $SEM::int";
+
+async function peekNextQueued(skip: string[], doorbellSemantics: number): Promise<string | null> {
   const r = await db.query(
     `SELECT task_id FROM claw_tasks
       WHERE status = 'queued'
@@ -160,15 +341,41 @@ async function peekNextQueued(skip: string[]): Promise<string | null> {
         -- run_budget_exhausted -- and the claim installs a fresh lease, which
         -- takes the row out of reapExpiredDoorbellRuns' reach on the way past.
         AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$2")}
         AND NOT (task_id = ANY($1::text[]))
       ORDER BY
         priority DESC,
         COALESCE(queued_at, created_at) ASC,
         created_at ASC
       LIMIT 1`,
-    [skip],
+    [skip, doorbellSemantics],
   );
   return (r.rows[0] as { task_id?: string } | undefined)?.task_id ?? null;
+}
+
+async function peekNextQueuedRows(
+  skip: string[],
+  doorbellSemantics: number,
+  q: StatementSource,
+): Promise<ClawTaskRow[]> {
+  const r = await q.query(
+    `SELECT * FROM claw_tasks
+      WHERE status = 'queued'
+        AND origin = 'chat'
+        AND executor = 'brain'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+        AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$2")}
+        AND NOT (task_id = ANY($1::text[]))
+      ORDER BY
+        priority DESC,
+        COALESCE(queued_at, created_at) ASC,
+        created_at ASC
+      LIMIT 1`,
+    [skip, doorbellSemantics],
+  );
+  return r.rows as ClawTaskRow[];
 }
 
 async function markUnclaimable(taskId: string): Promise<void> {
@@ -195,62 +402,6 @@ async function markUnclaimable(taskId: string): Promise<void> {
     "unclaimable",
     "Task failed: this run could not be started. Please send a new message.",
   );
-}
-
-/**
- * Hand a claimed row back, if this caller still holds the claim it took.
- *
- * `claimCount` is the generation, and without it this statement is unsafe.
- * `lease_owner` alone cannot say *which* claim is being released: `BRAIN_ID`
- * is the pod name, so it is the same string across every claim that pod ever
- * takes on the row. A release that arrives late therefore matches a claim it
- * knows nothing about.
- *
- * Late is the normal case, not an exotic one. Lock contention defers the retry
- * by `lockContentionNakMs`, which climbs to five minutes, while the lease is
- * forty-five seconds and nothing renews it for a run that never started. So
- * the lease lapses mid-wait, `requeueLostDoorbellLeases` puts the row back,
- * claim-next hands it to a replica -- one time in N, the same pod -- and that
- * replica starts executing. When the original timer finally fires, matching on
- * owner alone would yank a running row back onto the queue, where a third
- * claim would start a second agent loop for one turn, with nothing logged
- * anywhere to say so.
- *
- * `claim_count` is incremented by every `takeClaim`, so comparing it pins the
- * release to the exact claim that asked for it. A stale release matches
- * nothing and returns false, which is the right answer: whoever holds the row
- * now is entitled to it.
- *
- * The parameter is optional so a worker too old to report its generation keeps
- * the previous behaviour rather than being unable to release at all.
- */
-export async function releaseClaim(
-  taskId: string,
-  brainId: string,
-  claimCount?: number,
-  reason?: string,
-  settlement?: RunSettlement,
-): Promise<boolean> {
-  return settleAndTransition(taskId, settlement, (query) =>
-    applyTaskStatusTransition("queued", {
-      extra: {
-        lease_owner: null,
-        lease_expires_at: null,
-        heartbeat_at: null,
-        internal_token_hash: null,
-        // Cleared with the status, so a heartbeat racing this release cannot
-        // find the row still holding the attempt it is reporting for.
-        attempt_id: null,
-        started_at: null,
-        ...(reason ? { metadata: JSON.stringify({ last_release: reason }) } : {}),
-      },
-      where: `task_id = $1
-        AND lease_owner = $2
-        AND status IN ('queued','preparing','running')
-        AND ($3::int IS NULL OR claim_count = $3)`,
-      params: [taskId, brainId, claimCount ?? null],
-      query,
-    }));
 }
 
 /**
@@ -354,6 +505,112 @@ export async function settleFinishedClaim(
 }
 
 /**
+ * Hand a claimed row back, if this caller still holds the claim it took.
+ *
+ * `claimCount` is the generation, and without it this statement is unsafe.
+ * `lease_owner` alone cannot say *which* claim is being released: `BRAIN_ID`
+ * is the pod name, so it is the same string across every claim that pod ever
+ * takes on the row. A release that arrives late therefore matches a claim it
+ * knows nothing about.
+ *
+ * Late is the normal case, not an exotic one. Lock contention defers the retry
+ * by `lockContentionNakMs`, which climbs to five minutes, while the lease is
+ * forty-five seconds and nothing renews it for a run that never started. So
+ * the lease lapses mid-wait, `requeueLostDoorbellLeases` puts the row back,
+ * claim-next hands it to a replica -- one time in N, the same pod -- and that
+ * replica starts executing. When the original timer finally fires, matching on
+ * owner alone would yank a running row back onto the queue, where a third
+ * claim would start a second agent loop for one turn, with nothing logged
+ * anywhere to say so.
+ *
+ * `claim_count` is incremented by every `takeClaim`, so comparing it pins the
+ * release to the exact claim that asked for it. A stale release matches
+ * nothing and returns false, which is the right answer: whoever holds the row
+ * now is entitled to it.
+ *
+ * The parameter is optional so a worker too old to report its generation keeps
+ * the previous behaviour rather than being unable to release at all.
+ */
+export async function releaseClaim(
+  taskId: string,
+  brainId: string,
+  claimCount?: number,
+  reason?: string,
+  settlement?: RunSettlement,
+): Promise<boolean> {
+  // What the row became, read back from the one statement that decided it: a
+  // release is two outcomes now and only the requeue re-enters the queue.
+  // Tested for the closed arm rather than the open one, so a caller whose
+  // RETURNING does not carry the column keeps counting its requeue: the
+  // counter is suppressed only where the row is known to have been closed.
+  let became: string | undefined;
+  let closedSession: string | undefined;
+  // `setSql` rather than `extra.metadata`: one statement may assign a column
+  // once, and this assignment does two things -- carry the release reason and
+  // restamp the sojourn marker, so a row going round the requeue loop three
+  // times is measured as three waits rather than one that keeps growing.
+  const released = await settleAndTransition(taskId, settlement, async (query) => {
+    const rows = await applyTaskStatusTransition(
+      // A row the user stopped is closed here rather than put back. Releasing
+      // it to `queued` is what let a Stop be erased instead of merely missed:
+      // `peekNextQueued` would match it again within the same second and the
+      // turn ran on a second replica. Ending it here is also what keeps the
+      // wait short -- `cancelling` is outside `requeueLostDoorbellLeases`'
+      // statuses, so the only other pass that would reach the row is
+      // `reapLostLeases`, a whole `LEASE_LOST_GRACE_SEC` later with the
+      // session's gate shut for all of it.
+      { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END", terminal: true },
+      {
+        extra: {
+          lease_owner: null,
+          lease_expires_at: null,
+          heartbeat_at: null,
+          internal_token_hash: null,
+          // Cleared with the status, so a heartbeat racing this release cannot
+          // find the row still holding the attempt it is reporting for.
+          attempt_id: null,
+          started_at: null,
+        },
+        setSql: [
+          // The writer re-stamps `queued_at` for the literal status "queued"
+          // and this is an expression, so the requeue arm has to say it. Losing
+          // it would not fail anything loudly: the row still goes back on the
+          // queue, and every trip round the loop after the first would be
+          // measured from the first one's stamp, so one requeued run would
+          // report a wait that grows without bound.
+          `queued_at = CASE WHEN status = 'cancelling'
+                            THEN queued_at ELSE clock_timestamp() END`,
+          `failure_reason = CASE WHEN status = 'cancelling'
+                                 THEN 'cancelled' ELSE failure_reason END`,
+          `metadata = ${requeueSojournSql(`CASE
+                           WHEN $4::text IS NULL THEN COALESCE(metadata, '{}'::jsonb)
+                           ELSE COALESCE(metadata, '{}'::jsonb)
+                                || jsonb_build_object('last_release', $4::text)
+                         END`)}`,
+        ],
+        where: `task_id = $1
+          AND lease_owner = $2
+          AND status IN ('queued','preparing','running','cancelling')
+          AND ($3::int IS NULL OR claim_count = $3)`,
+        params: [taskId, brainId, claimCount ?? null, reason ?? null],
+        query,
+      },
+    );
+    became = rows[0]?.status;
+    closedSession = rows[0]?.session_id ?? undefined;
+    return rows;
+  });
+  if (released && became !== "cancelled") metrics.onQueueEntered("requeue");
+  // A closed row may have been the last thing occupying its session, and the
+  // Stop that parked it could not say so: it left the gate shut deliberately,
+  // for a turn that was still winding down. This is where it stops winding.
+  if (released && became === "cancelled" && closedSession) {
+    await releaseSessionGateIfUnoccupied(closedSession);
+  }
+  return released;
+}
+
+/**
  * Why the holder is ending a claim instead of putting the row back.
  *
  * `session_deleted` is the tombstone loop: unclaiming would let the next idle
@@ -363,10 +620,7 @@ export async function settleFinishedClaim(
  * `workspace_unbound` is a claimed run the gate cannot serialise: there is no
  * `callback_url` on a chat row, so `agent_done` would leave it preparing.
  */
-export type HeldClaimFailureReason =
-  | "session_deleted"
-  | "claim_abandoned"
-  | "workspace_unbound";
+export type HeldClaimFailureReason = RunFailClaimReason;
 
 const HELD_CLAIM_MESSAGE: Record<HeldClaimFailureReason, string> = {
   session_deleted: "the session this run belonged to was deleted",
@@ -376,11 +630,17 @@ const HELD_CLAIM_MESSAGE: Record<HeldClaimFailureReason, string> = {
 
 const HELD_CLAIM_REASONS = new Set<string>(Object.keys(HELD_CLAIM_MESSAGE));
 
-export function heldClaimReasonFrom(body: unknown): HeldClaimFailureReason {
+/**
+ * Why the holder is closing the row, when it says so. Absence keeps the
+ * historical default; a present-but-unrecognised value is refused, because the
+ * three reasons ask opposite things and a fail is terminal.
+ */
+export function heldClaimReasonFrom(body: unknown): HeldClaimFailureReason | "invalid" {
   const raw = body && typeof body === "object" ? (body as { reason?: unknown }).reason : undefined;
+  if (raw === undefined) return "session_deleted";
   return typeof raw === "string" && HELD_CLAIM_REASONS.has(raw)
     ? raw as HeldClaimFailureReason
-    : "session_deleted";
+    : "invalid";
 }
 
 /**
@@ -443,13 +703,26 @@ export async function failHeldClaim(
 async function takeClaim(
   taskId: string,
   brainId: string,
-): Promise<ClawTaskRow | "missing" | "busy"> {
+  doorbellSemantics: number,
+  q: StatementSource,
+): Promise<TakenRow | "missing" | "busy"> {
   const token = randomBytes(32).toString("hex");
   const hash = createHash("sha256").update(token).digest("hex");
   // Chat doorbells only: a DAG row whose lease lapsed is still the
   // scheduler's, and a fat chat row is still the JetStream message's.
-  // `preparing` for a row already there leaves the status alone and banks a
-  // zero segment, which is what the old conditional expression said.
+  // The prior state, locked before the claim writes over it: this is the only
+  // place that can still tell whether the claim was a queue exit, and an
+  // UPDATE's RETURNING answers with what the row became.
+  const before = await q.query(
+    `SELECT status AS prior_status, metadata->>'queued_since' AS queued_since
+       FROM claw_tasks WHERE task_id = $1 FOR UPDATE`,
+    [taskId],
+  );
+  // Through the one writer of `status`, which stamps `started_at` and the
+  // execution deadline for `preparing` itself, so the explicit stamps this
+  // statement used to carry are its job now. `preparing` for a row already
+  // there leaves the status alone and banks a zero segment, which is what the
+  // old conditional expression said.
   const rows = await applyTaskStatusTransition("preparing", {
     extra: {
       lease_owner: brainId,
@@ -477,18 +750,47 @@ async function takeClaim(
              AND sibling.metadata->>'message_id' IS NOT NULL
              AND sibling.metadata->>'message_id' = claw_tasks.metadata->>'message_id'
              AND sibling.status IN ('preparing','running','cancelling')
-        )`,
-    params: [taskId, RUN_LEASE_TTL_MS, CLAIMABLE],
+        )
+        AND ${SEMANTICS_FITS_SQL.replace("$SEM", "$4")}
+        AND ${RUN_CLAIM_FENCE_SQL}`,
+    params: [taskId, RUN_LEASE_TTL_MS, CLAIMABLE, doorbellSemantics],
+    query: ((text, params) => q.query(text, params)) as Querier,
   });
   if (rows.length === 0) {
-    const exists = await db.query(`SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId]);
+    const exists = await q.query(
+      `SELECT status, lease_expires_at FROM claw_tasks WHERE task_id = $1`, [taskId],
+    );
     if ((exists.rowCount ?? 0) === 0) return "missing";
     return "busy";
   }
-  const row = rows[0];
+  const prior = before.rows[0] as { prior_status?: string; queued_since?: string } | undefined;
+  const row = { ...rows[0], ...(prior ?? {}) } as TakenRow;
   (row as ClawTaskRow & { _lease_token: string })._lease_token = token;
   return row;
 }
+
+/**
+ * The sibling `NOT EXISTS` is a pre-check, not the guarantee: under READ
+ * COMMITTED both siblings of one turn can see the other still `queued`, so the
+ * unique index refuses the second, as a violation rather than a zero-row CAS.
+ */
+async function takeClaimOrBusy(
+  taskId: string,
+  brainId: string,
+  doorbellSemantics: number,
+  q: StatementSource,
+): Promise<TakenRow | "missing" | "busy"> {
+  try {
+    return await takeClaim(taskId, brainId, doorbellSemantics, q);
+  } catch (err) {
+    if ((err as { code?: string })?.code !== UNIQUE_VIOLATION) throw err;
+    logger.info({ taskId, brainId }, "run.claim.lost_to_sibling");
+    return "busy";
+  }
+}
+
+/** Postgres class 23505: the turn's uniqueness invariant refused this writer. */
+const UNIQUE_VIOLATION = "23505";
 
 async function assembleClaim(row: ClawTaskRow, brainId: string): Promise<ClaimedRun> {
   const token = (row as ClawTaskRow & { _lease_token?: string })._lease_token;
@@ -674,6 +976,7 @@ async function announceClaimFailure(
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: row.session_id,
     message_id: messageId,
+    task_id: row.task_id,
     ...event,
   });
   try {

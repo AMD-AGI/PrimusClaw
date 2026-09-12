@@ -13,6 +13,17 @@ import { db } from "../src/infra/db.js";
 import { claimNextRun, claimRunById, failHeldClaim, heldClaimReasonFrom, releaseClaim, runClaimPorts } from "../src/tasks/run-claim.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
+/**
+ * The release statement's own status expression.
+ *
+ * Matching `SET status = 'queued'` stopped naming this statement once a
+ * release grew a second outcome, and an absence assertion written that way
+ * passes for the wrong reason -- the literal is gone from every release, so
+ * the test would hold even if the release it forbids were issued.
+ */
+const RELEASE_STATUS =
+  /SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END/;
+
 const originalQuery = db.query;
 // These tests reply to queries positionally, so the claim's history rebuild --
 // several reads of its own -- would eat the replies meant for the user-env
@@ -53,6 +64,10 @@ function stubQueries(
     // subject of any assertion here, so it answers itself and consumes no
     // scripted reply.
     if (/run_phase/.test(sql)) return { rows: [], rowCount: 0 };
+    // Nor does the prior-state read the claim takes before it writes: the
+    // queue-exit metric is measured from what the row was, and a scripted
+    // reply consumed here would shift every later one by a statement.
+    if (/^SELECT status AS prior_status/.test(sql)) return { rows: [], rowCount: 0 };
     seen.push({ sql, params });
     const reply = replies[i++];
     if (!reply) return { rows: [], rowCount: 0 };
@@ -200,8 +215,14 @@ test("unclaim returns the row to queued for the holder only", async () => {
   ]);
   assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
   const update = statusUpdate(seen);
-  assert.match(update.sql, /SET status = 'queued'/);
-  assert.equal(update.params[update.params.length - 2], "brain-7");
+  assert.match(update.sql, RELEASE_STATUS);
+  // The one status writer numbers its own values before the caller's, so the
+  // holder's position is the writer's business. Read the placeholder the
+  // predicate uses -- `lease_owner` is in the SET too, so it has to be the one
+  // after WHERE.
+  const holder = update.sql.match(/WHERE .*lease_owner = \$(\d+)/);
+  assert.ok(holder, `no holder fence in:\n${update.sql}`);
+  assert.equal(update.params[Number(holder![1]) - 1], "brain-7");
 });
 
 test("a row that is not there is missing, not busy", async () => {
@@ -227,7 +248,7 @@ test("failing a held claim ends the row instead of returning it to the queue", a
   assert.equal(update.params[0], "session_deleted");
   assert.match(update.sql, /origin = 'chat'/);
   assert.ok(update.params.includes("brain-7"));
-  assert.ok(!seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+  assert.ok(!seen.some((q) => RELEASE_STATUS.test(q.sql)));
 });
 
 test("a doorbell term fails the held claim as claim_abandoned, not session_deleted", async () => {
@@ -253,11 +274,14 @@ test("failing a held claim is a no-op for a brain that does not hold it", async 
   assert.equal(await failHeldClaim("ktsk_1", "brain-other"), false);
 });
 
-test("fail-claim body reasons other than the held-claim set stay session_deleted", () => {
+test("fail-claim body reasons outside the held-claim set are refused, absence is not", () => {
   assert.equal(heldClaimReasonFrom({ brain_id: "b", reason: "claim_abandoned" }), "claim_abandoned");
   assert.equal(heldClaimReasonFrom({ reason: "workspace_unbound" }), "workspace_unbound");
   assert.equal(heldClaimReasonFrom({ brain_id: "b" }), "session_deleted");
-  assert.equal(heldClaimReasonFrom({ reason: "agent_error" }), "session_deleted");
+  assert.equal(heldClaimReasonFrom({ reason: "agent_error" }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: "" }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: null }), "invalid");
+  assert.equal(heldClaimReasonFrom({ reason: 7 }), "invalid");
 });
 
 test("claim-next skips an unclaimable row and takes the next chat run", async () => {
@@ -298,7 +322,9 @@ test("too many claims fail the row as max_retries_exceeded", async () => {
       () => ({ rows: [{ task_id: "ktsk_1" }], rowCount: 1 }),
     ]);
     const taken = await claimRunById("ktsk_1", "brain-7");
-    assert.ok(seen.some((q) => /claim_count = COALESCE\(claim_count, 0\) \+ 1/.test(q.sql)));
+    // Unqualified: the claim's UPDATE has no FROM clause, so there is nothing
+  // for `claw_tasks.` to disambiguate it from.
+  assert.ok(seen.some((q) => /claim_count = COALESCE\((?:claw_tasks\.)?claim_count, 0\) \+ 1/.test(q.sql)));
     // The reason is a bind parameter now: the poison guard reports
     // lock_contention_exhausted when the last holder said it was waiting on a
     // lock, and max_retries_exceeded otherwise.
@@ -328,7 +354,7 @@ test("exhausted claims put the row back when it was not actually failed", async 
     ]);
     assert.equal(await claimRunById("ktsk_1", "brain-7"), "busy");
     assert.equal(events.length, 0);
-    assert.ok(seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+    assert.ok(seen.some((q) => RELEASE_STATUS.test(q.sql)));
   } finally {
     runClaimPorts.publishSessionEvent = originalPublish;
   }
@@ -349,7 +375,7 @@ test("exhausted claims put the row back when marking the row throws", async () =
     ]);
     assert.equal(await claimRunById("ktsk_1", "brain-7"), "busy");
     assert.equal(events.length, 0);
-    assert.ok(seen.some((q) => /SET status = 'queued'/.test(q.sql)));
+    assert.ok(seen.some((q) => RELEASE_STATUS.test(q.sql)));
   } finally {
     runClaimPorts.publishSessionEvent = originalPublish;
   }
