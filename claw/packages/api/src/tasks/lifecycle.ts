@@ -355,7 +355,7 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
             -- previous one's settled time ledger or the identity that ledger
             -- was keyed under, which would credit this run with the other's
             -- states and leave it marked terminal before it starts.
-            metadata - 'run_phase' - 'last_release' - 'retried_into',
+            metadata - 'sandbox' - 'run_phase' - 'last_release' - 'retried_into',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
             workspace_throwaway,

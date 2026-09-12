@@ -59,7 +59,7 @@ import { resolveSandboxAction } from "../sandbox/params.js";
 import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
 import { runScript } from "./script-runner.js";
 import {
-  AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning,
+  AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
   type RunAttemptToken,
 } from "./callback.js";
 import type { RunTimeReport } from "@claw/protocol";
@@ -3369,6 +3369,7 @@ class TaskRunner {
       this.coverageOpened = true;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
+        sandbox: sandboxForLease(this.handsIdentity),
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
         phase: phase.phase,
         waitReason: phase.waitReason,

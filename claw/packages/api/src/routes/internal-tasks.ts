@@ -28,6 +28,7 @@ import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/ind
 import type { BackendMcpCtx } from "../backend-mcp/index.js";
 import { applyAgentDone, type AgentDonePayload } from "../tasks/lifecycle.js";
 import { getTask, transitionStatus } from "../tasks/db.js";
+import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
 import { db } from "../infra/db.js";
@@ -151,6 +152,9 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
+              metadata = CASE WHEN $9::jsonb IS NULL THEN metadata
+                         ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
+                         END,
               attempt_id          = COALESCE($5, attempt_id),
               attempt_generation  = CASE
                                       WHEN $5::text IS NOT NULL
@@ -170,6 +174,7 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
         taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
         attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
         body.claim_count ?? 0,
+        workloadId ? JSON.stringify({ provider: "safe-workload", handle: workloadId }) : null,
       ],
     );
     return (r.rowCount ?? 0) > 0;
@@ -182,8 +187,49 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
   }
 }
 
+async function recordLeaseSandbox(
+  taskId: string,
+  brainId: string,
+  sandbox: SandboxHandle,
+  token: AttemptToken,
+  authorization: string | undefined,
+): Promise<void> {
+  const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  try {
+    // Renewal and sandbox storage can straddle a takeover, including one by the same brain.
+    await db.query(
+      `UPDATE claw_tasks
+          SET sandbox_workload_id = $3,
+              metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+        WHERE task_id = $1
+          AND lease_owner = $2
+          AND lease_expires_at > NOW()
+          AND status = ANY($5::text[])
+          AND (
+            ($6::text IS NOT NULL AND attempt_id = $6 AND claim_count = $7
+              AND (delivery_seq, delivery_count) = ($8::bigint, $9::bigint))
+            OR ($6::text IS NULL AND attempt_generation = 0
+              AND internal_token_hash = $10 AND attempt_id IS NULL AND settled_attempt_id IS NULL)
+          )`,
+      [
+        taskId, brainId,
+        sandbox.provider === "safe-workload" ? sandbox.handle : null,
+        JSON.stringify(sandbox), RENEWABLE_STATUSES,
+        token.ok ? token.attemptId : null,
+        token.ok ? token.claimCount : null,
+        token.ok ? token.deliverySeq : null,
+        token.ok ? token.deliveryCount : null,
+        token.ok ? null : createHash("sha256").update(bearer).digest("hex"),
+      ],
+    );
+  } catch (err) {
+    logger.warn({ taskId, err: (err as Error)?.message }, "task.ownership_write_failed");
+  }
+}
+
 interface RunLeaseBody {
   brain_id?: string;
+  sandbox?: unknown;
   /** How long the row should treat this renewal as valid. Bounded below. */
   lease_seconds?: number;
   /** "executing" or "waiting"; anything else is read as executing. */
@@ -315,6 +361,7 @@ async function renewRunLease(
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner      = COALESCE($2, lease_owner),
+              brain_id         = COALESCE($2, brain_id),
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at     = NOW(),
               metadata         = jsonb_set(
@@ -387,6 +434,7 @@ async function renewLegacyRunLease(
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner = $2,
+              brain_id = $2,
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at = NOW(),
               metadata = jsonb_set(
@@ -599,11 +647,6 @@ async function buildBackendMcpCtxStub(
   };
 }
 
-/**
- * Register the three Brain → Backend lifecycle endpoints.
- *
- * Mount path: `/v1/internal/tasks/:taskId/{agent_done,event,backend-mcp}`.
- */
 export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
   registerAgentDoneRoute(app);
   registerEventRoute(app);
@@ -676,6 +719,14 @@ function registerLeaseRoute(app: FastifyInstance): void {
     async (req, reply) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
+      const sandbox = parseSandboxHandle(body.sandbox);
+      if (body.sandbox !== undefined && !sandbox) {
+        return reply.status(400).send({
+          ok: false,
+          error: "sandbox.provider must be 'safe-workload' or 'agent-sandbox'; sandbox.handle must be a non-empty string of at most 1024 characters"
+            + " without control characters and cannot be '.' or '..'",
+        });
+      }
       const token = attemptTokenOf(body);
       if (!token.ok && !isLegacyRunLease(body)) {
         // A partial modern token must never fall back to the legacy bridge.
@@ -688,6 +739,9 @@ function registerLeaseRoute(app: FastifyInstance): void {
         ? await renewRunLease(taskId, body, token)
         : await renewLegacyRunLease(taskId, body, req.headers.authorization);
       if (outcome.kind === "accepted") {
+        if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
+          await recordLeaseSandbox(taskId, body.brain_id, sandbox, token, req.headers.authorization);
+        }
         if (token.ok) await mergeRenewalCoverage(taskId, body, token);
         return { ok: true, status: outcome.status };
       }

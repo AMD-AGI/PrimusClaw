@@ -15,7 +15,7 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { ExecuteRequest } from "@claw/protocol";
 
-import { postRunLease } from "../src/tasks/callback.js";
+import { postRunLease, sandboxForLease } from "../src/tasks/callback.js";
 
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
@@ -93,4 +93,27 @@ test("a run with no lease endpoint says nothing and calls nobody", async () => {
   globalThis.fetch = (async () => { called = true; throw new Error("unreachable"); }) as never;
   assert.equal(await postRunLease({ session_id: "s-1" } as ExecuteRequest, renewal), null);
   assert.equal(called, false);
+});
+
+test("a chat lease sends a provider handle without sandbox credentials", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+  }) as typeof fetch;
+  for (const entry of [
+    { workloadId: "workload-1", platformKey: "private-platform-key" },
+    { provider: "agent-sandbox" as const, sessionId: "router-session-1", userId: "private-user" },
+    null,
+    { provider: "agent-sandbox" as const, sandboxName: "pod-is-not-a-session" },
+  ]) {
+    assert.equal(await postRunLease(request, { ...renewal, sandbox: sandboxForLease(entry) }), "running");
+  }
+  assert.deepEqual(bodies.map((body) => body.sandbox), [
+    { provider: "safe-workload", handle: "workload-1" },
+    { provider: "agent-sandbox", handle: "router-session-1" },
+    undefined,
+    undefined,
+  ]);
+  assert.ok(bodies.every((body) => !JSON.stringify(body).includes("private-")));
 });

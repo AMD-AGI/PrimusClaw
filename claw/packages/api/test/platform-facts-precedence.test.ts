@@ -15,7 +15,7 @@
  * Coverage:
  *   R1 a preempted run swept as brain_timeout reports preempted, not deadline
  *   R2 an OOM likewise, from the container's own reason
- *   R3 a brain_timeout the platform said nothing about still reports deadline
+ *   R3 liveness failures without platform facts remain unexplained
  *   R4 our own budget still outranks whatever the pod said on the way down
  */
 import test from "node:test";
@@ -48,17 +48,13 @@ test("R2 an OOM under the same sweep reports oom", () => {
   );
 });
 
-test("R3 with nothing from the platform, brain_timeout still means deadline", () => {
-  // The demotion must not become a deletion: a run that really did stop
-  // reporting, on a node that is fine, still has to come back as a kill we
-  // performed rather than an unexplained failure.
-  assert.deepEqual(
-    terminalFacts({ status: "failed", failure_reason: "brain_timeout" }),
-    // No exit code: the run stopped reporting, so nothing ever reported one
-    // either. `null`, not `0` -- a clean exit is the one thing that did not
-    // happen here.
-    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
-  );
+test("R3 an expired lease or missing worker does not establish a deadline", () => {
+  for (const failure_reason of ["brain_timeout", "worker_lost"]) {
+    assert.deepEqual(
+      terminalFacts({ status: "failed", failure_reason }),
+      { class: "failed", kill_reason: "", exit_code: null, signal: "" },
+    );
+  }
 });
 
 test("R4 our own budget still outranks the pod's account", () => {
@@ -73,4 +69,54 @@ test("R4 our own budget still outranks the pod's account", () => {
     }),
     { class: "killed", kill_reason: "deadline", exit_code: 137, signal: "SIGKILL" },
   );
+});
+
+test("a Pending sandbox queue ceiling is an enforced deadline", () => {
+  assert.deepEqual(
+    terminalFacts({
+      status: "failed", failure_reason: "sandbox_pending_timeout",
+      pod_failed_message: "Evicted, stopped after the queue deadline",
+    }),
+    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
+  );
+});
+
+test("a workload timeout message yields to explicit pod termination facts", () => {
+  assert.equal(terminalFacts({ status: "failed", failure_reason: "sandbox_timed_out" })?.kill_reason, "deadline");
+  assert.equal(terminalFacts({
+    status: "failed", failure_reason: "sandbox_timed_out", pod_failed_message: "Preempted, reclaimed",
+  })?.kill_reason, "preempted");
+});
+
+for (const failure_reason of ["worker_lost", "sandbox_workload_terminal"]) {
+  test(`${failure_reason} uses measured pod and container reasons`, () => {
+    for (const [pod_failed_message, container_reason, expected] of [
+      ["Preempted, reclaimed", "Error", "preempted"],
+      ["NodeLost, unreachable", "", "node_lost"],
+      ["", "OOMKilled", "oom"],
+      ["", "", ""],
+    ]) {
+      assert.equal(terminalFacts({
+        status: "failed", failure_reason, pod_failed_message, container_reason,
+      })?.kill_reason, expected);
+    }
+  });
+}
+
+test("session deletion is a user cancellation including a tombstoned delivery", () => {
+  for (const status of ["cancelled", "failed"]) {
+    assert.deepEqual(
+      terminalFacts({ status, failure_reason: "session_deleted", pod_failed_message: "Preempted" }),
+      { class: "cancelled", kill_reason: "user", exit_code: null, signal: "" },
+    );
+  }
+});
+
+test("agent and dispatch failures stay failures without platform evidence", () => {
+  for (const failure_reason of ["agent_error", "dispatch_failed"]) {
+    assert.deepEqual(
+      terminalFacts({ status: "failed", failure_reason }),
+      { class: "failed", kill_reason: "", exit_code: null, signal: "" },
+    );
+  }
 });

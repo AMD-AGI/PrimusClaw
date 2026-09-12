@@ -175,24 +175,14 @@ export interface TaskTerminalInput {
 const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["run_budget_exhausted", "deadline"],
   ["queue_timeout", "deadline"],
+  ["sandbox_pending_timeout", "deadline"],
   ["external_timeout", "deadline"],
 ]);
 
-/**
- * Reasons that only say nobody reported back.
- *
- * `brain_timeout` is written by the sweeper when a run stops reporting, and that
- * is precisely what a node reclaim looks like from here -- the sandbox and the
- * worker watching it go together, so no callback is ever sent. Ranking it with
- * the real deadlines labelled every preemption `killed/deadline`: a confident
- * wrong answer, and worse than the empty one, because a dispatcher reading
- * "deadline" holds the model responsible for the cluster's decision.
- *
- * So it yields to anything the platform said, and stands only when the platform
- * said nothing.
- */
+// The workload's timeout message is weaker than an explicit pod/container reason.
+// Liveness failures (`brain_timeout`, `worker_lost`) establish no deadline.
 const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
-  ["brain_timeout", "deadline"],
+  ["sandbox_timed_out", "deadline"],
 ]);
 
 /**
@@ -206,8 +196,7 @@ const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
  * 2. Claw's own deadline next, for the same reason: we enforced it, so the pod's
  *    account of being terminated is a description of us doing it.
  * 3. Then the platform's own reason, which is the only source for a preemption.
- * 4. Then `brain_timeout`, which outranks nothing: it says a run stopped
- *    reporting, and being reclaimed is one of the reasons a run does that.
+ * 4. Then a workload timeout reported without a pod/container reason.
  * 5. A failure nobody explained stays `failed`, not a kill with a guessed cause.
  */
 export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
@@ -223,7 +212,7 @@ export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
   const exitCode = typeof input.exit_code === "number" ? input.exit_code : null;
   const signal = signalOf(exitCode);
 
-  if (status === "cancelled") {
+  if (status === "cancelled" || (status === "failed" && input.failure_reason === "session_deleted")) {
     return { class: "cancelled", kill_reason: "user", exit_code: exitCode, signal };
   }
   if (status === "completed") {
@@ -246,8 +235,6 @@ export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {
     return { class: "killed", kill_reason: fromContainer, exit_code: exitCode, signal };
   }
 
-  // Only now: a timeout that means "nobody reported back" is the best answer
-  // left once the platform has been asked and had nothing to say.
   const weak = WEAK_REASONS.get(input.failure_reason ?? "");
   if (weak) return { class: "killed", kill_reason: weak, exit_code: exitCode, signal };
 

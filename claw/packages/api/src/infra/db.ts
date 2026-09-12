@@ -87,6 +87,34 @@ const lockPool = new pg.Pool({
 pool.on("error", (err) => logger.error({ err }, "db.pool.idle_client_error"));
 lockPool.on("error", (err) => logger.error({ err }, "db.lockPool.idle_client_error"));
 
+// The same protection for a client while a caller HOLDS it, which the two above
+// do not give: a pool's 'error' handler covers its clients only while they are
+// idle in it. A connection that drops while checked out emits on the client
+// itself, and a client with no listener for 'error' is the one case where
+// node's EventEmitter rethrows -- taking the process down rather than failing
+// the query.
+//
+// Not hypothetical, and not rare enough to leave: four API replicas were
+// restarting every few hours with
+//
+//   Error: Connection terminated unexpectedly
+//       at Client._handleErrorEvent (pg/lib/client.js:422)
+//   throw er; // Unhandled 'error' event
+//
+// Every long hold is exposed to it -- `withLeaderLock` keeps a client across a
+// whole scan, `withTransaction` across a transaction -- and the blast radius is
+// the replica, not the query: in-flight requests on that pod die with it, and
+// whatever the scan was holding is left to the next leader.
+//
+// Attached on 'connect' rather than at each of the dozen call sites, because
+// the ones that matter are exactly the ones a future call site will forget.
+// This is additive: the pool still removes and replaces the broken client.
+const surfaceClientError = (client: pg.PoolClient): void => {
+  client.on("error", (err) => logger.error({ err }, "db.client.error"));
+};
+pool.on("connect", surfaceClientError);
+lockPool.on("connect", surfaceClientError);
+
 if (DB_SCHEMA) {
   const setSearchPath = (client: pg.PoolClient): void => {
     client.query(`SET search_path TO "${DB_SCHEMA}"`);
@@ -1171,16 +1199,19 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await ensureConcurrentIndex(
       client,
-      "idx_tasks_platform_facts_pending",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
+      "idx_tasks_platform_facts_pending_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v2
          ON claw_tasks(
            platform_facts_next_retry_at ASC NULLS FIRST,
            completed_at ASC,
            task_id ASC
          )
        WHERE status = 'failed'
-         AND failure_reason IN ('brain_timeout','worker_lost')
-         AND sandbox_workload_id IS NOT NULL
+         AND failure_reason IN (
+           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
+           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed'
+         )
          AND platform_facts_resolved_at IS NULL`,
     );
     await client.query(

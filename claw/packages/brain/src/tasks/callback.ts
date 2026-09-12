@@ -16,6 +16,7 @@ import type {
 } from "@claw/protocol";
 import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
+import type { SandboxEntry } from "../sandbox/keepalive.js";
 
 const logger = pino({ name: "task-callback" });
 
@@ -144,6 +145,7 @@ export interface RunAttemptToken {
 /** What a lease renewal tells the row, beyond "the worker is still here". */
 export interface LeaseRenewal {
   brainId: string;
+  sandbox?: { provider: "safe-workload" | "agent-sandbox"; handle: string };
   /** How long the row should consider the lease valid from now. */
   leaseSeconds: number;
   phase: RunPhase;
@@ -155,6 +157,13 @@ export interface LeaseRenewal {
   attempt: RunAttemptToken;
   /** Absent for the opening tick, which has closed no interval to report. */
   runTime?: RunTimeReport;
+}
+
+export function sandboxForLease(entry: SandboxEntry | null): LeaseRenewal["sandbox"] {
+  if (!entry) return undefined;
+  const provider = entry.provider ?? "safe-workload";
+  const handle = provider === "agent-sandbox" ? entry.sessionId : entry.workloadId;
+  return handle ? { provider, handle } : undefined;
 }
 
 /**
@@ -221,6 +230,7 @@ export async function postRunLease(
       },
       body: JSON.stringify({
         brain_id: renewal.brainId,
+        sandbox: renewal.sandbox,
         lease_seconds: renewal.leaseSeconds,
         phase: renewal.phase,
         wait_reason: renewal.waitReason,
