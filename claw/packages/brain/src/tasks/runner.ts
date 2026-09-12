@@ -3412,6 +3412,36 @@ class TaskRunner {
         // went terminal leaves this worker holding a sandbox and a delivery
         // nobody else can release; a row another worker took over leaves it
         // holding neither, whatever it still has handles for.
+        // A Stop this run never heard on the wire.
+        //
+        // The interrupt is core NATS and at-most-once, and it is dropped by
+        // every pod with no abort registered for the address -- which this pod
+        // is, from the moment the claim writes the lease until `activeAbort`
+        // is populated two KV round trips later. A Stop landing in there wrote
+        // `cancelling` on the row and then had nothing left to reach: the
+        // durable half deliberately leaves a held row to its holder, and the
+        // holder was not listening yet. Anything else that loses the publish
+        // -- a pod restarting, a blip on the subject -- ends the same way.
+        //
+        // `postRunLease` has answered with the row's status all along, for
+        // exactly this ("so a caller can notice a run that has been
+        // cancelled"), and the fat delivery path already stops on it. This is
+        // the doorbell half of the same answer, one heartbeat behind at worst.
+        //
+        // Aborted with no reason on purpose: `cancelling` is not a terminal
+        // row and this replica still owns everything it holds, so the generic
+        // branch -- the one that files the ending as a user interrupt -- is
+        // the true account of what happened.
+        if (status === "cancelling") {
+          if (this.abortCtrl.signal.aborted) return;
+          logger.info(
+            { sessionId: this.sessionId, messageId: this.messageId,
+              taskId: this.request.task_id },
+            "run.stop_seen_on_renewal",
+          );
+          this.abortCtrl.abort();
+          return;
+        }
         const refused = status === "gone" || status === "superseded";
         if (!refused || this.abortCtrl.signal.aborted) return;
         logger.error(
