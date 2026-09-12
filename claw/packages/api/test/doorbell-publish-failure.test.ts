@@ -247,3 +247,28 @@ test("the horizon an insert stamps is what keeps a live dispatch off the first s
   assert.equal(row.status, "queued", "so the row is left to the dispatch that owns it");
   assert.notEqual(row.dispatch_reconcile_at, null, "and it keeps the marker it was inserted with");
 });
+
+test("a session reconciliation deletes is left where the cleanup sweep can find it", async () => {
+  // Hiding the row is the first of the things a delete owes, not all of them.
+  // `sweepSessionCleanups` selects on `cleanup_state = 'pending'`, so a bare
+  // `deleted_at` leaves the session's content un-tombstoned and its workspace
+  // references and objects never scheduled for collection -- and the
+  // reconciliation marker is cleared a moment later, so nothing comes back to
+  // notice. The deployment keeps paying for the storage of a session nobody
+  // can see.
+  const { reconcileAmbiguousDispatches } = await import("../src/tasks/sweeper.js");
+  await seedSession(h, "s-del");
+  await seedRun(h, "created", "s-del", { status: "queued", dispatch: "doorbell" });
+  await markReconcile("created", -1, "delete_created_session");
+
+  assert.equal(await reconcileAmbiguousDispatches(), 1);
+
+  const session = await sessionRow(h, "s-del");
+  assert.ok(session.deleted_at, "the session is hidden");
+  assert.equal(
+    session.cleanup_state, "pending",
+    "and queued for the teardown that tombstones it and releases what it held",
+  );
+  assert.equal((await runRow(h, "created")).dispatch_reconcile_at, null,
+    "the marker is still cleared, so the row is not reconciled twice");
+});

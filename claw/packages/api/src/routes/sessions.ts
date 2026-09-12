@@ -62,6 +62,13 @@ export interface NewSessionRow {
   config: Record<string, unknown>;
   parentSid: string | null;
   role: string;
+  /**
+   * The turn this row is born holding the gate for, or null when it is born
+   * idle. Set together with `agentStatus: "running"` or not at all: a session
+   * gated with no marker is one `releaseSessionGateIfLastRun` cannot hand back
+   * once ownership is enforced, and it waits out `reapStuckSessions` instead.
+   */
+  gateMessageId?: string | null;
 }
 
 // A value rather than a boolean, carrying the parent it was issued for, so a
@@ -88,11 +95,12 @@ export async function insertSessionRow(
   }
   await q.query(
     `INSERT INTO claw_sessions
-     (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
     [
       row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
       row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
+      row.gateMessageId ?? null,
     ],
   );
 }
@@ -954,6 +962,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // Insert session (+ pre-flip to 'running' when message is present,
         // so the row is born consistent with its dispatch state). Single
         // INSERT: no transaction needed because there's no row to lock yet.
+        //
+        // "Consistent" has to include which turn holds the gate. The pre-flip
+        // is the one path that gates a session without going through
+        // `takeSessionGate`, so it is the one path that used to leave the
+        // marker null -- and a null marker is not a row
+        // `releaseSessionGateIfLastRun` can hand back once ownership is
+        // enforced. The turn's own id is therefore minted here rather than
+        // inside the dispatch, and the same one is handed to it.
+        const firstMessageId = firstMessage ? newChatMessageId() : null;
         const initialStatus = firstMessage ? "running" : "idle";
         const newRow: NewSessionRow = {
           sessionId,
@@ -962,6 +979,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           systemPrompt: (system_prompt as string || ""),
           config: sessionConfig,
           parentSid, role,
+          gateMessageId: firstMessageId,
         };
         // A create with no parent grows no existing tree, and one with no
         // message writes no run, so only the two together take the lock.
@@ -1006,6 +1024,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         const dispatch = await dispatchTaskToBrain(
           {
             sessionId, userId, user,
+            messageId: firstMessageId ?? undefined,
             content: firstMessage.content,
             messageType: firstMessage.messageType,
             toolIds: firstMessage.toolIds,

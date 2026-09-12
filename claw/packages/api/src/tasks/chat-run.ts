@@ -40,7 +40,7 @@ import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
 import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
-import { db } from "../infra/db.js";
+import { db, type Querier } from "../infra/db.js";
 import { nc } from "../infra/nats.js";
 import { metrics, type QueueEntryCause } from "../infra/metrics.js";
 import { newTaskId } from "./ids.js";
@@ -569,9 +569,16 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
     // reference nothing releases.
     if (!row) return null;
     if (status === "queued") metrics.onQueueEntered(input.queueEntryCause ?? "direct");
+    // On the insert's own transaction when there is one: a reference committed
+    // beside a row that rolls back is one nothing can ever reclaim.
     const workspaceId = input.recordWorkspaceUse === false
       ? undefined
-      : await recordRunUse(input.sessionId, input.userId, taskId, input.filesWorkspaceId);
+      : await recordRunUse(
+        input.sessionId, input.userId, taskId, input.filesWorkspaceId,
+        input.client
+          ? ((text, params) => input.client!.query(text, params)) as Querier
+          : undefined,
+      );
     return {
       taskId,
       reconcileToken,
@@ -1374,7 +1381,9 @@ export async function stopSessionRuns(sessionId: string): Promise<number> {
  * describing this exact row for as long as nothing could put one there.
  */
 async function cancelUnheldRuns(sessionId: string): Promise<number> {
-  return cancelUnheld("session_id = $1", sessionId);
+  // The settled count, which is what a Stop reports: a row parked at
+  // `cancelling` is not settled, its holder still has to confirm.
+  return (await cancelUnheld("session_id = $1", sessionId)).terminal;
 }
 
 /**
@@ -1382,10 +1391,19 @@ async function cancelUnheldRuns(sessionId: string): Promise<number> {
  * rather than a session.
  */
 export async function cancelUnheldRun(taskId: string): Promise<boolean> {
-  return (await cancelUnheld("task_id = $1", taskId)) > 0;
+  // Whether a cancellation was applied, which is a different question from
+  // whether one settled. A held row is moved to `cancelling` and its holder
+  // confirms later; answering `false` for it sent `cancelTask` on to
+  // `transitionCancellation`, whose eligible statuses do not include
+  // `cancelling` -- so the row this call had just cancelled matched nothing,
+  // the route answered 404, and the interrupt that tells the worker was never
+  // published. The cancellation stuck and the caller was told it had not.
+  return (await cancelUnheld("task_id = $1", taskId)).moved > 0;
 }
 
-async function cancelUnheld(scope: string, scopeValue: string): Promise<number> {
+async function cancelUnheld(
+  scope: string, scopeValue: string,
+): Promise<{ moved: number; terminal: number }> {
   const held = `(
     lease_owner IS NOT NULL
     OR lease_expires_at IS NOT NULL
@@ -1453,8 +1471,10 @@ async function cancelUnheld(scope: string, scopeValue: string): Promise<number> 
     const terminal = rows.filter((row) => row.status === "cancelled");
     const leftQueue = rows.filter((row) => row.prior_status === "queued").length;
     if (leftQueue) metrics.onQueueExited("cancelled", leftQueue);
+    // Only a terminal row lets go of its workspace reference; a parked one is
+    // still a live turn and its holder is still writing.
     for (const row of terminal) await releaseRunUse(row.task_id, false);
-    return terminal.length;
+    return { moved: rows.length, terminal: terminal.length };
   } catch (err) {
     logger.warn({ err, scope: scopeValue }, "chat_run.cancel_unheld_fat_failed");
     throw err;

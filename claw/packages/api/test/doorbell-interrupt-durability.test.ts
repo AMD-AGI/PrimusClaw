@@ -102,6 +102,28 @@ test("cancelling one fat row by name terminalizes it rather than parking it", as
   assert.equal((await runRow(h, "fat")).status, "cancelled");
 });
 
+test("cancelling one held row by name reports the cancellation it applied", async () => {
+  // The row is moved to `cancelling` either way. What changed is the answer:
+  // counting only terminal rows made this read as "nothing was cancelled", so
+  // `cancelTask` went on to `transitionCancellation`, whose eligible statuses
+  // do not include `cancelling`. That matched nothing, the route answered 404,
+  // and the interrupt key it returns -- the only thing that tells the holder --
+  // was never published. The cancellation stuck; the caller was told it had not.
+  const { cancelTask } = await import("../src/tasks/lifecycle.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "held", "s1", {
+    status: "running", dispatch: "doorbell", messageId: "m-1",
+    leaseOwner: "brain-a", leaseExpiresInSec: 600, claimCount: 1,
+  });
+
+  assert.deepEqual(
+    await cancelTask("held"),
+    { ok: true, cancelled: 1, interrupt_key: "s1" },
+    "a parked cancellation is still a cancellation, and names the key to interrupt",
+  );
+  assert.equal((await runRow(h, "held")).status, "cancelling");
+});
+
 test("and a held one still goes through the handshake", async () => {
   const { cancelTask } = await import("../src/tasks/lifecycle.js");
   await seedSession(h, "s1");

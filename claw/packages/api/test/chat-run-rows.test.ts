@@ -447,3 +447,50 @@ test("Stop only reaches doorbell rows, and asks the right question about what is
   assert.match(cancel, /metadata->>'dispatch' = 'doorbell'/);
   assert.match(cancel, /status = 'preparing' AND lease_owner IS NULL/);
 });
+
+test("the workspace reference is written on the same connection as the row it belongs to", async () => {
+  // The insert runs on the admission transaction's client; the reference and
+  // the writer claim used to go out through the global pool beside it. A
+  // rollback after the insert -- a failed COMMIT is enough -- then takes the row
+  // away and leaves both behind, naming a task that does not exist.
+  // `releaseRefsOfFinishedRuns` reclaims by joining `claw_tasks`, so nothing can
+  // find them again: the workspace is pinned for the life of the deployment.
+  //
+  // Asserted as "which connection", because that is the whole of the fix: the
+  // writes are unchanged, and only the transaction they land in decides whether
+  // a rollback can take them back.
+  const pooled: string[] = [];
+  db.query = (async (text: string) => {
+    pooled.push(text.replace(/\s+/g, " ").trim());
+    return { rows: [{ workspace_id: "kws_1", task_id: "ktsk_x" }], rowCount: 1 };
+  }) as typeof db.query;
+
+  const onClient: string[] = [];
+  const client = {
+    query: async (text: string) => {
+      onClient.push(text.replace(/\s+/g, " ").trim());
+      return { rows: [{ workspace_id: "kws_1", task_id: "ktsk_x", version: "1" }], rowCount: 1 };
+    },
+  };
+
+  await openChatRun({
+    dispatch: "doorbell",
+    sessionId: "s-tx",
+    userId: "u-1",
+    messageId: "m-tx",
+    prompt: "hi",
+    filesWorkspaceId: "kws_1",
+    status: "queued",
+    client: client as never,
+  } as never);
+
+  const refWrite = /INSERT INTO claw_workspace_refs/;
+  assert.ok(
+    onClient.some((sql) => refWrite.test(sql)),
+    "the reference goes out on the transaction the row was inserted on",
+  );
+  assert.equal(
+    pooled.some((sql) => refWrite.test(sql)), false,
+    "and not beside it through the pool, where a rollback cannot reach it",
+  );
+});

@@ -25,7 +25,9 @@ import {
 } from "../tasks/chat-run.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
-import { decideAdmission } from "../tasks/admission.js";
+import type { PoolClient } from "pg";
+import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
+import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -318,17 +320,49 @@ export async function dispatchTaskToBrain(
       }
     }
 
-    const run = await sessionDispatchPorts.openChatRun({
-      dispatch: "fat",
-      sessionId,
-      userId,
-      messageId,
-      prompt: content,
-      workspaceId,
-      filesWorkspaceId,
-      pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      sandboxImage: finalSandboxImage,
+    // Admission is asked here and not only on the doorbell branch.
+    //
+    // Every ceiling used to live inside `dispatchByDoorbell`, so the fallback
+    // this branch is -- taken whenever `beginDoorbellDispatch` declines, which
+    // includes a revoked floor and a KV watch that merely died -- opened and
+    // published a run without consulting any of them. A configured ceiling was
+    // therefore disabled by a transient failure it has nothing to do with, in
+    // silence: no refusal, no counter, no log line. Verified against the
+    // cluster at `ADMIT_HARD_RUNS=1` with one run already occupying it: gate
+    // open, three turns gave 1x200 and 2x429; gate closed, the same three all
+    // returned 200 and ran.
+    //
+    // Decided and inserted under one lock, for the reason `handOffUncounted`
+    // states: creation order and commit order have to be the same order, or two
+    // creates that each cleared the check are both admitted against one slot.
+    const fatAsk = await admissionAskFor({
+      task, sessionId, userId, messageId, prompt: content,
+      publish: async () => undefined,
+    } as Parameters<typeof admissionAskFor>[0]);
+    const fatOpen = await withOwnedAdmissionLock(async (client: PoolClient) => {
+      const admission = await sessionDispatchPorts.admit(fatAsk, client);
+      if (admission.kind === "reject") return { admission } as const;
+      return {
+        admission,
+        run: await sessionDispatchPorts.openChatRun({
+          dispatch: "fat",
+          sessionId,
+          userId,
+          messageId,
+          prompt: content,
+          workspaceId,
+          filesWorkspaceId,
+          pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+          sandboxImage: finalSandboxImage,
+          client,
+        }),
+      } as const;
     });
+    if (fatOpen.admission.kind === "reject") {
+      await onPublishFailure();
+      return { kind: "rejected", messageId, reason: fatOpen.admission.reason };
+    }
+    const run = fatOpen.run;
     // Publishing without a row leaves a session `running` with no deadline,
     // no lease, and nothing for a sweeper to reap -- a worse failure than
     // refusing the turn. openChatRun reports insert errors by returning null

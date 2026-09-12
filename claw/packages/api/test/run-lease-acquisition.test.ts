@@ -378,6 +378,36 @@ describe("the generation fence", () => {
       "the successor's own renewal still has to work");
   });
 
+  it_("a taken-over row lets its new holder open an attempt of its own", async () => {
+    // The other half of the takeover. It installs the replacement owner and a
+    // lease reaching into the future, and until now it left the dead worker's
+    // attempt_id behind. The renewal may only replace a non-null attempt_id
+    // when the lease has lapsed -- and the acceptance just renewed it -- so the
+    // replacement's every heartbeat was refused under a token belonging to a
+    // pod that is gone, for the whole of the lease it had itself been granted.
+    // The fat pre-gate stops a delivery on any refusal, so what the row had
+    // just handed to a live worker it then took away again.
+    await seed({
+      taskId: "t-1", leaseOwner: "brain-dead", leaseIn: -30, fenced: true, claimCount: 1,
+    });
+    await observer.query(
+      "UPDATE claw_tasks SET attempt_id = $2 WHERE task_id = $1", ["t-1", "att-of-the-dead"],
+    );
+
+    const takeover = await accept("t-1", "brain-new");
+    assert.equal(takeover.status, 200);
+    assert.equal(
+      (await taskRow("t-1")).attempt_id, null,
+      "the outgoing worker's token does not survive the handover",
+    );
+
+    assert.equal(
+      (await fatHeartbeat("t-1", "brain-new", takeover.body.claim_count)).status, 200,
+      "and the new holder's first heartbeat opens its own",
+    );
+    assert.equal((await taskRow("t-1")).attempt_id, "att-fat-1");
+  });
+
   it_("a fat acceptance's own heartbeat is honoured when it carries an attempt token too", async () => {
     // What the real Brain sends, and what no other case here sends: the fat
     // path mints an attempt whose `claim_count` is 0 -- its discriminator is

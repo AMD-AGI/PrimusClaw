@@ -18,6 +18,7 @@
  *   - Finish session deletions whose cleanup did not complete in the request
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
+import { commitSessionDeletion } from "../sessions/teardown.js";
 import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
@@ -1447,10 +1448,24 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
       [row.session_id],
     );
     if (occupied.rowCount) return true;
-    await db.query(
-      "UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-      [row.session_id],
-    );
+    // The durable deletion, not a bare `deleted_at`. Hiding the row is only the
+    // first of the things a delete owes: `sweepSessionCleanups` selects on
+    // `cleanup_state = 'pending'`, so a session soft-deleted without it is one
+    // whose content is never tombstoned and whose workspace references and
+    // objects are never scheduled for collection. The marker is cleared a
+    // moment later, so nothing comes back to notice.
+    try {
+      await commitSessionDeletion(row.session_id);
+    } catch (err) {
+      // Left for the next tick rather than swallowed: the marker is only
+      // cleared by a `true` return, so answering false is what keeps this row
+      // eligible until the delete actually commits.
+      logger.warn(
+        { err, sessionId: row.session_id, taskId: row.task_id },
+        "sweeper.reconcile_delete_session_failed",
+      );
+      return false;
+    }
     return true;
   }
   return true;

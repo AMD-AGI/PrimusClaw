@@ -218,6 +218,60 @@ test("D5 a doorbell hard refusal rolls the session back and does not open a row"
   );
 });
 
+test("D5b the same refusal holds when the capability gate is shut", async () => {
+  // The fallback every ceiling used to be invisible to. `beginDoorbellDispatch`
+  // declines for an operator revocation and for a KV watch that merely died,
+  // and the fat branch it falls through to opened and published without
+  // consulting admission at all -- so a transient watch failure disabled every
+  // configured ceiling, in silence: no refusal, no counter, no log line.
+  //
+  // Seen on the cluster at ADMIT_HARD_RUNS=1 with one run already occupying
+  // it: gate open, three turns answered 1x200 and 2x429; gate revoked, the
+  // same three all answered 200 and ran, four live against a ceiling of one.
+  const seen = stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  const published: string[] = [];
+  sessionDispatchPorts.publishTask = async () => { published.push("task"); };
+  let opened = 0;
+  sessionDispatchPorts.openChatRun = (async () => {
+    opened += 1;
+    return { taskId: "ktsk_1" };
+  }) as typeof sessionDispatchPorts.openChatRun;
+
+  let rolledBack = false;
+  const result = await dispatchTaskToBrain(INPUT, async () => { rolledBack = true; });
+
+  assert.equal(result.kind, "rejected", "a shut gate is slower, never a way past the ceiling");
+  assert.equal(result.kind === "rejected" ? result.reason : "", "runs_hard_limit");
+  assert.equal(opened, 0, "and nothing is written for a run that was refused");
+  assert.deepEqual(published, []);
+  assert.ok(rolledBack);
+});
+
+test("D5c a shut gate still dispatches the turn the ceiling admits", async () => {
+  // The positive control. Without it D5b holds just as well against a fat
+  // branch that refuses everything once the gate is shut.
+  stubDb((sql) => (BIND_LOOKUP.test(sql) ? boundWorkspace() : undefined));
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.doorbellDispatch = closedDoorbellBarrier;
+  sessionDispatchPorts.admit = async () => ({ kind: "admit" });
+  const published: string[] = [];
+  sessionDispatchPorts.publishTask = async () => { published.push("task"); };
+  sessionDispatchPorts.openChatRun = (async () => ({ taskId: "ktsk_1" })) as typeof sessionDispatchPorts.openChatRun;
+  // The receipt writes the fat path gates itself on; unstubbed they read an
+  // empty result and the dispatch reports a publish it never attempted.
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
+
+  const result = await dispatchTaskToBrain(INPUT, async () => {});
+
+  assert.equal(result.kind, "dispatched");
+  assert.deepEqual(published, ["task"], "the fat fallback still publishes what it admitted");
+});
+
 test("D6 a doorbell soft queue returns a position and does not publish a wakeup", async () => {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();

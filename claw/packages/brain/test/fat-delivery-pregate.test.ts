@@ -378,12 +378,70 @@ describe("the accepted generation", () => {
     assert.equal(completion.task_id, "t-1");
     assert.equal(completion.run_claim, 9);
   });
+
+  it("F13 names the row even when only the lease URL carries its id", async () => {
+    // The shape an API published before `task_id` was on the wire: a lease URL
+    // and nothing else. The pre-gate accepts it -- and every acceptance fences
+    // the row -- so the completion it eventually emits has to name the row, or
+    // it is closed by `closeUnnamedChatRun`, whose predicate excludes exactly
+    // the rows acceptance fences. The turn finishes, the user gets the answer,
+    // and the row stays open until a reaper calls the worker lost.
+    //
+    // `resolveRunIdentity` has read the URL for this all along; the completion
+    // was the one place that did not.
+    const legacy = fatRequest({
+      task_id: undefined,
+      run_lease: { url: "http://api.test/v1/internal/tasks/t-legacy/lease", token: "tok" },
+    } as Partial<ExecuteRequest>);
+    const runner = runnerFixture();
+    const h = harness({
+      answers: () => granted("preparing", 4),
+      handle: (msg) => runner.run(msg, legacy),
+    });
+
+    await runDelivery(msgFor(legacy), h.deps);
+
+    const completion = runner.events.find((e) => e.type === "exec_complete");
+    assert.ok(completion, "the turn still reports");
+    assert.equal(
+      completion.task_id, "t-legacy",
+      "recovered from the only place this payload says it",
+    );
+    assert.equal(completion.run_claim, 4);
+  });
+
+  it("F12 travels with the settle behind a retry, not only with the renewals", async () => {
+    // `attempt.claimCount` is 0 on this path and always was: it was minted when
+    // a fat delivery genuinely took no claim. `acquireFatLease` takes one now
+    // -- `claim_count + 1` on acceptance -- so 0 is a stale answer, and
+    // `/settle-attempt` fences on it. Sending it returns `not_holder`: the
+    // coverage is never banked, the row keeps this attempt's token, and its
+    // lease turns the redelivery's first heartbeat away until it lapses on its
+    // own. The renewals already ask the delivery context for the real one;
+    // this is the other reader that did not.
+    const runner = runnerFixture({ failEngine: true });
+    const h = harness({
+      answers: () => granted("preparing", 9),
+      handle: (msg) => runner.run(msg),
+    });
+
+    await runDelivery(msgFor(fatRequest()), h.deps);
+
+    assert.equal(runner.settles.length, 1, "a fat retry settles its own attempt");
+    assert.equal(runner.settles[0].taskId, "t-1");
+    assert.equal(
+      runner.settles[0].claimCount, 9,
+      "the generation the acceptance minted, not the 0 the attempt was born with",
+    );
+    assert.equal(runner.settles[0].releaseLease, true);
+  });
 });
 
 /** The task runner, reduced to the two things this file asks of it. */
-function runnerFixture() {
+function runnerFixture(opts: { failEngine?: boolean } = {}) {
   const renewals: LeaseRenewal[] = [];
   const events: Array<Record<string, unknown>> = [];
+  const settles: Array<{ taskId: string; claimCount?: number; releaseLease?: boolean }> = [];
   const kv = fakeKv();
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
   const result: ExecuteResult = {
@@ -421,18 +479,25 @@ function runnerFixture() {
     releaseTaskLock: noop(undefined),
     flushTranscript: (() => Promise.resolve()) as never,
     makeHandsClient: (() => ({ close: async () => {} })) as never,
+    settleRunAttempt: ((taskId: string, claimCount?: number, _r?: unknown, releaseLease?: boolean) => {
+      settles.push({ taskId, claimCount, releaseLease });
+      return Promise.resolve();
+    }) as never,
   } as unknown as TaskRunnerSideEffects;
   const emitter = {
     async emit(_sessionId: string, evt: Record<string, unknown>) { events.push(evt); },
   } as unknown as NatsEmitter;
-  const engine: Engine = { async execute() { return result; } };
+  const engine: Engine = opts.failEngine
+    ? { async execute() { throw new Error("fetch failed"); } }
+    : { async execute() { return result; } };
   bindTaskRunnerDeps({ kv, kvCkpt: fakeKv(), emitter, engine, sideEffects });
 
   return {
     renewals,
     events,
-    run: (msg: JsMsg) => runHandleTask(
-      msg, fatRequest(), SESSION, `lock.${SESSION}`, "m-1", "u1", new AbortController(),
+    settles,
+    run: (msg: JsMsg, request: ExecuteRequest = fatRequest()) => runHandleTask(
+      msg, request, SESSION, `lock.${SESSION}`, "m-1", "u1", new AbortController(),
     ),
   };
 }

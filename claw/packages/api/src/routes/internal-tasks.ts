@@ -704,6 +704,17 @@ async function acquireFatLease(
             lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
             heartbeat_at     = NOW(),
             claim_count      = COALESCE(claim_count, 0) + 1,
+            -- The incoming worker's attempt is not the outgoing one's, and this
+            -- statement is what makes the difference unobservable if it does not
+            -- say so: the takeover arm renews the lease into the future, and the
+            -- renewal may only replace a non-null attempt_id when the lease has
+            -- lapsed. A taken-over row would therefore refuse its new holder's
+            -- every heartbeat under the dead worker's token until the lease it
+            -- just granted runs out. Cleared rather than assigned because the
+            -- acceptance does not carry one; the first heartbeat opens it, and a
+            -- null column is exactly the adoption arm's legitimate target, and
+            -- settled_attempt_id still remembers what was spent.
+            attempt_id       = NULL,
             metadata         = jsonb_set(
                                  CASE
                                    WHEN metadata->'dispatch_compensation'->>'version' = '1'

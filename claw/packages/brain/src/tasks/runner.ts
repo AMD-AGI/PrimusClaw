@@ -68,7 +68,7 @@ import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
-import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
+import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
@@ -235,8 +235,17 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
  */
 function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
   const runClaim = currentFatDelivery()?.runClaim;
+  // A fat payload published by an API that predates the field carries no
+  // `task_id`, only the lease URL -- and the URL names the row, which is why
+  // `resolveRunIdentity` already reads it. Without the same fallback here such
+  // a run reports a completion that names nothing, and an unnamed completion is
+  // closed by `closeUnnamedChatRun`, whose predicate excludes a fenced row --
+  // which this row is, because the pre-gate accepted it and every acceptance
+  // fences. The turn finishes, its answer reaches the user, and the row stays
+  // open until a reaper decides the worker was lost.
+  const taskId = request.task_id || taskIdFromLease(request).id || undefined;
   return {
-    ...(request.task_id ? { task_id: request.task_id } : {}),
+    ...(taskId ? { task_id: taskId } : {}),
     ...(runClaim === undefined ? {} : { run_claim: runClaim }),
   };
 }
@@ -3319,6 +3328,25 @@ class TaskRunner {
    * `beginRun` and it: a report that measured nothing must not advance the
    * row's watermark, and the interval stays visibly unbanked.
    */
+  /**
+   * The generation this attempt actually holds on the row.
+   *
+   * Two dispatch shapes keep it in two places. A claimed doorbell carries it in
+   * `attempt.claimCount`, minted from the claim. A fat delivery's acceptance
+   * mints one too -- `acquireFatLease` does `claim_count + 1` -- but hands it
+   * back out of band, in the pre-gate context, because `attempt.claimCount` was
+   * fixed at 0 when a fat delivery genuinely took no claim.
+   *
+   * It does take one now, so 0 is a stale answer, and every fence that reads it
+   * refuses: the settle behind a nak returns `not_holder`, its coverage is
+   * never banked, and the row keeps this attempt's token and a live lease that
+   * turns the redelivery's first heartbeat away until the lease lapses. The
+   * renewal path already asks the context; these are the two that did not.
+   */
+  private heldGeneration(): number {
+    return currentFatDelivery()?.runClaim ?? this.attempt.claimCount;
+  }
+
   private coverageReport(): { runTime: RunTimeReport } | null {
     if (!this.coverageOpened) return null;
     const snapshot = runTimeOf(this.runIdentity.key);
@@ -3329,7 +3357,7 @@ class TaskRunner {
       runTime: {
         key: this.runIdentity.key,
         attemptId: this.attempt.attemptId,
-        claimCount: this.attempt.claimCount,
+        claimCount: this.heldGeneration(),
         deliverySeq: this.attempt.deliverySeq,
         deliveryCount: this.attempt.deliveryCount,
         // Differences, never instants, so the database's own budget bounds them.
@@ -3361,7 +3389,7 @@ class TaskRunner {
     if (this.claimed) this.declareCoverage();
     else if (this.request.task_id) {
       await fx().settleRunAttempt(
-        this.request.task_id, this.attempt.claimCount, this.coverageReport()?.runTime, true,
+        this.request.task_id, this.heldGeneration(), this.coverageReport()?.runTime, true,
       );
     }
     this.msg.nak(delayMs);

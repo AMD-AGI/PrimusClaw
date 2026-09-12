@@ -436,3 +436,76 @@ test("N8 a legacy entry replayed off the busy-poll path is backfilled too", asyn
     await server.close();
   }
 });
+
+test("N9 a session created around a first message is inserted naming the turn that gates it", async () => {
+  // The wiring N2 does not see. The pre-flip to `running` happens in the
+  // session INSERT rather than through `takeSessionGate`, so this is the one
+  // create that gates a session without the writer that stamps the marker --
+  // and the marker was null until the turn's id was minted before the insert
+  // instead of inside the dispatch.
+  //
+  // It was invisible while nothing read the column. With
+  // `RUN_FAT_PREPARING_RECONCILE` defaulting on,
+  // `releaseSessionGateIfLastRun` matches on it, null matches nothing, and the
+  // session's first turn completes behind a gate that never opens. Every later
+  // message parks until `reapStuckSessions`, a whole `BRAIN_TASK_TIMEOUT_SEC`
+  // later. Seen against the cluster: run `completed`, gate `running`, marker
+  // null.
+  // Not pinned here, and it cannot be at this resolution: letting the dispatch
+  // mint its own id instead of taking this one is an equivalent mutant while
+  // both calls land in the same millisecond, because `newChatMessageId` is
+  // `claw-${Date.now()}`. That coincidence is exactly what the fix stops
+  // relying on -- under load the insert and the dispatch cross a millisecond
+  // and the marker then names a turn that does not exist, which wedges the
+  // gate the same way a null one does.
+  dispatchOpensRun();
+  const stub = stubFor("idle");
+  const server = await app();
+  try {
+    const res = await server.inject({
+      method: "POST",
+      url: "/v1/sessions",
+      payload: { name: "s", message: { content: "summarise the logs" } },
+    });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { data: { message: { message_id: string } } };
+
+    const insert = stub.seen.find((q) => /^INSERT INTO claw_sessions/.test(q.sql.trim()));
+    assert.ok(insert, "the create still writes the row");
+    assert.match(
+      insert!.sql, /agent_gate_message_id/,
+      "the gated row names its turn in the same statement that gates it",
+    );
+    assert.ok(
+      insert!.params?.includes(body.data.message.message_id),
+      "and the turn it names is the one the caller was told about",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("N10 a session created with no message is inserted holding no gate", async () => {
+  // The other half of the pairing: gated and named, or idle and unnamed.
+  // Without this, stamping unconditionally would read as a fix.
+  const stub = stubFor("idle");
+  const server = await app();
+  try {
+    const res = await server.inject({
+      method: "POST", url: "/v1/sessions", payload: { name: "s" },
+    });
+    assert.equal(res.statusCode, 200);
+
+    const insert = stub.seen.find((q) => /^INSERT INTO claw_sessions/.test(q.sql.trim()));
+    assert.ok(insert, "the create still writes the row");
+    assert.ok(
+      insert!.params?.includes("idle"), "a create with no message is born idle",
+    );
+    assert.equal(
+      insert!.params?.some((p) => typeof p === "string" && p.startsWith("claw-")), false,
+      "and names no turn, because none is holding it",
+    );
+  } finally {
+    await server.close();
+  }
+});

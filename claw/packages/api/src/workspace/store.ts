@@ -40,7 +40,7 @@
 import pino from "pino";
 import { PG_INT4_MAX } from "@claw/utils";
 import { envInt, reportSettingProblem } from "../config.js";
-import { db } from "../infra/db.js";
+import { db, type Querier } from "../infra/db.js";
 import { ACTIONABLE_RECEIPT_SQL } from "../tasks/chat-run.js";
 import { newWorkspaceId } from "../tasks/ids.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "./prefix.js";
@@ -291,16 +291,17 @@ export async function acquireRef(
   workspaceId: string,
   kind: WorkspaceRefKind,
   refId: string,
+  q: Querier = db.query,
 ): Promise<boolean> {
   try {
-    await db.query(
+    await q(
       `INSERT INTO claw_workspace_refs (workspace_id, ref_kind, ref_id)
        VALUES ($1, $2, $3)
        ON CONFLICT (workspace_id, ref_kind, ref_id)
        DO UPDATE SET released_at = NULL, created_at = NOW()`,
       [workspaceId, kind, refId],
     );
-    await db.query(
+    await q(
       `UPDATE claw_workspaces SET retention_expires_at = NULL, updated_at = NOW()
         WHERE workspace_id = $1`,
       [workspaceId],
@@ -427,11 +428,12 @@ export async function takeRunRef(
   userId: string,
   taskId: string,
   bound?: string,
+  q: Querier = db.query,
 ): Promise<string | undefined> {
   const workspaceId = bound
     ?? (await ensureSessionWorkspace(sessionId, userId))?.workspace_id;
   if (!workspaceId) return undefined;
-  if (!await acquireRef(workspaceId, "run", taskId)) return undefined;
+  if (!await acquireRef(workspaceId, "run", taskId, q)) return undefined;
   return workspaceId;
 }
 
@@ -471,15 +473,26 @@ export async function takeRunRef(
  * kept because it is what the version hangs off (see releaseWriter) and because
  * what it would measure becomes ordinary the moment a second claimant exists.
  */
+/**
+ * Take the reference and the write side this run needs.
+ *
+ * `q` is the transaction the row was inserted on, when there is one. Both
+ * writes have to land or roll back with that insert: committed through the
+ * pool beside a row that never committed, they leave a run reference and a
+ * writer claim naming a task that does not exist -- and
+ * `releaseRefsOfFinishedRuns` reclaims by joining `claw_tasks`, so nothing can
+ * ever find them again and the workspace is pinned for good.
+ */
 export async function recordRunUse(
   sessionId: string,
   userId: string,
   taskId: string,
   bound?: string,
+  q: Querier = db.query,
 ): Promise<string | undefined> {
-  const workspaceId = await takeRunRef(sessionId, userId, taskId, bound);
+  const workspaceId = await takeRunRef(sessionId, userId, taskId, bound, q);
   if (!workspaceId) return undefined;
-  const claim = await claimWriter(workspaceId, taskId);
+  const claim = await claimWriter(workspaceId, taskId, q);
   if (claim && !claim.held) {
     logger.warn(
       { sessionId, taskId, workspaceId, heldBy: claim.heldBy },
@@ -905,9 +918,10 @@ export interface WriterClaim {
 export async function claimWriter(
   workspaceId: string,
   runId: string,
+  q: Querier = db.query,
 ): Promise<WriterClaim | null> {
   try {
-    const r = await db.query(
+    const r = await q(
       `UPDATE claw_workspaces
           SET writer_run_id     = $2,
               writer_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
