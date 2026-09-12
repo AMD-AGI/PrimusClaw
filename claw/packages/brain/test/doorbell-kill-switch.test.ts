@@ -9,7 +9,7 @@
  * The on half is doorbell-semantics.test.ts.
  */
 
-import { readFileSync } from "node:fs";
+import { claimNextEnabled } from "../src/delivery/claim-next-loop.js";
 import "./doorbell-kill-switch-env.js";
 
 import { test } from "node:test";
@@ -60,22 +60,19 @@ test("a killed pod still executes a fat execute request", async () => {
 });
 
 test("the switch closes the claim-next route as well, not only the doorbell wire", () => {
-  // `src/index.ts` is the process entrypoint -- importing it here would run
-  // `main()` -- so the wiring is read out of its source text, the way
-  // multi-node-status-label.test.ts reads a module that cannot load under tsx.
   // A pod that acks and walks away from a doorbell, then claims the same row
   // through the polling loop seconds later, is a rollback that appears to have
-  // no effect: the switch has to gate both routes or it is not a switch.
-  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf-8");
-  const call = src.slice(src.indexOf("startClaimNextLoop({"));
-  assert.ok(call.startsWith("startClaimNextLoop({"), "the loop is still started from index.ts");
-  const enabled = /enabled:\s*([^\n]*),/.exec(call)?.[1] ?? "";
-  assert.ok(
-    enabled.includes("RUN_DOORBELL_DISPATCH"),
-    `the kill-switch must gate claim-next; it reads: ${enabled}`,
-  );
-  assert.ok(
-    !enabled.includes("||"),
-    `a disjunction lets either half enable the loop; it reads: ${enabled}`,
-  );
+  // no effect: the switch has to gate both routes or it is not a switch. And
+  // a pod with no API base cannot claim at all -- every cycle would fail at
+  // the POST -- so both inputs have to hold, not either.
+  //
+  // This used to read `src/index.ts` as text and check the spelling of the
+  // expression, because the entrypoint runs `main()` on import. The decision
+  // now lives in the module that owns the loop, so the four combinations are
+  // asserted rather than the characters that compute them.
+  assert.equal(claimNextEnabled("http://api", true), true, "both halves present");
+  assert.equal(claimNextEnabled("http://api", false), false, "the kill-switch closes it");
+  assert.equal(claimNextEnabled(undefined, true), false, "nothing to claim against");
+  assert.equal(claimNextEnabled(undefined, false), false);
+  assert.equal(claimNextEnabled("", true), false, "an empty base is no base");
 });

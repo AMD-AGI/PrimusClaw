@@ -67,7 +67,7 @@ import { bindTaskRunnerDeps } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest } from "./tasks/dispatch.js";
 import { claimNextRun } from "./clients/run-claim.js";
 import { flushPendingRetries } from "./delivery/doorbell-delivery.js";
-import { startClaimNextLoop } from "./delivery/claim-next-loop.js";
+import { claimNextEnabled, startClaimNextLoop } from "./delivery/claim-next-loop.js";
 import { taskExecutionGate } from "./tasks/execution-gate.js";
 import { setParkHooks } from "./tasks/run-phase.js";
 import { keepDeliveryAlive } from "./delivery/heartbeat.js";
@@ -686,10 +686,7 @@ async function main() {
   })();
 
   startClaimNextLoop({
-    // The kill-switch covers both routes into doorbell execution or it is not
-    // one: a pod that declines a doorbell on the wire would otherwise take the
-    // same row through this loop seconds later.
-    enabled: Boolean(INTERNAL_BACKEND_URL) && RUN_DOORBELL_DISPATCH,
+    enabled: claimNextEnabled(INTERNAL_BACKEND_URL, RUN_DOORBELL_DISPATCH),
     idleMs: CLAIM_NEXT_IDLE_MS,
     isDraining,
     isShuttingDown,
