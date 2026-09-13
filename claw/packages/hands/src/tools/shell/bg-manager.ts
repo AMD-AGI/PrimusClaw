@@ -34,7 +34,8 @@ import {
   type ProcessIdentity, type ShellRecord, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
 import {
-  absenceClass, outcomeExpired, ownerLiveness, shellVerdict,
+  absenceClass, outcomeExpired, ownerLiveness, shellVerdict, unregisteredLiveRecords,
+  unregisteredLiveTotal,
 } from "../../runtime/shell-liveness.js";
 import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
 import {
@@ -52,6 +53,15 @@ const BG_SHELL_MAX_CONCURRENT = parseInt(process.env.BG_SHELL_MAX_CONCURRENT || 
 const BG_SHELL_BUFFER_BYTES = parseInt(process.env.BG_SHELL_BUFFER_BYTES || "1048576", 10);
 /** Grace period between a background shell exiting and being removed from the
  *  registry. Lets the watchdog deliver the completion notification first. */
+/**
+ * How often a leader that exited is re-asked whether its group has gone too.
+ *
+ * A descendant is not this process's child, so nothing signals its exit here;
+ * the only way to learn is to look. The same grace the auto-reap uses, because
+ * the two answer the same question at the same resolution.
+ */
+const GROUP_DRAIN_POLL_MS = 1_000;
+
 const BG_SHELL_REAP_DELAY_MS = parseInt(process.env.BG_SHELL_REAP_DELAY_MS || "60000", 10);
 const DEFAULT_REAP_GRACE_MS = 2_000;
 
@@ -157,7 +167,13 @@ export function spawnBackground(
   // delay so its final output is still pollable, and counting those against the
   // cap let a sandbox that had finished every command refuse the next one for
   // the length of that window.
-  if (runningShells().length >= BG_SHELL_MAX_CONCURRENT) {
+  // Counted from the records as well as the map, for the reason
+  // `runningShellCount` gives: a background child is detached so it outlives
+  // the request that started it, which means it outlives the process too. After
+  // a restart the map is empty and the children are not, so a limit read from
+  // the map alone admitted a whole fresh allowance beside work that was already
+  // running -- and again after the next restart.
+  if (liveShellTotal() >= BG_SHELL_MAX_CONCURRENT) {
     throw new Error(`Background shell limit reached (max ${BG_SHELL_MAX_CONCURRENT})`);
   }
   if (shellId) assertShellId(shellId);
@@ -173,6 +189,12 @@ export function spawnBackground(
   const registered = shells.get(key);
   const collides = filesRecords() ? registered?.shell.status === "running" : !!registered;
   if (collides) throw new Error(`Shell ${id} already exists`);
+  // A start for a run whose work has already been reaped. Accepting it puts a
+  // shell into a sandbox whose owner has been told the run is over, and no
+  // later reap is coming for it.
+  if (run && runIsClosed(owner, run)) {
+    throw new Error(`Run ${run} is closed`);
+  }
   // The claim is durable before anything is spawned, and its exclusive create
   // is the arbiter: a start that lost it never reaches a process.
   if (!claimShell(owner, run, id, command, kind)) {
@@ -186,15 +208,45 @@ export function spawnBackground(
     throw new Error(`Shell ${id} already exists`);
   }
 
-  const shell = spawnManagedShell(command, {
-    id,
-    kind,
-    bufferBytes: BG_SHELL_BUFFER_BYTES,
-    unref: true,
-    owner,
-    run,
-  });
+  // Settled whatever happens next. The claim above is durable and exclusive, so
+  // a start that writes it and then fails without recording an outcome leaves a
+  // record stuck at `spawn_indeterminate`: it counts as protected work, it
+  // blocks its own id from ever being reused, and no reap has anything to stop
+  // because no process was ever there. Both shapes reached that state -- a
+  // synchronous throw out of the spawn, and an async failure like ENOENT or
+  // EAGAIN, which emits `error` and `close` but never the `exit` this file was
+  // listening for.
+  let shell: BgShell;
+  try {
+    shell = spawnManagedShell(command, {
+      id,
+      kind,
+      bufferBytes: BG_SHELL_BUFFER_BYTES,
+      unref: true,
+      owner,
+      run,
+    });
+  } catch (err) {
+    // Nothing started, so the claim is the only trace and it has to be closed
+    // here: left open it is a protected record for work that never existed.
+    failClaim(owner, run, id, err);
+    throw err;
+  }
   shells.set(key, { owner, run, shell });
+
+  // The asynchronous half of the same failure. A spawn that fails after
+  // returning -- a missing cwd, EAGAIN -- emits `error` and then `close`, and
+  // never `exit`, so the settlement below never ran and both the record and
+  // this registry entry stayed as they were.
+  shell.process.once("error", (err) => {
+    if (shell.status === "running") {
+      shell.status = "error";
+      shell.exitCode = shell.exitCode ?? 1;
+      shell.endedAt = shell.endedAt ?? Date.now();
+    }
+    failClaim(owner, run, id, err);
+    shells.delete(key);
+  });
 
   // Auto-reap finished shells so the concurrency cap cannot be saturated by
   // long-lived monitor/background entries that already exited. The delay keeps
@@ -204,6 +256,42 @@ export function spawnBackground(
   // handler is one whose outcome is never written and whose entry is never
   // dropped, on top of whatever the attachment failure already cost.
   shell.process.once("exit", () => {
+    // The leader exiting is not the shell ending. `sleep 600 &` returns its
+    // leader immediately and leaves the sleep in the group: writing a terminal
+    // outcome here told the classifier the shell had finished, which took the
+    // live group out of the active count and out of every reap report, while it
+    // went on holding the sandbox's CPU and its pipe handles. The reaping paths
+    // in this file already ask `processGroupAlive` for exactly this reason.
+    //
+    // So the outcome waits for the group, not the leader. Polled rather than
+    // subscribed because a descendant is not this process's child and emits no
+    // event here; the interval is the same grace the auto-reap below uses, and
+    // it is cleared the moment the group is gone.
+    if (processGroupAlive(shell)) {
+      const watch = setInterval(() => {
+        if (processGroupAlive(shell)) return;
+        clearInterval(watch);
+        // The exit handler left the status alone because the group was alive,
+        // so the terminal state is decided here, from what the leader reported
+        // when it went. Without this the record would settle as `failed` for a
+        // shell that exited cleanly and merely outlived its leader.
+        if (shell.status === "running") {
+          shell.status = shell.timedOut
+            ? "timed_out"
+            : (shell.signal ? "killed" : "exited");
+        }
+        shell.endedAt = shell.endedAt ?? Date.now();
+        settleExitedShell(owner, run, shell, key);
+      }, GROUP_DRAIN_POLL_MS);
+      watch.unref?.();
+      return;
+    }
+    settleExitedShell(owner, run, shell, key);
+  });
+
+  function settleExitedShell(
+    owner: string, run: string, shell: BgShell, key: string,
+  ): void {
     const durable = persistOutcome(owner, run, shell);
     const t = setTimeout(() => {
       const current = shells.get(key);
@@ -215,10 +303,32 @@ export function spawnBackground(
       }
     }, BG_SHELL_REAP_DELAY_MS);
     t.unref?.();
-  });
+  }
   attachSpawned(owner, run, shell);
 
   return { shell, resolution: "first_call" };
+}
+
+/**
+ * Close a claim whose process never ran.
+ *
+ * Written through `recordOutcome` like any other ending, because the reader
+ * cannot tell "failed to start" from "started and failed" by any other means --
+ * and a record with no outcome at all is the one state that is neither.
+ */
+function failClaim(owner: string, run: string, id: string, err: unknown): void {
+  if (!filesRecords()) return;
+  try {
+    void err;
+    recordOutcome(owner, recordRun(run), id, {
+      status: "failed",
+      exitCode: null,
+      signal: null,
+    });
+  } catch {
+    // The claim outlives this process either way; a record store that cannot be
+    // written is the reason the sweep exists.
+  }
 }
 
 function claimShell(
@@ -550,6 +660,20 @@ function runningShells(): BgEntry[] {
   return [...shells.values()].filter((e) => e.shell.status === "running");
 }
 
+/**
+ * Every live background shell this sandbox holds, registered or merely recorded.
+ *
+ * The registry is one input, not the answer. Owners are taken from both sides
+ * so a restart -- which empties the map and leaves the records -- does not make
+ * the whole sandbox look idle to admission.
+ */
+function liveShellTotal(): number {
+  const registered = runningShells();
+  if (!filesRecords()) return registered.length;
+  return registered.length + unregisteredLiveTotal((record) =>
+    shells.has(regKey(record.owner_scope, record.run_identity ?? NO_RUN, record.shell_id)));
+}
+
 /** Ids of `owner`'s live shells. Exists for tests and for shutdown logging. */
 export function listRunningShells(owner: string): string[] {
   return runningShells().filter((e) => e.owner === owner).map((e) => e.shell.id);
@@ -640,7 +764,54 @@ function sleepUnref(ms: number): Promise<void> {
  * so the caller can exit knowing it did what it could.
  */
 export async function shutdownAllShells(graceMs = REAP_GRACE_MS): Promise<number> {
-  return (await terminateShells(runningShells(), graceMs, "shutdown")).shells.length;
+  const fromRegistry = await terminateShells(runningShells(), graceMs, "shutdown");
+  // And the ones the registry cannot name. A background child is detached so it
+  // outlives the request that started it, which means it outlives the process
+  // too: after a Hands restart its record is all that remains, and a shutdown
+  // that read only the map left it running while `runningShellCount` went on
+  // reporting it. The count and the kill have to look in the same place.
+  const orphans = await terminateUnregisteredOrphans(graceMs);
+  return fromRegistry.shells.length + orphans;
+}
+
+/**
+ * SIGTERM, wait, SIGKILL the live shells that only the records know about.
+ *
+ * Signalled by process group, as the registry ones are: the record's pid is the
+ * leader's, and a leader that has already gone can still have a group behind it.
+ * `unregisteredLiveRecords` has checked each pid's start token, so a pid the
+ * kernel reissued is not among them.
+ *
+ * @returns how many were still addressable when the grace ran out.
+ */
+async function terminateUnregisteredOrphans(graceMs: number): Promise<number> {
+  if (!filesRecords()) return 0;
+  const owners = new Set<string>([...shells.values()].map((e) => e.owner));
+  for (const record of ownerRecordsToSweep(owners)) {
+    const pid = record.process_identity?.pid;
+    if (!pid) continue;
+    try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+  }
+  const pending = ownerRecordsToSweep(owners);
+  if (pending.length === 0) return 0;
+  await new Promise((r) => setTimeout(r, Math.max(0, graceMs)));
+  let left = 0;
+  for (const record of ownerRecordsToSweep(owners)) {
+    const pid = record.process_identity?.pid;
+    if (!pid) continue;
+    try { process.kill(-pid, "SIGKILL"); left += 1; } catch { /* already gone */ }
+  }
+  return left;
+}
+
+/** Every owner's unregistered live records, in one list. */
+function ownerRecordsToSweep(owners: Set<string>): ShellRecord[] {
+  const out: ShellRecord[] = [];
+  for (const owner of owners) {
+    out.push(...unregisteredLiveRecords(owner, (record) =>
+      shells.has(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id))));
+  }
+  return out;
 }
 
 /**
@@ -699,7 +870,43 @@ export async function shutdownRunShells(
   // the same reason: two owners may each hold a run of this id, and the
   // credential proved one pair, not one half of it.
   if (!run || !owner) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
-  return terminateShells(addressedByReap(owner, run), graceMs, "run_end");
+  // Closed before the list is taken, and left closed. The reap snapshots its
+  // shells once and then waits out a whole grace window, during which a start
+  // that was already in flight for this same run was still accepted -- so the
+  // report said "stopped, no survivors" while a shell it had never seen went on
+  // running. Refusing the start is the only answer that holds: the reap cannot
+  // widen its snapshot to cover work that does not exist yet.
+  //
+  // In this process only. A request arriving after a Hands restart finds an
+  // empty set and is accepted, which needs a durable closed-run marker this
+  // path has no store for; recorded as a follow-up rather than half-built here.
+  const fence = regKey(owner, run, "");
+  reapingRuns.add(fence);
+  try {
+    return await terminateShells(addressedByReap(owner, run), graceMs, "run_end");
+  } finally {
+    reapingRuns.delete(fence);
+  }
+}
+
+/**
+ * Runs whose reap is in flight, and which may not start more work until it ends.
+ *
+ * The window, not the run's whole future. A reap snapshots its shells once and
+ * then waits out a grace period, and a start accepted inside that window is
+ * outside the snapshot: the report says "stopped, no survivors" beside a shell
+ * it never saw. Refusing the start for the duration is what closes that.
+ *
+ * Cleared when the reap returns, deliberately. Keeping a run closed for ever
+ * would be a different rule than the one this defect needs, and a wider one:
+ * ids are reused -- a retry of the same task carries the same run -- and a
+ * permanent set would refuse work that has every right to start.
+ */
+const reapingRuns = new Set<string>();
+
+/** Whether `run` is inside a reap in this process. */
+export function runIsClosed(owner: string, run: string): boolean {
+  return reapingRuns.has(regKey(owner, run, ""));
 }
 
 /**

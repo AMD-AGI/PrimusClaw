@@ -134,12 +134,24 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   proc.stderr?.on("data", (chunk: Buffer) => appendBuffer(shell, "stderr", chunk, options.bufferBytes));
 
   proc.on("exit", (code, signal) => {
-    if (shell.status === "running") {
+    // The leader's exit is not the shell's end when the group outlived it.
+    // `sleep 30 & exit 0` returns its leader at once and leaves the sleep in
+    // the group: flipping the status here reported the shell finished, which
+    // took it out of `runningShellCount`, out of every reap report and to a
+    // terminal record, while the group went on holding the sandbox's CPU and
+    // its pipe handles.
+    //
+    // `processGroupAlive` is the question that means "ended", and this file
+    // already documents why the leader's own status is not it. A shell whose
+    // group is still running stays `running`; the watcher that spawned it
+    // settles it when the group actually goes.
+    const groupLives = shell.kind !== "foreground" && processGroupAlive(shell);
+    if (shell.status === "running" && !groupLives) {
       shell.status = shell.timedOut ? "timed_out" : (signal ? "killed" : "exited");
     }
     shell.exitCode = code;
     shell.signal = signal;
-    shell.endedAt = Date.now();
+    if (!groupLives) shell.endedAt = Date.now();
     // Foreground exit/error logs are emitted by runForegroundShell.finish so
     // each shell shows exactly one terminal event in the log stream.
     if (shell.kind !== "foreground") {
@@ -187,10 +199,36 @@ export async function runForegroundShell(
       if (forceTimer) clearTimeout(forceTimer);
     };
 
-    const finish = (exitCode: number, signal: NodeJS.Signals | null) => {
+    /**
+     * Drop the timers, except the escalation while the group is still alive.
+     *
+     * `close` fires when the leader's pipes shut, and the leader is not the
+     * group: `(trap "" TERM; sleep 600) & sleep 600` loses its leader to the
+     * SIGTERM above and keeps the child, which holds the sandbox's CPU and can
+     * still write into a workspace after another replica has taken the run
+     * over. Cancelling the SIGKILL here is what let it: the escalation this
+     * file already implements, and the group-wide signal it already sends, were
+     * called off by the one event that does not mean the group has ended.
+     *
+     * `processGroupAlive` is the question that does mean it, and is already
+     * written here for the same reason.
+     */
+    const cleanupTimersAfterClose = () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (sigkillTimer && !processGroupAlive(shell)) clearTimeout(sigkillTimer);
+    };
+
+    const finish = (
+      exitCode: number,
+      signal: NodeJS.Signals | null,
+      /** A leader that closed: the group may outlive it, so keep the escalation. */
+      viaClose = false,
+    ) => {
       if (finished) return;
       finished = true;
-      cleanupTimers();
+      if (viaClose) cleanupTimersAfterClose();
+      else cleanupTimers();
       if (shell.status === "running") {
         shell.status = shell.timedOut ? "timed_out" : (signal ? "killed" : "exited");
       }
@@ -212,7 +250,8 @@ export async function runForegroundShell(
       });
     };
 
-    shell.process.on("close", (code, signal) => finish(code ?? (shell.timedOut ? 124 : 1), signal));
+    shell.process.on("close", (code, signal) =>
+      finish(code ?? (shell.timedOut ? 124 : 1), signal, true));
     shell.process.on("error", () => finish(1, null));
 
     if (options.timeoutMs > 0) {

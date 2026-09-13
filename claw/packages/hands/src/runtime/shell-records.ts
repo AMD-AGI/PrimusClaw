@@ -95,10 +95,28 @@ function atomicWrite(path: string, value: unknown): void {
   const dir = join(stateRoot(), STAGING);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = mkdtempSync(join(dir, "w-"));
-  const staged = join(tmp, "v");
-  writeFileSync(staged, JSON.stringify(value), { mode: 0o600 });
-  renameSync(staged, path);
-  rmSync(tmp, { recursive: true, force: true });
+  // Removed whether or not the write lands.
+  //
+  // Not covered by a test of its own, deliberately. Provoking a failure here
+  // means making `renameSync` fail onto a path this module computes privately,
+  // and a test that reaches in to arrange that is coupled to the subtree layout
+  // more tightly than the leak it guards is worth -- an attempt at one passed
+  // while never entering this function, which is the failure mode that makes
+  // such a test worse than none. The change is a `finally` around an existing
+  // call with no branch of its own. A throw from either the write or
+  // the rename used to leave the directory and whatever was staged in it behind
+  // for good: there is no scavenger for this path, and the callers that catch
+  // and carry on -- a record amendment during a storage failure is the common
+  // one -- left a little more of it behind each time. Epoch creation goes
+  // through here even with background shells disabled, so the debris is not
+  // confined to deployments using the feature.
+  try {
+    const staged = join(tmp, "v");
+    writeFileSync(staged, JSON.stringify(value), { mode: 0o600 });
+    renameSync(staged, path);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 function recordPath(owner: string, run: RunPart, shellId: string): string {
@@ -212,6 +230,23 @@ export function listRecordsForOwner(owner: string): ShellRecord[] {
   const root = join(stateRoot(), SCOPES, ...ownerComponents(owner));
   const out: ShellRecord[] = [];
   walkRecords(root, out);
+  return out;
+}
+
+/**
+ * Every record in the subtree, across all owner scopes.
+ *
+ * For the questions that are about the sandbox rather than about one session --
+ * the concurrency limit is one: a shell holds a slot in this sandbox whoever
+ * started it. Walked once rather than per owner, because the owner path is
+ * chunked and enumerating owners would mean walking it anyway.
+ *
+ * Throws where the subtree exists and cannot be walked, for the reason
+ * `listRecordsForOwner` does: an unreadable subtree is not an empty one.
+ */
+export function listAllRecords(): ShellRecord[] {
+  const out: ShellRecord[] = [];
+  walkRecords(join(stateRoot(), SCOPES), out);
   return out;
 }
 

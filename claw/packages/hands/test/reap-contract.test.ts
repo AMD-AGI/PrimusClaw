@@ -166,3 +166,30 @@ test("a repeated reap addresses whatever is still there rather than reporting a 
   bg.spawnBackground(OWNER, "ktsk_repeat", "sleep 60", "second");
   assert.equal((await bg.shutdownRunShells(OWNER, "ktsk_repeat", 250)).shells.length, 1);
 });
+
+test("a start for a run whose reap is in flight is refused, and accepted once it ends", async () => {
+  // The reap snapshots its shells once and then waits out the grace period. A
+  // start accepted inside that window is outside the snapshot, so the report
+  // says "stopped, no survivors" beside a shell it never saw.
+  //
+  // The refusal lasts the window and not a moment longer: run ids are reused --
+  // a retry of the same task carries the same run -- so a permanent close would
+  // refuse work that has every right to start, which is what the repeat-reap
+  // contract above is about.
+  bg.spawnBackground(OWNER, "ktsk_window", "sleep 60", "during");
+  const reaping = bg.shutdownRunShells(OWNER, "ktsk_window", 400);
+
+  await new Promise((r) => setTimeout(r, 50));
+  assert.throws(
+    () => bg.spawnBackground(OWNER, "ktsk_window", "sleep 60", "sneaked-in"),
+    /closed/,
+    "a start inside the window would be work the reap has already reported on",
+  );
+
+  await reaping;
+  assert.ok(
+    bg.spawnBackground(OWNER, "ktsk_window", "sleep 60", "after"),
+    "and the run is startable again once its reap has ended",
+  );
+  await bg.shutdownRunShells(OWNER, "ktsk_window", 250);
+});

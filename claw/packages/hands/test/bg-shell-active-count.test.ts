@@ -78,3 +78,35 @@ test("an exited shell does not mask a running one, or inflate the count beside i
   assert.equal(runningShellCount(OWNER), 0,
     "with the last running shell gone the handle is free, whatever is still retained");
 });
+
+test("a leader that exits while its group runs on is still work", async () => {
+  // `sleep 30 &` inside the command: bash returns immediately, the sleep stays
+  // in the process group. Counting the leader alone reported the shell finished
+  // -- it left the active count, left every reap report, and took its record to
+  // a terminal status -- while the group went on holding the sandbox's CPU and
+  // its pipe handles. `processGroupAlive` is the question that sees it, and is
+  // already what the reaping paths in bg-manager ask.
+  const orphaning = spawnBackground(OWNER, RUN, "sleep 30 & exit 0", "group1").shell!;
+  // The leader's own exit, read from the code it reported rather than from the
+  // status -- the status deliberately does not move while the group lives, and
+  // asserting on it here would be asserting the defect.
+  assert.ok(
+    await until(() => orphaning.exitCode !== null),
+    "sanity: the leader itself ends at once",
+  );
+  assert.equal(
+    orphaning.status, "running",
+    "and the shell is not called finished while its group is not",
+  );
+
+  assert.equal(
+    runningShellCount(OWNER), 1,
+    "the group outlived its leader, so the sandbox is still doing this shell's work",
+  );
+
+  await killShell(OWNER, RUN, "group1");
+  assert.ok(
+    await until(() => runningShellCount(OWNER) === 0),
+    "and killing the shell takes the group with it, so the count comes back down",
+  );
+});

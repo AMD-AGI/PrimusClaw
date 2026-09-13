@@ -25,7 +25,7 @@ import {
   type EpochFreshness, type ProcessView, type ShellClass,
 } from "./shell-classify.js";
 import {
-  type ProcessIdentity, type ShellRecord, listRecordsForOwner, processStartToken,
+  type ProcessIdentity, type ShellRecord, listAllRecords, listRecordsForOwner, processStartToken,
   readEpochMarker, readRecord, subtreeReadable,
 } from "./shell-records.js";
 
@@ -124,6 +124,83 @@ export function ownerLiveness(
     if (PROTECTED_CLASSES.includes(cls)) active += 1;
   }
   return { active, classes, determinate: true };
+}
+
+/**
+ * How many live shells the whole sandbox holds that the registry cannot name.
+ *
+ * The sandbox-wide counterpart of `unregisteredLiveRecords`, for the
+ * concurrency limit: a slot is held by a shell whoever started it, and after a
+ * restart every one of them is unregistered. Counting the map alone admitted a
+ * fresh allowance beside work already running, once per restart.
+ *
+ * @returns zero when the subtree cannot be read, which is the same answer the
+ *          per-owner form gives and carries the same caveat: not evidence of an
+ *          idle sandbox.
+ */
+export function unregisteredLiveTotal(
+  registryHas: (record: ShellRecord) => boolean,
+): number {
+  if (!subtreeReadable()) return 0;
+  let records: ShellRecord[];
+  try {
+    records = listAllRecords();
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const record of records) {
+    if (registryHas(record)) continue;
+    const cls = classifyShellRecord({
+      record,
+      epoch: epochFreshness(record.hands_epoch),
+      registry: "absent",
+      process: processView(record.process_identity),
+    });
+    if (PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined) n += 1;
+  }
+  return n;
+}
+
+/**
+ * The owner's live shells that this process's registry cannot address.
+ *
+ * `ownerLiveness` counts these -- that is the whole reason it reads records
+ * rather than the map -- but counting was as far as it went: `kill_shell` and
+ * `shutdownAllShells` looked only at the registry, so a child that outlived a
+ * Hands restart answered "one still running" and then "nothing was signalled".
+ * A conversation shell has no run identity either, so the per-run shutdown
+ * could not reach it from the other side.
+ *
+ * Identity is the record's, not a bare pid: `processView` checks the start
+ * token before it answers, so a pid the kernel has since handed to something
+ * else reads as terminated here rather than being signalled.
+ *
+ * @returns the records worth signalling, empty when the subtree cannot be read
+ *          -- an unreadable store is not evidence that nothing is running, and
+ *          the caller must not treat it as a clean sandbox.
+ */
+export function unregisteredLiveRecords(
+  owner: string,
+  registryHas: (record: ShellRecord) => boolean,
+): ShellRecord[] {
+  if (!subtreeReadable()) return [];
+  let records: ShellRecord[];
+  try {
+    records = listRecordsForOwner(owner);
+  } catch {
+    return [];
+  }
+  return records.filter((record) => {
+    if (registryHas(record)) return false;
+    const cls = classifyShellRecord({
+      record,
+      epoch: epochFreshness(record.hands_epoch),
+      registry: "absent",
+      process: processView(record.process_identity),
+    });
+    return PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined;
+  });
 }
 
 /**

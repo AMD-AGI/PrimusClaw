@@ -73,8 +73,20 @@ export const wait = {
           structuredContent: { shell_class: "unknown" as const },
         };
       }
+      // Through the ordinary poll, for the reason the blocking path below gives:
+      // a wait and a bash_output have to leave the read offset in the same
+      // place. Skipping it here did both halves of the harm -- the final output
+      // of a shell that had already finished was not returned at all, so
+      // whether `wait` produced it depended on losing a race with the shell,
+      // and the bytes it did not read went at the reap deadline.
+      const finishedOutput = pollOutput(owner, run, args.shell_id, undefined);
+      const tail = finishedOutput.text ? `\n\n${finishedOutput.text}` : "";
+
       return {
-        content: [{ type: "text" as const, text: `Shell ${args.shell_id} is ${pending.cls}; nothing was waited for` }],
+        content: [{
+          type: "text" as const,
+          text: `Shell ${args.shell_id} is ${pending.cls}; nothing was waited for${tail}`,
+        }],
         structuredContent: {
           shell_id: args.shell_id,
           shell_class: pending.cls,
