@@ -29,7 +29,8 @@ process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "claw-liveness-"));
 process.env.AUTH_CLAW_TOKEN = "test-internal-token";
 if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 const records = await import("../src/runtime/shell-records.js");
-const { ownerLiveness } = await import("../src/runtime/shell-liveness.js");
+const liveness = await import("../src/runtime/shell-liveness.js");
+const { ownerLiveness } = liveness;
 const { runningShellCount } = await import("../src/tools/shell/bg-manager.js");
 const { app } = await import("../src/index.js");
 
@@ -73,6 +74,15 @@ function spawnRecorded(shellId: string): ChildProcess {
   return child;
 }
 
+/** Block until nothing is left in `pid`'s process group. */
+async function waitForGroupToDrain(pid: number): Promise<void> {
+  for (let i = 0; i < 100; i += 1) {
+    if (!liveness.groupHasMember(pid)) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`group ${pid} never drained`);
+}
+
 /** What a restart is, as the sandbox sees it: new epoch, empty registry. */
 function restartHands(): void {
   records.mintEpoch({ pid: process.pid, startToken: records.processStartToken(process.pid) });
@@ -103,8 +113,16 @@ test("a shell that ended before the restart does not hold the sandbox open", asy
   // terminated process has no work left to protect, and counting its lingering
   // record would hold sandboxes open indefinitely.
   const child = spawnRecorded("finished");
-  child.kill("SIGKILL");
+  // The group, not the leader. `sh -c "sleep 60"` forks rather than execs, so
+  // signalling the leader alone leaves the sleep in the group -- live work, and
+  // counted as such now that the count reads the group. This test is about the
+  // other case, so it has to actually produce it.
+  const groupPid = child.pid!;
+  try { process.kill(-groupPid, "SIGKILL"); } catch { /* already gone */ }
   await new Promise((r) => child.once("exit", r));
+  // The leader's exit is delivered before its children are reaped; the count
+  // asks the process table, so the table has to have caught up.
+  await waitForGroupToDrain(groupPid);
   restartHands();
 
   const after = ownerLiveness(OWNER, emptyRegistry);

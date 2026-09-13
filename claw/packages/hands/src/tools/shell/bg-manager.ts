@@ -34,7 +34,8 @@ import {
   type ProcessIdentity, type ShellRecord, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
 import {
-  absenceClass, allUnregisteredLiveRecords, outcomeExpired, ownerLiveness, shellVerdict,
+  absenceClass, allUnregisteredLiveRecords, groupHasMember, outcomeExpired, ownerLiveness,
+  shellVerdict,
   unregisteredLiveTotal,
 } from "../../runtime/shell-liveness.js";
 import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
@@ -391,7 +392,15 @@ export class ShellStartNotDurable extends Error {}
  */
 function attachSpawned(owner: string, run: string, shell: BgShell): void {
   if (!filesRecords() || !shell.pid) return;
-  const identity: ProcessIdentity = { pid: shell.pid, startToken: processStartToken(shell.pid) };
+  // The group token travels with the identity: once the leader is collected the
+  // pid and its start token can no longer say whose group is under that number,
+  // and the record is the only place a later process can learn what to look for
+  // in the children that survived.
+  const identity: ProcessIdentity = {
+    pid: shell.pid,
+    startToken: processStartToken(shell.pid),
+    ...(shell.groupToken ? { groupToken: shell.groupToken } : {}),
+  };
   try {
     attachRecord(owner, recordRun(run), shell.id, identity);
   } catch (err) {
@@ -842,12 +851,24 @@ async function terminateUnregisteredOrphans(graceMs: number): Promise<number> {
   let left = 0;
   for (const id of signalled) {
     // The identity is re-checked before the escalation, not just before the
-    // first signal. A pid number stays reserved while its group still has a
-    // member, so a leader dying alone cannot be confused with anything -- but
-    // a group that ended completely inside the grace window frees its number,
-    // and the kernel can hand it to an unrelated detached group. SIGKILL is
-    // not a signal to send on a number alone.
-    if (processStartToken(id.pid) !== id.startToken) continue;
+    // first signal: a group that ended completely inside the grace window frees
+    // its number, and the kernel can hand it to an unrelated detached group.
+    //
+    // But the token is unreadable once the leader has been reaped, and a reaped
+    // leader is the ordinary outcome of the SIGTERM just sent -- so requiring
+    // it outright left the survivors of exactly the groups this escalation is
+    // for. When the token is gone the question falls back to the one that is
+    // still answerable: does the group still have a member?
+    //
+    // The group marker goes with it, for the same reason selection passes it: a
+    // pid number is free the moment the group it named ends, and this signal is
+    // sent after a grace period in which that can happen. A member carrying a
+    // different group's marker is the one case that can be told apart, and it
+    // is refused here as it is there. Where nothing can be read the answer is
+    // the number's, which is what it has always been.
+    const token = processStartToken(id.pid);
+    const sameProcess = token === id.startToken;
+    if (!sameProcess && (token || !groupHasMember(id.pid, id.groupToken))) continue;
     try { process.kill(-id.pid, "SIGKILL"); left += 1; } catch { /* already gone */ }
   }
   return left;
@@ -1052,6 +1073,7 @@ function untrackedShell(record: ShellRecord): BgShell {
     kind: record.kind,
     command: "",
     pid: record.process_identity!.pid,
+    groupToken: record.process_identity!.groupToken,
     process: { pid: record.process_identity!.pid } as BgShell["process"],
     status: "running",
     exitCode: null,

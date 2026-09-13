@@ -4,6 +4,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { SHELL_GROUP_TOKEN_VAR } from "@claw/protocol";
 import { WORKSPACE } from "../../config.js";
 import { resolveChildPrivilege } from "../../runtime/child-privilege.js";
 
@@ -32,6 +33,26 @@ export interface ManagedShell {
   startedAt: number;
   lastOutputAt: number;
   endedAt: number | null;
+  /**
+   * A value every process in this shell's group inherits, and nothing outside
+   * it carries.
+   *
+   * The pid alone cannot answer "is this still my group" once the leader has
+   * been collected: the number is free again, and a later unrelated group under
+   * the same number reads identically -- the leader is gone in both cases, so
+   * the start-token check that would tell them apart has nothing to read. That
+   * is the one case where the reaped-leader fallback has to decide, and it is
+   * exactly the case it cannot decide from the number.
+   *
+   * The children can answer it, because they inherit the environment: a group
+   * member carrying this token is this shell's, and one that does not is not.
+   *
+   * Optional, and `undefined` means "not known" rather than "no token": a
+   * stand-in built from a record written before tokens existed has none, and
+   * asking for an empty one would match no member at all -- a silent negative
+   * dressed as a check.
+   */
+  groupToken?: string;
 }
 
 export interface ManagedShellResult {
@@ -98,9 +119,10 @@ export function logShellEvent(event: string, shell: ManagedShell, extra: Record<
 export function spawnManagedShell(command: string, options: SpawnManagedShellOptions): ManagedShell {
   const id = options.id || `${options.kind}-${randomUUID().slice(0, 8)}`;
   const privilege = resolveChildPrivilege(options.owner, options.run);
+  const groupToken = randomUUID();
   const proc = spawn("/bin/sh", ["-c", command], {
     cwd: WORKSPACE,
-    env: privilege.env,
+    env: { ...privilege.env, [SHELL_GROUP_TOKEN_VAR]: groupToken },
     ...(privilege.uid === undefined ? {} : { uid: privilege.uid, gid: privilege.gid }),
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
@@ -116,6 +138,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
     exitCode: null,
     signal: null,
     timedOut: false,
+    groupToken,
     stdoutBuf: [],
     stderrBuf: [],
     stdoutBytes: 0,
@@ -297,7 +320,18 @@ export function processGroupAlive(shell: ManagedShell): boolean {
     const pid = Number(entry);
     if (!Number.isInteger(pid) || pid <= 0) continue;
     const member = readProcessGroupState(pid);
-    if (member && member.pgrp === shell.pid && member.state !== "Z") return true;
+    if (!member || member.pgrp !== shell.pid || member.state === "Z") continue;
+    // Membership alone, deliberately. This is the liveness question -- is
+    // anything still running -- and the group marker cannot be asked here: a
+    // child that sanitises its own environment (`env -u`, `env -i`, a re-exec
+    // through sudo) keeps running and stops carrying it, and `/proc/<pid>/
+    // environ` is unreadable across uids at all, which configured child
+    // isolation makes the ordinary case. Either would turn live work into a
+    // group reported dead, which is the whole defect this file exists to
+    // prevent. The marker narrows *whom to signal*, never *whether anything is
+    // there*; the two questions want opposite answers when the evidence cannot
+    // be read.
+    return true;
   }
   return false;
 }

@@ -12,6 +12,15 @@
 
 export type ShellRecordStatus = "exited" | "killed" | "failed";
 
+/**
+ * The environment variable every process in a shell's group inherits.
+ *
+ * Named here rather than in Hands because the value is written by the spawner
+ * and read by the liveness checks, and a name that drifts between the two ends
+ * silently stops identifying anything.
+ */
+export const SHELL_GROUP_TOKEN_VAR = "CLAW_SHELL_GROUP";
+
 export interface ProcessIdentity {
   /** The operating-system process identifier. */
   pid: number;
@@ -21,6 +30,14 @@ export interface ProcessIdentity {
    * identifier and not the token is a non-match, never a weaker match.
    */
   startToken: string;
+  /**
+   * The group token this shell's processes carry, where the record was written
+   * by a Hands that mints them.
+   *
+   * Optional because records written before it existed are still readable and
+   * must keep their old, weaker answer rather than being refused outright.
+   */
+  groupToken?: string;
 }
 
 export interface ShellRecord {

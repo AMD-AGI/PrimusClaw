@@ -19,6 +19,7 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { SHELL_GROUP_TOKEN_VAR } from "@claw/protocol";
 import { nowMs } from "./clock.js";
 import {
   PROTECTED_CLASSES, classifyShellRecord,
@@ -64,7 +65,7 @@ export function processView(identity: ProcessIdentity | undefined): ProcessView 
  * process table, the same way `processGroupAlive` reads it for a shell this
  * process started.
  */
-function groupHasMember(pid: number): boolean {
+export function groupHasMember(pid: number, groupToken?: string): boolean {
   let entries: string[];
   try {
     entries = readdirSync("/proc");
@@ -82,9 +83,45 @@ function groupHasMember(pid: number): boolean {
     const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
     // state, ppid, pgid
     if (after[0] === "Z") continue;
-    if (Number(after[2]) === pid) return true;
+    if (Number(after[2]) !== pid) continue;
+    // The marker only ever *disconfirms*. A member that carries somebody else's
+    // token is somebody else's, and that is the case worth catching: after the
+    // leader is collected the pid is free, so a later group under the same
+    // number is otherwise indistinguishable from the recorded one.
+    //
+    // It cannot be made to confirm. A child that sanitises its own environment
+    // keeps running without the variable, and `/proc/<pid>/environ` is
+    // unreadable across uids -- which configured child isolation makes the
+    // ordinary case. Requiring the marker turned both of those into "this group
+    // is dead", which is the defect this whole file exists to prevent. So
+    // absent or unreadable means "not established", and the answer stays the
+    // one the number alone was always given.
+    if (groupToken !== undefined && carriesForeignToken(Number(entry), groupToken)) continue;
+    return true;
   }
   return false;
+}
+
+/**
+ * Whether one process demonstrably belongs to some *other* shell's group.
+ *
+ * True only on positive evidence: the marker was read, it is present, and it
+ * names a different group. An unreadable environment and a missing marker both
+ * answer `false` -- not because they are reassuring but because they establish
+ * nothing, and a check that cannot be read must not be the reason live work is
+ * abandoned or an orphan is left unsignalled.
+ */
+function carriesForeignToken(pid: number, token: string): boolean {
+  let environ: string;
+  try {
+    environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+  } catch {
+    return false;
+  }
+  const prefix = `${SHELL_GROUP_TOKEN_VAR}=`;
+  const found = environ.split("\0").find((kv) => kv.startsWith(prefix));
+  if (found === undefined) return false;
+  return found !== `${prefix}${token}`;
 }
 
 /** A terminated-but-unreaped entry is still present, so presence is not life. */
@@ -149,7 +186,7 @@ export function ownerLiveness(
       record,
       epoch: epochFreshness(record.hands_epoch),
       registry: registryHas(record) ? "running" : "absent",
-      process: processView(record.process_identity),
+      process: groupProcessView(record.process_identity),
     });
     classes[cls] = (classes[cls] ?? 0) + 1;
     if (PROTECTED_CLASSES.includes(cls)) active += 1;
@@ -182,15 +219,84 @@ export function unregisteredLiveTotal(
   let n = 0;
   for (const record of records) {
     if (registryHas(record)) continue;
+    // The group first, because the leader's own state does not answer this
+    // question. `sleep 600 &` leaves its sleep in the group and returns; once
+    // that leader is collected it has no `/proc` entry, so classification sees
+    // `terminated` and answers `ended_unreaped` -- a class kept out of the
+    // protected set on the grounds that a terminated process has no work left
+    // to protect. True of the leader, false of the shell: the group is still
+    // holding the sandbox's CPU, and a count that missed it admitted a fresh
+    // full allowance beside every group a restart left behind.
+    //
+    // The same rule the orphan sweep uses, and it has to be the same one: a
+    // readable token that differs is a recycled pid and is refused, while an
+    // unreadable one falls back to the question a reaped leader still answers.
+    //
+    // A record that already carries an outcome is excluded first, because this
+    // branch answers ahead of classification and would otherwise skip the one
+    // exclusion classification makes before any other: the outcome phase is the
+    // only producer of `finished`, and a shell that has one is over. Its pid is
+    // free, and a later group under that number would otherwise be counted as
+    // this record's own work -- a finished shell holding a slot against the
+    // live one that inherited its number.
+    if (record.status) continue;
+    if (groupAliveUnderIdentity(record.process_identity)) {
+      n += 1;
+      continue;
+    }
     const cls = classifyShellRecord({
       record,
       epoch: epochFreshness(record.hands_epoch),
       registry: "absent",
-      process: processView(record.process_identity),
+      process: groupProcessView(record.process_identity),
     });
     if (PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined) n += 1;
   }
   return n;
+}
+
+/**
+ * Whether the recorded identity's process group still has a live member.
+ *
+ * Shared by the sandbox-wide count and the orphan sweep so the two cannot drift
+ * apart: one deciding a group is live work while the other declines to signal
+ * it is how a slot comes to be held by something nothing will ever release.
+ */
+/**
+ * The recorded identity's state, answered about its group rather than its
+ * leader.
+ *
+ * `processView` is about one pid, and classification tests `terminated` before
+ * it consults the registry at all -- so a shell whose leader exited into a
+ * living group was classified `ended_unreaped` while its registry entry
+ * correctly still read `running`. Two surfaces then contradicted each other
+ * over the same shell in the same second: `wait` said still running and
+ * `bash_output` said ended, and a caller reading the second stops waiting for
+ * work that is still going.
+ *
+ * Only the terminated answer is revisited. `present` and `unreadable` already
+ * say what they mean, and widening either of them would be a different rule
+ * than the one this needs.
+ */
+function groupProcessView(identity: ProcessIdentity | undefined): ProcessView {
+  const view = processView(identity);
+  if (view !== "terminated") return view;
+  return groupAliveUnderIdentity(identity) ? "present" : "terminated";
+}
+
+export function groupAliveUnderIdentity(identity: ProcessIdentity | undefined): boolean {
+  if (!identity) return false;
+  const token = processStartToken(identity.pid);
+  if (token && token !== identity.startToken) return false;
+  // A readable, matching token settles it: the leader is the one recorded, so
+  // its group is the recorded group. Where the leader has been collected there
+  // is nothing left to read, and the pid number on its own cannot distinguish
+  // this group from a later one that happens to have been given the same
+  // number -- so the group token decides, and a record old enough not to carry
+  // one keeps the weaker answer it was always given rather than losing its
+  // group to a check that did not exist when it was written.
+  if (token) return groupHasMember(identity.pid);
+  return groupHasMember(identity.pid, identity.groupToken);
 }
 
 /**
@@ -250,8 +356,14 @@ export function allUnregisteredLiveRecords(
     // group still has a member is a target whatever the leader's own state.
     const identity = record.process_identity;
     if (!identity) return false;
-    if (processStartToken(identity.pid) !== identity.startToken) return false;
-    if (!groupHasMember(identity.pid)) return false;
+    // Same rule the escalation uses, and it has to be the same rule: a leader
+    // that has been reaped has no token to read, and requiring one here dropped
+    // its record before the escalation's own fallback could ever apply. A
+    // readable token that differs is a different process and is refused; an
+    // unreadable one falls back to the question a reaped leader still answers,
+    // which is whether its group has a member. A pid number stays reserved
+    // while it does, so a live group under that number is not a recycled one.
+    if (!groupAliveUnderIdentity(identity)) return false;
     // The group is alive under the recorded identity, which is the whole of the
     // question here: classification's remaining job is to exclude records that
     // are not this sweep's to act on at all.
@@ -282,7 +394,7 @@ export function unregisteredLiveRecords(
       record,
       epoch: epochFreshness(record.hands_epoch),
       registry: "absent",
-      process: processView(record.process_identity),
+      process: groupProcessView(record.process_identity),
     });
     return PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined;
   });
@@ -358,7 +470,7 @@ export function shellVerdict(
     record,
     epoch,
     registry: registryHas(record) ? "running" : "absent",
-    process: processView(record.process_identity),
+    process: groupProcessView(record.process_identity),
   });
   return { cls, collectorLive: cls === "ended_unreaped" && epoch === "current" && registryHas(record), record };
 }

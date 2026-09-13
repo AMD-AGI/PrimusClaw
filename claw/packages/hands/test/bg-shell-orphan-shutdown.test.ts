@@ -18,7 +18,7 @@
 
 import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -131,4 +131,54 @@ after(() => {
   try {
     rmSync(STATE_ROOT_FOR_CLEANUP, { recursive: true, force: true });
   } catch { /* the test's own cleanup is not worth failing a green run over */ }
+});
+
+test("a group whose leader was reaped is still escalated against", async () => {
+  // SIGTERM kills the leader and the kernel reaps it, so its /proc entry -- and
+  // with it the start token -- is gone by the time the grace expires. Requiring
+  // the token at escalation therefore skipped exactly the groups this sweep
+  // exists for: the survivors of the signal it had just sent. The fallback is
+  // the question that is still answerable, group membership, and a pid number
+  // stays reserved while its group has one.
+  // The child must ignore SIGTERM *itself* -- `trap` in a subshell does not
+  // protect the `sleep` it then execs, and an earlier version of this test
+  // died to the SIGTERM before the escalation it meant to exercise ever ran.
+  // A shell that traps and then waits keeps the group open through SIGTERM.
+  const leader = spawn(
+    "/bin/sh",
+    ["-c", '/bin/sh -c \'trap "" TERM; while :; do sleep 1; done\' & exit 0'],
+    { detached: true, stdio: "ignore" },
+  );
+  leader.unref();
+  await settle(200);
+
+  // A token that was real when the record was written and cannot be read now.
+  // The leader exits immediately, so reading its token here would give "" --
+  // and "" equals the "" a reaped pid yields, which makes the old
+  // token-required implementation behave identically to the new one. An
+  // earlier version of this test did exactly that and could not tell them
+  // apart. A non-empty token is what makes the distinction observable, and it
+  // is also what production records hold: the token is taken at spawn, while
+  // the leader is alive.
+  const id = `reaped-leader-${leader.pid}`;
+  assert.ok(records.claimRecord({
+    owner_scope: OWNER,
+    run_identity: RUN,
+    shell_id: id,
+    hands_epoch: records.currentEpoch() ?? undefined,
+    process_identity: { pid: leader.pid!, startToken: "42" },
+  } as Parameters<typeof records.claimRecord>[0]), "sanity: the record is filed");
+
+  assert.ok(
+    !records.processStartToken(leader.pid!),
+    "sanity: the leader is gone, so its token cannot be read now",
+  );
+
+  await shutdownAllShells(300);
+  await settle(400);
+
+  const survivors = spawnSync("/bin/sh", [
+    "-c", `ps -eo pgid= | tr -d ' ' | grep -c '^${leader.pid}$' || true`,
+  ], { encoding: "utf8" }).stdout.trim();
+  assert.equal(survivors, "0", "the surviving group was escalated against, not skipped");
 });
