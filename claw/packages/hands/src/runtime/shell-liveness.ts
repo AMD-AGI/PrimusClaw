@@ -180,6 +180,49 @@ export function unregisteredLiveTotal(
  *          -- an unreadable store is not evidence that nothing is running, and
  *          the caller must not treat it as a clean sandbox.
  */
+/**
+ * Every live shell in the sandbox the registry cannot address, as records.
+ *
+ * The list form of `unregisteredLiveTotal`, and the one shutdown needs. Its
+ * first version derived the owners to sweep from the in-process map, which is
+ * empty after exactly the restart that leaves these records behind -- so it
+ * examined nothing and signalled nothing in the one situation it was written
+ * for. The records are the input; the map only says which of them are already
+ * addressable.
+ */
+export function allUnregisteredLiveRecords(
+  registryHas: (record: ShellRecord) => boolean,
+): ShellRecord[] {
+  if (!subtreeReadable()) return [];
+  let records: ShellRecord[];
+  try {
+    records = listAllRecords();
+  } catch {
+    return [];
+  }
+  return records.filter((record) => {
+    if (registryHas(record)) return false;
+    // The identity check comes first and is not advisory.
+    //
+    // Classification can answer `unverified_running` -- a protected class -- on
+    // an indeterminate epoch, and that answer is about the *record*, not about
+    // the pid. Acting on it let the sweep signal a process group that merely
+    // inherited a recycled pid: the start token said so and was outvoted. A
+    // caller that is about to send SIGTERM to a group needs the narrower
+    // question answered first, because the cost of being wrong here is killing
+    // somebody else's work.
+    const view = processView(record.process_identity);
+    if (view !== "present") return false;
+    const cls = classifyShellRecord({
+      record,
+      epoch: epochFreshness(record.hands_epoch),
+      registry: "absent",
+      process: view,
+    });
+    return PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined;
+  });
+}
+
 export function unregisteredLiveRecords(
   owner: string,
   registryHas: (record: ShellRecord) => boolean,

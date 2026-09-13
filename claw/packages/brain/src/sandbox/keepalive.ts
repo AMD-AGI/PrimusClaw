@@ -1517,6 +1517,15 @@ async function collectIdleTarget(
   return true;
 }
 
+/**
+ * How long an expiry may wait for the sandbox's own work evidence.
+ *
+ * Short on purpose: the answer only ever *holds* a binding, so a slow read
+ * costs a binding that would have been released a tick later, while a long one
+ * costs the whole sweep its schedule.
+ */
+const EXPIRY_WORK_READ_MS = 2_000;
+
 async function expireIdleTarget(
   deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
   /** The provider has said the sandbox is absent or terminal. */
@@ -1559,8 +1568,20 @@ async function expireIdleTarget(
   // nothing left to hold, and reading a container that is not there is what
   // `positive absence does not require a container read` forbids.
   const inst = sandboxGone ? null : instanceFromEntry(sessionId, info);
+  // Bounded, because the sweep that contains it is. Candidates are processed
+  // one after another, so an unbounded provider round-trip per candidate adds
+  // up across a batch and pushes the whole tick past the timing the pings and
+  // probes are budgeted against. A read that has not answered inside the bound
+  // is treated as no positive evidence -- the same as a failure, and for the
+  // same reason: unavailable evidence must not hold a binding.
   const live = inst
-    ? await countLiveWork(inst, HANDS_STATE_DIR).catch(() => null)
+    ? await Promise.race([
+      countLiveWork(inst, HANDS_STATE_DIR).catch(() => null),
+      new Promise<null>((resolve) => {
+        const t = setTimeout(() => resolve(null), EXPIRY_WORK_READ_MS);
+        t.unref?.();
+      }),
+    ])
     : null;
   if (live?.verdict === "protected") {
     stats.keptProbe += 1;

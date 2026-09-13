@@ -168,6 +168,15 @@ export function attachRecord(
  * Phase 3 -- the outcome, appended only after the parent has collected the
  * exit status. `retain_until` is fixed by this write from the deadline the
  * claim carried, and an absent deadline never expires.
+ *
+ * A conversation shell is the exception, and is recognised by having no run
+ * identity: it is shared across the turns that follow the one that started it,
+ * which is the whole reason it is filed under no run. Its claim still carries
+ * the originating turn's deadline, so an outcome written after that deadline
+ * arrived already expired -- the next poll or wait answered "shell not found"
+ * for a shell whose output was still buffered and whose record said so. A
+ * deadline belongs to the turn that set it, and this shell has outlived that
+ * turn on purpose.
  */
 export function recordOutcome(
   owner: string, run: string | null, shellId: string,
@@ -180,7 +189,7 @@ export function recordOutcome(
     signal: outcome.signal,
     ended_at: new Date().toISOString(),
     output_available: true,
-    ...(r.deadline_at ? { retain_until: r.deadline_at } : {}),
+    ...(r.deadline_at && r.run_identity ? { retain_until: r.deadline_at } : {}),
   }));
 }
 

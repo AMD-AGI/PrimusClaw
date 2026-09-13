@@ -19,6 +19,8 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { isolatingSandbox } from "./support/sandbox-isolation.js";
@@ -26,6 +28,11 @@ import { isolatingSandbox } from "./support/sandbox-isolation.js";
 isolatingSandbox();
 
 process.env.WORKSPACE_PATH = tmpdir();
+// Its own record subtree. These files write records and read them back by
+// walking the whole tree, so sharing a root with another test file running in
+// parallel makes each one see the other's shells -- the suite passed serially
+// and failed at random under the default concurrency.
+process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "bg-shell-orphan-shutdown-"));
 process.env.BG_SHELL_ENABLED = "true";
 
 const records = await import("../src/runtime/shell-records.js");
@@ -49,11 +56,11 @@ const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
 afterEach(async () => { await shutdownAllShells(200); });
 
 test("a live shell that only its record names is still shut down", async () => {
-  // One registry entry so the owner is known to the sweep, and one detached
-  // process that is not in the registry at all -- the survivor.
-  const registered = spawnBackground(OWNER, RUN, "sleep 30", `registered-${process.pid}`).shell!;
-  assert.equal(registered.status, "running", "sanity: the registered one is up");
-
+  // No registry entry at all, which is the state a restart leaves and the one
+  // the first version of this test failed to create: it registered a shell so
+  // the owner would be "known", and the sweep under test derived its owners
+  // from the registry -- so the test supplied the very thing production does
+  // not have, and passed against a sweep that examined nothing.
   const orphan = spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
   orphan.unref();
   await settle(100);
@@ -72,7 +79,7 @@ test("a live shell that only its record names is still shut down", async () => {
   assert.ok(claimed, "sanity: the record was filed");
 
   assert.ok(
-    (runningShellCount(OWNER) ?? 0) >= 2,
+    (runningShellCount(OWNER) ?? 0) >= 1,
     "the survivor counts as work, which is what made its unkillability a defect",
   );
 

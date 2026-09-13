@@ -115,3 +115,26 @@ test("another scope's id and an id never issued are answered identically", async
   assert.ok(!(foreign instanceof Promise) && !(absent instanceof Promise));
   assert.deepEqual(foreign, absent);
 });
+
+/**
+ * A wait must end when the shell ends, and the shell ends when its group does.
+ *
+ * The leader exiting is not the shell ending: `sleep 600 &` returns its leader
+ * at once and leaves the sleep in the group. The exit handler was taught that
+ * -- it defers the terminal status until the group drains -- but the wait's own
+ * `once("exit")` was not, so it resolved on the leader's exit and handed back a
+ * shell still marked `running`. `wait` reports any returned shell as finished,
+ * so the caller was told a job had completed while it was still going, with a
+ * header that contradicted itself: "finished ... (status=running)".
+ */
+test("a wait does not end when only the leader exits", async () => {
+  spawnBackground("owner-group", "run-group", "sleep 30 & exit 0", "leader-gone");
+  // Long enough that the leader's own exit has certainly been delivered, short
+  // enough that the surviving `sleep 30` cannot have ended on its own.
+  const result = await promised(waitForShellExit("owner-group", "run-group", "leader-gone", 1_500));
+
+  assert.equal(
+    result, null,
+    "the group outlived the leader, so the wait times out rather than reporting completion",
+  );
+});

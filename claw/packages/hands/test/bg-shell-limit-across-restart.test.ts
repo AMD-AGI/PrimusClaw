@@ -18,6 +18,8 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { isolatingSandbox } from "./support/sandbox-isolation.js";
@@ -25,6 +27,11 @@ import { isolatingSandbox } from "./support/sandbox-isolation.js";
 isolatingSandbox();
 
 process.env.WORKSPACE_PATH = tmpdir();
+// Its own record subtree. These files write records and read them back by
+// walking the whole tree, so sharing a root with another test file running in
+// parallel makes each one see the other's shells -- the suite passed serially
+// and failed at random under the default concurrency.
+process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "bg-shell-limit-across-restart-"));
 process.env.BG_SHELL_ENABLED = "true";
 process.env.BG_SHELL_MAX_CONCURRENT = "1";
 

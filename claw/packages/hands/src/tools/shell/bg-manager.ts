@@ -34,7 +34,7 @@ import {
   type ProcessIdentity, type ShellRecord, type ShellRecordStatus,
 } from "../../runtime/shell-records.js";
 import {
-  absenceClass, outcomeExpired, ownerLiveness, shellVerdict, unregisteredLiveRecords,
+  absenceClass, allUnregisteredLiveRecords, outcomeExpired, ownerLiveness, shellVerdict,
   unregisteredLiveTotal,
 } from "../../runtime/shell-liveness.js";
 import { callerVisibleClass, type ShellClass } from "../../runtime/shell-classify.js";
@@ -267,26 +267,31 @@ export function spawnBackground(
     // subscribed because a descendant is not this process's child and emits no
     // event here; the interval is the same grace the auto-reap below uses, and
     // it is cleared the moment the group is gone.
+    // One settle path for both branches. Asking `processGroupAlive` twice -- once
+    // here and once on the interval's first tick -- meant a group that ended in
+    // between took the direct branch, which did not decide the terminal state:
+    // the record settled `failed` while the in-memory status stayed `running`,
+    // so the auto-reap refused to drop the entry and it held a slot for good.
+    const settleDrained = () => {
+      if (shell.status === "running") {
+        shell.status = shell.timedOut
+          ? "timed_out"
+          : (shell.signal ? "killed" : "exited");
+      }
+      shell.endedAt = shell.endedAt ?? Date.now();
+      settleExitedShell(owner, run, shell, key);
+      announceGroupDrained(key);
+    };
     if (processGroupAlive(shell)) {
       const watch = setInterval(() => {
         if (processGroupAlive(shell)) return;
         clearInterval(watch);
-        // The exit handler left the status alone because the group was alive,
-        // so the terminal state is decided here, from what the leader reported
-        // when it went. Without this the record would settle as `failed` for a
-        // shell that exited cleanly and merely outlived its leader.
-        if (shell.status === "running") {
-          shell.status = shell.timedOut
-            ? "timed_out"
-            : (shell.signal ? "killed" : "exited");
-        }
-        shell.endedAt = shell.endedAt ?? Date.now();
-        settleExitedShell(owner, run, shell, key);
+        settleDrained();
       }, GROUP_DRAIN_POLL_MS);
       watch.unref?.();
       return;
     }
-    settleExitedShell(owner, run, shell, key);
+    settleDrained();
   });
 
   function settleExitedShell(
@@ -629,12 +634,32 @@ export function waitForShellExit(
       settled = true;
       resolve(value);
     };
-    const onExit = () => {
+    const finish = () => {
       clearTimeout(timer);
       // One tick, so process-runner's own exit handler has set status and
       // exitCode before the caller reads them off the shell.
       setImmediate(() => done(shell));
     };
+    // The leader exiting is not the shell ending, and the wait has to be told
+    // that in the same terms the exit handler was: `sleep 600 &` returns its
+    // leader at once and leaves the sleep in the group. Resolving here handed
+    // back a shell still marked `running`, and `wait` reports any shell it is
+    // given as finished -- so a caller was told its job had completed while it
+    // was still going, under a header that contradicted itself.
+    //
+    // Deferring costs nothing: the settle that eventually writes the terminal
+    // status announces the drain, and that announcement is already subscribed
+    // below. The status is not consulted here because it is the thing being
+    // waited for; the group is, because the group is what "still running"
+    // means.
+    const onExit = () => {
+      if (processGroupAlive(shell)) return;
+      finish();
+    };
+    // And the group, for a shell whose leader has already gone: that `exit` was
+    // delivered before this call existed, so the subscription below can never
+    // fire for it and the wait would sit out its whole timeout.
+    const offGroup = onGroupDrained(regKey(owner, run || NO_RUN, id), () => finish());
     const timer = setTimeout(() => {
       // The listener leaves with the wait that registered it. A wait that runs
       // out is expected to be repeated -- the documented way to sit on a
@@ -642,6 +667,7 @@ export function waitForShellExit(
       // accumulates on the same emitter until Node reports a
       // MaxListenersExceededWarning against a leak that is not one.
       shell.process.removeListener("exit", onExit);
+      offGroup();
       done(null);
     }, timeoutMs);
     timer.unref?.();
@@ -786,33 +812,32 @@ export async function shutdownAllShells(graceMs = REAP_GRACE_MS): Promise<number
  */
 async function terminateUnregisteredOrphans(graceMs: number): Promise<number> {
   if (!filesRecords()) return 0;
-  const owners = new Set<string>([...shells.values()].map((e) => e.owner));
-  for (const record of ownerRecordsToSweep(owners)) {
-    const pid = record.process_identity?.pid;
-    if (!pid) continue;
+  // Driven by the records, not by the map. Deriving the owners from the map was
+  // wrong in exactly the case this exists for: after a restart the map is empty
+  // and the records are not, so the sweep examined nothing and signalled
+  // nothing. `allUnregisteredLiveRecords` walks the subtree and asks the map
+  // only whether each record is already addressable.
+  const targets = allUnregisteredLiveRecords((record) =>
+    shells.has(regKey(record.owner_scope, record.run_identity ?? NO_RUN, record.shell_id)));
+  if (targets.length === 0) return 0;
+  // The pids are taken once, here. Re-enumerating before the escalation asked
+  // the records again, and a leader that SIGTERM had just killed classified as
+  // ended -- its record dropped out of the set, and the descendants that
+  // ignored SIGTERM never saw SIGKILL. The group is the target, and the pid
+  // that names it does not change because its leader died.
+  const pids = targets.map((r) => r.process_identity?.pid).filter((p): p is number => !!p);
+  for (const pid of pids) {
     try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
   }
-  const pending = ownerRecordsToSweep(owners);
-  if (pending.length === 0) return 0;
   await new Promise((r) => setTimeout(r, Math.max(0, graceMs)));
   let left = 0;
-  for (const record of ownerRecordsToSweep(owners)) {
-    const pid = record.process_identity?.pid;
+  for (const pid of pids) {
     if (!pid) continue;
     try { process.kill(-pid, "SIGKILL"); left += 1; } catch { /* already gone */ }
   }
   return left;
 }
 
-/** Every owner's unregistered live records, in one list. */
-function ownerRecordsToSweep(owners: Set<string>): ShellRecord[] {
-  const out: ShellRecord[] = [];
-  for (const owner of owners) {
-    out.push(...unregisteredLiveRecords(owner, (record) =>
-      shells.has(regKey(owner, record.run_identity ?? NO_RUN, record.shell_id))));
-  }
-  return out;
-}
 
 /**
  * How much live background work `owner` still holds in this sandbox.
@@ -880,12 +905,11 @@ export async function shutdownRunShells(
   // In this process only. A request arriving after a Hands restart finds an
   // empty set and is accepted, which needs a durable closed-run marker this
   // path has no store for; recorded as a follow-up rather than half-built here.
-  const fence = regKey(owner, run, "");
-  reapingRuns.add(fence);
+  const fence = enterReapFence(owner, run);
   try {
     return await terminateShells(addressedByReap(owner, run), graceMs, "run_end");
   } finally {
-    reapingRuns.delete(fence);
+    leaveReapFence(fence);
   }
 }
 
@@ -902,11 +926,65 @@ export async function shutdownRunShells(
  * ids are reused -- a retry of the same task carries the same run -- and a
  * permanent set would refuse work that has every right to start.
  */
-const reapingRuns = new Set<string>();
+/**
+ * Callbacks waiting for a shell whose group outlived its leader.
+ *
+ * `wait` subscribes to the leader's `exit`, and for these shells that event has
+ * already been delivered -- the leader went first and the group kept running --
+ * so nothing would ever wake it and the call sat out its whole timeout
+ * reporting "still running" about a shell that had finished. The watcher that
+ * settles the group announces here instead.
+ */
+const groupDrainWaiters = new Map<string, Set<() => void>>();
+
+/** Register `fn` to run when `key`'s group finishes draining. */
+function onGroupDrained(key: string, fn: () => void): () => void {
+  const set = groupDrainWaiters.get(key) ?? new Set();
+  set.add(fn);
+  groupDrainWaiters.set(key, set);
+  return () => {
+    const current = groupDrainWaiters.get(key);
+    if (!current) return;
+    current.delete(fn);
+    if (current.size === 0) groupDrainWaiters.delete(key);
+  };
+}
+
+/** Tell anything waiting on `key` that its group has ended. */
+function announceGroupDrained(key: string): void {
+  const set = groupDrainWaiters.get(key);
+  if (!set) return;
+  groupDrainWaiters.delete(key);
+  for (const fn of set) fn();
+}
+
+const reapingRuns = new Map<string, number>();
 
 /** Whether `run` is inside a reap in this process. */
 export function runIsClosed(owner: string, run: string): boolean {
-  return reapingRuns.has(regKey(owner, run, ""));
+  return (reapingRuns.get(regKey(owner, run, "")) ?? 0) > 0;
+}
+
+/** Enter a reap's fence, returning the key to leave it by. */
+function enterReapFence(owner: string, run: string): string {
+  const fence = regKey(owner, run, "");
+  reapingRuns.set(fence, (reapingRuns.get(fence) ?? 0) + 1);
+  return fence;
+}
+
+/**
+ * Leave one reap's fence.
+ *
+ * Counted rather than set-membership: two reaps of one run overlap easily --
+ * the second finds no shells and returns while the first is still inside its
+ * grace window -- and a `delete` from the second dropped the first one's fence
+ * with it. A start was then accepted during a reap that had already taken its
+ * snapshot, which is the defect the fence exists to prevent.
+ */
+function leaveReapFence(fence: string): void {
+  const held = (reapingRuns.get(fence) ?? 0) - 1;
+  if (held > 0) reapingRuns.set(fence, held);
+  else reapingRuns.delete(fence);
 }
 
 /**
