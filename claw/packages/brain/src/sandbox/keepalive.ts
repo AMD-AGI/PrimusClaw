@@ -409,7 +409,21 @@ async function shouldSkipExpiredRetry(
   const nowMs = Date.now();
   if (!pending || !isRetryPendingExpired(pending, nowMs)) return false;
   const lockKey = pending.lockKey || sessionId;
-  const activeLock = await deps.kv.get(`lock.${lockKey}`).catch(() => null);
+  // A read that failed is not a lock that is absent. Collapsing the two with
+  // `.catch(() => null)` made a KV hiccup indistinguishable from "nobody holds
+  // this", and the unregister below then ran on the strength of an error.
+  let activeLock: Awaited<ReturnType<typeof deps.kv.get>> | null = null;
+  let lockReadFailed = false;
+  try {
+    activeLock = await deps.kv.get(`lock.${lockKey}`);
+  } catch (err) {
+    lockReadFailed = true;
+    logger.warn({ err, sessionId, lockKey }, "keepalive.retry_lock_read_failed");
+  }
+  if (lockReadFailed) {
+    // Nothing is known, so nothing is released: the next sweep asks again.
+    return false;
+  }
   if (activeLock) {
     logger.warn(
       {
@@ -426,6 +440,23 @@ async function shouldSkipExpiredRetry(
       "keepalive.retry_pending_expired_but_lock_active",
     );
     return false;
+  }
+
+  // And the sandbox itself, before its binding goes. Everything above is about
+  // the retry record and its lock; none of it can see a background shell still
+  // running in the sandbox, which is precisely the work a keepalive binding
+  // exists to protect. Only positive evidence holds it -- an unreadable answer
+  // must not, or a failed read would strand every binding.
+  const retryInst = entry ? instanceFromEntry(sessionId, entry as unknown as HandsKvEntry) : null;
+  if (retryInst) {
+    const live = await countLiveWork(retryInst, HANDS_STATE_DIR).catch(() => null);
+    if (live?.verdict === "protected") {
+      logger.warn(
+        { sessionId, source, lockKey, classes: live.classes },
+        "keepalive.retry_pending_expired_but_work_live",
+      );
+      return false;
+    }
   }
 
   unregisterSandbox(sessionId, entry);
@@ -921,9 +952,21 @@ function peekBackgroundWork(
   identity: string,
   info: HandsKvEntry,
 ): { state: BackgroundWork; source: VerdictSource; at?: number } {
-  if (!info.handsUrl || !info.token) return { state: "idle", source: "no-hands" };
   const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
+  // Missing credentials mean this replica cannot ask again -- not that the
+  // answer is no. Returning `idle` here, before any verdict was read, threw
+  // away a witnessed `running` that another replica (or this one, before the
+  // token went) had already established: a sandbox with live background work
+  // was released because the address to re-check it had gone missing.
+  //
+  // So the evidence is read first, and the legacy `idle` is the fallback for
+  // the case it was written for: no credentials *and* nothing on record.
+  if (!info.handsUrl || !info.token) {
+    if (cached?.state === "running") return { state: "running", source: "mem", at: cached.at };
+    if (shared?.state === "running") return { state: "running", source: "handle", at: shared.at };
+    return { state: "idle", source: "no-hands" };
+  }
   if (cached?.state === "gone" || cached?.state === "unknown") {
     return { state: cached.state, source: "mem", at: cached.at };
   }
@@ -1464,7 +1507,9 @@ async function collectIdleTarget(
   }
   const expired = bgWork === "gone"
     || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
-  if (expired) await expireIdleTarget(deps, candidate, { ...e, value }, stats);
+  if (expired) {
+    await expireIdleTarget(deps, candidate, { ...e, value }, stats, bgWork === "gone");
+  }
   else {
     stats.withinWindow += 1;
     await deps.kv.update(key, value, e.revision).catch(() => {});
@@ -1474,6 +1519,8 @@ async function collectIdleTarget(
 
 async function expireIdleTarget(
   deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
+  /** The provider has said the sandbox is absent or terminal. */
+  sandboxGone = false,
 ): Promise<void> {
   const { key, identity, sessionId, info } = candidate;
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
@@ -1491,6 +1538,34 @@ async function expireIdleTarget(
   if (probeOutstanding(info)) {
     stats.keptProbe += 1;
     await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    return;
+  }
+  // One last question, and the only one that is about the sandbox rather than
+  // about this session: is anything still running on it?
+  //
+  // Every check above is owner-scoped -- this session's registrations, this
+  // session's run lease, this session's outstanding probe -- and the verdict
+  // that brought the candidate here came from a shell count scoped to the same
+  // session. Work under another owner (a DAG root, a second session sharing the
+  // sandbox) is invisible to all of them, so a binding could expire out from
+  // under work that was still going.
+  //
+  // Asked here rather than in the probe: this runs once per expiry candidate,
+  // not once per probe per tick, so the provider round-trip it costs is
+  // affordable. Only a positive "running" holds the binding -- evidence being
+  // unavailable must not, or a failed provider call would hold every pod, which
+  // is the failure the whole reclaim path exists to prevent.
+  // Skipped where the provider has already said the sandbox is gone: there is
+  // nothing left to hold, and reading a container that is not there is what
+  // `positive absence does not require a container read` forbids.
+  const inst = sandboxGone ? null : instanceFromEntry(sessionId, info);
+  const live = inst
+    ? await countLiveWork(inst, HANDS_STATE_DIR).catch(() => null)
+    : null;
+  if (live?.verdict === "protected") {
+    stats.keptProbe += 1;
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    logger.info({ sessionId, identity }, "keepalive.kept_other_owner_work");
     return;
   }
   // Release only after the conditional delete wins against any reactivation.
