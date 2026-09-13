@@ -18,7 +18,7 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -31,7 +31,8 @@ process.env.WORKSPACE_PATH = tmpdir();
 // walking the whole tree, so sharing a root with another test file running in
 // parallel makes each one see the other's shells -- the suite passed serially
 // and failed at random under the default concurrency.
-process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "bg-shell-limit-across-restart-"));
+const STATE_ROOT_FOR_CLEANUP = mkdtempSync(join(tmpdir(), "bg-shell-limit-across-restart-"));
+process.env.HANDS_STATE_DIR = STATE_ROOT_FOR_CLEANUP;
 process.env.BG_SHELL_ENABLED = "true";
 process.env.BG_SHELL_MAX_CONCURRENT = "1";
 
@@ -71,4 +72,12 @@ test("a shell that only its record names still holds its slot", async () => {
     /limit reached/,
     "the sandbox is already at its limit, whoever is holding it",
   );
+});
+
+// The isolated root goes with the run that made it. Left behind, each run adds
+// another directory of epoch and record files under the system temp dir.
+after(() => {
+  try {
+    rmSync(STATE_ROOT_FOR_CLEANUP, { recursive: true, force: true });
+  } catch { /* the test's own cleanup is not worth failing a green run over */ }
 });

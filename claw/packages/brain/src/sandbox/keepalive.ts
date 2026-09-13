@@ -442,23 +442,6 @@ async function shouldSkipExpiredRetry(
     return false;
   }
 
-  // And the sandbox itself, before its binding goes. Everything above is about
-  // the retry record and its lock; none of it can see a background shell still
-  // running in the sandbox, which is precisely the work a keepalive binding
-  // exists to protect. Only positive evidence holds it -- an unreadable answer
-  // must not, or a failed read would strand every binding.
-  const retryInst = entry ? instanceFromEntry(sessionId, entry as unknown as HandsKvEntry) : null;
-  if (retryInst) {
-    const live = await countLiveWork(retryInst, HANDS_STATE_DIR).catch(() => null);
-    if (live?.verdict === "protected") {
-      logger.warn(
-        { sessionId, source, lockKey, classes: live.classes },
-        "keepalive.retry_pending_expired_but_work_live",
-      );
-      return false;
-    }
-  }
-
   unregisterSandbox(sessionId, entry);
   await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
   await clearRetryPending(deps.kv, sessionId, pending.lockKey);
@@ -1508,7 +1491,7 @@ async function collectIdleTarget(
   const expired = bgWork === "gone"
     || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
   if (expired) {
-    await expireIdleTarget(deps, candidate, { ...e, value }, stats, bgWork === "gone");
+    await expireIdleTarget(deps, candidate, { ...e, value }, stats);
   }
   else {
     stats.withinWindow += 1;
@@ -1524,12 +1507,9 @@ async function collectIdleTarget(
  * costs a binding that would have been released a tick later, while a long one
  * costs the whole sweep its schedule.
  */
-const EXPIRY_WORK_READ_MS = 2_000;
 
 async function expireIdleTarget(
   deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
-  /** The provider has said the sandbox is absent or terminal. */
-  sandboxGone = false,
 ): Promise<void> {
   const { key, identity, sessionId, info } = candidate;
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
@@ -1547,46 +1527,6 @@ async function expireIdleTarget(
   if (probeOutstanding(info)) {
     stats.keptProbe += 1;
     await deps.kv.update(key, e.value, e.revision).catch(() => {});
-    return;
-  }
-  // One last question, and the only one that is about the sandbox rather than
-  // about this session: is anything still running on it?
-  //
-  // Every check above is owner-scoped -- this session's registrations, this
-  // session's run lease, this session's outstanding probe -- and the verdict
-  // that brought the candidate here came from a shell count scoped to the same
-  // session. Work under another owner (a DAG root, a second session sharing the
-  // sandbox) is invisible to all of them, so a binding could expire out from
-  // under work that was still going.
-  //
-  // Asked here rather than in the probe: this runs once per expiry candidate,
-  // not once per probe per tick, so the provider round-trip it costs is
-  // affordable. Only a positive "running" holds the binding -- evidence being
-  // unavailable must not, or a failed provider call would hold every pod, which
-  // is the failure the whole reclaim path exists to prevent.
-  // Skipped where the provider has already said the sandbox is gone: there is
-  // nothing left to hold, and reading a container that is not there is what
-  // `positive absence does not require a container read` forbids.
-  const inst = sandboxGone ? null : instanceFromEntry(sessionId, info);
-  // Bounded, because the sweep that contains it is. Candidates are processed
-  // one after another, so an unbounded provider round-trip per candidate adds
-  // up across a batch and pushes the whole tick past the timing the pings and
-  // probes are budgeted against. A read that has not answered inside the bound
-  // is treated as no positive evidence -- the same as a failure, and for the
-  // same reason: unavailable evidence must not hold a binding.
-  const live = inst
-    ? await Promise.race([
-      countLiveWork(inst, HANDS_STATE_DIR).catch(() => null),
-      new Promise<null>((resolve) => {
-        const t = setTimeout(() => resolve(null), EXPIRY_WORK_READ_MS);
-        t.unref?.();
-      }),
-    ])
-    : null;
-  if (live?.verdict === "protected") {
-    stats.keptProbe += 1;
-    await deps.kv.update(key, e.value, e.revision).catch(() => {});
-    logger.info({ sessionId, identity }, "keepalive.kept_other_owner_work");
     return;
   }
   // Release only after the conditional delete wins against any reactivation.

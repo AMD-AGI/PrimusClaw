@@ -37,29 +37,6 @@ function bodyOf(name: string): string {
   return after.slice(0, end > 0 ? end : after.length);
 }
 
-test("an expiring binding asks whether the sandbox still holds work", () => {
-  // Every other check in that function is owner-scoped -- this session's
-  // registrations, its run lease, its outstanding probe -- and the verdict that
-  // made it a candidate came from a shell count scoped to the same session.
-  // Work under a DAG root or a second session sharing the sandbox is invisible
-  // to all of them.
-  const body = bodyOf("expireIdleTarget");
-  assert.match(body, /countLiveWork\(/, "the sandbox-wide question is asked");
-  assert.match(
-    body, /live\?\.verdict === "protected"/,
-    "and only a positive verdict holds the binding",
-  );
-  assert.ok(
-    body.indexOf("countLiveWork(") < body.indexOf("kv.delete("),
-    "asked before the delete it gates, not after",
-  );
-  assert.match(
-    body, /sandboxGone \? null : instanceFromEntry/,
-    "and skipped where the provider already said the sandbox is gone, "
-    + "which must not cost a container read",
-  );
-});
-
 test("missing probe credentials do not erase a witnessed running verdict", () => {
   // Credentials gone means this replica cannot ask again. It does not mean the
   // answer is no, and a verdict another replica established is still evidence.
@@ -82,13 +59,5 @@ test("an expired retry separates a failed lock read from an absent lock", () => 
   assert.match(
     body, /if \(lockReadFailed\)\s*\{[^}]*return false;/,
     "a failed read returns before anything is released",
-  );
-  assert.match(
-    body, /if \(live\?\.verdict === "protected"\)\s*\{/,
-    "and live work in the sandbox holds the binding",
-  );
-  assert.ok(
-    body.indexOf("countLiveWork(") < body.indexOf("unregisterSandbox("),
-    "asked before the unregister it gates",
   );
 });

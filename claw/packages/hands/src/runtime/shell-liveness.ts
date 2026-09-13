@@ -18,7 +18,7 @@
  * not a reason to stop protecting it.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { nowMs } from "./clock.js";
 import {
   PROTECTED_CLASSES, classifyShellRecord,
@@ -54,6 +54,37 @@ export function processView(identity: ProcessIdentity | undefined): ProcessView 
   if (!token) return "unreadable";
   if (token !== identity.startToken) return "terminated";
   return readProcessState(identity.pid);
+}
+
+/**
+ * Whether any process still belongs to `pid`'s group and is not a zombie.
+ *
+ * The leader's own state is not the answer -- a zombie leader with a live child
+ * is exactly the case the orphan sweep is for -- so membership is read from the
+ * process table, the same way `processGroupAlive` reads it for a shell this
+ * process started.
+ */
+function groupHasMember(pid: number): boolean {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+    } catch {
+      continue;
+    }
+    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    // state, ppid, pgid
+    if (after[0] === "Z") continue;
+    if (Number(after[2]) === pid) return true;
+  }
+  return false;
 }
 
 /** A terminated-but-unreaped entry is still present, so presence is not life. */
@@ -202,24 +233,35 @@ export function allUnregisteredLiveRecords(
   }
   return records.filter((record) => {
     if (registryHas(record)) return false;
-    // The identity check comes first and is not advisory.
+    // Identity first, liveness second -- and they are different questions.
     //
-    // Classification can answer `unverified_running` -- a protected class -- on
-    // an indeterminate epoch, and that answer is about the *record*, not about
-    // the pid. Acting on it let the sweep signal a process group that merely
-    // inherited a recycled pid: the start token said so and was outvoted. A
-    // caller that is about to send SIGTERM to a group needs the narrower
-    // question answered first, because the cost of being wrong here is killing
-    // somebody else's work.
-    const view = processView(record.process_identity);
-    if (view !== "present") return false;
+    // Classification can answer `unverified_running` on an indeterminate epoch,
+    // and that answer is about the *record*, not about the pid: acting on it
+    // let the sweep signal a group that merely inherited a recycled pid, the
+    // start token having said so and been outvoted. So the token is checked
+    // here and is not advisory; killing somebody else's work is the cost of
+    // getting it wrong.
+    //
+    // But `processView` answers `terminated` for a zombie leader, and a zombie
+    // leader is the ordinary shape of a group that outlived it -- which is
+    // precisely the group this sweep exists to reach. Gating on `present`
+    // alone excluded them, and left running what the previous implementation
+    // killed. The group is the unit: a leader whose identity matches and whose
+    // group still has a member is a target whatever the leader's own state.
+    const identity = record.process_identity;
+    if (!identity) return false;
+    if (processStartToken(identity.pid) !== identity.startToken) return false;
+    if (!groupHasMember(identity.pid)) return false;
+    // The group is alive under the recorded identity, which is the whole of the
+    // question here: classification's remaining job is to exclude records that
+    // are not this sweep's to act on at all.
     const cls = classifyShellRecord({
       record,
       epoch: epochFreshness(record.hands_epoch),
       registry: "absent",
-      process: view,
+      process: "present",
     });
-    return PROTECTED_CLASSES.includes(cls) && record.process_identity !== undefined;
+    return PROTECTED_CLASSES.includes(cls);
   });
 }
 

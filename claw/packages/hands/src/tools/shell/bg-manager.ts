@@ -636,6 +636,13 @@ export function waitForShellExit(
     };
     const finish = () => {
       clearTimeout(timer);
+      // Both subscriptions, on every path out. The timeout used to carry the
+      // listener removal, so a wait woken by the group drain cancelled the
+      // timeout and left its `once("exit")` attached to an event that had
+      // already fired -- one closure per wait, held until the shell itself is
+      // released.
+      shell.process.removeListener("exit", onExit);
+      offGroup();
       // One tick, so process-runner's own exit handler has set status and
       // exitCode before the caller reads them off the shell.
       setImmediate(() => done(shell));
@@ -825,15 +832,23 @@ async function terminateUnregisteredOrphans(graceMs: number): Promise<number> {
   // ended -- its record dropped out of the set, and the descendants that
   // ignored SIGTERM never saw SIGKILL. The group is the target, and the pid
   // that names it does not change because its leader died.
-  const pids = targets.map((r) => r.process_identity?.pid).filter((p): p is number => !!p);
-  for (const pid of pids) {
-    try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+  const signalled = targets
+    .map((r) => r.process_identity)
+    .filter((id): id is NonNullable<typeof id> => !!id);
+  for (const id of signalled) {
+    try { process.kill(-id.pid, "SIGTERM"); } catch { /* already gone */ }
   }
   await new Promise((r) => setTimeout(r, Math.max(0, graceMs)));
   let left = 0;
-  for (const pid of pids) {
-    if (!pid) continue;
-    try { process.kill(-pid, "SIGKILL"); left += 1; } catch { /* already gone */ }
+  for (const id of signalled) {
+    // The identity is re-checked before the escalation, not just before the
+    // first signal. A pid number stays reserved while its group still has a
+    // member, so a leader dying alone cannot be confused with anything -- but
+    // a group that ended completely inside the grace window frees its number,
+    // and the kernel can hand it to an unrelated detached group. SIGKILL is
+    // not a signal to send on a number alone.
+    if (processStartToken(id.pid) !== id.startToken) continue;
+    try { process.kill(-id.pid, "SIGKILL"); left += 1; } catch { /* already gone */ }
   }
   return left;
 }

@@ -16,10 +16,10 @@
  * leaves behind, without needing a second process to leave it.
  */
 
-import test, { afterEach } from "node:test";
+import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -32,7 +32,8 @@ process.env.WORKSPACE_PATH = tmpdir();
 // walking the whole tree, so sharing a root with another test file running in
 // parallel makes each one see the other's shells -- the suite passed serially
 // and failed at random under the default concurrency.
-process.env.HANDS_STATE_DIR = mkdtempSync(join(tmpdir(), "bg-shell-orphan-shutdown-"));
+const STATE_ROOT_FOR_CLEANUP = mkdtempSync(join(tmpdir(), "bg-shell-orphan-shutdown-"));
+process.env.HANDS_STATE_DIR = STATE_ROOT_FOR_CLEANUP;
 process.env.BG_SHELL_ENABLED = "true";
 
 const records = await import("../src/runtime/shell-records.js");
@@ -122,4 +123,12 @@ test("a spawn that fails after returning closes its claim instead of stranding i
     runningShellCount(OWNER), 0,
     "a claim that failed to start holds no slot",
   );
+});
+
+// The isolated root goes with the run that made it. Left behind, each run adds
+// another directory of epoch and record files under the system temp dir.
+after(() => {
+  try {
+    rmSync(STATE_ROOT_FOR_CLEANUP, { recursive: true, force: true });
+  } catch { /* the test's own cleanup is not worth failing a green run over */ }
 });
