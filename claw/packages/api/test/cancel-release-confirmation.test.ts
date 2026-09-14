@@ -534,18 +534,24 @@ test("R18 a handle is on record before its stop is attempted, not after it fails
   // used to see an empty map and an empty record and answer `confirmed` for a
   // workload whose only stop was still in flight -- and a process that died
   // mid-stop left no trace that the attempt had happened at all.
+  // Observed inside `destroy`, not inside `fetch`. The mapping is dropped
+  // there, so that is the instant the evidence has to already exist -- and a
+  // check in `fetch` passes just as well with the record written after the
+  // destroy, which is the ordering this test exists to forbid.
   stubDb();
   stubHandles({ main: "w-1" });
-  let markedWhileInFlight: boolean | null = null;
-  globalThis.fetch = (async () => {
-    markedWhileInFlight = await unreleasedRecord.any("t-root");
-    return new Response("", { status: 200 });
-  }) as typeof globalThis.fetch;
+  let markedBeforeDestroy: boolean | null = null;
+  const passThrough = handleRegistry.destroy;
+  handleRegistry.destroy = async (dag: string, name: string) => {
+    markedBeforeDestroy = await unreleasedRecord.any("t-root");
+    return passThrough(dag, name);
+  };
+  stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal((await cancelTask("t-root")).released, "confirmed");
   assert.equal(
-    markedWhileInFlight, true,
-    "the window has to fail safe: on record first, cleared by a release that lands",
+    markedBeforeDestroy, true,
+    "on record before the mapping is dropped, cleared by a release that lands",
   );
   assert.equal(await unreleasedRecord.any("t-root"), false, "and it does get cleared");
 });
@@ -612,11 +618,11 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   // with nothing recorded anywhere, so the next caller reads an empty map, an
   // empty record, and answers `nothing_held` for a workload never stopped.
   //
-  // Recorded with an empty workload id, which is the truth -- `destroy` is what
-  // would have returned it. The deliberate cost is that nothing clears this
-  // entry, because no later teardown revisits a handle that is no longer in the
-  // map. A standing false alarm is visible and checkable; a false clear on a
-  // live GPU is neither.
+  // The workload id comes from the lookup that now precedes the destroy, so
+  // the entry names the workload even though `destroy` never answered. The
+  // deliberate cost is that nothing clears it: no later teardown revisits a
+  // handle that is no longer in the map. A standing false alarm is visible and
+  // checkable; a false clear on a live GPU is neither.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
   handleRegistry.lookup = async () => ({ workload_id: "w-1" });

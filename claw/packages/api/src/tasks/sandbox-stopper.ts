@@ -562,7 +562,23 @@ export async function stopSandboxByHandle(
 
   // On record first, so the window below is one this can be recovered from
   // rather than one that loses the handle. Cleared by a release that lands.
-  await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
+  //
+  // And if that write did not land, the mapping stays. Recording first is only
+  // protection if the destroy is conditional on it having worked: writing the
+  // evidence, swallowing the failure, and dropping the mapping anyway loses the
+  // handle exactly as completely as not recording at all -- a concurrent cancel
+  // then reads an empty map and an empty record and answers `nothing_held`.
+  // Keeping the mapping costs a sandbox that stays registered until something
+  // retries, which the sweeper does; the alternative costs the only reference
+  // to it. (The cancellation's own verdict is already written and unaffected --
+  // this returns, it does not throw.)
+  if (!await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed")) {
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: known.workload_id },
+      "sandbox.teardown_skipped_unrecorded",
+    );
+    return "unconfirmed";
+  }
 
   let wid: string | null;
   try {
@@ -577,10 +593,20 @@ export async function stopSandboxByHandle(
     );
     return "unconfirmed";
   }
-  // Someone else destroyed it between the lookup and here. They own whatever
-  // they did with it; this call established nothing, and the entry recorded
-  // above keeps the DAG from reading the gap as `nothing_held`.
-  if (wid === null) return "unconfirmed";
+  if (wid === null) {
+    // Someone else destroyed it between the lookup and here, and they went
+    // through this same path: they recorded their own attempt and will clear it
+    // if their stop lands. So the mark written above is retracted -- it was
+    // speculative, made before this call knew it had anything to do, and
+    // nothing would ever clear it. Left in place it is a DAG that reports
+    // `unconfirmed` for ever over a workload the other caller released
+    // perfectly well, which teaches an operator to ignore the field.
+    //
+    // Retracting is safe precisely because it is not the only record: theirs
+    // stands until their release is established.
+    await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "confirmed");
+    return "unconfirmed";
+  }
 
   let released: ReleaseOutcome;
   try {
@@ -615,7 +641,7 @@ async function rememberOutcome(
   handleName: string,
   workloadId: string,
   released: ReleaseOutcome,
-): Promise<void> {
+): Promise<boolean> {
   try {
     // Cleared by identity: this release confirms THIS workload, and says
     // nothing about another one a rebuild registered under the same name.
@@ -624,6 +650,7 @@ async function rememberOutcome(
     } else {
       await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
     }
+    return true;
   } catch (e) {
     // Swallowed, and not a silent loss of evidence: this record lives on
     // `claw_tasks`, and a database that cannot take this write is one that
@@ -641,6 +668,7 @@ async function rememberOutcome(
       { dagRootTaskId, handleName, workloadId, released, err: errText(e) },
       "sandbox.unreleased_record_write_failed",
     );
+    return false;
   }
 }
 

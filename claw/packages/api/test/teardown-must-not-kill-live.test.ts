@@ -21,6 +21,7 @@
  *   L2 a terminal standalone task's sandbox still is
  *   L3 a handle is not torn down while a sibling node is still running
  *   L4 and is torn down once the siblings are terminal
+ *   L5 a sandbox the NEXT task in the session is reusing is not reaped
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -82,14 +83,18 @@ test("L1 a standalone task's sandbox is not reaped as an orphan while it runs", 
   // that value, matched nothing, read the row as `missing`, and tore the
   // sandbox out from under a task that was still running on it.
   handleFor("t-solo");
+  // Answers as the real database would for a standalone task: it HAS a row,
+  // and that row's `dag_node_id` is NULL. Ordering matters -- the old predicate
+  // is checked first, so restoring it makes this test fail rather than being
+  // rescued by a looser prefix match on the new query.
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
+    if (sql.includes("dag_node_id = '__dag_root__'")) return { rows: [], rowCount: 0 };
     if (sql.startsWith("SELECT status, session_id FROM claw_tasks")) {
       return { rows: [{ status: "running", session_id: "s-1" }], rowCount: 1 };
     }
-    // The old predicate. Answering nothing here is what the real database does
-    // for a standalone task, and is what made this reachable.
-    if (sql.includes("dag_node_id = '__dag_root__'")) return { rows: [], rowCount: 0 };
+    // The session-liveness guard: this task is the live one.
+    if (sql.startsWith("SELECT 1 FROM claw_tasks")) return { rows: [{ "?column?": 1 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
 
@@ -107,9 +112,12 @@ test("L2 a terminal standalone task's sandbox still is reaped", async () => {
   handleFor("t-solo");
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
+    if (sql.includes("dag_node_id = '__dag_root__'")) return { rows: [], rowCount: 0 };
     if (sql.startsWith("SELECT status, session_id FROM claw_tasks")) {
       return { rows: [{ status: "completed", session_id: "s-1" }], rowCount: 1 };
     }
+    // Nothing live in the session either.
+    if (sql.startsWith("SELECT 1 FROM claw_tasks")) return { rows: [], rowCount: 0 };
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
 
@@ -195,5 +203,35 @@ test("L4 and the handle is torn down once the siblings are terminal", async () =
   assert.deepEqual(
     stopped, ["w-live"],
     "with every other node finished, the last user really is the last user",
+  );
+});
+
+test("L5 a sandbox the next task in the session is reusing is not reaped", async () => {
+  // The registering task being terminal does not mean the sandbox is idle.
+  // Brain keeps a finished task's pod warm as `hands.<session>`, and the next
+  // message in the same session reuses it without moving the DAG handle's
+  // ownership. So T1 completes, T2 picks up the same workload, and a sweep
+  // reading only T1 stops the sandbox T2 is running on. The two are
+  // sequential: this needs no race at all, it is the normal shape of a
+  // session, which is why "the owner is terminal" is not enough on its own.
+  handleFor("t-1");
+  handleRegistry.listAll = async () => [
+    ["t-1", { main: { workload_id: "w-live", session_id: "s-1" } }],
+  ];
+  db.query = (async (text: string) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    if (sql.startsWith("SELECT status, session_id FROM claw_tasks")) {
+      return { rows: [{ status: "completed", session_id: "s-1" }], rowCount: 1 };
+    }
+    // T2, still running in the same session on the reused sandbox.
+    if (sql.startsWith("SELECT 1 FROM claw_tasks")) return { rows: [{ "?column?": 1 }], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+
+  await reapOrphanHandles();
+
+  assert.deepEqual(
+    stopped, [],
+    "the workload belongs to the session while the session still has live work",
   );
 });

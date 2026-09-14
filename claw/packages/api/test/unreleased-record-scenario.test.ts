@@ -30,6 +30,7 @@
  *   U7 a DAG root that does not exist is an unknown, not "nothing outstanding"
  *   U8 the record reaches the caller through the public task read
  *   U9 a handle named `token` survives the round trip, database to redactor
+ *   U10 two workloads under one handle name are separate entries, cleared apart
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -234,4 +235,38 @@ test("U9 a handle named `token` survives the round trip, database to redactor", 
     );
     assert.equal(entries[0]!.handle, "token", "with the handle name intact beside it");
   })();
+});
+
+test("U10 two workloads under one handle name are separate entries, cleared apart", async () => {
+  // What the digest is FOR, and what nothing else here would catch: a key made
+  // only of the handle name passes every other test in this file, because every
+  // other test uses one workload per name.
+  //
+  // A handle name is reused -- a rebuild registers a second workload under the
+  // same name. Keyed by name, the two share an entry: the newer failure
+  // overwrites the older, and worse, an older workload's stop succeeding clears
+  // the newer one's failure. That is a confirmed release assembled out of two
+  // unrelated events, and the leaked workload is the one nobody is now looking
+  // for.
+  await seedDagRoot();
+  await unreleasedRecord.mark("t-root", "main", "w-old");
+  await unreleasedRecord.mark("t-root", "main", "w-new");
+
+  const both = (await metadata()).sandbox_release as { unreleased: Record<string, unknown> };
+  assert.equal(
+    Object.keys(both.unreleased).length, 2,
+    "same name, different workloads: two things leaked, so two entries",
+  );
+
+  // The older workload's stop lands. It says nothing about the newer one.
+  await unreleasedRecord.clear("t-root", "main", "w-old");
+
+  const left = Object.values(
+    ((await metadata()).sandbox_release as { unreleased: Record<string, unknown> }).unreleased,
+  ) as Array<{ workload_id: string }>;
+  assert.deepEqual(
+    left.map((e) => e.workload_id), ["w-new"],
+    "clearing the one that was released must not clear the one that was not",
+  );
+  assert.equal(await unreleasedRecord.any("t-root"), true, "so the DAG is still outstanding");
 });

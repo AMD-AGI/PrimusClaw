@@ -1054,7 +1054,7 @@ export async function reapOrphanHandles(): Promise<number> {
   const all = await handleRegistry.listAll();
   let dropped = 0;
   let unreleased = 0;
-  for (const [dagRoot] of all) {
+  for (const [dagRoot, handles] of all) {
     // Keyed by `task_id` alone, which is the primary key. The old predicate
     // also demanded `dag_node_id = '__dag_root__'`, and that was not a
     // narrowing of the same row -- it was a different row for half the
@@ -1074,10 +1074,39 @@ export async function reapOrphanHandles(): Promise<number> {
     // terminal owns its sandbox, whatever shape of task it is.
     const status = owner?.status ?? "missing";
     if (status === "completed" || status === "failed" || status === "cancelled" || status === "missing") {
+      // The registering task being terminal does not mean the sandbox is idle.
+      // Brain keeps a finished task's pod warm as `hands.<session>` and the
+      // next message in the same session reuses it (`tryReuseSessionSandbox`)
+      // WITHOUT moving the DAG handle's ownership. So T1 completes, T2 picks up
+      // the same workload, and this sweep -- reading only T1 -- stops the
+      // sandbox T2 is running on. No race is needed: the two are sequential,
+      // which is the normal shape of a session.
+      //
+      // Ownership should move with the reuse, and that is Brain's to do. Until
+      // it does, the session is the wider thing the workload actually belongs
+      // to, so a session with live work keeps its sandboxes. The cost is a
+      // deferred reap on a busy session; the cost of the alternative is a pod
+      // pulled out from under a running task.
+      const sessionId = owner?.session_id
+        ?? Object.values(handles).find((h) => h.session_id)?.session_id
+        ?? "";
+      if (sessionId) {
+        const live = await db.query(
+          `SELECT 1 FROM claw_tasks
+            WHERE session_id = $1
+              AND status NOT IN ('completed','failed','cancelled')
+            LIMIT 1`,
+          [sessionId],
+        );
+        if ((live.rowCount ?? 0) > 0) {
+          logger.info({ dagRoot, sessionId }, "sweeper.orphan_handles_session_live");
+          continue;
+        }
+      }
       // The owner's session id when known; falling back to "" is safe because
       // safeStopWorkload reads the platform key from the session and skips
       // when absent.
-      if (await stopAllHandlesForDag(dagRoot, owner?.session_id ?? "") === "unconfirmed") unreleased++;
+      if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
       dropped++;
     }
   }
