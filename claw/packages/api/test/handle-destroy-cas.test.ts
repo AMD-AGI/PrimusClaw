@@ -32,6 +32,7 @@
  *   C2 the row is deleted, conditionally, when the last handle goes
  *   C3 a row that will not settle raises rather than silently giving up
  *   C4 a non-conflict failure is raised, not retried away
+ *   C5 the removal is bound to the workload it was asked to remove
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -51,6 +52,13 @@ function fakeBucket(initial: Record<string, unknown>) {
     current: () => (value === null ? null : JSON.parse(new TextDecoder().decode(value))),
     /** Runs once, after the next read, to land a concurrent write. */
     interleave(f: () => void) { onRead = f; },
+    /** A rebuild re-registering the same name against a new workload. */
+    replace(name: string, workloadId: string) {
+      const row = value === null ? {} : JSON.parse(new TextDecoder().decode(value));
+      row[name] = { workload_id: workloadId };
+      value = enc.encode(JSON.stringify(row));
+      revision += 1;
+    },
     /** A concurrent registration, as Brain makes it. */
     register(name: string, workloadId: string) {
       const row = value === null ? {} : JSON.parse(new TextDecoder().decode(value));
@@ -66,12 +74,19 @@ function fakeBucket(initial: Record<string, unknown>) {
         const f = onRead; onRead = null; f?.();
         return snapshot;
       },
-      async update(_k: string, data: Uint8Array, rev: number) {
-        if (rev !== revision) { conflicts.push(rev); throw new Error("wrong last sequence: 3"); }
+      // Real NATS semantics, and the distinction matters: an ABSENT revision
+      // is an unconditional write that succeeds, not a conflict. An earlier
+      // version of this fake treated `undefined` as a permanent conflict,
+      // which made C1 pass whether or not the code sent a revision -- the fake
+      // was supplying the protection the test claimed to be checking.
+      async update(_k: string, data: Uint8Array, rev?: number) {
+        if (rev !== undefined && rev !== revision) {
+          conflicts.push(rev); throw new Error("wrong last sequence: 3");
+        }
         value = data; revision += 1; return revision;
       },
-      async delete(_k: string, opts?: { previousSeq: number }) {
-        if (opts && opts.previousSeq !== revision) {
+      async delete(_k: string, opts?: { previousSeq?: number }) {
+        if (opts?.previousSeq !== undefined && opts.previousSeq !== revision) {
           conflicts.push(opts.previousSeq);
           throw new Error("wrong last sequence: 3");
         }
@@ -84,11 +99,16 @@ function fakeBucket(initial: Record<string, unknown>) {
 }
 
 /** The production removal, against a bucket with real revision semantics. */
-function destroy(bucket: ReturnType<typeof fakeBucket>, handle: string) {
+function destroy(
+  bucket: ReturnType<typeof fakeBucket>,
+  handle: string,
+  expect?: string,
+) {
   return destroyHandleCas(
     bucket.kv as unknown as Parameters<typeof destroyHandleCas>[0],
     "t-root",
     handle,
+    expect,
   );
 }
 
@@ -107,11 +127,27 @@ test("C1 a registration landing mid-destroy survives the removal", async () => {
   assert.equal(bucket.conflicts.length, 1, "which takes exactly one conflict and one retry");
 });
 
-test("C2 the row is deleted, conditionally, when the last handle goes", async () => {
-  const bucket = fakeBucket({ only: { workload_id: "W1" } });
+test("C2 the row is deleted when the last handle goes, and conditionally", async () => {
+  // Two assertions, because the delete path has its own revision argument and
+  // nothing else here exercises it. The uncontended case proves an emptied row
+  // is removed rather than left as `{}`; the contended one proves the removal
+  // is conditional, which the title claimed and the previous version of this
+  // test did not check at all -- it passed with the delete's `previousSeq`
+  // dropped entirely.
+  const quiet = fakeBucket({ only: { workload_id: "W1" } });
+  assert.equal(await destroy(quiet, "only"), "W1");
+  assert.equal(quiet.current(), null, "an emptied row is removed, not left behind");
 
-  assert.equal(await destroy(bucket, "only"), "W1");
-  assert.equal(bucket.current(), null, "an empty row is removed rather than left behind");
+  const contended = fakeBucket({ only: { workload_id: "W1" } });
+  // A registration lands after the read that decided the row would be empty.
+  contended.interleave(() => contended.register("b", "Wb"));
+
+  assert.equal(await destroy(contended, "only"), "W1");
+  assert.deepEqual(
+    contended.current(), { b: { workload_id: "Wb" } },
+    "the row was no longer empty by the time the write went out, so it must not be deleted",
+  );
+  assert.equal(contended.conflicts.length, 1, "which the revision on the delete is what catches");
 });
 
 test("C3 a row that will not settle raises rather than silently giving up", async () => {
@@ -134,4 +170,25 @@ test("C4 a non-conflict failure is raised, not retried away", async () => {
 
   await assert.rejects(() => destroy(bucket, "a"), /no responders/);
   assert.deepEqual(bucket.conflicts, [], "a broken bucket is not a busy one");
+});
+
+test("C5 the removal is bound to the workload it was asked to remove", async () => {
+  // The revision check stops a concurrent registration being overwritten; it
+  // does not stop a RETRY removing the wrong thing. Between the re-read and
+  // the write, a rebuild can register a different workload under the same
+  // handle name -- one this call never recorded and never meant to stop --
+  // and removing that entry drops the only reference to a live sandbox. That
+  // is the failure the revision check exists to prevent, arriving by the other
+  // door.
+  const bucket = fakeBucket({ a: { workload_id: "Wa" } });
+  // The handle keeps its name and changes its workload while this decides.
+  bucket.interleave(() => bucket.replace("a", "Wa2"));
+
+  const wid = await destroy(bucket, "a", "Wa");
+
+  assert.equal(wid, null, "the workload it was asked about is gone; this call removed nothing");
+  assert.deepEqual(
+    bucket.current(), { a: { workload_id: "Wa2" } },
+    "and the workload that took its place keeps its only reference",
+  );
 });

@@ -180,6 +180,7 @@ export async function destroyHandleCas(
   kv: KvLike,
   dagRootTaskId: string,
   handleName: string,
+  expectWorkloadId?: string,
 ): Promise<string | null> {
   const key = `${HANDLE_MAP_PREFIX}.${dagRootTaskId}`;
   const dec = new TextDecoder();
@@ -202,6 +203,19 @@ export async function destroyHandleCas(
       ? held
       : (held as { workload_id?: unknown } | undefined)?.workload_id;
     if (typeof workloadId !== "string") return null;
+    // Bound to the workload the caller recorded, not to whatever currently
+    // answers to the name. A retry re-reads, and between reads a rebuild can
+    // register a DIFFERENT workload under the same handle -- one this call
+    // never pre-marked and never intends to stop. Removing that entry drops
+    // the only reference to a live sandbox, which is the failure the revision
+    // check was added to prevent, arriving through the retry instead.
+    if (expectWorkloadId !== undefined && workloadId !== expectWorkloadId) {
+      logger.warn(
+        { dagRootTaskId, handleName, expected: expectWorkloadId, found: workloadId },
+        "sandbox.handle_identity_changed",
+      );
+      return null;
+    }
 
     delete row[handleName];
     try {
@@ -246,8 +260,14 @@ function isRevisionConflict(e: unknown): boolean {
  * outcomes below testable without a NATS server.
  */
 export const handleRegistry = {
-  destroy(dagRootTaskId: string, handleName: string): Promise<string | null> {
-    return destroyHandleCas(kvDagHandles as unknown as KvLike, dagRootTaskId, handleName);
+  destroy(
+    dagRootTaskId: string,
+    handleName: string,
+    expectWorkloadId?: string,
+  ): Promise<string | null> {
+    return destroyHandleCas(
+      kvDagHandles as unknown as KvLike, dagRootTaskId, handleName, expectWorkloadId,
+    );
   },
   lookup(dagRootTaskId: string, handleName: string): Promise<HandleInfo | null> {
     return handleMap().lookup(dagRootTaskId, handleName);
@@ -328,10 +348,17 @@ function entryKey(handleName: string, workloadId: string): string {
 
 export const unreleasedRecord = {
   async mark(dagRootTaskId: string, handleName: string, workloadId: string): Promise<void> {
+    // Keyed on `task_id` alone. The predicate used to demand
+    // `dag_node_id = '__dag_root__'`, which is not the owner row for every
+    // handle: Brain registers under `dag_root_task_id ?? task_id`, so a
+    // standalone task owns one under its own id and its `dag_node_id` is NULL.
+    // For those the statement matched nothing, reported success, and the
+    // mapping was then dropped on the strength of a record that does not
+    // exist.
     // One statement, so two cancels racing cannot lose each other's mark the
     // way a read-then-write pair would. `||` merges at each level, so a sibling
     // key written between this statement's read and its write survives.
-    await db.query(
+    const r = await db.query(
       `UPDATE claw_tasks
           SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
                 'sandbox_release',
@@ -340,7 +367,7 @@ export const unreleasedRecord = {
                   COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb)
                     || jsonb_build_object($2::text, $3::jsonb)
                 ))
-        WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+        WHERE task_id = $1`,
       [
         dagRootTaskId,
         entryKey(handleName, workloadId),
@@ -351,6 +378,12 @@ export const unreleasedRecord = {
         }),
       ],
     );
+    // A write that matched no row is not a write. Silently succeeding here is
+    // what lets `rememberOutcome` report a record that was never made, and the
+    // caller then drops the mapping believing the evidence is safe.
+    if ((r.rowCount ?? 0) === 0) {
+      throw new Error(`no task row ${dagRootTaskId} to record an unreleased handle on`);
+    }
   },
   async clear(dagRootTaskId: string, handleName: string, workloadId: string): Promise<void> {
     await db.query(
@@ -361,7 +394,7 @@ export const unreleasedRecord = {
                   'unreleased',
                   COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb) - $2::text
                 ))
-        WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+        WHERE task_id = $1`,
       [dagRootTaskId, entryKey(handleName, workloadId)],
     );
   },
@@ -369,7 +402,7 @@ export const unreleasedRecord = {
     const r = await db.query(
       `SELECT COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb)
                 <> '{}'::jsonb AS outstanding
-         FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+         FROM claw_tasks WHERE task_id = $1`,
       [dagRootTaskId],
     );
     // No root row is not "nothing outstanding": the row a mark would have been
@@ -550,7 +583,18 @@ export async function stopSandboxByHandle(
     // IS held and this code cannot release it, so `nothing_held` would assert
     // the opposite of what is true. The mapping is still dropped, as before.
     logger.warn({ dagRootTaskId, handleName }, "sandbox.stop_unsupported_handle");
-    await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed");
+    // The same gate the workload-id branch has: dropping the mapping when the
+    // record did not land loses the handle completely, and the next caller
+    // reads the gap as `nothing_held` for a sandbox nothing ever stopped. This
+    // branch cannot stop it either way, which is all the more reason the
+    // mapping is the only remaining trace.
+    if (!await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed")) {
+      logger.warn(
+        { dagRootTaskId, handleName },
+        "sandbox.teardown_skipped_unrecorded",
+      );
+      return "unconfirmed";
+    }
     await handleRegistry.destroy(dagRootTaskId, handleName).catch((e) => {
       logger.warn(
         { dagRootTaskId, handleName, err: errText(e) },
@@ -582,7 +626,7 @@ export async function stopSandboxByHandle(
 
   let wid: string | null;
   try {
-    wid = await handleRegistry.destroy(dagRootTaskId, handleName);
+    wid = await handleRegistry.destroy(dagRootTaskId, handleName, known.workload_id);
   } catch (e) {
     // The delete may or may not have committed, and the stop was not attempted
     // either way. Both possibilities are already on record above, which is the
@@ -594,17 +638,23 @@ export async function stopSandboxByHandle(
     return "unconfirmed";
   }
   if (wid === null) {
-    // Someone else destroyed it between the lookup and here, and they went
-    // through this same path: they recorded their own attempt and will clear it
-    // if their stop lands. So the mark written above is retracted -- it was
-    // speculative, made before this call knew it had anything to do, and
-    // nothing would ever clear it. Left in place it is a DAG that reports
-    // `unconfirmed` for ever over a workload the other caller released
-    // perfectly well, which teaches an operator to ignore the field.
+    // Someone else destroyed it between the lookup and here. This call
+    // established nothing, and the mark written above stays.
     //
-    // Retracting is safe precisely because it is not the only record: theirs
-    // stands until their release is established.
-    await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "confirmed");
+    // A previous round retracted it, reasoning that the winner keeps their own
+    // record. They do not: both callers derive the same key from the same
+    // (handle, workload) pair, so there is one record, and clearing it here
+    // deletes the winner's evidence when their stop failed. That turns an
+    // unreleased workload into `nothing_held` -- precisely the answer this
+    // whole change exists to stop inventing -- so the retraction was a worse
+    // bug than the one it fixed, and is gone.
+    //
+    // What it leaves is the cost that motivated it: when the winner's stop
+    // DID land, they clear the shared record and this mark is already gone
+    // with it, so the common case self-heals. The case that does not is a
+    // winner who cleared before this mark was written, leaving a standing
+    // `unconfirmed` on a DAG that is fine. That is a false alarm, which is
+    // visible and checkable; the alternative was a false clear, which is not.
     return "unconfirmed";
   }
 
@@ -722,6 +772,32 @@ export async function stopAllHandlesForDag(
     if (released !== "confirmed") allConfirmed = false;
   }
   if (!allConfirmed) return "unconfirmed";
+
+  // Re-read, because the snapshot this loop walked is not the DAG. A handle
+  // registered while the loop ran -- a rebuild, or a node that started after
+  // the snapshot -- is a live sandbox this call neither stopped nor counted,
+  // and the interrupt that would have stopped the work is not published until
+  // after this returns. Confirming over the top of it is the same mistake as
+  // confirming over an empty map, one step later.
+  //
+  // This does not establish that provisioning has finished: a workload exists
+  // before its handle is registered, so an empty re-read is not proof of
+  // quiescence. It is a bound on what this call may claim, not a fix for the
+  // race, and the race is recorded in the PR as needing cancel/provisioning
+  // coordination that does not exist yet.
+  try {
+    const left = Object.keys(await handleRegistry.listForDag(dagRootTaskId));
+    if (left.length > 0) {
+      logger.warn(
+        { dagRootTaskId, handles: left },
+        "sandbox.handles_registered_during_teardown",
+      );
+      return "unconfirmed";
+    }
+  } catch (e) {
+    logger.warn({ dagRootTaskId, err: errText(e) }, "sandbox.handle_list_failed");
+    return "unconfirmed";
+  }
 
   // Confirming this call's own loop is not confirming the DAG. The snapshot
   // above is of the handles still registered *now*, and a handle that leaked
