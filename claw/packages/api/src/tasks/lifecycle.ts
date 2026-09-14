@@ -227,9 +227,11 @@ async function maybeStopHandlesForLastUser(
   //
   // The guard does not need to know which nodes use the handle: if any sibling
   // is still live, the DAG is not finished with its sandboxes, and the handles
-  // are torn down by the DAG-root transition a moment later anyway. That is the
-  // path `stopAllHandlesForDag` exists for, so the cost of waiting is bounded
-  // by the DAG's own remaining work, and the failure it avoids is destroying a
+  // are collected once it is. Not by the DAG-root transition -- that only
+  // writes the root's status -- but by the orphan sweep, on its own interval
+  // and behind its own session-liveness guard, so on a busy session a deferral
+  // can outlast the DAG by more than a tick. The failure it avoids is
+  // destroying a
   // sandbox under a running task.
   const live = await db.query(
     `SELECT 1 FROM claw_tasks
@@ -331,8 +333,8 @@ export async function cancelTask(
   // branch is for.
   //
   // `released` is deliberately absent from everything this branch returns. A
-  // non-root cancel stops no sandbox: teardown happens later, when the DAG root
-  // transitions or the sweeper reaches it. Answering `nothing_held` here would
+  // non-root cancel stops no sandbox: teardown happens later, when the sweeper
+  // reaches the DAG -- the root's own transition only writes status. Answering `nothing_held` here would
   // claim no handle was ever recorded, which this branch has not checked and
   // usually is not true, and answering `unconfirmed` would report a failure of
   // an attempt that was never made. Omitting the field says what is actually

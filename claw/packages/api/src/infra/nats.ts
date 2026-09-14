@@ -53,9 +53,11 @@ export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
 /**
  * Sandbox handle registry, per DAG. Brain is the only writer of handle
  * entries -- see `brain/src/sandbox/handles.ts` -- and this side is the only
- * destroyer. Both create and reconcile the bucket: whichever process starts
- * first on a fresh cluster brings it up, and api additionally corrects replica
- * drift, which brain cannot (it holds no JetStreamManager). For a long time
+ * destroyer. Either process may CREATE it -- whichever starts first on a fresh
+ * cluster brings it up -- but only this one reconciles it, because `views.kv`
+ * attaches to an existing bucket and ignores its options, so a bucket first
+ * opened by brain keeps whatever it was created with until api corrects the
+ * drift. Brain cannot: it holds no JetStreamManager. For a long time
  * this side did not read it at all: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
  * never writes a handle to, so every teardown it ran found nothing to tear down
  * and every DAG's sandboxes outlived their DAG.

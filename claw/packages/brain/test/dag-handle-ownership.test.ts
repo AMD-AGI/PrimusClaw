@@ -123,9 +123,10 @@ test("H2 replace creates the entry when the name is free", async () => {
 });
 
 test("H3 replace leaves other handles of the same DAG alone", async () => {
-  // One row holds every handle of a DAG, and replace destroys before it
-  // creates -- so a replacement that took the row with it would drop the
-  // siblings' only reference, which is the failure it exists to prevent.
+  // One row holds every handle of a DAG, so a replacement is a rewrite of that
+  // whole row -- one conditional write, never a delete and a create. A version
+  // that dropped the row and rebuilt it would take the siblings' only
+  // reference with it, which is the failure this pins.
   await replaceDagHandle("dag-3", "train", { workload_id: "W-train" });
   await replaceDagHandle("dag-3", "eval", { workload_id: "W-eval" });
 

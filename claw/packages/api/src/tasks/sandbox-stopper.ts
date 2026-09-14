@@ -12,8 +12,10 @@
  *      of any handle (per DAG `handle_last_user` derived map) AND no sibling
  *      node of that DAG is still live -- the derived map names the last node
  *      in topological order, which is not the last one to finish.
- *   2. DAG root transition handler: tear every remaining handle of a
- *      finished / cancelled DAG.
+ *   2. cancelTask's DAG-root branch: tear every remaining handle of a DAG it
+ *      actually cancelled. A root reaching terminal on its own does NOT run
+ *      this -- the scheduler only writes status -- so those handles are the
+ *      sweeper's.
  *   3. Sweeper: orphan handles whose DAG row no longer exists.
  *
  * Both KV destroy and SaFE workload stop are idempotent.
@@ -540,14 +542,16 @@ async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
  * answers this call; the record answers the next one.
  *
  * `destroy` distinguishes two falsy results and so does this:
- *   - `null`  -- nothing of that name is registered NOW. Answered
- *                `nothing_held` only from the lookup that precedes the
- *                destroy, where it means this DAG holds no such handle; a
- *                `null` from the destroy itself means somebody else took it
- *                first and answers `unconfirmed`. Neither consults the
- *                record -- the DAG-level aggregate does that, and folds a
- *                per-handle `nothing_held` into `unconfirmed` for a DAG that
- *                held anything.
+ *   - `null`  -- from the LOOKUP, this DAG holds no handle of that name:
+ *                `nothing_held`. From the DESTROY it means something else:
+ *                either the handle went while this call was deciding, or it
+ *                is still there naming a DIFFERENT workload than the one
+ *                recorded, which the identity check refuses to remove. Both
+ *                answer `unconfirmed`, because in neither case did this call
+ *                release what it set out to. Neither consults the record --
+ *                the DAG-level aggregate does that, and folds a per-handle
+ *                `nothing_held` into `unconfirmed` for a DAG that held
+ *                anything.
  *   - `""`    -- a handle was registered with no SaFE workload id behind it.
  *                agent-sandbox handles are written this way (see Brain's
  *                ensureHands), and this path has never had a way to stop one.
@@ -698,10 +702,13 @@ export async function stopSandboxByHandle(
  * Keep or drop this handle's entry in the record, without letting the
  * bookkeeping decide the answer.
  *
- * A failed write is logged and swallowed deliberately. The outcome it was
- * about is already established and already being returned to this caller; all
- * that is lost is the next caller's ability to see it, and turning that into an
- * exception would throw away the answer this call did get.
+ * A failed write is logged and swallowed rather than thrown -- but it is NOT
+ * inconsequential, and an earlier version of this comment said it cost only
+ * the next caller's view. The pre-stop write's `false` stops THIS call from
+ * destroying the mapping at all, which is the point: the mapping is the last
+ * reference once the record is gone. Swallowing keeps the outcome this call
+ * did establish from being thrown away; the caller decides what to do about
+ * the bookkeeping having failed.
  */
 async function rememberOutcome(
   dagRootTaskId: string,

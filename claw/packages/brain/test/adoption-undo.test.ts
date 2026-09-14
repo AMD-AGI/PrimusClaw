@@ -5,7 +5,7 @@
  * Undoing an adoption that could not be recorded.
  *
  * When a DAG adopts a warm sandbox, `acceptExistingSandbox` clears the idle
- * markers and starts a keepalive ticker before the handle is registered. If
+ * markers and adds a keepalive registration before the handle is registered. If
  * that registration fails the turn must fail -- an unrecorded sandbox is one
  * Backend's teardown cannot find, and a cancel then reports the DAG holds
  * nothing and stops nothing. But failing alone leaves the adoption half-done:
@@ -31,7 +31,7 @@
  *
  * Coverage:
  *   A1 the undo addresses the Claw session, not the Router's
- *   A2 it stops the ticker before restoring the idle marker
+ *   A2 it drops the registration before restoring the idle marker
  *   A3 only an incomplete park is reported as incomplete (real log output)
  *   A4 the sandbox is not stopped -- this path did not create it
  */
@@ -113,13 +113,20 @@ test("A1 the undo addresses the Claw session, not the Router's", async () => {
   );
 });
 
-test("A2 it stops the ticker before restoring the idle marker", async () => {
+test("A2 it drops the registration before restoring the idle marker", async () => {
+  // Precisely: `unregisterSandbox` removes THIS session's entry from the local
+  // registry the keepalive ticker walks. It does not stop a ticker -- the
+  // ticker is global -- and it does not recall pings already sent.
+  //
+  // The order still matters, in the direction the reverse would be worse: park
+  // first and the KV entry reads idle while a live registration still names
+  // it, so the ticker keeps pinging something marked parked. This way the
+  // registration goes first, and the window between them is one where KV still
+  // reads active with nothing local pinging it -- which the next tick and the
+  // reuse gate both handle.
   const { seen } = await adopt("parked");
 
-  assert.deepEqual(
-    seen, ["unregister", "park"],
-    "reversed, the entry is briefly active with nobody pinging it",
-  );
+  assert.deepEqual(seen, ["unregister", "park"]);
 });
 
 test("A3 only an incomplete park is reported as incomplete", async () => {

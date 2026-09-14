@@ -211,7 +211,8 @@ function sandboxNamespaceFor(request: ExecuteRequest): string {
  *
  * Bound rather than called through the imports directly, so the gates below can
  * be exercised without a cluster: `destroyHands` reaches for the KV bucket and
- * the workload API, and `registerSandbox` starts a keepalive ticker. Neither is
+ * the workload API, and `registerSandbox` adds to the registry the keepalive
+ * ticker walks. Neither is
  * what the decision is about, and both are what a test of it would otherwise
  * have to stand up.
  */
@@ -698,13 +699,15 @@ export async function registerReusedDagHandle(
     const adoptedSession = request.session_id;
     try {
       // The two halves of what `acceptExistingSandbox` just did, undone in the
-      // reverse order it did them. To be exact about what this does and does
-      // not buy: `unregisterSandbox` drops THIS session's registration, it
-      // does not stop a global ticker or recall pings already collected, and
-      // between it and the park landing the KV entry still reads active. The
-      // order is still the right way round -- the alternative leaves a
-      // registration pointing at an entry already marked idle -- but it is not
-      // an atomic handover and nothing here should be read as claiming one.
+      // reverse order it did them. `unregisterSandbox` drops THIS session's
+      // entry from the registry the ticker walks -- it stops no ticker and
+      // recalls no ping already sent -- and between it and the park landing
+      // the KV entry still reads active with nothing local pinging it.
+      //
+      // The order is still the right way round: reversed, the entry reads idle
+      // while a live registration still names it, and the ticker goes on
+      // pinging something marked parked. It is not an atomic handover and
+      // nothing here should be read as claiming one.
       reuseEffects.unregisterSandbox(adoptedSession, identity);
       // `markHandsIdle` REPORTS failure rather than throwing -- `superseded`
       // for a revision conflict, `failed` for anything else -- so a catch
