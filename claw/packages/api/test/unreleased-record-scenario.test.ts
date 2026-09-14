@@ -32,6 +32,7 @@
  *   U9 a handle named `token` survives the round trip, database to redactor
  *   U10 two workloads under one handle name are separate entries, cleared apart
  *   U11 a retry stamps its key without taking the rest of `metadata` with it
+ *   U12 the replacement row does not inherit the original's leak evidence
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -308,5 +309,30 @@ test("U11 a retry stamps its key without taking the rest of metadata with it", a
   assert.deepEqual(
     meta.derived, { keep: "me" },
     "as does everything else the column held",
+  );
+});
+
+test("U12 the replacement row does not inherit the original's leak evidence", async () => {
+  // The record is evidence about a workload the PREVIOUS run held. The clone
+  // carried it over, so the replacement -- which has never had a sandbox --
+  // reported a leak it could never clear: releasing its own workload clears
+  // its own entry, never the inherited one. Meanwhile the original's copy is
+  // cleared when that workload is finally released, so the evidence ends up on
+  // exactly the row it is not about.
+  await seedSession(h, "s-1");
+  await seedRun(h, "t-orig", "s-1", { origin: "api", status: "failed" });
+  await unreleasedRecord.mark("t-orig", "main", "w-old");
+
+  const { retryTask } = await import("../src/tasks/lifecycle.js");
+  const r = await retryTask("t-orig");
+  assert.equal(r.ok, true);
+
+  assert.equal(
+    await unreleasedRecord.any(r.new_task_id!), false,
+    "the replacement never held a sandbox, so it has nothing outstanding",
+  );
+  assert.equal(
+    await unreleasedRecord.any("t-orig"), true,
+    "and the evidence stays on the row whose run actually held the workload",
   );
 });
