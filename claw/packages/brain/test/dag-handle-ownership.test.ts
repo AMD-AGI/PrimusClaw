@@ -32,6 +32,8 @@
  *   H6 an existing empty row is updated, not create-and-conflicted
  *   H7 the handle is registered while the workload is provisioning, not after
  *   H8 Brain's own row writer stores a `__proto__` handle too
+ *   H9 a displaced workload is carried forward, not dropped
+ *   H10 carrying is bounded, and never carries the workload being written
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -322,4 +324,45 @@ test("H7 the handle is registered while the workload is provisioning, not after"
     /getSafeWorkloadProvider\(\)\.stop\(/,
     "and that failure has to stop the workload before it rethrows, not just log it",
   );
+});
+
+test("H9 a displaced workload is carried forward, not dropped", async () => {
+  // `create` refused to overwrite a name that already mapped elsewhere exactly
+  // so a reference could not be lost. Replacing that refusal with an
+  // unconditional write reintroduced the loss by another door: a redelivery
+  // whose `hands.<session>` entry has expired -- BRAIN_REGISTRY has a TTL,
+  // DAG_HANDLES does not -- finds this handle still naming a workload that is
+  // still running, and takes the name for its replacement. Teardown then stops
+  // the replacement, sees it go, and reports the DAG released while the
+  // original keeps its GPU.
+  await replaceDagHandle("dag-9", "main", { workload_id: "W-live" });
+  await replaceDagHandle("dag-9", "main", { workload_id: "W-new" });
+
+  const held = await lookupDagHandle("dag-9", "main");
+  assert.equal(held?.workload_id, "W-new", "the name points at the replacement");
+  assert.deepEqual(
+    held?.superseded_workload_ids, ["W-live"],
+    "and the workload it was taken from keeps a reference, or nothing ever stops it",
+  );
+});
+
+test("H10 carrying is bounded, and never carries the workload being written", async () => {
+  // Evidence, not a log: a handle that churns must not grow the row without
+  // limit. And re-registering the SAME workload -- which `create` treats as an
+  // idempotent retry -- must not file it against itself as displaced.
+  await replaceDagHandle("dag-10", "main", { workload_id: "W-1" });
+  await replaceDagHandle("dag-10", "main", { workload_id: "W-1" });
+
+  assert.equal(
+    (await lookupDagHandle("dag-10", "main"))?.superseded_workload_ids, undefined,
+    "the same workload twice displaces nothing",
+  );
+
+  for (let i = 2; i <= 14; i += 1) {
+    await replaceDagHandle("dag-10", "main", { workload_id: `W-${i}` });
+  }
+  const carried = (await lookupDagHandle("dag-10", "main"))!.superseded_workload_ids!;
+  assert.equal(carried.length, 8, "bounded");
+  assert.equal(carried.at(-1), "W-13", "keeping the most recent, which are the likeliest still live");
+  assert.equal(carried.includes("W-14"), false, "and never the one currently held");
 });

@@ -101,6 +101,9 @@ export async function lookupDagHandle(
 /** How many times a registration re-reads a row that moved under it. */
 const REGISTER_CAS_ATTEMPTS = 5;
 
+/** How many displaced workloads one handle carries before the oldest is dropped. */
+const SUPERSEDED_LIMIT = 8;
+
 /**
  * Point an existing handle at a different workload, or create it if absent.
  *
@@ -173,8 +176,26 @@ export async function replaceDagHandle(
       }
       row = parsed as Record<string, unknown>;
     }
-    const previous = (getHandleEntry(row, handleName) as { workload_id?: string } | undefined)
-      ?.workload_id;
+    const prevEntry = getHandleEntry(row, handleName) as
+      { workload_id?: string; superseded_workload_ids?: string[] } | undefined;
+    const previous = prevEntry?.workload_id;
+    // Carry forward any workload this name is being taken away from, unless it
+    // is the one being written. `create` used to refuse this overwrite exactly
+    // so a reference could not be lost, and replacing that refusal with an
+    // unconditional write reintroduced the loss: a redelivery whose session
+    // entry has expired -- BRAIN_REGISTRY has a TTL, DAG_HANDLES does not --
+    // finds the handle still naming a workload that is still running, and
+    // overwrites it. Teardown then stops the replacement and reports the DAG
+    // released while the original keeps its GPU.
+    //
+    // Bounded, because this is evidence and not a log: a handle that churns
+    // must not grow the row without limit. The oldest are dropped first, and
+    // losing the oldest is the least bad thing to lose.
+    const carried = [
+      ...(prevEntry?.superseded_workload_ids ?? []),
+      ...(previous && previous !== info.workload_id ? [previous] : []),
+    ].filter((id, i, all) => id && id !== info.workload_id && all.indexOf(id) === i)
+      .slice(-SUPERSEDED_LIMIT);
     // One write that sets the key, never a delete followed by a create: an
     // absent handle is how Backend decides a DAG holds no sandbox, so a
     // replacement must not look, even for an instant, like never having had
@@ -184,7 +205,9 @@ export async function replaceDagHandle(
     // that reports success and stores nothing, which Backend reads as a DAG
     // holding no sandbox.
     setHandleEntry(row, handleName, {
-      ...info, created_at: info.created_at ?? new Date().toISOString(),
+      ...info,
+      created_at: info.created_at ?? new Date().toISOString(),
+      ...(carried.length > 0 ? { superseded_workload_ids: carried } : {}),
     });
 
     try {
@@ -192,7 +215,10 @@ export async function replaceDagHandle(
       if (keyExists) await kv.update(key, payload, entry!.revision);
       else await kv.create(key, payload);
       logger.info(
-        { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
+        {
+          dagRootTaskId, handleName, workloadId: info.workload_id,
+          previousWorkloadId: previous, supersededWorkloadIds: carried,
+        },
         "dag-handles.replaced",
       );
       return;

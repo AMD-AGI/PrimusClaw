@@ -348,6 +348,12 @@ export function markHandsIdle(
   return kv.get(kvKey)
     .then(async (entry): Promise<RunEndedParkResult> => {
       if (!entry) return { outcome: "gone" };
+      // A deleted key is not an absent one to `kv.get`: it answers with the
+      // tombstone, whose value is empty. Parsed, that reads as an unreadable
+      // entry -- which the adoption undo reports as an undo that did not
+      // happen, when in fact there is nothing left to park.
+      if (entry.operation === "DEL" || entry.operation === "PURGE") return { outcome: "gone" };
+      if (entry.value.length === 0) return { outcome: "gone" };
       let info: HandsKvEntry;
       try {
         info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;

@@ -46,6 +46,8 @@
  *   R17 a handle that leaked earlier is not confirmed away by a later teardown
  *   R18 a handle is on record before its stop runs, not after it fails
  *   R19 a destroy whose response was lost is recorded, not forgotten
+ *   R20 a workload the handle was taken from is stopped too, not left behind
+ *   R21 and one that will not stop keeps the DAG `unconfirmed`
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -147,6 +149,23 @@ function stubHandles(handles: Record<string, string>): void {
     const wid = live.get(name)!;
     live.delete(name);
     return wid;
+  };
+}
+
+/**
+ * `stubHandles` for entries that carry displaced workloads, and whose destroy
+ * really removes the handle -- so the end-of-teardown re-read sees an empty
+ * DAG. A stub that kept answering would make these tests assert on the
+ * re-read's verdict rather than on anything about superseded ids.
+ */
+function stubCarried(entries: Record<string, HandleInfo>): void {
+  const live = new Map(Object.entries(entries));
+  handleRegistry.listForDag = async () => Object.fromEntries(live);
+  handleRegistry.lookup = async (_dag: string, name: string) => live.get(name) ?? null;
+  handleRegistry.destroy = async (_dag: string, name: string) => {
+    const info = live.get(name);
+    live.delete(name);
+    return info?.workload_id ?? null;
   };
 }
 
@@ -645,4 +664,42 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   // it inventing the one answer it must never invent.
   handleRegistry.listForDag = async () => ({});
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+});
+
+test("R20 a workload the handle was taken from is stopped too", async () => {
+  // The other half of carrying a displaced workload forward: recording it
+  // changes nothing unless teardown acts on it.
+  //
+  // How one gets there without any race: all Brain instances are down past
+  // `BRAIN_REGISTRY`'s TTL, so `hands.<session>` expires while the DAG's own
+  // handle -- in a bucket with no TTL -- survives, still naming a workload
+  // that is still running. The task is redelivered, sees no session entry,
+  // creates a replacement, and the handle is taken for it. Stopping only the
+  // replacement and reporting `confirmed` is the exact false clear this whole
+  // change exists to remove.
+  stubDb();
+  stubCarried({ main: { workload_id: "w-new", superseded_workload_ids: ["w-live"] } });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(
+    stopped.sort(), ["w-live", "w-new"],
+    "the workload the handle was taken from has no other reference left",
+  );
+  assert.equal(r.released, "confirmed", "both stops landed, so the DAG really is released");
+});
+
+test("R21 a superseded workload that will not stop keeps the DAG unconfirmed", async () => {
+  stubDb();
+  stubCarried({ main: { workload_id: "w-new", superseded_workload_ids: ["w-live"] } });
+  stubSafe((wid) => new Response("", { status: wid === "w-live" ? 500 : 200 }));
+
+  const r = await cancelTask("t-root");
+
+  assert.equal(
+    r.released, "unconfirmed",
+    "the current workload going says nothing about the one it displaced",
+  );
+  assert.equal(await unreleasedRecord.any("t-root"), true, "and the leak is on record");
 });
