@@ -112,6 +112,14 @@ test("a handle named __proto__ is stored, not silently swallowed", async () => {
     Object.keys(await map.listForDag("dag-p")), ["__proto__"],
     "and it has to be a real own key, which is what teardown enumerates",
   );
+  // `listAll` builds its own per-DAG object the same way and is what the
+  // sweeper walks, so it needs the same cover -- reverting it alone left every
+  // other assertion here green.
+  const all = await map.listAll();
+  assert.deepEqual(
+    Object.keys(all.find(([dag]) => dag === "dag-p")![1]), ["__proto__"],
+    "the sweeper's enumeration has to see it too, or it reaps a DAG it reads as empty",
+  );
   assert.equal(
     await map.destroy("dag-p", "__proto__"), "W-proto",
     "and it has to be findable again when the sandbox is torn down",
@@ -126,9 +134,19 @@ test("a handle the row does not hold is absent, not inherited", async () => {
   const map = new DagHandleMap(memoryStore());
   await map.create("dag-q", "main", { workload_id: "W-1" });
 
+  // Each of these is a distinct way an inherited member could be mistaken for
+  // a handle. `__proto__` answers an object, `constructor` answers a function,
+  // and `toString` answers a function too -- read by shape rather than by
+  // ownership, the first is the dangerous one, because an object with no
+  // `workload_id` is exactly what a legacy entry check has to reject.
   assert.equal(await map.lookup("dag-q", "__proto__"), null);
   assert.equal(await map.lookup("dag-q", "constructor"), null);
+  assert.equal(await map.lookup("dag-q", "toString"), null);
   assert.equal(await map.destroy("dag-q", "constructor"), null);
+  assert.equal(
+    await map.destroy("dag-q", "__proto__"), null,
+    "and destroy must not claim to have removed something the row never held",
+  );
   assert.equal(
     (await map.lookup("dag-q", "main"))?.workload_id, "W-1",
     "and the real handle is untouched by any of that",

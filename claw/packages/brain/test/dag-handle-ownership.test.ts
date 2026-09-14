@@ -31,6 +31,7 @@
  *   H5 a row that moved under the write is re-read, not overwritten
  *   H6 an existing empty row is updated, not create-and-conflicted
  *   H7 the handle is registered while the workload is provisioning, not after
+ *   H8 Brain's own row writer stores a `__proto__` handle too
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -219,6 +220,39 @@ test("H5 a conflicting row is re-read rather than overwritten", async () => {
   );
 });
 
+test("H8 Brain's own writer stores a __proto__ handle, not only the map's", async () => {
+  // `replaceDagHandle` writes the row itself rather than going through
+  // `DagHandleMap`, so the protocol package's coverage says nothing about it:
+  // reverting this writer alone to a plain assignment left every test in both
+  // packages green. It is the writer every registration in Brain goes through.
+  let stored: Record<string, unknown> = {};
+  const enc = new TextEncoder();
+  const restore = bindDagHandleKvForTest({
+    async get() { return null; },
+    async create(_k: string, v: Uint8Array) {
+      stored = JSON.parse(new TextDecoder().decode(v)); return 1;
+    },
+    async update() { throw new Error("not reached"); },
+    async put() { throw new Error("unconditional put must not be used here"); },
+    async delete() {},
+    async keys() { return (async function* () {})(); },
+  } as never);
+  void enc;
+  try {
+    await replaceDagHandle("dag-8", "__proto__", { workload_id: "W-proto" });
+  } finally {
+    restore();
+  }
+
+  assert.deepEqual(
+    Object.keys(stored), ["__proto__"],
+    "a plain assignment here serialises the row as {} and reports success anyway",
+  );
+  assert.equal(
+    (stored as Record<string, { workload_id: string }>)["__proto__"]!.workload_id, "W-proto",
+  );
+});
+
 test("H6 an existing empty row is updated, not create-and-conflicted", async () => {
   // Two questions that come apart: "is there a row to build on" and "does the
   // key exist". An entry present with an empty value answers no to the first
@@ -276,8 +310,15 @@ test("H7 the handle is registered while the workload is provisioning, not after"
 
   assert.match(body, /await replaceDagHandle\(/,
     "the handle has to be recorded while the workload is provisioning");
-  assert.match(body, /pending_register_failed_rollback/,
-    "and a registration that cannot be written must roll the workload back");
-  assert.match(body, /getSafeWorkloadProvider\(\)\.stop\(/,
-    "rolled back by actually stopping it, not only by throwing");
+  // Ordered, not merely present. The hook already contained a `stop(` for the
+  // pending KV write's own rollback, so matching "a stop exists somewhere in
+  // the hook" passed with the new rollback deleted outright. What this needs
+  // is that THIS registration's failure is the one followed by a stop.
+  const failure = body.slice(body.indexOf("pending_register_failed_rollback"));
+  assert.notEqual(failure, "", "the early registration needs its own rollback log");
+  assert.match(
+    failure.slice(0, failure.indexOf("throw")),
+    /getSafeWorkloadProvider\(\)\.stop\(/,
+    "and that failure has to stop the workload before it rethrows, not just log it",
+  );
 });

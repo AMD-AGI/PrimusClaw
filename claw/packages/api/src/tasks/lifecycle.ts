@@ -449,6 +449,14 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );
-  await updateTask(taskId, { metadata: JSON.stringify({ ...(task.metadata ?? {}), retried_into: newId }) });
+  // Only the key this is setting. `updateTask` merges the patch into
+  // `metadata` at the top level, so spreading the whole row back in was never
+  // needed -- and it is actively destructive, because `task.metadata` is a
+  // snapshot read before the INSERT above. Anything written to the row in
+  // between is replaced by the older value it had at read time, and the
+  // sweeper writes exactly such a thing: an unreleased-handle record, whose
+  // loss turns a workload it could not stop into `nothing_held` for whoever
+  // asks next. A patch of one key cannot lose a sibling it never mentions.
+  await updateTask(taskId, { metadata: JSON.stringify({ retried_into: newId }) });
   return { ok: true, new_task_id: newId };
 }

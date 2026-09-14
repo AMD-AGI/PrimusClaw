@@ -41,7 +41,7 @@ import { lookupDagHandle, replaceDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
-import { registerSandbox } from "./keepalive.js";
+import { markHandsIdle, registerSandbox, unregisterSandbox } from "./keepalive.js";
 import type { SandboxEntry } from "./keepalive.js";
 import {
   parseHandsProbeValue,
@@ -635,6 +635,7 @@ async function clearIdleMarkers(
  * this name may already exist naming the workload this session used before.
  */
 async function registerReusedDagHandle(
+  kv: ReuseAttempt["kv"],
   request: ExecuteRequest,
   action: { kind: string; handle?: string },
   reused: EnsureHandsResult,
@@ -661,10 +662,36 @@ async function registerReusedDagHandle(
     // reports the DAG holds nothing and stops nothing, while the pod keeps its
     // GPU. Failing the turn is loud and retryable; succeeding quietly is how
     // the leak becomes invisible, which is the whole thing this work is about.
+    // Throwing alone leaves the adoption half-done. `acceptExistingSandbox`
+    // has already cleared the idle markers and registered keepalive, and the
+    // runner has not been handed the identity yet -- so nothing downstream can
+    // unwind either, `reapPendingHands` skips the READY entry, and the turn's
+    // own teardown answers `no_sandbox`. The sandbox stays active, owned by a
+    // session whose turn just failed, and unclaimed by any DAG.
+    //
+    // The adoption is therefore undone rather than abandoned: the sandbox goes
+    // back to idle, which is the state it was in a moment ago and the state
+    // the next turn expects to find it in. It is deliberately NOT stopped --
+    // this path did not create it, and another session's warm pod is not this
+    // turn's to destroy on the way out.
     logger.error(
-      { dagRoot, handle: action.handle, err: (e as Error).message },
+      { dagRoot, handle: action.handle, sessionId: identity.sessionId, err: (e as Error).message },
       "ensureHands.reused_handle_register_failed",
     );
+    const adoptedSession = identity.sessionId ?? request.session_id;
+    try {
+      // Stop the ticker this adoption started, then put the idle marker back:
+      // the two halves of what `acceptExistingSandbox` just did, undone in the
+      // reverse order so the entry is never active with nobody pinging it.
+      unregisterSandbox(adoptedSession, identity);
+      await markHandsIdle(kv, adoptedSession, identity);
+    } catch (undoErr) {
+      logger.error(
+        { dagRoot, handle: action.handle, sessionId: adoptedSession,
+          err: (undoErr as Error).message },
+        "ensureHands.reused_handle_undo_failed",
+      );
+    }
     throw e;
   }
 }
@@ -827,7 +854,7 @@ async function provisionHands(
       // only the creating task, sees that task terminal and tears the sandbox
       // down under the DAG now running on it. Ownership has to move with the
       // sandbox, and this is the moment it moves.
-      await registerReusedDagHandle(request, action, reused);
+      await registerReusedDagHandle(kv, request, action, reused);
       return reused;
     }
   }
