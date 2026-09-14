@@ -984,35 +984,21 @@ async function provisionHands(
   // / health. Rollback (stop) if the KV write fails so we never leak a workload.
   // Owned here so SafeWorkloadProvider stays KV-free.
   const onProvisioned = async (workloadId: string): Promise<void> => {
-    const pendingPayload = sc.encode(JSON.stringify({
-      status: "pending", workloadId, sandboxImage,
-      platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
-      createdAt: new Date().toISOString(),
-    }));
-    let ok = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try { await kv.put(`hands.${sessionId}`, pendingPayload); ok = true; break; }
-      catch (kvErr) {
-        logger.warn({ err: (kvErr as Error)?.message || String(kvErr), sessionId, workloadId, attempt }, "hands.kv.pending_put_retry");
-        if (attempt < 3) await sleep(200);
-      }
-    }
-    if (!ok) {
-      logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-      await getSafeWorkloadProvider().stop({
-        provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-        namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-      }).catch(() => {});
-      throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
-    }
-    logger.info({ sessionId, workloadId }, "hands.kv.pending");
-
-    // Phase (A) for the DAG handle too, and for the same reason the hands
-    // entry is written here rather than after bootstrap: the workload exists
-    // from this moment, and everything between here and the registration at
+    // Phase (A) for the DAG handle, written BEFORE the session entry below.
+    //
+    // Both records are made in this hook for the same reason: the workload
+    // exists from this moment, and everything between here and the registration at
     // the end of this function -- poll, bootstrap, health -- is time in which
     // a cancel can arrive. It found no handle, concluded the DAG held nothing,
     // and reported exactly that while the workload it missed kept its GPU.
+    //
+    // Their ORDER matters because only one of them is what a cancel reads.
+    // Backend decides whether a DAG holds a sandbox from the handle map, so
+    // every instant in which the session entry exists and the handle does not
+    // is an instant a cancel answers `nothing_held` over a live workload.
+    // This way round, the worst it sees is a handle whose session entry has
+    // not landed yet -- which errs towards reporting a workload that is
+    // there, the direction this whole change exists to err in.
     //
     // What is known now is what teardown needs: the id, the key to stop it
     // with, and the namespace to poll. `hands_url` and `token` are not known
@@ -1046,6 +1032,30 @@ async function provisionHands(
         throw new Error(`DAG handle registration failed for workload ${workloadId}, rolled back`);
       }
     }
+
+    const pendingPayload = sc.encode(JSON.stringify({
+      status: "pending", workloadId, sandboxImage,
+      platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
+      createdAt: new Date().toISOString(),
+    }));
+    let ok = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { await kv.put(`hands.${sessionId}`, pendingPayload); ok = true; break; }
+      catch (kvErr) {
+        logger.warn({ err: (kvErr as Error)?.message || String(kvErr), sessionId, workloadId, attempt }, "hands.kv.pending_put_retry");
+        if (attempt < 3) await sleep(200);
+      }
+    }
+    if (!ok) {
+      logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
+      await getSafeWorkloadProvider().stop({
+        provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+        namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
+      }).catch(() => {});
+      throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
+    }
+    logger.info({ sessionId, workloadId }, "hands.kv.pending");
+
   };
 
   logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
