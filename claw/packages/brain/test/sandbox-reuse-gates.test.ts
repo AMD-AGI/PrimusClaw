@@ -547,11 +547,18 @@ test("the SaFE handle records the namespace keepalive will poll", () => {
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
     "utf-8",
   );
-  const from = src.indexOf("await registerDagHandle(dagRoot, action.handle, {");
-  const call = src.slice(from, src.indexOf("});", from) + 3);
-  assert.doesNotMatch(call, /provider:\s*"agent-sandbox"/,
-    "the first register is the SaFE path, not the kubernetes one");
-  assert.match(call, /namespace:\s*nsForSandbox/,
+  // Selected by what the call IS, not by where it sits. There are three
+  // registrations now -- SaFE create, agent-sandbox create, and the reuse
+  // adoption -- and this test wants the first of those; picking "the first
+  // occurrence" silently retargeted it at the reuse call when that was added.
+  const calls = [...src.matchAll(/await replaceDagHandle\(dagRoot, action\.handle, \{/g)]
+    .map((m) => src.slice(m.index!, src.indexOf("});", m.index!) + 3));
+  const call = calls.find((c) => /workload_id:\s*workloadId\b/.test(c));
+
+  assert.ok(call, "no SaFE registration found -- has it been renamed or reshaped?");
+  assert.doesNotMatch(call!, /provider:\s*"agent-sandbox"/,
+    "this is the SaFE path, not the kubernetes one");
+  assert.match(call!, /namespace:\s*nsForSandbox/,
     "keepalive has to poll the namespace the request named");
 });
 

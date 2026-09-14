@@ -37,7 +37,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { lookupDagHandle, registerDagHandle } from "./handles.js";
+import { lookupDagHandle, replaceDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -620,6 +620,49 @@ async function clearIdleMarkers(
   }
 }
 
+
+/**
+ * Record that this DAG now holds the sandbox it just took over.
+ *
+ * Best-effort in the same sense the create path's registration is: a DAG can
+ * still run without the entry, just without reuse downstream and without
+ * Backend being able to tear it down by handle. It is emphatically not
+ * best-effort in what it means -- an unregistered reuse is a sandbox nothing
+ * owns on paper, which is how a live pod gets reaped and how a cancel reports
+ * that it released everything it could see.
+ *
+ * `replace` rather than `create`, because the whole point is that a handle of
+ * this name may already exist naming the workload this session used before.
+ */
+async function registerReusedDagHandle(
+  request: ExecuteRequest,
+  action: { kind: string; handle?: string },
+  reused: EnsureHandsResult,
+): Promise<void> {
+  const dagRoot = request.dag_root_task_id ?? request.task_id;
+  if (!dagRoot || !action.handle) return;
+  const identity = reused.identity;
+  if (!identity) return;
+  try {
+    await replaceDagHandle(dagRoot, action.handle, {
+      workload_id: identity.workloadId ?? "",
+      hands_url: reused.handsUrl,
+      token: reused.token,
+      platform_key: identity.platformKey ?? "",
+      provider: identity.provider,
+      sandbox_name: identity.sandboxName,
+      namespace: identity.namespace,
+      session_id: identity.sessionId,
+      user_id: identity.userId,
+    });
+  } catch (e) {
+    logger.warn(
+      { dagRoot, handle: action.handle, err: (e as Error).message },
+      "ensureHands.reused_handle_register_failed",
+    );
+  }
+}
+
 /** Keepalive and idle-marker bookkeeping shared by both paths that reuse. */
 async function acceptExistingSandbox(
   kv: ReuseAttempt["kv"],
@@ -766,7 +809,21 @@ async function provisionHands(
       kv, sessionId, request, multiNodeContext, requestedSpec, onEvent,
       signal: options.signal,
     });
-    if (reused) return reused;
+    if (reused) {
+      // A sandbox taken by reuse is held just as firmly as one that was
+      // created, and until now only the created case was ever registered: this
+      // path returned early, so the DAG that reused a warm pod owned it while
+      // the handle map still named whichever task created it.
+      //
+      // Two consequences, both reachable without any race. Backend's teardown
+      // for this DAG finds an empty map and reports it holds nothing, so a
+      // cancel stops nothing and says so confidently. And the sweeper, reading
+      // only the creating task, sees that task terminal and tears the sandbox
+      // down under the DAG now running on it. Ownership has to move with the
+      // sandbox, and this is the moment it moves.
+      await registerReusedDagHandle(request, action, reused);
+      return reused;
+    }
   }
 
   // kubernetes/BYOK: the selected LLM key is injected into the sandbox; safe
@@ -1058,9 +1115,16 @@ async function provisionHands(
   // and connect directly to this workload. Failures are non-fatal -- the DAG
   // can still complete with sandbox-per-node semantics, just without reuse.
   const dagRoot = request.dag_root_task_id ?? request.task_id;
+  // `replace`, not `create`. A create refuses a name that already maps
+  // elsewhere -- correct against a double-create, wrong here, because this IS
+  // the moment a handle legitimately changes hands: a rebuild has just stopped
+  // the previous workload and this is its replacement. Rejected and swallowed,
+  // as it was, the map goes on naming a workload that is gone while the new
+  // one runs unreferenced, so a later cancel stops the corpse, hears 404 or
+  // 200, and reports the sandbox released.
   if (dagRoot && action.kind === "create" && action.handle) {
     try {
-      await registerDagHandle(dagRoot, action.handle, {
+      await replaceDagHandle(dagRoot, action.handle, {
         workload_id: workloadId,
         hands_url: handsUrl,
         token: handsToken,
@@ -1282,9 +1346,13 @@ async function ensureHandsAgentSandbox(
     // so carry the provider + agent-sandbox identity for the use path. Failures
     // are non-fatal -- the DAG falls back to sandbox-per-node semantics.
     const dagRoot = request.dag_root_task_id ?? request.task_id;
+    // `replace` for the same reason as the SaFE path above: a rebuilt
+    // agent-sandbox is a new instance under the same handle name, and a create
+    // that refuses it leaves the map naming the instance that was just torn
+    // down.
     if (dagRoot && action.handle) {
       try {
-        await registerDagHandle(dagRoot, action.handle, {
+        await replaceDagHandle(dagRoot, action.handle, {
           workload_id: "",
           provider: "agent-sandbox",
           session_id: inst.id,

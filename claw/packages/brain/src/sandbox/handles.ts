@@ -7,7 +7,7 @@
  * Two callers:
  *
  *   - sandbox.create with `handle`: after a successful SaFE workload create,
- *     `registerDagHandle(...)` writes the handle info so downstream DAG
+ *     `replaceDagHandle(...)` writes the handle info so downstream DAG
  *     nodes can `sandbox.use` it.
  *   - sandbox.use: `lookupDagHandle(...)` returns the cached HandleInfo so
  *     Brain can short-circuit ensureHands and immediately build a
@@ -94,24 +94,52 @@ export async function lookupDagHandle(
   return await getMap().lookup(dagRootTaskId, handleName);
 }
 
-export async function registerDagHandle(
+/**
+ * Point an existing handle at a different workload, or create it if absent.
+ *
+ * This replaced a `registerDagHandle` that wrapped `create` directly. That one
+ * is gone rather than kept beside this: it had no callers left, and leaving a
+ * "refuse if the name exists" primitive next to a "take the name over" one is
+ * leaving the exact footgun that produced the bug -- three call sites reached
+ * for the stricter of the two, had the rejection swallowed, and ran live
+ * sandboxes the map did not name.
+ *
+ * `create` deliberately refuses to overwrite a name that already maps
+ * elsewhere, so that a mistaken double-create cannot silently lose a
+ * reference. That guard is right for a fresh registration and wrong for the
+ * two moments a handle legitimately changes hands:
+ *
+ *   - a rebuild, where the old workload has already been stopped and the same
+ *     handle must now name its replacement;
+ *   - a session reuse, where a DAG takes over a warm sandbox another task
+ *     created.
+ *
+ * Before this existed both went through `create`, were rejected, and had the
+ * rejection swallowed at the call site -- leaving the map naming a workload
+ * that is gone (rebuild) or absent entirely (reuse), while a live sandbox ran
+ * unreferenced. Backend then stopped the wrong thing, or nothing, and reported
+ * success either way.
+ *
+ * The previous entry is destroyed first so the write is a replacement rather
+ * than an overwrite `create` would refuse, and the old workload id is logged
+ * because it is the one identifier that otherwise disappears at exactly the
+ * moment somebody may need to go looking for it.
+ *
+ * Stopping the old workload is NOT this function's job and must not become it:
+ * the rebuild path has already stopped it, and the reuse path must not stop a
+ * sandbox it is adopting. This moves the name; it does not free anything.
+ */
+export async function replaceDagHandle(
   dagRootTaskId: string,
   handleName: string,
   info: HandleInfo,
 ): Promise<void> {
-  try {
-    await getMap().create(dagRootTaskId, handleName, info);
-    logger.info(
-      { dagRootTaskId, handleName, workloadId: info.workload_id },
-      "dag-handles.registered",
-    );
-  } catch (e) {
-    logger.warn(
-      { dagRootTaskId, handleName, err: (e as Error).message },
-      "dag-handles.register_failed",
-    );
-    throw e;
-  }
+  const previous = await getMap().destroy(dagRootTaskId, handleName);
+  await getMap().create(dagRootTaskId, handleName, info);
+  logger.info(
+    { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
+    "dag-handles.replaced",
+  );
 }
 
 /**
