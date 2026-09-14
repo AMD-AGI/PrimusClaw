@@ -278,6 +278,31 @@ export async function cancelTask(
         + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
       params: [task.task_id],
     });
+    // A DAG that was already terminal is not cancelled again, and its
+    // sandboxes are not this call's to tear down.
+    //
+    // The sequence that makes this load-bearing is entirely sequential. D1
+    // finishes without its `agent_done` teardown firing -- the topological last
+    // user deferred to a live sibling, and the sibling that finished last was
+    // not the last user -- so the scheduler marks D1 completed with its handle
+    // still registered. D2 then reuses the warm sandbox and registers its own
+    // reference to the same workload. A second cancel of D1 matched no rows,
+    // yet went on to stop that workload: it killed D2 and answered
+    // `cancelled: 0, released: "confirmed"`, which is both halves wrong at
+    // once.
+    //
+    // A workload two DAGs share is the wider problem here and is not solved by
+    // this guard -- cancelling D1 *while it runs* still stops a sandbox D2 may
+    // have adopted. What this closes is the case that needs no race and no
+    // running DAG: re-cancelling something already finished. The sweeper owns
+    // whatever a terminal DAG did leave behind, under its own session guard.
+    if (rows.length === 0) {
+      logger.info(
+        { taskId: task.task_id, status: task.status },
+        "task.cancel.already_terminal_no_teardown",
+      );
+      return { ok: true, cancelled: 0, interrupt_key: task.task_id };
+    }
     // The verdict above is already written and stays written. `released` only
     // reports what the cleanup that follows established; a failed release must
     // never turn a successful cancellation into a failure, because the sweeper

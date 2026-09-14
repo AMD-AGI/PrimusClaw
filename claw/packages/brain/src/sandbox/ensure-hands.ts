@@ -1148,10 +1148,26 @@ async function provisionHands(
       // that a cancel reports as `nothing_held` and never stops. Losing reuse
       // is a cost; losing the ability to account for a GPU is not one to take
       // silently.
+      //
+      // Throwing is not enough on its own: the workload is already created and
+      // its `hands.<session>` entry is already READY, and the failure cleanup
+      // above this only reaps PENDING entries. So the turn would fail while the
+      // GPU stayed allocated and unreferenced -- a leak with nothing left
+      // pointing at it. The workload is torn down here for the same reason, and
+      // in the same shape, as the rollback the pending KV write already does.
       logger.error(
-        { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
-        "ensureHands.handle_register_failed",
+        { sessionId, dagRoot, handle: action.handle, workloadId, err: (e as Error).message },
+        "ensureHands.handle_register_failed_rollback",
       );
+      await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+        // The one outcome worse than the failure being handled: the record says
+        // nothing holds this workload and the workload is still there. It is
+        // logged with the id because that is all anybody will have to find it.
+        logger.error(
+          { sessionId, workloadId, err: (cleanupErr as Error).message },
+          "ensureHands.handle_register_rollback_failed",
+        );
+      });
       throw e;
     }
   }
@@ -1377,12 +1393,21 @@ async function ensureHandsAgentSandbox(
           image: workloadImage,
         });
       } catch (e) {
-        // Same reasoning as the SaFE path: the registration is the record that
-        // makes the sandbox accountable, not an optimisation.
+        // Same reasoning as the SaFE path, rollback included: the sandbox is
+        // created and registered for keepalive by now, so failing the turn
+        // without tearing it down leaves an allocated sandbox nothing refers
+        // to.
         logger.error(
-          { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
-          "ensureHands.agent.handle_register_failed",
+          { sessionId, dagRoot, handle: action.handle, sandboxName: inst.sandboxName,
+            err: (e as Error).message },
+          "ensureHands.agent.handle_register_failed_rollback",
         );
+        await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+          logger.error(
+            { sessionId, sandboxName: inst.sandboxName, err: (cleanupErr as Error).message },
+            "ensureHands.agent.handle_register_rollback_failed",
+          );
+        });
         throw e;
       }
     }

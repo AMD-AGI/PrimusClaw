@@ -19,7 +19,9 @@
  */
 import type { JetStreamClient, KV } from "nats";
 import { StringCodec } from "nats";
-import { DagHandleMap, HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
+import {
+  DagHandleMap, HANDLE_MAP_PREFIX, getHandleEntry, setHandleEntry, type HandleInfo,
+} from "@claw/protocol";
 import { natsKvStore, type NatsLikeKv } from "@claw/utils";
 import { DAG_HANDLES_REPLICAS } from "../config.js";
 import pino from "pino";
@@ -160,12 +162,19 @@ export async function replaceDagHandle(
       }
       row = parsed as Record<string, unknown>;
     }
-    const previous = (row[handleName] as { workload_id?: string } | undefined)?.workload_id;
+    const previous = (getHandleEntry(row, handleName) as { workload_id?: string } | undefined)
+      ?.workload_id;
     // One write that sets the key, never a delete followed by a create: an
     // absent handle is how Backend decides a DAG holds no sandbox, so a
     // replacement must not look, even for an instant, like never having had
     // one.
-    row[handleName] = { ...info, created_at: info.created_at ?? new Date().toISOString() };
+    // Not `row[handleName] = ...`: a handle named `__proto__` would hit the
+    // prototype setter, and the row would serialise as `{}` -- a registration
+    // that reports success and stores nothing, which Backend reads as a DAG
+    // holding no sandbox.
+    setHandleEntry(row, handleName, {
+      ...info, created_at: info.created_at ?? new Date().toISOString(),
+    });
 
     try {
       const payload = enc.encode(JSON.stringify(row));

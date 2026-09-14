@@ -45,6 +45,39 @@ function keyOf(dagRootTaskId: string): string {
   return `${HANDLE_MAP_PREFIX}.${dagRootTaskId}`;
 }
 
+/**
+ * Write `name` onto a handle row without going through a prototype setter.
+ *
+ * `row[name] = info` looks total and is not: a handle legitimately named
+ * `__proto__` hits `Object.prototype`'s setter, so the assignment sets the
+ * row's prototype instead of adding a key and the row serialises as `{}`.
+ * Admission accepts that name, so a DAG can declare it -- and the result is a
+ * registration that reports success while storing nothing, which Backend then
+ * reads as a DAG holding no sandbox. `defineProperty` stores it as an own
+ * property, which is also what `JSON.parse` produces when reading it back.
+ */
+export function setHandleEntry(
+  row: Record<string, unknown>,
+  name: string,
+  info: HandleInfo,
+): void {
+  Object.defineProperty(row, name, {
+    value: info, enumerable: true, writable: true, configurable: true,
+  });
+}
+
+/**
+ * Read one handle off a row, by own property only.
+ *
+ * The mirror of the write above: `row["__proto__"]` on a row that has no such
+ * key answers `Object.prototype`, and `row["constructor"]` answers a function
+ * -- neither is a handle, and both would be judged by shape rather than by
+ * whether the row actually holds them.
+ */
+export function getHandleEntry(row: Record<string, unknown>, name: string): unknown {
+  return Object.prototype.hasOwnProperty.call(row, name) ? row[name] : undefined;
+}
+
 function isHandleInfo(v: unknown): v is HandleInfo {
   return !!v && typeof v === "object" && typeof (v as { workload_id?: unknown }).workload_id === "string";
 }
@@ -73,12 +106,12 @@ export class DagHandleMap {
   ): Promise<void> {
     const k = keyOf(dagRootTaskId);
     const existing = (await this.kv.get(k)) ?? {};
-    const prev = coerceToHandleInfo(existing[handleName]);
+    const prev = coerceToHandleInfo(getHandleEntry(existing, handleName));
     if (prev) {
       if (prev.workload_id === info.workload_id) {
         // Same workload -- merge in any newly known fields so a subsequent
         // sandbox.use sees the freshest hands_url / token.
-        existing[handleName] = { ...prev, ...info };
+        setHandleEntry(existing, handleName, { ...prev, ...info });
         await this.kv.put(k, existing);
         return;
       }
@@ -86,7 +119,9 @@ export class DagHandleMap {
         `handle '${handleName}' for dag ${dagRootTaskId} already maps to ${prev.workload_id}, refusing to overwrite with ${info.workload_id}`,
       );
     }
-    existing[handleName] = { ...info, created_at: info.created_at ?? new Date().toISOString() };
+    setHandleEntry(existing, handleName, {
+      ...info, created_at: info.created_at ?? new Date().toISOString(),
+    });
     await this.kv.put(k, existing);
   }
 
@@ -94,7 +129,7 @@ export class DagHandleMap {
   async lookup(dagRootTaskId: string, handleName: string): Promise<HandleInfo | null> {
     const entry = await this.kv.get(keyOf(dagRootTaskId));
     if (!entry) return null;
-    return coerceToHandleInfo(entry[handleName]);
+    return coerceToHandleInfo(getHandleEntry(entry, handleName));
   }
 
   /**
@@ -127,8 +162,10 @@ export class DagHandleMap {
   ): Promise<string | null> {
     const k = keyOf(dagRootTaskId);
     const existing = (await this.kv.get(k)) ?? {};
-    const prev = coerceToHandleInfo(existing[handleName]);
-    existing[handleName] = { ...info, created_at: info.created_at ?? new Date().toISOString() };
+    const prev = coerceToHandleInfo(getHandleEntry(existing, handleName));
+    setHandleEntry(existing, handleName, {
+      ...info, created_at: info.created_at ?? new Date().toISOString(),
+    });
     await this.kv.put(k, existing);
     return prev?.workload_id ?? null;
   }
@@ -143,7 +180,7 @@ export class DagHandleMap {
   async destroy(dagRootTaskId: string, handleName: string): Promise<string | null> {
     const k = keyOf(dagRootTaskId);
     const existing = (await this.kv.get(k)) ?? {};
-    const prev = coerceToHandleInfo(existing[handleName]);
+    const prev = coerceToHandleInfo(getHandleEntry(existing, handleName));
     if (!prev) return null;
     delete existing[handleName];
     if (Object.keys(existing).length === 0) {
@@ -161,7 +198,11 @@ export class DagHandleMap {
     const out: Record<string, HandleInfo> = {};
     for (const [name, raw] of Object.entries(entry)) {
       const info = coerceToHandleInfo(raw);
-      if (info) out[name] = info;
+      // Same reason the row itself is written this way: a handle named
+      // `__proto__` assigned onto the OUTPUT object vanishes just as
+      // completely, and this is the enumeration teardown walks -- so the
+      // stored entry would be correct and the DAG would still look empty.
+      if (info) setHandleEntry(out, name, info);
     }
     return out;
   }
@@ -180,7 +221,7 @@ export class DagHandleMap {
       const map: Record<string, HandleInfo> = {};
       for (const [name, v] of Object.entries(entry)) {
         const info = coerceToHandleInfo(v);
-        if (info) map[name] = info;
+        if (info) setHandleEntry(map, name, info);
       }
       return [dagId, map] as [string, Record<string, HandleInfo>];
     });

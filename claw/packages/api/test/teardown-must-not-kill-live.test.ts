@@ -22,6 +22,7 @@
  *   L3 a handle is not torn down while a sibling node is still running
  *   L4 and is torn down once the siblings are terminal
  *   L5 a sandbox the NEXT task in the session is reusing is not reaped
+ *   L6 re-cancelling a finished DAG does not stop what a newer DAG reuses
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -31,6 +32,7 @@ process.env.SAFE_API_URL = "http://safe.test";
 const { db } = await import("../src/infra/db.js");
 const { handleRegistry, unreleasedRecord } = await import("../src/tasks/sandbox-stopper.js");
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
+const { cancelTask } = await import("../src/tasks/lifecycle.js");
 const { applyAgentDone } = await import("../src/tasks/lifecycle.js");
 
 const originalQuery = db.query;
@@ -233,5 +235,46 @@ test("L5 a sandbox the next task in the session is reusing is not reaped", async
   assert.deepEqual(
     stopped, [],
     "the workload belongs to the session while the session still has live work",
+  );
+});
+
+test("L6 re-cancelling a finished DAG does not stop what a newer DAG reuses", async () => {
+  // Entirely sequential, and every step is ordinary. D1 finishes without its
+  // `agent_done` teardown firing -- the topological last user deferred to a
+  // live sibling, and the sibling that finished last was not the last user --
+  // so D1 is marked completed with its handle still registered. D2 then reuses
+  // the warm sandbox and registers its own reference to the same workload.
+  //
+  // A second cancel of D1 matched no rows and went on to tear that workload
+  // down anyway: it killed D2, and answered `cancelled: 0, released:
+  // "confirmed"` -- both halves wrong at once, and the `confirmed` is the
+  // worse one, because it says the thing it just broke was cleanly released.
+  handleFor("t-d1");
+  db.query = (async (text: string) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
+      return {
+        rows: [{
+          task_id: "t-d1", session_id: "s-1", status: "completed",
+          dag_node_id: "__dag_root__", dag_root_task_id: "t-d1",
+        }],
+        rowCount: 1,
+      };
+    }
+    // Already terminal: the cancelling UPDATE matches nothing.
+    if (sql.startsWith("UPDATE claw_tasks SET status")) return { rows: [], rowCount: 0 };
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+
+  const r = await cancelTask("t-d1");
+
+  assert.deepEqual(
+    stopped, [],
+    "a DAG that already finished has no sandboxes of its own left to stop",
+  );
+  assert.equal(r.cancelled, 0);
+  assert.equal(
+    "released" in r, false,
+    "and it must not claim a release it did not perform -- `confirmed` here named a workload it had just killed",
   );
 });

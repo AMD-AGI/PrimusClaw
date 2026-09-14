@@ -89,3 +89,48 @@ test("replace creates the handle when the name is free", async () => {
     "nothing was there, and the caller is told so rather than guessing");
   assert.equal((await map.lookup("dag-2", "main"))?.workload_id, "W-1");
 });
+
+test("a handle named __proto__ is stored, not silently swallowed", async () => {
+  // `row[name] = info` looks total and is not. `__proto__` hits
+  // `Object.prototype`'s setter, so the assignment sets the row's prototype
+  // instead of adding a key and the row serialises as `{}` -- a registration
+  // that reports success while storing nothing, which Backend then reads as a
+  // DAG holding no sandbox and answers `nothing_held` for a live workload.
+  //
+  // Admission accepts the name, so this is reachable by writing a DAG, not
+  // only by an attacker. Reuse does not go through the workload-label
+  // validation the create path has.
+  const map = new DagHandleMap(memoryStore());
+
+  await map.create("dag-p", "__proto__", { workload_id: "W-proto" });
+
+  assert.equal(
+    (await map.lookup("dag-p", "__proto__"))?.workload_id, "W-proto",
+    "the handle has to come back, or a live sandbox has no reference at all",
+  );
+  assert.deepEqual(
+    Object.keys(await map.listForDag("dag-p")), ["__proto__"],
+    "and it has to be a real own key, which is what teardown enumerates",
+  );
+  assert.equal(
+    await map.destroy("dag-p", "__proto__"), "W-proto",
+    "and it has to be findable again when the sandbox is torn down",
+  );
+});
+
+test("a handle the row does not hold is absent, not inherited", async () => {
+  // The mirror of the write: `row["__proto__"]` on a row without that key
+  // answers `Object.prototype`, and `row["constructor"]` answers a function.
+  // Judged by shape rather than by ownership, either could be mistaken for an
+  // entry -- or, worse, `destroy` could report having removed one.
+  const map = new DagHandleMap(memoryStore());
+  await map.create("dag-q", "main", { workload_id: "W-1" });
+
+  assert.equal(await map.lookup("dag-q", "__proto__"), null);
+  assert.equal(await map.lookup("dag-q", "constructor"), null);
+  assert.equal(await map.destroy("dag-q", "constructor"), null);
+  assert.equal(
+    (await map.lookup("dag-q", "main"))?.workload_id, "W-1",
+    "and the real handle is untouched by any of that",
+  );
+});
