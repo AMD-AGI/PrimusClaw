@@ -120,8 +120,12 @@ export async function lookupDagHandle(
  * unreferenced. Backend then stopped the wrong thing, or nothing, and reported
  * success either way.
  *
- * The previous entry is destroyed first so the write is a replacement rather
- * than an overwrite `create` would refuse, and the old workload id is logged
+ * The replacement is a single write -- see `DagHandleMap.replace`. Spelling it
+ * as destroy-then-create would open a window in which the handle resolves to
+ * nothing, and an absent handle is precisely how Backend's teardown decides a
+ * DAG holds no sandbox: a cancel landing in that window would answer "nothing
+ * held" for a running workload, which is the failure this whole change exists
+ * to remove. The old workload id comes back from the write and is logged,
  * because it is the one identifier that otherwise disappears at exactly the
  * moment somebody may need to go looking for it.
  *
@@ -134,8 +138,7 @@ export async function replaceDagHandle(
   handleName: string,
   info: HandleInfo,
 ): Promise<void> {
-  const previous = await getMap().destroy(dagRootTaskId, handleName);
-  await getMap().create(dagRootTaskId, handleName, info);
+  const previous = await getMap().replace(dagRootTaskId, handleName, info);
   logger.info(
     { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
     "dag-handles.replaced",

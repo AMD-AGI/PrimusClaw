@@ -98,6 +98,42 @@ export class DagHandleMap {
   }
 
   /**
+   * Point `handleName` at `info`, whether or not it already names something
+   * else, and return the workload id it named before.
+   *
+   * `create` refuses a name that already maps elsewhere so a mistaken
+   * double-create cannot silently lose a reference. That is the wrong answer
+   * at the two moments a handle legitimately changes hands -- a rebuild, where
+   * the previous workload has already been stopped, and a session reuse, where
+   * a DAG adopts a sandbox another task created. Both were going through
+   * `create`, being rejected, and having the rejection swallowed, which left
+   * the map naming a stopped workload or nothing at all while a live sandbox
+   * ran unreferenced.
+   *
+   * **One write, so the handle is never absent.** The obvious spelling --
+   * destroy then create -- opens a window in which the name resolves to
+   * nothing, and Backend's teardown reads exactly that: an absent handle is
+   * how it decides a DAG holds no sandbox, so a cancel landing in the window
+   * answers "nothing held" for a workload that is running. Replacing a name
+   * must never look, even briefly, like never having had one.
+   *
+   * It moves the name and frees nothing: stopping the workload that was there
+   * is the caller's business, and for reuse there is nothing to stop.
+   */
+  async replace(
+    dagRootTaskId: string,
+    handleName: string,
+    info: HandleInfo,
+  ): Promise<string | null> {
+    const k = keyOf(dagRootTaskId);
+    const existing = (await this.kv.get(k)) ?? {};
+    const prev = coerceToHandleInfo(existing[handleName]);
+    existing[handleName] = { ...info, created_at: info.created_at ?? new Date().toISOString() };
+    await this.kv.put(k, existing);
+    return prev?.workload_id ?? null;
+  }
+
+  /**
    * Remove the handle and return the workload id Backend should issue
    * `SaFE workload stop` for; null when the handle was already gone.
    *
