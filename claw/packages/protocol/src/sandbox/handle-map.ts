@@ -30,24 +30,6 @@ export const HANDLE_MAP_PREFIX = "dag-handles";
  */
 export interface HandleInfo {
   workload_id: string;
-  /**
-   * Workloads this handle named before, and which nothing has confirmed the
-   * release of.
-   *
-   * A handle name is reused: a rebuild replaces its workload, and so does a
-   * redelivery that finds the session's warm entry expired while the DAG's own
-   * handle -- which has no TTL -- is still there naming a workload that is
-   * still running. Overwriting the name in that second case drops the only
-   * reference to a live sandbox, and the teardown then stops the replacement,
-   * sees it go, and reports the DAG released.
-   *
-   * So the displaced id is carried here instead of being discarded, and
-   * teardown stops these as well as `workload_id`. A workload already stopped
-   * answers 404, which is a confirmed release -- so carrying an id that did
-   * not need carrying costs one request, while dropping one that did costs a
-   * GPU nobody is looking for.
-   */
-  superseded_workload_ids?: string[];
   hands_url?: string;
   token?: string;
   platform_key?: string;

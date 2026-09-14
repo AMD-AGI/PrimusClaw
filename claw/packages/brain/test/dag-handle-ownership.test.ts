@@ -24,7 +24,7 @@
  * `replaceDagHandle` exists.
  *
  * Coverage:
- *   H1 replace takes over a name that maps to a different workload
+ *   H1 a rebuild takes the name once the old workload is released
  *   H2 replace creates the entry when the name is free
  *   H3 replace leaves other handles of the same DAG alone
  *   H4 a registration that cannot be written fails the turn
@@ -32,8 +32,9 @@
  *   H6 an existing empty row is updated, not create-and-conflicted
  *   H7 the handle is registered while the workload is provisioning, not after
  *   H8 Brain's own row writer stores a `__proto__` handle too
- *   H9 a displaced workload is carried forward, not dropped
- *   H10 carrying is bounded, and never carries the workload being written
+ *   H9 a handle is not taken from a workload still on record
+ *   H10 re-registering the same workload is allowed, and enriches it
+ *   H11 releasing a handle frees the name, and only for the workload named
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -46,6 +47,7 @@ import {
   bindDagHandleKvForTest,
   initDagHandles,
   lookupDagHandle,
+  releaseDagHandle,
   replaceDagHandle,
 } from "../src/sandbox/handles.js";
 
@@ -104,16 +106,18 @@ before(async () => {
   bindDagHandleKvForTest(store.kv as never);
 });
 
-test("H1 replace takes over a name that maps to a different workload", async () => {
-  // Exactly what `create` refuses. A rebuild has already stopped W-old, so the
-  // refusal protects a reference that is dead while the live one goes
-  // unrecorded -- the worst of both.
+test("H1 a rebuild takes the name once the old workload is released", async () => {
+  // The sequence a rebuild really performs: stop the old sandbox, free its
+  // handle, then register the replacement. Taking the name without the middle
+  // step is what H9 forbids, and it is forbidden because the map is the only
+  // reference to a workload nobody stopped.
   await replaceDagHandle("dag-1", "main", { workload_id: "W-old" });
+  await releaseDagHandle("dag-1", "main", "W-old");
   await replaceDagHandle("dag-1", "main", { workload_id: "W-new" });
 
   assert.equal(
     (await lookupDagHandle("dag-1", "main"))?.workload_id, "W-new",
-    "the handle has to name the sandbox that exists, not the one that was stopped",
+    "the handle names the sandbox that exists, not the one that was stopped",
   );
 });
 
@@ -132,6 +136,7 @@ test("H3 replace leaves other handles of the same DAG alone", async () => {
   await replaceDagHandle("dag-3", "train", { workload_id: "W-train" });
   await replaceDagHandle("dag-3", "eval", { workload_id: "W-eval" });
 
+  await releaseDagHandle("dag-3", "train", "W-train");
   await replaceDagHandle("dag-3", "train", { workload_id: "W-train-2" });
 
   assert.equal((await lookupDagHandle("dag-3", "train"))?.workload_id, "W-train-2");
@@ -326,43 +331,57 @@ test("H7 the handle is registered while the workload is provisioning, not after"
   );
 });
 
-test("H9 a displaced workload is carried forward, not dropped", async () => {
-  // `create` refused to overwrite a name that already mapped elsewhere exactly
-  // so a reference could not be lost. Replacing that refusal with an
-  // unconditional write reintroduced the loss by another door: a redelivery
-  // whose `hands.<session>` entry has expired -- BRAIN_REGISTRY has a TTL,
-  // DAG_HANDLES does not -- finds this handle still naming a workload that is
-  // still running, and takes the name for its replacement. Teardown then stops
-  // the replacement, sees it go, and reports the DAG released while the
-  // original keeps its GPU.
+test("H9 a handle is not taken from a workload still on record", async () => {
+  // `create` refused this, and replacing that refusal with an unconditional
+  // write is what let a redelivery overwrite the only reference to a running
+  // workload: `hands.<session>` expires with BRAIN_REGISTRY's TTL while this
+  // handle, in a bucket with no TTL, keeps naming it. The turn fails instead,
+  // and the map goes on naming the workload -- which is what keeps it
+  // findable.
+  //
+  // A round was spent on the alternative -- carry the displaced id forward and
+  // stop it at teardown -- and it grew five ways to lose that id. Refusing has
+  // no state to lose.
   await replaceDagHandle("dag-9", "main", { workload_id: "W-live" });
-  await replaceDagHandle("dag-9", "main", { workload_id: "W-new" });
 
-  const held = await lookupDagHandle("dag-9", "main");
-  assert.equal(held?.workload_id, "W-new", "the name points at the replacement");
-  assert.deepEqual(
-    held?.superseded_workload_ids, ["W-live"],
-    "and the workload it was taken from keeps a reference, or nothing ever stops it",
+  await assert.rejects(
+    () => replaceDagHandle("dag-9", "main", { workload_id: "W-new" }),
+    /still names W-live/,
+  );
+  assert.equal(
+    (await lookupDagHandle("dag-9", "main"))?.workload_id, "W-live",
+    "and the name still points at the workload nobody released",
   );
 });
 
-test("H10 carrying is bounded, and never carries the workload being written", async () => {
-  // Evidence, not a log: a handle that churns must not grow the row without
-  // limit. And re-registering the SAME workload -- which `create` treats as an
-  // idempotent retry -- must not file it against itself as displaced.
+test("H10 re-registering the same workload is allowed, and enriches it", async () => {
+  // The refusal must not block the ordinary case it sits next to: the early
+  // provisioning write and the final one name the SAME workload, and the
+  // second adds the connection fields.
   await replaceDagHandle("dag-10", "main", { workload_id: "W-1" });
-  await replaceDagHandle("dag-10", "main", { workload_id: "W-1" });
+  await replaceDagHandle("dag-10", "main", { workload_id: "W-1", hands_url: "http://h" });
 
+  const held = await lookupDagHandle("dag-10", "main");
+  assert.equal(held?.workload_id, "W-1");
+  assert.equal(held?.hands_url, "http://h", "the second write enriches rather than being refused");
+});
+
+test("H11 releasing a handle frees the name, and only for the workload named", async () => {
+  // The other half of the refusal: whoever stops a workload frees its handle,
+  // which is why an ordinary rebuild never meets the refusal above.
+  await replaceDagHandle("dag-11", "main", { workload_id: "W-old" });
+
+  await releaseDagHandle("dag-11", "main", "W-someone-else");
   assert.equal(
-    (await lookupDagHandle("dag-10", "main"))?.superseded_workload_ids, undefined,
-    "the same workload twice displaces nothing",
+    (await lookupDagHandle("dag-11", "main"))?.workload_id, "W-old",
+    "a handle that has moved on belongs to whoever moved it",
   );
 
-  for (let i = 2; i <= 14; i += 1) {
-    await replaceDagHandle("dag-10", "main", { workload_id: `W-${i}` });
-  }
-  const carried = (await lookupDagHandle("dag-10", "main"))!.superseded_workload_ids!;
-  assert.equal(carried.length, 8, "bounded");
-  assert.equal(carried.at(-1), "W-13", "keeping the most recent, which are the likeliest still live");
-  assert.equal(carried.includes("W-14"), false, "and never the one currently held");
+  await releaseDagHandle("dag-11", "main", "W-old");
+  assert.equal(await lookupDagHandle("dag-11", "main"), null);
+  await replaceDagHandle("dag-11", "main", { workload_id: "W-new" });
+  assert.equal(
+    (await lookupDagHandle("dag-11", "main"))?.workload_id, "W-new",
+    "and the freed name is available to the replacement",
+  );
 });

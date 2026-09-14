@@ -101,9 +101,6 @@ export async function lookupDagHandle(
 /** How many times a registration re-reads a row that moved under it. */
 const REGISTER_CAS_ATTEMPTS = 5;
 
-/** How many displaced workloads one handle carries before the oldest is dropped. */
-const SUPERSEDED_LIMIT = 8;
-
 /**
  * Point an existing handle at a different workload, or create it if absent.
  *
@@ -177,25 +174,32 @@ export async function replaceDagHandle(
       row = parsed as Record<string, unknown>;
     }
     const prevEntry = getHandleEntry(row, handleName) as
-      { workload_id?: string; superseded_workload_ids?: string[] } | undefined;
+      { workload_id?: string } | undefined;
     const previous = prevEntry?.workload_id;
-    // Carry forward any workload this name is being taken away from, unless it
-    // is the one being written. `create` used to refuse this overwrite exactly
-    // so a reference could not be lost, and replacing that refusal with an
-    // unconditional write reintroduced the loss: a redelivery whose session
-    // entry has expired -- BRAIN_REGISTRY has a TTL, DAG_HANDLES does not --
-    // finds the handle still naming a workload that is still running, and
-    // overwrites it. Teardown then stops the replacement and reports the DAG
-    // released while the original keeps its GPU.
+    // Refuse to take the name from a DIFFERENT workload that is still on
+    // record. `create` refused this too, and replacing that refusal with an
+    // unconditional write is what let a redelivery -- whose `hands.<session>`
+    // expired while this handle, in a bucket with no TTL, kept naming a
+    // running workload -- overwrite the only reference to it.
     //
-    // Bounded, because this is evidence and not a log: a handle that churns
-    // must not grow the row without limit. The oldest are dropped first, and
-    // losing the oldest is the least bad thing to lose.
-    const carried = [
-      ...(prevEntry?.superseded_workload_ids ?? []),
-      ...(previous && previous !== info.workload_id ? [previous] : []),
-    ].filter((id, i, all) => id && id !== info.workload_id && all.indexOf(id) === i)
-      .slice(-SUPERSEDED_LIMIT);
+    // A round of review was spent instead carrying the displaced id forward
+    // and stopping it at teardown. That mechanism grew five ways to lose the
+    // carried id: a silent cap, a CAS retry that dropped it, a pre-destroy
+    // record that did not include it, an empty current id that skipped it, and
+    // a legacy string entry that never produced one. Refusing is smaller and
+    // has no state to lose.
+    //
+    // The cost is real and is the point: a turn fails rather than silently
+    // taking a name from something nobody released, and the map still names
+    // the workload, so it stays findable. Whoever legitimately replaces a
+    // workload removes its handle when they stop it -- see `runRebuild` --
+    // so this refusal is not on the path of an ordinary rebuild.
+    if (previous && info.workload_id && previous !== info.workload_id) {
+      throw new Error(
+        `dag-handle ${handleName} for ${dagRootTaskId} still names ${previous}; `
+        + `refusing to point it at ${info.workload_id} before that one is released`,
+      );
+    }
     // One write that sets the key, never a delete followed by a create: an
     // absent handle is how Backend decides a DAG holds no sandbox, so a
     // replacement must not look, even for an instant, like never having had
@@ -205,9 +209,7 @@ export async function replaceDagHandle(
     // that reports success and stores nothing, which Backend reads as a DAG
     // holding no sandbox.
     setHandleEntry(row, handleName, {
-      ...info,
-      created_at: info.created_at ?? new Date().toISOString(),
-      ...(carried.length > 0 ? { superseded_workload_ids: carried } : {}),
+      ...info, created_at: info.created_at ?? new Date().toISOString(),
     });
 
     try {
@@ -215,10 +217,7 @@ export async function replaceDagHandle(
       if (keyExists) await kv.update(key, payload, entry!.revision);
       else await kv.create(key, payload);
       logger.info(
-        {
-          dagRootTaskId, handleName, workloadId: info.workload_id,
-          previousWorkloadId: previous, supersededWorkloadIds: carried,
-        },
+        { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
         "dag-handles.replaced",
       );
       return;
@@ -252,6 +251,31 @@ function isRevisionConflict(e: unknown): boolean {
  * anything: the fallback that exists for a node whose token lives only in the
  * handle map, because a sibling owns `hands.<sessionId>`, always answered no.
  */
+/**
+ * Drop this DAG's handle when it names `workloadId`, because that workload has
+ * just been stopped.
+ *
+ * The other half of `replaceDagHandle` refusing to take a name from a workload
+ * still on record: whoever stops one removes its handle, so the name is free
+ * for the replacement and the refusal never fires on an ordinary rebuild. Left
+ * in place, the entry would name a workload that is gone -- which a later
+ * teardown stops, hears 404 for, and counts as released, so the leak is not
+ * here; the breakage would be the next registration being refused.
+ *
+ * Conditional on the id: a handle that has already moved on to something else
+ * belongs to whoever moved it, and this must not remove that.
+ */
+export async function releaseDagHandle(
+  dagRootTaskId: string,
+  handleName: string,
+  workloadId: string,
+): Promise<void> {
+  const current = await lookupDagHandle(dagRootTaskId, handleName);
+  if (!current || current.workload_id !== workloadId) return;
+  await getMap().destroy(dagRootTaskId, handleName);
+  logger.info({ dagRootTaskId, handleName, workloadId }, "dag-handles.released");
+}
+
 export async function isValidDagHandleToken(token: string): Promise<boolean> {
   if (!token || !_kvBucket) return false;
   try {

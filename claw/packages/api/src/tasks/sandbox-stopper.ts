@@ -689,24 +689,6 @@ export async function stopSandboxByHandle(
   try {
     const platformKey = await loadPlatformKeyForSession(sessionId);
     released = await safeStopWorkload(wid, platformKey);
-    // Workloads this handle named before and which nothing confirmed the
-    // release of -- a rebuild's predecessor, or one displaced by a redelivery
-    // that found the session's warm entry expired while this handle was still
-    // naming a live sandbox. Stopping the current workload says nothing about
-    // those, and they have no other reference left.
-    //
-    // An already-stopped workload answers 404, which is a confirmed release,
-    // so a carried id that did not need carrying costs one request.
-    for (const stale of known.superseded_workload_ids ?? []) {
-      if (!stale || stale === wid) continue;
-      const staleReleased = await safeStopWorkload(stale, platformKey);
-      logger.info(
-        { dagRootTaskId, handleName, workloadId: stale, released: staleReleased },
-        "sandbox.superseded_destroyed",
-      );
-      await rememberOutcome(dagRootTaskId, handleName, stale, staleReleased);
-      if (staleReleased !== "confirmed") released = "unconfirmed";
-    }
   } catch (e) {
     // Reaching the credentials is part of issuing the stop; failing to is a
     // stop that did not happen, not an error for the cancel to raise.
