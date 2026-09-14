@@ -149,13 +149,21 @@ export async function replaceDagHandle(
 
   for (let attempt = 0; attempt < REGISTER_CAS_ATTEMPTS; attempt += 1) {
     const entry = await kv.get(key);
-    const absent = !entry
-      || entry.operation === "DEL"
-      || entry.operation === "PURGE"
-      || entry.value.length === 0;
+    // Two different questions, and conflating them wedges the write. "Is there
+    // a row to build on" governs what gets parsed; "does the key exist" governs
+    // whether the write may be a `create`. They come apart for an entry that is
+    // present with an empty value: there is nothing to build on, but the key is
+    // there, so `create` is refused for as long as it is retried and the
+    // registration fails against a row it could perfectly well have updated.
+    // A DEL/PURGE tombstone is the opposite case -- no key to collide with, so
+    // `create` is right, which is what the client itself does over a tombstone.
+    const tombstoned = !!entry
+      && (entry.operation === "DEL" || entry.operation === "PURGE");
+    const keyExists = !!entry && !tombstoned;
+    const emptyRow = !entry || tombstoned || entry.value.length === 0;
 
     let row: Record<string, unknown> = {};
-    if (!absent) {
+    if (!emptyRow) {
       const parsed: unknown = JSON.parse(dec.decode(entry!.value));
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error(`dag-handles row ${key} is not a JSON object`);
@@ -178,8 +186,8 @@ export async function replaceDagHandle(
 
     try {
       const payload = enc.encode(JSON.stringify(row));
-      if (absent) await kv.create(key, payload);
-      else await kv.update(key, payload, entry!.revision);
+      if (keyExists) await kv.update(key, payload, entry!.revision);
+      else await kv.create(key, payload);
       logger.info(
         { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
         "dag-handles.replaced",

@@ -979,6 +979,46 @@ async function provisionHands(
       throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
     }
     logger.info({ sessionId, workloadId }, "hands.kv.pending");
+
+    // Phase (A) for the DAG handle too, and for the same reason the hands
+    // entry is written here rather than after bootstrap: the workload exists
+    // from this moment, and everything between here and the registration at
+    // the end of this function -- poll, bootstrap, health -- is time in which
+    // a cancel can arrive. It found no handle, concluded the DAG held nothing,
+    // and reported exactly that while the workload it missed kept its GPU.
+    //
+    // What is known now is what teardown needs: the id, the key to stop it
+    // with, and the namespace to poll. `hands_url` and `token` are not known
+    // until the sandbox answers, and the registration at the end fills them in
+    // by replacing this entry -- so a `sandbox.use` that somehow resolved this
+    // early would find a handle it cannot connect through, which is a worse
+    // failure than it sounds but a far better one than an untracked GPU.
+    //
+    // A registration that cannot be written rolls the workload back, exactly
+    // as the pending write above does: an unregisterable workload is one
+    // nothing can account for, and it must not outlive this call.
+    const earlyDagRoot = request.dag_root_task_id ?? request.task_id;
+    if (earlyDagRoot && action.kind === "create" && action.handle) {
+      try {
+        await replaceDagHandle(earlyDagRoot, action.handle, {
+          workload_id: workloadId,
+          platform_key: apiKey || "",
+          image: workloadImage,
+          namespace: nsForSandbox,
+        });
+      } catch (err) {
+        logger.error(
+          { sessionId, workloadId, dagRoot: earlyDagRoot, handle: action.handle,
+            err: (err as Error).message },
+          "dag-handles.pending_register_failed_rollback",
+        );
+        await getSafeWorkloadProvider().stop({
+          provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+          namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
+        }).catch(() => {});
+        throw new Error(`DAG handle registration failed for workload ${workloadId}, rolled back`);
+      }
+    }
   };
 
   logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");

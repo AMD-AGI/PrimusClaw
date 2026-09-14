@@ -29,10 +29,15 @@
  *   H3 replace leaves other handles of the same DAG alone
  *   H4 a registration that cannot be written fails the turn
  *   H5 a row that moved under the write is re-read, not overwritten
+ *   H6 an existing empty row is updated, not create-and-conflicted
+ *   H7 the handle is registered while the workload is provisioning, not after
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   bindDagHandleKvForTest,
@@ -212,4 +217,67 @@ test("H5 a conflicting row is re-read rather than overwritten", async () => {
     Object.keys(row), ["main"],
     "the retry built on what Backend left behind, rather than restoring the stale row",
   );
+});
+
+test("H6 an existing empty row is updated, not create-and-conflicted", async () => {
+  // Two questions that come apart: "is there a row to build on" and "does the
+  // key exist". An entry present with an empty value answers no to the first
+  // and yes to the second, and conflating them sends a `create` at a key that
+  // is already there -- refused, retried five times, refused five times, and
+  // the registration fails against a row it could perfectly well have updated.
+  let revision = 3;
+  let value = new Uint8Array();       // present, and empty
+  let createAttempts = 0;
+  const bucket = {
+    async get() { return { value, revision, operation: "PUT" }; },
+    async create() { createAttempts += 1; throw new Error("wrong last sequence: key exists"); },
+    async update(_k: string, data: Uint8Array, rev: number) {
+      assert.equal(rev, revision, "the update carries the revision it read");
+      value = data; return ++revision;
+    },
+    async put() { throw new Error("unconditional put must not be used here"); },
+    async delete() {},
+    async keys() { return (async function* () {})(); },
+  };
+  const restore = bindDagHandleKvForTest(bucket as never);
+  try {
+    await replaceDagHandle("dag-6", "main", { workload_id: "W-1" });
+  } finally {
+    restore();
+  }
+
+  assert.equal(createAttempts, 0, "the key exists, so this was never a create");
+  assert.equal(
+    (JSON.parse(new TextDecoder().decode(value)) as Record<string, { workload_id: string }>)
+      .main.workload_id,
+    "W-1",
+  );
+});
+
+test("H7 the handle is registered while the workload is provisioning, not after", () => {
+  // The window this closes: the workload exists from the moment SaFE assigns
+  // its id, and poll, bootstrap and health all happen before the registration
+  // at the end of ensureHands. A cancel arriving in there found no handle,
+  // concluded the DAG held nothing, and said so -- while the workload it had
+  // missed kept its GPU.
+  //
+  // Asserted structurally because reaching `onProvisioned` needs a provider
+  // and a cluster. What matters is where the call sits: inside the hook that
+  // fires on workload assignment, and rolling the workload back if it cannot
+  // be written, exactly as the pending KV write beside it already does.
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
+    "utf-8",
+  );
+  const hook = src.slice(
+    src.indexOf("const onProvisioned = async (workloadId: string)"),
+  );
+  const body = hook.slice(0, hook.indexOf("\n  };"));
+
+  assert.match(body, /await replaceDagHandle\(/,
+    "the handle has to be recorded while the workload is provisioning");
+  assert.match(body, /pending_register_failed_rollback/,
+    "and a registration that cannot be written must roll the workload back");
+  assert.match(body, /getSafeWorkloadProvider\(\)\.stop\(/,
+    "rolled back by actually stopping it, not only by throwing");
 });

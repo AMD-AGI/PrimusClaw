@@ -595,7 +595,11 @@ export async function stopSandboxByHandle(
       );
       return "unconfirmed";
     }
-    await handleRegistry.destroy(dagRootTaskId, handleName).catch((e) => {
+    // Bound to the empty id it was recorded against. Without it, an entry that
+    // has since been replaced by a real SaFE workload is deleted here -- and
+    // this branch then discards the id `destroy` hands back, so that workload
+    // is neither recorded nor stopped, and loses its only reference.
+    await handleRegistry.destroy(dagRootTaskId, handleName, "").catch((e) => {
       logger.warn(
         { dagRootTaskId, handleName, err: errText(e) },
         "sandbox.handle_destroy_failed",
