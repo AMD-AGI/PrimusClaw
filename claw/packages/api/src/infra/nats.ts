@@ -7,7 +7,7 @@ import {
   TASK_MAX_DELIVER, TASK_MAX_ACK_PENDING,
   BRAIN_REGISTRY_TTL_MS,
   BRAIN_REGISTRY_REPLICAS, BRAIN_CHECKPOINTS_REPLICAS, SYSTEM_ENV_REPLICAS,
-  TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS,
+  TASK_STREAM_REPLICAS, EVENT_STREAM_REPLICAS, DAG_HANDLES_REPLICAS,
 } from "../config.js";
 import {
   TASK_CONSUMER_ACK_WAIT_NS, TASK_CONSUMER_NAME, TASK_STREAM_NAME,
@@ -25,6 +25,7 @@ export let kv: KV;
 export let kvCkpt: KV;
 export let kvSystemEnv: KV;
 export let kvTombstones: KV;
+export let kvDagHandles: KV;
 
 // Stream + subject names are stable across environments. Multi-account
 // isolation at the NATS server level keeps each environment's messages
@@ -49,6 +50,21 @@ export const SYSTEM_ENV_BUCKET = "SYSTEM_ENV";
 // session -- a task the queue can still redeliver, and every event still held
 // on the event stream, whichever of the two windows is the longer.
 export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
+/**
+ * Sandbox handle registry, per DAG. **Created by Brain**, not here -- see
+ * `brain/src/sandbox/handles.ts`, which is the only writer. This side attaches
+ * to the same name because it is the only destroyer, and for a long time it did
+ * not: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
+ * never writes a handle to, so every teardown it ran found nothing to tear down
+ * and every DAG's sandboxes outlived their DAG.
+ *
+ * TTL 0 is not a default, it is the requirement: a handle has to live as long
+ * as its DAG, which for a long evaluation is hours, and `BRAIN_REGISTRY`'s
+ * five-minute TTL -- sized for `lock.<key>` -- is what made the wrong bucket
+ * look plausible while quietly discarding the mapping. `widenOnly` so that
+ * attaching from this side can never narrow a bucket Brain owns.
+ */
+export const DAG_HANDLES_BUCKET = "DAG_HANDLES";
 
 // KV bucket config (Plan Y v2). Local consts; brain/src/config.ts mirrors
 // these so a future @claw/shared-config package has one grep target. The
@@ -238,6 +254,7 @@ export async function initNats(): Promise<void> {
   kvCkpt = buckets.checkpoints;
   kvTombstones = buckets.tombstones;
   kvSystemEnv = buckets.systemEnv;
+  kvDagHandles = buckets.dagHandles;
 
   logger.info(
     {
@@ -269,6 +286,7 @@ export interface KvBuckets {
   checkpoints: KV;
   tombstones: KV;
   systemEnv: KV;
+  dagHandles: KV;
 }
 
 /**
@@ -305,6 +323,15 @@ export async function ensureKvBuckets(
     systemEnv: await ensure(SYSTEM_ENV_BUCKET, {
       ttl: SYSTEM_ENV_TTL_MS,
       replicas: SYSTEM_ENV_REPLICAS,
+    }),
+    // DAG sandbox handles. Brain creates and writes this bucket; this side
+    // attaches because it is the only destroyer. `ttl: 0` means no expiry,
+    // which is what a handle that must outlive a multi-hour DAG needs, and
+    // `widenOnly` keeps an attach from this side from ever narrowing it.
+    dagHandles: await ensure(DAG_HANDLES_BUCKET, {
+      ttl: 0,
+      replicas: DAG_HANDLES_REPLICAS,
+      ttlPolicy: "widenOnly",
     }),
   };
 }

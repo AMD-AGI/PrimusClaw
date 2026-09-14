@@ -38,11 +38,13 @@
  *   R9 the non-root branch omits the field rather than guessing at it
  *   R10 the route answers 200 with the field added and nothing else changed
  *   R11 a repeat cancel does not downgrade a failed release to `nothing_held`
- *   R12 a confirmed release does clear, so a repeat is not latched unconfirmed
+ *   R12 a confirmed release clears the record instead of latching it
  *   R13 an accepted stop is `confirmed`, with no second request behind it
  *   R14 a deleted handle key reads as absent, not as a corrupt entry
  *   R15 an unreadable handle registry is `unconfirmed`, never `nothing_held`
  *   R16 cleanup that throws is contained: still a 200, later handles still run
+ *   R17 a handle that leaked earlier is not confirmed away by a later teardown
+ *   R18 a handle is on record before its stop runs, not after it fails
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -396,17 +398,24 @@ test("R11 a repeat cancel does not downgrade a failed release to nothing_held", 
   );
 });
 
-test("R12 a DAG whose release was confirmed reports nothing_held on a repeat", async () => {
+test("R12 a confirmed release clears the record instead of latching it", async () => {
   // The other side of R11: the record must not be a one-way latch that makes
-  // every DAG unconfirmed forever. A confirmed release clears the entry, and
-  // a later call over an empty map then answers accurately -- nothing is held
-  // and nothing escaped.
+  // every DAG unconfirmed forever. Seeded as already-outstanding on purpose --
+  // the earlier version of this test started from an empty record, so it passed
+  // with the `clear` call deleted and proved only that nothing had been written.
   stubDb();
+  await unreleasedRecord.mark("t-root", "main", "w-1");
+  assert.equal(await unreleasedRecord.any("t-root"), true, "the DAG starts out leaking");
+
   stubHandles({ main: "w-1" });
   stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal((await cancelTask("t-root")).released, "confirmed");
-  assert.equal((await cancelTask("t-root")).released, "nothing_held");
+  assert.equal(
+    await unreleasedRecord.any("t-root"), false,
+    "a release that landed has to retire the evidence that it had not",
+  );
+  assert.equal((await cancelTask("t-root")).released, "nothing_held", "and stay retired");
 });
 
 test("R13 an accepted stop is confirmed, and only one request is made", async () => {
@@ -469,13 +478,64 @@ test("R14 a deleted handle key reads as absent, not as a corrupt entry", async (
 });
 
 test("R15 an unreadable handle registry is unconfirmed, never nothing_held", async () => {
-  // The KV adapter used to turn every read failure into `null`, which
-  // `listForDag` renders as `{}`. Classifying that as "holds nothing" would let
-  // an unreachable NATS report a clean release for every DAG in the fleet.
+  // Driven through the real adapter rather than by replacing `listForDag` with
+  // a throwing function: the earlier version did the latter, which asserts that
+  // `stopAllHandlesForDag` catches a throw and never that the adapter produces
+  // one. The adapter is the part that used to turn every read failure into
+  // `null`, which `listForDag` renders as `{}` -- and an unreachable NATS
+  // reporting a clean release for every DAG in the fleet is the failure this
+  // exists to prevent.
   stubDb();
-  handleRegistry.listForDag = async () => { throw new Error("nats: no responders"); };
+  const { makeKvStore } = await import("../src/tasks/sandbox-stopper.js");
+  const { DagHandleMap } = await import("@claw/protocol");
+  const unreachable = new DagHandleMap(makeKvStore({
+    get: async () => { throw new Error("nats: no responders"); },
+  } as unknown as Parameters<typeof makeKvStore>[0]));
+  handleRegistry.listForDag = (dag: string) => unreachable.listForDag(dag);
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+});
+
+test("R17 a handle that leaked earlier is not confirmed away by a later teardown", async () => {
+  // `agent_done` tears a handle down as soon as its last user finishes. If that
+  // stop fails, the mapping is already gone, so a cancel arriving afterwards
+  // sees only the handles that remain -- releases them perfectly well -- and
+  // would report `confirmed` over the top of the workload nobody released.
+  // Confirming this call's own loop is not confirming the DAG.
+  stubDb();
+  await unreleasedRecord.mark("t-root", "already-leaked", "w-gone");
+  stubHandles({ still_here: "w-2" });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(stopped, ["w-2"], "the handle it can see is released");
+  assert.equal(
+    r.released, "unconfirmed",
+    "and the one it cannot see is still outstanding, which is the DAG's answer",
+  );
+});
+
+test("R18 a handle is on record before its stop is attempted, not after it fails", async () => {
+  // Between `destroy` and the outcome the handle is in neither place: gone from
+  // the map, not yet in the record. A concurrent cancel landing in that window
+  // used to see an empty map and an empty record and answer `confirmed` for a
+  // workload whose only stop was still in flight -- and a process that died
+  // mid-stop left no trace that the attempt had happened at all.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  let markedWhileInFlight: boolean | null = null;
+  globalThis.fetch = (async () => {
+    markedWhileInFlight = await unreleasedRecord.any("t-root");
+    return new Response("", { status: 200 });
+  }) as typeof globalThis.fetch;
+
+  assert.equal((await cancelTask("t-root")).released, "confirmed");
+  assert.equal(
+    markedWhileInFlight, true,
+    "the window has to fail safe: on record first, cleared by a release that lands",
+  );
+  assert.equal(await unreleasedRecord.any("t-root"), false, "and it does get cleared");
 });
 
 test("R16 cleanup that throws is contained: 200, and the other handles still run", async () => {

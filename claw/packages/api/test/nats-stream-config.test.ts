@@ -483,33 +483,48 @@ test("the tombstone bucket is the one bucket whose TTL is never narrowed", async
   assert.equal(calls[0].opts.ttlPolicy, "widenOnly");
 });
 
-test("and it is the only bucket of the four that asks for that policy", async () => {
-  // The conclusion of this whole change, and the thing nothing else holds: every
-  // other bucket's TTL is a setting this code is the authority on, so one of them
-  // given `widenOnly` as well is a bucket a shortened setting can no longer
-  // reach -- silently, since refusing to narrow is by design invisible from
-  // outside. Reading the wiring is what used to have to catch that.
+test("only the two buckets whose TTL this process does not own ask for widenOnly", async () => {
+  // The conclusion of this whole change, and the thing nothing else holds: a
+  // bucket whose TTL is a setting this code is the authority on must be given
+  // `exact`, because one handed `widenOnly` as well is a bucket a shortened
+  // setting can no longer reach -- silently, since refusing to narrow is by
+  // design invisible from outside. Reading the wiring is what used to have to
+  // catch that.
+  //
+  // Two buckets are legitimately not settings. BRAIN_TOMBSTONES' TTL is derived
+  // from the event stream's retention. DAG_HANDLES is not this process's bucket
+  // at all: Brain creates and writes it, this side attaches because it is the
+  // only destroyer, and narrowing it from here would expire the handle mappings
+  // of every DAG still running.
   const { ensure, calls } = recordingEnsure();
 
   const buckets = await ensureKvBuckets({ retentionMs: EVENT_STREAM_RETENTION_MS, measured: true }, ensure);
 
   assert.deepEqual(
     calls.map((c) => c.name),
-    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV"],
-    "every bucket this process owns goes through here, or the guard below sees less than it claims",
+    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV", "DAG_HANDLES"],
+    "every bucket this process opens goes through here, or the guard below sees less than it claims",
   );
   assert.deepEqual(
     calls.filter((c) => c.opts.ttlPolicy === "widenOnly").map((c) => c.name),
-    ["BRAIN_TOMBSTONES"],
+    ["BRAIN_TOMBSTONES", "DAG_HANDLES"],
   );
   for (const call of calls) {
-    if (call.name === "BRAIN_TOMBSTONES") continue;
+    if (call.name === "BRAIN_TOMBSTONES" || call.name === "DAG_HANDLES") continue;
     assert.equal(call.opts.ttlPolicy ?? "exact", "exact",
       `${call.name}'s TTL is a setting, so a start-up has to be able to shorten it`);
   }
+  // The requirement, not a default: a sandbox handle has to outlive its DAG,
+  // which for a long evaluation is hours. The API's sandbox-stopper used to
+  // read BRAIN_REGISTRY instead -- five minutes, sized for `lock.<key>` -- and
+  // a bucket that forgets is exactly what made the wrong one look plausible.
+  assert.equal(
+    calls.find((c) => c.name === "DAG_HANDLES")!.opts.ttl, 0,
+    "a handle that expires under its own DAG is a sandbox nothing will ever destroy",
+  );
   assert.deepEqual(Object.keys(buckets).sort(),
-    ["checkpoints", "registry", "systemEnv", "tombstones"],
-    "and every one of them is handed back, since initNats binds all four");
+    ["checkpoints", "dagHandles", "registry", "systemEnv", "tombstones"],
+    "and every one of them is handed back, since initNats binds them all");
 });
 
 test("the bucket's own line says whether that retention was measured or assumed", () => {

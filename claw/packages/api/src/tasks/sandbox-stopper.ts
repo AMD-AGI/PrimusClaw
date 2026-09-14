@@ -21,13 +21,23 @@ import type { KVStore } from "@claw/utils";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
-import { kv as natsKv } from "../infra/nats.js";
+import { kvDagHandles } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
 const logger = pino({ name: "sandbox-stopper" });
 
 /** Unchanged from before this file reported outcomes. */
 const SAFE_STOP_TIMEOUT_MS = 15_000;
+
+/**
+ * A rejection is not required to be an `Error`, and every catch on this path
+ * exists to keep a cancellation alive -- so reading `.message` off whatever
+ * arrived, and throwing a TypeError out of the handler when it was `undefined`,
+ * would defeat the containment at exactly the moment it is needed.
+ */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
 let _handleMap: DagHandleMap | null = null;
 
@@ -41,7 +51,7 @@ export interface KvLike {
 
 /** Build the DagHandleMap on demand using the existing NATS KV bucket. */
 function handleMap(): DagHandleMap {
-  _handleMap ??= new DagHandleMap(makeKvStore(natsKv as unknown as KvLike));
+  _handleMap ??= new DagHandleMap(makeKvStore(kvDagHandles as unknown as KvLike));
   return _handleMap;
 }
 
@@ -80,11 +90,20 @@ export function makeKvStore(kv: KvLike): KVStore {
       // wrong would report a clean teardown as unreadable.
       if (entry.operation === "DEL" || entry.operation === "PURGE") return null;
       if (entry.value.length === 0) return null;
+      let parsed: unknown;
       try {
-        return JSON.parse(dec.decode(entry.value)) as Record<string, unknown>;
+        parsed = JSON.parse(dec.decode(entry.value));
       } catch (e) {
-        throw new Error(`handle map entry ${key} is not readable JSON: ${(e as Error).message}`);
+        throw new Error(`handle map entry ${key} is not readable JSON: ${errText(e)}`);
       }
+      // `JSON.parse` is happy with `null`, `false` and `7`, and the cast that
+      // used to follow it was happy with all three. `DagHandleMap` then reads
+      // them as a DAG holding no handles -- an unknown wearing the one answer
+      // that must never be invented. Shape is as much of the contract as syntax.
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`handle map entry ${key} is not a JSON object`);
+      }
+      return parsed as Record<string, unknown>;
     },
     async put(key, value) {
       await kv.put(key, enc.encode(JSON.stringify(value)));
@@ -314,7 +333,7 @@ async function safeStopWorkload(
     }
     return "confirmed";
   } catch (e) {
-    logger.warn({ workloadId, err: (e as Error).message }, "safe.stop_exception");
+    logger.warn({ workloadId, err: errText(e) }, "safe.stop_exception");
     return "unconfirmed";
   }
 }
@@ -363,9 +382,13 @@ export async function stopSandboxByHandle(
     wid = await handleRegistry.destroy(dagRootTaskId, handleName);
   } catch (e) {
     // The mapping may or may not have been removed and the stop was never
-    // attempted, so this says nothing about the workload either way.
+    // attempted, so this says nothing about the workload either way. It is
+    // also the one branch with no handle id to record against: `destroy` did
+    // not answer, so there is nothing to write. The `unconfirmed` returned here
+    // is what a concurrent reader would miss, which is why the aggregate does
+    // not trust its own loop alone -- see stopAllHandlesForDag.
     logger.warn(
-      { dagRootTaskId, handleName, err: (e as Error).message },
+      { dagRootTaskId, handleName, err: errText(e) },
       "sandbox.handle_destroy_failed",
     );
     return "unconfirmed";
@@ -377,6 +400,16 @@ export async function stopSandboxByHandle(
     return "unconfirmed";
   }
 
+  // Marked BEFORE the stop is attempted, not after it fails. Between `destroy`
+  // above and the outcome below, the handle is in neither place: gone from the
+  // map, not yet in the record. A concurrent cancel landing in that window sees
+  // an empty map and an empty record for this handle and answers `confirmed`
+  // for a workload whose only stop is still in flight -- and if this process
+  // dies mid-stop, nothing ever records that the attempt was made at all.
+  // Marking first makes the window fail safe: the worst it can now produce is
+  // an `unconfirmed` that a completed release immediately clears.
+  await rememberOutcome(dagRootTaskId, handleName, wid, "unconfirmed");
+
   let released: ReleaseOutcome;
   try {
     const platformKey = await loadPlatformKeyForSession(sessionId);
@@ -385,7 +418,7 @@ export async function stopSandboxByHandle(
     // Reaching the credentials is part of issuing the stop; failing to is a
     // stop that did not happen, not an error for the cancel to raise.
     logger.warn(
-      { dagRootTaskId, handleName, workloadId: wid, err: (e as Error).message },
+      { dagRootTaskId, handleName, workloadId: wid, err: errText(e) },
       "sandbox.stop_precondition_failed",
     );
     released = "unconfirmed";
@@ -415,8 +448,12 @@ async function rememberOutcome(
     if (released === "confirmed") await unreleasedRecord.clear(dagRootTaskId, handleName);
     else await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
   } catch (e) {
+    // `workloadId` deliberately: this warning is the only trace of a handle
+    // whose record was not written, and without the id an operator has to
+    // correlate it against a separate `sandbox.destroyed` line to learn which
+    // workload to go and look for.
     logger.warn(
-      { dagRootTaskId, handleName, released, err: (e as Error).message },
+      { dagRootTaskId, handleName, workloadId, released, err: errText(e) },
       "sandbox.unreleased_record_write_failed",
     );
   }
@@ -448,7 +485,7 @@ export async function stopAllHandlesForDag(
     handles = Object.keys(await handleRegistry.listForDag(dagRootTaskId));
   } catch (e) {
     logger.warn(
-      { dagRootTaskId, err: (e as Error).message },
+      { dagRootTaskId, err: errText(e) },
       "sandbox.handle_list_failed",
     );
     return "unconfirmed";
@@ -459,7 +496,7 @@ export async function stopAllHandlesForDag(
       return (await unreleasedRecord.any(dagRootTaskId)) ? "unconfirmed" : "nothing_held";
     } catch (e) {
       logger.warn(
-        { dagRootTaskId, err: (e as Error).message },
+        { dagRootTaskId, err: errText(e) },
         "sandbox.unreleased_record_read_failed",
       );
       return "unconfirmed";
@@ -471,5 +508,23 @@ export async function stopAllHandlesForDag(
     const released = await stopSandboxByHandle(dagRootTaskId, handle, sessionId);
     if (released !== "confirmed") allConfirmed = false;
   }
-  return allConfirmed ? "confirmed" : "unconfirmed";
+  if (!allConfirmed) return "unconfirmed";
+
+  // Confirming this call's own loop is not confirming the DAG. The snapshot
+  // above is of the handles still registered *now*, and a handle that leaked
+  // earlier is no longer among them: the agent_done path tears down a handle as
+  // soon as its last user finishes, and the sweeper and a concurrent cancel
+  // both reach the same handles by other routes. Each of those removes the
+  // mapping and leaves its failure only in the record, so a later cancel that
+  // released everything it could see would otherwise report `confirmed` over
+  // the top of a workload nobody released.
+  try {
+    return (await unreleasedRecord.any(dagRootTaskId)) ? "unconfirmed" : "confirmed";
+  } catch (e) {
+    logger.warn(
+      { dagRootTaskId, err: errText(e) },
+      "sandbox.unreleased_record_read_failed",
+    );
+    return "unconfirmed";
+  }
 }
