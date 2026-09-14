@@ -66,7 +66,8 @@ const originalRecord = { ...unreleasedRecord };
 const originalInterrupt = { ...interruptDelivery };
 const originalFetch = globalThis.fetch;
 
-/** The record's real storage is NATS KV; in-memory is the same contract. */
+/** The record's real storage is `claw_tasks.metadata`; this is the same
+ *  contract in memory. The scenario suite exercises the real statements. */
 let recorded: Map<string, Set<string>>;
 
 function restoreAll(): void {

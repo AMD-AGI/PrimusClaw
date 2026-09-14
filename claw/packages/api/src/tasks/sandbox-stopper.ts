@@ -9,7 +9,9 @@
  * entry points feed this module:
  *
  *   1. agent_done callback handler: if the calling task is the last user
- *      of any handle (per DAG `handle_last_user` derived map).
+ *      of any handle (per DAG `handle_last_user` derived map) AND no sibling
+ *      node of that DAG is still live -- the derived map names the last node
+ *      in topological order, which is not the last one to finish.
  *   2. DAG root transition handler: tear every remaining handle of a
  *      finished / cancelled DAG.
  *   3. Sweeper: orphan handles whose DAG row no longer exists.
@@ -308,8 +310,12 @@ export const handleRegistry = {
  *     -- the caller can see *which* handle was not released and what workload it
  *     was, which is the part a `released: "unconfirmed"` alone cannot say.
  *
- * Written only on the unhappy path, cleared as soon as a release for that
- * handle is established, and read only when the handle map has nothing to say.
+ * Written BEFORE the stop is attempted and cleared once a release for that
+ * workload is established -- not written only on failure, which an earlier
+ * version of this comment said. It is read when the handle map has nothing to
+ * say, and again before a teardown that stopped everything it saw may answer
+ * `confirmed`. A pre-write that fails stops THIS call's destroy; it is not
+ * merely the next caller's problem.
  * A DAG whose handles were all released confirmed therefore leaves nothing
  * behind and answers `nothing_held` on a repeat call, which is accurate:
  * nothing is held and nothing escaped.
@@ -534,7 +540,14 @@ async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
  * answers this call; the record answers the next one.
  *
  * `destroy` distinguishes two falsy results and so does this:
- *   - `null`  -- no handle of that name was registered: `nothing_held`.
+ *   - `null`  -- nothing of that name is registered NOW. Answered
+ *                `nothing_held` only from the lookup that precedes the
+ *                destroy, where it means this DAG holds no such handle; a
+ *                `null` from the destroy itself means somebody else took it
+ *                first and answers `unconfirmed`. Neither consults the
+ *                record -- the DAG-level aggregate does that, and folds a
+ *                per-handle `nothing_held` into `unconfirmed` for a DAG that
+ *                held anything.
  *   - `""`    -- a handle was registered with no SaFE workload id behind it.
  *                agent-sandbox handles are written this way (see Brain's
  *                ensureHands), and this path has never had a way to stop one.

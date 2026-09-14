@@ -32,11 +32,16 @@
  * Coverage:
  *   A1 the undo addresses the Claw session, not the Router's
  *   A2 it stops the ticker before restoring the idle marker
- *   A3 a `superseded` park is reported as an incomplete undo, not swallowed
+ *   A3 only an incomplete park is reported as incomplete (real log output)
  *   A4 the sandbox is not stopped -- this path did not create it
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
 
 const { bindSandboxReuseEffects, registerReusedDagHandle } =
   await import("../src/sandbox/ensure-hands.js");
@@ -82,7 +87,7 @@ async function adopt(parkOutcome: "parked" | "superseded" | "failed") {
   const err = await registerReusedDagHandle(
     {} as never,
     { session_id: CLAW_SESSION, task_id: "t-1", dag_root_task_id: "dag-1" } as never,
-    { kind: "use", handle: "main" },
+    { kind: "create", handle: "main" },
     {
       handsUrl: "http://hands", created: false, token: "tok",
       identity: {
@@ -117,20 +122,46 @@ test("A2 it stops the ticker before restoring the idle marker", async () => {
   );
 });
 
-test("A3 a superseded park is reported as an incomplete undo, not swallowed", async () => {
-  // `markHandsIdle` returns this rather than throwing, and a revision conflict
-  // is the ordinary case: the entry is live and its TTL is being refreshed.
-  // Treated as success, the local registration is gone while KV still says
-  // active, and the next tick pings a sandbox no turn owns.
-  const { err } = await adopt("superseded");
+test("A3 only an incomplete park is reported as incomplete", async () => {
+  // Asserted on the log the process really writes, in a subprocess, because
+  // the previous version of this test matched the source for the condition
+  // text -- which passes with the log line deleted, or the condition body
+  // emptied, and so proved nothing about the behaviour it is named for.
+  //
+  // The distinction matters in both directions. `markHandsIdle` REPORTS
+  // failure rather than throwing, and a revision conflict is the ordinary case
+  // here because the entry is live and its TTL is being refreshed underneath.
+  // Treat `superseded` as success and the local registration is gone while KV
+  // still says active, so the next tick finds the workload again and pings a
+  // sandbox no turn owns. Treat `gone` as failure and every adoption of an
+  // already-reaped entry pages somebody over nothing.
+  const { stdout } = await run(process.execPath, [
+    fileURLToPath(new URL("../../../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+    fileURLToPath(new URL("./fixtures/adoption-undo-outcomes.ts", import.meta.url)),
+  ], { timeout: 60_000 });
 
-  assert.ok(err, "the turn still fails");
-  const src = await import("node:fs/promises").then((fs) =>
-    fs.readFile(new URL("../src/sandbox/ensure-hands.ts", import.meta.url), "utf-8")
+  const incomplete = stdout.split("\n")
+    .filter((l) => l.includes("reused_handle_undo_incomplete"));
+
+  assert.equal(
+    incomplete.length, 2,
+    `exactly the two outcomes that did not park should report. stdout:\n${stdout}`,
   );
-  assert.match(
-    src, /parked\.outcome !== "parked" && parked\.outcome !== "gone"/,
-    "the outcome has to be inspected; a try/catch around it establishes nothing",
+  assert.ok(
+    incomplete.some((l) => /"outcome":"superseded"/.test(l)),
+    "a revision conflict left the undo unfinished and has to say so",
+  );
+  assert.ok(
+    incomplete.some((l) => /"outcome":"failed"/.test(l)),
+    "and so does an outright failure",
+  );
+  assert.equal(
+    incomplete.some((l) => /"outcome":"(parked|gone)"/.test(l)), false,
+    "while a park that landed, or an entry already gone, is a complete undo",
+  );
+  assert.ok(
+    incomplete.every((l) => l.includes(CLAW_SESSION)),
+    "reported against the Claw session, which is the one the undo addressed",
   );
 });
 

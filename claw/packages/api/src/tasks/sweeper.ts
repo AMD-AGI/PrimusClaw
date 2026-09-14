@@ -1082,9 +1082,12 @@ export async function reapOrphanHandles(): Promise<number> {
       // sandbox T2 is running on. No race is needed: the two are sequential,
       // which is the normal shape of a session.
       //
-      // Ownership should move with the reuse, and that is Brain's to do. Until
-      // it does, the session is the wider thing the workload actually belongs
-      // to, so a session with live work keeps its sandboxes. The cost is a
+      // Reuse now DOES register the adopting DAG -- but it adds that reference
+      // without removing the creating task's, so this sweep can still reach a
+      // workload through a terminal owner while a live DAG holds it too. The
+      // session is the wider thing the workload actually belongs to, so a
+      // session with live work keeps its sandboxes, and this guard stays
+      // necessary rather than being made redundant by the registration. The cost is a
       // deferred reap on a busy session; the cost of the alternative is a pod
       // pulled out from under a running task.
       const sessionId = owner?.session_id

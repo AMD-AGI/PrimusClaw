@@ -632,12 +632,10 @@ async function clearIdleMarkers(
 /**
  * Record that this DAG now holds the sandbox it just took over.
  *
- * Best-effort in the same sense the create path's registration is: a DAG can
- * still run without the entry, just without reuse downstream and without
- * Backend being able to tear it down by handle. It is emphatically not
- * best-effort in what it means -- an unregistered reuse is a sandbox nothing
- * owns on paper, which is how a live pod gets reaped and how a cancel reports
- * that it released everything it could see.
+ * Not best-effort, and no longer described as such anywhere on this path: a
+ * failure undoes the adoption and throws. An unregistered reuse is a sandbox
+ * nothing owns on paper, which is how a live pod gets reaped and how a cancel
+ * reports that it released everything it could see.
  *
  * `replace` rather than `create`, because the whole point is that a handle of
  * this name may already exist naming the workload this session used before.
@@ -699,9 +697,14 @@ export async function registerReusedDagHandle(
     // reporting success.
     const adoptedSession = request.session_id;
     try {
-      // Stop the ticker this adoption started, then put the idle marker back:
-      // the two halves of what `acceptExistingSandbox` just did, undone in the
-      // reverse order so the entry is never active with nobody pinging it.
+      // The two halves of what `acceptExistingSandbox` just did, undone in the
+      // reverse order it did them. To be exact about what this does and does
+      // not buy: `unregisterSandbox` drops THIS session's registration, it
+      // does not stop a global ticker or recall pings already collected, and
+      // between it and the park landing the KV entry still reads active. The
+      // order is still the right way round -- the alternative leaves a
+      // registration pointing at an entry already marked idle -- but it is not
+      // an atomic handover and nothing here should be read as claiming one.
       reuseEffects.unregisterSandbox(adoptedSession, identity);
       // `markHandsIdle` REPORTS failure rather than throwing -- `superseded`
       // for a revision conflict, `failed` for anything else -- so a catch
@@ -1228,8 +1231,9 @@ async function provisionHands(
   // task-design.md §9.4: when the calling task belongs to a DAG and declared
   // a sandbox.handle name, publish a HandleInfo to the DagHandleMap so any
   // downstream node with `sandbox.use=<handle>` can short-circuit ensureHands
-  // and connect directly to this workload. Failures are non-fatal -- the DAG
-  // can still complete with sandbox-per-node semantics, just without reuse.
+  // and connect directly to this workload. A failure here is fatal and rolls
+  // the workload back: the handle is also the only record Backend has of what
+  // this DAG holds.
   const dagRoot = request.dag_root_task_id ?? request.task_id;
   // `replace`, not `create`. A create refuses a name that already maps
   // elsewhere -- correct against a double-create, wrong here, because this IS
@@ -1482,8 +1486,8 @@ async function ensureHandsAgentSandbox(
 
     // task-design.md §9.4: publish the handle so downstream DAG nodes with
     // `sandbox.use=<handle>` can re-attach. agent-sandbox has no workload_id,
-    // so carry the provider + agent-sandbox identity for the use path. Failures
-    // are non-fatal -- the DAG falls back to sandbox-per-node semantics.
+    // so carry the provider + agent-sandbox identity for the use path. A
+    // failure here is fatal and tears the sandbox down, as on the SaFE path.
     const dagRoot = request.dag_root_task_id ?? request.task_id;
     // `replace` for the same reason as the SaFE path above: a rebuilt
     // agent-sandbox is a new instance under the same handle name, and a create

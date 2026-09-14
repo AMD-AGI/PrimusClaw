@@ -51,10 +51,12 @@ export const SYSTEM_ENV_BUCKET = "SYSTEM_ENV";
 // on the event stream, whichever of the two windows is the longer.
 export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
 /**
- * Sandbox handle registry, per DAG. **Created by Brain**, not here -- see
- * `brain/src/sandbox/handles.ts`, which is the only writer. This side attaches
- * to the same name because it is the only destroyer, and for a long time it did
- * not: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
+ * Sandbox handle registry, per DAG. Brain is the only writer of handle
+ * entries -- see `brain/src/sandbox/handles.ts` -- and this side is the only
+ * destroyer. Both create and reconcile the bucket: whichever process starts
+ * first on a fresh cluster brings it up, and api additionally corrects replica
+ * drift, which brain cannot (it holds no JetStreamManager). For a long time
+ * this side did not read it at all: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
  * never writes a handle to, so every teardown it ran found nothing to tear down
  * and every DAG's sandboxes outlived their DAG.
  *
@@ -295,9 +297,11 @@ export interface KvBuckets {
  * Apart from `initNats` so that the settings each bucket is created with can be
  * asserted against a fake. The TTL policy is the reason: `exact` is the default
  * and is what a TTL that is a setting needs, `widenOnly` belongs to the
- * tombstone bucket alone (see KvTtlPolicy), and a second bucket quietly given
- * `widenOnly` is a bucket whose TTL a shortened setting can no longer reach --
- * with nothing failing, and nothing in a start-up log to say so.
+ * buckets whose TTL is not a setting this process owns (see KvTtlPolicy) --
+ * BRAIN_TOMBSTONES, derived from the event stream's retention, and
+ * DAG_HANDLES, which brain also creates. A bucket whose TTL *is* a setting and
+ * is quietly given `widenOnly` is one a shortened setting can no longer reach
+ * -- with nothing failing, and nothing in a start-up log to say so.
  */
 export async function ensureKvBuckets(
   retention: EventStreamRetention,
