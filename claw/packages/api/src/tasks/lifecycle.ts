@@ -12,7 +12,7 @@
  */
 import { db, inTransaction } from "../infra/db.js";
 import pino from "pino";
-import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
+import { applyTaskStatusTransition, getTask, transitionStatus } from "./db.js";
 import { type ReleaseOutcome, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
@@ -449,14 +449,29 @@ export async function retryTask(taskId: string): Promise<{ ok: boolean; new_task
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );
-  // Only the key this is setting. `updateTask` merges the patch into
-  // `metadata` at the top level, so spreading the whole row back in was never
-  // needed -- and it is actively destructive, because `task.metadata` is a
-  // snapshot read before the INSERT above. Anything written to the row in
-  // between is replaced by the older value it had at read time, and the
-  // sweeper writes exactly such a thing: an unreleased-handle record, whose
-  // loss turns a workload it could not stop into `nothing_held` for whoever
-  // asks next. A patch of one key cannot lose a sibling it never mentions.
-  await updateTask(taskId, { metadata: JSON.stringify({ retried_into: newId }) });
+  // Merged in the database, not composed in this process.
+  //
+  // Two wrong versions preceded this one and both lost data. The original
+  // wrote `{...task.metadata, retried_into}` -- a snapshot read before the
+  // INSERT above, so anything written to the row in between was reverted, and
+  // the sweeper writes exactly such a thing: an unreleased-handle record whose
+  // loss turns a workload it could not stop into `nothing_held`. The fix for
+  // that patched only `{retried_into}`, on the belief that `updateTask` merges
+  // its patch -- it does not. `updateTask` assigns (`metadata = $1`); the
+  // function that merges is `applyTaskStatusTransition`. So the patch replaced
+  // the whole column with one key, destroying `derived` -- handle_last_user,
+  // root_node_id, schema_digest -- along with everything else, and needing no
+  // concurrency to do it.
+  //
+  // `||` in the statement is the only form that is both complete and atomic:
+  // nothing is read into this process, so nothing can go stale between the
+  // read and the write, and every key this call does not name survives.
+  await db.query(
+    `UPDATE claw_tasks
+        SET metadata = COALESCE(metadata, '{}'::jsonb)
+                       || jsonb_build_object('retried_into', $2::text)
+      WHERE task_id = $1`,
+    [taskId, newId],
+  );
   return { ok: true, new_task_id: newId };
 }

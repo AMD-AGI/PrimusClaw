@@ -675,16 +675,37 @@ async function registerReusedDagHandle(
     // this path did not create it, and another session's warm pod is not this
     // turn's to destroy on the way out.
     logger.error(
-      { dagRoot, handle: action.handle, sessionId: identity.sessionId, err: (e as Error).message },
+      { dagRoot, handle: action.handle, sessionId: request.session_id,
+        err: (e as Error).message },
       "ensureHands.reused_handle_register_failed",
     );
-    const adoptedSession = identity.sessionId ?? request.session_id;
+    // The CLAW session, not `identity.sessionId`. For agent-sandbox that field
+    // is the Router's session id, while keepalive registrations and the
+    // `hands.<session>` key are both keyed by Claw's -- so preferring it sent
+    // the unregister and the idle write to a session that does not exist, and
+    // the adoption stayed exactly as un-undone as before, with the undo
+    // reporting success.
+    const adoptedSession = request.session_id;
     try {
       // Stop the ticker this adoption started, then put the idle marker back:
       // the two halves of what `acceptExistingSandbox` just did, undone in the
       // reverse order so the entry is never active with nobody pinging it.
       unregisterSandbox(adoptedSession, identity);
-      await markHandsIdle(kv, adoptedSession, identity);
+      // `markHandsIdle` REPORTS failure rather than throwing -- `superseded`
+      // for a revision conflict, `failed` for anything else -- so a catch
+      // around it establishes nothing. A conflict is the ordinary case here:
+      // the entry is live and its TTL is being refreshed underneath. Left
+      // unchecked, the local registration is gone while the KV entry still
+      // says active, and the next keepalive tick finds the workload again from
+      // KV and goes on pinging a sandbox no turn owns.
+      const parked = await markHandsIdle(kv, adoptedSession, identity);
+      if (parked.outcome !== "parked" && parked.outcome !== "gone") {
+        logger.error(
+          { dagRoot, handle: action.handle, sessionId: adoptedSession,
+            outcome: parked.outcome },
+          "ensureHands.reused_handle_undo_incomplete",
+        );
+      }
     } catch (undoErr) {
       logger.error(
         { dagRoot, handle: action.handle, sessionId: adoptedSession,

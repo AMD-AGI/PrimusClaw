@@ -31,6 +31,7 @@
  *   U8 the record reaches the caller through the public task read
  *   U9 a handle named `token` survives the round trip, database to redactor
  *   U10 two workloads under one handle name are separate entries, cleared apart
+ *   U11 a retry stamps its key without taking the rest of `metadata` with it
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -269,4 +270,43 @@ test("U10 two workloads under one handle name are separate entries, cleared apar
     "clearing the one that was released must not clear the one that was not",
   );
   assert.equal(await unreleasedRecord.any("t-root"), true, "so the DAG is still outstanding");
+});
+
+test("U11 a retry stamps its key without taking the rest of metadata with it", async () => {
+  // Run against a real database because this exact line has now been wrong
+  // twice, in opposite directions, and neither version could be caught by
+  // reading it. The first wrote back a snapshot read before the INSERT, so a
+  // record written in between was reverted. The second patched only
+  // `retried_into`, on the belief that `updateTask` merges -- it assigns, so
+  // that replaced the whole column with one key and destroyed `derived` along
+  // with the record, deterministically. Both statements look right.
+  //
+  // A STANDALONE row, because that is the only kind `retryTask` accepts: chat
+  // rows and anything with a `dag_root_task_id` are refused before the write.
+  // It is also the kind that matters here -- the sweeper records an unreleased
+  // handle against the owner row, and for a standalone task that is this row.
+  await seedSession(h, "s-1");
+  await seedRun(h, "t-solo", "s-1", { origin: "api", status: "failed" });
+  await h.sql(
+    `UPDATE claw_tasks SET metadata = metadata || '{"derived":{"keep":"me"}}'::jsonb
+      WHERE task_id = 't-solo'`,
+  );
+  await unreleasedRecord.mark("t-solo", "main", "w-1");
+  assert.equal(await unreleasedRecord.any("t-solo"), true, "the row starts out leaking");
+
+  const { retryTask } = await import("../src/tasks/lifecycle.js");
+  const r = await retryTask("t-solo");
+  assert.equal(r.ok, true, "the retry has to actually happen, or this test proves nothing");
+
+  const rows = await h.sql(`SELECT metadata FROM claw_tasks WHERE task_id = 't-solo'`);
+  const meta = rows[0].metadata as Record<string, unknown>;
+  assert.equal(meta.retried_into, r.new_task_id, "the stamp is written");
+  assert.equal(
+    await unreleasedRecord.any("t-solo"), true,
+    "and the leak record survives it -- losing it makes the workload unfindable",
+  );
+  assert.deepEqual(
+    meta.derived, { keep: "me" },
+    "as does everything else the column held",
+  );
 });
