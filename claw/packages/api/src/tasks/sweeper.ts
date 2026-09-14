@@ -32,8 +32,7 @@ import { envBool, envInt, LEASE_LOST_GRACE_SEC, TASK_SWEEPER_TICK_MS } from "../
 import { nc } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
-import { stopAllHandlesForDag } from "./sandbox-stopper.js";
-import { handleMap } from "./sandbox-stopper.js";
+import { handleRegistry, stopAllHandlesForDag } from "./sandbox-stopper.js";
 import { RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC } from "./run-budget.js";
 import { applyTaskStatusTransition } from "./db.js";
 import type { ClawTaskRow } from "./types.js";
@@ -1041,10 +1040,20 @@ export async function reapStuckSessions(): Promise<number> {
   return r.rowCount;
 }
 
-/** Reconcile DagHandleMap: drop entries for terminal DAG roots. */
+/**
+ * Reconcile DagHandleMap: drop entries for terminal DAG roots.
+ *
+ * `dropped` counts DAGs reached, which is not a count of sandboxes released --
+ * `stopAllHandlesForDag` reports that separately, and this is the one teardown
+ * path with no caller to report it to. So the sweeps it could not establish a
+ * release for are counted and logged here, because an operator watching for a
+ * leak has nowhere else to look: the per-handle warnings say which stop failed,
+ * but only this says how much of a tick's reconciliation did not land.
+ */
 export async function reapOrphanHandles(): Promise<number> {
-  const all = await handleMap().listAll();
+  const all = await handleRegistry.listAll();
   let dropped = 0;
+  let unreleased = 0;
   for (const [dagRoot] of all) {
     const r = await db.query(
       `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
@@ -1057,9 +1066,12 @@ export async function reapOrphanHandles(): Promise<number> {
       // session and skips when absent.
       const sess = await db.query(`SELECT session_id FROM claw_tasks WHERE task_id = $1`, [dagRoot]);
       const sessionId = sess.rows[0]?.session_id ?? "";
-      await stopAllHandlesForDag(dagRoot, sessionId);
+      if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
       dropped++;
     }
+  }
+  if (unreleased > 0) {
+    logger.warn({ dropped, unreleased }, "sweeper.orphan_handles_unreleased");
   }
   return dropped;
 }

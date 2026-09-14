@@ -36,31 +36,62 @@
  *   R7 a handle with no SaFE workload behind it is `unconfirmed`, not `nothing_held`
  *   R8 a failed release does not fail the cancellation or change its fields
  *   R9 the non-root branch omits the field rather than guessing at it
- *   R10 the route forwards the field and leaves the rest of the response alone
+ *   R10 the route answers 200 with the field added and nothing else changed
+ *   R11 a repeat cancel does not downgrade a failed release to `nothing_held`
+ *   R12 a confirmed release does clear, so a repeat is not latched unconfirmed
+ *   R13 a stop SaFE accepted but has not finished is `unconfirmed`
+ *   R14 the confirming read timing out is `unconfirmed`
+ *   R15 an unreadable handle registry is `unconfirmed`, never `nothing_held`
+ *   R16 cleanup that throws is contained: still a 200, later handles still run
  */
-import test, { after, afterEach } from "node:test";
+import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import Fastify from "fastify";
 import type { HandleInfo } from "@claw/protocol";
 
 process.env.SAFE_API_URL = "http://safe.test";
 
 const { db } = await import("../src/infra/db.js");
-const { handleRegistry, stopAllHandlesForDag } = await import("../src/tasks/sandbox-stopper.js");
+const { handleRegistry, unreleasedRecord, stopAllHandlesForDag, stopSandboxByHandle } =
+  await import("../src/tasks/sandbox-stopper.js");
 const { cancelTask } = await import("../src/tasks/lifecycle.js");
+const { registerTaskRoutes, interruptDelivery } = await import("../src/routes/tasks.js");
 
 const originalQuery = db.query;
 const originalRegistry = { ...handleRegistry };
+const originalRecord = { ...unreleasedRecord };
+const originalInterrupt = { ...interruptDelivery };
 const originalFetch = globalThis.fetch;
-after(() => {
+
+/** The record's real storage is NATS KV; in-memory is the same contract. */
+let recorded: Map<string, Set<string>>;
+
+function restoreAll(): void {
   db.query = originalQuery;
   Object.assign(handleRegistry, originalRegistry);
+  Object.assign(unreleasedRecord, originalRecord);
+  Object.assign(interruptDelivery, originalInterrupt);
   globalThis.fetch = originalFetch;
+}
+after(restoreAll);
+afterEach(restoreAll);
+beforeEach(() => {
+  recorded = new Map();
+  unreleasedRecord.mark = async (dag, handle) => {
+    if (!recorded.has(dag)) recorded.set(dag, new Set());
+    recorded.get(dag)!.add(handle);
+  };
+  unreleasedRecord.clear = async (dag, handle) => { recorded.get(dag)?.delete(handle); };
+  unreleasedRecord.any = async (dag) => (recorded.get(dag)?.size ?? 0) > 0;
+  interruptDelivery.publish = () => {};
+  interruptDelivery.flush = async () => {};
 });
-afterEach(() => {
-  db.query = originalQuery;
-  Object.assign(handleRegistry, originalRegistry);
-  globalThis.fetch = originalFetch;
-});
+
+/** The session's owner, so the route's ownership gate passes on its own. */
+const CALLER = {
+  userId: "u-1", userName: "u-1", roles: ["default"],
+  platformKey: "pk", virtualKey: "vk-u-1",
+};
 
 const DAG_ROOT = {
   task_id: "t-root",
@@ -76,6 +107,10 @@ function stubDb(task: Record<string, unknown> = DAG_ROOT): void {
     const sql = text.replace(/\s+/g, " ").trim();
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
       return params[0] === task.task_id ? { rows: [task], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
+    // The cancel route's access gate, for the tests that go over HTTP.
+    if (sql.startsWith("SELECT user_id FROM claw_sessions")) {
+      return { rows: [{ user_id: CALLER.userId }], rowCount: 1 };
     }
     if (sql.startsWith("SELECT config FROM claw_sessions")) {
       return { rows: [{ config: {} }], rowCount: 1 };
@@ -104,22 +139,42 @@ function stubHandles(handles: Record<string, string>): void {
   };
 }
 
-/** Records every workload id a stop was issued for, answering per-id. */
-function stubSafe(answer: (workloadId: string) => Response | Promise<Response>): string[] {
+/**
+ * A SaFE that answers the stop per workload id and, by default, reports the
+ * workload gone on the confirming read that follows a 2xx.
+ *
+ * The read is not incidental: SaFE's stop returns once it has issued a
+ * Kubernetes delete, and the Workload survives its own finalizer until the
+ * pods are actually torn down. So "the stop was accepted" and "the GPU is
+ * free" are different states, and `confirmed` is the second one. `present`
+ * makes a test hold the workload in the first.
+ */
+function stubSafe(
+  answer: (workloadId: string) => Response | Promise<Response>,
+  opts: { present?: (workloadId: string) => boolean } = {},
+): { stopped: string[]; read: string[] } {
   const stopped: string[] = [];
+  const read: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input.toString();
-    const wid = /\/workloads\/([^/]+)\/stop$/.exec(url)?.[1] ?? "";
-    stopped.push(wid);
-    return await answer(wid);
+    const stopId = /\/workloads\/([^/]+)\/stop$/.exec(url)?.[1];
+    if (stopId !== undefined) {
+      stopped.push(stopId);
+      return await answer(stopId);
+    }
+    const readId = /\/workloads\/([^/]+)$/.exec(url)?.[1] ?? "";
+    read.push(readId);
+    return opts.present?.(readId)
+      ? new Response(JSON.stringify({ id: readId }), { status: 200 })
+      : new Response("not found", { status: 404 });
   }) as typeof globalThis.fetch;
-  return stopped;
+  return { stopped, read };
 }
 
 test("R1 a stop SaFE acknowledges is reported as confirmed", async () => {
   stubDb();
   stubHandles({ main: "w-1" });
-  const stopped = stubSafe(() => new Response("", { status: 200 }));
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   const r = await cancelTask("t-root");
 
@@ -178,7 +233,7 @@ test("R5 a DAG where one of several stops fails is not reported confirmed", asyn
   // unconfirmed.
   stubDb();
   stubHandles({ a: "w-a", b: "w-b", c: "w-c" });
-  const stopped = stubSafe((wid) =>
+  const { stopped } = stubSafe((wid) =>
     new Response("", { status: wid === "w-b" ? 502 : 200 })
   );
 
@@ -198,7 +253,7 @@ test("R5 a DAG where one of several stops fails is not reported confirmed", asyn
 test("R6 a task that never recorded a handle is nothing_held, not a failed release", async () => {
   stubDb();
   stubHandles({});
-  const stopped = stubSafe(() => new Response("", { status: 200 }));
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   const r = await cancelTask("t-root");
 
@@ -215,15 +270,24 @@ test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_he
   // shared a falsy check with "no such handle" and returned early. Something
   // IS held and this code did not release it, so reporting `nothing_held`
   // would assert the opposite of what is true.
+  //
+  // Asserted on stopSandboxByHandle directly, because the aggregate cannot
+  // tell this apart: `nothing_held` for the one handle of a non-empty DAG
+  // aggregates to `unconfirmed` too, so a cancel-level assertion would stay
+  // green with the branch returning exactly the wrong value.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
   handleRegistry.destroy = async () => "";
-  const stopped = stubSafe(() => new Response("", { status: 200 }));
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
-  const r = await cancelTask("t-root");
-
-  assert.equal(r.released, "unconfirmed");
+  assert.equal(await stopSandboxByHandle("t-root", "main", "s-1"), "unconfirmed");
   assert.deepEqual(stopped, [], "there is no workload id to issue a stop against");
+  assert.equal(
+    await unreleasedRecord.any("t-root"), true,
+    "and it is on record, so the next caller does not read the empty map as nothing_held",
+  );
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed", "and it aggregates through");
 });
 
 test("R8 a failed release changes nothing about the cancellation itself", async () => {
@@ -238,7 +302,9 @@ test("R8 a failed release changes nothing about the cancellation itself", async 
 
   assert.equal(r.ok, true);
   assert.equal(r.cancelled, 1, "the rows were still transitioned");
-  assert.equal(r.interrupt_key, "t-root", "the interrupt is still published");
+  assert.equal(r.interrupt_key, "t-root", "and the interrupt is still addressed");
+  // That the interrupt is actually PUBLISHED is the route's half of this, and
+  // is asserted where it happens -- see R10, which watches the seam.
 });
 
 test("R9 a non-root cancel omits the field rather than guessing at it", async () => {
@@ -266,21 +332,166 @@ test("R9 a non-root cancel omits the field rather than guessing at it", async ()
   assert.equal("released" in r, false, "no sandbox was touched, so nothing is established");
 });
 
-test("R10 the route forwards the field and leaves the rest of the response alone", async () => {
-  // Read from source rather than through a Fastify instance, which would need
-  // NATS: what matters is the shape of the object the handler returns, and that
-  // `ok` / `cancelled` and the status code are not rewritten alongside it.
-  const src = await import("node:fs/promises").then((fs) =>
-    fs.readFile(new URL("../src/routes/tasks.ts", import.meta.url), "utf-8")
-  );
-  const handler = src.slice(src.indexOf('"/v1/tasks/:taskId/cancel"'));
-  const body = handler.slice(0, handler.indexOf("/v1/tasks/:taskId/retry"));
+/** The cancel route, with the caller already authorized. */
+async function cancelOverHttp(taskId: string): Promise<{ status: number; body: unknown }> {
+  const app = Fastify();
+  app.addHook("preHandler", async (req) => {
+    (req as unknown as { user: unknown }).user = CALLER;
+  });
+  await registerTaskRoutes(app);
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "POST", url: `/v1/tasks/${taskId}/cancel` });
+    return { status: res.statusCode, body: JSON.parse(res.body) };
+  } finally {
+    await app.close();
+  }
+}
 
-  assert.match(
-    body, /\.\.\.\(r\.released \? \{ released: r\.released \} : \{\}\)/,
-    "the field is spread in only when the cancel established something",
+test("R10 the route answers 200 with the field added and nothing else changed", async () => {
+  // Over HTTP rather than by matching the handler's source. A source match
+  // cannot see a status code -- a `reply.status(500)` added before the return
+  // would leave it green -- and the status code is one of the three things
+  // this change promised not to touch.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  stubSafe(() => new Response("boom", { status: 500 }));
+  let published: string[] = [];
+  interruptDelivery.publish = (key: string) => { published.push(key); };
+
+  const failed = await cancelOverHttp("t-root");
+
+  assert.equal(failed.status, 200, "a release that could not be established is still a 200");
+  assert.deepEqual(
+    failed.body, { ok: true, cancelled: 1, released: "unconfirmed" },
+    "the whole body: `ok` and `cancelled` as before, `released` added beside them",
   );
-  assert.match(body, /ok: true,\s*cancelled: r\.cancelled,/, "the existing fields are unchanged");
+  assert.deepEqual(published, ["t-root"], "and the interrupt still went out");
+
+  // The same request when the release does land, so the field is shown to
+  // track the outcome rather than being a constant the route always appends.
+  stubHandles({ main: "w-1" });
+  stubSafe(() => new Response("", { status: 200 }));
+  const ok = await cancelOverHttp("t-root");
+  assert.deepEqual(ok.body, { ok: true, cancelled: 1, released: "confirmed" });
+});
+
+test("R11 a repeat cancel does not downgrade a failed release to nothing_held", async () => {
+  // The hole the record exists to close, and the one place the forbidden
+  // inference could still get in. The first cancel empties the handle map
+  // BEFORE its stop fails; a second cancel therefore reads an empty map, and
+  // reading that as "nothing was ever held" turns a leaked GPU into a clean
+  // bill of health -- exactly what this feature was asked to stop doing.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  stubSafe(() => new Response("boom", { status: 500 }));
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+  assert.deepEqual(await handleRegistry.listForDag("t-root"), {}, "the map is empty now");
+
+  const second = await cancelTask("t-root");
+  assert.equal(
+    second.released, "unconfirmed",
+    "the workload was never released, and a second look must not say otherwise",
+  );
+});
+
+test("R12 a DAG whose release was confirmed reports nothing_held on a repeat", async () => {
+  // The other side of R11: the record must not be a one-way latch that makes
+  // every DAG unconfirmed forever. A confirmed release clears the entry, and
+  // a later call over an empty map then answers accurately -- nothing is held
+  // and nothing escaped.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  stubSafe(() => new Response("", { status: 200 }));
+
+  assert.equal((await cancelTask("t-root")).released, "confirmed");
+  assert.equal((await cancelTask("t-root")).released, "nothing_held");
+});
+
+test("R13 a stop SaFE accepts but has not finished is unconfirmed", async () => {
+  // SaFE's stop returns once it has set the phase and issued a Kubernetes
+  // delete; the pods come down afterwards, under a finalizer that keeps the
+  // Workload readable until they do. So a 200 with the object still present
+  // means the teardown is in flight and the GPU is not free yet, and calling
+  // that `confirmed` would repeat the original lie one layer in.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  const { read } = stubSafe(
+    () => new Response("", { status: 202 }),
+    { present: () => true },
+  );
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+  assert.deepEqual(read, ["w-1"], "the accepted stop is checked, not taken at its word");
+});
+
+test("R14 the confirming read timing out is unconfirmed, not confirmed", async () => {
+  stubDb();
+  stubHandles({ main: "w-1" });
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/stop")) return new Response("", { status: 200 });
+    throw Object.assign(new Error("The operation was aborted due to timeout"), {
+      name: "TimeoutError",
+    });
+  }) as typeof globalThis.fetch;
+
+  assert.equal(
+    (await cancelTask("t-root")).released, "unconfirmed",
+    "not knowing whether the workload is gone is not knowing it is gone",
+  );
+});
+
+test("R15 an unreadable handle registry is unconfirmed, never nothing_held", async () => {
+  // The KV adapter used to turn every read failure into `null`, which
+  // `listForDag` renders as `{}`. Classifying that as "holds nothing" would let
+  // an unreachable NATS report a clean release for every DAG in the fleet.
+  stubDb();
+  handleRegistry.listForDag = async () => { throw new Error("nats: no responders"); };
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+});
+
+test("R16 cleanup that throws is contained: 200, and the other handles still run", async () => {
+  // `loadPlatformKeyForSession` runs outside the stop's own try/catch, so a
+  // database hiccup threw straight through the aggregate and out of
+  // cancelTask -- producing a 500 for a cancellation already written to the
+  // database, and abandoning every handle after the first.
+  const live = new Map([["a", "w-a"], ["b", "w-b"]]);
+  db.query = (async (text: string, params: unknown[] = []) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
+      return params[0] === "t-root" ? { rows: [DAG_ROOT], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith("SELECT user_id FROM claw_sessions")) {
+      return { rows: [{ user_id: CALLER.userId }], rowCount: 1 };
+    }
+    if (sql.startsWith("SELECT config FROM claw_sessions")) throw new Error("db: connection reset");
+    if (sql.startsWith("UPDATE claw_tasks SET status")) {
+      return { rows: [{ ...DAG_ROOT, status: "cancelled" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  handleRegistry.listForDag = async () =>
+    Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  const destroyed: string[] = [];
+  handleRegistry.destroy = async (_dag: string, name: string) => {
+    destroyed.push(name);
+    const wid = live.get(name) ?? null;
+    live.delete(name);
+    return wid;
+  };
+  stubSafe(() => new Response("", { status: 200 }));
+
+  const res = await cancelOverHttp("t-root");
+
+  assert.equal(res.status, 200, "the verdict is written; a cleanup that threw is not the caller's 500");
+  assert.deepEqual(res.body, { ok: true, cancelled: 1, released: "unconfirmed" });
+  assert.deepEqual(
+    destroyed, ["a", "b"],
+    "the second handle is still attempted -- one broken teardown must not abandon the rest",
+  );
 });
 
 test("stopAllHandlesForDag aggregates on its own, without a cancel around it", async () => {

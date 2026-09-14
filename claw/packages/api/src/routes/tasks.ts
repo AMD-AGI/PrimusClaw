@@ -170,6 +170,26 @@ async function loadPluginRow(pluginId: number) {
   return row;
 }
 
+/**
+ * Seam over interrupt delivery, in the shape `tasks/sandbox-stopper.ts` uses
+ * for the handle registry and `events/consumer.ts` for the tombstone bucket.
+ *
+ * `nc` is a live binding on a frozen module namespace, so until this existed
+ * the cancel handler could not be reached at all without a NATS server -- which
+ * is why the one thing it now has to get right, the response it builds, had no
+ * test that exercised it as HTTP. With the seam a test can assert the status
+ * code and the whole body, and can see whether the interrupt was published,
+ * rather than matching the handler's source text and hoping.
+ */
+export const interruptDelivery = {
+  publish(interruptKey: string): void {
+    nc.publish(interruptSubject(interruptKey));
+  },
+  flush(): Promise<void> {
+    return nc.flush();
+  },
+};
+
 export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { sessionId: string }; Body: CreateTaskBody }>(
     "/v1/sessions/:sessionId/tasks",
@@ -337,10 +357,10 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
       const r = await cancelTask(req.params.taskId);
       if (!r.ok) return reply.status(404).send({ ok: false, error: "not_found_or_terminal" });
       if (r.interrupt_key) {
-        nc.publish(interruptSubject(r.interrupt_key));
+        interruptDelivery.publish(r.interrupt_key);
         try {
           await Promise.race([
-            nc.flush(),
+            interruptDelivery.flush(),
             new Promise<never>((_, reject) =>
               setTimeout(() => reject(new Error("interrupt flush timed out")), 2_000)
             ),

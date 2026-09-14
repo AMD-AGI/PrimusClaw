@@ -24,17 +24,25 @@ delete process.env.SAFE_API_URL;
 
 const { SAFE_API_URL } = await import("../src/config.js");
 const { db } = await import("../src/infra/db.js");
-const { handleRegistry } = await import("../src/tasks/sandbox-stopper.js");
+const { handleRegistry, unreleasedRecord } = await import("../src/tasks/sandbox-stopper.js");
 const { cancelTask } = await import("../src/tasks/lifecycle.js");
 
 const originalQuery = db.query;
 const originalRegistry = { ...handleRegistry };
+const originalRecord = { ...unreleasedRecord };
 const originalFetch = globalThis.fetch;
 after(() => {
   db.query = originalQuery;
   Object.assign(handleRegistry, originalRegistry);
+  Object.assign(unreleasedRecord, originalRecord);
   globalThis.fetch = originalFetch;
 });
+
+// In-memory stand-in for the KV-backed record, same contract.
+const recorded = new Set<string>();
+unreleasedRecord.mark = async (_dag, handle) => { recorded.add(handle); };
+unreleasedRecord.clear = async (_dag, handle) => { recorded.delete(handle); };
+unreleasedRecord.any = async () => recorded.size > 0;
 
 test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", async () => {
   assert.equal(SAFE_API_URL, "", "the premise of this file: the setting is absent");
@@ -76,4 +84,8 @@ test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", asy
     "a handle was held and nothing released it; the caller has to be able to see that",
   );
   assert.equal(r.ok, true, "and the cancellation still stands");
+  assert.equal(
+    await unreleasedRecord.any("t-root"), true,
+    "and it is on record, so the next cancel does not read the emptied map as nothing_held",
+  );
 });
