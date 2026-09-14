@@ -45,6 +45,7 @@
  *   R16 cleanup that throws is contained: still a 200, later handles still run
  *   R17 a handle that leaked earlier is not confirmed away by a later teardown
  *   R18 a handle is on record before its stop runs, not after it fails
+ *   R19 a destroy whose response was lost is recorded, not forgotten
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -590,4 +591,33 @@ test("stopAllHandlesForDag aggregates on its own, without a cancel around it", a
   stubHandles({ a: "w-a", b: "w-b" });
   stubSafe((wid) => new Response("", { status: wid === "w-a" ? 503 : 200 }));
   assert.equal(await stopAllHandlesForDag("t-root", "s-1"), "unconfirmed");
+});
+
+test("R19 a destroy whose response was lost is recorded, not forgotten", async () => {
+  // The last way a false clear could get in. `destroy` removes the mapping on
+  // the server and the response is lost; the handle is now gone from the map
+  // with nothing recorded anywhere, so the next caller reads an empty map, an
+  // empty record, and answers `nothing_held` for a workload never stopped.
+  //
+  // Recorded with an empty workload id, which is the truth -- `destroy` is what
+  // would have returned it. The deliberate cost is that nothing clears this
+  // entry, because no later teardown revisits a handle that is no longer in the
+  // map. A standing false alarm is visible and checkable; a false clear on a
+  // live GPU is neither.
+  stubDb();
+  handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
+  handleRegistry.destroy = async () => { throw new Error("nats: request timeout"); };
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+  assert.deepEqual(stopped, [], "no workload id came back, so no stop could be issued");
+  assert.equal(
+    await unreleasedRecord.any("t-root"), true,
+    "the handle has to be on record, or the next cancel reads the gap as nothing_held",
+  );
+
+  // The next caller, with the map now genuinely empty: the record is what stops
+  // it inventing the one answer it must never invent.
+  handleRegistry.listForDag = async () => ({});
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
 });

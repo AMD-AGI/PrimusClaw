@@ -382,15 +382,24 @@ export async function stopSandboxByHandle(
     wid = await handleRegistry.destroy(dagRootTaskId, handleName);
   } catch (e) {
     // The mapping may or may not have been removed and the stop was never
-    // attempted, so this says nothing about the workload either way. It is
-    // also the one branch with no handle id to record against: `destroy` did
-    // not answer, so there is nothing to write. The `unconfirmed` returned here
-    // is what a concurrent reader would miss, which is why the aggregate does
-    // not trust its own loop alone -- see stopAllHandlesForDag.
+    // attempted. That second possibility is the dangerous one: a `destroy` the
+    // server executed and whose response was lost leaves the handle gone from
+    // the map with nothing recorded anywhere, so the next caller reads an empty
+    // map, an empty record, and answers `nothing_held` for a workload that was
+    // never stopped.
+    //
+    // So it is recorded here too, with an empty workload id -- which is the
+    // truth, since `destroy` is what would have returned it. The cost is that
+    // nothing can ever clear this entry: if the handle is gone from the map, no
+    // later teardown will revisit it, and the DAG answers `unconfirmed` from
+    // now on. That is the right way round to be wrong. A standing false alarm
+    // on a DAG whose KV read failed is visible and checkable; a false clear on
+    // a live GPU is neither, and is the whole reason this field exists.
     logger.warn(
       { dagRootTaskId, handleName, err: errText(e) },
       "sandbox.handle_destroy_failed",
     );
+    await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed");
     return "unconfirmed";
   }
   if (wid === null) return "nothing_held";
@@ -448,6 +457,14 @@ async function rememberOutcome(
     if (released === "confirmed") await unreleasedRecord.clear(dagRootTaskId, handleName);
     else await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
   } catch (e) {
+    // Swallowed, and not a silent loss of evidence: this record lives on
+    // `claw_tasks`, and a database that cannot take this write is one that
+    // could not take the cancellation's own verdict either -- that write
+    // happens first and throws, so the request fails loudly long before it
+    // reaches here. What is left for this catch is the narrow case of a write
+    // that fails on its own, where the outcome is still returned to this
+    // caller and only the next caller's view of it is lost.
+    //
     // `workloadId` deliberately: this warning is the only trace of a handle
     // whose record was not written, and without the id an operator has to
     // correlate it against a separate `sandbox.destroyed` line to learn which
