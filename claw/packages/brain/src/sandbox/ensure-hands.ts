@@ -228,6 +228,13 @@ export interface SandboxReuseEffects {
     signal?: AbortSignal,
   ) => Promise<ContainerProbeOutcome>;
   restartHandsInSandbox: typeof restartHandsInSandbox;
+  // The two halves of undoing an adoption. Through the seam for the same
+  // reason the rest of it is: the undo runs only when a registration failed,
+  // which no test can reach through a real KV, and it is the piece that has
+  // already been wrong once -- it addressed the Router's session id rather
+  // than Claw's, so it unwound nothing and reported success.
+  unregisterSandbox: typeof unregisterSandbox;
+  markHandsIdle: typeof markHandsIdle;
 }
 
 export interface EnsureHandsOptions {
@@ -253,6 +260,7 @@ export interface EnsureHandsOptions {
 
 const realReuseEffects: SandboxReuseEffects = {
   destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
+  unregisterSandbox, markHandsIdle,
 };
 let reuseEffects: SandboxReuseEffects = realReuseEffects;
 
@@ -633,8 +641,12 @@ async function clearIdleMarkers(
  *
  * `replace` rather than `create`, because the whole point is that a handle of
  * this name may already exist naming the workload this session used before.
+ *
+ * Exported for the same reason `destroyHandleCas` is on the Backend side: the
+ * undo below runs only when a registration failed, which no test reaches
+ * through a real KV, and it is the part that has already been wrong twice.
  */
-async function registerReusedDagHandle(
+export async function registerReusedDagHandle(
   kv: ReuseAttempt["kv"],
   request: ExecuteRequest,
   action: { kind: string; handle?: string },
@@ -690,7 +702,7 @@ async function registerReusedDagHandle(
       // Stop the ticker this adoption started, then put the idle marker back:
       // the two halves of what `acceptExistingSandbox` just did, undone in the
       // reverse order so the entry is never active with nobody pinging it.
-      unregisterSandbox(adoptedSession, identity);
+      reuseEffects.unregisterSandbox(adoptedSession, identity);
       // `markHandsIdle` REPORTS failure rather than throwing -- `superseded`
       // for a revision conflict, `failed` for anything else -- so a catch
       // around it establishes nothing. A conflict is the ordinary case here:
@@ -698,7 +710,7 @@ async function registerReusedDagHandle(
       // unchecked, the local registration is gone while the KV entry still
       // says active, and the next keepalive tick finds the workload again from
       // KV and goes on pinging a sandbox no turn owns.
-      const parked = await markHandsIdle(kv, adoptedSession, identity);
+      const parked = await reuseEffects.markHandsIdle(kv, adoptedSession, identity);
       if (parked.outcome !== "parked" && parked.outcome !== "gone") {
         logger.error(
           { dagRoot, handle: action.handle, sessionId: adoptedSession,
