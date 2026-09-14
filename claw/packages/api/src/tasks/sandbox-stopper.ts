@@ -16,7 +16,7 @@
  *
  * Both KV destroy and SaFE workload stop are idempotent.
  */
-import { DagHandleMap, type HandleInfo } from "@claw/protocol";
+import { DagHandleMap, HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
@@ -29,6 +29,14 @@ const logger = pino({ name: "sandbox-stopper" });
 
 /** Unchanged from before this file reported outcomes. */
 const SAFE_STOP_TIMEOUT_MS = 15_000;
+
+/**
+ * How many times a handle removal re-reads a row that moved under it. Each
+ * retry means a concurrent registration landed, which is rare and self-
+ * limiting; a row that will not settle is a broken invariant, not a busy one,
+ * and is raised rather than retried forever inside a cancel request.
+ */
+const CAS_ATTEMPTS = 5;
 
 /**
  * A rejection is not required to be an `Error`, and every catch on this path
@@ -44,9 +52,11 @@ let _handleMap: DagHandleMap | null = null;
 
 /** The part of the NATS KV surface this adapter uses. */
 export interface KvLike {
-  get(key: string): Promise<{ operation?: string; value: Uint8Array } | null>;
+  get(key: string): Promise<{ operation?: string; value: Uint8Array; revision: number } | null>;
   put(key: string, value: Uint8Array): Promise<unknown>;
-  delete(key: string): Promise<unknown>;
+  /** Revision-conditional put: rejects if the key moved since `revision`. */
+  update(key: string, value: Uint8Array, revision: number): Promise<unknown>;
+  delete(key: string, opts?: { previousSeq: number }): Promise<unknown>;
   keys(filter: string): Promise<AsyncIterable<string>>;
 }
 
@@ -134,6 +144,100 @@ export function makeKvStore(kv: KvLike): KVStore {
 }
 
 /**
+ * Remove one handle from a DAG's row without losing a handle registered
+ * alongside it, and return the workload id it held.
+ *
+ * `DagHandleMap.destroy` is a read-modify-write of the whole row with no
+ * revision on the write, and this module is the only caller of it anywhere:
+ * Brain registers and looks up, never destroys. So the lost-update it allows
+ * has never been reachable -- until this branch pointed the API at the bucket
+ * Brain actually writes, which is precisely what makes it this branch's to
+ * avoid rather than to note.
+ *
+ * The interleaving it allows costs a whole sandbox:
+ *
+ *   API      reads `{a: Wa}` and prepares to write the row without `a`
+ *   Brain    registers `b`, writing `{a: Wa, b: Wb}`
+ *   API      writes `{}` -- `b` is gone, and with it the only reference to Wb
+ *
+ * Nothing then knows Wb exists: not this cancel, not the record, not a later
+ * sweep. It holds its GPU until something outside Claw notices. That is worse
+ * than any misreport, because a misreport at least leaves the evidence intact.
+ *
+ * The write is therefore conditional on the revision the row was read at, and
+ * a conflict re-reads and retries. Conditional on the row, not the handle,
+ * because the row is what the KV versions. Implemented here rather than in
+ * `DagHandleMap` because that class is shared with Brain: giving `KVStore` a
+ * revision is the right fix and is a change to a contract two packages
+ * implement, which belongs in its own review, not smuggled in under this one.
+ *
+ * Takes the bucket rather than closing over the module's own, for the same
+ * reason `makeKvStore` does: what it guarantees is a property of the write it
+ * issues, and a test that cannot supply a bucket with real revision semantics
+ * cannot tell a conditional write from an unconditional one.
+ */
+export async function destroyHandleCas(
+  kv: KvLike,
+  dagRootTaskId: string,
+  handleName: string,
+): Promise<string | null> {
+  const key = `${HANDLE_MAP_PREFIX}.${dagRootTaskId}`;
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+
+  for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
+    const entry = await kv.get(key);
+    if (!entry) return null;
+    if (entry.operation === "DEL" || entry.operation === "PURGE") return null;
+    if (entry.value.length === 0) return null;
+
+    const parsed: unknown = JSON.parse(dec.decode(entry.value));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`handle map entry ${key} is not a JSON object`);
+    }
+    const row = parsed as Record<string, unknown>;
+    const held = row[handleName];
+    // Brain writes a HandleInfo; a legacy entry is the bare workload id.
+    const workloadId = typeof held === "string"
+      ? held
+      : (held as { workload_id?: unknown } | undefined)?.workload_id;
+    if (typeof workloadId !== "string") return null;
+
+    delete row[handleName];
+    try {
+      if (Object.keys(row).length === 0) {
+        await kv.delete(key, { previousSeq: entry.revision });
+      } else {
+        await kv.update(key, enc.encode(JSON.stringify(row)), entry.revision);
+      }
+      return workloadId;
+    } catch (e) {
+      // A conflict means the row moved under us -- which is exactly the case
+      // worth losing a round trip over, since committing would have discarded
+      // whatever moved it. Anything else is a real failure and is the caller's.
+      if (!isRevisionConflict(e)) throw e;
+      logger.info(
+        { dagRootTaskId, handleName, attempt },
+        "sandbox.handle_destroy_retry",
+      );
+    }
+  }
+  throw new Error(
+    `handle map row for ${dagRootTaskId} kept changing under ${CAS_ATTEMPTS} attempts`,
+  );
+}
+
+/**
+ * NATS answers a failed `previousSeq` with a "wrong last sequence" API error.
+ * Matched on text because the client surfaces it as a plain error; anything
+ * unrecognised is deliberately NOT treated as a conflict, so a real failure is
+ * raised rather than retried into the attempt limit and then raised anyway.
+ */
+function isRevisionConflict(e: unknown): boolean {
+  return /wrong last sequence|conflict/i.test(errText(e));
+}
+
+/**
  * Seam over the handle registry, in the shape `events/consumer.ts` uses for the
  * tombstone bucket and for the same reason: `handleMap()` closes over the
  * module-scoped NATS KV, which is a live binding on a frozen module namespace
@@ -143,7 +247,7 @@ export function makeKvStore(kv: KvLike): KVStore {
  */
 export const handleRegistry = {
   destroy(dagRootTaskId: string, handleName: string): Promise<string | null> {
-    return handleMap().destroy(dagRootTaskId, handleName);
+    return destroyHandleCas(kvDagHandles as unknown as KvLike, dagRootTaskId, handleName);
   },
   lookup(dagRootTaskId: string, handleName: string): Promise<HandleInfo | null> {
     return handleMap().lookup(dagRootTaskId, handleName);
