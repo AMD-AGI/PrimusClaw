@@ -28,11 +28,13 @@
  *   U5 clearing a handle that was never marked is a no-op, not a throw
  *   U6 the record is written to the DAG ROOT row, not to a node that shares the id
  *   U7 a DAG root that does not exist is an unknown, not "nothing outstanding"
+ *   U8 the record reaches the caller through the public task read
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { startHarness, seedSession, seedRun, type Harness } from "./scenario-harness.js";
+import { publicTaskRow } from "../src/events/redaction.js";
 
 let h: Harness;
 before(async () => { h = await startHarness(); });
@@ -152,4 +154,33 @@ test("U7 a DAG root that does not exist is an unknown, not nothing outstanding",
   // is no record to read, which is not the same as a record that is empty, and
   // the teardown turns this throw into `unconfirmed`.
   await assert.rejects(() => unreleasedRecord.any("t-nonexistent"));
+});
+
+test("U8 the record reaches the caller through the public task read", () => {
+  // Half the reason the record lives on `metadata` rather than in KV. A
+  // `released: "unconfirmed"` says a sandbox was not released; it cannot say
+  // WHICH handle, or what workload to go and look for, and an operator holding
+  // only the first has nothing to act on. `publicTaskRow` strips the three
+  // credential fields and redacts the rest, so this asserts the record is on
+  // the readable side of that -- a redactor that grew a rule for `*_id` or for
+  // anything under an unfamiliar key would take the actionable half away
+  // silently, leaving an endpoint that still answers and no longer helps.
+  const redacted = publicTaskRow({
+    task_id: "t-root",
+    internal_token_hash: "hash",
+    callback_url: "https://callback",
+    backend_mcp_url: "https://mcp",
+    metadata: {
+      sandbox_release: {
+        unreleased: { main: { workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" } },
+      },
+    },
+  } as never) as unknown as { metadata: Record<string, unknown> };
+
+  const outstanding = (redacted.metadata.sandbox_release as { unreleased: Record<string, unknown> })
+    ?.unreleased;
+  assert.deepEqual(
+    outstanding, { main: { workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" } },
+    "the handle name and the workload id are the two things the caller needs to act",
+  );
 });
