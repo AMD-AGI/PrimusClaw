@@ -44,10 +44,10 @@ export async function initDagHandles(js: JetStreamClient): Promise<DagHandleMap>
   // only one that creates anything: `views.kv` on a bucket that already exists
   // attaches to it and ignores the options, so a bucket first opened without
   // them keeps the JetStream default of one replica until something corrects
-  // it. Correcting that drift needs a JetStreamManager, which this package
-  // does not hold; api reconciles this bucket now -- it did not when this
-  // comment was written, which is why it said "for the life of the cluster" --
-  // as it does for the buckets it owns in
+  // it. Correcting that drift is api's job -- it is the side that implements
+  // the reconcile, and this function is handed a JetStreamClient alone. api
+  // reconciles this bucket now; it did not when this comment was written,
+  // which is why it used to say "for the life of the cluster". See
   // `ensureKvBucket`.
   _kvBucket = await js.views.kv(BUCKET, { replicas: DAG_HANDLES_REPLICAS });
   const adapter: NatsLikeKv = {

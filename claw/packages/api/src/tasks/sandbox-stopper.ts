@@ -260,7 +260,7 @@ function isRevisionConflict(e: unknown): boolean {
  * tombstone bucket and for the same reason: `handleMap()` closes over the
  * module-scoped NATS KV, which is a live binding on a frozen module namespace
  * and so cannot be substituted. A plain object can be, and every registry call
- * on the teardown path goes through these two methods, which is what makes the
+ * on the teardown path goes through these methods, which is what makes the
  * outcomes below testable without a NATS server.
  */
 export const handleRegistry = {
@@ -659,8 +659,11 @@ export async function stopSandboxByHandle(
     return "unconfirmed";
   }
   if (wid === null) {
-    // Someone else destroyed it between the lookup and here. This call
-    // established nothing, and the mark written above stays.
+    // Two ways to get here and neither is a release. The handle went between
+    // the lookup and the destroy, or it is still there naming a DIFFERENT
+    // workload than the one recorded -- the identity check refuses to remove
+    // that one. Either way this call established nothing, and the mark written
+    // above stays.
     //
     // A previous round retracted it, reasoning that the winner keeps their own
     // record. They do not: both callers derive the same key from the same
@@ -702,13 +705,11 @@ export async function stopSandboxByHandle(
  * Keep or drop this handle's entry in the record, without letting the
  * bookkeeping decide the answer.
  *
- * A failed write is logged and swallowed rather than thrown -- but it is NOT
- * inconsequential, and an earlier version of this comment said it cost only
- * the next caller's view. The pre-stop write's `false` stops THIS call from
- * destroying the mapping at all, which is the point: the mapping is the last
- * reference once the record is gone. Swallowing keeps the outcome this call
- * did establish from being thrown away; the caller decides what to do about
- * the bookkeeping having failed.
+ * A failed write is reported, not thrown, and it is not inconsequential: the
+ * pre-stop write returning `false` stops THIS call from destroying the
+ * mapping, which is the point of writing first -- the mapping is the last
+ * reference once the record is gone. Reporting rather than throwing keeps the
+ * outcome this call did establish from being discarded along with it.
  */
 async function rememberOutcome(
   dagRootTaskId: string,
@@ -726,13 +727,12 @@ async function rememberOutcome(
     }
     return true;
   } catch (e) {
-    // Swallowed, and not a silent loss of evidence: this record lives on
-    // `claw_tasks`, and a database that cannot take this write is one that
-    // could not take the cancellation's own verdict either -- that write
-    // happens first and throws, so the request fails loudly long before it
-    // reaches here. What is left for this catch is the narrow case of a write
-    // that fails on its own, where the outcome is still returned to this
-    // caller and only the next caller's view of it is lost.
+    // Contained here so the caller can decide. For the cancel path a database
+    // that cannot take this write could not have taken the cancellation's own
+    // verdict either -- that write happens first and throws -- so the request
+    // has usually failed already. The sweeper and the agent_done callback have
+    // no such write in front of them, so for those this is simply a write that
+    // failed, and `false` is how the caller learns not to drop the mapping.
     //
     // `workloadId` deliberately: this warning is the only trace of a handle
     // whose record was not written, and without the id an operator has to

@@ -188,8 +188,8 @@ config:
                   # with `ttl: 0` and `widenOnly` so it can widen a bucket
                   # somebody created narrow but never narrow brain's, and so
                   # replica drift on a bucket first opened without options can
-                  # be corrected -- which brain cannot do, holding no
-                  # JetStreamManager. CREATE is needed for the ordering where
+                  # be corrected -- which only api does, being the side that
+                  # implements the reconcile. CREATE is needed for the ordering where
                   # api starts first on a fresh cluster.
                   - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
                   - "$JS.API.STREAM.CREATE.KV_DAG_HANDLES"

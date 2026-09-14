@@ -24,9 +24,11 @@
  * message, so the count is reconciled to the exact figure in both directions,
  * while shortening a retention deletes history and is therefore refused.
  *
- * One KV bucket is reconciled the same way, and for a reason of its own: the
- * tombstone bucket's TTL has to cover whatever the event stream actually keeps,
- * so an operator who lengthened it by hand was correcting the code rather than
+ * Two KV buckets are reconciled the same way, each for a reason of its own.
+ * DAG_HANDLES because its TTL is not this process's setting at all -- brain
+ * may have created the bucket. And the tombstone bucket because its TTL has to
+ * cover whatever the event stream actually keeps, so an operator who
+ * lengthened it by hand was correcting the code rather than
  * drifting from it. Reconciling that in both directions narrowed it back on the
  * next start, which left no configuration in which a widened event stream and a
  * tombstone that covered it could both exist. Every other bucket's TTL is a

@@ -57,7 +57,9 @@ export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
  * cluster brings it up -- but only this one reconciles it, because `views.kv`
  * attaches to an existing bucket and ignores its options, so a bucket first
  * opened by brain keeps whatever it was created with until api corrects the
- * drift. Brain cannot: it holds no JetStreamManager. For a long time
+ * drift. Not because brain lacks a JetStreamManager -- its boot makes one --
+ * but because only this side implements the reconcile, and `initDagHandles` is
+ * handed a JetStreamClient alone. For a long time
  * this side did not read it at all: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
  * never writes a handle to, so every teardown it ran found nothing to tear down
  * and every DAG's sandboxes outlived their DAG.

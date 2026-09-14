@@ -333,8 +333,10 @@ export async function cancelTask(
   // branch is for.
   //
   // `released` is deliberately absent from everything this branch returns. A
-  // non-root cancel stops no sandbox: teardown happens later, when the sweeper
-  // reaches the DAG -- the root's own transition only writes status. Answering `nothing_held` here would
+  // non-root cancel stops no sandbox itself. Teardown happens later, by one of
+  // two routes: the `agent_done` this cancellation eventually produces, if this
+  // node is the last user of a handle and no sibling is still live, or the
+  // orphan sweep. Not the root's own transition -- that only writes status. Answering `nothing_held` here would
   // claim no handle was ever recorded, which this branch has not checked and
   // usually is not true, and answering `unconfirmed` would report a failure of
   // an attempt that was never made. Omitting the field says what is actually

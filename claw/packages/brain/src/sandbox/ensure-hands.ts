@@ -700,9 +700,11 @@ export async function registerReusedDagHandle(
     try {
       // The two halves of what `acceptExistingSandbox` just did, undone in the
       // reverse order it did them. `unregisterSandbox` drops THIS session's
-      // entry from the registry the ticker walks -- it stops no ticker and
-      // recalls no ping already sent -- and between it and the park landing
-      // the KV entry still reads active with nothing local pinging it.
+      // entry from the registry the ticker walks. It stops no ticker, recalls
+      // no ping already sent, and does not prevent one the ticker has already
+      // collected this session into its snapshot from being issued after the
+      // unregister returns. What it guarantees is narrower: no LATER snapshot
+      // includes it.
       //
       // The order is still the right way round: reversed, the entry reads idle
       // while a live registration still names it, and the ticker goes on

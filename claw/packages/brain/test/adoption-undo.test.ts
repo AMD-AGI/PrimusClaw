@@ -116,14 +116,16 @@ test("A1 the undo addresses the Claw session, not the Router's", async () => {
 test("A2 it drops the registration before restoring the idle marker", async () => {
   // Precisely: `unregisterSandbox` removes THIS session's entry from the local
   // registry the keepalive ticker walks. It does not stop a ticker -- the
-  // ticker is global -- and it does not recall pings already sent.
+  // ticker is global -- does not recall pings already sent, and does not stop
+  // one already collected into the current tick's snapshot from going out
+  // afterwards. It guarantees only that no later snapshot includes it.
   //
   // The order still matters, in the direction the reverse would be worse: park
   // first and the KV entry reads idle while a live registration still names
   // it, so the ticker keeps pinging something marked parked. This way the
   // registration goes first, and the window between them is one where KV still
-  // reads active with nothing local pinging it -- which the next tick and the
-  // reuse gate both handle.
+  // reads active while no later tick will pick it up -- which the reuse gate
+  // handles when the entry is next considered.
   const { seen } = await adopt("parked");
 
   assert.deepEqual(seen, ["unregister", "park"]);
