@@ -80,11 +80,16 @@ after(restoreAll);
 afterEach(restoreAll);
 beforeEach(() => {
   recorded = new Map();
-  unreleasedRecord.mark = async (dag, handle) => {
+  // Keyed the way production keys it: by workload identity, not handle name,
+  // so a stub cannot hide the identity confusion the real key exists to stop.
+  const key = (handle: string, wid: string) => `${wid || "unknown"}:${handle}`;
+  unreleasedRecord.mark = async (dag, handle, wid) => {
     if (!recorded.has(dag)) recorded.set(dag, new Set());
-    recorded.get(dag)!.add(handle);
+    recorded.get(dag)!.add(key(handle, wid));
   };
-  unreleasedRecord.clear = async (dag, handle) => { recorded.get(dag)?.delete(handle); };
+  unreleasedRecord.clear = async (dag, handle, wid) => {
+    recorded.get(dag)?.delete(key(handle, wid));
+  };
   unreleasedRecord.any = async (dag) => (recorded.get(dag)?.size ?? 0) > 0;
   interruptDelivery.publish = () => {};
   interruptDelivery.flush = async () => {};
@@ -134,6 +139,8 @@ function stubHandles(handles: Record<string, string>): void {
   const live = new Map(Object.entries(handles));
   handleRegistry.listForDag = async (): Promise<Record<string, HandleInfo>> =>
     Object.fromEntries([...live].map(([name, wid]) => [name, { workload_id: wid }]));
+  handleRegistry.lookup = async (_dag: string, name: string): Promise<HandleInfo | null> =>
+    live.has(name) ? { workload_id: live.get(name)! } : null;
   handleRegistry.destroy = async (_dag: string, name: string): Promise<string | null> => {
     if (!live.has(name)) return null;
     const wid = live.get(name)!;
@@ -282,6 +289,7 @@ test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_he
   // green with the branch returning exactly the wrong value.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
+  handleRegistry.lookup = async () => ({ workload_id: "" });
   handleRegistry.destroy = async () => "";
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
@@ -495,6 +503,7 @@ test("R15 an unreadable handle registry is unconfirmed, never nothing_held", asy
     get: async () => { throw new Error("nats: no responders"); },
   } as unknown as Parameters<typeof makeKvStore>[0]));
   handleRegistry.listForDag = (dag: string) => unreachable.listForDag(dag);
+  handleRegistry.lookup = (dag: string, h: string) => unreachable.lookup(dag, h);
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
 });
@@ -563,6 +572,8 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
   }) as typeof db.query;
   handleRegistry.listForDag = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  handleRegistry.lookup = async (_dag: string, name: string) =>
+    live.has(name) ? { workload_id: live.get(name)! } : null;
   const destroyed: string[] = [];
   handleRegistry.destroy = async (_dag: string, name: string) => {
     destroyed.push(name);
@@ -608,11 +619,12 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   // live GPU is neither.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
+  handleRegistry.lookup = async () => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => { throw new Error("nats: request timeout"); };
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
-  assert.deepEqual(stopped, [], "no workload id came back, so no stop could be issued");
+  assert.deepEqual(stopped, [], "the mapping's fate is unknown, so no stop is issued");
   assert.equal(
     await unreleasedRecord.any("t-root"), true,
     "the handle has to be on record, or the next cancel reads the gap as nothing_held",

@@ -29,6 +29,7 @@
  *   U6 the record is written to the DAG ROOT row, not to a node that shares the id
  *   U7 a DAG root that does not exist is an unknown, not "nothing outstanding"
  *   U8 the record reaches the caller through the public task read
+ *   U9 a handle named `token` survives the round trip, database to redactor
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -77,9 +78,14 @@ test("U1 a mark is readable, and leaves the rest of metadata alone", async () =>
     (meta.derived as Record<string, unknown>)?.handle_last_user, { main: "n-2" },
     "a write to sandbox_release must not take the rest of the row's metadata with it",
   );
-  const entry = ((meta.sandbox_release as Record<string, unknown>)
-    ?.unreleased as Record<string, { workload_id: string; at: string }>)?.main;
+  const outstanding = (meta.sandbox_release as Record<string, unknown>)
+    ?.unreleased as Record<string, { handle: string; workload_id: string; at: string }>;
+  // Keyed by workload identity, not by the handle name: a rebuild reuses the
+  // name, and a handle a DAG legitimately calls `token` would be redacted away
+  // as a key. The name is carried in the value, where it is data.
+  const [entry] = Object.values(outstanding);
   assert.equal(entry.workload_id, "w-1", "and the workload id is kept, not just the fact");
+  assert.equal(entry.handle, "main", "with the handle name beside it");
   assert.ok(Date.parse(entry.at) > 0, "with a timestamp an operator can age the leak by");
 });
 
@@ -90,7 +96,9 @@ test("U2 marks accumulate per handle instead of replacing one another", async ()
 
   const outstanding = (await metadata()).sandbox_release as { unreleased: Record<string, unknown> };
   assert.deepEqual(
-    Object.keys(outstanding.unreleased).sort(), ["a", "b"],
+    Object.values(outstanding.unreleased)
+      .map((e) => (e as { handle: string }).handle).sort(),
+    ["a", "b"],
     "a DAG can leak more than one sandbox, and the second must not erase the first",
   );
 });
@@ -100,11 +108,14 @@ test("U3 clearing one handle leaves the others outstanding", async () => {
   await unreleasedRecord.mark("t-root", "a", "w-a");
   await unreleasedRecord.mark("t-root", "b", "w-b");
 
-  await unreleasedRecord.clear("t-root", "a");
+  await unreleasedRecord.clear("t-root", "a", "w-a");
 
   assert.equal(await unreleasedRecord.any("t-root"), true, "b is still unreleased");
   const outstanding = (await metadata()).sandbox_release as { unreleased: Record<string, unknown> };
-  assert.deepEqual(Object.keys(outstanding.unreleased), ["b"]);
+  assert.deepEqual(
+    Object.values(outstanding.unreleased).map((e) => (e as { handle: string }).handle),
+    ["b"],
+  );
 });
 
 test("U4 clearing the last one makes the DAG answer nothing outstanding", async () => {
@@ -113,14 +124,14 @@ test("U4 clearing the last one makes the DAG answer nothing outstanding", async 
   // it reports `unconfirmed` forever and the field stops meaning anything.
   await seedDagRoot();
   await unreleasedRecord.mark("t-root", "a", "w-a");
-  await unreleasedRecord.clear("t-root", "a");
+  await unreleasedRecord.clear("t-root", "a", "w-a");
 
   assert.equal(await unreleasedRecord.any("t-root"), false);
 });
 
 test("U5 clearing a handle that was never marked is a no-op", async () => {
   await seedDagRoot();
-  await unreleasedRecord.clear("t-root", "never-marked");
+  await unreleasedRecord.clear("t-root", "never-marked", "w-x");
 
   assert.equal(await unreleasedRecord.any("t-root"), false);
   assert.deepEqual(
@@ -172,15 +183,55 @@ test("U8 the record reaches the caller through the public task read", () => {
     backend_mcp_url: "https://mcp",
     metadata: {
       sandbox_release: {
-        unreleased: { main: { workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" } },
+        unreleased: {
+        "3f1a9c0b2d4e6f80": { handle: "token", workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" },
+      },
       },
     },
   } as never) as unknown as { metadata: Record<string, unknown> };
 
   const outstanding = (redacted.metadata.sandbox_release as { unreleased: Record<string, unknown> })
     ?.unreleased;
+  // The handle is deliberately named `token` here: `redactPublicJson` replaces
+  // the value under any credential-shaped KEY, and handle names are chosen by
+  // whoever wrote the DAG. Keyed by name, this entry would arrive as
+  // "[REDACTED]" and take the workload id -- the only actionable part -- with
+  // it. Keyed by workload identity, the name is data and survives.
   assert.deepEqual(
-    outstanding, { main: { workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" } },
+    outstanding,
+    { "3f1a9c0b2d4e6f80": { handle: "token", workload_id: "w-1", at: "2026-09-14T00:00:00.000Z" } },
     "the handle name and the workload id are the two things the caller needs to act",
   );
+});
+
+test("U9 a handle named `token` survives the round trip, database to redactor", () => {
+  // U8 asserts a constructed record passes the redactor; this asserts the key
+  // the code actually writes does, for the handle name that provoked the
+  // design. `isSensitiveKey` splits a key into words, so `token`, `w-1:token`
+  // and `handle_token` are all redacted alike -- and a DAG author is entitled
+  // to call a handle `token`. Only a key with no word in it survives, which is
+  // why the key is a digest and both names live in the value.
+  //
+  // Written as one assertion over the real `mark` statement's key, rather than
+  // trusting that the digest "looks safe".
+  return (async () => {
+    await seedDagRoot();
+    await unreleasedRecord.mark("t-root", "token", "w-1");
+
+    const stored = await metadata();
+    const redacted = publicTaskRow({
+      task_id: "t-root", internal_token_hash: "h", callback_url: "c", backend_mcp_url: "m",
+      metadata: stored,
+    } as never) as unknown as { metadata: Record<string, unknown> };
+
+    const outstanding = (redacted.metadata.sandbox_release as { unreleased: Record<string, unknown> })
+      .unreleased;
+    const entries = Object.values(outstanding) as Array<{ handle?: string; workload_id?: string }>;
+    assert.equal(entries.length, 1);
+    assert.equal(
+      entries[0]!.workload_id, "w-1",
+      "the workload id is the actionable half, and a redacted key would have taken it",
+    );
+    assert.equal(entries[0]!.handle, "token", "with the handle name intact beside it");
+  })();
 });

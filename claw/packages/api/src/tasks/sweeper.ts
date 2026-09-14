@@ -1055,18 +1055,29 @@ export async function reapOrphanHandles(): Promise<number> {
   let dropped = 0;
   let unreleased = 0;
   for (const [dagRoot] of all) {
+    // Keyed by `task_id` alone, which is the primary key. The old predicate
+    // also demanded `dag_node_id = '__dag_root__'`, and that was not a
+    // narrowing of the same row -- it was a different row for half the
+    // handles here. Brain registers under `dag_root_task_id ?? task_id`
+    // (ensure-hands.ts), so a standalone task owns a handle under its own
+    // task id, and a standalone task's `dag_node_id` is NULL. Every one of
+    // them therefore matched nothing, read as `missing`, and was reaped as an
+    // orphan -- **while it was still running**, tearing the sandbox out from
+    // under a live task. Nothing had ever executed that path, because the
+    // handle map this walks was the wrong bucket until this branch fixed it.
     const r = await db.query(
-      `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      `SELECT status, session_id FROM claw_tasks WHERE task_id = $1`,
       [dagRoot],
     );
-    const status = r.rows[0]?.status ?? "missing";
+    const owner = r.rows[0] as { status?: string; session_id?: string } | undefined;
+    // A row that is absent is an orphan; a row that is present and not
+    // terminal owns its sandbox, whatever shape of task it is.
+    const status = owner?.status ?? "missing";
     if (status === "completed" || status === "failed" || status === "cancelled" || status === "missing") {
-      // We pass the dag root's session id when known; falling back to ""
-      // is safe because safeStopWorkload reads the platform key from the
-      // session and skips when absent.
-      const sess = await db.query(`SELECT session_id FROM claw_tasks WHERE task_id = $1`, [dagRoot]);
-      const sessionId = sess.rows[0]?.session_id ?? "";
-      if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
+      // The owner's session id when known; falling back to "" is safe because
+      // safeStopWorkload reads the platform key from the session and skips
+      // when absent.
+      if (await stopAllHandlesForDag(dagRoot, owner?.session_id ?? "") === "unconfirmed") unreleased++;
       dropped++;
     }
   }

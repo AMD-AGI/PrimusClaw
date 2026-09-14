@@ -212,12 +212,46 @@ async function maybeStopHandlesForLastUser(
   const root = r.rows[0] as { metadata: Record<string, unknown> };
   const lastUser = ((root.metadata?.derived as Record<string, unknown>)?.handle_last_user
     ?? {}) as Record<string, string>;
-  for (const [handle, nodeId] of Object.entries(lastUser)) {
-    if (nodeId === dagNodeId) {
-      await stopSandboxByHandle(dagRootTaskId, handle, sessionId).catch((e) => {
-        logger.warn({ dagRootTaskId, handle, err: (e as Error).message }, "stop_handle_failed");
-      });
-    }
+  const owned = Object.entries(lastUser).filter(([, nodeId]) => nodeId === dagNodeId);
+  if (owned.length === 0) return;
+
+  // `handle_last_user` is the last node in TOPOLOGICAL order that names the
+  // handle, which is not the last one to finish. Two siblings that both use a
+  // handle created upstream order as [root, A, B], so the map says B -- and if
+  // B finishes first, this would tear the sandbox down with A still running on
+  // it. Giving B the higher priority is enough to make that the normal case.
+  //
+  // Nothing had ever executed this teardown, because the handle map it reaches
+  // was the wrong bucket until this branch fixed it, so the derivation's
+  // looseness has never cost anything. It would now.
+  //
+  // The guard does not need to know which nodes use the handle: if any sibling
+  // is still live, the DAG is not finished with its sandboxes, and the handles
+  // are torn down by the DAG-root transition a moment later anyway. That is the
+  // path `stopAllHandlesForDag` exists for, so the cost of waiting is bounded
+  // by the DAG's own remaining work, and the failure it avoids is destroying a
+  // sandbox under a running task.
+  const live = await db.query(
+    `SELECT 1 FROM claw_tasks
+      WHERE dag_root_task_id = $1
+        AND dag_node_id <> '__dag_root__'
+        AND dag_node_id <> $2
+        AND status NOT IN ('completed','failed','cancelled')
+      LIMIT 1`,
+    [dagRootTaskId, dagNodeId],
+  );
+  if ((live.rowCount ?? 0) > 0) {
+    logger.info(
+      { dagRootTaskId, dagNodeId, handles: owned.map(([h]) => h) },
+      "sandbox.last_user_deferred_siblings_live",
+    );
+    return;
+  }
+
+  for (const [handle] of owned) {
+    await stopSandboxByHandle(dagRootTaskId, handle, sessionId).catch((e) => {
+      logger.warn({ dagRootTaskId, handle, err: (e as Error).message }, "stop_handle_failed");
+    });
   }
 }
 

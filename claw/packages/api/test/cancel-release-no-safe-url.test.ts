@@ -40,8 +40,9 @@ after(() => {
 
 // In-memory stand-in for the KV-backed record, same contract.
 const recorded = new Set<string>();
-unreleasedRecord.mark = async (_dag, handle) => { recorded.add(handle); };
-unreleasedRecord.clear = async (_dag, handle) => { recorded.delete(handle); };
+const key = (h: string, w: string) => `${w || "unknown"}:${h}`;
+unreleasedRecord.mark = async (_dag, h, w) => { recorded.add(key(h, w)); };
+unreleasedRecord.clear = async (_dag, h, w) => { recorded.delete(key(h, w)); };
 unreleasedRecord.any = async () => recorded.size > 0;
 
 test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", async () => {
@@ -68,6 +69,7 @@ test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", asy
 
   handleRegistry.listForDag = async (): Promise<Record<string, HandleInfo>> =>
     ({ main: { workload_id: "w-1" } });
+  handleRegistry.lookup = async (): Promise<HandleInfo | null> => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => "w-1";
 
   let called = false;

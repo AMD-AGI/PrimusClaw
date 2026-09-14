@@ -18,6 +18,7 @@
  */
 import { DagHandleMap, type HandleInfo } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
+import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
@@ -144,6 +145,9 @@ export const handleRegistry = {
   destroy(dagRootTaskId: string, handleName: string): Promise<string | null> {
     return handleMap().destroy(dagRootTaskId, handleName);
   },
+  lookup(dagRootTaskId: string, handleName: string): Promise<HandleInfo | null> {
+    return handleMap().lookup(dagRootTaskId, handleName);
+  },
   listForDag(dagRootTaskId: string): Promise<Record<string, HandleInfo>> {
     return handleMap().listForDag(dagRootTaskId);
   },
@@ -186,6 +190,38 @@ export const handleRegistry = {
  * behind and answers `nothing_held` on a repeat call, which is accurate:
  * nothing is held and nothing escaped.
  */
+/**
+ * The key one outstanding entry is filed under: a digest, not a readable name.
+ *
+ * Two requirements meet here and only a digest satisfies both.
+ *
+ * Identity. A handle name is reused -- a rebuild registers a second workload
+ * under the same name -- so keying by name alone lets one workload's outcome
+ * overwrite or clear another's. An older stop succeeding and clearing a newer
+ * one's failure is a confirmed release invented out of two unrelated events.
+ * The key has to name the workload, not just the handle.
+ *
+ * Redaction. The record's whole point is to be readable through
+ * `GET /v1/tasks/:taskId`, and `redactPublicJson` replaces the value under any
+ * key that *contains a sensitive word* -- `isSensitiveKey` splits the key into
+ * words and matches each. Handle names are chosen by whoever wrote the DAG, so
+ * a DAG may legitimately declare one called `token` or `auth`, and any key
+ * carrying that name as a word -- `token`, `w-1:token`, `handle_token` alike --
+ * comes back `"[REDACTED]"`, taking the workload id with it. The caller is left
+ * knowing a sandbox leaked and not which one, which is the half that mattered.
+ *
+ * So the key is `sha256(handle \0 workload)`, truncated: stable, unique per
+ * workload instance, and made only of hex, which cannot spell any word the
+ * redactor looks for. Both names live in the VALUE, where they are data --
+ * `handle` and `workload_id` are not sensitive keys, which U8 pins.
+ */
+function entryKey(handleName: string, workloadId: string): string {
+  return createHash("sha256")
+    .update(`${handleName}\u0000${workloadId}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
 export const unreleasedRecord = {
   async mark(dagRootTaskId: string, handleName: string, workloadId: string): Promise<void> {
     // One statement, so two cancels racing cannot lose each other's mark the
@@ -203,12 +239,16 @@ export const unreleasedRecord = {
         WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
       [
         dagRootTaskId,
-        handleName,
-        JSON.stringify({ workload_id: workloadId, at: new Date().toISOString() }),
+        entryKey(handleName, workloadId),
+        JSON.stringify({
+          handle: handleName,
+          workload_id: workloadId,
+          at: new Date().toISOString(),
+        }),
       ],
     );
   },
-  async clear(dagRootTaskId: string, handleName: string): Promise<void> {
+  async clear(dagRootTaskId: string, handleName: string, workloadId: string): Promise<void> {
     await db.query(
       `UPDATE claw_tasks
           SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
@@ -218,7 +258,7 @@ export const unreleasedRecord = {
                   COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb) - $2::text
                 ))
         WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
-      [dagRootTaskId, handleName],
+      [dagRootTaskId, entryKey(handleName, workloadId)],
     );
   },
   async any(dagRootTaskId: string): Promise<boolean> {
@@ -377,47 +417,66 @@ export async function stopSandboxByHandle(
   handleName: string,
   sessionId: string,
 ): Promise<ReleaseOutcome> {
+  // Read before destroying, and record before destroying, because `destroy` is
+  // the point of no return: it drops the mapping, and anything not written
+  // down by then cannot be recovered from anywhere. Between the drop and the
+  // first write there used to be a window in which the handle existed in
+  // neither place, and a concurrent cancel landing in it read an empty map and
+  // an empty record and answered `nothing_held` for a workload still running.
+  // A process dying in that window left the same state permanently.
+  //
+  // The cost is one extra KV read per handle, on a path that is already making
+  // an HTTP call to SaFE. The lookup failing is itself an unknown: it may mean
+  // no such handle, and it may mean an unreachable bucket, so it does not get
+  // to be `nothing_held`.
+  let known: HandleInfo | null;
+  try {
+    known = await handleRegistry.lookup(dagRootTaskId, handleName);
+  } catch (e) {
+    logger.warn(
+      { dagRootTaskId, handleName, err: errText(e) },
+      "sandbox.handle_lookup_failed",
+    );
+    return "unconfirmed";
+  }
+  if (known === null) return "nothing_held";
+  if (!known.workload_id) {
+    // agent-sandbox handles are registered with `workload_id: ""` (Brain's
+    // ensureHands), and this path has never had a way to stop one. Something
+    // IS held and this code cannot release it, so `nothing_held` would assert
+    // the opposite of what is true. The mapping is still dropped, as before.
+    logger.warn({ dagRootTaskId, handleName }, "sandbox.stop_unsupported_handle");
+    await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed");
+    await handleRegistry.destroy(dagRootTaskId, handleName).catch((e) => {
+      logger.warn(
+        { dagRootTaskId, handleName, err: errText(e) },
+        "sandbox.handle_destroy_failed",
+      );
+    });
+    return "unconfirmed";
+  }
+
+  // On record first, so the window below is one this can be recovered from
+  // rather than one that loses the handle. Cleared by a release that lands.
+  await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
+
   let wid: string | null;
   try {
     wid = await handleRegistry.destroy(dagRootTaskId, handleName);
   } catch (e) {
-    // The mapping may or may not have been removed and the stop was never
-    // attempted. That second possibility is the dangerous one: a `destroy` the
-    // server executed and whose response was lost leaves the handle gone from
-    // the map with nothing recorded anywhere, so the next caller reads an empty
-    // map, an empty record, and answers `nothing_held` for a workload that was
-    // never stopped.
-    //
-    // So it is recorded here too, with an empty workload id -- which is the
-    // truth, since `destroy` is what would have returned it. The cost is that
-    // nothing can ever clear this entry: if the handle is gone from the map, no
-    // later teardown will revisit it, and the DAG answers `unconfirmed` from
-    // now on. That is the right way round to be wrong. A standing false alarm
-    // on a DAG whose KV read failed is visible and checkable; a false clear on
-    // a live GPU is neither, and is the whole reason this field exists.
+    // The delete may or may not have committed, and the stop was not attempted
+    // either way. Both possibilities are already on record above, which is the
+    // point of writing it first.
     logger.warn(
-      { dagRootTaskId, handleName, err: errText(e) },
+      { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
       "sandbox.handle_destroy_failed",
     );
-    await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed");
     return "unconfirmed";
   }
-  if (wid === null) return "nothing_held";
-  if (wid === "") {
-    logger.warn({ dagRootTaskId, handleName }, "sandbox.stop_unsupported_handle");
-    await rememberOutcome(dagRootTaskId, handleName, "", "unconfirmed");
-    return "unconfirmed";
-  }
-
-  // Marked BEFORE the stop is attempted, not after it fails. Between `destroy`
-  // above and the outcome below, the handle is in neither place: gone from the
-  // map, not yet in the record. A concurrent cancel landing in that window sees
-  // an empty map and an empty record for this handle and answers `confirmed`
-  // for a workload whose only stop is still in flight -- and if this process
-  // dies mid-stop, nothing ever records that the attempt was made at all.
-  // Marking first makes the window fail safe: the worst it can now produce is
-  // an `unconfirmed` that a completed release immediately clears.
-  await rememberOutcome(dagRootTaskId, handleName, wid, "unconfirmed");
+  // Someone else destroyed it between the lookup and here. They own whatever
+  // they did with it; this call established nothing, and the entry recorded
+  // above keeps the DAG from reading the gap as `nothing_held`.
+  if (wid === null) return "unconfirmed";
 
   let released: ReleaseOutcome;
   try {
@@ -454,8 +513,13 @@ async function rememberOutcome(
   released: ReleaseOutcome,
 ): Promise<void> {
   try {
-    if (released === "confirmed") await unreleasedRecord.clear(dagRootTaskId, handleName);
-    else await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
+    // Cleared by identity: this release confirms THIS workload, and says
+    // nothing about another one a rebuild registered under the same name.
+    if (released === "confirmed") {
+      await unreleasedRecord.clear(dagRootTaskId, handleName, workloadId);
+    } else {
+      await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
+    }
   } catch (e) {
     // Swallowed, and not a silent loss of evidence: this record lives on
     // `claw_tasks`, and a database that cannot take this write is one that
