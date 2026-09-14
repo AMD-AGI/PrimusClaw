@@ -78,7 +78,15 @@ test("B3 the api user's NATS allow-list grants the bucket the code names", () =>
   // indistinguishable from the failure mode of the wrong bucket, and is the one
   // this whole PR exists to stop being invisible.
   const perms = read("../../../deploy/nats-values.yaml");
-  const apiBlock = perms.slice(perms.indexOf("- user: api"), perms.indexOf("- user: brain"));
+  // Grant lines only. Matching raw text would let a subject *named in a
+  // comment* -- this file explains several -- read as a permission, which is
+  // the same class of mistake as the allow-list agreeing with the bug.
+  const granted = new Set(
+    perms.slice(perms.indexOf("- user: api"), perms.indexOf("- user: brain"))
+      .split("\n").map((l) => l.trim())
+      .filter((l) => l.startsWith('- "'))
+      .map((l) => l.slice(3, -1)),
+  );
 
   // Every subject class the stopper reaches, each for a different operation:
   // put/delete is a publish, get is a direct read, and the sweeper's kv.keys()
@@ -90,7 +98,13 @@ test("B3 the api user's NATS allow-list grants the bucket the code names", () =>
     `$JS.API.STREAM.UPDATE.KV_${DAG_HANDLES_BUCKET}`,
     `$JS.API.DIRECT.GET.KV_${DAG_HANDLES_BUCKET}.>`,
     `$JS.API.STREAM.MSG.GET.KV_${DAG_HANDLES_BUCKET}`,
+    // Both forms. The server names an ordered consumer itself, so the request
+    // subject has no trailing token -- and addresses it as <stream>.<name>
+    // when it does. Asserting only the bare form let the `.>` grant be deleted
+    // with this test still green and `kv.keys()` failing in the cluster.
     `$JS.API.CONSUMER.CREATE.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.CONSUMER.CREATE.KV_${DAG_HANDLES_BUCKET}.>`,
+    `$JS.API.CONSUMER.INFO.KV_${DAG_HANDLES_BUCKET}.>`,
     `$JS.API.CONSUMER.DELETE.KV_${DAG_HANDLES_BUCKET}.>`,
     // Without flow control, kv.keys() stops yielding -- without throwing --
     // once the bucket is big enough for the server to apply backpressure, so
@@ -98,7 +112,7 @@ test("B3 the api user's NATS allow-list grants the bucket the code names", () =>
     `$JS.FC.KV_${DAG_HANDLES_BUCKET}.>`,
   ]) {
     assert.ok(
-      apiBlock.includes(`"${subject}"`),
+      granted.has(subject),
       `api cannot reach ${subject}, so this teardown fails silently in the cluster`,
     );
   }
