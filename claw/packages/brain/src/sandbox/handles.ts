@@ -126,6 +126,13 @@ const REGISTER_CAS_ATTEMPTS = 5;
  * Backend's teardown finds no handle, reports the DAG holds nothing, and stops
  * nothing. Failing the turn is loud and recoverable; succeeding with an
  * unregistered sandbox is neither.
+ *
+ * What that does NOT add is a turn failing because the map was never bound:
+ * `initDagHandles` is awaited unqualified in `index.ts` boot and nothing
+ * catches it, so a process that is serving has a bound map by construction and
+ * `not_initialized` is reachable only from a test. The failures this newly
+ * surfaces are writes that were genuinely refused -- which is the trade being
+ * made on purpose, and the only one.
  */
 export async function replaceDagHandle(
   dagRootTaskId: string,
