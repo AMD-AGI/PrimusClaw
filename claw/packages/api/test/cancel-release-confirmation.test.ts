@@ -39,8 +39,8 @@
  *   R10 the route answers 200 with the field added and nothing else changed
  *   R11 a repeat cancel does not downgrade a failed release to `nothing_held`
  *   R12 a confirmed release does clear, so a repeat is not latched unconfirmed
- *   R13 a stop SaFE accepted but has not finished is `unconfirmed`
- *   R14 the confirming read timing out is `unconfirmed`
+ *   R13 an accepted stop is `confirmed`, with no second request behind it
+ *   R14 a deleted handle key reads as absent, not as a corrupt entry
  *   R15 an unreadable handle registry is `unconfirmed`, never `nothing_held`
  *   R16 cleanup that throws is contained: still a 200, later handles still run
  */
@@ -409,37 +409,62 @@ test("R12 a DAG whose release was confirmed reports nothing_held on a repeat", a
   assert.equal((await cancelTask("t-root")).released, "nothing_held");
 });
 
-test("R13 a stop SaFE accepts but has not finished is unconfirmed", async () => {
-  // SaFE's stop returns once it has set the phase and issued a Kubernetes
-  // delete; the pods come down afterwards, under a finalizer that keeps the
-  // Workload readable until they do. So a 200 with the object still present
-  // means the teardown is in flight and the GPU is not free yet, and calling
-  // that `confirmed` would repeat the original lie one layer in.
+test("R13 an accepted stop is confirmed, and only one request is made", async () => {
+  // `confirmed` means SaFE accepted the stop. It deliberately does NOT mean the
+  // GPU is free -- SaFE tears the data plane down asynchronously under a
+  // finalizer, so the two differ by whatever the controller is behind by.
+  //
+  // A review round tried to close that gap with a follow-up
+  // `GET /api/v1/workloads/<id>`, confirming only on a 404. It cannot: the
+  // apiserver's read is database-backed and filters `is_deleted = false`, while
+  // the stop path writes phase/end_time/deletion_time and never `is_deleted`.
+  // The read answers 200 for a perfectly normal stop, so that version reported
+  // `unconfirmed` for every successful cancellation there is. This asserts the
+  // absence of that second request, because a field that cries wolf constantly
+  // is worse than the silence it replaced.
   stubDb();
   stubHandles({ main: "w-1" });
-  const { read } = stubSafe(
-    () => new Response("", { status: 202 }),
-    { present: () => true },
-  );
+  const { stopped, read } = stubSafe(() => new Response("", { status: 200 }));
 
-  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
-  assert.deepEqual(read, ["w-1"], "the accepted stop is checked, not taken at its word");
+  assert.equal((await cancelTask("t-root")).released, "confirmed");
+  assert.deepEqual(stopped, ["w-1"]);
+  assert.deepEqual(read, [], "no confirming read: it would report a clean stop as a failure");
 });
 
-test("R14 the confirming read timing out is unconfirmed, not confirmed", async () => {
-  stubDb();
-  stubHandles({ main: "w-1" });
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
-    const url = typeof input === "string" ? input : input.toString();
-    if (url.endsWith("/stop")) return new Response("", { status: 200 });
-    throw Object.assign(new Error("The operation was aborted due to timeout"), {
-      name: "TimeoutError",
-    });
-  }) as typeof globalThis.fetch;
+test("R14 a deleted handle key reads as absent, not as a corrupt entry", async () => {
+  // The KV adapter now lets read failures propagate so an unreadable registry
+  // cannot be reported as `nothing_held` (R15). That made the tombstone matter:
+  // `kv.get` does not filter DEL/PURGE -- it answers with the deleted entry,
+  // whose value is empty -- and an empty body is exactly what a stricter JSON
+  // parse calls corrupt. Every handle this module destroys leaves one behind,
+  // so without the DEL check a completely clean teardown reads as unreadable
+  // and every later cancel of that DAG answers `unconfirmed` forever.
+  const { makeKvStore } = await import("../src/tasks/sandbox-stopper.js");
+  /** Only `get` is exercised here; the rest of the bucket is never reached. */
+  const bucket = (get: () => Promise<unknown>) =>
+    makeKvStore({ get } as unknown as Parameters<typeof makeKvStore>[0]);
 
   assert.equal(
-    (await cancelTask("t-root")).released, "unconfirmed",
-    "not knowing whether the workload is gone is not knowing it is gone",
+    await bucket(async () => ({ operation: "DEL", value: new Uint8Array() }))
+      .get("dag-handles.t-root"),
+    null,
+    "a destroyed handle is a key that is not there, not a key that is broken",
+  );
+  assert.equal(
+    await bucket(async () => ({ operation: "PUT", value: new Uint8Array() }))
+      .get("dag-handles.t-root"),
+    null,
+    "and so is an empty value that carries no operation marker",
+  );
+  await assert.rejects(
+    () => bucket(async () => ({ operation: "PUT", value: new TextEncoder().encode("{oops") }))
+      .get("dag-handles.t-root"),
+    "while a genuinely corrupt payload is an unknown, which must not read as absent",
+  );
+  await assert.rejects(
+    () => bucket(async () => { throw new Error("nats: no responders"); })
+      .get("dag-handles.t-root"),
+    "as is a bucket that cannot be reached at all",
   );
 });
 

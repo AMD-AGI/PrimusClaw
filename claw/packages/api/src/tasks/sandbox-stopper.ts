@@ -28,39 +28,38 @@ const logger = pino({ name: "sandbox-stopper" });
 
 /** Unchanged from before this file reported outcomes. */
 const SAFE_STOP_TIMEOUT_MS = 15_000;
-/**
- * The confirming read is shorter than the stop it follows. It runs inside a
- * cancel request, once per handle, and its answer when it times out is the same
- * `unconfirmed` a caller gets from not asking -- so a slow SaFE must cost the
- * request as little as possible rather than doubling its worst case.
- */
-const SAFE_READ_TIMEOUT_MS = 5_000;
-
-/**
- * Its own key space beside `dag-handles.<root>`, not a field inside the handle
- * entry: the entry is deleted before the stop runs, so anything kept there is
- * gone exactly when it would be needed.
- */
-const UNRELEASED_PREFIX = "dag-unreleased";
 
 let _handleMap: DagHandleMap | null = null;
-let _kvStore: KVStore | null = null;
+
+/** The part of the NATS KV surface this adapter uses. */
+export interface KvLike {
+  get(key: string): Promise<{ operation?: string; value: Uint8Array } | null>;
+  put(key: string, value: Uint8Array): Promise<unknown>;
+  delete(key: string): Promise<unknown>;
+  keys(filter: string): Promise<AsyncIterable<string>>;
+}
 
 /** Build the DagHandleMap on demand using the existing NATS KV bucket. */
 function handleMap(): DagHandleMap {
-  _handleMap ??= new DagHandleMap(kvStore());
+  _handleMap ??= new DagHandleMap(makeKvStore(natsKv as unknown as KvLike));
   return _handleMap;
 }
 
-/** The adapter behind both the handle map and the unreleased record. */
-function kvStore(): KVStore {
-  if (_kvStore) return _kvStore;
-  // Adapt the in-process NATS KV (which the API already owns) into the
-  // KVStore interface DagHandleMap expects. We rely on the same encoding
-  // contract Brain uses to write handle entries: a JSON object payload.
+/**
+ * Adapt a NATS KV bucket into the KVStore interface DagHandleMap expects,
+ * using the same encoding contract Brain writes handle entries with: a JSON
+ * object payload.
+ *
+ * Takes the bucket rather than closing over the module's own, because what it
+ * decides -- which answers mean "absent", which mean "unknown" -- is now load
+ * bearing for whether a DAG can be reported as holding nothing, and that
+ * decision deserves to be exercised directly rather than only through a NATS
+ * server.
+ */
+export function makeKvStore(kv: KvLike): KVStore {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
-  const ks: KVStore = {
+  return {
     // `null` means the key is not there. It used to also mean "the read
     // threw", which the teardown path below now has to be able to tell apart:
     // a bucket that cannot be read says nothing about what a DAG holds, and
@@ -70,8 +69,17 @@ function kvStore(): KVStore {
     // reading as absent. Callers that genuinely do not care still get one --
     // the sweeper tick already contains its sweeps.
     async get(key) {
-      const entry = await natsKv.get(key);
+      const entry = await kv.get(key);
       if (!entry) return null;
+      // A deleted key is not an absent one to `kv.get`: it answers with the
+      // tombstone, whose value is empty. The client filters DEL/PURGE on its
+      // watch paths and deliberately not here, so this is where "deleted" has
+      // to become "absent" -- and above all must not become "corrupt", which is
+      // what an empty body parses as now that a parse failure throws. Every
+      // handle this module destroys leaves one of these behind, so getting it
+      // wrong would report a clean teardown as unreadable.
+      if (entry.operation === "DEL" || entry.operation === "PURGE") return null;
+      if (entry.value.length === 0) return null;
       try {
         return JSON.parse(dec.decode(entry.value)) as Record<string, unknown>;
       } catch (e) {
@@ -79,28 +87,30 @@ function kvStore(): KVStore {
       }
     },
     async put(key, value) {
-      await natsKv.put(key, enc.encode(JSON.stringify(value)));
+      await kv.put(key, enc.encode(JSON.stringify(value)));
     },
     async delete(key) {
-      await natsKv.delete(key);
+      await kv.delete(key);
     },
     async scanPrefix(prefix) {
       const filter = prefix.endsWith(".") ? `${prefix}>` : `${prefix}.>`;
-      const iter = await natsKv.keys(filter);
+      const iter = await kv.keys(filter);
       const out: Array<[string, Record<string, unknown>]> = [];
       for await (const key of iter) {
         if (!key.startsWith(prefix)) continue;
-        const entry = await natsKv.get(key);
+        // Same three answers as `get`, and for the same reasons: a tombstone or
+        // an empty value is a key that is gone, while an entry that will not
+        // parse is an unknown. A scan that silently skipped the last of those
+        // would hand the sweeper a short list of DAGs and call it complete.
+        const entry = await kv.get(key);
         if (!entry) continue;
-        try {
-          out.push([key, JSON.parse(dec.decode(entry.value))]);
-        } catch { /* skip */ }
+        if (entry.operation === "DEL" || entry.operation === "PURGE") continue;
+        if (entry.value.length === 0) continue;
+        out.push([key, JSON.parse(dec.decode(entry.value)) as Record<string, unknown>]);
       }
       return out;
     },
   };
-  _kvStore = ks;
-  return _kvStore;
 }
 
 /**
@@ -123,11 +133,6 @@ export const handleRegistry = {
   },
 };
 
-/** KV key holding the handles of one DAG whose release was never established. */
-function unreleasedKey(dagRootTaskId: string): string {
-  return `${UNRELEASED_PREFIX}.${dagRootTaskId}`;
-}
-
 /**
  * The record that survives a teardown, so a later call can tell "this DAG never
  * held anything" from "this DAG held something and letting go of it failed".
@@ -139,30 +144,76 @@ function unreleasedKey(dagRootTaskId: string): string {
  * anything else got to the handles first: a concurrent cancel, the agent_done
  * path, or the sweeper.
  *
- * It is written only on the unhappy path, cleared as soon as a release for that
+ * **It lives on the DAG root's `metadata`, not in the KV bucket beside the
+ * handle map**, for three reasons that all point the same way:
+ *
+ *   - Lifetime. `BRAIN_REGISTRY` is short-lived coordination state with a
+ *     bucket-wide TTL (`BRAIN_REGISTRY_TTL_MS`, five minutes by default, sized
+ *     for `lock.<key>`). A leaked GPU outlives five minutes; evidence of one
+ *     that expires on that schedule is evidence only for as long as nobody was
+ *     going to look.
+ *   - Concurrency. A JSON blob under one KV key is read-modify-write, and the
+ *     adapter's `put` carries no revision, so two cancels racing lose a mark
+ *     and the lost one is a workload reported as released. Each write here is
+ *     one statement, atomic on the row, and merges rather than replaces.
+ *   - Reach. `publicTaskRow` strips only the three credential fields, so
+ *     anything on `metadata` is already readable through `GET /v1/tasks/:taskId`
+ *     -- the caller can see *which* handle was not released and what workload it
+ *     was, which is the part a `released: "unconfirmed"` alone cannot say.
+ *
+ * Written only on the unhappy path, cleared as soon as a release for that
  * handle is established, and read only when the handle map has nothing to say.
  * A DAG whose handles were all released confirmed therefore leaves nothing
- * behind and answers `nothing_held` on a repeat call, which is accurate: nothing
- * is held and nothing escaped.
+ * behind and answers `nothing_held` on a repeat call, which is accurate:
+ * nothing is held and nothing escaped.
  */
 export const unreleasedRecord = {
   async mark(dagRootTaskId: string, handleName: string, workloadId: string): Promise<void> {
-    const k = unreleasedKey(dagRootTaskId);
-    const existing = (await kvStore().get(k)) ?? {};
-    existing[handleName] = { workload_id: workloadId, at: new Date().toISOString() };
-    await kvStore().put(k, existing);
+    // One statement, so two cancels racing cannot lose each other's mark the
+    // way a read-then-write pair would. `||` merges at each level, so a sibling
+    // key written between this statement's read and its write survives.
+    await db.query(
+      `UPDATE claw_tasks
+          SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'sandbox_release',
+                COALESCE(metadata -> 'sandbox_release', '{}'::jsonb) || jsonb_build_object(
+                  'unreleased',
+                  COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb)
+                    || jsonb_build_object($2::text, $3::jsonb)
+                ))
+        WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      [
+        dagRootTaskId,
+        handleName,
+        JSON.stringify({ workload_id: workloadId, at: new Date().toISOString() }),
+      ],
+    );
   },
   async clear(dagRootTaskId: string, handleName: string): Promise<void> {
-    const k = unreleasedKey(dagRootTaskId);
-    const existing = await kvStore().get(k);
-    if (!existing || !(handleName in existing)) return;
-    delete existing[handleName];
-    if (Object.keys(existing).length === 0) await kvStore().delete(k);
-    else await kvStore().put(k, existing);
+    await db.query(
+      `UPDATE claw_tasks
+          SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'sandbox_release',
+                COALESCE(metadata -> 'sandbox_release', '{}'::jsonb) || jsonb_build_object(
+                  'unreleased',
+                  COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb) - $2::text
+                ))
+        WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      [dagRootTaskId, handleName],
+    );
   },
   async any(dagRootTaskId: string): Promise<boolean> {
-    const existing = await kvStore().get(unreleasedKey(dagRootTaskId));
-    return !!existing && Object.keys(existing).length > 0;
+    const r = await db.query(
+      `SELECT COALESCE(metadata -> 'sandbox_release' -> 'unreleased', '{}'::jsonb)
+                <> '{}'::jsonb AS outstanding
+         FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      [dagRootTaskId],
+    );
+    // No root row is not "nothing outstanding": the row a mark would have been
+    // written to is not there to be read, so this establishes nothing. The
+    // caller turns that into `unconfirmed`, as it does every other unknown.
+    if (r.rowCount === 0) throw new Error(`no dag root row for ${dagRootTaskId}`);
+    return r.rows[0].outstanding === true;
   },
 };
 
@@ -174,13 +225,15 @@ export const unreleasedRecord = {
  * task now -- but opposite meanings for whoever is counting leaked GPUs, and a
  * caller that cannot tell them apart is back where it started.
  *
- *   - `confirmed`   every handle held is established to be gone. Not merely
- *                   accepted -- see `safeStopWorkload` for why a 2xx from
- *                   SaFE's stop is not that.
+ *   - `confirmed`   SaFE accepted the stop for every handle held (2xx, or a
+ *                   404 saying it does not know the workload). Read
+ *                   `safeStopWorkload` before leaning on this: SaFE's teardown
+ *                   is asynchronous, so accepted is the strongest thing its API
+ *                   can be asked, and it is weaker than "the GPU is free".
  *   - `unconfirmed` at least one handle's release was not established: a
  *                   non-2xx, a timeout, an unset `SAFE_API_URL`, a registry
- *                   that could not be read, a teardown still in flight, or a
- *                   handle this path cannot stop at all.
+ *                   that could not be read, or a handle this path cannot stop
+ *                   at all.
  *   - `nothing_held` this DAG holds no handle and none is on record as having
  *                   escaped release. Nothing was leaked.
  *
@@ -195,53 +248,45 @@ export const unreleasedRecord = {
 export type ReleaseOutcome = "confirmed" | "unconfirmed" | "nothing_held";
 
 /**
- * Whether SaFE still knows this workload, asked after a stop was accepted.
- *
- * `false` only for a 404/410, which is the one answer that means the object is
- * gone. Every other outcome -- a 200, a 5xx, a timeout, an unreadable response
- * -- is `true` in the sense that matters here: this side did not establish the
- * workload's absence. The caller reports `unconfirmed` for all of them.
- */
-async function safeWorkloadStillPresent(
-  workloadId: string,
-  platformKey: string,
-): Promise<boolean> {
-  try {
-    const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads/${workloadId}`, {
-      headers: platformKey ? { Authorization: `Bearer ${platformKey}` } : {},
-      signal: AbortSignal.timeout(SAFE_READ_TIMEOUT_MS),
-    });
-    return !(resp.status === 404 || resp.status === 410);
-  } catch (e) {
-    logger.warn({ workloadId, err: (e as Error).message }, "safe.release_read_exception");
-    return true;
-  }
-}
-
-/**
- * Stop one SaFE workload and say whether the workload is actually gone.
+ * Stop one SaFE workload and say whether SaFE accepted the stop.
  *
  * Every branch that used to `return` after a `logger.warn` now answers
- * `unconfirmed` instead, which is the first half of the point: the logging was
- * already correct, it just went somewhere no caller could read. Failure is
- * still not thrown -- cleanup must not fail the cancellation that triggered it.
+ * `unconfirmed` instead, which is the point: the logging was already correct,
+ * it just went somewhere no caller could read. Failure is still not thrown --
+ * cleanup must not fail the cancellation that triggered it.
  *
- * The second half is that **a 2xx from the stop is not a release.** SaFE's
- * `stopWorkload` sets the Workload's phase and issues a Kubernetes delete, then
- * returns; the data-plane objects are torn down afterwards by the job-manager's
- * reconcile loop, which requeues every 10s for as long as any remain and only
- * then drops `WorkloadFinalizer`. So a 200 and a Pod still holding a GPU
- * coexist on any normal controller latency, and persist on a controller that is
- * stuck. Reporting that as `confirmed` would re-tell the exact lie this field
- * was added to stop telling, one layer further in.
+ * A 404 counts as `confirmed`. SaFE does not know the workload, which is the
+ * state the stop was reaching for.
  *
- * That same finalizer is what makes the truth cheap to read: the Workload
- * survives in etcd until the teardown finishes, so one GET separates "gone"
- * from "still going". This waits for no teardown -- it reads once and answers
- * `unconfirmed` if the object is still there, because at that instant it is.
+ * ## What `confirmed` does and does not establish
  *
- * A 404 from the stop itself is `confirmed` without a second call: SaFE does
- * not know the workload, which is the state the stop was reaching for.
+ * It establishes that SaFE accepted the stop, which is the strongest thing this
+ * API can be asked. It does NOT establish that the GPU is free at that instant,
+ * and the difference is real rather than pedantic: `stopWorkload` sets the
+ * Workload's phase and issues a Kubernetes delete, then returns, while the
+ * job-manager tears the data-plane objects down afterwards -- requeuing every
+ * 10s for as long as any remain and only then dropping `WorkloadFinalizer`. So
+ * a 200 and a Pod still holding a GPU coexist on any normal controller latency.
+ *
+ * A round of review tried to close that gap here, by following an accepted stop
+ * with a `GET /api/v1/workloads/<id>` and confirming only on a 404. That does
+ * not work, and the reason is recorded so it is not tried again: the
+ * apiserver's read is **database-backed**, not etcd-backed. `GetWorkload`
+ * filters on `is_deleted = false`, and the stop path writes
+ * `SetWorkloadStopped` -- phase, end_time, deletion_time -- and never
+ * `is_deleted`. The read therefore answers 200 for a workload that stopped
+ * perfectly normally, so wiring it in would have reported `unconfirmed` for
+ * every successful cancellation in the fleet. A field that cries wolf
+ * constantly is worse than the silence it replaces: the one real failure
+ * becomes indistinguishable from the noise.
+ *
+ * The finalizer state that would actually answer the question lives on the CR
+ * in etcd and no endpoint Claw can reach exposes it. Closing this properly
+ * needs a data-plane-completion signal from SaFE. Until there is one,
+ * `confirmed` means accepted, says so wherever it is documented, and the
+ * failures it now surfaces -- a refused stop, a timeout, an unreachable SaFE,
+ * an unconfigured one -- are exactly the ones that were silently dropped
+ * before, which is what this change was asked for.
  */
 async function safeStopWorkload(
   workloadId: string,
@@ -262,21 +307,16 @@ async function safeStopWorkload(
       headers: platformKey ? { Authorization: `Bearer ${platformKey}` } : {},
       signal: AbortSignal.timeout(SAFE_STOP_TIMEOUT_MS),
     });
-    if (resp.status === 404) return "confirmed";
-    if (!resp.ok) {
+    if (!resp.ok && resp.status !== 404) {
       const body = await resp.text();
       logger.warn({ workloadId, status: resp.status, body: body.slice(0, 200) }, "safe.stop_failed");
       return "unconfirmed";
     }
+    return "confirmed";
   } catch (e) {
     logger.warn({ workloadId, err: (e as Error).message }, "safe.stop_exception");
     return "unconfirmed";
   }
-  if (await safeWorkloadStillPresent(workloadId, platformKey)) {
-    logger.warn({ workloadId }, "safe.stop_accepted_but_not_released");
-    return "unconfirmed";
-  }
-  return "confirmed";
 }
 
 async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
