@@ -27,34 +27,60 @@
  *   H1 replace takes over a name that maps to a different workload
  *   H2 replace creates the entry when the name is free
  *   H3 replace leaves other handles of the same DAG alone
- *   H4 the reuse path registers, so an adopted sandbox is not unowned
+ *   H4 a registration that cannot be written fails the turn
+ *   H5 a row that moved under the write is re-read, not overwritten
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { StringCodec } from "nats";
 
-import { initDagHandles, lookupDagHandle, replaceDagHandle } from "../src/sandbox/handles.js";
+import {
+  bindDagHandleKvForTest,
+  initDagHandles,
+  lookupDagHandle,
+  replaceDagHandle,
+} from "../src/sandbox/handles.js";
 
 const sc = StringCodec();
 
-/** An in-memory stand-in for the DAG_HANDLES bucket. */
+/**
+ * An in-memory stand-in for the DAG_HANDLES bucket, with real revision
+ * semantics: `create` refuses an existing key and `update` refuses a stale
+ * revision, the way NATS does. A fake that accepted both unconditionally would
+ * supply the protection these tests are meant to be checking.
+ */
 function fakeJs(initial: Record<string, unknown> = {}) {
   const rows: Record<string, unknown> = { ...initial };
+  const revs: Record<string, number> = {};
+  for (const k of Object.keys(rows)) revs[k] = 1;
   const kv = {
     async get(key: string) {
       const v = rows[key];
-      return v === undefined ? null : { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
+      return v === undefined
+        ? null
+        : { key, value: sc.encode(JSON.stringify(v)), revision: revs[key] ?? 1, operation: "PUT" };
+    },
+    async create(key: string, value: Uint8Array) {
+      if (rows[key] !== undefined) throw new Error("wrong last sequence: key exists");
+      rows[key] = JSON.parse(new TextDecoder().decode(value));
+      revs[key] = 1;
+      return 1;
+    },
+    async update(key: string, value: Uint8Array, rev: number) {
+      if ((revs[key] ?? 0) !== rev) throw new Error(`wrong last sequence: ${revs[key]}`);
+      rows[key] = JSON.parse(new TextDecoder().decode(value));
+      revs[key] = rev + 1;
+      return revs[key];
     },
     async put(key: string, value: Uint8Array) {
       rows[key] = JSON.parse(new TextDecoder().decode(value));
-      return 1;
+      revs[key] = (revs[key] ?? 0) + 1;
+      return revs[key];
     },
-    async delete(key: string) { delete rows[key]; },
+    async delete(key: string) { delete rows[key]; delete revs[key]; },
     async keys() { return (async function* () { for (const k of Object.keys(rows)) yield k; })(); },
   };
-  return { rows, js: { views: { kv: async () => kv } } as never };
+  return { rows, kv, js: { views: { kv: async () => kv } } as never };
 }
 
 // `initDagHandles` memoises, so the first call binds the map for the whole
@@ -63,7 +89,12 @@ function fakeJs(initial: Record<string, unknown> = {}) {
 // without sharing any state, and a test that accidentally depended on
 // another's rows would be asserting about a DAG it never wrote.
 const store = fakeJs();
-before(async () => { await initDagHandles(store.js); });
+before(async () => {
+  await initDagHandles(store.js);
+  // `replaceDagHandle` writes straight to the bucket, so the tests that assert
+  // on its results have to be bound to the same one `lookupDagHandle` reads.
+  bindDagHandleKvForTest(store.kv as never);
+});
 
 test("H1 replace takes over a name that maps to a different workload", async () => {
   // Exactly what `create` refuses. A rebuild has already stopped W-old, so the
@@ -101,25 +132,84 @@ test("H3 replace leaves other handles of the same DAG alone", async () => {
   );
 });
 
-test("H4 the reuse path registers, so an adopted sandbox is not unowned", () => {
-  // Asserted on the source, as the sibling test for the SaFE namespace field
-  // does, because reaching this branch through `ensureHands` needs a live KV,
-  // a provider and a session. What matters is structural and visible here: the
-  // early return that adopts a warm sandbox does not get to return before
-  // ownership has moved.
-  const src = readFileSync(
-    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
-    "utf-8",
+test("H4 a registration that cannot be written fails the turn", async () => {
+  // The failure mode the source-level version of this test could not see: an
+  // early `return` inserted at the top of the helper left both of its regexes
+  // matching. What matters is not that the call is written, it is that a
+  // sandbox nobody could record ownership for is never handed back as if it
+  // were owned.
+  //
+  // A registration is the only record Backend has of what a DAG holds. Swallow
+  // its failure and the DAG runs a workload whose cancel reports `nothing_held`
+  // and issues no stop, while the pod keeps its GPU. Failing the turn is loud
+  // and retryable; succeeding quietly is how the leak becomes invisible.
+  const broken = fakeJs();
+  broken.js = {
+    views: {
+      kv: async () => ({
+        async get() { return null; },
+        async create() { throw new Error("nats: no responders"); },
+        async update() { throw new Error("nats: no responders"); },
+        async put() { throw new Error("nats: no responders"); },
+        async delete() {},
+        async keys() { return (async function* () {})(); },
+      }),
+    },
+  } as never;
+  const restore = bindDagHandleKvForTest(
+    (await (broken.js as unknown as { views: { kv: () => Promise<unknown> } }).views.kv()) as never,
   );
-  const branch = src.slice(src.indexOf("const reused = await tryReuseSessionSandbox("));
-  const body = branch.slice(0, branch.indexOf("\n  }") + 4);
+  try {
+    await assert.rejects(
+      () => replaceDagHandle("dag-4", "main", { workload_id: "W-1" }),
+      /no responders/,
+      "a registration that cannot commit must raise, not return quietly",
+    );
+  } finally {
+    restore();
+  }
+});
 
-  assert.match(
-    body, /await registerReusedDagHandle\([\s\S]*?\);\s*\n\s*return reused;/,
-    "ownership must move with the sandbox, before the reuse path returns",
+test("H5 a conflicting row is re-read rather than overwritten", async () => {
+  // Backend removes handles under a revision-conditional write. A plain
+  // read-modify-write from this side resurrects an entry Backend has just
+  // removed -- reviving a reference to a stopped workload, or undoing the
+  // removal of one that is still running. The two writers have to agree on the
+  // same row version, so a conflict re-reads instead of clobbering.
+  let revision = 7;
+  let row: Record<string, unknown> = { other: { workload_id: "W-other" } };
+  let rejectedOnce = false;
+  const enc = new TextEncoder();
+  const bucket = {
+    async get() {
+      return { value: enc.encode(JSON.stringify(row)), revision, operation: "PUT" };
+    },
+    async update(_k: string, data: Uint8Array, rev: number) {
+      if (!rejectedOnce) {
+        // Backend commits between this caller's read and its write.
+        rejectedOnce = true;
+        row = {};
+        revision += 1;
+        throw new Error("wrong last sequence: 8");
+      }
+      assert.equal(rev, revision, "the retry writes against the version it just read");
+      row = JSON.parse(new TextDecoder().decode(data));
+      return ++revision;
+    },
+    async create() { throw new Error("key exists"); },
+    async put() { throw new Error("unconditional put must not be used here"); },
+    async delete() {},
+    async keys() { return (async function* () {})(); },
+  };
+  const restore = bindDagHandleKvForTest(bucket as never);
+  try {
+    await replaceDagHandle("dag-5", "main", { workload_id: "W-new" });
+  } finally {
+    restore();
+  }
+
+  assert.deepEqual(
+    Object.keys(row), ["main"],
+    "the retry built on what Backend left behind, rather than restoring the stale row",
   );
-  // And it must be a replace: the name may already map to whatever created the
-  // sandbox this DAG is adopting, which is precisely the case `create` refuses.
-  const helper = src.slice(src.indexOf("async function registerReusedDagHandle("));
-  assert.match(helper.slice(0, helper.indexOf("\n}")), /await replaceDagHandle\(/);
 });

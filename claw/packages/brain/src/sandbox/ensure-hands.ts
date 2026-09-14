@@ -656,10 +656,16 @@ async function registerReusedDagHandle(
       user_id: identity.userId,
     });
   } catch (e) {
-    logger.warn(
+    // Not swallowed. Adopting a sandbox whose ownership could not be recorded
+    // hands this DAG a workload that Backend's teardown cannot find: a cancel
+    // reports the DAG holds nothing and stops nothing, while the pod keeps its
+    // GPU. Failing the turn is loud and retryable; succeeding quietly is how
+    // the leak becomes invisible, which is the whole thing this work is about.
+    logger.error(
       { dagRoot, handle: action.handle, err: (e as Error).message },
       "ensureHands.reused_handle_register_failed",
     );
+    throw e;
   }
 }
 
@@ -1136,10 +1142,17 @@ async function provisionHands(
         namespace: nsForSandbox,
       });
     } catch (e) {
-      logger.warn(
+      // Was non-fatal, on the reasoning that a DAG can still complete without
+      // reuse. It can -- but the handle is also the only record Backend has of
+      // what this DAG holds, so a swallowed failure leaves a live workload
+      // that a cancel reports as `nothing_held` and never stops. Losing reuse
+      // is a cost; losing the ability to account for a GPU is not one to take
+      // silently.
+      logger.error(
         { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
         "ensureHands.handle_register_failed",
       );
+      throw e;
     }
   }
 
@@ -1364,10 +1377,13 @@ async function ensureHandsAgentSandbox(
           image: workloadImage,
         });
       } catch (e) {
-        logger.warn(
+        // Same reasoning as the SaFE path: the registration is the record that
+        // makes the sandbox accountable, not an optimisation.
+        logger.error(
           { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
           "ensureHands.agent.handle_register_failed",
         );
+        throw e;
       }
     }
 

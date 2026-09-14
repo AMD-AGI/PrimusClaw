@@ -19,7 +19,7 @@
  */
 import type { JetStreamClient, KV } from "nats";
 import { StringCodec } from "nats";
-import { DagHandleMap, type HandleInfo } from "@claw/protocol";
+import { DagHandleMap, HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
 import { natsKvStore, type NatsLikeKv } from "@claw/utils";
 import { DAG_HANDLES_REPLICAS } from "../config.js";
 import pino from "pino";
@@ -94,55 +94,100 @@ export async function lookupDagHandle(
   return await getMap().lookup(dagRootTaskId, handleName);
 }
 
+/** How many times a registration re-reads a row that moved under it. */
+const REGISTER_CAS_ATTEMPTS = 5;
+
 /**
  * Point an existing handle at a different workload, or create it if absent.
  *
- * This replaced a `registerDagHandle` that wrapped `create` directly. That one
- * is gone rather than kept beside this: it had no callers left, and leaving a
- * "refuse if the name exists" primitive next to a "take the name over" one is
- * leaving the exact footgun that produced the bug -- three call sites reached
- * for the stricter of the two, had the rejection swallowed, and ran live
- * sandboxes the map did not name.
+ * `DagHandleMap.create` refuses a name that already maps elsewhere so a
+ * mistaken double-create cannot silently lose a reference. That is the wrong
+ * answer at the two moments a handle legitimately changes hands -- a rebuild,
+ * where the previous workload has already been stopped, and a session reuse,
+ * where a DAG adopts a sandbox another task created. Both were reaching for
+ * `create`, being rejected, and having the rejection swallowed by the caller,
+ * so the map named a stopped workload or nothing at all while a live sandbox
+ * ran unreferenced.
  *
- * `create` deliberately refuses to overwrite a name that already maps
- * elsewhere, so that a mistaken double-create cannot silently lose a
- * reference. That guard is right for a fresh registration and wrong for the
- * two moments a handle legitimately changes hands:
+ * Written here against the bucket rather than through `DagHandleMap`, for the
+ * reason Backend's `destroyHandleCas` is: the map's writes carry no revision,
+ * and Backend now removes handles under a revision-conditional write. A plain
+ * read-modify-write from this side resurrects an entry Backend has just
+ * removed -- reviving a reference to a workload that was stopped, or undoing
+ * the removal of one that was not -- so the two writers have to agree on the
+ * same row version. Conflicts re-read and retry.
  *
- *   - a rebuild, where the old workload has already been stopped and the same
- *     handle must now name its replacement;
- *   - a session reuse, where a DAG takes over a warm sandbox another task
- *     created.
+ * It moves the name and frees nothing: the rebuild path has already stopped
+ * the old workload, and the reuse path must not stop a sandbox it is adopting.
  *
- * Before this existed both went through `create`, were rejected, and had the
- * rejection swallowed at the call site -- leaving the map naming a workload
- * that is gone (rebuild) or absent entirely (reuse), while a live sandbox ran
- * unreferenced. Backend then stopped the wrong thing, or nothing, and reported
- * success either way.
- *
- * The replacement is a single write -- see `DagHandleMap.replace`. Spelling it
- * as destroy-then-create would open a window in which the handle resolves to
- * nothing, and an absent handle is precisely how Backend's teardown decides a
- * DAG holds no sandbox: a cancel landing in that window would answer "nothing
- * held" for a running workload, which is the failure this whole change exists
- * to remove. The old workload id comes back from the write and is logged,
- * because it is the one identifier that otherwise disappears at exactly the
- * moment somebody may need to go looking for it.
- *
- * Stopping the old workload is NOT this function's job and must not become it:
- * the rebuild path has already stopped it, and the reuse path must not stop a
- * sandbox it is adopting. This moves the name; it does not free anything.
+ * **It throws when it cannot commit, and callers must not swallow that.** A
+ * registration is the record that makes a sandbox findable and stoppable, so a
+ * turn that cannot write one is holding a workload nothing can account for:
+ * Backend's teardown finds no handle, reports the DAG holds nothing, and stops
+ * nothing. Failing the turn is loud and recoverable; succeeding with an
+ * unregistered sandbox is neither.
  */
 export async function replaceDagHandle(
   dagRootTaskId: string,
   handleName: string,
   info: HandleInfo,
 ): Promise<void> {
-  const previous = await getMap().replace(dagRootTaskId, handleName, info);
-  logger.info(
-    { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
-    "dag-handles.replaced",
+  const kv = _kvBucket;
+  if (!kv) throw new Error("dag-handles.not_initialized -- call initDagHandles(js) at boot");
+  const key = `${HANDLE_MAP_PREFIX}.${dagRootTaskId}`;
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+
+  for (let attempt = 0; attempt < REGISTER_CAS_ATTEMPTS; attempt += 1) {
+    const entry = await kv.get(key);
+    const absent = !entry
+      || entry.operation === "DEL"
+      || entry.operation === "PURGE"
+      || entry.value.length === 0;
+
+    let row: Record<string, unknown> = {};
+    if (!absent) {
+      const parsed: unknown = JSON.parse(dec.decode(entry!.value));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`dag-handles row ${key} is not a JSON object`);
+      }
+      row = parsed as Record<string, unknown>;
+    }
+    const previous = (row[handleName] as { workload_id?: string } | undefined)?.workload_id;
+    // One write that sets the key, never a delete followed by a create: an
+    // absent handle is how Backend decides a DAG holds no sandbox, so a
+    // replacement must not look, even for an instant, like never having had
+    // one.
+    row[handleName] = { ...info, created_at: info.created_at ?? new Date().toISOString() };
+
+    try {
+      const payload = enc.encode(JSON.stringify(row));
+      if (absent) await kv.create(key, payload);
+      else await kv.update(key, payload, entry!.revision);
+      logger.info(
+        { dagRootTaskId, handleName, workloadId: info.workload_id, previousWorkloadId: previous },
+        "dag-handles.replaced",
+      );
+      return;
+    } catch (e) {
+      if (!isRevisionConflict(e)) throw e;
+      logger.info({ dagRootTaskId, handleName, attempt }, "dag-handles.register_retry");
+    }
+  }
+  throw new Error(
+    `dag-handles row for ${dagRootTaskId} kept changing under ${REGISTER_CAS_ATTEMPTS} attempts`,
   );
+}
+
+/**
+ * NATS reports a failed `previousSeq` (and a `create` on an existing key) as a
+ * "wrong last sequence" API error. Anything unrecognised is deliberately not
+ * treated as a conflict, so a real failure is raised rather than retried into
+ * the attempt limit and raised later with worse context.
+ */
+function isRevisionConflict(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /wrong last sequence|conflict|key exists/i.test(msg);
 }
 
 /**
