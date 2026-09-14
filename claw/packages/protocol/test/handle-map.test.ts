@@ -6,10 +6,12 @@
  *
  * The property under test is that a handle name which collides with an object
  * member -- `__proto__`, `constructor` -- is stored and enumerated as a real
- * own key. Admission accepts those names, so a DAG can declare one, and a
- * plain `row[name] = info` silently sets the row's prototype instead: the
- * registration reports success, the row serialises as `{}`, and Backend reads
- * the DAG as holding no sandbox while a live workload keeps its GPU.
+ * own key. Admission accepts those names, so a DAG can declare one. For
+ * `__proto__` a plain `row[name] = info` silently sets the row's prototype
+ * instead -- the registration reports success, the row serialises as `{}`, and
+ * Backend reads the DAG as holding no sandbox while a live workload keeps its
+ * GPU. `constructor` stores fine and is the read side of the same problem: a
+ * row that does not hold it answers with a function.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -57,7 +59,7 @@ test("a handle named __proto__ is stored, not silently swallowed", async () => {
   const all = await map.listAll();
   assert.deepEqual(
     Object.keys(all.find(([dag]) => dag === "dag-p")![1]), ["__proto__"],
-    "the sweeper's enumeration has to see it too, or it reaps a DAG it reads as empty",
+    "the sweeper's enumeration has to see it too, or the DAG it reaches is one it cannot list",
   );
   assert.equal(
     await map.destroy("dag-p", "__proto__"), "W-proto",

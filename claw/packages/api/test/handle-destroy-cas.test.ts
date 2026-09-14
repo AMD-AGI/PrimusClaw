@@ -22,6 +22,10 @@
  * sweep. It holds its GPU until something outside Claw notices. A misreport at
  * least leaves the evidence intact; this destroys it.
  *
+ * The teardown reaches this through `destroyHandleCas`, not `DagHandleMap`:
+ * the class method is what the lost update belongs to, and the production path
+ * stopped using it when this was fixed.
+ *
  * Driven against a fake bucket with real revision semantics, because the
  * property under test IS the revision check — a fake without one would pass
  * whether the code sent a revision or not.

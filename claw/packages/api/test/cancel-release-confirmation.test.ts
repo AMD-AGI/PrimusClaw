@@ -279,10 +279,10 @@ test("R6 a task that never recorded a handle is nothing_held, not a failed relea
 
 test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_held", async () => {
   // agent-sandbox handles are registered with `workload_id: ""` (Brain's
-  // ensureHands), and this path has never had a way to stop one: the old code
-  // shared a falsy check with "no such handle" and returned early. Something
-  // IS held and this code did not release it, so reporting `nothing_held`
-  // would assert the opposite of what is true.
+  // ensureHands), and this path has no way to stop one: the old code shared a
+  // falsy check with "no such handle" and returned early. Something IS held
+  // and this code did not release it, so `nothing_held` would assert the
+  // opposite of what is true.
   //
   // Asserted on stopSandboxByHandle directly, because the aggregate cannot
   // tell this apart: `nothing_held` for the one handle of a non-empty DAG
@@ -390,12 +390,16 @@ test("R10 the route answers 200 with the field added and nothing else changed", 
   assert.deepEqual(ok.body, { ok: true, cancelled: 1, released: "confirmed" });
 });
 
-test("R11 a repeat cancel does not downgrade a failed release to nothing_held", async () => {
-  // The hole the record exists to close, and the one place the forbidden
-  // inference could still get in. The first cancel empties the handle map
-  // BEFORE its stop fails; a second cancel therefore reads an empty map, and
-  // reading that as "nothing was ever held" turns a leaked GPU into a clean
-  // bill of health -- exactly what this feature was asked to stop doing.
+test("R11 a repeat teardown does not downgrade a failed release to nothing_held", async () => {
+  // The hole the record exists to close. The first teardown empties the handle
+  // map BEFORE its stop fails; a second reads an empty map, and reading that as
+  // "nothing was ever held" turns a leaked GPU into a clean bill of health --
+  // exactly what this feature was asked to stop doing.
+  //
+  // Driven by calling cancelTask twice because that is the shortest route to a
+  // second teardown. In production a repeat CANCEL usually matches no rows and
+  // returns before teardown; the second caller here stands for the sweeper or
+  // an agent_done reaching the same DAG.
   stubDb();
   stubHandles({ main: "w-1" });
   stubSafe(() => new Response("boom", { status: 500 }));
@@ -475,7 +479,7 @@ test("R14 a deleted handle key reads as absent, not as a corrupt entry", async (
     await bucket(async () => ({ operation: "PUT", value: new Uint8Array() }))
       .get("dag-handles.t-root"),
     null,
-    "and so is an empty value that carries no operation marker",
+    "and so is an empty value on an ordinary PUT",
   );
   await assert.rejects(
     () => bucket(async () => ({ operation: "PUT", value: new TextEncoder().encode("{oops") }))

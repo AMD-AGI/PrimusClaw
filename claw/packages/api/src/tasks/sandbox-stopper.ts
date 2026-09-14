@@ -8,10 +8,10 @@
  * it created when KV bookkeeping fails inside its own create path. Three
  * entry points feed this module:
  *
- *   1. agent_done callback handler: if the calling task is the last user
- *      of any handle (per DAG `handle_last_user` derived map) AND no sibling
- *      node of that DAG is still live -- the derived map names the last node
- *      in topological order, which is not the last one to finish.
+ *   1. agent_done callback handler: if the calling task is the last user of
+ *      any handle (per DAG `handle_last_user`) AND no sibling node of that DAG
+ *      is still live -- that map names the last node in topological order,
+ *      which is not the last one to finish.
  *   2. cancelTask's DAG-root branch: tear every remaining handle of a DAG it
  *      actually cancelled. A root reaching terminal on its own does NOT run
  *      this -- the scheduler only writes status -- so those handles are the
@@ -100,9 +100,9 @@ export function makeKvStore(kv: KvLike): KVStore {
       // tombstone, whose value is empty. The client filters DEL/PURGE on its
       // watch paths and deliberately not here, so this is where "deleted" has
       // to become "absent" -- and above all must not become "corrupt", which is
-      // what an empty body parses as now that a parse failure throws. Every
-      // handle this module destroys leaves one of these behind, so getting it
-      // wrong would report a clean teardown as unreadable.
+      // what an empty body parses as now that a parse failure throws. A DAG
+      // whose last handle goes has its row deleted, so getting this wrong
+      // reports that clean teardown as unreadable.
       if (entry.operation === "DEL" || entry.operation === "PURGE") return null;
       if (entry.value.length === 0) return null;
       let parsed: unknown;
@@ -152,11 +152,12 @@ export function makeKvStore(kv: KvLike): KVStore {
  * alongside it, and return the workload id it held.
  *
  * `DagHandleMap.destroy` is a read-modify-write of the whole row with no
- * revision on the write, and this module is the only caller of it anywhere:
- * Brain registers and looks up, never destroys. So the lost-update it allows
- * has never been reachable -- until this branch pointed the API at the bucket
- * Brain actually writes, which is precisely what makes it this branch's to
- * avoid rather than to note.
+ * revision on the write, and this module was its only caller anywhere: Brain
+ * registers and looks up, never destroys. So the lost update it allows was
+ * never reachable -- until this branch pointed the API at the bucket Brain
+ * actually writes. That is what made it this branch's to avoid rather than to
+ * note, and why the teardown path now goes through the conditional removal
+ * below instead.
  *
  * The interleaving it allows costs a whole sandbox:
  *
@@ -424,10 +425,11 @@ export const unreleasedRecord = {
 /**
  * What a caller is entitled to believe about a sandbox after a teardown ran.
  *
- * The three values are deliberately not a boolean. "the stop failed" and "there
- * was never anything to stop" have the same shape -- nothing is running for this
- * task now -- but opposite meanings for whoever is counting leaked GPUs, and a
- * caller that cannot tell them apart is back where it started.
+ * The three values are deliberately not a boolean. "the stop failed" and
+ * "there was never anything to stop" both leave this task holding no handle,
+ * yet mean opposite things to whoever is counting leaked GPUs -- in the first
+ * a workload may well still be running -- and a caller that cannot tell them
+ * apart is back where it started.
  *
  *   - `confirmed`   SaFE accepted the stop for every handle held (2xx, or a
  *                   404 saying it does not know the workload). Read
@@ -447,7 +449,8 @@ export const unreleasedRecord = {
  * those apart across calls.
  *
  * `unconfirmed` is the conservative answer and every uncertain case collapses
- * into it; it never means "definitely still running", only "not established".
+ * into it. It never means "definitely still running", nor "nothing is
+ * running" -- only that this side did not establish the release.
  */
 export type ReleaseOutcome = "confirmed" | "unconfirmed" | "nothing_held";
 
@@ -534,8 +537,8 @@ async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
  * which of the two actually happened.
  *
  * The ordering below is load-bearing and is the reason this function has to
- * return anything at all: `destroy` runs FIRST and the stop may then fail, so
- * after this returns the handle map is empty either way. **An empty handle map
+ * return anything at all: when `destroy` does run it runs BEFORE the stop, so a
+ * stop that then fails leaves the mapping already gone. **An empty handle map
  * is evidence the attempt was made, not that it worked** -- nothing downstream
  * may infer release from it, which is why an outcome short of `confirmed` is
  * also written to `unreleasedRecord` before it is returned. The return value
@@ -727,12 +730,8 @@ async function rememberOutcome(
     }
     return true;
   } catch (e) {
-    // Contained here so the caller can decide. For the cancel path a database
-    // that cannot take this write could not have taken the cancellation's own
-    // verdict either -- that write happens first and throws -- so the request
-    // has usually failed already. The sweeper and the agent_done callback have
-    // no such write in front of them, so for those this is simply a write that
-    // failed, and `false` is how the caller learns not to drop the mapping.
+    // Contained here so the caller can decide: `false` is how it learns not to
+    // drop the mapping.
     //
     // `workloadId` deliberately: this warning is the only trace of a handle
     // whose record was not written, and without the id an operator has to

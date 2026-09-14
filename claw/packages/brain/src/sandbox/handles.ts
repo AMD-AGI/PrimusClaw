@@ -124,7 +124,8 @@ const REGISTER_CAS_ATTEMPTS = 5;
  * It moves the name and frees nothing: the rebuild path has already stopped
  * the old workload, and the reuse path must not stop a sandbox it is adopting.
  *
- * **It throws when it cannot commit, and callers must not swallow that.** A
+ * **It throws when it cannot commit -- a refused write, an unreadable row, an
+ * unparseable one -- and callers must not swallow that.** A
  * registration is the record that makes a sandbox findable and stoppable, so a
  * turn that cannot write one is holding a workload nothing can account for:
  * Backend's teardown finds no handle, reports the DAG holds nothing, and stops

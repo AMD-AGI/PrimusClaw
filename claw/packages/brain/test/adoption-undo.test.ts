@@ -22,9 +22,9 @@
  *     `hands.<session>` key are both keyed by Claw's -- so both halves went to
  *     a session that does not exist, and the undo reported success.
  *   - It wrapped `markHandsIdle` in a try/catch. That function REPORTS failure
- *     instead of throwing (`superseded` on a revision conflict, `failed`
- *     otherwise), and a conflict is the ordinary case here because the entry is
- *     live and its TTL is being refreshed underneath. So the catch established
+ *     instead of throwing -- `parked`, `gone`, `skipped`, `superseded` or
+ *     `failed` -- and a conflict is the ordinary case here because the entry
+ *     is live and its TTL is being refreshed underneath. So the catch established
  *     nothing, and an undo that silently did not happen left the local
  *     registration gone while KV still said active -- the next tick finds the
  *     workload again from KV and pings a sandbox no turn owns.
@@ -32,7 +32,7 @@
  * Coverage:
  *   A1 the undo addresses the Claw session, not the Router's
  *   A2 it drops the registration before restoring the idle marker
- *   A3 only an incomplete park is reported as incomplete (real log output)
+ *   A3 only the outcomes meaning "not undone" are reported (real log output)
  *   A4 the sandbox is not stopped -- this path did not create it
  */
 import test, { afterEach } from "node:test";
@@ -123,15 +123,16 @@ test("A2 it drops the registration before restoring the idle marker", async () =
   // The order still matters, in the direction the reverse would be worse: park
   // first and the KV entry reads idle while a live registration still names
   // it, so the ticker keeps pinging something marked parked. This way the
-  // registration goes first, and the window between them is one where KV still
-  // reads active while no later tick will pick it up -- which the reuse gate
-  // handles when the entry is next considered.
+  // registration goes first. Note this does not make the sandbox unreachable:
+  // keepalive also scans `hands.*`, so an entry still marked active is picked
+  // up from KV regardless of the local registry. The park is the half that
+  // decides, which is why A3 checks its outcome.
   const { seen } = await adopt("parked");
 
   assert.deepEqual(seen, ["unregister", "park"]);
 });
 
-test("A3 only an incomplete park is reported as incomplete", async () => {
+test("A3 only the outcomes meaning \"not undone\" are reported", async () => {
   // Asserted on the log the process really writes, in a subprocess, because
   // the previous version of this test matched the source for the condition
   // text -- which passes with the log line deleted, or the condition body
@@ -153,8 +154,8 @@ test("A3 only an incomplete park is reported as incomplete", async () => {
     .filter((l) => l.includes("reused_handle_undo_incomplete"));
 
   assert.equal(
-    incomplete.length, 2,
-    `exactly the two outcomes that did not park should report. stdout:\n${stdout}`,
+    incomplete.length, 3,
+    `only the outcomes that mean "not undone" should report. stdout:\n${stdout}`,
   );
   assert.ok(
     incomplete.some((l) => /"outcome":"superseded"/.test(l)),
@@ -164,9 +165,18 @@ test("A3 only an incomplete park is reported as incomplete", async () => {
     incomplete.some((l) => /"outcome":"failed"/.test(l)),
     "and so does an outright failure",
   );
+  assert.ok(
+    incomplete.some((l) => /"outcome":"skipped"/.test(l) && /"reason":"unreadable"/.test(l)),
+    "and an entry that could not be read, which is an undo that did not happen",
+  );
   assert.equal(
     incomplete.some((l) => /"outcome":"(parked|gone)"/.test(l)), false,
     "while a park that landed, or an entry already gone, is a complete undo",
+  );
+  assert.equal(
+    incomplete.some((l) => /"reason":"(not_ready|other_sandbox)"/.test(l)), false,
+    "as is an entry that is no longer this adoption's to undo -- reporting those "
+    + "would page somebody for an ordinary handover",
   );
   assert.ok(
     incomplete.every((l) => l.includes(CLAW_SESSION)),

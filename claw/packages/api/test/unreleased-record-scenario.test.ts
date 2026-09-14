@@ -146,8 +146,8 @@ test("U5 clearing a handle that was never marked is a no-op", async () => {
 test("U6 the record is written to the DAG root row, not to a node of the same DAG", async () => {
   // Both rows carry `dag_root_task_id = 't-root'`; only one is the root. The
   // predicate that separates them is the whole reason `any` can read back what
-  // `mark` wrote, and a statement missing it would write to whichever row the
-  // planner reached first.
+  // `mark` wrote: a statement missing it would write to EVERY row it matched,
+  // not merely to the wrong one.
   await seedDagRoot();
   await seedRun(h, "t-node", "s-1");
   await h.sql(
@@ -196,7 +196,8 @@ test("U8 the record reaches the caller through the public task read", () => {
   const outstanding = (redacted.metadata.sandbox_release as { unreleased: Record<string, unknown> })
     ?.unreleased;
   // The handle is deliberately named `token` here: `redactPublicJson` replaces
-  // the value under any credential-shaped KEY, and handle names are chosen by
+  // the value under any key containing a sensitive WORD -- ordinary words pass
+  // through untouched -- and handle names are chosen by
   // whoever wrote the DAG. Keyed by name, this entry would arrive as
   // "[REDACTED]" and take the workload id -- the only actionable part -- with
   // it. Keyed by workload identity, the name is data and survives.

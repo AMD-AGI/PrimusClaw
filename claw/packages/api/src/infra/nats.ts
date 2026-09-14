@@ -571,7 +571,8 @@ export function kvTtlTooNarrow(currentMaxAgeNs: number, desiredMaxAgeNs: number)
  * What a start-up may do to a bucket's existing TTL.
  *
  * `exact` reconciles in both directions, which is what a TTL that is a setting
- * needs. `BRAIN_REGISTRY_TTL_MS` is the one that matters: `lock.<key>` lives in
+ * needs. `widenOnly` belongs to the buckets whose TTL is not one -- the
+ * tombstone bucket, and DAG_HANDLES, which brain may have created. `BRAIN_REGISTRY_TTL_MS` is the one that matters: `lock.<key>` lives in
  * that bucket, so the TTL is how long a dead worker's claim survives it, and the
  * lease reap grace and the lock-blocked takeover deadlines are re-derived from
  * the same number. An operator who shortens it and leaves the bucket at the old,

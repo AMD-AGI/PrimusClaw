@@ -20,15 +20,31 @@ bindDagHandleKvForTest({
   async keys() { return (async function* () {})(); },
 } as never);
 
-for (const outcome of ["parked", "gone", "superseded", "failed"] as const) {
+/** Every outcome, and every `skipped` reason, since they do not all mean the same. */
+const CASES = [
+  { outcome: "parked" },
+  { outcome: "gone" },
+  { outcome: "skipped", reason: "not_ready" },
+  { outcome: "skipped", reason: "other_sandbox" },
+  { outcome: "skipped", reason: "unreadable" },
+  { outcome: "superseded" },
+  { outcome: "failed" },
+] as const;
+
+for (const result of CASES) {
+  const outcome = result.outcome;
   bindSandboxReuseEffects({
     unregisterSandbox: (() => {}) as never,
-    markHandsIdle: (async () => ({ outcome })) as never,
+    markHandsIdle: (async () => result) as never,
     destroyHands: (async () => {}) as never,
   });
   await registerReusedDagHandle(
     {} as never,
-    { session_id: CLAW_SESSION, task_id: `t-${outcome}`, dag_root_task_id: `dag-${outcome}` } as never,
+    {
+      session_id: CLAW_SESSION,
+      task_id: `t-${outcome}-${(result as { reason?: string }).reason ?? "x"}`,
+      dag_root_task_id: `dag-${outcome}`,
+    } as never,
     { kind: "create", handle: "main" },
     {
       handsUrl: "http://hands", created: false, token: "tok",

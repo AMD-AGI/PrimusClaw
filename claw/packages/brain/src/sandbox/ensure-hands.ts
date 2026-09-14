@@ -633,10 +633,11 @@ async function clearIdleMarkers(
 /**
  * Record that this DAG now holds the sandbox it just took over.
  *
- * Not best-effort, and no longer described as such anywhere on this path: a
- * failure undoes the adoption and throws. An unregistered reuse is a sandbox
- * nothing owns on paper, which is how a live pod gets reaped and how a cancel
- * reports that it released everything it could see.
+ * A failure throws, and attempts to undo the adoption first -- attempts,
+ * because the undo can itself report failure and is logged when it does. An
+ * unregistered reuse is a sandbox nothing owns on paper, which is how a live
+ * pod gets reaped and how a cancel reports that it released everything it
+ * could see.
  *
  * `replace` rather than `create`, because the whole point is that a handle of
  * this name may already exist naming the workload this session used before.
@@ -700,29 +701,40 @@ export async function registerReusedDagHandle(
     try {
       // The two halves of what `acceptExistingSandbox` just did, undone in the
       // reverse order it did them. `unregisterSandbox` drops THIS session's
-      // entry from the registry the ticker walks. It stops no ticker, recalls
-      // no ping already sent, and does not prevent one the ticker has already
-      // collected this session into its snapshot from being issued after the
-      // unregister returns. What it guarantees is narrower: no LATER snapshot
-      // includes it.
+      // entry from the LOCAL registry. It stops no ticker and recalls no ping
+      // already collected into the current tick. It does not make the sandbox
+      // unreachable either: keepalive also scans `hands.*` directly, so an
+      // entry still marked active is picked up again from KV regardless of the
+      // local registry -- which is why the park below is the half that
+      // matters, and why its outcome is checked.
       //
       // The order is still the right way round: reversed, the entry reads idle
-      // while a live registration still names it, and the ticker goes on
-      // pinging something marked parked. It is not an atomic handover and
-      // nothing here should be read as claiming one.
+      // while a live local registration still names it. It is not an atomic
+      // handover and nothing here should be read as claiming one.
       reuseEffects.unregisterSandbox(adoptedSession, identity);
-      // `markHandsIdle` REPORTS failure rather than throwing -- `superseded`
-      // for a revision conflict, `failed` for anything else -- so a catch
-      // around it establishes nothing. A conflict is the ordinary case here:
+      // `markHandsIdle` REPORTS its result rather than throwing -- `parked`,
+      // `gone`, `skipped`, `superseded` or `failed` -- so a catch around it
+      // establishes nothing, and which of those means "not undone" has to be
+      // decided rather than assumed. A conflict is the ordinary case here:
       // the entry is live and its TTL is being refreshed underneath. Left
       // unchecked, the local registration is gone while the KV entry still
       // says active, and the next keepalive tick finds the workload again from
       // KV and goes on pinging a sandbox no turn owns.
       const parked = await reuseEffects.markHandsIdle(kv, adoptedSession, identity);
-      if (parked.outcome !== "parked" && parked.outcome !== "gone") {
+      // What counts as "the undo did not happen" is narrower than "not
+      // parked". `gone` means there is no entry left to park. `skipped` covers
+      // three cases, and two of them -- the entry is not READY, or it now
+      // names a different sandbox -- mean this adoption's marks are no longer
+      // what is there, so there is nothing of ours left to undo. Reporting
+      // those would page somebody for an ordinary handover. `unreadable` is
+      // the one that does mean the undo was not performed.
+      const incomplete = parked.outcome === "superseded"
+        || parked.outcome === "failed"
+        || (parked.outcome === "skipped" && parked.reason === "unreadable");
+      if (incomplete) {
         logger.error(
           { dagRoot, handle: action.handle, sessionId: adoptedSession,
-            outcome: parked.outcome },
+            outcome: parked.outcome, reason: parked.reason },
           "ensureHands.reused_handle_undo_incomplete",
         );
       }
@@ -1041,12 +1053,13 @@ async function provisionHands(
     // not landed yet -- which errs towards reporting a workload that is
     // there, the direction this whole change exists to err in.
     //
-    // What is known now is what teardown needs: the id, the key to stop it
-    // with, and the namespace to poll. `hands_url` and `token` are not known
-    // until the sandbox answers, and the registration at the end fills them in
-    // by replacing this entry -- so a `sandbox.use` that somehow resolved this
-    // early would find a handle it cannot connect through, which is a worse
-    // failure than it sounds but a far better one than an untracked GPU.
+    // What is written now is what teardown needs: the id, the key to stop it
+    // with, and the namespace to poll. The connection fields are deliberately
+    // left off -- not because they are unknown, but because the endpoint is
+    // not up yet, and the registration at the end adds them by replacing this
+    // entry. A `sandbox.use` that resolved this early finds a handle it cannot
+    // connect through, which is a worse failure than it sounds and a far
+    // better one than an untracked GPU.
     //
     // A registration that cannot be written rolls the workload back, exactly
     // as the pending write above does: an unregisterable workload is one
@@ -1270,18 +1283,19 @@ async function provisionHands(
       //
       // Throwing is not enough on its own: the workload is already created and
       // its `hands.<session>` entry is already READY, and the failure cleanup
-      // above this only reaps PENDING entries. So the turn would fail while the
-      // GPU stayed allocated and unreferenced -- a leak with nothing left
-      // pointing at it. The workload is torn down here for the same reason, and
-      // in the same shape, as the rollback the pending KV write already does.
+      // above this only reaps PENDING entries. So the turn would fail with the
+      // GPU still allocated. The early registration usually still names it --
+      // this write was enriching that entry, not creating it -- so it is not
+      // necessarily unreferenced; it is simply not released, which is what the
+      // teardown here is for, in the same shape as the pending write's own
+      // rollback.
       logger.error(
         { sessionId, dagRoot, handle: action.handle, workloadId, err: (e as Error).message },
         "ensureHands.handle_register_failed_rollback",
       );
       await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
-        // The one outcome worse than the failure being handled: the record says
-        // nothing holds this workload and the workload is still there. It is
-        // logged with the id because that is all anybody will have to find it.
+        // Logged with the id: if the early registration is also gone, this
+        // line is what is left to find the workload by.
         logger.error(
           { sessionId, workloadId, err: (cleanupErr as Error).message },
           "ensureHands.handle_register_rollback_failed",

@@ -38,7 +38,8 @@ after(() => {
   globalThis.fetch = originalFetch;
 });
 
-// In-memory stand-in for the KV-backed record, same contract.
+// In-memory stand-in for the record, which really lives in
+// `claw_tasks.metadata`. Same contract.
 const recorded = new Set<string>();
 const key = (h: string, w: string) => `${w || "unknown"}:${h}`;
 unreleasedRecord.mark = async (_dag, h, w) => { recorded.add(key(h, w)); };

@@ -547,9 +547,10 @@ test("the SaFE handle records the namespace keepalive will poll", () => {
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
     "utf-8",
   );
-  // Selected by what the call IS, not by where it sits. There are three
-  // registrations now -- SaFE create, agent-sandbox create, and the reuse
-  // adoption -- and this test wants the first of those; picking "the first
+  // Selected by what the call IS, not by where it sits. Several registrations
+  // match this shape -- the early provisioning write, SaFE create,
+  // agent-sandbox create, the reuse adoption -- and this test wants the SaFE
+  // create; picking "the first
   // occurrence" silently retargeted it at the reuse call when that was added.
   const calls = [...src.matchAll(/await replaceDagHandle\(dagRoot, action\.handle, \{/g)]
     .map((m) => src.slice(m.index!, src.indexOf("});", m.index!) + 3));
