@@ -4,7 +4,9 @@
 /**
  * Complete fleet census used by rollout and rollback operations.
  * Any unreadable or unusable record fails the census instead of shrinking it;
- * session bindings and DAG handles are both included.
+ * session bindings and DAG handles are both included. A binding still being
+ * provisioned is a row and not a hole: it already names what a rollback deletes
+ * by, and only its endpoint is missing.
  */
 
 import type { HandleInfo } from "@claw/protocol";
@@ -20,6 +22,13 @@ export interface SandboxRow {
   namespace: string;
   provider: string;
   healthy: boolean;
+  /**
+   * The binding's own lifecycle state -- `"pending"` or `"ready"`, and empty on
+   * a record written without one. A row that is still being provisioned has no
+   * endpoint yet, and saying which it is here is what stops an operator reading
+   * that emptiness as a sandbox that exists and cannot be reached.
+   */
+  status: string;
 }
 
 export interface DagHandleRow {
@@ -76,6 +85,7 @@ function rowFromEntry(sessionId: string, info: Record<string, unknown>, healthy:
     namespace: (info.namespace as string) || "",
     provider: (info.provider as string) || "",
     healthy,
+    status: typeof info.status === "string" ? info.status : "",
   };
 }
 
@@ -127,14 +137,25 @@ function dagRows(
 /**
  * A row that parses and still cannot be used.
  *
- * A binding with no endpoint cannot be pinged and one with no name and no
- * workload id cannot be deleted, so it is a sandbox this census can neither
- * drain nor prove drained -- the same hole a corrupt record leaves, and treated
- * the same way rather than returned as a row that looks complete.
+ * A binding with no endpoint and no in-flight provision to explain it cannot be
+ * pinged, and one with no name and no workload id cannot be deleted, so it is a
+ * sandbox this census can neither drain nor prove drained -- the same hole a
+ * corrupt record leaves, and treated the same way rather than returned as a row
+ * that looks complete.
  */
 function isUsable(info: Record<string, unknown>): boolean {
   const nonEmpty = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
-  if (!nonEmpty(info.handsUrl)) return false;
+  // An entry past provisioning must name an endpoint; one still in it
+  // legitimately carries none. The SaFE path writes `status:"pending"` the
+  // moment a workload id exists and only promotes it to `"ready"` once
+  // bootstrap and health have passed, nothing reclaims it in between, and the
+  // queue wait it covers runs to hours -- so holding a pending entry to the
+  // endpoint rule fails the whole census for the length of a perfectly normal
+  // wait. It still names the workload a rollback deletes by, which is what the
+  // identity test below decides; only the ping is missing, and `healthy:false`
+  // is what says so. The kubernetes path is single-phase and never writes one,
+  // so the rows the rollout gates iterate are unchanged.
+  if (info.status !== "pending" && !nonEmpty(info.handsUrl)) return false;
   // What a rollback deletes by differs per provider, so "has an identifier" is
   // not the test: a kubernetes Sandbox is addressed by name *and* namespace,
   // and a row carrying one without the other names nothing kubectl can reach.
@@ -174,8 +195,13 @@ export async function collectSandboxInventory(deps: InventoryDeps): Promise<Sand
       unreadable += 1;
       continue;
     }
+    // `handsUrl` is genuinely absent on a pending row, so the probe is asked
+    // only where there is something to ask about: `healthy:false` is already
+    // the answer for a binding that cannot be pinged yet.
+    const handsUrl = (info.handsUrl as string) || "";
     sessions.push(rowFromEntry(
-      deps.sessionIdFromKey(key), info, await deps.probeHealth(info.handsUrl as string),
+      deps.sessionIdFromKey(key), info,
+      handsUrl ? await deps.probeHealth(handsUrl) : false,
     ));
   }
 

@@ -236,6 +236,32 @@ export function childEnvironment(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * The range this sandbox declared, or null where it declared none.
+ *
+ * Declaring a range is declaring the boundary. Half of it is not a weaker
+ * boundary, it is none: one shared identity leaves the runs sharing a sandbox
+ * able to enumerate and signal one another's processes. Both questions are
+ * asked from here rather than at each caller so that startup and the spawn
+ * cannot answer differently -- a boot admitting a posture every later spawn
+ * refuses is the sandbox reporting itself healthy while nothing it offers
+ * works.
+ *
+ * @throws ChildPrivilegeUnavailable where a declared range cannot be used.
+ */
+function declaredBoundary(sandbox: SandboxIsolation): { min: number; max: number } | null {
+  const range = sandbox.identityRange();
+  if (!range) return null;
+  if (!sandbox.partitionsProcessView()) {
+    throw new ChildPrivilegeUnavailable(
+      "this sandbox declares a child identity range and cannot keep one run's "
+      + "processes out of another's view, so nothing can be run under the "
+      + "boundary it asked for",
+    );
+  }
+  return range;
+}
+
 /** What a deployment writes to say it is serving without the boundary. */
 export const ISOLATION_UNENFORCED = "unenforced";
 
@@ -259,11 +285,20 @@ export const ISOLATION_UNENFORCED = "unenforced";
  * meet the same answer, and a process refusing each one in turn is a sandbox
  * reporting itself healthy while nothing it offers works.
  *
+ * That is why a declared range is checked ahead of the feature gate rather than
+ * behind it. Whether one can be honoured is not a question about background
+ * shells -- the foreground path resolves the same boundary through the same
+ * two questions -- so a deployment declaring a range answers for it here
+ * whether or not it serves any. The gate below is for the deployment that
+ * declared nothing, which is the one case where serving no background shells
+ * means there is nothing left to ask.
+ *
  * @throws ChildPrivilegeUnavailable where the feature is on and neither is
  * stated, or where a declared range cannot be used.
  */
 export function assertChildBoundaryForBackgroundShells(bgShellEnabled: boolean): void {
-  if (!bgShellEnabled || sandboxIsolation().identityRange() !== null) return;
+  if (declaredBoundary(sandboxIsolation()) !== null) return;
+  if (!bgShellEnabled) return;
   if (process.env.HANDS_CHILD_ISOLATION === ISOLATION_UNENFORCED) {
     reportUnenforced();
     return;
@@ -289,19 +324,10 @@ export function resolveChildPrivilege(owner: string, run: string): ChildPrivileg
   // reading as no declaration: the two are opposite answers, and collapsing
   // them serves the command under Hands' identity on a deployment that asked
   // for the boundary.
-  const range = sandbox.identityRange();
+  const range = declaredBoundary(sandbox);
   if (!range) {
     reportUnenforced();
     return { env: childEnvironment() };
-  }
-  // Declaring a range is declaring the boundary. Half of it is not a weaker
-  // boundary, it is none: one shared identity leaves the runs sharing a sandbox
-  // able to enumerate and signal one another's processes.
-  if (!sandbox.partitionsProcessView()) {
-    throw new ChildPrivilegeUnavailable(
-      "this sandbox cannot keep one run's processes out of another's view, "
-      + "so the command was not run",
-    );
   }
   const id = identityFor(owner, run, range);
   return { uid: id, gid: id, env: childEnvironment() };

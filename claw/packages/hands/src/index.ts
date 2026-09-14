@@ -62,11 +62,21 @@ type ScopeFailure = { status: number; error: string; field?: string };
  * believes it is addressing a scope must not be answered about a different one.
  */
 function callerScope(
-  req: { headers: Record<string, unknown>; body?: Record<string, unknown> },
+  req: { headers: Record<string, unknown>; body?: unknown },
 ): { scope: CredentialScope } | { failure: ScopeFailure } {
-  for (const field of ["owner", "run"]) {
-    if (req.body && field in req.body) {
-      return { failure: { status: 400, error: "scope_not_in_body", field } };
+  // The body is typed as unknown here rather than as the object the routes
+  // declare, because nothing makes that declaration true: no schema is attached
+  // and Fastify's default JSON parser hands through whatever parsed, so a
+  // caller sending `123` arrives with a number. Naming it unknown forces the
+  // narrowing below, without which `field in body` throws and a request that
+  // has proved nothing is answered with a 500 and a logged stack instead of the
+  // refusal it earned.
+  const body = req.body;
+  if (typeof body === "object" && body !== null) {
+    for (const field of ["owner", "run"]) {
+      if (field in body) {
+        return { failure: { status: 400, error: "scope_not_in_body", field } };
+      }
     }
   }
   if (!INTERNAL_TOKEN) {

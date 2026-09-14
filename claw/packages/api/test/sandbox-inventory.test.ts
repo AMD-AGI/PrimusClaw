@@ -175,3 +175,48 @@ test("a genuinely empty fleet is a successful read, not a failure", async () => 
   assert.deepEqual(inventory.dag_handles, [],
     "nothing to drain is not nothing readable, and a rollback has to run here");
 });
+
+test("a binding still being provisioned is a row, not a hole", async () => {
+  // `ensureHands` records `status:"pending"` with no endpoint the moment SaFE
+  // assigns a workload id, the reaper waits on that entry indefinitely, and the
+  // queue wait it covers runs to hours -- so counting it unreadable answers
+  // "this inventory is incomplete" for the whole of a perfectly normal wait.
+  const pending = JSON.stringify({
+    status: "pending", workloadId: "wl-2", namespace: "ns-a",
+    platformKey: "pk", createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  const entries = { "hands.sess-1": READY, "hands.sess-2": pending };
+  const inventory = await collectSandboxInventory(deps({
+    handsKeys: async () => Object.keys(entries),
+    handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+    probeHealth: async (handsUrl) => {
+      assert.notEqual(handsUrl, "", "there is nothing to ping on a pending row");
+      return true;
+    },
+  }));
+
+  assert.equal(inventory.ok, true, "an in-flight provision is not a failed read");
+  assert.equal(inventory.unreadable, 0);
+  const row = inventory.sessions.find((r) => r.session_id === "sess-2")!;
+  assert.equal(row.hands_url, "", "it has no endpoint yet");
+  assert.equal(row.healthy, false, "which is what says it cannot be pinged");
+  assert.equal(row.status, "pending",
+    "and the row says which it is, rather than leaving an operator to read that "
+      + "emptiness as a sandbox that exists and cannot be reached");
+  assert.equal(row.workload_id, "wl-2", "while still naming what a rollback deletes by");
+});
+
+test("a pending binding that names nothing to delete by still fails the read", async () => {
+  // The endpoint is the only thing an in-flight provision is excused; a record
+  // that also names no workload and no Sandbox is a hole whatever its status.
+  const entries = {
+    "hands.sess-1": READY,
+    "hands.sess-2": JSON.stringify({ status: "pending", namespace: "ns-a" }),
+  };
+  const inventory = await collectSandboxInventory(deps({
+    handsKeys: async () => Object.keys(entries),
+    handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+  }));
+  assert.equal(inventory.ok, false);
+  assert.equal(inventory.unreadable, 1);
+});

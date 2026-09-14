@@ -12,6 +12,7 @@ import {
   BRAIN_REGISTRY_TTL_MS,
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
+import { isTombstone } from "../tasks/lock.js";
 import { destroyHands } from "./reaper.js";
 import {
   handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
@@ -269,6 +270,29 @@ async function sweepRetention(
     return true;
   }
 
+  // The record behind the projection, which this bucket expires like everything
+  // else in it: written once when the retention was taken and never again, it
+  // outlives the retention by one TTL window and no longer, after which a
+  // projection an old replica writes over is restored from nothing. At the
+  // value the projection holds, byte for byte, so what a later reassertion puts
+  // back is still what was retained.
+  //
+  // Refreshed, never created, and before the projection rather than after it --
+  // between them is the one order that cannot resurrect a retention another
+  // replica has given up. `releaseRetention` removes the record first and the
+  // projection second, so a release interleaved anywhere around these two
+  // writes settles as removed: ahead of both, the record is gone and this
+  // refuses to put it back; between them, the release's own delete of the
+  // projection lands after this refresh; after both, it removes what was just
+  // written. Creating the record here instead -- an unconditional put -- would
+  // write it back in that middle window, and the next `reassertRetentions`
+  // would restore a retention whose work had already finished.
+  //
+  // Its failure is not the projection's. The projection is the live protection
+  // and this is only what repairs it, so a record that could not be refreshed
+  // is logged and the sweep goes on to the refresh that matters.
+  await refreshRetentionLedger(deps.kv, ledgerKeyForRetention(key), entry.value);
+
   try {
     await deps.kv.update(key, entry.value, entry.revision);
   } catch (err) {
@@ -278,6 +302,32 @@ async function sweepRetention(
     return false;
   }
   return true;
+}
+
+/**
+ * Put a retention's record back at the age it was written, if it is still there.
+ *
+ * On the revision it was just read at, so two replicas sweeping the same entry
+ * do not both count as a refresh: the loser's conflict says the record was
+ * refreshed by someone else in this window, which is the outcome it wanted.
+ * A record that is simply gone is left gone -- see the ordering note above.
+ */
+async function refreshRetentionLedger(
+  kv: KV, ledgerKey: string, value: Uint8Array,
+): Promise<void> {
+  try {
+    const held = await kv.get(ledgerKey);
+    if (!held || isTombstone(held)) {
+      logger.warn({ ledgerKey }, "keepalive.retention_ledger_absent");
+      return;
+    }
+    await kv.update(ledgerKey, value, held.revision);
+  } catch (err) {
+    if (isRevisionConflict(err)) return;
+    logger.error(
+      { err: (err as Error)?.message, ledgerKey }, "keepalive.retention_ledger_refresh_failed",
+    );
+  }
 }
 
 /**

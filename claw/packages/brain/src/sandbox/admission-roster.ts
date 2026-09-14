@@ -310,8 +310,8 @@ export async function reconcileTargets(
  * every new sandbox against a count made almost entirely of corpses.
  *
  * Ageing is still what releases, not a single absent census: `censusComplete`
- * says whether this sweep read the fleet whole, and one that did not renews on
- * ownership and reaps nothing.
+ * says whether this sweep read the fleet whole, and one that did not renews the
+ * bound entries on ownership and reaps nothing.
  */
 export async function renewAndReap(
   store: RosterStore, config: RosterConfig, named: Set<string>, now = Date.now(),
@@ -324,9 +324,14 @@ export async function renewAndReap(
       // slot while it is still being pinged -- the over-admission the ceiling
       // exists to forbid. Renew on ownership, reap nothing, and leave the
       // decision to the next sweep that reads the fleet whole.
+      //
+      // Provisional entries are left out of that: no census names one to begin
+      // with, so an unreadable census says nothing about it either, and stamping
+      // it here would push the horizon out from under the only thing that ever
+      // reclaims it.
       const held = roster.entries.map((entry) =>
-        (entry.claimedBy === config.replicaId
-          || (entry.identity !== null && named.has(entry.identity))
+        (entry.identity !== null
+          && (entry.claimedBy === config.replicaId || named.has(entry.identity))
           ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now }
           : entry));
       return { write: { ...roster, entries: held }, result: held.length };
@@ -337,11 +342,17 @@ export async function renewAndReap(
     const entries = kept.entries.map((entry) => {
       // A provisional entry names no sandbox, so no census can ever account for
       // it; the horizon is the only thing that can hold its slot while the
-      // sandbox it was claimed for is still being provisioned.
-      const accounted = entry.identity === null
-        ? entry.claimedBy === config.replicaId
-        : named.has(entry.identity);
-      return accounted ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now } : entry;
+      // sandbox it was claimed for is still being provisioned -- and ownership
+      // is no substitute. A claim whose release was lost is still owned by the
+      // replica that made it, so renewing on ownership resets the age on every
+      // sweep, the horizon it is held under never arrives, and the slot is never
+      // given back: enough of them and admission refuses fleet-wide with nothing
+      // left to reap. The horizon exceeds the declared provisioning ceiling, so
+      // a create still in flight keeps its reservation with no renewal at all.
+      if (entry.identity === null) return entry;
+      return named.has(entry.identity)
+        ? { ...entry, claimedBy: config.replicaId, renewedAtMs: now }
+        : entry;
     });
     return { write: { ...roster, entries }, result: entries.length };
   });

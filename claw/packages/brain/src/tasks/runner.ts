@@ -2757,10 +2757,19 @@ class TaskRunner {
         turns: this.reportedCkpt?.turns_completed ?? 0 },
       "task.lease_lost.stood_down",
     );
+    // The admission slot is the one part of the local entry that is not local,
+    // and it belongs to the sandbox rather than to whoever is pinging it. The
+    // holder reached this same container through `ensureHands`'s reuse path,
+    // which claims no slot of its own and names the same roster identity, so
+    // the entry dropped here is that live sandbox's only claim on the ceiling
+    // -- and giving it up is exactly the fleet-shared write this path exists
+    // not to make. Same reasoning as `stopKeepaliveAfterTask`, one step
+    // further: there the sandbox outlives the turn, here it outlives the pod.
+    const keepSlot = { releaseSlot: false };
     if (this.handsIdentity) {
-      fx().unregisterSandbox(this.sessionId, this.handsIdentity);
+      fx().unregisterSandbox(this.sessionId, this.handsIdentity, keepSlot);
     } else if (this.handsWorkloadId) {
-      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId });
+      fx().unregisterSandbox(this.sessionId, { workloadId: this.handsWorkloadId }, keepSlot);
     }
   }
 

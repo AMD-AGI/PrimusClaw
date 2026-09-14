@@ -99,11 +99,18 @@ export const BG_SHELL_DISABLED_MESSAGE =
   + "Run the command in the foreground with a suitable bash timeout instead.";
 
 /** What a start answers with: the shell, and whether this call is the one that
- *  produced it. A machine-readable field rather than an inference from wording. */
+ *  produced it. A machine-readable field rather than an inference from wording.
+ *
+ *  A strict subset of the resolutions a caller can be handed. `deduplicated` is
+ *  Brain's answer, produced from its own reference row and a probe of the
+ *  record; a sandbox that only ever wins or loses an exclusive create has no
+ *  intent key to compare against and so cannot tell a replay of the same start
+ *  from a different command reusing the id. Its answer to a lost claim is the
+ *  collision, or `retry_expired` where the record has aged out. */
 export interface BgStart {
   shell?: BgShell;
   shellId?: string;
-  resolution: "first_call" | "deduplicated" | "retry_expired";
+  resolution: "first_call" | "retry_expired";
 }
 
 interface BgEntry {
@@ -499,7 +506,12 @@ export function resolveShell(owner: string, run: string, id: string): ShellResol
     shell,
     status: verdict.record.status,
     exitCode: verdict.record.exit_code ?? null,
-    outputAvailable: verdict.record.output_available === true && !!shell,
+    // A live entry is the buffer, whatever phase the record has reached. The
+    // release is written by the same step that drops the entry, so a record
+    // carrying no outcome yet -- every running shell -- says nothing about
+    // whether there is anything to read, and reading its silence as `false`
+    // answers "no output" in the same body that is printing new bytes.
+    outputAvailable: !!shell && verdict.record.output_available !== false,
   };
 }
 
@@ -631,9 +643,14 @@ export function waitForShellExit(
   const resolved = resolveShell(owner, run, id);
   const shell = resolved.shell;
   // Only an entry this process still owes an exit event for can be waited on,
-  // which is exactly the collector-live window: `ended_unreaped` qualifies
-  // there and resolves to `finished` without a second call, while every other
-  // class is answered at once rather than sat on until the timeout.
+  // and the predicate is that entry rather than the class: a shell whose epoch
+  // could not be read (`unverified_running`) or whose attachment write never
+  // landed (`spawn_indeterminate`) is still this process's own child, so its
+  // exit is still coming and the wait on it is real. An `ended_unreaped` inside
+  // the collector-live window likewise resolves to `finished` without a second
+  // call. Everything with no running entry is answered at once rather than sat
+  // on until the timeout. A caller deciding whether to hand back an execution
+  // slot has to predict this line, so it is stated as the registry fact it is.
   if (!shell || shell.status !== "running") return resolved;
 
   return new Promise<BgShell | null>((resolve) => {

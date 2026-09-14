@@ -19,7 +19,7 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
 import type { KV } from "nats";
-import { retentionKey } from "../src/sandbox/retain-container.js";
+import { ledgerKeyForRetention, retentionKey } from "../src/sandbox/retain-container.js";
 import {
   runKeepaliveTickForTest, resetBackgroundWorkStateForTest,
 } from "../src/sandbox/keepalive.js";
@@ -72,23 +72,53 @@ function stubProvider(): { execs: string[] } {
   return { execs };
 }
 
-function fakeKv(): { kv: KV; deleted: string[]; updated: number[] } {
+const LEDGER = ledgerKeyForRetention(KEY);
+const PROJECTION_REVISION = 5;
+const LEDGER_REVISION = 9;
+
+/**
+ * The bucket, with the retention's two halves in it.
+ *
+ * `ledger` says whether the record under `retention.` is still there, because
+ * the sweep has to tell "expired or refreshable" from "released by another
+ * replica" and must act oppositely on the two.
+ */
+function fakeKv(opts: { ledger?: boolean; ledgerWriteFails?: boolean } = {}): {
+  kv: KV; deleted: string[]; updated: { key: string; revision: number }[]; put: string[];
+} {
+  const ledgerPresent = opts.ledger ?? true;
   const deleted: string[] = [];
-  const updated: number[] = [];
+  const updated: { key: string; revision: number }[] = [];
+  const put: string[] = [];
   const kv = {
     async keys(filter = ">") {
       const matched = filterToRegExp(filter).test(KEY) && !deleted.includes(KEY) ? [KEY] : [];
       return (async function* () { yield* matched; })();
     },
     async get(key: string) {
-      if (key !== KEY || deleted.includes(key)) return null;
-      return { key, value: sc.encode(JSON.stringify(RETAINED)), revision: 5 };
+      if (deleted.includes(key)) return null;
+      if (key === KEY) {
+        return { key, value: sc.encode(JSON.stringify(RETAINED)), revision: PROJECTION_REVISION };
+      }
+      if (key === LEDGER && ledgerPresent) {
+        return { key, value: sc.encode(JSON.stringify(RETAINED)), revision: LEDGER_REVISION };
+      }
+      return null;
     },
     async delete(key: string) { deleted.push(key); },
-    async put() { return 1; },
-    async update(_k: string, _v: unknown, rev: number) { updated.push(rev); return rev + 1; },
+    async put(key: string) { put.push(key); return 1; },
+    async update(key: string, _v: unknown, revision: number) {
+      if (key === LEDGER && opts.ledgerWriteFails) throw new Error("bucket refused the write");
+      updated.push({ key, revision });
+      return revision + 1;
+    },
   } as unknown as KV;
-  return { kv, deleted, updated };
+  return { kv, deleted, updated, put };
+}
+
+/** Whether this sweep re-put `key` at the revision it had just read. */
+function refreshed(updated: { key: string; revision: number }[], key: string, revision: number) {
+  return updated.some((u) => u.key === key && u.revision === revision);
 }
 
 /**
@@ -138,7 +168,46 @@ test("a retained entry has its TTL refreshed, so the bucket does not drop it", a
   const { kv, updated } = fakeKv();
   stubProvider();
   await sweepTwice(kv, async () => 0);
-  assert.ok(updated.includes(5), `re-put at the revision just read; updates=${JSON.stringify(updated)}`);
+  assert.ok(refreshed(updated, KEY, PROJECTION_REVISION),
+    `re-put at the revision just read; updates=${JSON.stringify(updated)}`);
+});
+
+test("the record behind it is refreshed too, so the repair path outlives one TTL", async () => {
+  // The projection is what a pre-scheme replica overwrites and the record under
+  // `retention.` is the only thing it is put back from. That record is in the
+  // same bucket as the projection, so refreshing one and not the other leaves
+  // the repair working for one TTL window and silently never again.
+  const { kv, updated } = fakeKv();
+  stubProvider();
+  await sweepTwice(kv, async () => 0);
+  assert.ok(refreshed(updated, LEDGER, LEDGER_REVISION),
+    `the record was not re-put at the revision just read; updates=${JSON.stringify(updated)}`);
+});
+
+test("a record another replica released is not written back", async () => {
+  // `releaseRetention` removes the record first and the projection second, so a
+  // sweep that finds the record gone is looking at a retention already given
+  // up -- possibly between its own two writes. Creating it again would have the
+  // next `reassertRetentions` restore a retention whose work had finished, and
+  // the container it protects would then be held against admission by nothing
+  // any sweep can retire.
+  const { kv, updated, put } = fakeKv({ ledger: false });
+  stubProvider();
+  await sweepTwice(kv, async () => 0);
+  assert.ok(!updated.some((u) => u.key === LEDGER) && !put.includes(LEDGER),
+    `the released record was written back; updates=${JSON.stringify(updated)}, puts=${JSON.stringify(put)}`);
+});
+
+test("a record the bucket refuses does not cost the retention its refresh", async () => {
+  // Losing the backup is not losing the protection: the projection is what
+  // keeps the container out of the sweep's reclaim, so a failed record write is
+  // logged and the entry stands rather than being failed back to the sweep.
+  const { kv, deleted, updated } = fakeKv({ ledgerWriteFails: true });
+  stubProvider();
+  await sweepTwice(kv, async () => 0);
+  assert.ok(refreshed(updated, KEY, PROJECTION_REVISION),
+    `the projection was not refreshed; updates=${JSON.stringify(updated)}`);
+  assert.deepEqual(deleted, [], "the retention was reclaimed over a failed record write");
 });
 
 test("a retention is not eligible for post-task idle reuse", async () => {

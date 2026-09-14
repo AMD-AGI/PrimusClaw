@@ -87,11 +87,8 @@ export const bash = {
             structuredContent: { shell_id: id, resolution: start.resolution, shell_class: "unknown" },
           };
         }
-        const already = start.resolution === "deduplicated"
-          ? " This start was already committed to, so nothing was run a second time."
-          : "";
         return {
-          content: [{ type: "text" as const, text: `Started background shell ${id}. Poll output with bash_output, terminate with kill_shell.${already}` }],
+          content: [{ type: "text" as const, text: `Started background shell ${id}. Poll output with bash_output, terminate with kill_shell.` }],
           // The same answer as a field: a caller that has to match prose to
           // tell a first call from a replay is one reword away from running
           // the command twice.

@@ -4,10 +4,10 @@
 /**
  * When a `wait` hands the pod's execution slot back, and when it must not.
  *
- * Parking every wait looks harmless and is not: a wait on a shell nobody can
- * ever emit an exit event for -- one whose process is gone, whose claim never
- * became a process, or whose state could not be read -- returns at once, so the
- * slot is released and reacquired around a call that never blocked. Worse, the
+ * Parking every wait looks harmless and is not: a wait on a shell nobody is
+ * left to emit an exit event for -- one whose process is gone, or whose
+ * collector died holding the exit code -- returns at once, so the slot is
+ * released and reacquired around a call that never blocked. Worse, the
  * decision has to be taken before the call is routed, because that is where the
  * slot is handed back, while the class is a fact only the call would return.
  *
@@ -191,10 +191,24 @@ test("the execution slot is observably free while the wait is parked", async () 
 test("every class that cannot block returns without touching the slot", async () => {
   // Each of these is settled already: blocking on it would hold the slot for
   // the whole timeout waiting for an event nothing present can deliver.
-  for (const cls of ["finished", "lost", "unknown", "spawn_indeterminate", "unverified_running"]) {
+  for (const cls of ["finished", "lost", "unknown"]) {
     const { router, routed } = classifyingRouter(cls);
     const parkEvents = await runWait(router);
     assert.deepEqual(parkEvents, [], `${cls} released the execution slot`);
+    assert.deepEqual(routed, ["wait"], `${cls} did not reach the tool`);
+  }
+});
+
+test("an indeterminate class still parks, because the sandbox still blocks on it", async () => {
+  // The sandbox decides whether to block from the shell's registry entry, not
+  // from its class: a shell whose epoch could not be read, or whose attachment
+  // write never landed, is still this sandbox's own running child, and the
+  // wait on it sits there for the whole granted timeout. A run that read those
+  // as settled kept the pod's execution slot for all of it.
+  for (const cls of ["unverified_running", "spawn_indeterminate"]) {
+    const { router, routed } = classifyingRouter(cls);
+    const parkEvents = await runWait(router);
+    assert.deepEqual(parkEvents, ["park", "unpark"], `${cls} held the execution slot`);
     assert.deepEqual(routed, ["wait"], `${cls} did not reach the tool`);
   }
 });

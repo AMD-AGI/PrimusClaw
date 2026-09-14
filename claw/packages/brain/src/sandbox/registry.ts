@@ -43,7 +43,16 @@ function reservedKeyStore(kv: KV): HandsKeyStore {
     },
     read: async (key) => {
       const entry = await kv.get(key);
-      return entry ? { value: sc.decode(entry.value), revision: entry.revision } : null;
+      // A delete leaves a readable entry with an empty value rather than a
+      // miss -- the same fact the run-lease guard below is written about. Passed
+      // through, it reads as an entry holding "" instead of as the absence it
+      // is, and every caller here hands that "" to JSON.parse: the startup
+      // separation check then refuses the deployment through its unreadable
+      // arm, naming a key no operator can remove because another replica's
+      // sweep already released it. A walk is a snapshot, so a key it listed
+      // being gone by the time this reads it is routine, not a collision.
+      return entry && !isTombstone(entry)
+        ? { value: sc.decode(entry.value), revision: entry.revision } : null;
     },
     create: async (key, value) => {
       try {

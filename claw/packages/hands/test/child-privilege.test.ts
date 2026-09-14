@@ -231,6 +231,35 @@ test("background shells refuse to start where nothing states the isolation postu
       () => privilege.assertChildBoundaryForBackgroundShells(true),
       "and a declared identity range is the boundary itself",
     );
+
+    // A declared range is answered for ahead of the feature gate, in both of
+    // the ways it can fail to be honoured. Either one leaves every spawn
+    // refused -- foreground shells included, which no flag governs -- so a
+    // boot that admitted it would be a sandbox reporting itself healthy while
+    // nothing it offers works.
+    privilege.bindSandboxIsolation({
+      identityRange: () => ({ min: 65500, max: 65533 }),
+      partitionsProcessView: () => false,
+    });
+    for (const bgShellEnabled of [true, false]) {
+      assert.throws(
+        () => privilege.assertChildBoundaryForBackgroundShells(bgShellEnabled),
+        privilege.ChildPrivilegeUnavailable,
+        `a declared range with no process view fails the boot (bg ${bgShellEnabled})`,
+      );
+    }
+
+    privilege.bindSandboxIsolation({
+      identityRange: () => {
+        throw new privilege.ChildPrivilegeUnavailable("not privileged enough");
+      },
+      partitionsProcessView: () => true,
+    });
+    assert.throws(
+      () => privilege.assertChildBoundaryForBackgroundShells(false),
+      privilege.ChildPrivilegeUnavailable,
+      "and a range this process cannot assume fails it too, not each bash call",
+    );
   } finally {
     if (previous === undefined) delete process.env.HANDS_CHILD_ISOLATION;
     else process.env.HANDS_CHILD_ISOLATION = previous;

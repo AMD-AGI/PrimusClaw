@@ -48,7 +48,12 @@ const settle = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 test("a running shell reads `running` on all three verbs", async () => {
   bg.spawnBackground(OWNER, RUN, "sleep 60", "live");
   try {
-    assert.equal(bg.pollOutput(OWNER, RUN, "live").structured.shell_class, "running");
+    const polled = bg.pollOutput(OWNER, RUN, "live");
+    assert.equal(polled.structured.shell_class, "running");
+    // The record only learns about output when the outcome is written, which
+    // for a running shell has not happened yet. The buffers are held by this
+    // process all the same, and the same answer says so on the line above.
+    assert.equal(polled.structured.output_available, true, "its buffers are held by this process");
     const waited = bg.waitForShellExit(OWNER, RUN, "live", 20);
     assert.ok(waited instanceof Promise, "a running shell is the one class a wait blocks on");
     assert.equal(await waited, null, "it timed out rather than resolving");

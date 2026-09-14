@@ -22,7 +22,11 @@ import {
   handsSessionKey, isEncodedSessionKey, isReservedRetentionKey, isRetentionEntry,
   migrateReservedSessionKeys, sessionIdFromHandsKey, type HandsKeyStore,
 } from "../src/sandbox/hands-key.js";
+import { retentionStore } from "../src/sandbox/registry.js";
+import { StringCodec, type KV } from "nats";
 import { matchesKvFilter } from "./fixtures/kv-filter.js";
+
+const sc = StringCodec();
 
 function memoryStore(seed: Record<string, string | null> = {}): HandsKeyStore & {
   map: Map<string, { value: string | null; revision: number }>;
@@ -178,6 +182,46 @@ test("an entry that cannot be read is refused, not passed over", async () => {
     const store = memoryStore({ [`hands.${RETAINED_PREFIX}BROKEN`]: broken });
     await assert.rejects(() => assertRetentionSeparation(store), ReservedKeyCollision, String(broken));
   }
+});
+
+test("a retention released between the walk and the read is not a collision", async () => {
+  // The walk is a snapshot, and this check runs at boot while every other
+  // replica's sweep goes on releasing the retentions it finds clear. A key the
+  // snapshot listed and the read cannot find is nothing holding the key, not a
+  // session binding holding it -- and refusing here would crash-loop the pod
+  // telling an operator to remove a key that is already removed.
+  const released = `hands.${RETAINED_PREFIX}RELEASED`;
+  const store = memoryStore({
+    [released]: retention(),
+    "hands.sess_ordinary": session("ordinary"),
+  });
+  const racing: HandsKeyStore = {
+    ...store,
+    async keys(filter) {
+      const listed = await store.keys(filter);
+      store.map.delete(released);
+      return listed;
+    },
+  };
+
+  await assert.doesNotReject(() => assertRetentionSeparation(racing));
+});
+
+test("the store reads a deleted key as absent, not as an entry holding nothing", async () => {
+  // The half the skip above rests on, and the one that covers the dominant
+  // race: the key-value client answers a deleted key with a DEL entry carrying
+  // an empty payload rather than with a miss. Passed through, the check reaches
+  // `JSON.parse("")` and refuses the deployment through its unreadable arm --
+  // the same crash-loop by another route, over the same key that is gone.
+  const store = retentionStore({
+    get: async (key: string) => (key.endsWith("RELEASED")
+      ? { key, revision: 4, operation: "DEL", value: new Uint8Array(0) }
+      : { key, revision: 2, operation: "PUT", value: sc.encode(retention()) }),
+  } as unknown as KV);
+
+  assert.equal(await store.read(`hands.${RETAINED_PREFIX}RELEASED`), null);
+  assert.equal((await store.read(`hands.${RETAINED_PREFIX}LIVE`))!.value, retention(),
+    "and a live retention still reads back, so the check still has something to check");
 });
 
 test("an ordinary deployment starts", async () => {

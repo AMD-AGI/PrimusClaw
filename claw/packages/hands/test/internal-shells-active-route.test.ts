@@ -116,6 +116,18 @@ test("a credential proving nothing counts nothing", async () => {
   assert.equal(otherSecret.statusCode, 401);
 });
 
+test("a body that is not an object is refused, not thrown on", async () => {
+  // No schema is attached to these routes, so Fastify's JSON parser hands the
+  // handler whatever parsed: a truthy primitive used to reach the `in` that
+  // looks for a scope field and throw, turning a refusal into a 500 with a
+  // logged stack. The payload has to be a number — light-my-request sends a
+  // bare string as text/plain, which is refused with a 415 before the handler
+  // ever runs, so a string here would pin nothing.
+  const res = await ask({}, 123);
+  assert.equal(res.statusCode, 401, "a primitive body must still reach the credential check");
+  assert.deepEqual(res.json(), { error: "scope_credential_malformed" });
+});
+
 test("a proof for one owner cannot be presented for another", async () => {
   // The pair's parts cannot span the separator, so no re-reading of one
   // credential's bytes yields a different pair with the same proof.

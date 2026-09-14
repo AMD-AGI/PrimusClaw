@@ -38,6 +38,13 @@ export {
  */
 export interface HandsKeyStore {
   keys(filter: string): Promise<string[]>;
+  /**
+   * Null for a key that is not there, and only for that. A store that could not
+   * answer throws instead, and one whose delete leaves a readable empty entry
+   * behind -- which is what the key-value client does -- reports that as null
+   * too: the callers here tell "gone" from "unreadable" and act oppositely on
+   * the two, so the distinction cannot be left for each of them to make.
+   */
   read(key: string): Promise<{ value: string; revision: number } | null>;
   /** False where the key already exists. Never overwrites. */
   create(key: string, value: string): Promise<boolean>;
@@ -159,7 +166,9 @@ export class ReservedKeyCollision extends Error {}
  * Refuse the deployment where a session binding occupies a retention's key.
  *
  * An entry that cannot be read is refused too: it may be either, and a check
- * that passed on what it could not open would be no check.
+ * that passed on what it could not open would be no check. An entry that is
+ * *gone* is not refused: a key nothing holds occupies nothing, and there is no
+ * binding for the check to be fooled about.
  */
 export async function assertRetentionSeparation(store: HandsKeyStore): Promise<void> {
   const colliding: string[] = [];
@@ -170,7 +179,17 @@ export async function assertRetentionSeparation(store: HandsKeyStore): Promise<v
     if (!isLegacySessionKey(key)) continue;
     try {
       const entry = await store.read(key);
-      if (entry === null || !isRetentionEntry(JSON.parse(entry.value))) colliding.push(key);
+      // Skipped rather than refused, and it is the walk being a snapshot that
+      // makes this the common case rather than an exotic one: this runs at boot
+      // during a rolling restart, while every other replica's sweep goes on
+      // releasing the retentions it finds clear and the bucket goes on expiring
+      // projections nothing refreshed. Such a key is not a session binding
+      // sitting in the reserved namespace -- it is nothing at all -- and
+      // refusing the deployment over it tells an operator to remove or rename a
+      // key that no longer exists, in the window where they are watching for
+      // real trouble. A store that could not answer still throws into the catch.
+      if (entry === null) continue;
+      if (!isRetentionEntry(JSON.parse(entry.value))) colliding.push(key);
     } catch {
       colliding.push(key);
     }

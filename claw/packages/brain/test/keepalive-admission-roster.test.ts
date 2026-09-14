@@ -329,6 +329,34 @@ test("the replica that claimed a target releases it once the census stops naming
       "a target no census has named for ten reclaim horizons must not hold a slot");
   });
 
+test("the replica that claimed a provisional slot ages it out rather than renewing it",
+  async () => {
+    // The release that lost every retry is swallowed at the call site, so the
+    // reservation outlives the create it was made for -- and the replica that
+    // claimed it goes on sweeping, which is what production has. Renewed on
+    // ownership it would be held for the life of that pod, and once enough of
+    // them accumulate every replica refuses at the boundary with nothing left
+    // to reap.
+    const shared = sharedStore();
+    const a = shared.store("replica-a");
+    const claim = await claimProvisionalSlot(a, CONFIG);
+    assert.ok(claim.ok);
+    const claimedAt = shared.peek()!.entries[0].renewedAtMs;
+    const sweepMs = CONFIG.reclaimHorizonMs / 4;
+
+    for (let i = 1; i <= 3; i++) {
+      await renewAndReap(a, CONFIG, new Set<string>(), claimedAt + i * sweepMs);
+    }
+    assert.equal(shared.peek()!.entries.length, 1,
+      "held throughout the provisioning ceiling, by its own sweeper as much as a neighbour's");
+
+    for (let i = 4; i <= 40; i++) {
+      await renewAndReap(a, CONFIG, new Set<string>(), claimedAt + i * sweepMs);
+    }
+    assert.equal(shared.peek()!.entries.length, 0,
+      "ownership is no evidence a provisioning is still in flight");
+  });
+
 test("a target absent from one census is aged, not released", async () => {
   // One census that missed a target is not proof the target is gone. The
   // horizon has to stand between the two, or a sweep that raced a registration
@@ -371,4 +399,27 @@ test("an incomplete census neither ages nor releases", async () => {
   }
   assert.equal(shared.peek()!.entries.length, 1,
     "a target a sweep could not read is not a target a sweep may retire");
+});
+
+test("an incomplete census does not renew a provisional slot either", async () => {
+  // That branch reaps nothing, so it cannot strand a slot on its own -- but it
+  // stamps what it renews, and a census that keeps coming back incomplete more
+  // often than the horizon would keep deferring the ageing that is the only
+  // thing which ever reclaims a provisional entry.
+  const shared = sharedStore();
+  const a = shared.store("replica-a");
+  const claim = await claimProvisionalSlot(a, CONFIG);
+  assert.ok(claim.ok);
+  const claimedAt = shared.peek()!.entries[0].renewedAtMs;
+
+  const sweepMs = CONFIG.reclaimHorizonMs / 4;
+  for (let i = 1; i <= 40; i++) {
+    await renewAndReap(a, CONFIG, new Set<string>(), claimedAt + i * sweepMs, false);
+  }
+  assert.equal(shared.peek()!.entries[0].renewedAtMs, claimedAt,
+    "the stamp the claim left is the one the horizon goes on being measured from");
+
+  await renewAndReap(a, CONFIG, new Set<string>(), claimedAt + CONFIG.reclaimHorizonMs + 1);
+  assert.equal(shared.peek()!.entries.length, 0,
+    "so the first sweep that reads the fleet whole can retire it");
 });

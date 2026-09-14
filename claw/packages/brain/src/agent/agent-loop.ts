@@ -46,6 +46,22 @@ const logger = pino({ name: "agent-loop" });
 const WAITING_TOOLS = new Set(["wait"]);
 
 /**
+ * The classes a `wait` can still block in.
+ *
+ * The sandbox blocks for as long as the shell's registry entry reads running,
+ * and that is as true of a shell whose epoch could not be read
+ * (`unverified_running`) or whose attachment never landed
+ * (`spawn_indeterminate`) as of a plain `running` one: the process is that
+ * sandbox's own child and the exit event is still coming. Reading either as
+ * settled held the pod's execution slot for the whole wait timeout of a call
+ * that really blocked. The error the other way -- one of those classes whose
+ * registry entry is already gone, so the call is answered at once -- costs a
+ * park/unpark round trip around a call that did not block, which is the trade
+ * an unreadable sandbox already takes by reading as running.
+ */
+const BLOCKING_SHELL_CLASSES = new Set(["running", "unverified_running", "spawn_indeterminate"]);
+
+/**
  * Detect upstream-connect failures that LiteLLM mis-classifies as 401
  * `auth_error` (e.g. wrapping `httpx.ConnectError` when it can't reach the
  * real LLM provider) so they retry like 5xx instead of failing the task
@@ -861,17 +877,17 @@ class AgentLoopRunner {
   /**
    * Whether a `wait` on this shell can block, from a non-consuming read.
    *
-   * Only a class this sandbox still owes an exit event for can: `running`, and
-   * `ended_unreaped` inside the window where the collecting process is alive
-   * and the event is pending. Everything else -- finished, lost, unknown, a
-   * claim with no process, a shell whose state could not be read -- is already
+   * Only a class this sandbox still owes an exit event for can: the ones in
+   * BLOCKING_SHELL_CLASSES, and `ended_unreaped` inside the window where the
+   * collecting process is alive and the event is pending. Everything else --
+   * finished, lost, unknown, an exit whose collector is gone -- is already
    * settled and is answered at once, so no slot is released for it.
    */
   private async waitCanBlock(input: Record<string, unknown>): Promise<boolean> {
     const shellId = input.shell_id;
     if (typeof shellId !== "string" || !shellId) return false;
     const probe = await this.router.classifyShell(shellId);
-    return probe.shellClass === "running"
+    return BLOCKING_SHELL_CLASSES.has(probe.shellClass)
       || (probe.shellClass === "ended_unreaped" && probe.collectorLive);
   }
 
