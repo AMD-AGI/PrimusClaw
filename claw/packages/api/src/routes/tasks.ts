@@ -352,7 +352,21 @@ export async function registerTaskRoutes(app: FastifyInstance): Promise<void> {
           );
         }
       }
-      return { ok: true, cancelled: r.cancelled };
+      // `released` says whether the sandbox teardown that cancellation triggers
+      // was actually acknowledged -- "confirmed" / "unconfirmed" / "nothing_held";
+      // see ReleaseOutcome. Without it an accepted cancel and a silently failed
+      // release are the same response, and a GPU workload that outlives its task
+      // is invisible to the caller.
+      //
+      // Added, never substituted: the status code and `ok` / `cancelled` keep
+      // exactly the values they had, and the field is omitted rather than
+      // guessed when the branch taken established nothing, so a client that
+      // does not know about it reads an unchanged response.
+      return {
+        ok: true,
+        cancelled: r.cancelled,
+        ...(r.released ? { released: r.released } : {}),
+      };
     },
   );
 

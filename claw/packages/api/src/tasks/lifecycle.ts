@@ -13,7 +13,7 @@
 import { db, inTransaction } from "../infra/db.js";
 import pino from "pino";
 import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
-import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
+import { type ReleaseOutcome, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
@@ -228,7 +228,12 @@ async function maybeStopHandlesForLastUser(
  */
 export async function cancelTask(
   taskId: string,
-): Promise<{ ok: boolean; cancelled: number; interrupt_key?: string }> {
+): Promise<{
+  ok: boolean;
+  cancelled: number;
+  interrupt_key?: string;
+  released?: ReleaseOutcome;
+}> {
   const task = await getTask(taskId);
   if (!task) return { ok: false, cancelled: 0 };
 
@@ -239,8 +244,18 @@ export async function cancelTask(
         + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
       params: [task.task_id],
     });
-    await stopAllHandlesForDag(task.task_id, task.session_id);
-    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id };
+    // The verdict above is already written and stays written. `released` only
+    // reports what the cleanup that follows established; a failed release must
+    // never turn a successful cancellation into a failure, because the sweeper
+    // and Dispatron both rely on the verdict landing regardless.
+    const released = await stopAllHandlesForDag(task.task_id, task.session_id);
+    if (released === "unconfirmed") {
+      logger.warn(
+        { taskId: task.task_id, sessionId: task.session_id },
+        "task.cancel.release_unconfirmed",
+      );
+    }
+    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id, released };
   }
 
   // `preparing` counts as executing, not as pending. The dispatcher sets it at
@@ -255,6 +270,15 @@ export async function cancelTask(
   // nothing to acknowledge the cancellation. That one sits in `cancelling`
   // until the sweeper closes it, which is what the sweeper's `cancelling`
   // branch is for.
+  //
+  // `released` is deliberately absent from everything this branch returns. A
+  // non-root cancel stops no sandbox: teardown happens later, when the DAG root
+  // transitions or the sweeper reaches it. Answering `nothing_held` here would
+  // claim no handle was ever recorded, which this branch has not checked and
+  // usually is not true, and answering `unconfirmed` would report a failure of
+  // an attempt that was never made. Omitting the field says what is actually
+  // the case: this call establishes nothing about the sandbox. Dispatron
+  // cancels the DAG root, which is the branch above.
   const executing = task.status === "preparing" || task.status === "running";
   const updated = await transitionStatus(
     task.task_id,
