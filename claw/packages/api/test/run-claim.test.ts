@@ -233,6 +233,34 @@ test("a row that is not there is missing, not busy", async () => {
   assert.equal(await claimRunById("ktsk_gone", "brain-7"), "missing");
 });
 
+test("an unclaim that closes a stopped row hands its workspace back", async () => {
+  // The Stop parked the row at `cancelling` and kept the reference on purpose,
+  // for a turn that was still winding down. This unclaim is where it stops,
+  // so this is where the reference is owed -- leaving it to the sweeper's
+  // reconciler is a tick of delay and a release credited as a write.
+  const seen = stubQueries([
+    () => ({ rows: [{ task_id: "ktsk_1", status: "cancelled" }], rowCount: 1 }),
+    () => ({ rows: [], rowCount: 0 }),
+  ]);
+  assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
+  assert.match(statusUpdate(seen).sql, RELEASE_STATUS);
+  const ref = seen.find((q) => /FROM claw_workspace_refs/.test(q.sql));
+  assert.ok(ref, `no workspace release among:\n${seen.map((q) => q.sql).join("\n")}`);
+  assert.match(ref!.sql, /ref_kind = 'run'/);
+  assert.equal(ref!.params[0], "ktsk_1");
+});
+
+test("an unclaim that requeues a row keeps its workspace", async () => {
+  // The other arm of the same statement: a requeued row is still a live turn
+  // waiting for its next claim, and releasing here would take the workspace
+  // out from under it.
+  const seen = stubQueries([
+    () => ({ rows: [{ task_id: "ktsk_1", status: "queued" }], rowCount: 1 }),
+  ]);
+  assert.equal(await releaseClaim("ktsk_1", "brain-7"), true);
+  assert.ok(!seen.some((q) => /FROM claw_workspace_refs/.test(q.sql)));
+});
+
 test("unclaim by a different brain does not move the row", async () => {
   stubQueries([() => ({ rows: [], rowCount: 0 })]);
   assert.equal(await releaseClaim("ktsk_1", "brain-other"), false);

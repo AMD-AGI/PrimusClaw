@@ -92,6 +92,24 @@ export async function failClaimedRun(
 }
 
 /**
+ * How a holder action speaks, where the defaults are not what the caller is.
+ *
+ * Both defaults are what every ordinary holder wants: this pod's own id, and
+ * the retry ladder below. The fat pre-gate wants neither. It takes its lease
+ * under an id it was handed rather than the module's, and `settleFinishedClaim`
+ * fences on `lease_owner = $2` and answers a mismatch with the 409 this client
+ * reads as success -- so a release under the wrong name leaks the lease with
+ * nothing logged. And it releases from a path a shutdown can cut off in the
+ * middle, which would take the verdict that follows the release with it.
+ */
+export interface HolderCall {
+  /** The owner the row is fenced to, when it is not this pod's own id. */
+  brainId?: string;
+  /** How many times to try. One, for a caller that cannot outlive its ladder. */
+  attempts?: number;
+}
+
+/**
  * End this attempt's record without giving the row back: a chat row carries no
  * `callback_url`, so a clean finish sends no `agent_done` to settle it.
  */
@@ -100,11 +118,12 @@ export async function settleClaimedRun(
   claimCount?: number,
   runTime?: RunTimeReport,
   releaseLease = false,
+  as: HolderCall = {},
 ): Promise<void> {
   await postHolderAction(taskId, "settle-attempt", "run.settle_attempt_failed", {
     ...claimExtra(claimCount), ...(runTime ? { run_time: runTime } : {}),
     ...(releaseLease ? { release_lease: true } : {}),
-  });
+  }, as);
 }
 
 function claimExtra(claimCount?: number): Record<string, string | number> {
@@ -116,10 +135,11 @@ async function postHolderAction(
   action: HolderAction,
   warn: string,
   extra: Record<string, unknown> = {},
+  as: HolderCall = {},
 ): Promise<void> {
   const url = taskActionUrl(taskId, action);
   if (!url) return;
-  const attempts = 3;
+  const attempts = as.attempts ?? 3;
   let lastDetail: unknown = null;
   for (let i = 0; i < attempts; i++) {
     // Spaced, because the failures worth retrying here are a rolling API
@@ -132,7 +152,7 @@ async function postHolderAction(
       const resp = await fetch(url, {
         method: "POST",
         headers: claimHeaders(),
-        body: JSON.stringify({ brain_id: BRAIN_ID, ...extra }),
+        body: JSON.stringify({ brain_id: as.brainId || BRAIN_ID, ...extra }),
         signal: AbortSignal.timeout(5_000),
       });
       if (resp.ok || resp.status === 409) return;

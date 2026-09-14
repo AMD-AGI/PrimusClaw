@@ -132,7 +132,7 @@ describe("an unmetered A2A send is still all-or-nothing", { skip }, () => {
     );
 
     assert.equal(errorOf(res.body), "Failed to create task");
-    assert.equal(await sessions(), 0, "the session write is undone by the refusal that follows it");
+    assert.equal(await sessions(), 0, "the refusal is read-only and runs before any session is written");
     assert.equal(await runs(), 0);
     assert.equal(
       okCreated(await registry.metrics()) - before, 0,

@@ -378,13 +378,14 @@ async function releaseRefRow(
   kind: WorkspaceRefKind,
   refId: string,
   retentionDays: number,
+  q: Querier = db.query,
 ): Promise<RefRelease> {
-  const released = await db.query(
+  const released = await q(
     `UPDATE claw_workspace_refs SET released_at = NOW()
       WHERE workspace_id = $1 AND ref_kind = $2 AND ref_id = $3 AND released_at IS NULL`,
     [workspaceId, kind, refId],
   );
-  await db.query(
+  await q(
     `UPDATE claw_workspaces w
         SET retention_expires_at = NOW() + ($2::int * INTERVAL '1 day'),
             updated_at = NOW()
@@ -541,14 +542,21 @@ export type RunRelease = "released" | "none_held" | "ambiguous" | "failed";
  * find it by, and a claim taken over a reference that was never recorded leaves
  * no reference at all. Two workspaces answering for one run is a split nothing
  * here may pick a side of, so it releases neither.
+ *
+ * `q` is the transaction the row the reference names is being removed on, when
+ * there is one -- the mirror of `recordRunUse` taking the insert's. A caller
+ * that deletes the run row has to release on that same transaction, because the
+ * DELETE destroys the only path back to the reference: there is no foreign key,
+ * and every reclaimer here finds a run reference by joining `claw_tasks`.
  */
 export async function releaseRunUseStrict(
   taskId: string,
   changed: boolean,
+  q: Querier = db.query,
 ): Promise<RunRelease> {
   let candidates: string[];
   try {
-    const r = await db.query(
+    const r = await q(
       `SELECT workspace_id FROM claw_workspace_refs
         WHERE ref_kind = 'run' AND ref_id = $1
        UNION
@@ -567,8 +575,8 @@ export async function releaseRunUseStrict(
   }
   const workspaceId = candidates[0];
   try {
-    await releaseWriterRow(workspaceId, taskId, changed);
-    await releaseRefRow(workspaceId, "run", taskId, RETENTION_DAYS);
+    await releaseWriterRow(workspaceId, taskId, changed, q);
+    await releaseRefRow(workspaceId, "run", taskId, RETENTION_DAYS, q);
   } catch (err) {
     logger.warn({ err, taskId, workspaceId }, "workspace.run_release_failed");
     return "failed";
@@ -979,8 +987,9 @@ async function releaseWriterRow(
   workspaceId: string,
   runId: string,
   changed: boolean,
+  q: Querier = db.query,
 ): Promise<void> {
-  await db.query(
+  await q(
     `UPDATE claw_workspaces
         SET writer_run_id     = NULL,
             writer_expires_at = NULL,

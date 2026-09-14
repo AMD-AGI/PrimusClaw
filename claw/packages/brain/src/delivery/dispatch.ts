@@ -70,6 +70,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { isRunDoorbell, type ExecuteRequest } from "@claw/protocol";
 import type { JsMsg } from "nats";
 
+import { settleClaimedRun } from "../clients/run-claim.js";
 import { BRAIN_ID, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS } from "../config.js";
 import { askRunLease, type LeaseRenewal } from "../tasks/callback.js";
 import { taskIdFromLease } from "../tasks/run-identity.js";
@@ -150,7 +151,12 @@ export type DeliveryStop = "cancelling" | "gone" | "superseded";
 
 /** What the first lease POST concluded. */
 export type Acceptance =
-  /** The lease is this pod's. `stop` is set when the row is already over. */
+  /**
+   * This delivery is this pod's to finish with. `stop` is set when the row is
+   * already over, which the answer reaches two ways: a lease granted on a row
+   * the user had stopped, and a lease refused by a stopped row nobody holds.
+   * Neither is a run, and both leave the settlement to this delivery.
+   */
   | { kind: "held"; runClaim?: number; stop?: DeliveryStop }
   /** Terminal or missing: nobody holds anything, so the delivery is settled. */
   | { kind: "gone" }
@@ -177,6 +183,8 @@ export interface FatPreGate {
   ): PreGateHeartbeat;
   /** The interrupted completion a delivery stopped before the handler settles with. */
   settleStopped(target: FatTarget, runClaim: number | undefined): Promise<void>;
+  /** Give an accepted lease back, so a redelivery may take it at once. */
+  release(target: FatTarget, runClaim: number | undefined): Promise<void>;
 }
 
 /** The parsed delivery, which is what every step of the protocol acts on. */
@@ -438,6 +446,17 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
     if (!arm.raised()) slotHeld = await raceGateAgainstStop(deps, arm.signal);
     if (deps.isDraining() && !arm.raised()) {
       deps.onRefuse?.("drain");
+      // The lease goes back with the message. This pod has held it since before
+      // the gate -- renewed across the whole queue wait, which is as long as
+      // another run -- and a redelivery that finds it live is classified
+      // `superseded` and naks in turn, so the turn stands still for the rest of
+      // the TTL on a pod that already knows it will not run it. Renewal stopped
+      // first, then the release, then the nak: the order `nakAfterAttempt` uses,
+      // for the same reason. `preGate.stop()` is `clearInterval`, so the
+      // `finally` calling it again costs nothing, and the release reports its
+      // own failures rather than raising them, so the nak always follows.
+      preGate?.stop();
+      await deps.fatPreGate!.release(target, runClaim);
       msg.nak(DRAIN_NAK_MS);
       return;
     }
@@ -469,6 +488,8 @@ export interface FatPreGateDeps {
   emit(sessionId: string, event: Record<string, unknown>): Promise<void>;
   /** The lease POST. A seam so a test can answer it without a server. */
   ask?: typeof askRunLease;
+  /** The settle-and-release POST. A seam so a test can answer it without a server. */
+  settle?: typeof settleClaimedRun;
   brainId?: string;
   leaseTtlMs?: number;
   heartbeatMs?: number;
@@ -488,6 +509,7 @@ const PRE_GATE_INTERRUPT_TEXT = "[Interrupted by user before any turn completed]
  */
 export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
   const ask = deps.ask ?? askRunLease;
+  const settle = deps.settle ?? settleClaimedRun;
   const brainId = deps.brainId ?? BRAIN_ID;
   const leaseSeconds = Math.ceil((deps.leaseTtlMs ?? RUN_LEASE_TTL_MS) / 1000);
   const heartbeatMs = deps.heartbeatMs ?? RUN_LEASE_HEARTBEAT_MS;
@@ -528,6 +550,19 @@ export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
     async accept(target) {
       const answer = await ask(target, body(undefined, true));
       if (answer.kind === "refused") {
+        // A row stopped before anybody accepted it. Nothing else will emit the
+        // completion that moves it off `cancelling` -- the interrupt subject
+        // has no subscriber until a run starts, and this delivery is the last
+        // thing holding it -- so it is settled visibly rather than acked away.
+        // The generation is the row's own, quoted back so the completion is
+        // admissible on a row a previous attempt left fenced.
+        if (answer.stop === "cancelling") {
+          return {
+            kind: "held",
+            stop: "cancelling",
+            ...(answer.claimCount === undefined ? {} : { runClaim: answer.claimCount }),
+          };
+        }
         return answer.refusal === "gone" ? { kind: "gone" } : { kind: "refused" };
       }
       // No verdict is not a lease. A mid-run heartbeat may wait for the next
@@ -579,6 +614,27 @@ export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
         ...(runTaskIdOf(target) ? { task_id: runTaskIdOf(target) } : {}),
         ...(runClaim === undefined ? {} : { run_claim: runClaim }),
       });
+    },
+
+    async release(target, runClaim) {
+      const taskId = runTaskIdOf(target);
+      // Nothing to fence with is nothing to release. An acceptance that issued
+      // no generation came from an API that predates them, and owner alone
+      // cannot say which of this pod's leases on the row is being given back --
+      // `brain_id` is a pod name, the same string for every lease it ever takes
+      // here. Left to lapse instead, which is what happened before this
+      // release existed.
+      if (!taskId || runClaim === undefined) return;
+      // Owner null, expiry stamped in the past: the shape `acquireFatLease`'s
+      // released-lease arm is written for, so the redelivery accepts at once.
+      // Under this pre-gate's own `brainId`, because that is the owner the
+      // acceptance wrote and the settle fences on it -- a mismatch answers 409,
+      // which this client reads as success, and the lease would leak silently.
+      // One attempt, because the message is coming back in DRAIN_NAK_MS either
+      // way and the retry ladder is longer than the shutdown that may be
+      // running underneath it: a release still in flight when the process exits
+      // takes the nak with it.
+      await settle(taskId, runClaim, undefined, true, { brainId, attempts: 1 });
     },
   };
 }

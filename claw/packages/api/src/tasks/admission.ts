@@ -333,6 +333,28 @@ function anyCeilingSet(limits: AdmitLimits): boolean {
     || limits.softGpuNodes > 0 || limits.hardGpuNodes > 0;
 }
 
+/**
+ * The tree bounds alone, for a write that grows a tree and starts no work.
+ *
+ * Creating a session node is that write. Putting it through the whole decision
+ * would have it refused by `hardOverflow` on the fleet's *run* occupancy --
+ * which the node does not add to, and which an unparented create of the same
+ * shape is never asked about -- so lowering a run ceiling would start refusing
+ * idle team setup that runs nothing. Dispatch is where a run meets a run cap.
+ */
+export function treeCeilingRefusal(
+  ask: AdmissionAsk, limits: AdmitLimits = envAdmitLimits(),
+): AdmissionRejectReason | null {
+  const reason = treeCapReason(ask, limits);
+  // Counted here, as `decideAdmission` counts its own. A refusal this route
+  // makes but does not record is a 429 the rollout's positive-rejection and
+  // unexpected-reason checks cannot see, which reads as a route that never
+  // refuses anything.
+  metrics.onAdmissionDecision(ask.origin, reason ? "reject" : "admit");
+  if (reason) metrics.onAdmissionRejected(ask.origin, "pre_insert", reason);
+  return reason;
+}
+
 function treeCapReason(ask: AdmissionAsk, limits: AdmitLimits): AdmissionRejectReason | null {
   if (limits.treeMaxNodes > 0 && (ask.treeNodeCount ?? 1) > limits.treeMaxNodes) {
     return "tree_nodes_exceeded";
@@ -631,17 +653,75 @@ export function chargeAccepted(
 }
 
 export interface FillOptions<T> {
-  /** One priority-ordered page, excluding the ids already passed over. */
-  page: (skip: string[]) => Promise<T[]>;
+  /**
+   * One priority-ordered page, excluding the ids already passed over.
+   *
+   * `from` is where this pass starts in the queue's own order, and is 0 unless
+   * a previous pass stopped on its scan budget. `skip` covers what this pass
+   * has already examined past that point, so the two compose rather than
+   * overlap: the offset gets a bounded pass past a long blocked prefix, the
+   * id list keeps a page from re-reading what the page before it returned.
+   */
+  page: (skip: string[], from: number) => Promise<T[]>;
   /** Whether this candidate fits; charging the snapshot is the caller's. */
   fits: (row: T) => boolean;
   /** How many rows the caller can use. */
   want: number;
   idOf: (row: T) => string;
+  /**
+   * Name this caller's resume point under, or omit to always start at the head.
+   *
+   * Callers that page the same queue on a timer share one name; a caller whose
+   * candidate set is a different queue needs its own, or one would advance the
+   * other past rows it never read.
+   */
+  resume?: string;
 }
 
 /**
- * Page candidates in priority order until `want` fit or a page comes back short.
+ * How many candidates one pass may read past before it leaves the rest.
+ *
+ * Every caller's page is exactly `want` rows wide, so "a page came back short"
+ * is not reached until the whole backlog has been read -- and it is read under
+ * {@link ADMISSION_LOCK_KEY}, the one gate every create, retry, expansion and
+ * hand-off also waits behind. A saturated dimension rejects every candidate
+ * that asks for it, so an unbudgeted pass over a deep queue holds that lock for
+ * the length of the queue: a round-trip per page, each re-sending every id
+ * passed over so far, while nothing in the fleet can start anything.
+ *
+ * The budget pays for that in head-of-line delay -- a row that fits sitting
+ * behind more than this many that do not is reached a pass later rather than
+ * this one. That is the lesser of the two, and it clears the same way the
+ * ceiling itself does, as the rows ahead of it finish.
+ */
+const MAX_FILL_SCAN = 512;
+
+/**
+ * Where each caller's last budget-bounded pass stopped reading.
+ *
+ * A budget alone is not enough: every pass starts with an empty `skip`, so a
+ * blocked prefix longer than the budget is re-read from the top every tick and
+ * the row at `MAX_FILL_SCAN + 1` is never reached at all -- starvation, not the
+ * one-pass delay the budget is meant to buy. A pass that spends its budget
+ * therefore remembers how far it got and the next one resumes from there, so
+ * the queue is covered in bounded steps.
+ *
+ * Cleared as soon as a pass reaches the end of the queue or fills its want,
+ * which is what stops the offset from walking away from a backlog that has
+ * since drained. Process-local and advisory on purpose: it decides only where
+ * to start reading, never what may be admitted, so a replica restart or two
+ * replicas at different offsets cost a repeated read and nothing else.
+ */
+const fillResume = new Map<string, number>();
+
+/** Forget every caller's resume point. For tests, which share a module. */
+export function resetFillResumeForTest(): void {
+  fillResume.clear();
+}
+
+/**
+ * Page candidates in priority order until `want` fit, a page comes back short,
+ * or {@link MAX_FILL_SCAN} candidates have been read past.
  *
  * Deliberately does not stop on a saturated dimension: demand is optional per
  * dimension, so a row asking for no sandbox fits a fleet with no sandbox
@@ -650,8 +730,18 @@ export interface FillOptions<T> {
 export async function fillWithinCeiling<T>(opts: FillOptions<T>): Promise<T[]> {
   const accepted: T[] = [];
   const skip: string[] = [];
+  // `skip` takes every candidate examined, accepted or not, so its length is
+  // the scan. Floored at `want` so the budget only ever bounds how far past a
+  // blocked prefix one pass reads, never how many rows a caller may be given.
+  const maxScan = Math.max(opts.want, MAX_FILL_SCAN);
+  const from = opts.resume ? fillResume.get(opts.resume) ?? 0 : 0;
+  let budgetSpent = false;
   while (accepted.length < opts.want) {
-    const rows = await opts.page(skip);
+    if (skip.length >= maxScan) {
+      budgetSpent = true;
+      break;
+    }
+    const rows = await opts.page(skip, from);
     if (!rows.length) break;
     for (const row of rows) {
       if (accepted.length >= opts.want) break;
@@ -659,6 +749,22 @@ export async function fillWithinCeiling<T>(opts: FillOptions<T>): Promise<T[]> {
       skip.push(opts.idOf(row));
     }
     if (rows.length < opts.want) break;
+  }
+  if (opts.resume) {
+    // Advanced only by a pass that stopped on the budget; anything else means
+    // there is nothing further back to reach, and starting the next pass deeper
+    // into a queue that has drained would skip rows that do fit.
+    if (budgetSpent) fillResume.set(opts.resume, from + skip.length);
+    else fillResume.delete(opts.resume);
+  }
+  // Said out loud, because a pass that stopped at the budget hands back what a
+  // drained queue hands back, and the two call for opposite responses: one
+  // wants the ceiling raised or the backlog looked at, the other wants nothing.
+  if (budgetSpent) {
+    logger.warn(
+      { scanned: skip.length, from, accepted: accepted.length, want: opts.want },
+      "admission.fill_budget_spent",
+    );
   }
   return accepted;
 }

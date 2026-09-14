@@ -192,6 +192,41 @@ test("a create whose publish outcome is unknown answers 503 and keeps the sessio
   }
 });
 
+test("a create whose reconciliation marker could not be handed back keeps the session", async () => {
+  // The wakeup is already on the stream by the time the marker is cleared, so
+  // the statement that clears it is the one thing past the publish that may not
+  // answer a publish failure: a throw read as one terminalizes a turn that
+  // really was dispatched, and the create's rollback then deletes the session
+  // and the message under it. A marker this call could not hand back is
+  // reconciliation's to settle, which is the answer a takeover already gets.
+  const sessionDispatchPorts = await freshPorts();
+  sessionDispatchPorts.doorbellDispatch = openDoorbellBarrier;
+  sessionDispatchPorts.publishSse = () => {};
+  sessionDispatchPorts.publishTask = async () => 1;
+  const inner = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    if (/SET dispatch_reconcile_at = NULL/.test(text)) throw new Error("ECONNRESET");
+    return await inner(text, params);
+  }) as typeof db.query;
+  const app = await appAs(registerSessionRoutes);
+  try {
+    const res = await createWithMessage(app);
+
+    assert.equal(res.statusCode, 503);
+    assert.equal((await sessionRows()).length, 1, "the session the turn will answer into is still here");
+    const rows = await h.sql("SELECT status, dispatch_reconcile_at FROM claw_tasks");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, "queued", "not failed: a Brain may be running this turn already");
+    assert.notEqual(
+      rows[0].dispatch_reconcile_at, null,
+      "and the marker the sweeper settles the row from is left armed",
+    );
+  } finally {
+    db.query = inner;
+    await app.close();
+  }
+});
+
 test("a message whose publish outcome is unknown answers 503 and keeps the gate", async () => {
   await unknownPublishOutcome();
   await seedSession(h, "s1", { agentStatus: "idle", gateOwner: null });
@@ -242,11 +277,20 @@ test("a managed-agent rejection records no event saying the turn started", async
   assert.equal((await sessionRows())[0].agent_status, "idle");
 });
 
-test("a managed-agent deferral records the message but not a running event", async () => {
+test("a managed-agent deferral records the running event its held gate implies", async () => {
   const { response, events } = await managedEventWithAdmission({ kind: "queue", position: 1 });
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(events.map((event) => event.event), ["UserMessage"]);
+  const messageId = response.json().data[0].id as string;
+  assert.deepEqual(
+    events.map((event) => event.event),
+    ["UserMessage", "AnthropicSessionRunning"],
+  );
+  assert.equal(events[1].event_id, `claw-running-${messageId}`);
+  assert.equal(
+    (await sessionRows())[0].agent_status, "running",
+    "which is what the REST view answers for the whole wait, so the stream saying nothing contradicted it",
+  );
 });
 
 test("a managed-agent dispatch records one stable running event after admission", async () => {

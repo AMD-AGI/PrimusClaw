@@ -286,6 +286,7 @@ apply_body="$tmp/apply-body.yaml"
 rollout_env=(
   RUN_DOORBELL_DISPATCH="true"
   BRAIN_DOORBELL_EXECUTION="false"
+  RUN_FAT_PREPARING_RECONCILE="false"
   ADMIT_SOFT_RUNS="11" ADMIT_HARD_RUNS="12"
   ADMIT_SOFT_SANDBOXES="13" ADMIT_HARD_SANDBOXES="14"
   ADMIT_SOFT_GPU_NODES="15" ADMIT_HARD_GPU_NODES="16"
@@ -311,6 +312,7 @@ with open(sys.argv[1], encoding="utf-8") as f:
 features, api = values.get("features", {}), values.get("api", {})
 assert features.get("runDoorbellDispatch") is True, features
 assert features.get("brainDoorbellExecution") is False, features
+assert features.get("runFatPreparingReconcile") is False, features
 expected = {
     "admitSoftRuns": "11", "admitHardRuns": "12",
     "admitSoftSandboxes": "13", "admitHardSandboxes": "14",
@@ -346,6 +348,7 @@ api_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" 
 for _flag in \
   "--set features.runDoorbellDispatch=true" \
   "--set features.brainDoorbellExecution=false" \
+  "--set features.runFatPreparingReconcile=false" \
   "--set-string api.admitSoftRuns=11" "--set-string api.admitHardRuns=12" \
   "--set-string api.admitSoftSandboxes=13" "--set-string api.admitHardSandboxes=14" \
   "--set-string api.admitSoftGpuNodes=15" "--set-string api.admitHardGpuNodes=16" \
@@ -385,6 +388,32 @@ checksum_staged="$(grep -o 'checksum/rollout-config: [^ ]*' "$apply_body" | head
   exit 1
 }
 
+# ── A recorded key re-passed on the command line ──
+# The file wins, which is the documented contract for this whole class. What
+# the contract needs is a word about it: a kill switch flipped on the command
+# line and dropped in silence looks exactly like one that took effect, the
+# write-back only fills blanks so it writes nothing either, and upgrade.sh
+# prints no effective-value summary. Every run above uses `env -i` because that
+# is the shape of a real upgrade, so the stale value needs an invocation of its
+# own -- and helm is mocked here, so nothing has to be true of a cluster.
+: >"$capture"
+env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
+  MOCK_HELM_STATUS=0 TAG="release-test-r1b" RUN_DOORBELL_DISPATCH="false" \
+  bash "$repo_root/claw/deploy/upgrade.sh" -n "$rollout_namespace" --dry-run \
+    >"$tmp/upgrade-ignored.log" 2>&1 || { command cat "$tmp/upgrade-ignored.log" >&2; exit 1; }
+
+grep -q 'WARN: RUN_DOORBELL_DISPATCH=.*IGNORED' "$tmp/upgrade-ignored.log" || {
+  echo "a shell value the values file pins was discarded without saying so" >&2
+  command cat "$tmp/upgrade-ignored.log" >&2
+  exit 1
+}
+
+ignored_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" | tail -1)"
+case "$ignored_render" in
+  *"--set features.runDoorbellDispatch=true"*) ;;
+  *) echo "the warning was printed but the file did not win: $ignored_render" >&2; exit 1 ;;
+esac
+
 # The shipped defaults: every key blank, so nothing is forwarded and no patch
 # is issued -- and the annotation must still differ from the staged render, or
 # the ceiling would reach the Secret and never reach a pod.
@@ -393,7 +422,7 @@ import re, sys
 path = sys.argv[1]
 with open(path, encoding="utf-8") as f:
     text = f.read()
-text = re.sub(r'(?m)^((?:ADMIT_[A-Z_]+|RUN_DOORBELL_DISPATCH|BRAIN_DOORBELL_EXECUTION))=.*$', r'\1=""', text)
+text = re.sub(r'(?m)^((?:ADMIT_[A-Z_]+|RUN_DOORBELL_DISPATCH|BRAIN_DOORBELL_EXECUTION|RUN_FAT_PREPARING_RECONCILE))=.*$', r'\1=""', text)
 assert '="11"' not in text, "failed to blank the rollout keys"
 with open(path, "w", encoding="utf-8") as f:
     f.write(text)

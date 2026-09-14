@@ -110,6 +110,14 @@ spec:
         # the first also stop the second draining the backlog.
         - name: RUN_DOORBELL_DISPATCH
           value: {{ dig "runDoorbellDispatch" true (.Values.features | default dict) | quote }}
+        # Also container-level, but for a different reason: only the API reads
+        # it, so putting it in the shared Secret would hand it to every
+        # workload. The API asserts with it that no Brain executes without
+        # first taking a durable holder -- false for the length of a rollup
+        # from a release that predates the holder, cleared once every replica
+        # on both sides is new.
+        - name: RUN_FAT_PREPARING_RECONCILE
+          value: {{ dig "runFatPreparingReconcile" true (.Values.features | default dict) | quote }}
         - name: NODE_OPTIONS
           value: {{ .Values.api.nodeOptions | quote }}
         - name: BRAIN_TASK_TIMEOUT_SEC

@@ -470,6 +470,46 @@ async function a2aAdmissionAsk(
 }
 
 /**
+ * The ownership the ask depends on, established before the ask reads the tree.
+ *
+ * `resolveSendTarget` and `attachA2AParent` enforce exactly these two rules,
+ * but they run *after* the decision -- so a send naming another tenant's task
+ * is answered "that tree is full" before it is answered "no such task", and
+ * the refusal names which of a stranger's ceilings is saturated. The parented
+ * half is sharper still, because its prospective shape is `nodeCount + 1`: a
+ * stranger's ordinary session is rejected where a session id that exists
+ * nowhere falls through, which is an existence oracle over every row in
+ * `claw_sessions`. Authorise, then shape, then decide -- the order
+ * `admitParentedSessionCreate` already uses.
+ *
+ * Read-only on purpose. `withOwnedAdmissionLock` commits whatever the callback
+ * returns and rolls back only on a throw, so moving the *writing* checks up
+ * instead would commit the session insert and the gate take of a send that was
+ * then rejected or deferred.
+ */
+async function denySendTargetAccess(
+  message: Message,
+  callerId: string,
+  rpcId: string | number,
+  auth: A2AAuthContext,
+  spec: A2ARunSpec,
+  q: StatementRunner,
+): Promise<JsonRpcResponse | null> {
+  if (message.taskId) {
+    const owned = await q.query(
+      "SELECT 1 FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL AND a2a_caller_id = $2",
+      [message.taskId, callerId],
+    );
+    if (!owned.rows?.length) return makeTaskNotFoundError(rpcId, message.taskId);
+  }
+  // The parent refusal stays a throw, the shape it has on the write path: the
+  // handler flattens it into a generic "Failed to create task", and telling a
+  // caller nothing at all about a session that is not theirs is the point.
+  if (spec.parentSessionId) await assertParentWritable(spec.parentSessionId, auth, q);
+  return null;
+}
+
+/**
  * On the admission lock's own transaction, so the row cannot outlive the session
  * write it references.
  *
@@ -553,6 +593,8 @@ async function admitAndOpenA2ASend(
     };
   }
   return await countingCreatedSession(withOwnedAdmissionLock(async (client) => {
+    const denied = await denySendTargetAccess(message, callerId, rpcId, auth, spec, client);
+    if (denied) return { kind: "error", error: denied };
     const ask = await a2aAdmissionAsk(message.taskId ?? null, spec, client);
     const decision = await decideAdmission(ask, client);
     if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
@@ -601,9 +643,25 @@ async function attachA2AParent(
 ): Promise<void> {
   if (!spec.parentSessionId) return;
   if (!target.created) throw new Error("a2a.reparent_existing_session");
+  // Kept on the write path even though `denySendTargetAccess` has already run
+  // it on this same transaction: this is the function that performs the UPDATE,
+  // and the rule belongs next to the write it guards.
+  await assertParentWritable(spec.parentSessionId, auth, q);
+  await q.query(
+    "UPDATE claw_sessions SET parent_session_id = $1, team_role = $2 WHERE session_id = $3",
+    [spec.parentSessionId, spec.teamRole || "", target.taskId],
+  );
+}
+
+/** The one rule for attaching to a parent, shared by the precheck and the write. */
+async function assertParentWritable(
+  parentSessionId: string,
+  auth: A2AAuthContext,
+  q: StatementRunner,
+): Promise<void> {
   const parent = (await q.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-    [spec.parentSessionId],
+    [parentSessionId],
   )).rows[0] as { user_id?: string | null } | undefined;
   const caller: UserInfo = {
     userId: auth.userId,
@@ -615,10 +673,6 @@ async function attachA2AParent(
   if (!parent || !canWriteSessionAsOperator(parent.user_id, caller)) {
     throw new Error("parent_session_access_denied");
   }
-  await q.query(
-    "UPDATE claw_sessions SET parent_session_id = $1, team_role = $2 WHERE session_id = $3",
-    [spec.parentSessionId, spec.teamRole || "", target.taskId],
-  );
 }
 
 async function publishA2AExecuteTask(

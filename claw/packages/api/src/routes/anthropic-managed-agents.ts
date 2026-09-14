@@ -1333,7 +1333,15 @@ async function dispatchUserMessageTurn(input: {
   if (dispatch.kind === "rejected") {
     return sendError(input.reply, 429, "rate_limit_error", dispatch.reason);
   }
-  if (dispatch.kind === "dispatched") {
+  // Both kinds that survive the refusals above hold the gate this request took,
+  // and `agent_status` is what GET /sessions/:id answers as `running`. A turn
+  // the admission ceiling deferred therefore announced nothing while the REST
+  // view called the session running, and no claimer writes this event when the
+  // queued row is finally picked up -- so that turn got no "started" signal at
+  // all rather than a late one. The refusals returned above and still record
+  // nothing, which is what keeps a turn that never ran from leaving a phantom
+  // "turn started" row in history.
+  if (dispatch.kind === "dispatched" || dispatch.kind === "queued") {
     await publishAnthropicRunningEvent(input.sessionId, dispatch.messageId);
   }
   return input.reply.send({ data: [{ ...input.sentEvent, id: dispatch.messageId }] });

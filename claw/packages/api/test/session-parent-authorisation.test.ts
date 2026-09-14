@@ -97,9 +97,10 @@ test("naming no parent is an answer the resolver gives, not a check it skips", a
 });
 
 test("a parented row cannot be written under a no-parent witness", async () => {
-  // The shape a create takes when it carries no first message. The write is
-  // what refuses: a witness saying nothing was authorised cannot stand in for
-  // one naming the parent about to be stored.
+  // The shape a create takes when it names no parent -- the one path that
+  // still writes outside the admission transaction -- handed a parented row
+  // anyway. The write is what refuses: a witness saying nothing was authorised
+  // cannot stand in for one naming the parent about to be stored.
   await seedParent("s-parent", "u-owner");
   await assert.rejects(
     () => insertSessionRow(db, childRow("s-parent"), { parentSid: null }),

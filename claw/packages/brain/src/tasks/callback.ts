@@ -190,6 +190,23 @@ export interface LeaseRenewal {
 export type LeaseRefused = "gone" | "superseded";
 
 /**
+ * A 409, and the settlement it sometimes leaves to the refused caller.
+ *
+ * `stop` is the one refusal that is not "let go of this": the row was stopped
+ * before anybody accepted the delivery, so nothing else exists that can report
+ * the interrupt, and acking it away leaves the turn recorded nowhere. It is
+ * said beside `refusal` rather than as a third value of it, so an API that
+ * does not send it is read exactly as it was before.
+ */
+export interface LeaseRefusal {
+  refusal: LeaseRefused;
+  /** The stopped row this caller must settle rather than walk away from. */
+  stop?: "cancelling";
+  /** That row's generation, which the completion it asks for is fenced on. */
+  claimCount?: number;
+}
+
+/**
  * Which refusal a 409 was, defaulting to the one that touches nothing.
  *
  * An API too old to say -- the window of a rolling upgrade -- reads as
@@ -199,9 +216,17 @@ export type LeaseRefused = "gone" | "superseded";
  * its budget runs out. Giving a live worker's sandbox and message away costs
  * that worker's turn.
  */
-async function readRefusal(resp: Response): Promise<LeaseRefused> {
-  const body = (await resp.json().catch(() => null)) as { reason?: string } | null;
-  return body?.reason === "terminal" || body?.reason === "missing" ? "gone" : "superseded";
+async function readRefusal(resp: Response): Promise<LeaseRefusal> {
+  const body = (await resp.json().catch(() => null)) as {
+    reason?: string; stop?: string; claim_count?: unknown;
+  } | null;
+  const refusal: LeaseRefused =
+    body?.reason === "terminal" || body?.reason === "missing" ? "gone" : "superseded";
+  return {
+    refusal,
+    ...(body?.stop === "cancelling" ? { stop: "cancelling" as const } : {}),
+    ...(typeof body?.claim_count === "number" ? { claimCount: body.claim_count } : {}),
+  };
 }
 
 /**
@@ -242,7 +267,7 @@ export async function postRunLease(
  */
 export type LeaseAnswer =
   | { kind: "granted"; status: string; claimCount?: number }
-  | { kind: "refused"; refusal: LeaseRefused }
+  | ({ kind: "refused" } & LeaseRefusal)
   | { kind: "unresolved" };
 
 /**
@@ -290,7 +315,7 @@ export async function askRunLease(
     // 409 is the one rejection that means something: this worker is not the
     // one the row recognises. Any other failure is just a failure, and a worker
     // must not stand down because the API had a bad moment.
-    if (resp.status === 409) return { kind: "refused", refusal: await readRefusal(resp) };
+    if (resp.status === 409) return { kind: "refused", ...await readRefusal(resp) };
     if (!resp.ok) {
       logger.warn({ status: resp.status }, "run.lease_renew_rejected");
       return { kind: "unresolved" };

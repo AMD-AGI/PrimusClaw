@@ -659,6 +659,7 @@ for _key, _var in (
 for _key, _var in (
     ("runDoorbellDispatch", "RUN_DOORBELL_DISPATCH"),
     ("brainDoorbellExecution", "BRAIN_DOORBELL_EXECUTION"),
+    ("runFatPreparingReconcile", "RUN_FAT_PREPARING_RECONCILE"),
 ):
     _raw = env(_var)
     if not _raw:

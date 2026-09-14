@@ -236,6 +236,35 @@ const MIGRATION_STATEMENT_TIMEOUT_MS =
   envInt("PG_MIGRATION_STATEMENT_TIMEOUT_MS", 300_000);
 
 /**
+ * How many times {@link ensureChatTurnClaimIndex} reconciles and rebuilds
+ * before giving up and letting `assertSchema` refuse to serve.
+ *
+ * Bounded, not open-ended: everything it retries is a claim that won a race
+ * against an unfenced build, and a fleet claiming fast enough to win three in a
+ * row will not be out-waited by a fourth attempt -- it needs an operator.
+ */
+const CHAT_TURN_INDEX_ATTEMPTS = 3;
+
+/**
+ * Ceiling on the chat-turn reconcile's wait for a row lock.
+ *
+ * Short because the wait is pathological when it happens at all: the reconcile
+ * touches only the spare rows of a duplicated turn, and the one thing likely to
+ * be holding one is a claim already blocked on the fence this reconcile holds.
+ * Aborting and retrying costs a boot a second; waiting costs it the migration
+ * timeout, or a deadlock.
+ */
+const RECONCILE_LOCK_TIMEOUT_MS = 5_000;
+
+/**
+ * Postgres classes that mean "somebody else had the row": 55P03 is
+ * lock_not_available, which is what the lock_timeout above raises, and 40P01 is
+ * deadlock_detected. Both say to try again; nothing else the reconcile can
+ * raise does.
+ */
+const CLAIM_FENCE_RETRY_CODES = new Set(["55P03", "40P01"]);
+
+/**
  * Fail startup when the schema the code needs is not the schema that exists.
  *
  * Most DDL above discards its error, which is right for a race between
@@ -600,39 +629,96 @@ async function reconcileDuplicateChatTurns(client: pg.PoolClient): Promise<void>
 }
 
 /**
- * Establish the uniqueness invariant behind `takeClaim`'s sibling guard. The
- * fence covers the reconcile and the build together: a claim landing between
- * them writes a fresh duplicate and the build then arrives INVALID.
+ * Establish the uniqueness invariant behind `takeClaim`'s sibling guard.
+ *
+ * The fence covers the reconcile only, and the build runs outside it. Holding
+ * the fence across the build is not a stronger version of this -- it cannot
+ * complete at all. `CREATE INDEX CONCURRENTLY` waits out every transaction
+ * holding a write lock on claw_tasks, and a claim blocked on the fence is one
+ * of them: Postgres takes the UPDATE's RowExclusiveLock on the table during
+ * parse analysis, long before the `pg_advisory_xact_lock_shared` conjunct in
+ * its WHERE is ever evaluated. So the build waits on the claim's virtual
+ * transaction, the claim waits on the fence the build's own session holds, and
+ * the deadlock detector picks one of them to kill -- either aborting the
+ * migration into a crashloop, since an interrupted concurrent build is
+ * discarded and restarted from nothing, or failing claims fleet-wide for the
+ * length of the build.
+ *
+ * What the fence bought is therefore bought differently: a claim that lands
+ * during the unfenced build can still write the duplicate that makes the build
+ * arrive INVALID (or refuse with 23505, which leaves it INVALID too), and that
+ * outcome is recovered from rather than prevented -- the next attempt's
+ * reconcile closes the spare and {@link ensureConcurrentIndex} drops the
+ * unusable object before rebuilding.
  */
 async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
   // Probed before the fence, not under it. The fence is exclusive and every
-  // claim takes it shared, so holding it across a concurrent build stalls the
-  // fleet's claims for as long as the build runs -- and this function runs on
-  // every boot: every restart, every scale-up, every rolling deploy pays that
-  // wait even though there is nothing to build. The work below is needed only
-  // when the index is absent or INVALID, which is the migration boot and the
-  // boot after an interrupted one; those are the only boots that should be
-  // able to block a claim, and they are the ones where blocking is the point.
+  // claim takes it shared, so taking it at all stalls the fleet's claims until
+  // it is let go -- and this function runs on every boot: every restart, every
+  // scale-up, every rolling deploy would pay that wait even though there is
+  // nothing to reconcile. The work below is needed only when the index is
+  // absent or INVALID, which is the migration boot and the boot after an
+  // interrupted one; those are the only boots that should be able to block a
+  // claim, and there the stall is one statement rather than a whole build.
   //
-  // Racing two boots into the same conclusion is safe: the loser takes the
-  // fence, re-reads, and returns. The window cannot turn a valid index invalid
-  // -- only a build can, and no build starts without the fence held.
+  // Racing two boots into the same conclusion is safe: `initDb` holds the
+  // migration lock across its entire run and discards the connection rather
+  // than returning it, so the second boot's probe here reads whatever the
+  // first one finished.
   const valid = await readIndexValidity(client, CHAT_TURN_CLAIM_INDEX);
   if (valid.rowCount && valid.rows[0].indisvalid) return;
 
-  await client.query("SELECT pg_advisory_lock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
-  try {
-    await reconcileDuplicateChatTurns(client);
-    await ensureConcurrentIndex(
-      client,
-      CHAT_TURN_CLAIM_INDEX,
-      `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${CHAT_TURN_CLAIM_INDEX}
-         ON claw_tasks(session_id, (metadata->>'message_id'))
-       WHERE ${ACTIVE_CHAT_TURN_SQL}`,
-    );
-  } finally {
-    await client.query("SELECT pg_advisory_unlock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
+  for (let attempt = 1; attempt <= CHAT_TURN_INDEX_ATTEMPTS; attempt++) {
+    await client.query("SELECT pg_advisory_lock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
+    try {
+      // Bounded, because a claim blocked on the fence on the admission-lock
+      // path is holding the `FOR UPDATE` tuple lock its preceding statement
+      // took, and that row may be one this reconcile is closing. Waiting for it
+      // unboundedly is the same cycle the build was moved out of the hold to
+      // avoid, one lock tag down. Scoped like the concurrent build's ceiling
+      // above -- set for these statements only, restored whatever happens.
+      await client.query(`SET lock_timeout = ${RECONCILE_LOCK_TIMEOUT_MS}`);
+      try {
+        await reconcileDuplicateChatTurns(client);
+      } finally {
+        await client.query("RESET lock_timeout")
+          .catch(() => { /* the next statement will fail loudly enough */ });
+      }
+    } catch (err) {
+      // Only the lock-wait classes. `reconcileDuplicateChatTurns` refuses a
+      // turn held by two live executions, and retrying that refusal three times
+      // before reporting it would bury the one error an operator has to read.
+      if (!CLAIM_FENCE_RETRY_CODES.has((err as { code?: string })?.code ?? "")) throw err;
+      logger.warn({ err, attempt }, "db.chat_turn_reconcile_retry");
+      continue;
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
+    }
+    try {
+      await ensureConcurrentIndex(
+        client,
+        CHAT_TURN_CLAIM_INDEX,
+        `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${CHAT_TURN_CLAIM_INDEX}
+           ON claw_tasks(session_id, (metadata->>'message_id'))
+         WHERE ${ACTIVE_CHAT_TURN_SQL}`,
+      );
+    } catch (err) {
+      // A duplicate written by a claim racing the unfenced build does not come
+      // back as a quietly invalid index: the build raises 23505 and leaves the
+      // index INVALID, so the validity read below is never reached. Caught
+      // rather than propagated because a throw here would abort the rest of the
+      // migration and skip assertSchema, the check that exists to catch exactly
+      // the incomplete state a throw produces.
+      logger.warn({ err, attempt }, "db.chat_turn_index_build_retry");
+      continue;
+    }
+    const built = await readIndexValidity(client, CHAT_TURN_CLAIM_INDEX);
+    if (built.rowCount && built.rows[0].indisvalid) return;
   }
+  // Falls through deliberately. `assertChatTurnClaimIndex` runs at the end of
+  // the migration and refuses to serve on an index that is absent or INVALID,
+  // which is the same answer with the rest of the schema still migrated.
+  logger.error({ attempts: CHAT_TURN_INDEX_ATTEMPTS }, "db.chat_turn_index_attempts_exhausted");
 }
 
 /** Run schema migrations on startup. */

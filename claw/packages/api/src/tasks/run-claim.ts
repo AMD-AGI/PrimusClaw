@@ -275,8 +275,8 @@ async function takeNextWithinSoftCeiling(
   return await withOwnedAdmissionLock(async (client, afterCommit) => {
     const { usage, roots } = await loadUsageWithRoots("executing", client);
     const accepted = await fillWithinCeiling<ClawTaskRow>({
-      page: (skip) => peekNextQueuedRows(
-        [...alreadySkipped, ...skip], doorbellSemantics, client,
+      page: (skip, from) => peekNextQueuedRows(
+        [...alreadySkipped, ...skip], doorbellSemantics, client, from,
       ),
       fits: (row) => {
         const ask = askFromRow(row, roots);
@@ -289,6 +289,10 @@ async function takeNextWithinSoftCeiling(
       },
       want: 1,
       idOf: (row) => row.task_id,
+      // Named per semantics: two Brains asking with different capability sets
+      // are reading two different candidate queues, and one may not advance
+      // the other past rows it was never offered.
+      resume: `claim_next:${doorbellSemantics}`,
     });
     const row = accepted[0];
     if (!row) return null;
@@ -357,6 +361,7 @@ async function peekNextQueuedRows(
   skip: string[],
   doorbellSemantics: number,
   q: StatementSource,
+  from = 0,
 ): Promise<ClawTaskRow[]> {
   const r = await q.query(
     `SELECT * FROM claw_tasks
@@ -372,8 +377,8 @@ async function peekNextQueuedRows(
         priority DESC,
         COALESCE(queued_at, created_at) ASC,
         created_at ASC
-      LIMIT 1`,
-    [skip, doorbellSemantics],
+      LIMIT 1 OFFSET $3`,
+    [skip, doorbellSemantics, from],
   );
   return r.rows as ClawTaskRow[];
 }
@@ -603,6 +608,15 @@ export async function releaseClaim(
     return rows;
   });
   if (released && became !== "cancelled") metrics.onQueueEntered("requeue");
+  // The Stop that parked this row at `cancelling` deliberately left its
+  // workspace reference held -- a parked row is still a live turn and its
+  // holder is still writing -- so the arm that finally closes it is the one
+  // that owes the reference back, exactly as `failHeldClaim` does for the
+  // other way a claimed row ends. `releaseRefsOfFinishedRuns` would reconcile
+  // it a sweeper tick later, but through a release that defaults `changed` to
+  // true; the holder went away without reporting, so it is let go uncredited
+  // rather than credited with a write nothing can show it made.
+  if (released && became === "cancelled") await releaseRunUse(taskId, false);
   // A closed row may have been the last thing occupying its session, and the
   // Stop that parked it could not say so: it left the gate shut deliberately,
   // for a turn that was still winding down. This is where it stops winding.

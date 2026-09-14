@@ -177,6 +177,14 @@ AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
 # down is reverted by the next ordinary upgrade, mid-canary and with no error.
 RUN_DOORBELL_DISPATCH="${RUN_DOORBELL_DISPATCH:-}"
 BRAIN_DOORBELL_EXECUTION="${BRAIN_DOORBELL_EXECUTION:-}"
+
+# The API's assertion that every Brain able to receive a task takes a durable
+# SQL holder before its execution gate. Empty means the chart default, which is
+# on. A fleet rolling up from a release that predates the holder must set this
+# to false before the first new API replica starts and blank it again once
+# every API and Brain replica is new -- asserted early, a reaper closes
+# deliveries that are about to execute. API-only; the Brain never reads it.
+RUN_FAT_PREPARING_RECONCILE="${RUN_FAT_PREPARING_RECONCILE:-}"
 ADMIT_SOFT_RUNS="${ADMIT_SOFT_RUNS:-}"
 ADMIT_HARD_RUNS="${ADMIT_HARD_RUNS:-}"
 ADMIT_SOFT_SANDBOXES="${ADMIT_SOFT_SANDBOXES:-}"
@@ -204,7 +212,7 @@ _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 # Fields the file may leave blank for the shell to answer, and which the run
 # that answers one records for every run after it.
 CLAW_RECORDED_KEYS="AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION
-RUN_DOORBELL_DISPATCH BRAIN_DOORBELL_EXECUTION
+RUN_DOORBELL_DISPATCH BRAIN_DOORBELL_EXECUTION RUN_FAT_PREPARING_RECONCILE
 ADMIT_SOFT_RUNS ADMIT_HARD_RUNS ADMIT_SOFT_SANDBOXES ADMIT_HARD_SANDBOXES
 ADMIT_SOFT_GPU_NODES ADMIT_HARD_GPU_NODES ADMIT_TREE_MAX_NODES ADMIT_TREE_MAX_DEPTH"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
@@ -245,6 +253,24 @@ export BRAIN_CHECKPOINT_KEY
 [ -z "${S3_ACCESS_KEY:-}" ]       && S3_ACCESS_KEY="$_SHELL_S3_ACCESS_KEY"
 [ -z "${S3_SECRET_KEY:-}" ]       && S3_SECRET_KEY="$_SHELL_S3_SECRET_KEY"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
+  # Say when the policy above discards something. These keys carry the Doorbell
+  # switches, and a kill-switch flipped on the command line and dropped in
+  # silence looks exactly like one that took effect: the values file already
+  # pins the opposite, nothing below writes (the write-back only fills blanks),
+  # and upgrade.sh prints no effective-value summary -- so the only clue left is
+  # a rendered manifest that did not move. Advisory, not fatal: "file wins" is
+  # the documented contract for this whole class, and re-running deploy.sh with
+  # a stale value still in the shell has to keep working.
+  #
+  # The six explicit fields just above are deliberately not covered: they are
+  # auto-discovered credentials and endpoints, and naming a discarded
+  # AUTH_INTERNAL_TOKEN or S3_SECRET_KEY would put it in the log.
+  eval "_recorded_shell=\${_SHELL_${_recorded_key}}
+        _recorded_file=\${${_recorded_key}:-}"
+  if [ -n "$_recorded_shell" ] && [ -n "$_recorded_file" ] \
+     && [ "$_recorded_shell" != "$_recorded_file" ]; then
+    log "WARN: $_recorded_key=\"$_recorded_shell\" from the shell is IGNORED -- $_VALUES_FILE pins \"$_recorded_file\". Edit that file (or pass the value to helm directly) to change it."
+  fi
   # Exported: deploy.sh builds its values JSON from the environment, and a
   # field the file left blank was never exported by sourcing it.
   eval "[ -n \"\${${_recorded_key}:-}\" ] || ${_recorded_key}=\"\${_SHELL_${_recorded_key}}\"
@@ -281,7 +307,7 @@ unset _SHELL_DOMAIN _SHELL_AUTH_INTERNAL_TOKEN _SHELL_S3_ENDPOINT \
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   unset "_SHELL_${_recorded_key}"
 done
-unset _recorded_key
+unset _recorded_key _recorded_shell _recorded_file
 # Defaults for any placeholder not provided by the values file. Fallback to
 # the literal "<KEY>" so render output keeps the placeholder, and the
 # deploy.sh guard fails loudly rather than silently shipping empty secrets.
@@ -813,6 +839,7 @@ render_chart() {
     ${AGENT_SANDBOX_MAX_SESSION_DURATION:+--set-string brain.maxSessionDuration="$AGENT_SANDBOX_MAX_SESSION_DURATION"} \
     ${RUN_DOORBELL_DISPATCH:+--set features.runDoorbellDispatch="$RUN_DOORBELL_DISPATCH"} \
     ${BRAIN_DOORBELL_EXECUTION:+--set features.brainDoorbellExecution="$BRAIN_DOORBELL_EXECUTION"} \
+    ${RUN_FAT_PREPARING_RECONCILE:+--set features.runFatPreparingReconcile="$RUN_FAT_PREPARING_RECONCILE"} \
     ${ADMIT_SOFT_RUNS:+--set-string api.admitSoftRuns="$ADMIT_SOFT_RUNS"} \
     ${ADMIT_HARD_RUNS:+--set-string api.admitHardRuns="$ADMIT_HARD_RUNS"} \
     ${ADMIT_SOFT_SANDBOXES:+--set-string api.admitSoftSandboxes="$ADMIT_SOFT_SANDBOXES"} \

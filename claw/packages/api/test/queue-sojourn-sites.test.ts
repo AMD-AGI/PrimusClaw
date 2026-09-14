@@ -173,6 +173,40 @@ test("a replayed dispatch's spare row is recorded as the duplicate exit it is", 
   assert.equal((await runRow(h, "spare")).failure_reason, "duplicate_dispatch_row");
 });
 
+test("a named close reads the prior status and writes it back in one transaction", async () => {
+  // `db.query` takes a connection per statement, so a `FOR UPDATE` sent through
+  // it is released at the semicolon and the read says only what the row was a
+  // moment ago. A claim landing in that window counts its own exit and leaves
+  // this close still matching -- the close of a doorbell row is not
+  // generation-fenced, since nothing but `acquireFatLease` writes
+  // `lease_fenced` and a doorbell completion carries no `run_claim` -- so the
+  // one queue entry is booked as two exits. The rollout gate compares those two
+  // totals directly. Holding the row for the whole decision is what makes the
+  // other writer find it terminal instead, and there is no asserting that from
+  // one PGlite backend: what is checked here is that the two statements go out
+  // as one transaction.
+  const { closeChatRun } = await import("../src/tasks/chat-run.js");
+  await seedSession(h, "s1");
+  await seedRun(h, "named", "s1", { status: "queued", dispatch: "doorbell", messageId: "m-n" });
+
+  h.statements.length = 0;
+  assert.deepEqual(
+    await closeChatRun("s1", "m-n", "completed", undefined, { taskId: "named" }),
+    ["named"],
+  );
+
+  const at = (match: (sql: string) => boolean) => h.statements.findIndex((sql) => match(sql));
+  const begin = at((sql) => sql === "BEGIN");
+  const read = at((sql) => /status AS prior_status.*FOR UPDATE/.test(sql));
+  const write = at((sql) => /^UPDATE claw_tasks SET status =/.test(sql));
+  const commit = at((sql) => sql === "COMMIT");
+  assert.ok(
+    begin >= 0 && begin < read && read < write && write < commit,
+    `the locked read and the transition it authorises are one transaction, not two: ${
+      JSON.stringify(h.statements, null, 2)}`,
+  );
+});
+
 test("the budget sweep counts only the rows it took off the queue", async () => {
   // `queuedExits` reads `prior_status`, and `claw_tasks` has no such column:
   // fed the rows an UPDATE returned it matches none of them and the exit

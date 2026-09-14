@@ -19,7 +19,7 @@ import {
   withOwnedAdmissionLock, type AdmissionRefusal,
 } from "./admission.js";
 import { cancelUnheldRun } from "./chat-run.js";
-import { applyTaskStatusTransition, getTask, transitionStatus, updateTask } from "./db.js";
+import { applyTaskStatusTransition, getTask, transitionStatus } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
 import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
@@ -448,6 +448,20 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );
-  await updateTask(taskId, { metadata: JSON.stringify({ ...(task.metadata ?? {}), retried_into: newId }) });
+  // Written here as a statement rather than through `updateTask`, which is
+  // hard-wired to the pool. From inside the route's admission transaction that
+  // helper would check out a *second* connection while this request already
+  // holds one of the pool's, and it would commit the pointer on its own ahead
+  // of the clone it points at -- so a failed COMMIT above would leave the
+  // original row aimed at a task id that was never inserted. Merging with `||`
+  // against the live row rather than re-writing the blob `getTask` read at the
+  // top also keeps a concurrent metadata writer's field from being reverted.
+  await (client ?? db).query(
+    `UPDATE claw_tasks
+        SET metadata = COALESCE(metadata, '{}'::jsonb)
+                       || jsonb_build_object('retried_into', $2::text)
+      WHERE task_id = $1`,
+    [taskId, newId],
+  );
   return { ok: true, new_task_id: newId };
 }

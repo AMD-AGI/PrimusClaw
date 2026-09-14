@@ -232,6 +232,62 @@ test("a row nobody can find is not reported as somebody else's", async () => {
   assert.equal(res.json().reason, "missing");
 });
 
+test("an acceptance refused by a stopped row nobody holds is told to settle it", async () => {
+  // A Stop taken before anybody accepted parks the row at `cancelling` and
+  // leaves the confirmation to the delivery still in flight: nothing subscribes
+  // to a run's interrupt subject until that run starts, so this POST is the
+  // only time the row can tell anyone. Answered with a bare `terminal` the
+  // delivery acks itself away, no interrupted completion is ever emitted, and
+  // the stopped turn is recorded nowhere while the row waits out a reaper.
+  //
+  // Said beside `reason` rather than as a fourth value of it, because an
+  // unknown reason falls into Brain's `superseded` default -- which would have
+  // the delivery bounce for its whole redelivery budget -- and the two sides of
+  // a rolling upgrade do not deploy in a fixed order.
+  updateRows = [];
+  refusalRows = [{ status: "cancelling", lease_owner: null, lease_live: false, claim_count: 4 }];
+  const res = await acquire({ brain_id: "brain-7", lease_seconds: 45, accept: true });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.json().reason, "terminal", "an old Brain reads this exactly as it always did");
+  assert.equal(res.json().stop, "cancelling");
+  assert.equal(
+    res.json().claim_count, 4,
+    "the row's own generation: a fat retry that released its lease left the row fenced, "
+    + "and a completion that quotes nothing is refused as superseded",
+  );
+});
+
+test("a stopped row whose holder is still there settles nothing on somebody else's behalf", async () => {
+  // The lapsed-lease shape: pod A holds the row, its lease expires while it is
+  // still running, the user Stops, and the redelivery arrives. A is running its
+  // own interrupt, so a second worker emitting the completion would close the
+  // row out from under it -- the damage the refusal ordering exists to prevent.
+  // Both shapes that really need settling have a null owner.
+  updateRows = [];
+  refusalRows = [{
+    status: "cancelling", lease_owner: "brain-9", lease_live: false, claim_count: 4,
+  }];
+  const res = await acquire({ brain_id: "brain-7", lease_seconds: 45, accept: true });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.json().reason, "terminal");
+  assert.equal(res.json().stop, undefined);
+});
+
+test("a renewal on a stopped row is not asked to settle it", async () => {
+  // Only an acceptance is told, because only its arrival proves the delivery is
+  // unheld and about to be discarded. A renewal is somebody's own heartbeat,
+  // and it means what it always meant.
+  updateRows = [];
+  refusalRows = [{ status: "cancelling", lease_owner: null, lease_live: false, claim_count: 4 }];
+  const res = await renew({ brain_id: "brain-7", lease_seconds: 45 });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.json().reason, "terminal");
+  assert.equal(res.json().stop, undefined);
+});
+
 test("only the worker the row recognises may renew it", async () => {
   // Without this the row accepted a renewal from anyone, so when two workers
   // ended up on one run -- a lock that expired under a worker that could not

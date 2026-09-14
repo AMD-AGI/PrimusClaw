@@ -345,6 +345,29 @@ function runPhasePatch(body: RunLeaseBody): string {
   });
 }
 
+/**
+ * The generation this caller quotes, which is `run_claim` whenever it sends one.
+ *
+ * The attempt token's own `claim_count` is the claim path's answer, and on the
+ * fat path there is no claim to count: the Brain mints that attempt with a zero
+ * and carries the generation the acceptance issued in `run_claim` instead.
+ *
+ * One definition rather than one per fence, because everything downstream of
+ * the renewal has to agree with it. The UPDATE binds it to `claim_count`;
+ * `reportIsCurrent` compares the nested report against the row's own column;
+ * so the gate between them has to read the same value, or it refuses the
+ * holder its own coverage on a body the fence just accepted.
+ *
+ * `generationOf` cannot answer "invalid" here: the route refuses an
+ * out-of-range generation with a 400 before either statement runs.
+ */
+function quotedGeneration(
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): number {
+  return (generationOf(body.run_claim) as number | null) ?? token.claimCount;
+}
+
 /** Renew the lease and return whether its attempt fence was applied. */
 async function renewRunLease(
   taskId: string,
@@ -405,14 +428,10 @@ async function renewRunLease(
         runPhasePatch(body),
         RENEWABLE_STATUSES,
         token.attemptId,
-        // The generation this caller quotes, which is `run_claim` whenever it
-        // sends one. The attempt token's own `claim_count` is the claim path's
-        // answer, and on the fat path there is no claim to count: the Brain
-        // mints that attempt with a zero and carries the generation the
-        // acceptance issued in `run_claim` instead. Fencing on the zero
-        // refuses the holder its own heartbeat, which stands the worker down
-        // mid-turn and hands the delivery back to be run again.
-        generationOf(body.run_claim) ?? token.claimCount,
+        // Fencing on the attempt token's zero instead refuses a fat holder its
+        // own heartbeat, which stands the worker down mid-turn and hands the
+        // delivery back to be run again.
+        quotedGeneration(body, token),
         token.deliverySeq,
         token.deliveryCount,
       ],
@@ -547,7 +566,7 @@ async function mergeRenewalCoverage(
     return;
   }
   const report = decoded?.report;
-  if (report && !sameAttemptToken(report, token)) {
+  if (report && !sameAttemptToken(report, body, token)) {
     logger.warn(
       { taskId, tokenAttemptId: token.attemptId, reportAttemptId: report.attemptId },
       "run_lease.run_time_token_mismatch",
@@ -570,10 +589,15 @@ async function mergeRenewalCoverage(
 /** Whether a nested report speaks for the attempt the lease body presented. */
 function sameAttemptToken(
   report: { attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number },
+  body: RunLeaseBody,
   token: Extract<AttemptToken, { ok: true }>,
 ): boolean {
   return report.attemptId === token.attemptId
-    && report.claimCount === token.claimCount
+    // The generation the renewal above committed under, not the token's own:
+    // the report has to quote the row's `claim_count` because that is what the
+    // ledger's own fence compares it against, and on the fat path the token
+    // carries a zero instead.
+    && report.claimCount === quotedGeneration(body, token)
     && report.deliverySeq === token.deliverySeq
     && report.deliveryCount === token.deliveryCount;
 }
@@ -592,6 +616,51 @@ function sameAttemptToken(
  * a live worker's sandbox and message away costs the turn.
  */
 type LeaseRefusal = "superseded" | "terminal" | "missing" | "unexplained";
+
+/**
+ * A refusal, and the settlement it leaves to the caller.
+ *
+ * `reason` keeps exactly the meaning it has always had, so a Brain too old to
+ * know the fields beside it reads this body the way it always did. That is the
+ * point of saying it this way rather than by inventing a fourth `reason`: an
+ * unknown reason falls into the `superseded` default, which would have the
+ * refused caller bounce its delivery for its whole redelivery budget, and the
+ * two sides of a rolling upgrade do not deploy in a fixed order.
+ */
+interface LeaseRefusalAnswer {
+  reason: LeaseRefusal;
+  /** See `stoppedAndUnheld`: the caller is the only one that can settle it. */
+  stop?: "cancelling";
+  /** The row's own generation, which the completion `stop` asks for is fenced on. */
+  claim_count?: number;
+}
+
+/**
+ * Whether a refused acceptance is the only thing left that can settle the row.
+ *
+ * A Stop taken before anyone accepted parks the row at `cancelling` and leaves
+ * the confirmation to the delivery still in flight: nothing subscribes to a
+ * run's interrupt subject until that run starts, so the row is the only place
+ * the Stop can be told, and this POST is the only time it is read. Told plain
+ * `terminal`, that delivery acks itself away -- nothing emits the interrupted
+ * completion, the stopped turn is recorded nowhere, and the row waits out a
+ * reaper.
+ *
+ * Only an acceptance is told, because its arrival is the proof that the
+ * delivery is unheld and about to be discarded; a renewal is somebody's own
+ * heartbeat and means what it always meant. And only while `lease_owner` is
+ * null: a holder whose lease merely lapsed is still running its own interrupt,
+ * and a second worker closing the row under it is precisely the damage the
+ * ordering in `classifyRow` exists to prevent.
+ */
+function stoppedAndUnheld(
+  row: RefusalRow | undefined,
+  reason: LeaseRefusal,
+  declaredAccept: boolean,
+): boolean {
+  return declaredAccept && reason === "terminal"
+    && row?.status === "cancelling" && row.lease_owner === null;
+}
 
 /**
  * The statuses a live run can be in. Shared by both UPDATEs above and by the
@@ -879,7 +948,8 @@ async function classifyLeaseRefusal(
   // Absent under the attempt protocol, which fences on the token rather than
   // on a quoted generation; the classifier then judges on the holder alone.
   runClaim: number | null = null,
-): Promise<LeaseRefusal> {
+  declaredAccept = false,
+): Promise<LeaseRefusalAnswer> {
   try {
     const r = await db.query(
       `SELECT status, lease_owner, lease_expires_at > NOW() AS lease_live,
@@ -890,21 +960,27 @@ async function classifyLeaseRefusal(
       [taskId],
     );
     const row = r.rows[0] as RefusalRow | undefined;
-    const refusal = classifyRow(row, brainId, runClaim);
+    const reason = classifyRow(row, brainId, runClaim);
     logger.warn(
       {
         taskId,
         caller: brainId ?? null,
         status: row?.status ?? "missing",
         leaseOwner: row?.lease_owner ?? null,
-        refusal,
+        refusal: reason,
       },
       "run.lease_renew_refused",
     );
-    return refusal;
+    if (!stoppedAndUnheld(row, reason, declaredAccept)) return { reason };
+    // The row's generation, not the caller's: the caller has none -- its
+    // acceptance was refused -- and the completion it is being asked for is
+    // fenced against this column. A fat retry that released its lease left a
+    // fenced, non-zero row behind, and a completion quoting nothing is refused
+    // as superseded, which would settle nothing after all.
+    return { reason, stop: "cancelling", claim_count: Number(row?.claim_count ?? 0) };
   } catch (err) {
     logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_refusal_unexplained");
-    return "unexplained";
+    return { reason: "unexplained" };
   }
 }
 
@@ -1093,8 +1169,10 @@ function registerLeaseRoute(app: FastifyInstance): void {
       // run" and "this run was cancelled" ask the refused worker for opposite
       // things: one must give its sandbox and its delivery back, the other
       // must leave both alone, because they are the live worker's now.
-      const reason = await classifyLeaseRefusal(taskId, body.brain_id, runClaim);
-      return reply.status(409).send({ ok: false, error: "run is not active", reason });
+      const refusal = await classifyLeaseRefusal(
+        taskId, body.brain_id, runClaim, declaredAccept,
+      );
+      return reply.status(409).send({ ok: false, error: "run is not active", ...refusal });
     },
   );
 }

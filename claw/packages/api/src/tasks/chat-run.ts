@@ -40,14 +40,14 @@ import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
 import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
-import { db, type Querier } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { nc } from "../infra/nats.js";
 import { metrics, type QueueEntryCause } from "../infra/metrics.js";
 import { newTaskId } from "./ids.js";
 import { applyTaskStatusTransition, insertTask } from "./db.js";
 import type { RunOrigin } from "./run-budget.js";
 import type { TaskStatus } from "./types.js";
-import { recordRunUse, releaseRunUse } from "../workspace/store.js";
+import { recordRunUse, releaseRunUse, releaseRunUseStrict } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
 
 const logger = pino({ name: "chat-run" });
@@ -106,20 +106,41 @@ export type ChatRunOutcome = "completed" | "failed" | "cancelled";
  * closes it alongside the row it reaps, keyed on this id being the one thing the
  * two rows share.
  */
-/** Release this publisher's reconciliation claim. Returns false after takeover. */
+/**
+ * Release this publisher's reconciliation claim. Returns false after takeover.
+ *
+ * Swallowed like everything else in this file, and here that is load bearing
+ * rather than routine, because of where the caller stands when it asks: the
+ * doorbell is already on the stream. A throw leaving this function unwinds into
+ * the publish's own `catch`, which can only read it as a publish that failed --
+ * it terminalizes the row, and the create's rollback then deletes the session
+ * and the user's message out from under a turn that really was dispatched.
+ * Nothing after a successful publish may answer a publish failure.
+ *
+ * `false` is the answer both call sites already know how to give: the marker is
+ * not this call's to hand back, so the outcome is not this caller's to report
+ * and `reconcileAmbiguousDispatches` settles the row -- exactly what happens to
+ * a marker lost to a takeover, which is the case this return value was written
+ * for. A marker left armed is the designed state for that, not a leak.
+ */
 export async function clearDispatchReconcile(
   taskId: string,
   token: string,
 ): Promise<boolean> {
-  const r = await db.query(
-    `UPDATE claw_tasks
-        SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
-            metadata = metadata - 'dispatch_reconcile_token'
-      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
-        AND metadata->>'dispatch_reconcile_token' = $2`,
-    [taskId, token],
-  );
-  return (r.rowCount ?? 0) > 0;
+  try {
+    const r = await db.query(
+      `UPDATE claw_tasks
+          SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
+              metadata = metadata - 'dispatch_reconcile_token'
+        WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+          AND metadata->>'dispatch_reconcile_token' = $2`,
+      [taskId, token],
+    );
+    return (r.rowCount ?? 0) > 0;
+  } catch (err) {
+    logger.warn({ err, taskId }, "chat_run.clear_dispatch_reconcile_failed");
+    return false;
+  }
 }
 
 /**
@@ -710,27 +731,44 @@ async function closeNamedChatRun(
   reason: string | null,
   message: string | null,
 ): Promise<ClosedRow[]> {
-  // Prior state first, locked: the queue-exit metric is measured from what the
-  // row was, and a transition answers with what it became.
-  const before = await db.query(
-    `SELECT status AS prior_status, metadata->>'queued_since' AS queued_since
-       FROM claw_tasks WHERE task_id = $1 FOR UPDATE`,
-    [target.taskId],
-  );
-  const closed = await applyTaskStatusTransition(outcome, {
-    extra: { failure_reason: reason, error_message: message },
-    where: `task_id = $1
-        AND session_id = $2
-        AND origin IN ('chat','a2a')
-        AND status = ANY($3::text[])
-        AND (
-             COALESCE(claim_count, 0) = $4::int
-          OR ($4::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
-        )`,
-    params: [target.taskId, sessionId, CLOSEABLE_RUN_STATUSES, target.runClaim ?? null],
+  // Prior state first, under the row's lock and on the write's own connection:
+  // the queue-exit metric is measured from what the row was, and a transition
+  // answers with what it became. `db.query` takes a connection per call, so a
+  // `FOR UPDATE` sent through it is released at the semicolon, and the read
+  // then describes a queue the row may already have left. The close of a
+  // doorbell row is not generation-fenced -- nothing but `acquireFatLease`
+  // writes `lease_fenced`, and a doorbell completion carries no `run_claim` --
+  // so a claim landing in that window does not stop this UPDATE from matching,
+  // and the one queue entry is booked as two exits: the claim's, and this one
+  // off a `queued` that is no longer true. The rollout gate compares those two
+  // totals directly. Holding the row for the whole decision is what makes the
+  // orderings exclusive instead: the claim finds a row already terminal, or
+  // this read finds the `preparing` the claim left.
+  //
+  // One row, so this adds no session-before-task lock ordering of its own --
+  // the same shape as `transitionCancellation`, for the same reason.
+  return await inTransaction(async (query) => {
+    const before = await query(
+      `SELECT status AS prior_status, metadata->>'queued_since' AS queued_since
+         FROM claw_tasks WHERE task_id = $1 FOR UPDATE`,
+      [target.taskId],
+    );
+    const closed = await applyTaskStatusTransition(outcome, {
+      extra: { failure_reason: reason, error_message: message },
+      where: `task_id = $1
+          AND session_id = $2
+          AND origin IN ('chat','a2a')
+          AND status = ANY($3::text[])
+          AND (
+               COALESCE(claim_count, 0) = $4::int
+            OR ($4::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
+          )`,
+      params: [target.taskId, sessionId, CLOSEABLE_RUN_STATUSES, target.runClaim ?? null],
+      query,
+    });
+    const prior = before.rows[0] as { prior_status?: string; queued_since?: string } | undefined;
+    return closed.map((row) => ({ ...row, ...(prior ?? {}) })) as ClosedRow[];
   });
-  const prior = before.rows[0] as { prior_status?: string; queued_since?: string } | undefined;
-  return closed.map((row) => ({ ...row, ...(prior ?? {}) })) as ClosedRow[];
 }
 
 /**
@@ -1168,17 +1206,44 @@ export async function discardChatRunDispatch(
   const statuses = opts.statuses ?? OPEN_RUN_STATUSES;
   const observed = opts.observedReceipt === undefined ? null : JSON.stringify(opts.observedReceipt);
   try {
-    const r = await db.query(
-      `DELETE FROM claw_tasks
-        WHERE ${unheldOpenRowSql("$1", "$2", "$3", "$4", "$5")}
-        RETURNING task_id`,
-      [
-        taskId, statuses, observed,
-        opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
-      ],
-    );
-    if (!r.rowCount) return await verdictForUnmatchedRow(taskId, statuses);
-    await releaseRunUse(taskId, false);
+    // The DELETE destroys the only way back to this run's workspace reference:
+    // there is no foreign key, and every reclaimer -- the
+    // `releaseRefsOfFinishedRuns` join, the finalizer's owed-resource arm,
+    // `releaseSessionRefs` -- finds a run reference by joining `claw_tasks`. A
+    // release a round trip later is therefore not merely late here, the way it
+    // is for `failChatRunDispatch`, whose terminal row is precisely what keeps
+    // the sweeper able to finish the job: a crash in between leaves a live
+    // reference and a writer claim naming a task that does not exist, and the
+    // workspace is pinned for good. So the removal and the release commit
+    // together or not at all, through the release that reports rather than the
+    // one that swallows, because a release this pass cannot prove happened is
+    // exactly that leak.
+    const deleted = await inTransaction(async (q) => {
+      const r = await q(
+        `DELETE FROM claw_tasks
+          WHERE ${unheldOpenRowSql("$1", "$2", "$3", "$4", "$5")}
+          RETURNING task_id`,
+        [
+          taskId, statuses, observed,
+          opts.fleetAsserted ?? false, opts.deliverySettled ?? false,
+        ],
+      );
+      if (!r.rowCount) return false;
+      // Only `failed` rolls back. `none_held` is a run opened with
+      // `recordWorkspaceUse: false`, which legitimately holds nothing, and
+      // `ambiguous` is a split that does not clear by itself -- refusing every
+      // discard of that row forever would leave a refused turn open, unheld and
+      // claimable, which is the one outcome this path may not produce. A
+      // failed statement is the only one a retry can still settle.
+      const release = await releaseRunUseStrict(taskId, false, q);
+      if (release === "failed") {
+        throw new Error(`workspace release failed for ${taskId}`);
+      }
+      return true;
+    });
+    // Outside the transaction: a row the DELETE did not match is read with no
+    // connection held, since nothing about that read is part of the decision.
+    if (!deleted) return await verdictForUnmatchedRow(taskId, statuses);
     return "closed";
   } catch (err) {
     logger.warn({ err, taskId }, "chat_run.discard_dispatch_failed");

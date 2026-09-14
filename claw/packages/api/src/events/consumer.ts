@@ -474,26 +474,92 @@ export async function releaseSessionGateIfLastRun(
   sessionId: string,
   messageId: string | null,
   failed: boolean,
+  taskId: string | null = null,
 ): Promise<boolean> {
-  // A NULL marker fails closed rather than matching: a session gated before the
-  // column existed is released by no run-scoped caller, and reapStuckSessions
-  // is the backstop for that bounded population.
+  // Compared with `IS NOT DISTINCT FROM` rather than `=`, which is the sibling
+  // idiom in `runCleanupAction` and in `applySessionGateTransition`, and the
+  // difference between the two is only ever the both-NULL case.
+  //
+  // A NULL marker still fails closed against a completion that names a turn:
+  // `NULL IS NOT DISTINCT FROM 'm-1'` is false, so a session gated before this
+  // column existed is released by no run-scoped caller and reapStuckSessions
+  // stays the backstop for that bounded population.
+  //
+  // A completion that names no turn is the other NULL, and it is not the same
+  // one. The field is optional on the wire -- a Brain that predates the echo
+  // omits it, and an A2A send carrying no `messageId` never had one. Under `=`
+  // such a completion matched no row at all, so the gate stayed shut and the
+  // pending drain behind it never ran; under this operator it hands back
+  // exactly the gate that is also unnamed, and nothing else. Switching
+  // enforcement off for the call instead -- leaving occupancy as the only
+  // test -- is what must not be done: `takeSessionGate` commits before
+  // `dispatchTaskToBrain` writes the row that would occupy the session, so a
+  // completion delayed into that window sees an empty occupancy check and
+  // would clear the *next* turn's marker, admitting a second message on top of
+  // a live run. Occupancy cannot stand in for ownership across that window.
   const r = await db.query(
     `UPDATE claw_sessions
         SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
-        AND (NOT $4::boolean OR agent_gate_message_id = $3)
+        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3)
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
-             AND t.origin = 'chat'
+             -- A2A rows count only for an unnamed completion. A client that
+             -- sends two messages with no id leaves two rows this report
+             -- cannot tell apart, and closeChatRun rightly closes neither;
+             -- reading only chat rows would then hand the session back while
+             -- accepted A2A work is still executing, and GetTask would answer
+             -- "done". A named completion keeps the predicate it had.
+             AND (t.origin = 'chat' OR ($3::text IS NULL AND t.origin = 'a2a'))
              AND t.status IN ('queued','preparing','running','cancelling')
-             AND t.metadata->>'message_id' IS DISTINCT FROM $3
+             AND CASE
+                   -- This turn's own row is what has to be excluded, and with
+                   -- no id to name it by, the row is excluded by identity
+                   -- instead. Excluding on a NULL id would take every other
+                   -- anonymous row with it -- a legacy run still executing
+                   -- reads as "the same turn" and stops occupying the session,
+                   -- which is the gate opening over live work.
+                   WHEN $3::text IS NULL
+                     THEN $5::text IS NULL OR t.task_id IS DISTINCT FROM $5
+                   ELSE t.metadata->>'message_id' IS DISTINCT FROM $3
+                 END
         )`,
-    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced()],
+    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced(), taskId],
   );
   return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * The turn a completion belongs to, when the completion itself does not say.
+ *
+ * `message_id` is optional on the wire, but the row the report names is not
+ * anonymous: it was opened under the same id the gate was taken with. Reading
+ * it back is what lets an unnamed completion hand back the named gate it is
+ * actually ending -- without it the gate only opens once `reapStuckSessions`
+ * times the session out, minutes later, with every further message parked
+ * behind it.
+ *
+ * Never invented: a row that carries no id, or none this session owns, leaves
+ * the answer null and the gate is then matched as the unnamed one it is.
+ */
+async function turnOfChatRow(sessionId: string, taskId: string): Promise<string | null> {
+  try {
+    const r = await db.query(
+      `SELECT metadata->>'message_id' AS message_id
+         FROM claw_tasks WHERE task_id = $1 AND session_id = $2 AND origin IN ('chat','a2a')`,
+      [taskId, sessionId],
+    );
+    const named = r.rows[0] as { message_id?: string | null } | undefined;
+    return named?.message_id || null;
+  } catch (err) {
+    // Best effort by construction: failing to recover the id leaves the caller
+    // where it was before this lookup existed, and a gate the sweeper reaps is
+    // a better outcome than a completion that throws and is redelivered.
+    logger.warn({ err, sessionId, taskId }, "exec_complete.turn_lookup_failed");
+    return null;
+  }
 }
 
 /**
@@ -665,7 +731,16 @@ async function handleComplete(
   // turn's row is terminal and cannot match anyway; it matters only if that
   // close found nothing, which is the one case where trusting the row state
   // alone would leave the session gated for ever.
-  const gateOpened = await releaseSessionGateIfLastRun(sessionId, messageId, Boolean(failed));
+  //
+  // The id the event omitted is recovered from the row it names before the
+  // gate is asked about it, because the gate is matched on ownership and an
+  // unnamed completion would otherwise only ever match an unnamed gate.
+  const gateTurn = messageId
+    ?? (provenance && provenance !== "foreign" ? await turnOfChatRow(sessionId, provenance) : null);
+  const gateOpened = await releaseSessionGateIfLastRun(
+    sessionId, gateTurn, Boolean(failed),
+    provenance !== "foreign" ? provenance : null,
+  );
 
   // 3. Save conversation turns.
   await recordCompletionTurns(sessionId, event, messageId);

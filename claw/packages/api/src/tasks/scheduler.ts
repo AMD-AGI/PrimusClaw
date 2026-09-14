@@ -55,15 +55,16 @@ async function readyCandidates(
   client: StatementRunner,
   skip: string[],
   limit: number,
+  from = 0,
 ): Promise<ClawTaskRow[]> {
   const r = await client.query(
     `SELECT * FROM claw_tasks
       WHERE ${READY_PREDICATE_SQL}
         AND NOT (task_id = ANY($1::text[]))
       ORDER BY priority DESC, created_at ASC
-      LIMIT $2
+      LIMIT $2 OFFSET $3
       FOR UPDATE SKIP LOCKED`,
-    [skip, limit],
+    [skip, limit, from],
   );
   return r.rows as ClawTaskRow[];
 }
@@ -118,10 +119,11 @@ export async function promoteReadyTasks(): Promise<number> {
   return await withOwnedAdmissionLock(async (client) => {
     const { usage, roots } = await loadUsageWithRoots("occupying", client);
     const admitted = await fillWithinCeiling<ClawTaskRow>({
-      page: (skip) => readyCandidates(client, skip, MAX_PROMOTE_PAGE),
+      page: (skip, from) => readyCandidates(client, skip, MAX_PROMOTE_PAGE, from),
       fits: (row) => chargeIfWithinHardHeadroom(row, usage, roots),
       want: MAX_PROMOTE_PAGE,
       idOf: (row) => row.task_id,
+      resume: "promote_ready",
     });
     if (!admitted.length) return 0;
     // The readiness predicate is repeated in the write: the advisory lock
@@ -200,6 +202,7 @@ async function pickQueuedTasks(
   limit: number,
   skip: string[] = [],
   client?: StatementRunner,
+  from = 0,
 ): Promise<ClawTaskRow[]> {
   // Chat doorbell rows sit at `queued` until a Brain claims them. This loop
   // is the DAG publisher: if it takes those rows it CAS-es them to
@@ -212,8 +215,8 @@ async function pickQueuedTasks(
        AND origin IS DISTINCT FROM 'chat'
        AND NOT (task_id = ANY($2::text[]))
      ORDER BY priority DESC, queued_at ASC NULLS LAST
-     LIMIT $1`,
-    [limit, skip],
+     LIMIT $1 OFFSET $3`,
+    [limit, skip, from],
   );
   return r.rows as ClawTaskRow[];
 }
@@ -280,7 +283,7 @@ async function reserveQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
   return await withOwnedAdmissionLock(async (client) => {
     const { usage, roots } = await loadUsageWithRoots("executing", client);
     const accepted = await fillWithinCeiling<ClawTaskRow>({
-      page: (skip) => pickQueuedTasks(limit, skip, client),
+      page: (skip, from) => pickQueuedTasks(limit, skip, client, from),
       fits: (row) => {
         const ask = askFromRow(row, roots);
         if (softOverflow(usage, ask, limits)) return false;
@@ -289,6 +292,7 @@ async function reserveQueuedTasks(limit: number): Promise<ClawTaskRow[]> {
       },
       want: limit,
       idOf: (row) => row.task_id,
+      resume: "reserve_queued",
     });
     return await reserveForExecution(
       client,

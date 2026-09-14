@@ -1316,6 +1316,39 @@ test("AC4 a body whose nested report names another attempt is refused whole", as
   assert.equal(after!.knownMsByState.executing, 40);
 });
 
+test("AC4 a fat holder's coverage is gated on the generation its renewal fenced on", async () => {
+  // The fat path puts two generations on one body. The attempt token is minted
+  // with `claim_count: 0` -- it was designed when a fat delivery genuinely took
+  // no claim -- and the generation `acquireFatLease` issued travels beside it in
+  // `run_claim`. The renewal fences on the quoted one, and the nested report has
+  // to quote it too, because the ledger's own fence compares the report against
+  // the row's `claim_count`. A gate reading the token's zero instead accepts the
+  // renewal and then throws away everything it carried, so a run whose pod is
+  // killed mid-turn banks none of its per-state time at all.
+  await seedRun(h, "ktsk-fatcov", SESSION, {
+    status: "running", dispatch: "fat", leaseOwner: BRAIN, leaseExpiresInSec: 45,
+    queuedAgoSec: 1, claimCount: 3,
+  });
+  const token = { attempt_id: "att-fat", claim_count: 0, delivery_seq: 7, delivery_count: 1 };
+
+  // The opening tick carries no coverage, so the record it opens is not what
+  // this case is about -- it is what isolates the tick that does.
+  const opened = await renew("ktsk-fatcov", { ...token, run_claim: 3 });
+  assert.equal(opened.statusCode, 200, "the fence reads the quoted generation, not the zero");
+  assert.equal((await ledgerOf("ktsk-fatcov"))!.attempts.length, 1,
+    "the identity-only tick opens the attempt record");
+
+  const res = await renew("ktsk-fatcov", {
+    ...token,
+    run_claim: 3,
+    run_time: { ...coverage("ktsk-fatcov", "att-fat", token, 40), claimCount: 3 },
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal((await ledgerOf("ktsk-fatcov"))!.knownMsByState.executing, 40,
+    "the report quotes the row's generation, which is the one the renewal committed under");
+});
+
 test("AC4 coverage is refused once the row has moved on between fence and merge", async () => {
   await seedRun(h, "ktsk-race", SESSION, {
     status: "running", leaseOwner: BRAIN, leaseExpiresInSec: 45, queuedAgoSec: 1,

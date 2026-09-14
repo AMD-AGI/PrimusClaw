@@ -128,18 +128,68 @@ test("reconciliation keeps the holder and refuses two of them", () => {
   );
 });
 
-test("the reconcile and the build share one exclusive hold of the claim fence", () => {
-  // Two separate holds would leave a window in which a serving replica claims a
-  // turn between them, and the build then arrives INVALID.
+test("the fence covers the reconcile, and is released before the build", () => {
+  // Holding it across the build is not a stronger guarantee, it is a lock
+  // cycle. CREATE INDEX CONCURRENTLY waits out every transaction holding a
+  // write lock on claw_tasks, and a claim blocked on the fence is one of them:
+  // its UPDATE takes the table's RowExclusiveLock during parse analysis, before
+  // the fence conjunct in its WHERE is evaluated. So the build would wait on
+  // the claim and the claim on the build's own fence, and Postgres would break
+  // the tie by killing one -- a migration crashloop, or fleet-wide claim
+  // failures for the length of the build.
   assert.match(CHAT_TURN_FN, /pg_advisory_lock\(\$1\)", \[RUN_CLAIM_FENCE_LOCK_ID\]/);
   assert.match(CHAT_TURN_FN, /pg_advisory_unlock\(\$1\)", \[RUN_CLAIM_FENCE_LOCK_ID\]/);
   const lockAt = CHAT_TURN_FN.indexOf("pg_advisory_lock");
   const unlockAt = CHAT_TURN_FN.indexOf("pg_advisory_unlock");
   const reconcileAt = CHAT_TURN_FN.indexOf("reconcileDuplicateChatTurns");
   const buildAt = CHAT_TURN_FN.indexOf("ensureConcurrentIndex");
-  assert.ok(lockAt < reconcileAt && reconcileAt < buildAt && buildAt < unlockAt,
-    "reconcile and build both happen inside the one hold");
+  assert.ok(lockAt < reconcileAt && reconcileAt < unlockAt && unlockAt < buildAt,
+    "the reconcile happens inside the hold and the build strictly after it");
   assert.match(CHAT_TURN_FN, /finally \{/, "and the fence is released whatever happens");
+});
+
+test("the reconcile's own wait is bounded, because it holds the fence", () => {
+  // Moving the build out leaves a narrower version of the same cycle: a claim
+  // blocked on the fence on the admission-lock path is holding a `FOR UPDATE`
+  // tuple lock, and the reconcile's UPDATE may want that very row. An unbounded
+  // wait there relocates the deadlock rather than removing it.
+  assert.match(CHAT_TURN_FN, /SET lock_timeout = \$\{RECONCILE_LOCK_TIMEOUT_MS\}/,
+    "the reconcile waits on a budget");
+  assert.match(CHAT_TURN_FN, /finally\s*\{[\s\S]*RESET lock_timeout/,
+    "and gives the session's default back in a finally");
+  const lockTimeoutAt = CHAT_TURN_FN.indexOf("SET lock_timeout");
+  const buildAt = CHAT_TURN_FN.indexOf("ensureConcurrentIndex");
+  assert.ok(lockTimeoutAt < buildAt,
+    "and the budget is scoped to the reconcile, not imposed on a half-hour build");
+});
+
+test("a build lost to a racing claim is retried, and only a lock wait retries the reconcile", () => {
+  // CREATE UNIQUE INDEX CONCURRENTLY that meets a duplicate does not return an
+  // invalid index, it raises 23505 and leaves one behind -- so a loop that only
+  // re-read validity would never run a second attempt. The build call has to be
+  // inside a catch for the retry to exist at all.
+  assert.match(CHAT_TURN_FN, /for \(let attempt = 1; attempt <= CHAT_TURN_INDEX_ATTEMPTS; attempt\+\+\)/);
+  assert.match(CHAT_TURN_FN, /db\.chat_turn_index_build_retry/, "the build is caught and retried");
+  // And the reconcile is not: it refuses a turn two live executions hold, and
+  // that refusal is the one error an operator has to read.
+  assert.match(CHAT_TURN_FN, /CLAIM_FENCE_RETRY_CODES\.has\(/);
+  assert.match(SRC, /const CLAIM_FENCE_RETRY_CODES = new Set\(\["55P03", "40P01"\]\)/,
+    "lock_not_available and deadlock_detected, and nothing else");
+  assert.ok(
+    CHAT_TURN_FN.indexOf("throw err") < CHAT_TURN_FN.indexOf("db.chat_turn_reconcile_retry"),
+    "anything that is not a lock wait leaves the function",
+  );
+});
+
+test("exhausting the attempts reports rather than aborting the migration", () => {
+  // Same reasoning as ensureConcurrentIndex's warn-not-throw ending: a throw
+  // here would skip the ~200 lines of DDL below and assertSchema with them, and
+  // assertSchema is the check that catches exactly this state.
+  assert.match(CHAT_TURN_FN, /db\.chat_turn_index_attempts_exhausted/);
+  assert.ok(
+    !/throw new Error/.test(CHAT_TURN_FN),
+    "the boot is refused by assertChatTurnClaimIndex, not by the builder",
+  );
 });
 
 test("but an already-valid index is recognised before the fence is taken", () => {

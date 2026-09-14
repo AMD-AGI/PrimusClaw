@@ -66,9 +66,24 @@ nothing is reporting -- see *Why the expressions look like this*.
 3. No legacy `preparing` rows are outstanding from a previous attempt.
    Reconciling them is gated on `RUN_FAT_PREPARING_RECONCILE`, the API's
    assertion that every Brain able to receive a task takes a durable holder
-   before it executes; it ships off and is read from the API process
-   environment, not from a chart value. Turning it on before every replica on
+   before it executes. It ships **on**, as `features.runFatPreparingReconcile`,
+   an API-only chart value; the same assertion also turns on session
+   gate-ownership enforcement, which a replica that does not maintain
+   `agent_gate_message_id` cannot satisfy. Asserting it before every replica on
    both sides is new lets a reaper close a delivery that is about to run.
+
+   A fleet rolling up from a release that predates the durable holder therefore
+   turns it off in an upgrade of its own, before the first new API replica
+   starts, and clears it in an upgrade of its own afterwards. `deploy.sh` sends
+   values and image in a single `helm upgrade --install -f`, so one run that
+   changes both brings up replicas that are already asserting:
+
+   1. With the old image still deployed, record
+      `RUN_FAT_PREPARING_RECONCILE="false"` in
+      `claw/deploy/values.<namespace>.env` and apply.
+   2. Upgrade the image.
+   3. Once every API and Brain replica is new, blank the key -- empty means the
+      chart default, which is on -- and apply again.
 4. Prometheus reaches the API `/metrics` endpoint of every replica, and P1
    below passes.
 5. Every run-creating path is routed through admission, so a ceiling means what

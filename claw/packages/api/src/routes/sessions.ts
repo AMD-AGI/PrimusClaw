@@ -33,7 +33,8 @@ import { metrics } from "../infra/metrics.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
 import {
-  acquireAdmissionLock, decideAdmission, sessionTreeShape,
+  acquireAdmissionLock, envAdmitLimits, sessionTreeShape, treeCeilingRefusal,
+  type AdmissionAsk,
 } from "../tasks/admission.js";
 import { S3_BUCKET, UPLOAD_TTL_DAYS } from "../config.js";
 import { getS3Client } from "../infra/s3-client.js";
@@ -138,15 +139,18 @@ function isRefusal(
   return "statusCode" in result;
 }
 
-// The two shapes differ only in where the parent is read: a create carrying a
-// first message grows a tree somebody may be racing, so it takes the lock.
+// The two shapes differ only in where the parent is read: a create that names
+// a parent grows a tree somebody may be racing, so it takes the lock. Whether
+// it also carries a first message is not the question -- a node the ceiling
+// never saw is exactly the child idled into the tree that `sessionTreeShape`
+// is written to bound, and it would be paid for later by every session in the
+// tree, whose next turn is the one the ceiling finally refuses.
 async function createSessionRow(
   row: NewSessionRow,
   parentSid: string | null,
   user: ReturnType<typeof getUser>,
-  admitTree: boolean,
 ): Promise<SessionCreateRefusal | null> {
-  if (parentSid && admitTree) return admitParentedSessionCreate(parentSid, user, row);
+  if (parentSid) return admitParentedSessionCreate(parentSid, user, row);
   const parentAuth = await resolveParentAuthorisation(db, parentSid, user);
   if (isRefusal(parentAuth)) return parentAuth;
   await insertSessionRow(db, row, parentAuth);
@@ -174,21 +178,32 @@ export async function admitParentedSessionCreate(
         await client.query("ROLLBACK");
         return parentAuth;
       }
-      const shape = await sessionTreeShape(parentSid, client);
-      const decision = await decideAdmission({
-        origin: "chat",
-        newRunRoots: 0,
-        sandboxes: 0,
-        gpuNodes: 0,
-        treeRootId: shape.rootId,
-        treeNodeCount: shape.nodeCount + 1,
-        treeDepth: shape.depth + 1,
-      }, client);
-      if (decision.kind === "reject") {
+      // The walk is what a tree ceiling costs, so a fleet that meters no tree
+      // does not pay it: with no tree bound the ask below carries no run,
+      // sandbox or GPU either, and the decision is a no-op on it.
+      let ask: AdmissionAsk = { origin: "chat", newRunRoots: 0, sandboxes: 0, gpuNodes: 0 };
+      const limits = envAdmitLimits();
+      if (limits.treeMaxNodes > 0 || limits.treeMaxDepth > 0) {
+        const shape = await sessionTreeShape(parentSid, client);
+        ask = {
+          ...ask,
+          treeRootId: shape.rootId,
+          treeNodeCount: shape.nodeCount + 1,
+          treeDepth: shape.depth + 1,
+        };
+      }
+      // The tree bounds and nothing else. This write adds a node, never a run:
+      // asking the full decision would put it against the fleet's run, sandbox
+      // and GPU ceilings, and an operator lowering ADMIT_HARD_RUNS below current
+      // occupancy would then start refusing idle child-session setup that starts
+      // no work -- while the same create with no parent still succeeded. A run
+      // meets a run cap when it is dispatched.
+      const refusal = treeCeilingRefusal(ask, limits);
+      if (refusal) {
         await client.query("ROLLBACK");
         return {
           statusCode: 429,
-          response: { ok: false, error: "admission_rejected", reason: decision.reason },
+          response: { ok: false, error: "admission_rejected", reason: refusal },
         };
       }
       await insertSessionRow(client, row, parentAuth);
@@ -981,9 +996,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           parentSid, role,
           gateMessageId: firstMessageId,
         };
-        // A create with no parent grows no existing tree, and one with no
-        // message writes no run, so only the two together take the lock.
-        const refused = await createSessionRow(newRow, parentSid, user, Boolean(firstMessage));
+        // A create with no parent grows no existing tree; every create that
+        // names one adds a node to it, so it is decided against the ceiling
+        // before the row is written.
+        const refused = await createSessionRow(newRow, parentSid, user);
         if (refused) {
           return { statusCode: refused.statusCode, response: refused.response };
         }

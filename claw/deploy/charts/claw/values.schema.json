@@ -32,6 +32,10 @@
         "brainDoorbellExecution": {
           "description": "A Brain replica executes doorbell runs, on the wire and from claim-next.",
           "type": "boolean"
+        },
+        "runFatPreparingReconcile": {
+          "description": "The API asserts every Brain takes a durable SQL holder before its execution gate.",
+          "type": "boolean"
         }
       }
     },

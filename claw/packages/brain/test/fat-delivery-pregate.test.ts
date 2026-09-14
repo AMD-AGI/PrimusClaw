@@ -23,6 +23,7 @@
  *   F8  a refusal mid-wait stops the delivery before the handler
  *   F9  a Stop taken while queued settles visibly and leaks no slot
  *   F10 the accepted generation reaches the run's own heartbeat and completion
+ *   F14 a drain gives the accepted lease back with the message
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -33,7 +34,7 @@ import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
 
 import {
   runDelivery, createFatPreGate, currentFatDelivery, DeliveryResidency,
-  type DeliveryDeps, type FatPreGate,
+  type DeliveryDeps, type FatPreGate, type FatPreGateDeps,
 } from "../src/delivery/dispatch.js";
 import { ExecutionGate } from "../src/tasks/execution-gate.js";
 import type { LeaseAnswer, LeaseRenewal } from "../src/tasks/callback.js";
@@ -101,6 +102,10 @@ function harness(opts: {
   answers: (n: number, renewal: LeaseRenewal, request: ExecuteRequest) => LeaseAnswer;
   max?: number;
   handle?: (msg: JsMsg, h: Harness) => Promise<void>;
+  /** Re-asked per delivery, so a case can start the drain while one is queued. */
+  draining?: () => boolean;
+  /** The settle-and-release POST, for the case that asserts the lease goes back. */
+  settle?: FatPreGateDeps["settle"];
 }): Harness {
   const gate = new ExecutionGate(opts.max ?? 1, opts.max ?? 1);
   const leases: LeaseRenewal[] = [];
@@ -119,13 +124,14 @@ function harness(opts: {
       // keep a delivery and queue it rather than hand it back.
       canRefuse: () => false,
       surplusNakMs: () => 1_000,
-      isDraining: () => false,
+      isDraining: () => opts.draining?.() ?? false,
       fatPreGate: createFatPreGate({
         emit: async (_sessionId, evt) => { events.push(evt); },
         ask: async (request, renewal) => {
           leases.push(renewal);
           return opts.answers(leases.length, renewal, request);
         },
+        ...(opts.settle ? { settle: opts.settle } : {}),
         brainId: "brain-7",
         leaseTtlMs: 60_000,
         heartbeatMs: HEARTBEAT_MS,
@@ -145,6 +151,17 @@ const granted = (status: string, claimCount?: number): LeaseAnswer =>
   claimCount === undefined
     ? { kind: "granted", status }
     : { kind: "granted", status, claimCount };
+
+/**
+ * The 409 a stopped row nobody holds answers an acceptance with.
+ *
+ * Not a grant: `acquireFatLease` filters on the acquirable statuses and returns
+ * the row it wrote, so no server version hands out a lease whose status is
+ * `cancelling`. The row says so by refusing, and says beside the refusal that
+ * this delivery is the only thing left that can settle it.
+ */
+const stoppedRow = (claimCount: number): LeaseAnswer =>
+  ({ kind: "refused", refusal: "gone", stop: "cancelling", claimCount });
 
 describe("the pre-gate lease", () => {
   it("F1 completes before the delivery queues for a slot", async () => {
@@ -328,7 +345,7 @@ describe("a Stop taken while the delivery is queued", () => {
   it("F9 settles it visibly, runs nothing, and leaks no slot", async () => {
     const h = harness({
       answers: (_n, _renewal, request) =>
-        (request.task_id === "t-2" ? granted("cancelling", 4) : granted("preparing", 4)),
+        (request.task_id === "t-2" ? stoppedRow(4) : granted("preparing", 4)),
       max: 1,
     });
     const running = msgFor(fatRequest());
@@ -372,7 +389,7 @@ describe("a Stop taken while the delivery is queued", () => {
     const h = harness({
       answers: (_n, _renewal, request) => (
         request.run_lease?.url?.includes("t-legacy")
-          ? granted("cancelling", 4)
+          ? stoppedRow(4)
           : granted("preparing", 4)
       ),
       max: 1,
@@ -391,6 +408,88 @@ describe("a Stop taken while the delivery is queued", () => {
       "recovered from the only place this payload says it",
     );
     h.finish();
+  });
+
+  it("F9c settles a Stop an API too old to refuse the acceptance granted instead", async () => {
+    // The other side of a rolling upgrade. An API that predates the acceptance
+    // flag serves the first lease from its renewal statement, whose renewable
+    // set includes `cancelling`, so it answers 200 with that status and no
+    // generation at all. Still a Stop, still nobody else to report it, and the
+    // completion has to go out quoting nothing -- which is admissible exactly
+    // because such an API never fenced the row either.
+    const h = harness({
+      answers: (_n, _renewal, request) =>
+        (request.task_id === "t-2" ? granted("cancelling") : granted("preparing", 4)),
+      max: 1,
+    });
+    void runDelivery(msgFor(fatRequest()), h.deps);
+    await settle();
+    const legacyStop = msgFor(fatRequest({ task_id: "t-2" }));
+
+    await runDelivery(legacyStop, h.deps);
+
+    assert.deepEqual(verdictsOf(legacyStop), ["ack"]);
+    assert.equal(h.handled.length, 1, "the stopped delivery never entered the handler");
+    const completion = h.events.find((e) => e.type === "exec_complete");
+    assert.ok(completion, "the interrupt is still reported");
+    assert.equal(completion.interrupted, true);
+    assert.equal(completion.run_claim, undefined, "an API that issued none is quoted none");
+    h.finish();
+  });
+});
+
+describe("a drain that starts while the delivery is queued", () => {
+  it("F14 gives the accepted lease back before it hands the message back", async () => {
+    // The drain is re-asked only after the gate returns, so the whole queue
+    // wait -- which is as long as another run -- passes with an accepted lease
+    // renewed on the row. Naking without releasing it leaves every redelivery
+    // classified `superseded` and naking in turn, so the turn stands still for
+    // a full lease TTL on a pod that already knows it will not run it. This is
+    // the ordinary precursor to every rolling upgrade: a version drain leaves
+    // the pod alive with its consumer running, and each delivery parked on the
+    // gate takes this branch as the running tasks finish.
+    let draining = false;
+    const order: string[] = [];
+    const settles: Array<Record<string, unknown>> = [];
+    const h = harness({
+      answers: (_n, _renewal, request) =>
+        granted("preparing", request.task_id === "t-2" ? 7 : 3),
+      max: 1,
+      draining: () => draining,
+      settle: (async (taskId, claimCount, runTime, releaseLease, as) => {
+        order.push("release");
+        settles.push({ taskId, claimCount, runTime, releaseLease, as });
+      }) as NonNullable<FatPreGateDeps["settle"]>,
+    });
+
+    void runDelivery(msgFor(fatRequest()), h.deps);
+    await settle();
+    const queued = msgFor(fatRequest({ task_id: "t-2" }));
+    const nak = queued.nak.bind(queued);
+    queued.nak = (ms?: number) => { order.push("nak"); nak(ms); };
+    const drained = runDelivery(queued, h.deps);
+    await settle();
+    assert.deepEqual(verdictsOf(queued), [], "it is queued for a slot, not refused on arrival");
+
+    draining = true;
+    h.finish();
+    await drained;
+
+    assert.deepEqual(order, ["release", "nak"],
+      "the lease goes back before the message does, so the redelivery can take it");
+    assert.deepEqual(verdictsOf(queued), ["nak:5000"]);
+    assert.equal(h.handled.length, 1, "the drained delivery never entered the handler");
+    assert.equal(settles.length, 1);
+    assert.equal(settles[0].taskId, "t-2");
+    assert.equal(settles[0].claimCount, 7,
+      "the generation the acceptance issued, which the settle is fenced on");
+    assert.equal(settles[0].releaseLease, true,
+      "owner null and expiry in the past is the shape the acceptance's released arm takes");
+    assert.deepEqual(settles[0].as, { brainId: "brain-7", attempts: 1 },
+      "under the identity that took the lease -- a mismatch answers 409, which this "
+      + "client reads as success, and the lease would leak with nothing logged");
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.gate.inflight, 0, "and the slot it briefly held went back");
   });
 });
 

@@ -136,6 +136,38 @@ ok "the Brain kill-switch is off when its own value is false"
 refuses "features.brainDoorbellExecution=notabool" \
   "${rollout_base[@]}" --set-string features.brainDoorbellExecution=notabool
 
+echo "==> the fat-preparing reconcile assertion"
+
+# The same shape as the switch above -- container-level env, read once at
+# startup -- but on one Deployment instead of both, because only the API
+# consults it. The rollup procedure in claw/docs/doorbell-rollout.md turns it
+# off for the length of the rollout, so "the chart can express false" is the
+# half that has to hold; without a chart value at all there is no supported way
+# to say it, and the API asserts a fleet property it has not yet earned.
+reconcile_env_of() {
+  local template="$1"; shift
+  helm template rollout-test "$chart_dir" "$@" --show-only "templates/$template" 2>"$err" |
+    rg -A1 'name: RUN_FAT_PREPARING_RECONCILE' | rg -o 'value: "\w+"'
+}
+
+[ "$(reconcile_env_of api-deployment.yaml "${release_base[@]}")" = 'value: "true"' ] \
+  || bad "the chart default did not enable RUN_FAT_PREPARING_RECONCILE on the API"
+api_env="$(reconcile_env_of api-deployment.yaml "${release_base[@]}" \
+  --set features.runFatPreparingReconcile=false)"
+[ "$api_env" = 'value: "false"' ] \
+  || bad "features.runFatPreparingReconcile=false did not reach the API container, got: ${api_env:-nothing}"
+ok "the API takes RUN_FAT_PREPARING_RECONCILE from features.runFatPreparingReconcile"
+
+# An absence, not a value: the Brain never reads this name, and a Secret key
+# would have handed it to every workload that mounts the shared Secret.
+brain_env="$(reconcile_env_of brain-deployment.yaml "${release_base[@]}" || true)"
+[ -z "$brain_env" ] \
+  || bad "RUN_FAT_PREPARING_RECONCILE reached the Brain container, got: $brain_env"
+ok "the Brain is not handed the reconcile assertion"
+
+refuses "features.runFatPreparingReconcile=notabool" \
+  "${rollout_base[@]}" --set-string features.runFatPreparingReconcile=notabool
+
 echo "==> per-key schema refusals"
 
 refuses "api.admitSoftRuns=-1" "${rollout_base[@]}" --set-string api.admitSoftRuns=-1
