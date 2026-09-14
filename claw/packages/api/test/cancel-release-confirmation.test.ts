@@ -143,18 +143,20 @@ function stubHandles(handles: Record<string, string>): void {
 }
 
 /**
- * A SaFE that answers the stop per workload id and, by default, reports the
- * workload gone on the confirming read that follows a 2xx.
+ * A SaFE that answers the stop per workload id, and records any OTHER workload
+ * request separately.
  *
- * The read is not incidental: SaFE's stop returns once it has issued a
- * Kubernetes delete, and the Workload survives its own finalizer until the
- * pods are actually torn down. So "the stop was accepted" and "the GPU is
- * free" are different states, and `confirmed` is the second one. `present`
- * makes a test hold the workload in the first.
+ * `read` exists to be asserted empty. A review round added a confirming
+ * `GET /api/v1/workloads/<id>` after each accepted stop, on the theory that a
+ * 2xx is not a release -- which is true, since SaFE's teardown is asynchronous
+ * under a finalizer. The read cannot establish it either: the apiserver's read
+ * is database-backed and answers 200 for a workload that stopped perfectly
+ * normally, so it reported `unconfirmed` for every successful cancellation
+ * there is. Keeping the counter means R13 can assert the second request is
+ * *absent*, which is the property that version violated.
  */
 function stubSafe(
   answer: (workloadId: string) => Response | Promise<Response>,
-  opts: { present?: (workloadId: string) => boolean } = {},
 ): { stopped: string[]; read: string[] } {
   const stopped: string[] = [];
   const read: string[] = [];
@@ -165,11 +167,11 @@ function stubSafe(
       stopped.push(stopId);
       return await answer(stopId);
     }
-    const readId = /\/workloads\/([^/]+)$/.exec(url)?.[1] ?? "";
-    read.push(readId);
-    return opts.present?.(readId)
-      ? new Response(JSON.stringify({ id: readId }), { status: 200 })
-      : new Response("not found", { status: 404 });
+    // Nothing should reach here. Recorded rather than thrown so the assertion
+    // names the request that was made, instead of a test failing on a stray
+    // fetch with no indication of which one.
+    read.push(/\/workloads\/([^/]+)$/.exec(url)?.[1] ?? url);
+    return new Response("not found", { status: 404 });
   }) as typeof globalThis.fetch;
   return { stopped, read };
 }
