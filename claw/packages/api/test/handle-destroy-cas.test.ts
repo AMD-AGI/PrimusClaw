@@ -33,6 +33,7 @@
  *   C3 a row that will not settle raises rather than silently giving up
  *   C4 a non-conflict failure is raised, not retried away
  *   C5 the removal is bound to the workload it was asked to remove
+ *   C6 the rewrite path is conditional too, not only the delete path
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -191,4 +192,25 @@ test("C5 the removal is bound to the workload it was asked to remove", async () 
     bucket.current(), { a: { workload_id: "Wa2" } },
     "and the workload that took its place keeps its only reference",
   );
+});
+
+test("C6 the rewrite path is conditional too, not only the delete path", async () => {
+  // C1 looks like it covers this and does not. Its first write is the DELETE
+  // (its row empties), so it pins the delete's `previousSeq` and says nothing
+  // about the update's revision -- with that argument dropped, C1 still
+  // passes. The two writes are separate arguments in separate branches and
+  // need separate cover.
+  //
+  // Here the row does not empty, so the removal is a rewrite, and a
+  // registration landing after the read is one an unconditional rewrite would
+  // silently discard.
+  const bucket = fakeBucket({ a: { workload_id: "Wa" }, b: { workload_id: "Wb" } });
+  bucket.interleave(() => bucket.register("c", "Wc"));
+
+  assert.equal(await destroy(bucket, "a"), "Wa");
+  assert.deepEqual(
+    bucket.current(), { b: { workload_id: "Wb" }, c: { workload_id: "Wc" } },
+    "Wc registered while this was deciding, and a rewrite without a revision would drop it",
+  );
+  assert.equal(bucket.conflicts.length, 1);
 });
