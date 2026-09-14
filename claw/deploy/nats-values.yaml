@@ -157,17 +157,43 @@ config:
                   # enough for backpressure to kick in.
                   - "$JS.FC.PRIMUS_CLAW_EVENTS.>"
                   - "$JS.FC.KV_BRAIN_REGISTRY.>"
+                  - "$JS.FC.KV_DAG_HANDLES.>"
                   # KV writes. A put, update or delete is a publish.
                   - "$KV.BRAIN_REGISTRY.hands.*"
                   - "$KV.BRAIN_REGISTRY.lock.>"
                   - "$KV.BRAIN_REGISTRY.deleted.*"
-                  - "$KV.BRAIN_REGISTRY.dag-handles.>"
                   - "$KV.BRAIN_REGISTRY.brain.min_version"
+                  # Sandbox handles, in the bucket brain writes them to. This
+                  # list used to say `$KV.BRAIN_REGISTRY.dag-handles.>`, which
+                  # was a faithful grant of what the code did and a permission
+                  # for a key nobody has ever written: brain registers handles
+                  # under `$KV.DAG_HANDLES.dag-handles.*`, so every api-side
+                  # teardown read an empty bucket and destroyed nothing. The
+                  # allow-list matching the bug is part of why it survived --
+                  # a subject that is wrong but agreed on by both sides looks
+                  # exactly like a subject that is right.
+                  #
+                  # `.*` rather than `.>` because a handle key is
+                  # `dag-handles.<dag_root_task_id>`: one token, and a task id
+                  # contains no dots. This is the same grant brain holds.
+                  - "$KV.DAG_HANDLES.dag-handles.*"
                   - "$KV.BRAIN_TOMBSTONES.deleted.*"
                   - "$KV.SYSTEM_ENV.current"
-                  # Bucket lifecycle. api creates and reconciles four buckets,
+                  # Bucket lifecycle. api creates and reconciles five buckets,
                   # including BRAIN_CHECKPOINTS -- provisioning only; see the
                   # note under that bucket's absence from the data lists.
+                  #
+                  # DAG_HANDLES is the exception brain's own block describes: it
+                  # is the one bucket brain creates. api reconciles it anyway,
+                  # with `ttl: 0` and `widenOnly` so it can widen a bucket
+                  # somebody created narrow but never narrow brain's, and so
+                  # replica drift on a bucket first opened without options can
+                  # be corrected -- which brain cannot do, holding no
+                  # JetStreamManager. CREATE is needed for the ordering where
+                  # api starts first on a fresh cluster.
+                  - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
+                  - "$JS.API.STREAM.CREATE.KV_DAG_HANDLES"
+                  - "$JS.API.STREAM.UPDATE.KV_DAG_HANDLES"
                   - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
                   - "$JS.API.STREAM.CREATE.KV_BRAIN_REGISTRY"
                   - "$JS.API.STREAM.UPDATE.KV_BRAIN_REGISTRY"
@@ -188,6 +214,9 @@ config:
                   - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES"
                   - "$JS.API.DIRECT.GET.KV_BRAIN_TOMBSTONES.>"
                   - "$JS.API.STREAM.MSG.GET.KV_BRAIN_TOMBSTONES"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_DAG_HANDLES"
                   # kv.keys() and kv.watch() build ordered ephemeral consumers
                   # and tear them down again; without DELETE each sweep leaks
                   # one, and every teardown here is a bare .catch(() => {}).
@@ -196,6 +225,13 @@ config:
                   - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
+                  # The sweeper's orphan-handle pass is a kv.keys() over this
+                  # bucket, so it needs the same ordered-consumer lifecycle.
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES"
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.INFO.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_DAG_HANDLES.>"
               subscribe:
                 allow:
                   # Reply inboxes, subscribe only. Nobody gets publish on

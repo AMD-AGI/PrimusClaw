@@ -27,6 +27,8 @@
  * Coverage:
  *   B1 Brain's writer and the API's reader name the same bucket
  *   B2 the stopper reads that binding, not the short-lived registry one
+ *   B3 the api user's NATS allow-list grants the bucket the code names
+ *   B4 and no longer grants the one it does not
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -63,5 +65,58 @@ test("B2 the stopper reads the DAG handles binding, not the short-lived registry
   assert.equal(
     /\bkv as natsKv\b/.test(stopper), false,
     "BRAIN_REGISTRY is coordination state that expires; a handle mapping must not",
+  );
+});
+
+test("B3 the api user's NATS allow-list grants the bucket the code names", () => {
+  // The other half of why this survived, and the reason a code-only fix would
+  // have failed in the cluster while passing every test here: the allow-list
+  // agreed with the bug. It granted `$KV.BRAIN_REGISTRY.dag-handles.>`, a
+  // permission for a key nobody has ever written, and nothing granted
+  // KV_DAG_HANDLES at all. A denied publish does not raise in the NATS client,
+  // so the failure mode is a teardown that silently does nothing -- which is
+  // indistinguishable from the failure mode of the wrong bucket, and is the one
+  // this whole PR exists to stop being invisible.
+  const perms = read("../../../deploy/nats-values.yaml");
+  const apiBlock = perms.slice(perms.indexOf("- user: api"), perms.indexOf("- user: brain"));
+
+  // Every subject class the stopper reaches, each for a different operation:
+  // put/delete is a publish, get is a direct read, and the sweeper's kv.keys()
+  // builds an ordered consumer and tears it down again.
+  for (const subject of [
+    `$KV.${DAG_HANDLES_BUCKET}.dag-handles.*`,
+    `$JS.API.STREAM.INFO.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.STREAM.CREATE.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.STREAM.UPDATE.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.DIRECT.GET.KV_${DAG_HANDLES_BUCKET}.>`,
+    `$JS.API.STREAM.MSG.GET.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.CONSUMER.CREATE.KV_${DAG_HANDLES_BUCKET}`,
+    `$JS.API.CONSUMER.DELETE.KV_${DAG_HANDLES_BUCKET}.>`,
+    // Without flow control, kv.keys() stops yielding -- without throwing --
+    // once the bucket is big enough for the server to apply backpressure, so
+    // the sweeper would silently see a short list of DAGs.
+    `$JS.FC.KV_${DAG_HANDLES_BUCKET}.>`,
+  ]) {
+    assert.ok(
+      apiBlock.includes(`"${subject}"`),
+      `api cannot reach ${subject}, so this teardown fails silently in the cluster`,
+    );
+  }
+});
+
+test("B4 and no longer grants the bucket it does not use", () => {
+  // Left behind, this is a standing invitation to put the code back: a grant
+  // that describes a layout nothing implements, sitting in the file somebody
+  // reads to find out what the layout is.
+  // Grant lines only. The comment recording why the old subject was wrong has
+  // to keep naming it, or the next reader loses the reason with the line.
+  const granted = read("../../../deploy/nats-values.yaml")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('- "'));
+
+  assert.deepEqual(
+    granted.filter((l) => l.includes("BRAIN_REGISTRY.dag-handles")), [],
+    "handles never lived in BRAIN_REGISTRY; a grant saying they do is how this bug reads as intentional",
   );
 });
