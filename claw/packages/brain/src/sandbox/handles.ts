@@ -274,11 +274,55 @@ function isRevisionConflict(e: unknown): boolean {
  */
 export async function releaseHandlesForWorkload(workloadId: string): Promise<void> {
   if (!workloadId) return;
+  const kv = _kvBucket;
+  if (!kv) throw new Error("dag-handles.not_initialized -- call initDagHandles(js) at boot");
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+
   for (const [dagRoot, handles] of await getMap().listAll()) {
-    for (const [name, info] of Object.entries(handles)) {
-      if (info.workload_id !== workloadId) continue;
-      await getMap().destroy(dagRoot, name);
-      logger.info({ dagRootTaskId: dagRoot, handleName: name, workloadId }, "dag-handles.released");
+    const names = Object.entries(handles)
+      .filter(([, info]) => info.workload_id === workloadId)
+      .map(([name]) => name);
+    if (names.length === 0) continue;
+
+    // Revision-conditional, and bound to the workload. `DagHandleMap.destroy`
+    // is an unconditional rewrite of the whole row, so a handle registered
+    // between the scan above and the write below is deleted with it -- the
+    // same lost update the removal on the Backend side was made conditional
+    // to prevent, reintroduced here. And the entry may have moved on to a
+    // different workload since the scan, which is somebody else's and must
+    // not be removed on the strength of a stale read.
+    for (const name of names) {
+      for (let attempt = 0; attempt < REGISTER_CAS_ATTEMPTS; attempt += 1) {
+        const key = `${HANDLE_MAP_PREFIX}.${dagRoot}`;
+        const entry = await kv.get(key);
+        if (!entry || entry.operation === "DEL" || entry.operation === "PURGE") break;
+        if (entry.value.length === 0) break;
+        const parsed: unknown = JSON.parse(dec.decode(entry.value));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) break;
+        const row = parsed as Record<string, unknown>;
+
+        const held = getHandleEntry(row, name);
+        const heldId = typeof held === "string"
+          ? held
+          : (held as { workload_id?: string } | undefined)?.workload_id;
+        // Already gone, or moved on to something else: not ours to remove.
+        if (heldId !== workloadId) break;
+
+        delete row[name];
+        try {
+          if (Object.keys(row).length === 0) {
+            await kv.delete(key, { previousSeq: entry.revision });
+          } else {
+            await kv.update(key, enc.encode(JSON.stringify(row)), entry.revision);
+          }
+          logger.info({ dagRootTaskId: dagRoot, handleName: name, workloadId }, "dag-handles.released");
+          break;
+        } catch (e) {
+          if (!isRevisionConflict(e)) throw e;
+          logger.info({ dagRootTaskId: dagRoot, handleName: name, attempt }, "dag-handles.release_retry");
+        }
+      }
     }
   }
 }

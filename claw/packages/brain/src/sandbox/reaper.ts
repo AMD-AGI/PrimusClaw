@@ -158,21 +158,31 @@ export function bindSandboxStopRetry(over: Partial<typeof stopRetry>): () => voi
 /**
  * Stop the named sandbox, or say why the caller must not replace it.
  *
- * Returns normally in exactly two cases: the stop was confirmed, or this
- * deployment cannot issue one at all (see SandboxStopUnavailable). Everything
- * else is retried and then thrown, because the caller's next move is to build a
- * replacement over the top of it.
+ * Returns normally in exactly two cases, and says WHICH: the stop was
+ * confirmed, or this deployment cannot issue one at all (see
+ * SandboxStopUnavailable). Everything else is retried and then thrown, because
+ * the caller's next move is to build a replacement over the top of it.
+ *
+ * The distinction is not cosmetic. A caller that treats "cannot stop" as
+ * "stopped" drops the workload's last reference while it is still running --
+ * which is how a deployment with no platform key or no `SAFE_API_URL` turns
+ * every teardown into a silent leak the report then calls released.
  */
-async function stopNamedSandbox(sessionId: string, entry: HandsProbeEntry): Promise<void> {
+async function stopNamedSandbox(
+  sessionId: string,
+  entry: HandsProbeEntry,
+): Promise<"stopped" | "unavailable"> {
   const inst = instanceFromEntry(sessionId, entry);
-  if (!inst) return;
+  // No instance to address: nothing was stopped, and nothing may be released
+  // on the strength of it.
+  if (!inst) return "unavailable";
   const provider = inst.provider === "agent-sandbox"
     ? getAgentSandboxProvider()
     : getSafeWorkloadProvider();
   for (let attempt = 1; ; attempt++) {
     try {
       await provider.stop(inst);
-      return;
+      return "stopped";
     } catch (err) {
       if (err instanceof SandboxStopUnavailable) {
         // Nothing to retry and nothing an operator can do mid-request. Leave
@@ -182,7 +192,7 @@ async function stopNamedSandbox(sessionId: string, entry: HandsProbeEntry): Prom
           { err: String(err), sessionId, provider: inst.provider },
           "hands.stop_unavailable",
         );
-        return;
+        return "unavailable";
       }
       if (attempt >= stopRetry.attempts) {
         logger.warn(
@@ -253,7 +263,7 @@ export async function destroyHands(
   }
 
   try {
-    await stopNamedSandbox(sessionId, target);
+    const stopOutcome = await stopNamedSandbox(sessionId, target);
     metrics.onSandboxStop("ok");
     // Whoever stops a workload frees its handle. Registration refuses to point
     // a handle away from a workload still on record -- which is what stops a
@@ -264,7 +274,12 @@ export async function destroyHands(
     // must never be why a teardown reports failure. If it does not land, the
     // next registration refuses and the turn fails visibly, with the handle
     // still naming the stopped workload for a sweep to find.
-    const stoppedWorkload = (target as { workloadId?: string }).workloadId;
+    // Only when a stop was actually issued and accepted. `unavailable` means
+    // this deployment could not ask -- the workload is still running, and its
+    // handle is the last thing pointing at it.
+    const stoppedWorkload = stopOutcome === "stopped"
+      ? (target as { workloadId?: string }).workloadId
+      : undefined;
     if (stoppedWorkload) {
       await releaseHandlesForWorkload(stoppedWorkload).catch((e: unknown) => {
         logger.warn(

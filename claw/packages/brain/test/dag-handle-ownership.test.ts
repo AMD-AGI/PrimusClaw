@@ -36,6 +36,8 @@
  *   H10 re-registering the same workload is allowed, and enriches it
  *   H11 releasing by workload frees the name, and only for the workload named
  *   H12 a legacy bare-string entry still counts as a workload on record
+ *   H13 releasing does not delete a handle registered while it decided
+ *   H14 releasing does not take a handle that has moved to another workload
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -88,7 +90,16 @@ function fakeJs(initial: Record<string, unknown> = {}) {
       revs[key] = (revs[key] ?? 0) + 1;
       return revs[key];
     },
-    async delete(key: string) { delete rows[key]; delete revs[key]; },
+    // Enforces `previousSeq` the way NATS does. A fake that deleted
+    // unconditionally would supply the protection these tests are checking --
+    // the conditional delete is exactly what stops a row being removed after
+    // somebody added a handle to it.
+    async delete(key: string, opts?: { previousSeq?: number }) {
+      if (opts?.previousSeq !== undefined && opts.previousSeq !== revs[key]) {
+        throw new Error(`wrong last sequence: ${revs[key]}`);
+      }
+      delete rows[key]; delete revs[key];
+    },
     async keys() { return (async function* () { for (const k of Object.keys(rows)) yield k; })(); },
   };
   return { rows, kv, js: { views: { kv: async () => kv } } as never };
@@ -404,4 +415,65 @@ test("H12 a legacy bare-string entry still counts as a workload on record", asyn
   } finally {
     restore();
   }
+});
+
+test("H13 releasing does not delete a handle registered while it decided", async () => {
+  // The lost update the Backend's removal was made conditional to prevent,
+  // reintroduced in the release. It needs a precise interleave, which is why
+  // the first version of this test passed with the protection removed:
+  // `destroy` removes ONE key and only deletes the whole row when its own
+  // snapshot leaves it empty. So the registration has to land after that
+  // snapshot is read and before the delete goes out -- landing earlier just
+  // means the remover sees it and leaves it alone.
+  await replaceDagHandle("dag-13", "a", { workload_id: "W-a" });
+
+  const key = "dag-handles.dag-13";
+  const realGet = store.kv.get.bind(store.kv);
+  let reads = 0;
+  store.kv.get = (async (k: string) => {
+    const entry = await realGet(k);
+    // The SECOND read of this row is the remover's own, after the scan.
+    if (k === key && ++reads === 2) {
+      await replaceDagHandle("dag-13", "b", { workload_id: "W-b" });
+    }
+    return entry;
+  }) as typeof store.kv.get;
+  try {
+    await releaseHandlesForWorkload("W-a");
+  } finally {
+    store.kv.get = realGet;
+  }
+
+  assert.equal(
+    (await lookupDagHandle("dag-13", "b"))?.workload_id, "W-b",
+    "the handle registered while the remover decided keeps its only reference",
+  );
+  assert.equal(await lookupDagHandle("dag-13", "a"), null, "and the released one is gone");
+});
+
+test("H14 releasing does not take a handle that has moved to another workload", async () => {
+  // The scan says this handle names W-old; by the time the write goes out it
+  // may name something else, which belongs to whoever moved it.
+  await replaceDagHandle("dag-14", "main", { workload_id: "W-old" });
+
+  const key = "dag-handles.dag-14";
+  const realGet = store.kv.get.bind(store.kv);
+  let reads = 0;
+  store.kv.get = (async (k: string) => {
+    if (k === key && ++reads === 2) {
+      await releaseHandlesForWorkload("W-old");
+      await replaceDagHandle("dag-14", "main", { workload_id: "W-newer" });
+    }
+    return realGet(k);
+  }) as typeof store.kv.get;
+  try {
+    await releaseHandlesForWorkload("W-old");
+  } finally {
+    store.kv.get = realGet;
+  }
+
+  assert.equal(
+    (await lookupDagHandle("dag-14", "main"))?.workload_id, "W-newer",
+    "a handle that has moved on is not removed on a stale read of the old workload",
+  );
 });
