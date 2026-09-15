@@ -28,8 +28,9 @@ test("the backfill backlog is re-drivable, not discarded", async () => {
     .then((fs) => fs.readFile(new URL("../src/tasks/platform-backfill.ts", import.meta.url), "utf8"));
   assert.ok(src.includes("export async function drainPendingPlatformFacts"), "a drain must exist");
   const q = src.slice(src.indexOf("drainPendingPlatformFacts"));
-  assert.ok(q.includes("sandbox_workload_id IS NOT NULL"), "that have something to ask about");
-  assert.ok(q.includes("status = 'failed'"), "liveness failures only");
+  assert.ok(!q.includes("sandbox_workload_id IS NOT NULL"), "KV-only handles must reach the reader");
+  assert.ok(q.includes("'sandbox_workload_terminal'"), "startup failures closed by callbacks are revisited");
+  assert.ok(q.includes("status = 'failed'"), "failed runs only");
   assert.ok(q.includes("platform_facts_resolved_at IS NULL"), "not already resolved");
   assert.ok(q.includes("platform_facts_next_retry_at"), "transient failures are retried with a gate");
 

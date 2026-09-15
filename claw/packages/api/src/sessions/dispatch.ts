@@ -15,6 +15,7 @@ import { db, MarketplaceDb } from "../infra/db.js";
 import { canViewPlugin, formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
 import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
+import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -172,6 +173,12 @@ export async function dispatchTaskToBrain(
       (await ensureSessionWorkspace(sessionId, userId))?.workspace_id,
       { sessionId },
     );
+    if (user?.platformKey) {
+      await stampSessionCredentials(sessionId, user).catch(() => {
+        // Database errors can include the credential-bearing config row.
+        throw new Error("session.credentials_stamp_failed");
+      });
+    }
 
     const userEvent = {
       type: "UserMessage",

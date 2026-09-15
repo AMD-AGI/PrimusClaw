@@ -1,43 +1,20 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/**
- * Asking the platform why a run died, for the runs nobody was left to ask.
- *
- * Brain reads this itself when a sandbox dies under a live run. The case it
- * cannot cover is the common one: a node reclaim takes the sandbox and the Brain
- * worker together, so no callback is ever sent and the row is closed minutes
- * later by the sweeper -- with `brain_timeout`, which says only that nobody
- * reported back. That is exactly the run whose ending matters most to name, and
- * it is the one arriving with nothing on it.
- *
- * So the sweeper asks on the run's behalf. Late, but not too late: SaFE serves a
- * pod's account of its own ending from the pod, and the sweep runs within a
- * minute of the timeout, while a garbage collector works in tens of minutes.
- * When the pod is already gone the read returns nothing and the row keeps its
- * honest "we do not know" rather than gaining a guess.
- *
- * Best-effort throughout. Nothing here may fail a sweep: the sweep's job is to
- * stop rows being stuck, and a SaFE that is down must not prevent that.
- */
+/** Best-effort platform attribution for terminal runs, including chat callbacks. */
 import pino from "pino";
-import { platformFactsFromWorkloadDetail } from "@claw/protocol";
+import { platformFactsFromWorkloadDetail, type PlatformFacts } from "@claw/protocol";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
+import { kv, sc } from "../infra/nats.js";
 import { SAFE_API_URL } from "../config.js";
+import { parseSandboxHandle, type SandboxHandle } from "./sandbox-handle.js";
 
 const logger = pino({ name: "platform-backfill" });
 
 /** One GET each, capped: this runs inside the sweeper tick. */
 const FETCH_TIMEOUT_MS = 10_000;
-/**
- * How many rows one sweep will ask about.
- *
- * A reclaim takes a whole node, so these arrive in batches -- one per run that
- * was on it. The cap keeps a bad node from turning one tick into hundreds of
- * serial SaFE calls; what it drops is the tail of a batch whose head already
- * named the same node, so the answer is rarely lost, only its per-row copy.
- */
+/** Bound bursts from a node loss; the drain revisits deferred rows. */
 const MAX_PER_SWEEP = 50;
 /** Concurrent reads. Small: SaFE is shared, and nothing here is urgent. */
 const CONCURRENCY = 5;
@@ -51,10 +28,25 @@ export interface SweptRow {
   task_id: string;
   session_id: string | null;
   sandbox_workload_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+  origin?: string | null;
+  created_at?: Date | string | null;
+  completed_at?: Date | string | null;
+}
+
+/** Shared connection and diagnostic seam; never opens another NATS client. */
+export const platformBackfillPorts = {
+  readHandsEntry: (sessionId: string) => kv.get(`hands.${sessionId}`),
+  cannotRead: (fields: Record<string, unknown>) => {
+    logger.warn(fields, "platform_backfill.cannot_read");
+  },
+};
+
+function cannotRead(row: SweptRow, reason: string, fields: Partial<SandboxHandle> & { status?: number } = {}): void {
+  platformBackfillPorts.cannotRead({ taskId: row.task_id, sessionId: row.session_id, reason, ...fields });
 }
 
 async function claimRow(row: SweptRow): Promise<SweptRow | null> {
-  if (!SAFE_API_URL) return null;
   const r = await db.query(
     `UPDATE claw_tasks
         SET platform_facts_attempts = platform_facts_attempts + 1,
@@ -66,7 +58,7 @@ async function claimRow(row: SweptRow): Promise<SweptRow | null> {
         AND status IN ('completed', 'failed', 'cancelled')
         AND platform_facts_resolved_at IS NULL
         AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
-      RETURNING task_id, session_id, sandbox_workload_id`,
+      RETURNING task_id, session_id, sandbox_workload_id, metadata, origin, created_at, completed_at`,
     [row.task_id, RETRY_BASE_SEC, RETRY_MAX_SEC],
   );
   return (r.rows[0] as SweptRow | undefined) ?? null;
@@ -82,39 +74,184 @@ async function platformKeyForSession(sessionId: string | null): Promise<string> 
   return readTrustedSessionCredentials(r.rows[0].config).platformKey;
 }
 
-async function readAndStore(row: SweptRow): Promise<boolean> {
-  const workloadId = row.sandbox_workload_id;
-  if (!workloadId || !SAFE_API_URL) return false;
-  const apiKey = await platformKeyForSession(row.session_id).catch(() => "");
-  if (!apiKey) return false;
+interface HandsEntry {
+  sandbox: SandboxHandle;
+  platformKey: string;
+  createdAt: unknown;
+}
 
-  let detail: Record<string, unknown>;
+async function readHandsEntry(row: SweptRow): Promise<HandsEntry | null> {
+  if (!row.session_id) return null;
   try {
-    const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads/${workloadId}`, {
+    const entry = await platformBackfillPorts.readHandsEntry(row.session_id);
+    if (!entry || entry.operation === "DEL" || entry.operation === "PURGE") return null;
+    const value: unknown = JSON.parse(sc.decode(entry.value));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      cannotRead(row, "invalid_kv_entry");
+      return null;
+    }
+    const data = value as Record<string, unknown>;
+    // Pending entries predate provider tagging. Only the legacy workload field
+    // identifies them as SaFE; an unknown explicit provider is never guessed.
+    const provider = data.provider === undefined ? "safe-workload" : data.provider;
+    const sandbox = parseSandboxHandle({
+      provider,
+      handle: provider === "agent-sandbox" ? data.sessionId : data.workloadId,
+    });
+    if (!sandbox) {
+      cannotRead(row, "invalid_kv_handle");
+      return null;
+    }
+    return {
+      sandbox,
+      platformKey: typeof data.platformKey === "string" ? data.platformKey : "",
+      createdAt: data.createdAt,
+    };
+  } catch {
+    // KV values contain credentials. Do not include their contents or a JSON
+    // parser's error excerpt in diagnostics.
+    cannotRead(row, "kv_read_failed");
+    return null;
+  }
+}
+
+function timestamp(value: unknown): number {
+  return value instanceof Date ? value.getTime()
+    : typeof value === "string" ? Date.parse(value) : NaN;
+}
+
+async function rememberFallback(row: SweptRow, sandbox: SandboxHandle): Promise<boolean> {
+  // Pin the observed identity so a later retry cannot follow the session into
+  // its next sandbox. A concurrent ownership report wins instead of being
+  // overwritten with the KV snapshot.
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = COALESCE(metadata, '{}'::jsonb)
+                       || jsonb_build_object('sandbox', $2::jsonb),
+            sandbox_workload_id = $3
+      WHERE task_id = $1
+        AND (metadata->'sandbox' IS NULL OR metadata->'sandbox' = 'null'::jsonb)
+        AND NULLIF(sandbox_workload_id, '') IS NULL
+        AND platform_facts_resolved_at IS NULL
+      RETURNING task_id`,
+    [row.task_id, JSON.stringify(sandbox), sandbox.provider === "safe-workload" ? sandbox.handle : null],
+  );
+  if (!r.rowCount) cannotRead(row, "sandbox_ownership_changed");
+  return Boolean(r.rowCount);
+}
+
+interface ResolvedSandbox {
+  sandbox: SandboxHandle;
+  hands: HandsEntry | null;
+}
+
+async function resolveSandbox(row: SweptRow): Promise<ResolvedSandbox | null> {
+  const recorded = row.metadata?.sandbox;
+  let sandbox = recorded == null
+    ? parseSandboxHandle({ provider: "safe-workload", handle: row.sandbox_workload_id })
+    : parseSandboxHandle(recorded);
+  if (recorded != null && !sandbox) {
+    cannotRead(row, "invalid_recorded_handle");
+    return null;
+  }
+  let hands: HandsEntry | null = null;
+  if (!sandbox) {
+    // DAG nodes may share a session concurrently, so its latest sandbox cannot
+    // establish a particular node's ownership.
+    if (row.origin !== "chat") {
+      cannotRead(row, "kv_handle_run_unattributed");
+      return null;
+    }
+    hands = await readHandsEntry(row);
+    if (!hands) {
+      cannotRead(row, "missing_sandbox_handle");
+      return null;
+    }
+    // A session outlives its runs. Refuse both an older sandbox this turn may
+    // never have used and a replacement created after it ended. Reuse needs
+    // the run's own lease report to establish ownership.
+    const createdAt = timestamp(hands.createdAt);
+    const runCreatedAt = timestamp(row.created_at);
+    const completedAt = timestamp(row.completed_at);
+    if (!Number.isFinite(createdAt) || !Number.isFinite(runCreatedAt) || !Number.isFinite(completedAt)
+      || createdAt < runCreatedAt || createdAt > completedAt) {
+      cannotRead(row, "kv_handle_outside_run", hands.sandbox);
+      return null;
+    }
+    sandbox = hands.sandbox;
+    if (!await rememberFallback(row, sandbox)) return null;
+  }
+  return { sandbox, hands };
+}
+
+async function platformKeyForSandbox(row: SweptRow, { sandbox, hands }: ResolvedSandbox): Promise<string> {
+  let apiKey = await platformKeyForSession(row.session_id).catch(() => {
+    cannotRead(row, "session_credentials_read_failed", sandbox);
+    return "";
+  });
+  if (!apiKey) {
+    // Only Brain's KV entry for this exact identity may supply a missing key.
+    // A newer sandbox's credentials must never be paired with an older handle.
+    hands ??= await readHandsEntry(row);
+    if (hands?.sandbox.provider === sandbox.provider && hands.sandbox.handle === sandbox.handle) {
+      apiKey = hands.platformKey;
+    } else if (hands) {
+      cannotRead(row, "kv_handle_mismatch", sandbox);
+    }
+  }
+  if (!apiKey) {
+    cannotRead(row, "missing_platform_key", sandbox);
+  }
+  return apiKey;
+}
+
+type PlatformRead = { kind: "absent" } | { kind: "facts"; facts: PlatformFacts };
+
+async function readSafeWorkload(row: SweptRow, resolved: ResolvedSandbox): Promise<PlatformRead | null> {
+  const { sandbox } = resolved;
+  if (!SAFE_API_URL) {
+    cannotRead(row, "missing_safe_api_url", sandbox);
+    return null;
+  }
+  const apiKey = await platformKeyForSandbox(row, resolved);
+  if (!apiKey) return null;
+  try {
+    const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads/${encodeURIComponent(sandbox.handle)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (resp.status === 404 || resp.status === 410) {
-      const resolved = await db.query(
-        `UPDATE claw_tasks
-            SET platform_facts_resolved_at = NOW(),
-                platform_facts_next_retry_at = NULL
-          WHERE task_id = $1
-            AND platform_facts_resolved_at IS NULL`,
-        [row.task_id],
-      );
-      return Boolean(resolved.rowCount);
+      return { kind: "absent" };
     }
-    if (!resp.ok) return false;
-    detail = (await resp.json()) as Record<string, unknown>;
-  } catch (err) {
-    logger.warn({ err, workloadId }, "platform_backfill.read_failed");
-    return false;
+    if (!resp.ok) {
+      cannotRead(row, "platform_http_error", { ...sandbox, status: resp.status });
+      return null;
+    }
+    const facts = platformFactsFromWorkloadDetail(await resp.json());
+    if (!facts) {
+      cannotRead(row, "platform_facts_unavailable", sandbox);
+      return null;
+    }
+    return { kind: "facts", facts };
+  } catch {
+    cannotRead(row, "platform_read_failed", sandbox);
+    return null;
   }
+}
 
-  const facts = platformFactsFromWorkloadDetail(detail);
-  if (!facts) return false;
-
+async function storePlatformRead(row: SweptRow, sandbox: SandboxHandle, read: PlatformRead): Promise<boolean> {
+  if (read.kind === "absent") {
+    const resolved = await db.query(
+      `UPDATE claw_tasks
+          SET platform_facts_resolved_at = NOW(),
+              platform_facts_next_retry_at = NULL
+        WHERE task_id = $1
+          AND platform_facts_resolved_at IS NULL`,
+      [row.task_id],
+    );
+    return Boolean(resolved.rowCount);
+  }
+  const { facts } = read;
   // COALESCE preserves a late Brain callback that reached the row between the
   // sweeper's terminal update and this read. The explicit resolved stamp is
   // separate from content: an empty pod message is still a successful read.
@@ -133,33 +270,39 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
   );
   if (r.rowCount) {
     logger.info(
-      { taskId: row.task_id, workloadId, node: facts.node, reason: facts.containerReason },
+      { taskId: row.task_id, ...sandbox, node: facts.node, reason: facts.containerReason },
       "platform_backfill.recorded",
     );
   }
   return Boolean(r.rowCount);
 }
 
+async function readAndStore(row: SweptRow): Promise<boolean> {
+  const resolved = await resolveSandbox(row);
+  if (!resolved) return false;
+  if (resolved.sandbox.provider === "agent-sandbox") {
+    // The router's session/recovery/audit endpoints have no pod termination
+    // facts. Keep this unresolved rather than recording a successful empty read.
+    cannotRead(row, "termination_facts_unavailable", resolved.sandbox);
+    return false;
+  }
+  const read = await readSafeWorkload(row, resolved);
+  return read ? storePlatformRead(row, resolved.sandbox, read) : false;
+}
+
 /**
- * Record what the platform says about each swept row that had a sandbox.
+ * Record what the platform says about each offered terminal run.
  *
  * Returns how many rows reached a conclusive answer. Never throws: a caller is a sweeper arm
  * that has already closed these rows, and the close must stand whatever SaFE
  * does.
  */
 export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
-  const withWorkload = rows.filter((r) => r.sandbox_workload_id);
-  const candidates = withWorkload.slice(0, MAX_PER_SWEEP);
+  const candidates = rows.slice(0, MAX_PER_SWEEP);
   if (candidates.length === 0) return 0;
-  if (withWorkload.length > MAX_PER_SWEEP) {
-    // The overflow is not lost, only deferred: the rows are already terminal
-    // and the sweeper's UPDATE cannot select them again, so before this they
-    // were dropped in memory and no path ever revisited them -- a reap of 200
-    // left 150 runs permanently without a platform account. drainPending picks
-    // them up on later ticks by looking for exactly the state they are left
-    // in: a workload id recorded and no facts against it.
+  if (rows.length > MAX_PER_SWEEP) {
     logger.warn(
-      { swept: rows.length, asked: MAX_PER_SWEEP, deferred: withWorkload.length - MAX_PER_SWEEP },
+      { swept: rows.length, asked: MAX_PER_SWEEP, deferred: rows.length - MAX_PER_SWEEP },
       "platform_backfill.capped",
     );
   }
@@ -169,13 +312,13 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
     for (;;) {
       const candidate = queue.shift();
       if (!candidate) return;
-      const row = await claimRow(candidate).catch((err) => {
-        logger.warn({ err, taskId: candidate.task_id }, "platform_backfill.claim_failed");
+      const row = await claimRow(candidate).catch(() => {
+        cannotRead(candidate, "claim_failed");
         return null;
       });
       if (!row) continue;
-      const ok = await readAndStore(row).catch((err) => {
-        logger.warn({ err, taskId: candidate.task_id }, "platform_backfill.failed");
+      const ok = await readAndStore(row).catch(() => {
+        cannotRead(candidate, "backfill_failed");
         return false;
       });
       if (ok) resolved++;
@@ -186,15 +329,9 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
 }
 
 /**
- * Work down the backlog the per-sweep cap leaves behind.
- *
- * Selected by outcome rather than by remembering a list. Only failures written
- * by a liveness reaper need this fallback; normal terminal callbacks either
- * carried their own facts or ended for a reason where platform attribution does
- * not change the answer.
- *
- * Bounded per tick for the same reason the sweep is: this runs inside the
- * sweeper's tick and talks to SaFE one workload at a time.
+ * Retry liveness losses and sandbox failures, including consumer-closed chat
+ * rows. Cleanup may already have removed their KV handle or platform detail;
+ * this bounded fallback cannot reconstruct evidence that no longer exists.
  */
 export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
@@ -208,9 +345,12 @@ export async function drainPendingPlatformFacts(): Promise<number> {
               ) AS lane_position
          FROM claw_tasks
         WHERE status = 'failed'
-          AND failure_reason IN ('brain_timeout', 'worker_lost')
-          AND sandbox_workload_id IS NOT NULL
-          AND sandbox_workload_id <> ''
+          AND failure_reason IN (
+            'brain_timeout', 'worker_lost',
+            'sandbox_workload_terminal', 'sandbox_pending_timeout', 'sandbox_timed_out',
+            'sandbox_exited_before_ready', 'sandbox_gone', 'sandbox_status_unreadable',
+            'sandbox_health_failed', 'sandbox_bootstrap_failed'
+          )
           AND platform_facts_resolved_at IS NULL
           AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
           AND completed_at > NOW() - INTERVAL '1 hour'
