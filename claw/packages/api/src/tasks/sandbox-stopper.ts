@@ -22,13 +22,16 @@
  */
 import {
   DagHandleMap, HANDLE_MAP_PREFIX, setHandleEntry, type HandleInfo,
+  HANDS_KEY_PREFIX,
+  RETAINED_PREFIX,
+  isRetentionEntry,
 } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
-import { DAG_HANDLES_BUCKET, jsm, kvDagHandles, nc } from "../infra/nats.js";
+import { DAG_HANDLES_BUCKET, jsm, kv, kvDagHandles, nc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
 const logger = pino({ name: "sandbox-stopper" });
@@ -323,6 +326,32 @@ export const handleRegistry = {
   },
   listAll(): Promise<Array<[string, Record<string, HandleInfo>]>> {
     return handleMap().listAll();
+  },
+  /**
+   * Is this workload protected by a retention record?
+   *
+   * Brain writes these into the registry bucket beside the session entries,
+   * keyed `hands.retained-<generation>`, when a container has background work
+   * its DAG has finished with. From that moment the record IS the container's
+   * reference and the DAG handle is released -- so a handle still naming a
+   * retained container is a bookkeeping failure, not a licence to stop it.
+   *
+   * On the seam with the rest of the registry reads, for the reason given
+   * above: it closes over a module-scoped live binding that cannot be
+   * substituted, and every outcome below has to be reachable without NATS.
+   */
+  async retained(workloadId: string): Promise<boolean> {
+    if (!workloadId) return false;
+    const dec = new TextDecoder();
+    for await (const key of await kv.keys(`${HANDS_KEY_PREFIX}${RETAINED_PREFIX}*`)) {
+      const entry = await kv.get(key);
+      if (!entry || !entry.value?.length) continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(dec.decode(entry.value)); } catch { continue; }
+      if (!isRetentionEntry(parsed)) continue;
+      if ((parsed as { workloadId?: string }).workloadId === workloadId) return true;
+    }
+    return false;
   },
   /**
    * Every DAG the registry has a key for, readable or not.
@@ -835,6 +864,37 @@ export async function stopSandboxByHandle(
     );
     return "unconfirmed";
   }
+  // Retention is a claim too, and an older one than this handle.
+  //
+  // Handing a container to the retention store is how Brain keeps a sandbox
+  // alive for background work its DAG has moved on from, and that hand-over
+  // frees the handle itself. A handle still naming a retained container means
+  // only that the free did not land -- and whether a stop happens must not
+  // depend on that. With the free landed, this cancel would never have seen the
+  // workload at all; a failed bookkeeping write cannot be what shortens a
+  // protected container's life.
+  let retained: boolean;
+  try {
+    retained = await withDeadline(
+      handleRegistry.retained(wid),
+      SHARED_CHECK_TIMEOUT_MS,
+      `retention check for ${wid}`,
+    );
+  } catch (e) {
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: wid, err: errText(e) },
+      "sandbox.retention_check_failed",
+    );
+    return "unconfirmed";
+  }
+  if (retained) {
+    logger.info(
+      { dagRootTaskId, handleName, workloadId: wid },
+      "sandbox.stop_skipped_retained",
+    );
+    return "unconfirmed";
+  }
+
   if (heldElsewhere) {
     // Not a failure and not a release: this DAG has let go, and the workload
     // is still legitimately held. `unconfirmed` because nothing here
@@ -1008,6 +1068,8 @@ async function otherDagHolding(
  * answered only when the record also has nothing outstanding, and a registry
  * that cannot be read answers neither.
  */
+
+
 export async function stopAllHandlesForDag(
   dagRootTaskId: string,
   sessionId: string,

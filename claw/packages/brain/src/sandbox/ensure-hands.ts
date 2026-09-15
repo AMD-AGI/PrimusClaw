@@ -1880,45 +1880,44 @@ export async function rollbackUnregisterableWorkload(args: {
     // deletes that live binding as the older of the pair.
     const key = handsSessionKey(sessionId);
     const names = [key, `hands.${sessionId}`].filter((n, i, a) => a.indexOf(n) === i);
-    let found: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
+    // EVERY name, all the way through -- no early exit. Breaking on the first
+    // usable row decided the answer before knowing whose it was, so a canonical
+    // row belonging to this very workload (or holding unparseable bytes) hid a
+    // live row under the legacy name, and the migration then deleted that live
+    // binding as the older of the pair.
+    //
+    // Unparseable is treated as "somebody else's" for the same reason: it is
+    // not evidence that the slot is free, and the alternative is overwriting a
+    // row whose owner simply could not be read.
+    let mine: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
+    let replaceable: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
     for (const name of names) {
       const e = await kv.get(name);
       if (!e) continue;
-      const usable = e.operation !== "DEL" && e.operation !== "PURGE"
+      const live = e.operation !== "DEL" && e.operation !== "PURGE"
         && (e.value?.length ?? 0) > 0;
-      // A row that names somebody else decides the answer wherever it is found,
-      // so it wins over a tombstone the other name happens to hold.
-      if (usable) { found = { key: name, entry: e }; break; }
-      found ??= { key: name, entry: e };
-    }
-    const cur = found?.entry ?? null;
-    if (cur) {
-      // A key that exists is replaced by revision, whatever state it is in.
-      // Splitting on "has a usable value" and routing the rest to `create` was
-      // a regression: the heartbeat re-`update`s tombstones it read, and NATS
-      // does not carry the DEL operation across an update, so the bucket holds
-      // a PUT with a zero-byte value. `create` allows an absent key or a
-      // tombstone -- not that -- so it conflicted on every attempt, where the
-      // unconditional `put` this replaced simply succeeded.
-      const live = cur.operation !== "DEL" && cur.operation !== "PURGE"
-        && (cur.value?.length ?? 0) > 0;
-      let claimedByOther = false;
-      if (live) {
-        try {
-          claimedByOther = JSON.parse(sc.decode(cur.value!)).workloadId !== workloadId;
-        } catch { /* unparseable: nothing is relying on it, so it may be replaced */ }
-      }
-      if (claimedByOther) {
+      if (!live) { replaceable ??= { key: name, entry: e }; continue; }
+      let owner: string | null = null;
+      let readable = true;
+      try {
+        owner = (JSON.parse(sc.decode(e.value!)) as { workloadId?: string }).workloadId ?? null;
+      } catch { readable = false; }
+      if (!readable || (owner && owner !== workloadId)) {
         logger.warn(
-          { sessionId, workloadId },
+          { sessionId, workloadId, key: name, owner, readable },
           "dag-handles.pending_register_rollback_session_reused",
         );
         return false;
       }
-      // The key it was actually read under, never a re-derived one: updating
-      // the canonical name on the strength of a legacy read is the lost update
-      // this whole check exists to avoid.
-      await kv.update(found?.key ?? key, pendingPayload, cur.revision);
+      mine ??= { key: name, entry: e };
+    }
+
+    // Our own row first, then a tombstone to revive, then create the canonical
+    // name. Always the key it was read under: updating the canonical name on
+    // the strength of a legacy read is the lost update this check exists for.
+    const target = mine ?? replaceable;
+    if (target) {
+      await kv.update(target.key, pendingPayload, target.entry.revision);
       return true;
     }
     await kv.create(key, pendingPayload);

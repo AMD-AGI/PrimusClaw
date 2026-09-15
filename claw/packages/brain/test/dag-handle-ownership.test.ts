@@ -50,6 +50,7 @@
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
+import { handsSessionKey } from "@claw/protocol";
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -809,7 +810,7 @@ test("H23 the merge's own four seams", async () => {
   // legacy one is invisible otherwise, and the migration then deletes it as the
   // older of the pair. H25 pins the shape that check ended up with; here it is
   // enough that it writes back the key it was read under.
-  assert.match(body, /found\?\.key/,
+  assert.match(body, /await kv\.update\(target\.key, pendingPayload, target\.entry\.revision\)/,
     "and update the key it was read under, never a re-derived one");
 
   // B2: retention is a handover. The container stays alive for its live work
@@ -901,6 +902,15 @@ test("H25 what round 43 found the halves of", async () => {
   const body = rec.slice(0, rec.indexOf("\n  };"));
   assert.match(body, /const names = \[key, `hands\.\$\{sessionId\}`\]/,
     "the occupancy check reads both names");
+  // Round 44: reading both is not checking both. Breaking on the first usable
+  // row decided the answer before knowing whose it was, so this workload's own
+  // canonical row -- or unparseable bytes there -- hid a live row under the
+  // legacy name. Every name is examined, and anything unreadable or anybody
+  // else's refuses.
+  assert.equal(/if \(usable\) \{ found = \{ key: name, entry: e \}; break; \}/.test(body), false,
+    "the loop must not stop before it knows whose the row is");
+  assert.match(body, /if \(!readable \|\| \(owner && owner !== workloadId\)\)/,
+    "unreadable is not evidence the slot is free");
   assert.equal(/readHandsEntry\(/.test(body), false,
     "and not through the canonical-first reader, which stops at the first hit");
 
@@ -925,4 +935,78 @@ test("H25 what round 43 found the halves of", async () => {
     "answered from the ledger, which a failed handle release cannot invalidate");
   assert.match(taker.slice(0, taker.indexOf("\n}")), /return false;\n\s+\}\n\s+\};/,
     "and an unreadable ledger is not a licence to take the name");
+});
+
+test("H26 the rollback's occupancy check reads every name before deciding", async () => {
+  // Round 44, and M52: reading both names is not checking both. Breaking on the
+  // first usable row decided the answer before knowing whose it was, so a
+  // canonical row belonging to THIS workload hid a live row under the legacy
+  // name -- and the migration then deleted that live binding as the older of
+  // the pair.
+  //
+  // The two names only diverge for a session id that needs re-keying, which is
+  // one starting with the retention prefix (see `handsKeyNeedsRekey`). An
+  // ordinary id encodes to the legacy spelling exactly, which is why an earlier
+  // version of this test -- with an invented canonical key -- passed with the
+  // fix removed: neither name matched anything, so nothing was read at all.
+  const SESSION = "retained-x";
+  const canonical = handsSessionKey(SESSION);
+  const legacy = `hands.${SESSION}`;
+  assert.notEqual(canonical, legacy, "this fixture is pointless unless they differ");
+
+  const reads: string[] = [];
+  const row = (workloadId: string) => ({
+    value: sc.encode(JSON.stringify({ status: "ready", workloadId })),
+    revision: 3,
+    operation: "PUT",
+  });
+  const rows: Record<string, ReturnType<typeof row>> = {
+    [canonical]: row("W-self"),   // this workload's own row
+    [legacy]: row("W-live"),      // somebody else's, live
+  };
+  const writes: string[] = [];
+  const outcome = await rollbackUnregisterableWorkload({
+    sessionId: SESSION, workloadId: "W-self", namespace: "ns", platformKey: "pk",
+    pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W-self" })),
+    kv: {
+      async get(key: string) { reads.push(key); return rows[key] ?? null; },
+      async create(key: string) { writes.push(key); return 1; },
+      async update(key: string) { writes.push(key); return 4; },
+    },
+    deps: {
+      stop: async () => { throw new Error("503 from SaFE"); },
+      retryDelaysMs: [],
+      detach: () => {},
+    },
+  });
+
+  assert.deepEqual(reads.slice(0, 2).sort(), [canonical, legacy].sort(),
+    "both names have to be read before the answer is decided");
+  assert.deepEqual(writes, [],
+    "a live row under the other name refuses the write, whichever name holds it");
+  assert.equal(outcome, "orphaned", "nothing was recorded and the stop did not land");
+});
+
+test("H27 releasing a retention also frees any handle still naming it", async () => {
+  // Round 44 (B2 ①). The hand-over into retention frees the handle itself, but
+  // a release that did not land leaves it behind -- and the retention record
+  // was the ONLY evidence that let a later registration take the name back
+  // (`mayTakeFrom`). Deleting that record when the work finishes would strip
+  // the evidence at the very moment it stops being reproducible: the session
+  // binding is already gone, so nothing re-enters the hand-over path, and every
+  // replacement is refused for the life of the DAG -- reproduced as
+  // `retention records = [], handle = W-old, stopped = [W-new-1, W-new-2]`.
+  //
+  // Structural: the behaviour lives inside a keepalive sweep that needs a bound
+  // roster, a census and a live exec channel. What is checkable here is that the
+  // cleanup is adjacent to the release and cannot be reordered away from it.
+  const ka = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/keepalive.ts", import.meta.url)), "utf-8");
+  const at = ka.indexOf("await releaseRetention(");
+  assert.notEqual(at, -1, "expected the retention release");
+  const after = ka.slice(at, ka.indexOf("released += 1;", at));
+  assert.match(after, /releaseHandlesForWorkload\(target\.inst\.id\)/,
+    "the handle has to be freed in the same step that removes its evidence");
+  assert.match(ka, /import \{ listAllDagHandles, releaseHandlesForWorkload \}/,
+    "and imported, not shadowed by a local of the same name");
 });

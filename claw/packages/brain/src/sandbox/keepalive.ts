@@ -19,7 +19,7 @@ import {
   sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { listAllDagHandles } from "./handles.js";
+import { listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -449,6 +449,26 @@ async function runRetentionReadPhase(
       // The only irreversible act on this path, and it still happens only after
       // a read that answered `clear`, on this sweep, about this container.
       await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
+      // And any DAG handle still naming it.
+      //
+      // The hand-over into retention frees that handle itself, but a release
+      // that did not land leaves it behind -- and until now the retention
+      // record was the only evidence that let a later registration take the
+      // name back. Deleting the record here without this would strip that
+      // evidence at the very moment it stops being reproducible: the session
+      // binding is already gone, so nothing re-enters the hand-over path, and
+      // every replacement is refused for the life of the DAG.
+      //
+      // Keyed by workload, and by this point nothing is meant to be holding it
+      // -- the container has just been read `clear` and is leaving protection.
+      if (target.inst.id) {
+        await releaseHandlesForWorkload(target.inst.id).catch((err) => {
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
+            "keepalive.retention_handle_release_failed",
+          );
+        });
+      }
       released += 1;
     } catch (err) {
       complete = false;

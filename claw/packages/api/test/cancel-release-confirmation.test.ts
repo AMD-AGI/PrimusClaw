@@ -85,6 +85,11 @@ function restoreAll(): void {
 after(restoreAll);
 afterEach(restoreAll);
 beforeEach(() => {
+  // Nothing is retained unless a test says so. The real `retained` reads the
+  // registry bucket, which no test here binds -- and its failure direction is
+  // `unconfirmed`, so leaving it unstubbed turns every outcome in this file
+  // into one. Tests that care about the retained path set it themselves.
+  handleRegistry.retained = async () => false;
   recorded = new Map();
   // Keyed the way production keys it: by workload identity, not handle name,
   // so a stub cannot hide the identity confusion the real key exists to stop.
@@ -778,4 +783,54 @@ test("R25 an unreachable registry keeps the DAG unconfirmed", async () => {
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
   assert.deepEqual(stopped, []);
+});
+
+test("R26 a cancel does not stop a container retention is protecting", async () => {
+  // Round 44. Handing a container to the retention store is how Brain keeps a
+  // sandbox alive for background work its DAG has moved on from, and that
+  // hand-over releases the handle itself. A handle still naming a retained
+  // container means only that the release did not land -- and whether a stop
+  // happens must not depend on that. With the release landed this cancel would
+  // never have seen the workload at all, so a failed bookkeeping write cannot
+  // be what shortens a protected container's life.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+  handleRegistry.retained = async (wid: string) => wid === "w-1";
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(stopped, [], "a retained container is not this cancel's to stop");
+  assert.equal(r.released, "unconfirmed",
+    "and nothing here established it is gone -- it demonstrably is not");
+});
+
+test("R27 a retention store that cannot be read does not license a stop", async () => {
+  // Same direction as every other unknown on this path: a read that fails is
+  // not an answer, and the one it must not be read as is "free to stop".
+  stubDb();
+  stubHandles({ main: "w-1" });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+  handleRegistry.retained = async () => { throw new Error("registry unreadable"); };
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(stopped, []);
+  assert.equal(r.released, "unconfirmed");
+});
+
+test("R28 the same cancel, with nothing retained, does stop", async () => {
+  // The control for R26 and R27, and the reason they mean anything: without it
+  // both pass whenever something UPSTREAM of the retention gate refuses. The
+  // first version of R26 did exactly that -- it passed with the gate deleted,
+  // because the shared-holder check threw first.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+  handleRegistry.retained = async () => false;
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(stopped, ["w-1"], "nothing is holding it, so this cancel stops it");
+  assert.equal(r.released, "confirmed");
 });
