@@ -171,7 +171,9 @@ export function bindSandboxStopRetry(over: Partial<typeof stopRetry>): () => voi
 async function stopNamedSandbox(
   sessionId: string,
   entry: HandsProbeEntry,
-): Promise<"stopped" | "unavailable"> {
+  /** Re-asked before every attempt -- see the note in the retry loop. */
+  stillOwned?: () => boolean,
+): Promise<"stopped" | "unavailable" | "not_owned"> {
   const inst = instanceFromEntry(sessionId, entry);
   // No instance to address: nothing was stopped, and nothing may be released
   // on the strength of it.
@@ -180,6 +182,18 @@ async function stopNamedSandbox(
     ? getAgentSandboxProvider()
     : getSafeWorkloadProvider();
   for (let attempt = 1; ; attempt++) {
+    // Before EVERY attempt, not once before the loop. A stop that comes back
+    // 503 is retried after a wait, and that wait is long enough to stop being
+    // the owner: the first attempt can be refused while the workload is still
+    // this attempt's, and the retry land after a successor has taken the lock
+    // and promoted it. Checking on the way in only covers the first try.
+    if (stillOwned && !stillOwned()) {
+      logger.warn(
+        { sessionId, workloadId: inst.id, attempt },
+        "hands.stop_abandoned_not_owned",
+      );
+      return "not_owned";
+    }
     try {
       await provider.stop(inst);
       return "stopped";
@@ -273,16 +287,20 @@ export async function destroyHands(
     return;
   }
 
-  if (stillOwned && !stillOwned()) {
-    logger.warn(
-      { sessionId, workloadId: (target as { workloadId?: string })?.workloadId ?? null },
-      "hands.destroy_skipped_not_owned",
-    );
-    return;
-  }
-
   try {
-    const stopOutcome = await stopNamedSandbox(sessionId, target);
+    // Asked inside, before every attempt, rather than once here: the retry
+    // after a refused stop is its own window.
+    const stopOutcome = await stopNamedSandbox(sessionId, target, stillOwned);
+    if (stopOutcome === "not_owned") {
+      // Nothing was stopped, so nothing downstream may act as though it was --
+      // the handle stays, the KV entry stays, local state stays. They belong to
+      // whoever holds the lock now.
+      logger.warn(
+        { sessionId, workloadId: (target as { workloadId?: string })?.workloadId ?? null },
+        "hands.destroy_skipped_not_owned",
+      );
+      return;
+    }
     metrics.onSandboxStop("ok");
     // Whoever stops a workload frees its handle. Registration refuses to point
     // a handle away from a workload still on record -- which is what stops a

@@ -467,3 +467,80 @@ test("R10 a lease lost after an ordinary abort is still not forgotten", async ()
   assert.equal(safeCalls.includes("reapPendingHands"), false,
     "an abort for another reason must not hide the lock having moved");
 });
+
+test("R11 a run superseded after an ordinary abort is not forgotten either", async () => {
+  // Round 36. The same news arrives by two roads -- the lock renewal saying
+  // `lost`, and the run-row lease saying `superseded` -- and fixing only the
+  // first left the second swallowed by any earlier abort, exactly as before:
+  // `leaseAnswer=superseded, callbackValue=true, stoppedWhileReady=true`.
+  //
+  // `gone` is deliberately not the same: the row went terminal and nobody took
+  // over, so this worker is still the one holding the sandbox.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const lost = await run({
+    request: {
+      session_id: SESSION, task_id: "t-superseded-row", prompt: "go",
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));
+      throw new Error("503 from upstream");
+    },
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "superseded";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "another worker holds this run, so its workload is not ours to reap");
+});
+
+test("R12 a row that went terminal is still this worker's to clean up", async () => {
+  // The other half of R11, and the reason `refused` is not the condition.
+  // `gone` means the row went terminal with nobody taking over -- this worker
+  // is still the one holding the sandbox and the delivery, so it must still
+  // reap what it left behind. Treating it like `superseded` would leak the
+  // workload instead of mis-stopping one, which is a different bug, not a
+  // safer one.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const terminal = await run({
+    request: {
+      session_id: SESSION, task_id: "t-row-gone", prompt: "go",
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));
+      throw new Error("503 from upstream");
+    },
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "gone";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await terminal.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.ok(safeCalls.includes("reapPendingHands"),
+    "nobody took this run over, so its half-created workload is still ours");
+});

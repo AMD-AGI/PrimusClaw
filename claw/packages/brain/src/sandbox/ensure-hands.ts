@@ -37,7 +37,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { dagHoldsWorkload, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle } from "./handles.js";
+import { dagHoldsWorkload, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -237,6 +237,7 @@ export interface SandboxReuseEffects {
   unregisterSandbox: typeof unregisterSandbox;
   markHandsIdle: typeof markHandsIdle;
   dagHoldsWorkload: typeof dagHoldsWorkload;
+  workloadHeldByOtherDag: typeof workloadHeldByOtherDag;
 }
 
 export interface EnsureHandsOptions {
@@ -262,6 +263,7 @@ export interface EnsureHandsOptions {
 
 const realReuseEffects: SandboxReuseEffects = {
   dagHoldsWorkload,
+  workloadHeldByOtherDag,
   destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
   unregisterSandbox, markHandsIdle,
 };
@@ -484,7 +486,13 @@ async function entryOwnedByAnother(
   const workloadId = typeof info.workloadId === "string" ? info.workloadId : null;
   if (!workloadId) return true;
   try {
-    return !(await reuseEffects.dagHoldsWorkload(mineRoot, workloadId));
+    // Two questions, and both have to be answered before destroying. Holding a
+    // handle says this DAG is A holder, which is what makes a rebuild its
+    // right; it does not say it is the ONLY one. The creator can still be
+    // running on the same workload -- reuse is the point -- and permission read
+    // off the first question alone stopped a sandbox it was using.
+    if (!(await reuseEffects.dagHoldsWorkload(mineRoot, workloadId))) return true;
+    return await reuseEffects.workloadHeldByOtherDag(mineRoot, workloadId);
   } catch (e) {
     logger.warn(
       { sessionId: request.session_id, workloadId, dagRoot: mineRoot,

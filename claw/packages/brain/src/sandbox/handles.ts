@@ -163,6 +163,47 @@ const RELEASE_SCAN_TIMEOUT_MS = 10_000;
  * is as much a holder as the task that created it -- which is the case a check
  * against the entry's original writer gets wrong.
  */
+/**
+ * Does any DAG OTHER than this one hold a handle naming this workload?
+ *
+ * `dagHoldsWorkload` answers "am I a holder", which is the right question for
+ * "may I rebuild it" and the wrong one for "may I destroy it": being a holder
+ * does not make you the only one. A DAG that reused another's sandbox holds a
+ * handle on it while the creator is still running on it, and permission read
+ * off that handle alone stopped a workload somebody was using.
+ *
+ * Scans, like `releaseHandlesForWorkload`, because the registry is keyed by DAG
+ * and the question is keyed by workload -- the reverse index this PR defers.
+ * Bounded by the same deadline, and a scan that cannot complete answers YES:
+ * the cost of being wrong that way is a refused rebuild, and the cost of being
+ * wrong the other way is stopping a live workload.
+ */
+export async function workloadHeldByOtherDag(
+  mineDagRootTaskId: string,
+  workloadId: string,
+): Promise<boolean> {
+  if (!workloadId) return false;
+  let timer: NodeJS.Timeout;
+  const rows = await Promise.race([
+    getMap().listAll().finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`dag-handles holder scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
+        RELEASE_SCAN_TIMEOUT_MS,
+      );
+      timer.unref?.();
+    }),
+  ]);
+  for (const [dagRoot, handles] of rows) {
+    if (dagRoot === mineDagRootTaskId) continue;
+    for (const info of Object.values(handles)) {
+      const id = typeof info === "string" ? info : info?.workload_id;
+      if (id && id === workloadId) return true;
+    }
+  }
+  return false;
+}
+
 export async function dagHoldsWorkload(
   dagRootTaskId: string,
   workloadId: string,

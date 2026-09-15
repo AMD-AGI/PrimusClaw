@@ -156,3 +156,46 @@ test("a lease lost during destroyHands' own read still stops the teardown", asyn
   assert.ok(reads >= 2, "this only means anything if the second read happened");
   assert.deepEqual(stopped, [], "the successor's workload is not ours to stop");
 });
+
+test("a lease lost between a refused stop and its retry abandons the retry", async () => {
+  // Round 36. A stop that comes back 503 is retried after a wait, and that wait
+  // is long enough to stop being the owner: the first attempt is refused while
+  // the workload is still this attempt's, and the retry lands after a successor
+  // has taken the lock and promoted it -- `第一次 stop：stillOwned=true`,
+  // `第二次 stop：stillOwned=false, successorReady=true`, 503 then 202.
+  //
+  // So the question is asked before EVERY attempt, not once on the way in.
+  const { bindSandboxStopRetry } = await import("../src/sandbox/reaper.js");
+  const restoreRetry = bindSandboxStopRetry({ delayMs: 1 });
+  try {
+    let owned = true;
+    const attempts: boolean[] = [];
+    const kv = {
+      async get(key: string) {
+        return { key, value: sc.encode(JSON.stringify(pending("W2", "t-same"))), revision: 3 };
+      },
+      async delete() {},
+      async put() { return 1; },
+      async update() { return 4; },
+    } as unknown as KV;
+    bindHandsKv(kv);
+    const provider = {
+      kind: "safe-workload",
+      async stop() {
+        attempts.push(owned);
+        if (attempts.length === 1) {
+          owned = false;  // the successor takes the lock while we back off
+          throw new Error("safe-workload stop failed: HTTP 503");
+        }
+      },
+    } as unknown as SandboxProvider;
+    restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+
+    await reapPendingHands(SESSION, { taskId: "t-same", stillOwned: () => owned });
+
+    assert.deepEqual(attempts, [true],
+      "the retry must not run once the workload has stopped being ours");
+  } finally {
+    restoreRetry();
+  }
+});

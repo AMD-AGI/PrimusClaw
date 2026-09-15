@@ -109,6 +109,8 @@ function stubEffects(
   refusal?: string,
   /** Whether the caller's DAG holds a handle on the entry's workload. */
   holds?: boolean | (() => Promise<boolean>),
+  /** Whether some OTHER DAG also holds a handle on it. */
+  heldByOther?: boolean | (() => Promise<boolean>),
 ): {
   destroyed: string[];
   registered: Registration[];
@@ -126,6 +128,10 @@ function stubEffects(
     dagHoldsWorkload: (async () => {
       if (typeof holds === "function") return holds();
       return holds ?? false;
+    }) as never,
+    workloadHeldByOtherDag: (async () => {
+      if (typeof heldByOther === "function") return heldByOther();
+      return heldByOther ?? false;
     }) as never,
     restartHandsInSandbox: async () => {
       restartCalls.push(1);
@@ -812,4 +818,31 @@ test("a registry that cannot be read answers 'not mine'", async () => {
 
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(destroyed, []);
+});
+
+test("holding a handle is not the same as being the only holder", async () => {
+  // Round 36, and a regression I introduced answering round 35. Reuse is the
+  // point of the handle registry, so a DAG holding a handle on a workload says
+  // it is A holder -- which is what makes rebuilding it that DAG's right. It
+  // does not say it is the ONLY one: the creator can still be running on the
+  // same workload. Permission read off the first question alone stopped a
+  // sandbox somebody was using -- `stopped=[{id:"W1", inUse:true}]`.
+  const { destroyed } = stubEffects("dead", true, undefined, true, true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "the creator is still using it");
+});
+
+test("a scan that cannot answer who else holds it refuses the destroy", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, true,
+    async () => { throw new Error("scan timed out"); });
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "a refused rebuild beats stopping a live workload");
 });

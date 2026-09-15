@@ -3444,6 +3444,13 @@ class TaskRunner {
         // nobody else can release; a row another worker took over leaves it
         // holding neither, whatever it still has handles for.
         const refused = status === "gone" || status === "superseded";
+        // Recorded before the early return, exactly as the lock renewal does.
+        // `superseded` means another worker holds this run, which is the same
+        // news as a lost lock and arrives by a different road -- fixing only
+        // the other road left this one swallowed by any earlier abort. `gone`
+        // is not: the row went terminal and nobody took over, so this worker is
+        // still the one holding the sandbox.
+        if (status === "superseded") this.leaseLost = true;
         if (!refused || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId,
