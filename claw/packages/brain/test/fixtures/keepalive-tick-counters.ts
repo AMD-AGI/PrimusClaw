@@ -63,11 +63,13 @@ const kv = {
   },
 } as unknown as KV;
 
-const deps = { kv, countActiveShells: async () => 0 };
+let clock = Date.now();
+const deps = { kv, countActiveShells: async () => 0, now: () => clock };
 
 for (let i = 0; i < 4 && !deleted.includes(KEY); i++) {
   await runKeepaliveTickForTest(deps);
   await new Promise((r) => setImmediate(r));
+  clock += 16 * 60_000;
 }
 // Flush: pino writes through sonic-boom, and the parent reads what reached fd 1.
 await new Promise((r) => setTimeout(r, 50));

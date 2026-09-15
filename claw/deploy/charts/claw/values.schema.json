@@ -1,7 +1,7 @@
 {
-  "$schema": "https://json-schema.org/draft-07/schema#",
-  "title": "Claw chart values",
-  "description": "Constrains only the Doorbell dispatch switch and the eight admission ceilings. Every object here allows additional properties: a whitelist would reject every other value key and break the first upgrade after this schema shipped.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claw chart values",
+  "description": "Constrains the background-shell keys, the Doorbell dispatch switches and the eight admission ceilings. Scoped deliberately and additionalProperties left open throughout: helm applies a schema to the whole merged values document, so a whitelist would reject every other value key and break the first upgrade after this schema shipped.",
   "type": "object",
   "additionalProperties": true,
   "definitions": {
@@ -25,6 +25,62 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "backgroundShell": {
+          "description": "Enable background shell tools. Also tightens the foreground bash ceiling; pin brain.bashMaxTimeoutSec to decouple them.",
+          "default": false,
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "true",
+                "false",
+                ""
+              ]
+            }
+          ]
+        },
+        "keepaliveTargetCeiling": {
+          "description": "Largest number of distinct keepalive ping targets one Brain replica may face. Required when backgroundShell is true; Brain refuses to start without it rather than substituting a number the refresh-gap relation was never proven at.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]*$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ]
+        },
+        "keepaliveIdleDeadlineSec": {
+          "description": "Shortest idle reclaim in force, in seconds. Required when backgroundShell is true: Brain proves the worst-case refresh gap against it at startup and refuses to start if the gap is not under it.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]*$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ]
+        },
+        "keepaliveReconcileReserve": {
+          "description": "Slots held back from ordinary admission so a target another replica created can be taken on before it is served. Required when backgroundShell is true, and must be below keepaliveTargetCeiling.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]*$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ]
+        },
         "runDoorbellDispatch": {
           "description": "Chat dispatch publishes a doorbell instead of a full execute request.",
           "type": "boolean"
@@ -39,18 +95,52 @@
         }
       }
     },
+    "brain": {
+      "type": "object",
+      "properties": {
+        "bashMaxTimeoutSec": {
+          "description": "Foreground bash ceiling in seconds. Empty means the code default, which depends on features.backgroundShell. Zero is excluded because Brain refuses a ceiling below 1 at startup, so admitting it here moves the failure from helm to a crash-looping pod.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]*$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ]
+        }
+      }
+    },
     "api": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "admitSoftRuns": { "$ref": "#/definitions/admitCeiling" },
-        "admitHardRuns": { "$ref": "#/definitions/admitCeiling" },
-        "admitSoftSandboxes": { "$ref": "#/definitions/admitCeiling" },
-        "admitHardSandboxes": { "$ref": "#/definitions/admitCeiling" },
-        "admitSoftGpuNodes": { "$ref": "#/definitions/admitCeiling" },
-        "admitHardGpuNodes": { "$ref": "#/definitions/admitCeiling" },
-        "admitTreeMaxNodes": { "$ref": "#/definitions/admitCeiling" },
-        "admitTreeMaxDepth": { "$ref": "#/definitions/admitCeiling" }
+        "admitSoftRuns": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitHardRuns": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitSoftSandboxes": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitHardSandboxes": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitSoftGpuNodes": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitHardGpuNodes": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitTreeMaxNodes": {
+          "$ref": "#/definitions/admitCeiling"
+        },
+        "admitTreeMaxDepth": {
+          "$ref": "#/definitions/admitCeiling"
+        }
       }
     }
   }

@@ -111,6 +111,14 @@ CLAW_DEPLOY_ROOT="${CLAW_DEPLOY_ROOT:-}"
 BRAIN_REPLICAS="${BRAIN_REPLICAS:-3}"
 AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
+BG_SHELL_ENABLED="${BG_SHELL_ENABLED:-}"
+BASH_MAX_TIMEOUT_SEC="${BASH_MAX_TIMEOUT_SEC:-}"
+SANDBOX_KEEPALIVE_TARGET_CEILING="${SANDBOX_KEEPALIVE_TARGET_CEILING:-}"
+SANDBOX_KEEPALIVE_RECONCILE_RESERVE="${SANDBOX_KEEPALIVE_RECONCILE_RESERVE:-}"
+HANDS_CHILD_UID_MIN="${HANDS_CHILD_UID_MIN:-}"
+HANDS_CHILD_UID_MAX="${HANDS_CHILD_UID_MAX:-}"
+HANDS_CHILD_ISOLATION="${HANDS_CHILD_ISOLATION:-}"
+SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="${SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   log "dry-run: using ephemeral placeholder values"
@@ -193,6 +201,20 @@ ADMIT_SOFT_GPU_NODES="${ADMIT_SOFT_GPU_NODES:-}"
 ADMIT_HARD_GPU_NODES="${ADMIT_HARD_GPU_NODES:-}"
 ADMIT_TREE_MAX_NODES="${ADMIT_TREE_MAX_NODES:-}"
 ADMIT_TREE_MAX_DEPTH="${ADMIT_TREE_MAX_DEPTH:-}"
+
+# Background shells, and the foreground bash ceiling in seconds. Empty means
+# the chart default, which is off, and the code default the flag implies. They
+# live here for the same reason the lifetimes do: upgrade.sh re-renders the
+# Brain Deployment from this file alone, so an enablement passed once on the
+# command line is one the next upgrade silently reverts.
+BG_SHELL_ENABLED="${BG_SHELL_ENABLED:-}"
+BASH_MAX_TIMEOUT_SEC="${BASH_MAX_TIMEOUT_SEC:-}"
+SANDBOX_KEEPALIVE_TARGET_CEILING="${SANDBOX_KEEPALIVE_TARGET_CEILING:-}"
+SANDBOX_KEEPALIVE_RECONCILE_RESERVE="${SANDBOX_KEEPALIVE_RECONCILE_RESERVE:-}"
+HANDS_CHILD_UID_MIN="${HANDS_CHILD_UID_MIN:-}"
+HANDS_CHILD_UID_MAX="${HANDS_CHILD_UID_MAX:-}"
+HANDS_CHILD_ISOLATION="${HANDS_CHILD_ISOLATION:-}"
+SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="${SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -210,11 +232,19 @@ _SHELL_S3_API_ENDPOINT="${S3_API_ENDPOINT:-}"
 _SHELL_S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
 _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 # Fields the file may leave blank for the shell to answer, and which the run
-# that answers one records for every run after it.
+# that answers one records for every run after it. Both feature families live
+# in this one list: the Doorbell switches and admission ceilings, and the
+# background-shell runtime's enablement, bash ceiling, keepalive bounds and
+# child-UID range. Adding a key here is all it takes to give it the whole
+# capture -> file-wins -> write-back cycle below.
 CLAW_RECORDED_KEYS="AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION
 RUN_DOORBELL_DISPATCH BRAIN_DOORBELL_EXECUTION RUN_FAT_PREPARING_RECONCILE
 ADMIT_SOFT_RUNS ADMIT_HARD_RUNS ADMIT_SOFT_SANDBOXES ADMIT_HARD_SANDBOXES
-ADMIT_SOFT_GPU_NODES ADMIT_HARD_GPU_NODES ADMIT_TREE_MAX_NODES ADMIT_TREE_MAX_DEPTH"
+ADMIT_SOFT_GPU_NODES ADMIT_HARD_GPU_NODES ADMIT_TREE_MAX_NODES ADMIT_TREE_MAX_DEPTH
+BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC
+SANDBOX_KEEPALIVE_TARGET_CEILING SANDBOX_KEEPALIVE_RECONCILE_RESERVE
+SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
+HANDS_CHILD_UID_MIN HANDS_CHILD_UID_MAX HANDS_CHILD_ISOLATION"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   eval "_SHELL_${_recorded_key}=\${${_recorded_key}:-}"
 done
@@ -254,13 +284,14 @@ export BRAIN_CHECKPOINT_KEY
 [ -z "${S3_SECRET_KEY:-}" ]       && S3_SECRET_KEY="$_SHELL_S3_SECRET_KEY"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   # Say when the policy above discards something. These keys carry the Doorbell
-  # switches, and a kill-switch flipped on the command line and dropped in
-  # silence looks exactly like one that took effect: the values file already
-  # pins the opposite, nothing below writes (the write-back only fills blanks),
-  # and upgrade.sh prints no effective-value summary -- so the only clue left is
-  # a rendered manifest that did not move. Advisory, not fatal: "file wins" is
-  # the documented contract for this whole class, and re-running deploy.sh with
-  # a stale value still in the shell has to keep working.
+  # switches and the background-shell enablement, and a kill-switch flipped on
+  # the command line and dropped in silence looks exactly like one that took
+  # effect: the values file already pins the opposite, nothing below writes (the
+  # write-back only fills blanks), and upgrade.sh prints no effective-value
+  # summary -- so the only clue left is a rendered manifest that did not move.
+  # Advisory, not fatal: "file wins" is the documented contract for this whole
+  # class, and re-running deploy.sh with a stale value still in the shell has to
+  # keep working.
   #
   # The six explicit fields just above are deliberately not covered: they are
   # auto-discovered credentials and endpoints, and naming a discarded
@@ -359,11 +390,13 @@ trap cleanup_deploy_temp_files EXIT
 #
 # helm template does NOT stamp metadata.namespace onto rendered objects, so the
 # imperative kubectl_apply below always passes -n "$NAMESPACE".
-# Sandbox lifetime settings ride along here rather than at each call site.
-# Both deploy.sh and upgrade.sh render through this, and upgrade.sh re-renders
-# the whole Deployment every time -- so a value only some callers pass is a value
-# the next upgrade silently drops. Empty stays unset, which leaves the chart
-# default, which leaves the sandbox template's own numbers.
+# Every recorded knob -- sandbox lifetimes, the Doorbell switches and admission
+# ceilings, the background-shell runtime's flags -- rides along here rather than
+# at each call site. Both deploy.sh and upgrade.sh render through this, and
+# upgrade.sh re-renders the whole Deployment every time -- so a value only some
+# callers pass is a value the next upgrade silently drops. Empty stays unset,
+# which leaves the chart default: the sandbox template's own numbers for the
+# lifetimes, and the shipped default for every other knob forwarded below.
 # ── Security values that must survive a re-render ────────────────────────
 #
 # render_chart renders one template with chart DEFAULTS for everything it is
@@ -848,6 +881,14 @@ render_chart() {
     ${ADMIT_HARD_GPU_NODES:+--set-string api.admitHardGpuNodes="$ADMIT_HARD_GPU_NODES"} \
     ${ADMIT_TREE_MAX_NODES:+--set-string api.admitTreeMaxNodes="$ADMIT_TREE_MAX_NODES"} \
     ${ADMIT_TREE_MAX_DEPTH:+--set-string api.admitTreeMaxDepth="$ADMIT_TREE_MAX_DEPTH"} \
+    ${BG_SHELL_ENABLED:+--set-string features.backgroundShell="$BG_SHELL_ENABLED"} \
+    ${BASH_MAX_TIMEOUT_SEC:+--set-string brain.bashMaxTimeoutSec="$BASH_MAX_TIMEOUT_SEC"} \
+    ${SANDBOX_KEEPALIVE_TARGET_CEILING:+--set-string features.keepaliveTargetCeiling="$SANDBOX_KEEPALIVE_TARGET_CEILING"} \
+    ${SANDBOX_KEEPALIVE_RECONCILE_RESERVE:+--set-string features.keepaliveReconcileReserve="$SANDBOX_KEEPALIVE_RECONCILE_RESERVE"} \
+    ${SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC:+--set-string features.keepaliveIdleDeadlineSec="$SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC"} \
+    ${HANDS_CHILD_UID_MIN:+--set-string features.childUidMin="$HANDS_CHILD_UID_MIN"} \
+    ${HANDS_CHILD_UID_MAX:+--set-string features.childUidMax="$HANDS_CHILD_UID_MAX"} \
+    ${HANDS_CHILD_ISOLATION:+--set-string features.childIsolation="$HANDS_CHILD_ISOLATION"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst"

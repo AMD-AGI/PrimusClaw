@@ -20,6 +20,8 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import { nowMs } from "./clock.js";
+
 /**
  * Header Brain stamps with the addressing scope a shell belongs to: the DAG
  * root when the run is a DAG node, else the session.
@@ -28,6 +30,9 @@ export const OWNER_HEADER = "x-claw-owner";
 
 /** Header Brain stamps with the id of the single run making the call. */
 export const RUN_HEADER = "x-claw-run";
+
+// Bounds result retention to the owning run; absent means the sandbox lifetime.
+export const DEADLINE_HEADER = "x-claw-deadline";
 
 /**
  * Owner used when the header is absent: an older Brain, a probe, a test, a
@@ -47,6 +52,7 @@ export const NO_RUN = "";
 interface CallerContext {
   owner: string;
   run: string;
+  deadline?: string;
 }
 
 const store = new AsyncLocalStorage<CallerContext>();
@@ -79,6 +85,14 @@ export function normalizeRun(raw: unknown): string {
   return normalizeCallerKey(raw, NO_RUN);
 }
 
+// Invalid values fail closed to the longer sandbox-lifetime retention window.
+export function normalizeDeadline(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  const at = Date.parse(trimmed);
+  return Number.isFinite(at) && at > nowMs() ? trimmed : undefined;
+}
+
 export function withCaller<T>(ctx: CallerContext, fn: () => T): T {
   return store.run(ctx, fn);
 }
@@ -89,4 +103,8 @@ export function currentOwner(): string {
 
 export function currentRun(): string {
   return store.getStore()?.run ?? NO_RUN;
+}
+
+export function currentDeadline(): string | undefined {
+  return store.getStore()?.deadline;
 }

@@ -71,6 +71,15 @@ jobs:
       # that only tsc catches would otherwise slip through.
       - run: npm run build
 
+      # The test directory is outside every package's `typecheck`, so a name in
+      # a stub that resolves to nothing throws a ReferenceError the surrounding
+      # seam catches -- and the test passes having asserted nothing. This is the
+      # only job that builds Claw, so it is the only place the guard can run.
+      - name: Tests must resolve
+        run: |
+          bash scripts/lint-tests-must-resolve.sh --self-test
+          bash scripts/lint-tests-must-resolve.sh --all
+
       - run: npm test
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres

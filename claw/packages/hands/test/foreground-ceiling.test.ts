@@ -33,6 +33,9 @@ const CEILING_SEC = 2;
 process.env.BASH_MAX_TIMEOUT_SEC = String(CEILING_SEC);
 const { bash } = await import("../src/tools/shell/bash.js");
 
+const { isolatingSandbox } = await import("./support/sandbox-isolation.js");
+isolatingSandbox();
+
 const textOf = (r: { content: Array<{ text: string }> }) => r.content[0].text;
 
 test("a command over the ceiling is cut at it, and told which limit it met", async () => {
@@ -78,4 +81,29 @@ test("hitting the ceiling without having asked for more says so plainly", async 
 test("a nonsense timeout is refused rather than silently defaulted", async () => {
   const result = await bash.execute({ command: "echo hi", timeout: -1 });
   assert.match(textOf(result as { content: Array<{ text: string }> }), /must be a positive number/);
+});
+
+test("a forwarded ceiling is enforced as given, not swapped for the fallback", async () => {
+  // The control for the unforwarded-ceiling files: this process sets a concrete
+  // non-empty value, so it exercises the forwarded branch. Without it those
+  // files could be measuring a constant rather than the fallback they name.
+  const { MAX_TIMEOUT_SEC } = await import("../src/tools/shell/bash.js");
+  assert.equal(MAX_TIMEOUT_SEC, CEILING_SEC);
+  assert.notEqual(MAX_TIMEOUT_SEC, 36000, "the fallback is not what a present value reaches");
+});
+
+test("a command timeout cannot be mistaken for a transport timeout", () => {
+  // The two classes are separated by the killed question: this one says the
+  // process group is gone, and the transport class says the command may still
+  // be running. Both true of their own case, and each fatal read as the other.
+  return bash.execute({ command: "sleep 30", timeout: 600 }).then((result) => {
+    const text = textOf(result as { content: Array<{ text: string }> });
+    assert.match(text, /killed the whole process group/);
+    assert.match(text, new RegExp(`timeout after ${CEILING_SEC}s`));
+    assert.doesNotMatch(text, /deadline/, "no deadline of Brain's stopped this");
+    assert.doesNotMatch(text, /may still be running/);
+    assert.doesNotMatch(text, /disabled/);
+    assert.doesNotMatch(text, /not found|unknown shell|no longer available/,
+      "a bare absence phrase belongs to the lost-registry class, not this one");
+  });
 });
