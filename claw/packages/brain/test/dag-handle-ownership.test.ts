@@ -799,10 +799,19 @@ test("H23 the merge's own four seams", async () => {
   // past a live READY row on the canonical key, reports `recorded` over it, and
   // the next migration promotes this pending row over that live sandbox.
   const rollback = eh.slice(eh.indexOf("const recordPending = async"));
-  assert.match(rollback.slice(0, rollback.indexOf("};")), /handsSessionKey\(sessionId\)/,
-    "the rollback has to write the key everything else reads");
+  const body = rollback.slice(0, rollback.indexOf("\n  };"));
+  assert.match(body, /handsSessionKey\(sessionId\)/,
+    "the rollback has to write the canonical key");
   assert.equal(/const key = `hands\.\$\{sessionId\}`/.test(eh), false,
     "and the legacy spelling must not come back");
+  // Round 42: writing the canonical name is only half of it. The occupancy
+  // check has to read through BOTH names, the way `readReusableEntry` does --
+  // a live binding held under the legacy name is invisible to a single read,
+  // and the migration then deletes it as the older of the pair.
+  assert.match(body, /readHandsEntry\(/,
+    "the occupancy check has to read through both names, not just one");
+  assert.match(body, /found\?\.key/,
+    "and update the key it was read under, never a re-derived one");
 
   // B2: retention is a handover. The container stays alive for its live work
   // and the retention record owns it; leaving the handle on it makes the

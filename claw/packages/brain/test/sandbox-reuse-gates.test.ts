@@ -123,6 +123,7 @@ function stubEffects(
   retainedKeys: string[];
 } {
   const destroyed: string[] = [];
+  const released: string[] = [];
   const registered: Registration[] = [];
   const restartCalls: number[] = [];
   const retained: string[] = [];
@@ -133,6 +134,10 @@ function stubEffects(
       registered.push({ sessionId, target });
     }) as never,
     probeSandboxContainer: async () => ({ verdict: probe, reason: "exec_ok" as const }),
+    // Succeeds by default: the retention path releases the handed-over
+    // container's handle before it retains it, so a fixture that threw here
+    // would stop every retention test short of its assertion.
+    releaseHandlesForWorkload: (async () => { released.push("release"); }) as never,
     dagHoldsWorkload: (async () => {
       if (typeof holds === "function") return holds();
       return holds ?? false;
@@ -1040,4 +1045,30 @@ test("an agent-sandbox entry is identified by its Router session, not a blank wo
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(queries, ["other"], "the holder question has to actually be asked");
   assert.deepEqual(destroyed, [], "another DAG is using that Router sandbox");
+});
+
+test("a retention whose handle release fails leaves everything retryable", async () => {
+  // Round 42. Releasing AFTER `retainContainer` looked equivalent and was not:
+  // `retainContainer` deletes the session binding, and the binding is what
+  // brings the next attempt back through this path. One failed delete then
+  // stripped the only way to retry, so the stale handle rolled back every
+  // replacement for good -- `stopped=[W-new-1, W-new-2]`.
+  //
+  // Released first, a failure leaves the binding, the handle and the container
+  // as they were, and the next attempt walks in and tries again.
+  const retained: unknown[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    releaseHandlesForWorkload: (async () => { throw new Error("kv down"); }) as never,
+    retainContainer: (async (args: unknown) => { retained.push(args); }) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" }),
+    restartHandsInSandbox: async () => ({ ok: false, detail: "refused", refused: true }),
+    countLiveWork: (async () => ({ verdict: "protected", classes: {}, reason: "shells" })) as never,
+    destroyHands: (async () => {}) as never,
+  });
+  stubHealth("fail");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf(), workloadId: "W-old" } as never);
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(retained, [],
+    "the binding must not be deleted while the handle still names the container");
 });
