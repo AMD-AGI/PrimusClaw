@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { HandsClient } from "../clients/hands.js";
+import { HandsClient, type ShellClassProbe } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
@@ -163,10 +163,16 @@ export class ToolRouter {
   }
 
   /**
-   * The sandbox, opening one first if this run deferred it. Every path that
-   * reaches Hands goes through here, so a tool call is the thing that decides
-   * a sandbox is needed — no caller has to remember to ask for one.
+   * The class of a background shell, read without consuming its output.
+   *
+   * Exists so a caller can decide whether a `wait` on it can block before the
+   * wait is routed. A sandbox that cannot be reached answers `running`, which
+   * is the reading that costs a slot for one call rather than for a timeout.
    */
+  async classifyShell(shellId: string): Promise<ShellClassProbe> {
+    return (await this.requireHands()).classifyShell(shellId);
+  }
+
   private async requireHands(): Promise<HandsClient> {
     if (this.hands) return this.hands;
     if (!this.attachHands) throw new Error("No sandbox is attached to this run");
@@ -246,6 +252,17 @@ export class ToolRouter {
     name: string,
     input: Record<string, unknown>,
     signal?: AbortSignal,
+    /**
+     * Filled with what the tool actually answered.
+     *
+     * The result text alone cannot say: a failure's wording is the tool's to
+     * choose, and a caller matching prefixes counts every phrasing it did not
+     * anticipate as a success. Anything that needs to know whether the work
+     * happened reads this instead.
+     */
+    outcome?: { isError: boolean; structured?: Record<string, unknown> },
+    /** Replay-stable identity of this call site; sealed on the reference row. */
+    ctx?: { stepIdentity?: string },
   ): Promise<string> {
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
@@ -339,6 +356,7 @@ export class ToolRouter {
     }
 
     if (!BG_SHELL_ENABLED && isBackgroundShellCall(name, input)) {
+      if (outcome) outcome.isError = true;
       return BG_SHELL_DISABLED_MESSAGE;
     }
 
@@ -349,7 +367,15 @@ export class ToolRouter {
       // and the file was missing (e.g. Pi/Codex don't materialize skills to disk),
       // the skill name still landed in skillsRead and polluted feedback / probation /
       // evolution stats with attribution to a skill that never actually loaded.
-      const result = await (await this.requireHands()).callTool(name, input, signal);
+      const answered = await (await this.requireHands()).callToolFull(name, input, signal, ctx);
+      if (outcome) {
+        outcome.isError = answered.isError;
+        // The durable state of a shell is a field, not a sentence. Dropping it
+        // here left every read, wait and kill answerable only by matching the
+        // prose a later reword would change.
+        outcome.structured = answered.structured as Record<string, unknown> | undefined;
+      }
+      const result = answered.text;
       if (name === "bash" && typeof input.command === "string") {
         this.trackSkillRead(input.command);
       } else if ((name === "read" || name === "grep" || name === "glob") && typeof input.path === "string") {

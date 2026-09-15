@@ -332,10 +332,14 @@ test("H7 the handle is registered while the workload is provisioning, not after"
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
     "utf-8",
   );
-  const hook = src.slice(
-    src.indexOf("const onProvisioned = async (workloadId: string)"),
-  );
-  const body = hook.slice(0, hook.indexOf("\n  };"));
+  // The hook lives in `makeOnProvisioned` now -- main's #35 lifted it out of
+  // ensureHands so the admission ceiling could wrap it. Same hook, same
+  // requirement: the handle is written from inside it.
+  const decl = src.slice(src.indexOf("export function makeOnProvisioned"));
+  // Past the deps type literal, whose own `\n})` would otherwise end the slice
+  // before the body it is meant to be reading.
+  const hook = decl.slice(decl.indexOf("}): (workloadId: string) => Promise<void> {"));
+  const body = hook.slice(0, hook.indexOf("\n}"));
 
   assert.match(body, /await replaceDagHandle\(/,
     "the handle has to be recorded while the workload is provisioning");
@@ -775,6 +779,8 @@ test("H22 the reaper's identity check is wired through every call site", async (
   const ehSrc = readFileSync(
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
   const payload = ehSrc.slice(ehSrc.indexOf("const pendingPayload = sc.encode"));
-  assert.match(payload.slice(0, payload.indexOf("}));")), /taskId: request\.task_id/,
+  assert.match(payload.slice(0, payload.indexOf("}));")), /taskId: deps\.taskId/,
     "and the entry has to record who wrote it");
+  assert.match(ehSrc, /taskId: request\.task_id \?\? null,\n\s+dagRootTaskId:/,
+    "which means ensureHands has to pass it in");
 });

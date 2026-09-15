@@ -21,8 +21,8 @@
 import pino from "pino";
 import {
   CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL, LOCAL_MODE_HANDS_BINARY,
-  HANDS_BOOTSTRAP_START_TIMEOUT, BG_SHELL_ENABLED, BASH_FOREGROUND_DEFAULT_SEC,
-  WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC,
+  HANDS_BOOTSTRAP_START_TIMEOUT, BG_SHELL_ENABLED, BG_SHELL_REAP_GRACE_MS, BASH_FOREGROUND_DEFAULT_SEC,
+  WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC, HANDS_CHILD_ISOLATION_ENV,
 } from "../config.js";
 import { toolTimeoutCeilingSec } from "../tools/hands.js";
 
@@ -119,19 +119,23 @@ function envFileConsumedGuard(envFile: string, waitSec: number): string {
  * failure, and the download source once backgrounded the whole chain and so
  * reported success for a download that never finished.
  */
+const dirOf = (path: string): string => path.slice(0, path.lastIndexOf("/")) || "/";
+
 function launchCmd(
   baseEnv: string,
   binPath: string,
   envFile?: string,
   envWaitSec: number = HANDS_ENV_FILE_WAIT_SEC,
-  logPath: string = "/workspace/hands.log",
+  logPath: string = HANDS_LOG_PATH,
 ): string {
   // Truncate is a statement of its own, not `truncate && start &`. `&`
   // backgrounds a whole AND-OR list, so that form made `$!` the helper
   // shell bash forks to run the list -- dash happens to exec-replace it
   // with the setsid process, bash does not, and the kill chain then hits
   // the helper while Hands keeps the port.
-  return `: > ${logPath} || { echo "cannot write ${logPath}" >&2; exit 1; }; `
+  // The state directory is a cross-run boundary and must be private before log creation.
+  return `mkdir -p ${dirOf(logPath)} && chmod 700 ${dirOf(logPath)} || { echo "cannot create ${dirOf(logPath)}" >&2; exit 1; }; `
+    + `: > ${logPath} || { echo "cannot write ${logPath}" >&2; exit 1; }; `
     + `${baseEnv} setsid ${binPath} </dev/null >>${logPath} 2>&1 & `
     + `PID=$!; sleep 1; `
     + `if ! kill -0 $PID 2>/dev/null; then echo "hands-binary at ${binPath} crashed immediately" >&2; cat ${logPath} >&2; exit 1; fi; `
@@ -153,7 +157,7 @@ export function inImageStartCmd(
   timeoutSec: number = SELF_CHECK_TIMEOUT_SEC,
   envFile?: string,
   envWaitSec: number = HANDS_ENV_FILE_WAIT_SEC,
-  logPath: string = "/workspace/hands.log",
+  logPath: string = HANDS_LOG_PATH,
 ): string {
   // `--self-check` rather than a plain -x test, because every image is probed
   // now instead of only the ones whose name we recognised: the question is
@@ -186,7 +190,7 @@ function brainDownloadStartCmd(baseEnv: string, handsToken: string, envFile?: st
   // `curl && chmod && :>log && setsid bin & echo started_pid=$!` chain, so the
   // step ALWAYS reported success (the foreground `echo` exits 0) even when the
   // download never completed — Brain then waited out the whole /health poll on a
-  // /workspace/hands.log that was never created (the observed
+  // hands.log that was never created (the observed
   // `sandbox_health_failed` with "hands.log: No such file or directory"). Only
   // the final binary launch is backgrounded, then verified alive, mirroring
   // sharedStorageStartCmd.
@@ -262,9 +266,26 @@ export function handsBaseEnv(
     + `BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")} `
     + `BASH_DEFAULT_TIMEOUT_SEC=${BASH_FOREGROUND_DEFAULT_SEC} `
     + `WAIT_MAX_SEC=${toolTimeoutCeilingSec("wait")} `
-    + `WAIT_DEFAULT_SEC=${WAIT_DEFAULT_SEC}`
+    + `WAIT_DEFAULT_SEC=${WAIT_DEFAULT_SEC} `
+    + `BG_SHELL_REAP_GRACE_MS=${BG_SHELL_REAP_GRACE_MS} `
+    + `HANDS_STATE_DIR=${HANDS_STATE_DIR}`
+    + childIsolationEnv()
     + (envFile ? ` HANDS_ENV_FILE=${envFile}` : "");
 }
+
+// Do not default this list; absence is how Hands enforces a fail-closed posture.
+function childIsolationEnv(): string {
+  return HANDS_CHILD_ISOLATION_ENV
+    .filter((key) => process.env[key])
+    .map((key) => ` ${key}=${process.env[key]}`)
+    .join("");
+}
+
+// Kept outside the synced, user-writable workspace.
+export const HANDS_STATE_DIR = "/tmp/.claw-hands";
+
+// Shell ids and PIDs must stay outside the all-runs-writable, externally synced workspace.
+export const HANDS_LOG_PATH = `${HANDS_STATE_DIR}/hands.log`;
 
 /**
  * Where the per-request environment is handed over.

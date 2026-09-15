@@ -10,6 +10,11 @@ export {
 } from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
 export {
+  ABSENT_RUN_SCOPE, encodeScopePart, decodeScopePart, scopeBytes,
+  mintScopeCredential, verifyScopeCredential,
+  type CredentialScope, type ScopeCredentialError, type ScopeVerification,
+} from "./security/scope-credential.js";
+export {
   sealAead, openAead, decodeAeadKey, AeadOpenError, AEAD_KEY_LEN, AEAD_VERSION_V1,
 } from "./crypto/aead.js";
 export { isRevisionConflict } from "./kv/errors.js";

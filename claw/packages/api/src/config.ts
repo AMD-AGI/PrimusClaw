@@ -223,7 +223,6 @@ export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", NATS_REPLICAS, 
 // later brain restart attaches without restoring its own value. They still
 // have to agree, or the bucket brain creates on a fresh cluster is wrong until
 // api first reconciles it.
-export const DAG_HANDLES_REPLICAS = envInt("DAG_HANDLES_REPLICAS", NATS_REPLICAS, { min: 1 });
 // The two streams, which had no replica setting at all and so were created at
 // the JetStream default of 1. A single-replica stream lives on exactly one
 // server: when that server's pod went away on 2026-09-01 nothing was hosting

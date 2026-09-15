@@ -236,6 +236,31 @@ spec:
         # decides both what the model is offered and what the sandbox will run.
         - name: BG_SHELL_ENABLED
           value: {{ .Values.features.backgroundShell | default false | quote }}
+        # Read together with the flag above: Brain refuses to start with
+        # background shells on and either of these undeclared, because the gap
+        # between two refreshes of one handle is derived from them and a
+        # sandbox hosting a live shell is reclaimed if that gap is wrong.
+        - name: SANDBOX_KEEPALIVE_TARGET_CEILING
+          value: {{ .Values.features.keepaliveTargetCeiling | quote }}
+        - name: SANDBOX_KEEPALIVE_RECONCILE_RESERVE
+          value: {{ .Values.features.keepaliveReconcileReserve | quote }}
+        - name: SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
+          value: {{ .Values.features.keepaliveIdleDeadlineSec | quote }}
+        # Forwarded into every sandbox, and rendered only when set: an absent
+        # value is what makes Hands refuse to serve background shells, so a
+        # default here would answer for a deployment that had not decided.
+        {{- with .Values.features.childUidMin }}
+        - name: HANDS_CHILD_UID_MIN
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.features.childUidMax }}
+        - name: HANDS_CHILD_UID_MAX
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.features.childIsolation }}
+        - name: HANDS_CHILD_ISOLATION
+          value: {{ . | quote }}
+        {{- end }}
         # Read by brain and, until now, reachable only by editing the Deployment
         # by hand -- which the next helm upgrade would have undone. Each renders
         # empty when the value is absent, and each answers an empty value with

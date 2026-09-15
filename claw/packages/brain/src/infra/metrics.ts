@@ -72,6 +72,45 @@ const taskDuration = new Histogram({
 });
 
 // Hands-binary HTTP fallback (sandbox bootstrap downloads).
+/**
+ * Foreground bash commands the sandbox stopped at their granted second.
+ *
+ * The one operator-readable signal a tightened foreground ceiling causally
+ * emits. A clamped command comes back to the model as a tool result rather than
+ * ending its run, so nothing about the run's own terminal state moves with the
+ * ceiling and a killed-run count measures something else entirely. `clamped`
+ * separates a command that met the ceiling it asked past -- the regression a
+ * rollout is watching for -- from one that simply ran out of its own timeout.
+ */
+const bashForegroundTimeoutTotal = new Counter({
+  name: "claw_bash_foreground_timeout_total",
+  help: "Foreground bash commands killed at their granted timeout, by whether the request was clamped to the ceiling.",
+  labelNames: ["clamped"] as const,
+  registers: [registry],
+});
+// Both label combinations exist from startup, so a rollout reading the rate
+// before any clamped timeout has happened reads zero rather than finding no
+// series at all -- an absent series and a quiet window are the same text to a
+// log scraper, and one of them is a stop condition with no reading.
+bashForegroundTimeoutTotal.inc({ clamped: "true" }, 0);
+bashForegroundTimeoutTotal.inc({ clamped: "false" }, 0);
+
+/**
+ * Park sites that could not park under a usable key.
+ *
+ * The ledger helper cannot report this: a missing entry is the legitimate
+ * sub-agent case there. Only the call site knows it holds its own execution
+ * slot and can name the key it passed, which is the difference between a
+ * missing key and a wrong one -- and a wrong one held the slot for the whole
+ * of every wait with nothing recorded anywhere.
+ */
+const parkKeyUnusableTotal = new Counter({
+  name: "claw_brain_park_key_unusable_total",
+  help: "Park attempts from a run holding its own execution slot whose park key was absent or unknown to the run-phase ledger.",
+  labelNames: ["site", "reason"] as const,
+  registers: [registry],
+});
+
 const handsBinaryDownloadTotal = new Counter({
   name: "claw_brain_hands_binary_download_total",
   help: "GET /internal/assets/hands-binary by outcome.",
@@ -544,6 +583,16 @@ const sessionCleanupIncompleteTotal = new Counter({
 });
 
 export const metrics = {
+  /** One park site that could not park under a key the ledger knows. */
+  onParkKeyUnusable(site: string, reason: "absent" | "untracked"): void {
+    parkKeyUnusableTotal.inc({ site, reason });
+  },
+
+  /** One foreground bash command stopped at its granted second. */
+  onBashForegroundTimeout(clamped: boolean): void {
+    bashForegroundTimeoutTotal.inc({ clamped: clamped ? "true" : "false" });
+  },
+
   /**
    * One LLM turn's cache accounting.
    *

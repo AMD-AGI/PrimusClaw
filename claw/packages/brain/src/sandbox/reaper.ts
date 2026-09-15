@@ -56,6 +56,8 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
+import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { readHandsEntry as readSessionBinding } from "./registry.js";
 
 const logger = pino({ name: "sandbox-reaper" });
 const sc = StringCodec();
@@ -70,9 +72,10 @@ const sc = StringCodec();
  */
 export async function readSessionPlatformKey(sessionId: string): Promise<string> {
   try {
-    const entry = await getHandsKv().get(`hands.${sessionId}`);
+    // Read-through, so a teardown finds the binding an old replica wrote.
+    const entry = await readSessionBinding(getHandsKv(), sessionId);
     if (!entry) return "";
-    return String(JSON.parse(sc.decode(entry.value)).platformKey ?? "");
+    return String(JSON.parse(entry.value).platformKey ?? "");
   } catch {
     return "";
   }
@@ -82,6 +85,8 @@ interface RecordedHandsEntry {
   state: "valid" | "missing" | "unknown";
   identity?: HandsProbeEntry;
   revision?: number;
+  /** The key the binding was read from; a delete conditioned on `revision` must target it. */
+  key?: string;
 }
 
 /**
@@ -91,7 +96,8 @@ interface RecordedHandsEntry {
  */
 async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
   try {
-    const entry = await getHandsKv().get(`hands.${sessionId}`);
+    const found = await readSessionBinding(getHandsKv(), sessionId);
+    const entry = found?.entry;
     // A deleted key reads back as an entry with an empty value, and letting it
     // reach the parser turns "gone" into "unreadable". The two are not
     // interchangeable here: `missing` lets teardown finish, while `unknown`
@@ -99,10 +105,10 @@ async function readHandsEntry(sessionId: string): Promise<RecordedHandsEntry> {
     // unavailable after confirmed sandbox stop" -- so a second teardown, or a
     // sweeper, deleting this key first would fail a user request over a
     // workload that is already stopped.
-    if (!entry || isTombstone(entry)) return { state: "missing" };
-    const identity = parseHandsProbeValue(sc.decode(entry.value));
+    if (!found || !entry || isTombstone(entry)) return { state: "missing" };
+    const identity = parseHandsProbeValue(found.value);
     if (!instanceFromEntry(sessionId, identity)) return { state: "unknown" };
-    return { state: "valid", identity, revision: entry.revision };
+    return { state: "valid", identity, revision: entry.revision, key: found.key };
   } catch (err) {
     logger.warn({ err: String(err), sessionId }, "hands.entry_unreadable");
     return { state: "unknown" };
@@ -271,8 +277,8 @@ export async function destroyHands(
   stillOwned?: () => boolean,
 ): Promise<void> {
   const kv = getHandsKv();
-  const key = `hands.${sessionId}`;
   const recorded = await readHandsEntry(sessionId);
+  const key = recorded.key ?? handsSessionKey(sessionId);
   const target = known ?? recorded.identity;
   const ownsRecorded = recorded.state === "valid"
     && !!recorded.identity
@@ -373,7 +379,7 @@ export async function destroyHands(
     && latest.revision !== undefined
     && sameHandsSandbox(target, latest.identity)
   ) {
-    if (await deleteHandsEntryIfRevision(kv, key, latest.revision)) return;
+    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) return;
     // Losing twice means the key is being written faster than we can clear
     // it -- but the workload is already stopped, which is the part callers
     // build a replacement on top of. Throwing here fails a user request over
@@ -409,9 +415,11 @@ export async function reapPendingHands(
 ): Promise<void> {
   try {
     const kv = getHandsKv();
-    const entry = await kv.get(`hands.${sessionId}`);
+    // Read-through: a pending binding an old replica wrote sits under the
+    // legacy name, and missing it leaks the workload it names.
+    const entry = await readSessionBinding(kv, sessionId);
     if (!entry) return;
-    const info = JSON.parse(sc.decode(entry.value));
+    const info = JSON.parse(entry.value);
     if (info.status !== "pending") return;
     // Whose workload this is decides whether it may be stopped. A session can
     // hold more than one DAG at once under a session-scoped run gate, and
@@ -476,7 +484,7 @@ async function sweepStaleHands(): Promise<void> {
     const now = new Date().toISOString();
     for await (const key of iter) {
       scanned += 1;
-      const sessionId = key.slice("hands.".length);
+      const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       try {
         const entry = await kv.get(key);
@@ -586,7 +594,7 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
   try {
     const iter = await kv.keys("hands.*");
     for await (const key of iter) {
-      const sessionId = key.slice("hands.".length);
+      const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       try {
         const entry = await kv.get(key);

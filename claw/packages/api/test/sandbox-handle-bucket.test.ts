@@ -97,8 +97,11 @@ test("B3 the api user's NATS allow-list grants the bucket the code names", () =>
   for (const subject of [
     `$KV.${DAG_HANDLES_BUCKET}.dag-handles.*`,
     `$JS.API.STREAM.INFO.KV_${DAG_HANDLES_BUCKET}`,
-    `$JS.API.STREAM.CREATE.KV_${DAG_HANDLES_BUCKET}`,
-    `$JS.API.STREAM.UPDATE.KV_${DAG_HANDLES_BUCKET}`,
+    // No STREAM.CREATE or UPDATE, deliberately. This side binds to Brain's
+    // bucket rather than ensuring it: `ensureKvBucket` corrects drift as well
+    // as creating, so an attach carrying its own replica setting would rewrite
+    // Brain's config on every boot. Row writes stay, because whoever stops a
+    // workload frees its handle and this side stops them on cancel.
     `$JS.API.DIRECT.GET.KV_${DAG_HANDLES_BUCKET}.>`,
     `$JS.API.STREAM.MSG.GET.KV_${DAG_HANDLES_BUCKET}`,
     // Both forms. The server names an ordered consumer itself, so the request

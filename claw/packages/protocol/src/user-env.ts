@@ -72,6 +72,20 @@ export function isClawInternalEnv(name: string): boolean {
 }
 
 /**
+ * True when the env name configures the sandbox's own tool server.
+ *
+ * Whole family, for the reason the `CLAW_*` one is: these decide what the
+ * sandbox is, not what runs inside it. `HANDS_CHILD_UID_MIN`/`MAX` and
+ * `HANDS_CHILD_ISOLATION` say whether a command runs under an identity of its
+ * own, and `HANDS_STATE_DIR` says where the records that address background
+ * shells live -- so a request that could set them would be choosing its own
+ * privilege boundary and the location of the evidence about it.
+ */
+export function isHandsInternalEnv(name: string): boolean {
+  return name.startsWith("HANDS_");
+}
+
+/**
  * Single composite gate used by both API (PUT validation) and Brain
  * (env merge re-check). Returns true iff the env name is safe for
  * user-supplied injection.
@@ -80,6 +94,7 @@ export function isUserEnvKeyAllowed(name: string): boolean {
   if (!USER_ENV_KEY_NAME_RE.test(name)) return false;
   if (isBashFuncInjection(name)) return false;
   if (isClawInternalEnv(name)) return false;
+  if (isHandsInternalEnv(name)) return false;
   if (USER_ENV_DENY_LIST.has(name)) return false;
   return true;
 }

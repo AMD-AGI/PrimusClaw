@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { SHELL_GROUP_TOKEN_VAR } from "@claw/protocol";
 import { WORKSPACE } from "../../config.js";
+import { resolveChildPrivilege } from "../../runtime/child-privilege.js";
 
 export type ManagedShellKind = "foreground" | "background" | "monitor";
 export type ManagedShellStatus = "running" | "exited" | "killed" | "timed_out" | "error";
@@ -30,6 +33,26 @@ export interface ManagedShell {
   startedAt: number;
   lastOutputAt: number;
   endedAt: number | null;
+  /**
+   * A value every process in this shell's group inherits, and nothing outside
+   * it carries.
+   *
+   * The pid alone cannot answer "is this still my group" once the leader has
+   * been collected: the number is free again, and a later unrelated group under
+   * the same number reads identically -- the leader is gone in both cases, so
+   * the start-token check that would tell them apart has nothing to read. That
+   * is the one case where the reaped-leader fallback has to decide, and it is
+   * exactly the case it cannot decide from the number.
+   *
+   * The children can answer it, because they inherit the environment: a group
+   * member carrying this token is this shell's, and one that does not is not.
+   *
+   * Optional, and `undefined` means "not known" rather than "no token": a
+   * stand-in built from a record written before tokens existed has none, and
+   * asking for an empty one would match no member at all -- a silent negative
+   * dressed as a check.
+   */
+  groupToken?: string;
 }
 
 export interface ManagedShellResult {
@@ -48,6 +71,9 @@ interface SpawnManagedShellOptions {
   kind: ManagedShellKind;
   bufferBytes: number;
   unref?: boolean;
+  /** The pair the child runs as. Both forms supply it; neither may omit it. */
+  owner: string;
+  run: string;
 }
 
 interface RunForegroundOptions {
@@ -55,6 +81,8 @@ interface RunForegroundOptions {
   bufferBytes: number;
   terminateGraceMs?: number;
   forceResolveMs?: number;
+  owner: string;
+  run: string;
 }
 
 /** Write a compact structured lifecycle log to stdout. */
@@ -81,12 +109,21 @@ export function logShellEvent(event: string, shell: ManagedShell, extra: Record<
   }));
 }
 
-/** Spawn a managed shell as a detached process group. */
+/**
+ * Spawn a managed shell as a detached process group, under its run's own
+ * unprivileged identity and with an environment built from an allow-list.
+ *
+ * @throws ChildPrivilegeUnavailable where the sandbox declares an identity
+ * range and cannot partition the process view to go with it.
+ */
 export function spawnManagedShell(command: string, options: SpawnManagedShellOptions): ManagedShell {
   const id = options.id || `${options.kind}-${randomUUID().slice(0, 8)}`;
+  const privilege = resolveChildPrivilege(options.owner, options.run);
+  const groupToken = randomUUID();
   const proc = spawn("/bin/sh", ["-c", command], {
     cwd: WORKSPACE,
-    env: process.env,
+    env: { ...privilege.env, [SHELL_GROUP_TOKEN_VAR]: groupToken },
+    ...(privilege.uid === undefined ? {} : { uid: privilege.uid, gid: privilege.gid }),
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -101,6 +138,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
     exitCode: null,
     signal: null,
     timedOut: false,
+    groupToken,
     stdoutBuf: [],
     stderrBuf: [],
     stdoutBytes: 0,
@@ -119,12 +157,24 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   proc.stderr?.on("data", (chunk: Buffer) => appendBuffer(shell, "stderr", chunk, options.bufferBytes));
 
   proc.on("exit", (code, signal) => {
-    if (shell.status === "running") {
+    // The leader's exit is not the shell's end when the group outlived it.
+    // `sleep 30 & exit 0` returns its leader at once and leaves the sleep in
+    // the group: flipping the status here reported the shell finished, which
+    // took it out of `runningShellCount`, out of every reap report and to a
+    // terminal record, while the group went on holding the sandbox's CPU and
+    // its pipe handles.
+    //
+    // `processGroupAlive` is the question that means "ended", and this file
+    // already documents why the leader's own status is not it. A shell whose
+    // group is still running stays `running`; the watcher that spawned it
+    // settles it when the group actually goes.
+    const groupLives = shell.kind !== "foreground" && processGroupAlive(shell);
+    if (shell.status === "running" && !groupLives) {
       shell.status = shell.timedOut ? "timed_out" : (signal ? "killed" : "exited");
     }
     shell.exitCode = code;
     shell.signal = signal;
-    shell.endedAt = Date.now();
+    if (!groupLives) shell.endedAt = Date.now();
     // Foreground exit/error logs are emitted by runForegroundShell.finish so
     // each shell shows exactly one terminal event in the log stream.
     if (shell.kind !== "foreground") {
@@ -142,9 +192,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   });
 
   if (options.unref) proc.unref();
-  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell, {
-    command: command.slice(0, 500),
-  });
+  logShellEvent(shell.kind === "foreground" ? "shell.foreground.start" : "shell.background.start", shell);
   return shell;
 }
 
@@ -156,6 +204,8 @@ export async function runForegroundShell(
   const shell = spawnManagedShell(command, {
     kind: "foreground",
     bufferBytes: options.bufferBytes,
+    owner: options.owner,
+    run: options.run,
   });
   const terminateGraceMs = options.terminateGraceMs ?? 5_000;
   const forceResolveMs = options.forceResolveMs ?? 10_000;
@@ -172,10 +222,36 @@ export async function runForegroundShell(
       if (forceTimer) clearTimeout(forceTimer);
     };
 
-    const finish = (exitCode: number, signal: NodeJS.Signals | null) => {
+    /**
+     * Drop the timers, except the escalation while the group is still alive.
+     *
+     * `close` fires when the leader's pipes shut, and the leader is not the
+     * group: `(trap "" TERM; sleep 600) & sleep 600` loses its leader to the
+     * SIGTERM above and keeps the child, which holds the sandbox's CPU and can
+     * still write into a workspace after another replica has taken the run
+     * over. Cancelling the SIGKILL here is what let it: the escalation this
+     * file already implements, and the group-wide signal it already sends, were
+     * called off by the one event that does not mean the group has ended.
+     *
+     * `processGroupAlive` is the question that does mean it, and is already
+     * written here for the same reason.
+     */
+    const cleanupTimersAfterClose = () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (sigkillTimer && !processGroupAlive(shell)) clearTimeout(sigkillTimer);
+    };
+
+    const finish = (
+      exitCode: number,
+      signal: NodeJS.Signals | null,
+      /** A leader that closed: the group may outlive it, so keep the escalation. */
+      viaClose = false,
+    ) => {
       if (finished) return;
       finished = true;
-      cleanupTimers();
+      if (viaClose) cleanupTimersAfterClose();
+      else cleanupTimers();
       if (shell.status === "running") {
         shell.status = shell.timedOut ? "timed_out" : (signal ? "killed" : "exited");
       }
@@ -197,7 +273,8 @@ export async function runForegroundShell(
       });
     };
 
-    shell.process.on("close", (code, signal) => finish(code ?? (shell.timedOut ? 124 : 1), signal));
+    shell.process.on("close", (code, signal) =>
+      finish(code ?? (shell.timedOut ? 124 : 1), signal, true));
     shell.process.on("error", () => finish(1, null));
 
     if (options.timeoutMs > 0) {
@@ -214,6 +291,72 @@ export async function runForegroundShell(
       }, options.timeoutMs);
     }
   });
+}
+
+/**
+ * Whether anything in the shell's process group is still running.
+ *
+ * The leader's own exit status is not the answer: a descendant that stayed in
+ * the group outlives it, and reading the leader alone reports the group gone
+ * while a detached child still holds the sandbox's CPU.
+ *
+ * Signal 0 is not the answer either. A terminated leader whose parent has not
+ * yet collected it keeps a process-table entry, so the whole group answers
+ * deliverable for as long as that lasts -- which would report a shell that did
+ * stop as surviving. Membership is read from the process table instead, and a
+ * member in the terminated state is not a member that is running.
+ */
+export function processGroupAlive(shell: ManagedShell): boolean {
+  if (!shell.pid) return false;
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    // Unreadable is not empty: signal 0 is the coarser answer, and its bias is
+    // towards reporting the group alive, which is the safe direction here.
+    return groupSignalable(shell.pid);
+  }
+  for (const entry of entries) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const member = readProcessGroupState(pid);
+    if (!member || member.pgrp !== shell.pid || member.state === "Z") continue;
+    // Membership alone, deliberately. This is the liveness question -- is
+    // anything still running -- and the group marker cannot be asked here: a
+    // child that sanitises its own environment (`env -u`, `env -i`, a re-exec
+    // through sudo) keeps running and stops carrying it, and `/proc/<pid>/
+    // environ` is unreadable across uids at all, which configured child
+    // isolation makes the ordinary case. Either would turn live work into a
+    // group reported dead, which is the whole defect this file exists to
+    // prevent. The marker narrows *whom to signal*, never *whether anything is
+    // there*; the two questions want opposite answers when the evidence cannot
+    // be read.
+    return true;
+  }
+  return false;
+}
+
+function groupSignalable(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM is a group alive and not ours to signal, which is still alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The state letter and process-group of one entry, or null where unreadable. */
+function readProcessGroupState(pid: number): { state: string; pgrp: number } | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Fields after the command, which is parenthesised and may itself contain
+    // spaces: state is the first, process-group the third.
+    const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { state: after[0], pgrp: Number(after[2]) };
+  } catch {
+    return null;
+  }
 }
 
 /** Terminate the full process group, falling back to the direct child PID. */

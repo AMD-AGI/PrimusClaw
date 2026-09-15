@@ -45,8 +45,8 @@ function taskIdFromLease(request: ExecuteRequest): { id: string | null; shapeMis
  * The identity this run is tracked under. Total over every combination of
  * present, absent and empty across `task_id` and `message_id`.
  *
- * Independent of `TaskRunner.runId`, which decides which sandbox shells a
- * redelivered attempt re-adopts: the tiers below would change that answer.
+ * Independent of `TaskRunner.runId`, which keys background-start rows across
+ * redeliveries: the tiers below would change which rows an attempt can find.
  */
 export function resolveRunIdentity(
   request: ExecuteRequest,

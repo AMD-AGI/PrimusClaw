@@ -502,6 +502,39 @@ test("a chat turn leaves its background shells running", async () => {
   assert.ok(!r.calls.includes("hands.reapShells"), "the next turn is expected to poll them");
 });
 
+for (const taskId of [undefined, "task-chat"]) {
+  for (const resumed of [false, true]) {
+    test(`chat client keeps its row identity with task ${taskId ?? "absent"}, resumed ${resumed}`, async () => {
+      const constructed: Parameters<TaskRunnerSideEffects["makeHandsClient"]>[] = [];
+      const deadline = new Date(Date.now() + 60_000).toISOString();
+      const r = await runScenario({
+        taskId,
+        request: { deadline_at: deadline },
+        deliveryCount: resumed ? 2 : 1,
+        ...(resumed ? { seedCheckpoint: {} } : {}),
+        engineBehavior: attachThen(async () => result()),
+        sideEffects: {
+          makeHandsClient: (...args) => {
+            constructed.push(args);
+            return {
+              close: async () => {},
+              reconcileOutstandingStarts: async () => ({ confirmed: [], released: [], unresolved: [] }),
+            } as never;
+          },
+        },
+      });
+
+      assert.deepEqual(r.verdicts, ["ack"]);
+      assert.equal(constructed.length, 1);
+      const [, , owner, rowRun, deadlineAt, shellRun] = constructed[0];
+      assert.equal(owner, SESSION);
+      assert.equal(rowRun, taskId ?? MESSAGE);
+      assert.equal(deadlineAt, deadline);
+      assert.equal(shellRun, "");
+    });
+  }
+}
+
 test("the shells are asked for once, however many steps could ask", async () => {
   // Two steps of a successful node want them stopped: the snapshot, so it is not
   // read from underneath a running process, and the release on the way out. The

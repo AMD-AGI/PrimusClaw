@@ -18,7 +18,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ExecuteRequest } from "@claw/protocol";
 
-const { pickLockKey, pickRunScope } = await import("../src/tasks/lock.js");
+const { pickLockKey, pickRunScope, pickShellRun } = await import("../src/tasks/lock.js");
 
 function req(over: Record<string, unknown> = {}): ExecuteRequest {
   return {
@@ -76,4 +76,63 @@ test("G4 background shells stay addressable per conversation, not per workspace"
   assert.equal(mine, "sess-1");
   assert.equal(pickRunScope(req({ ...shared, dag_root_task_id: "root-7" })), "root-7",
     "a DAG's nodes share one scope, since a node inherits the sandbox upstream left");
+});
+
+test("a conversation's shells are filed under no run, so the next turn can reach them", () => {
+  const turnOne = pickShellRun(req({ session_id: "s-1", task_id: "ktsk_turn_1" }));
+  const turnTwo = pickShellRun(req({ session_id: "s-1", task_id: "ktsk_turn_2" }));
+
+  assert.equal(turnOne, "", "no run: the third state Hands documents for shells that outlive one");
+  assert.equal(turnOne, turnTwo,
+    "two turns of one conversation address the same shells, which is the point of "
+      + "starting one in the background");
+});
+
+test("a DAG node's shells stay filed under the node, so a sibling cannot reach them", () => {
+  const node = pickShellRun(req({
+    session_id: "s-1", task_id: "ktsk_node_a", dag_root_task_id: "ktsk_root", dag_node_id: "a",
+  }));
+  const sibling = pickShellRun(req({
+    session_id: "s-1", task_id: "ktsk_node_b", dag_root_task_id: "ktsk_root", dag_node_id: "b",
+  }));
+
+  assert.equal(node, "ktsk_node_a", "a node's shells are its own, and its report reaps them");
+  assert.notEqual(node, sibling,
+    "a sibling under one graph root is not entitled to the other's work");
+});
+
+test("a DAG node named only by its node id is still a node", () => {
+  // Both fields carry the same fact and a request may arrive with either, so a
+  // check on one alone files half of them as a conversation's -- shells a
+  // sibling could then reach and no node report would reap.
+  assert.equal(
+    pickShellRun(req({ session_id: "s-1", task_id: "ktsk_n", dag_node_id: "a" })),
+    "ktsk_n",
+  );
+  assert.equal(
+    pickShellRun(req({ session_id: "s-1", task_id: "ktsk_n", dag_root_task_id: "r" })),
+    "ktsk_n",
+  );
+});
+
+test("a DAG node without a task id uses its node id and stays separate from siblings", () => {
+  for (const task_id of [undefined, ""]) {
+    for (const dag_root_task_id of [undefined, "root-1"]) {
+      const fields = { task_id, dag_root_task_id };
+      assert.equal(pickShellRun(req({ ...fields, dag_node_id: "node-a" })), "node-a");
+      assert.equal(pickShellRun(req({ ...fields, dag_node_id: "node-b" })), "node-b");
+    }
+  }
+});
+
+test("a DAG request without a task or node id cannot use the conversation shell scope", () => {
+  for (const task_id of [undefined, ""]) {
+    for (const dag_node_id of [undefined, ""]) {
+      assert.throws(
+        () => pickShellRun(req({ task_id, dag_node_id, dag_root_task_id: "root-1" })),
+        /DAG shell scope requires a non-empty task_id or dag_node_id/,
+      );
+    }
+  }
+  assert.equal(pickShellRun(req()), "");
 });

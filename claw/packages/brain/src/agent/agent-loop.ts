@@ -31,7 +31,7 @@ import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
-import { whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
+import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
@@ -44,6 +44,22 @@ const logger = pino({ name: "agent-loop" });
  * in one is time the run holds a slot without using it.
  */
 const WAITING_TOOLS = new Set(["wait"]);
+
+/**
+ * The classes a `wait` can still block in.
+ *
+ * The sandbox blocks for as long as the shell's registry entry reads running,
+ * and that is as true of a shell whose epoch could not be read
+ * (`unverified_running`) or whose attachment never landed
+ * (`spawn_indeterminate`) as of a plain `running` one: the process is that
+ * sandbox's own child and the exit event is still coming. Reading either as
+ * settled held the pod's execution slot for the whole wait timeout of a call
+ * that really blocked. The error the other way -- one of those classes whose
+ * registry entry is already gone, so the call is answered at once -- costs a
+ * park/unpark round trip around a call that did not block, which is the trade
+ * an unreadable sandbox already takes by reading as running.
+ */
+const BLOCKING_SHELL_CLASSES = new Set(["running", "unverified_running", "spawn_indeterminate"]);
 
 /**
  * Detect upstream-connect failures that LiteLLM mis-classifies as 401
@@ -192,6 +208,8 @@ export interface ToolStats {
   total_calls: number;
   error_calls: number;
   by_tool: Record<string, number>;
+  /** Calls of each tool that came back without an error; see toolOkByName. */
+  by_tool_ok?: Record<string, number>;
 }
 
 export interface LoopResult {
@@ -599,6 +617,17 @@ class AgentLoopRunner {
   private usage: TokenUsage;
   private errorCount: number;
   private toolCallsByName: Record<string, number>;
+  /**
+   * Calls of each tool that reached the sandbox and came back without an error.
+   *
+   * Separate from the attempt count above, which is incremented before the tool
+   * runs: a pre-hook rejection, a refusal, or a command that failed all leave
+   * that count raised and nothing done. A caller asking "did this actually
+   * happen" -- a rollout gate proving a sandbox was touched -- has to read a
+   * number the tool machinery produces after the fact, not one the model's own
+   * text can be made to imply.
+   */
+  private toolOkByName: Record<string, number>;
   private totalToolCalls: number;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
@@ -722,6 +751,13 @@ class AgentLoopRunner {
       ? { ...resumeFrom.usage }
       : { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 };
     this.errorCount = resumeFrom?.error_count ?? 0;
+    // Restored beside its attempt count, not reset: the two are reported as one
+    // run's `by_tool` / `by_tool_ok`, so carrying only the attempts would ship a
+    // pair describing different spans. See CheckpointState.tool_ok_by_name for
+    // why an absent field stays empty rather than being inferred.
+    this.toolOkByName = resumeFrom?.tool_ok_by_name
+      ? { ...resumeFrom.tool_ok_by_name }
+      : {};
     this.toolCallsByName = resumeFrom
       ? { ...resumeFrom.tool_calls_by_name }
       : {};
@@ -808,7 +844,10 @@ class AgentLoopRunner {
       tokenUsage: this.usage,
       turns: this.turnsExecuted,
       errorCount: this.errorCount,
-      toolStats: { total_calls: this.totalToolCalls, error_calls: this.errorCount, by_tool: this.toolCallsByName },
+      toolStats: {
+        total_calls: this.totalToolCalls, error_calls: this.errorCount,
+        by_tool: this.toolCallsByName, by_tool_ok: this.toolOkByName,
+      },
       elapsedMs: Date.now() - this.startTime,
     };
   }
@@ -822,6 +861,40 @@ class AgentLoopRunner {
       filtered = filtered.filter((t) => PLAN_MODE_ALLOWLIST.has(t.name));
     }
     return filtered;
+  }
+
+  private runIdentityKeyFor(site: "approval" | "background_command"): RunIdentity["key"] | undefined {
+    const key = this.opts.runIdentity?.key;
+    const ownsSlot = this.waitMode === "timed+park";
+    if (!key) {
+      if (ownsSlot) {
+        metrics.onParkKeyUnusable(site, "absent");
+        logger.warn({ site, sessionId: this.sessionId }, "park.key_unavailable");
+      }
+      return undefined;
+    }
+    if (ownsSlot && !isTrackedRun(key)) {
+      metrics.onParkKeyUnusable(site, "untracked");
+      logger.warn({ site, sessionId: this.sessionId, runIdentityKey: key }, "park.key_untracked");
+    }
+    return key;
+  }
+
+  /**
+   * Whether a `wait` on this shell can block, from a non-consuming read.
+   *
+   * Only a class this sandbox still owes an exit event for can: the ones in
+   * BLOCKING_SHELL_CLASSES, and `ended_unreaped` inside the window where the
+   * collecting process is alive and the event is pending. Everything else --
+   * finished, lost, unknown, an exit whose collector is gone -- is already
+   * settled and is answered at once, so no slot is released for it.
+   */
+  private async waitCanBlock(input: Record<string, unknown>): Promise<boolean> {
+    const shellId = input.shell_id;
+    if (typeof shellId !== "string" || !shellId) return false;
+    const probe = await this.router.classifyShell(shellId);
+    return BLOCKING_SHELL_CLASSES.has(probe.shellClass)
+      || (probe.shellClass === "ended_unreaped" && probe.collectorLive);
   }
 
   private async emitSandboxStatus(
@@ -1529,6 +1602,7 @@ class AgentLoopRunner {
           text_parts: [...this.textParts],
           error_count: this.errorCount,
           tool_calls_by_name: { ...this.toolCallsByName },
+          tool_ok_by_name: { ...this.toolOkByName },
           total_tool_calls: this.totalToolCalls,
           elapsed_ms_before: Date.now() - this.startTime,
           setup_commands: [...this.setupCommands],
@@ -1673,7 +1747,7 @@ class AgentLoopRunner {
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
       const hitlResult = this.opts.hitl.willAsk(toolName)
-        ? await whileWaiting(this.opts.runIdentity?.key, "approval", this.waitMode, decide)
+        ? await whileWaiting(this.runIdentityKeyFor("approval"), "approval", this.waitMode, decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
           const reason = `Error: ${hitlResult.reason}`;
@@ -1792,14 +1866,29 @@ class AgentLoopRunner {
 
       const toolStart = Date.now();
       let resultText: string;
+      let toolOutcome = { isError: false };
       try {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
       // executing split exists to measure.
-      resultText = WAITING_TOOLS.has(toolName)
-        ? await whileWaiting(this.opts.runIdentity?.key, "background_command", this.waitMode, () =>
-            this.router.route(toolName, finalInput, this.signal))
-        : await this.router.route(toolName, finalInput, this.signal);
+      // Filled by the router from the tool's own result, so what counts as
+      // success is the tool's answer rather than the shape of its wording.
+      const outcome = { isError: false };
+      // The model-issued tool-use identifier. Sealed onto the reference row
+      // before the dispatch, so a resumed run recognises its own retry of this
+      // exact call rather than one that merely produced the same command.
+      const stepCtx = { stepIdentity: toolId };
+      // Whether this call can block at all, decided before it is routed and
+      // from the shell's class rather than from the tool's name. Parking a run
+      // for a shell that can never produce an exit event hands the pod's
+      // execution slot away for nothing; the read is separate from the poll so
+      // it moves no output offset.
+      const parks = WAITING_TOOLS.has(toolName) && await this.waitCanBlock(finalInput);
+      resultText = parks
+        ? await whileWaiting(this.runIdentityKeyFor("background_command"), "background_command", this.waitMode, () =>
+            this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
+        : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
+      toolOutcome = outcome;
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result
         // text describes a business-level failure (exit != 0), which still came
@@ -1831,6 +1920,11 @@ class AgentLoopRunner {
           "tool.result",
         );
       } catch (err: any) {
+        // A call that threw is a call that did not happen. Left at its
+        // optimistic default the outcome would fall through to the success
+        // count below, which is the one place a transport failure could be
+        // recorded as work the sandbox did.
+        toolOutcome.isError = true;
         // Both the name and the arguments as sent, because the deadline the
         // message reports is built from the two together: the tool decides the
         // ceiling a timeout argument is clamped to, and whether any of this is
@@ -1869,6 +1963,12 @@ class AgentLoopRunner {
       // `start` (above); not re-sending it halves bytes vs always-double
       // serialising args without breaking the frontend reducer (which
       // matches by actionId and updates description on success/error).
+      // Counted from the tool's own error bit, not from the attempt and not
+      // from the wording: a failure's phrasing is the tool's to choose, and a
+      // prefix match counts every one it did not anticipate as a success.
+      if (!toolOutcome.isError) {
+        this.toolOkByName[toolName] = (this.toolOkByName[toolName] || 0) + 1;
+      }
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),

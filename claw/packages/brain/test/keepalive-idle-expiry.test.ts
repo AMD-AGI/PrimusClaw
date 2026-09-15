@@ -61,7 +61,7 @@ const idle = async () => 0;
  * get past the first.
  */
 async function sweepTwice(kv: KV): Promise<void> {
-  await runKeepaliveTickForTest({ kv, countActiveShells: idle });
+  await runKeepaliveTickForTest({ kv, countActiveShells: idle, now: () => 0 });
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest({ kv, countActiveShells: idle });
 }
@@ -94,6 +94,8 @@ function stubPingableProvider(): void {
 function fakeKv(opts: { runLease?: boolean } = {}): { kv: KV; deleted: string[]; updated: number[] } {
   const deleted: string[] = [];
   const updated: number[] = [];
+  let value = sc.encode(JSON.stringify(ENTRY));
+  let revision = 5;
   const kv = {
     // Honour the filter. A stub that yields everything makes getRetryPending's
     // `retry-pending.>` scan match the sandbox key, decode it as an expired
@@ -113,11 +115,16 @@ function fakeKv(opts: { runLease?: boolean } = {}): { kv: KV; deleted: string[];
         return { key, value: sc.encode("{}"), revision: 1 };
       }
       if (key !== `hands.${SESSION}` || deleted.includes(key)) return null;
-      return { key, value: sc.encode(JSON.stringify(ENTRY)), revision: 5 };
+      return { key, value, revision };
     },
     async delete(key: string) { deleted.push(key); },
     async put() { return 1; },
-    async update(_k: string, _v: unknown, rev: number) { updated.push(rev); return rev + 1; },
+    async update(_k: string, next: Uint8Array, rev: number) {
+      if (rev !== revision) throw new Error("revision conflict");
+      updated.push(rev);
+      value = next;
+      return ++revision;
+    },
   } as unknown as KV;
   return { kv, deleted, updated };
 }
