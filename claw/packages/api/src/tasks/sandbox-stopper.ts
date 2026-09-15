@@ -37,6 +37,29 @@ const logger = pino({ name: "sandbox-stopper" });
 const SAFE_STOP_TIMEOUT_MS = 15_000;
 
 /**
+ * Ceiling on establishing sole ownership before a stop.
+ *
+ * The check enumerates the registry and leader-reads it, and the SDK's ordered
+ * consumer will rebuild and retry indefinitely when JetStream is unavailable
+ * while the core connection stays healthy -- the iterator simply never ends.
+ * Without a ceiling that hangs the cancel request, and with it the interrupt,
+ * which the route publishes only after `cancelTask` returns: the row reads
+ * cancelled while Brain is never told, which is a worse outcome than either
+ * answer this check can give.
+ *
+ * Expiring is not a failure to report -- it is the same unknown as a failed
+ * read, and takes the same conservative answer: decline to stop.
+ *
+ * Sized against the healthy cost, which is one leader read per other DAG: a
+ * registry holding tens of DAGs settles far inside this, and one holding
+ * thousands would not. That is the wrong way to find out, so if this starts
+ * expiring the answer is the workload-keyed ownership record described on
+ * `otherDagHolding`, not a larger number here -- expiry leaks (visibly), and
+ * raising it trades that for hung cancels.
+ */
+const SHARED_CHECK_TIMEOUT_MS = 10_000;
+
+/**
  * How many times a handle removal re-reads a row that moved under it. Each
  * retry means a concurrent registration landed, which is rare and self-
  * limiting; a row that will not settle is a broken invariant, not a busy one,
@@ -800,7 +823,11 @@ export async function stopSandboxByHandle(
   // which is the same direction every other unknown on this path takes.
   let heldElsewhere: string | null;
   try {
-    heldElsewhere = await otherDagHolding(dagRootTaskId, wid);
+    heldElsewhere = await withDeadline(
+      otherDagHolding(dagRootTaskId, wid),
+      SHARED_CHECK_TIMEOUT_MS,
+      `shared-holder check for ${wid}`,
+    );
   } catch (e) {
     logger.warn(
       { dagRootTaskId, handleName, workloadId: wid, err: errText(e) },
@@ -877,6 +904,26 @@ async function rememberOutcome(
     );
     return false;
   }
+}
+
+/**
+ * Reject if `work` has not settled within `ms`.
+ *
+ * The underlying operation is not cancelled -- there is nothing to cancel an
+ * in-flight ordered consumer with here -- so this bounds what the CALLER waits
+ * for, not what the cluster does. That is the property needed: a cancel must
+ * not be held open by a registry scan, whatever the scan goes on doing.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    work.finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms}ms`)), ms);
+      // Never hold the process open for this timer alone.
+      timer.unref?.();
+    }),
+  ]);
 }
 
 /**

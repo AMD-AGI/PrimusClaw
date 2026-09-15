@@ -27,6 +27,7 @@
  *   L8 and one nobody else holds still is
  *   L9 a co-holder dropped by the scan does not permit the stop
  *   L10 an enumeration ended by a closed connection does not permit the stop
+ *   L11 a scan that hangs does not hold the cancel open
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -376,4 +377,31 @@ test("L10 an enumeration that ended on a closed connection does not permit the s
     "an enumeration that cannot be trusted must not be read as sole ownership",
   );
   assert.equal(released, "unconfirmed");
+});
+
+test("L11 a shared-holder check that hangs does not hold the cancel open", async () => {
+  // The SDK's ordered consumer rebuilds and retries indefinitely when
+  // JetStream is unavailable while the core connection stays healthy, so the
+  // enumeration simply never ends. Unbounded, that hangs the cancel request --
+  // and with it the interrupt, which the route publishes only after
+  // `cancelTask` returns. The row would read cancelled while Brain was never
+  // told, which is worse than either answer this check can give.
+  //
+  // Expiring is the same unknown as a failed read and takes the same
+  // conservative answer: decline to stop.
+  db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
+  handleFor("dag-1", "w-shared");
+  handleRegistry.listAll = async () => [["dag-1", { main: { workload_id: "w-shared" } }]];
+  handleRegistry.listDagRoots = () => new Promise(() => { /* never settles */ });
+
+  const started = process.hrtime.bigint();
+  const released = await stopAllHandlesForDag("dag-1", "s-1");
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.equal(released, "unconfirmed", "an unestablished ownership declines to stop");
+  assert.deepEqual(stopped, [], "and issues no stop on the strength of a scan that never finished");
+  assert.ok(
+    elapsedMs < 30_000,
+    `the cancel must not wait on the scan indefinitely (waited ${Math.round(elapsedMs)}ms)`,
+  );
 });

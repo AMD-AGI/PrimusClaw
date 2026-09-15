@@ -37,7 +37,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { lookupDagHandle, replaceDagHandle } from "./handles.js";
+import { lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -1106,6 +1106,20 @@ async function provisionHands(
         provider: "safe-workload", id: workloadId, sandboxName: workloadId,
         namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
       }).catch(() => {});
+      // The handle written moments ago names the workload just stopped, and
+      // this rollback is the only thing that will ever look at it: no session
+      // entry was written, so `reapPendingHands` has nothing to find, and the
+      // owning task is still running so no orphan sweep reaches it either.
+      // Left behind, the next attempt's registration is refused -- the name
+      // still points at a workload on record -- and rolled back in turn, so a
+      // recovered KV never recovers the task. Whoever stops a workload frees
+      // its handle; this path stops one too.
+      await releaseHandlesForWorkload(workloadId).catch((e) => {
+        logger.error(
+          { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
+          "dag-handles.pending_rollback_release_failed",
+        );
+      });
       throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
     }
     logger.info({ sessionId, workloadId }, "hands.kv.pending");
