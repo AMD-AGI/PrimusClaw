@@ -685,6 +685,37 @@ export async function stopSandboxByHandle(
     return "unconfirmed";
   }
 
+  // A workload two DAGs hold is not this one's to stop. Reuse registers the
+  // adopting DAG's own handle against the same workload, so D1 finishing or
+  // being cancelled while D2 runs on the sandbox it adopted would otherwise
+  // stop it out from under D2 -- sequentially, with no race, because that is
+  // what session reuse is for.
+  //
+  // Checked against the registry rather than inferred: this DAG's entry is
+  // already gone by here, so anything still naming the workload is somebody
+  // else's. A read that fails answers `unconfirmed` rather than guessing,
+  // which is the same direction every other unknown on this path takes.
+  let heldElsewhere: string | null;
+  try {
+    heldElsewhere = await otherDagHolding(dagRootTaskId, wid);
+  } catch (e) {
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: wid, err: errText(e) },
+      "sandbox.shared_check_failed",
+    );
+    return "unconfirmed";
+  }
+  if (heldElsewhere) {
+    // Not a failure and not a release: this DAG has let go, and the workload
+    // is still legitimately held. `unconfirmed` because nothing here
+    // established that it is gone -- it demonstrably is not.
+    logger.info(
+      { dagRootTaskId, handleName, workloadId: wid, alsoHeldBy: heldElsewhere },
+      "sandbox.stop_skipped_shared",
+    );
+    return "unconfirmed";
+  }
+
   let released: ReleaseOutcome;
   try {
     const platformKey = await loadPlatformKeyForSession(sessionId);
@@ -743,6 +774,27 @@ async function rememberOutcome(
     );
     return false;
   }
+}
+
+/**
+ * The first other DAG whose handles still name `workloadId`, or null.
+ *
+ * Only DAGs other than this one: this DAG's own entry is removed before the
+ * stop, so its absence here is expected and its presence would be a stale read
+ * rather than a second holder.
+ */
+async function otherDagHolding(
+  dagRootTaskId: string,
+  workloadId: string,
+): Promise<string | null> {
+  if (!workloadId) return null;
+  for (const [dagRoot, handles] of await handleRegistry.listAll()) {
+    if (dagRoot === dagRootTaskId) continue;
+    for (const info of Object.values(handles)) {
+      if (info.workload_id === workloadId) return dagRoot;
+    }
+  }
+  return null;
 }
 
 /**

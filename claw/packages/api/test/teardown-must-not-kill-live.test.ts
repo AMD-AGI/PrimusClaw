@@ -23,6 +23,8 @@
  *   L4 and is torn down once the siblings are terminal
  *   L5 a sandbox the NEXT task in the session is reusing is not reaped
  *   L6 re-cancelling a finished DAG does not stop what a newer DAG reuses
+ *   L7 a workload another DAG still holds is not stopped by this one's teardown
+ *   L8 and one nobody else holds still is
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -32,6 +34,7 @@ process.env.SAFE_API_URL = "http://safe.test";
 const { db } = await import("../src/infra/db.js");
 const { handleRegistry, unreleasedRecord } = await import("../src/tasks/sandbox-stopper.js");
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
+const { stopAllHandlesForDag } = await import("../src/tasks/sandbox-stopper.js");
 const { cancelTask } = await import("../src/tasks/lifecycle.js");
 const { applyAgentDone } = await import("../src/tasks/lifecycle.js");
 
@@ -277,4 +280,43 @@ test("L6 re-cancelling a finished DAG does not stop what a newer DAG reuses", as
     "released" in r, false,
     "and it must not claim a release it did not perform -- `confirmed` here named a workload it had just killed",
   );
+});
+
+test("L7 a workload another DAG still holds is not stopped by this one's teardown", async () => {
+  // Reuse registers the adopting DAG's own handle against the same workload,
+  // so a sandbox can legitimately be held by two DAGs at once. D1 being
+  // cancelled -- or simply finishing -- would then stop the sandbox D2 is
+  // running on. Sequential, no race: it is what session reuse is for.
+  db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
+  // The destroy really removes it, so the end-of-teardown re-read sees an
+  // empty DAG. A stub that kept answering would decide the outcome for the
+  // re-read's reason instead of for anything about sharing.
+  handleFor("dag-1", "w-shared");
+  handleRegistry.listAll = async () => [
+    // D2 adopted the same workload and registered its own reference.
+    ["dag-2", { main: { workload_id: "w-shared" } }],
+  ];
+
+  const released = await stopAllHandlesForDag("dag-1", "s-1");
+
+  assert.deepEqual(stopped, [], "the sandbox D2 is running on must survive D1's teardown");
+  assert.equal(
+    released, "unconfirmed",
+    "this DAG let go and the workload is still held -- not a failure, and not a release",
+  );
+});
+
+test("L8 and one nobody else holds still is stopped", async () => {
+  // The guard must not become "never stop anything": with no other holder the
+  // teardown proceeds exactly as before.
+  db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
+  handleFor("dag-1", "w-solo");
+  handleRegistry.listAll = async () => [
+    ["dag-2", { other: { workload_id: "w-unrelated" } }],
+  ];
+
+  const released = await stopAllHandlesForDag("dag-1", "s-1");
+
+  assert.deepEqual(stopped, ["w-solo"]);
+  assert.equal(released, "confirmed");
 });

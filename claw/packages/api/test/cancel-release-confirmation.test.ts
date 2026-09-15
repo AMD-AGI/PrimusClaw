@@ -148,6 +148,13 @@ function stubHandles(handles: Record<string, string>): void {
     live.delete(name);
     return wid;
   };
+  // The teardown asks the whole registry whether another DAG still holds the
+  // workload before stopping it. These tests are about one DAG, so the answer
+  // is "nobody else" -- but it has to be answered, or the check reads as an
+  // unreadable registry and every outcome below collapses to `unconfirmed`.
+  handleRegistry.listAll = async () => [
+    ["t-root", Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]))],
+  ];
 }
 
 /**
@@ -292,6 +299,7 @@ test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_he
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
   handleRegistry.lookup = async () => ({ workload_id: "" });
   handleRegistry.destroy = async () => "";
+  handleRegistry.listAll = async () => [];
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal(await stopSandboxByHandle("t-root", "main", "s-1"), "unconfirmed");
@@ -585,6 +593,7 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
   handleRegistry.lookup = async (_dag: string, name: string) =>
     live.has(name) ? { workload_id: live.get(name)! } : null;
+  handleRegistry.listAll = async () => [];
   const destroyed: string[] = [];
   handleRegistry.destroy = async (_dag: string, name: string) => {
     destroyed.push(name);
@@ -632,6 +641,7 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
   handleRegistry.lookup = async () => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => { throw new Error("nats: request timeout"); };
+  handleRegistry.listAll = async () => [];
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
