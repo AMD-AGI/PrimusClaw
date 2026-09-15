@@ -40,6 +40,32 @@ const SAFE_SKILL_NAME = /^[A-Za-z0-9._-]+$/;
  * directory owned by somebody else, or one left readable/writable by group or
  * other. `process.getuid` is absent on Windows, where the ownership half of
  * this simply does not apply; the mode check still runs.
+ *
+ * The one case that is not an attack, and must not strand the host, is a
+ * group/other-open directory that is demonstrably *ours*. Brain releases from
+ * before this hardening created `<tmp>/claw-plugin-work` with
+ * `fs.mkdirSync(root, { recursive: true })` -- no mode, so 0o777 & ~umask:
+ * 0755 on a stock umask 022 host, 0775 under Ubuntu's 002. AgentEngine
+ * .execute() deletes only the per-session child in its `finally`, so that
+ * parent outlives the process, and anywhere os.tmpdir() outlives a restart --
+ * `tsx watch` in development (scripts/start-brain.sh), a bare-metal or systemd
+ * install, a container run with /tmp bind-mounted -- the first plugin request
+ * after the upgrade finds it still sitting there. Refusing it would then fail
+ * every later plugin request as well, brand-new sessions included, and the
+ * refusal happens before AgentEngine.execute opens its try/finally, so the run
+ * dies at the caller with nothing cleaned up. The only escape would be a
+ * manual `rm -rf` on every affected host.
+ *
+ * Tightening it in place is safe precisely *because* the ownership check above
+ * has already passed: another local account cannot produce a directory owned
+ * by us, so a group/other-open directory we own was created by us (or by root,
+ * who has no need of this attack). We chmod to 0700 and then re-check from a
+ * fresh lstat, so a chmod that does not take hold still fails closed. Anything
+ * planted inside the directory while it was open is still caught downstream:
+ * the caller runs this on every component below it as well, and the staging
+ * leaf is an mkdtemp that refuses to reuse an existing name. What must never
+ * be repaired is a directory owned by somebody *else* -- that is the attack
+ * this function exists to stop, and it stays a hard failure above.
  */
 function assertPrivateDir(dir: string): void {
   // lstat, never stat: the whole point is to see the symlink rather than
@@ -53,7 +79,27 @@ function assertPrivateDir(dir: string): void {
     throw new Error(`plugin work dir is owned by uid ${st.uid}, not ${uid}: ${dir}`);
   }
   if ((st.mode & 0o077) !== 0) {
-    throw new Error(`plugin work dir is accessible by other users: ${dir}`);
+    if (uid === null) {
+      // Ownership is unverifiable here, so our own leftover and somebody
+      // else's planted directory are indistinguishable. Fail closed.
+      throw new Error(`plugin work dir is accessible by other users: ${dir}`);
+    }
+    const was = (st.mode & 0o777).toString(8);
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch (err) {
+      throw new Error(
+        `plugin work dir is accessible by other users and could not be made private ` +
+          `(${(err as Error).message}); remove it and retry: ${dir}`,
+      );
+    }
+    if ((fs.lstatSync(dir).mode & 0o077) !== 0) {
+      throw new Error(
+        `plugin work dir is accessible by other users and stayed that way after chmod; ` +
+          `remove it and retry: ${dir}`,
+      );
+    }
+    logger.warn({ dir, was }, "plugin.staging_dir_tightened");
   }
 }
 
@@ -81,8 +127,11 @@ function assertPrivateDir(dir: string): void {
  * anything that already exists must pass assertPrivateDir or we stage nothing
  * at all. Failing closed here aborts the run, which is the correct outcome --
  * a /tmp in that state is either under attack or misconfigured, and silently
- * continuing would write plugin payloads somewhere we did not choose. Please
- * do not simplify this back into a single recursive mkdir.
+ * continuing would write plugin payloads somewhere we did not choose. The one
+ * exception, spelled out on assertPrivateDir, is a group/other-open directory
+ * that is already proven to be ours: that is an older release's leftover, and
+ * it gets tightened rather than turned into a permanent outage. Please do not
+ * simplify this back into a single recursive mkdir.
  */
 export function createPrivateStagingRoot(workRoot: string): string {
   const abs = path.resolve(workRoot);

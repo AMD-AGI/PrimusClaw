@@ -26,8 +26,10 @@
  *   P1 the staging root is private (0700) and so is every component we create
  *   P2 the leaf is unguessable and never reused between runs
  *   P3 a symlink planted at a predictable component is refused, not followed
- *   P4 a directory planted by "another user" (world-writable) is refused
+ *   P4 a directory owned by another local account is refused, never adopted
  *   P5 a workRoot outside the temp dir does not reject the operator's own tree
+ *   P6 an older release's own 0755 leftover is tightened, not turned into a
+ *      permanent outage
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -84,22 +86,42 @@ test("P3 a symlink planted on the predictable path is refused, not followed", ()
   fs.rmSync(base, { recursive: true, force: true });
 });
 
-test("P4 a pre-created world-writable directory is refused", () => {
+test("P4 a directory owned by another local account is refused, never adopted", () => {
   const base = freshTmpBase();
   const planted = path.join(base, "claw-plugin-work");
   fs.mkdirSync(planted, { recursive: true });
-  // Ownership cannot be faked without root, so stand in for "not ours" with
-  // the other half of the same check: open to every other local account.
   fs.chmodSync(planted, 0o777);
 
-  const workRoot = path.join(planted, "session-abc");
-  assert.throws(
-    () => createPrivateStagingRoot(workRoot),
-    /accessible by other users/,
-    "a component other users can write to must abort staging",
-  );
-  assert.equal(fs.existsSync(workRoot), false, "no session dir may be created under it");
-  fs.rmSync(base, { recursive: true, force: true });
+  // This used to stand in for "not ours" with world-writability alone, which
+  // stopped being the same thing once a group/other-open directory that IS
+  // ours became a repairable leftover (P6). So fake the other side of the
+  // comparison instead: `process.getuid` is what assertPrivateDir asks, and
+  // faking it is the same move P5 makes with `os.tmpdir`. Re-anchoring
+  // os.tmpdir() at `base` keeps the faked uid from tripping on the test's own
+  // scratch directories higher up the path before it reaches the planted one.
+  const realGetuid = process.getuid;
+  const realTmpdir = os.tmpdir;
+  const ours = realGetuid ? realGetuid() : 0;
+  (os as { tmpdir: () => string }).tmpdir = () => base;
+  (process as { getuid?: () => number }).getuid = () => ours + 1;
+  try {
+    const workRoot = path.join(planted, "session-abc");
+    assert.throws(
+      () => createPrivateStagingRoot(workRoot),
+      /owned by uid/,
+      "a component owned by another account must abort staging",
+    );
+    assert.equal(fs.existsSync(workRoot), false, "no session dir may be created under it");
+    assert.equal(
+      fs.lstatSync(planted).mode & 0o777,
+      0o777,
+      "the leftover repair must never tighten, and so adopt, somebody else's directory",
+    );
+  } finally {
+    (process as { getuid?: () => number }).getuid = realGetuid;
+    (os as { tmpdir: () => string }).tmpdir = realTmpdir;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("P5 a workRoot outside the temp dir trusts the operator's existing tree", () => {
@@ -123,4 +145,52 @@ test("P5 a workRoot outside the temp dir trusts the operator's existing tree", (
     (os as { tmpdir: () => string }).tmpdir = realTmp;
     fs.rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("P6 an older release's 0755 leftover is tightened instead of failing the run", () => {
+  // The upgrade shape, which nothing above can reach because every other test
+  // lets `claw-plugin-work` be created fresh (0700) by the code under test.
+  // Releases before this hardening created it with a bare recursive mkdir, so
+  // it landed at 0o777 & ~umask, and AgentEngine.execute()'s `finally` removes
+  // only the per-session child -- the parent survives the upgrade wherever
+  // os.tmpdir() does (`tsx watch`, bare metal, a bind-mounted /tmp). Refusing
+  // it failed every later plugin request, brand-new sessions included, from
+  // outside the engine's try/finally.
+  const base = freshTmpBase();
+  const leftover = path.join(base, "claw-plugin-work");
+  fs.mkdirSync(leftover, { recursive: true });
+  // Pinned rather than left to the ambient umask so the precondition holds on
+  // a 022 host and an 002 one alike.
+  fs.chmodSync(leftover, 0o755);
+  assert.notEqual(fs.lstatSync(leftover).mode & 0o077, 0, "precondition: leftover is not private");
+
+  const workRoot = path.join(leftover, "session-brand-new");
+  const stage = createPrivateStagingRoot(workRoot);
+
+  assert.ok(stage.startsWith(`${workRoot}${path.sep}`), "staging must proceed after the upgrade");
+  for (const dir of [leftover, workRoot, stage]) {
+    assert.equal(fs.lstatSync(dir).mode & 0o077, 0, `${dir} must end up private`);
+  }
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("P6b a symlink under a repaired leftover is still refused", () => {
+  // Tightening the parent must not buy the caller anything it could not have
+  // had: whatever was planted inside while the directory stood open is still
+  // checked component by component on the way down.
+  const base = freshTmpBase();
+  const leftover = path.join(base, "claw-plugin-work");
+  fs.mkdirSync(leftover, { recursive: true });
+  fs.chmodSync(leftover, 0o755);
+  const elsewhere = path.join(base, "attacker-target");
+  fs.mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(elsewhere, path.join(leftover, "session-abc"));
+
+  assert.throws(
+    () => createPrivateStagingRoot(path.join(leftover, "session-abc")),
+    /not a real directory/,
+    "a symlink below the repaired parent must still abort staging",
+  );
+  assert.deepEqual(fs.readdirSync(elsewhere), [], "nothing may be written through the symlink");
+  fs.rmSync(base, { recursive: true, force: true });
 });
