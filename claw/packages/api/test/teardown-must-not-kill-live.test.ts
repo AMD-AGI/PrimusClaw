@@ -26,6 +26,7 @@
  *   L7 a workload another DAG still holds is not stopped by this one's teardown
  *   L8 and one nobody else holds still is
  *   L9 a co-holder dropped by the scan does not permit the stop
+ *   L10 an enumeration ended by a closed connection does not permit the stop
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -352,5 +353,27 @@ test("L9 a co-holder dropped by the scan does not permit the stop", async () => 
   const released = await stopAllHandlesForDag("dag-1", "s-1");
 
   assert.deepEqual(stopped, [], "the sandbox D2 is running on must survive");
+  assert.equal(released, "unconfirmed");
+});
+
+test("L10 an enumeration that ended on a closed connection does not permit the stop", async () => {
+  // `for await` completing is not the same as the enumeration being complete.
+  // A connection that exhausts its reconnects and closes ends the iterator the
+  // way exhaustion does -- no error, just fewer keys -- so a truncated list
+  // reads as the whole registry: zero DAGs to leader-check, and a stop issued
+  // over a co-holder that was never delivered.
+  db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
+  handleFor("dag-1", "w-shared");
+  handleRegistry.listAll = async () => [["dag-1", { main: { workload_id: "w-shared" } }]];
+  handleRegistry.listDagRoots = async () => {
+    throw new Error("dag-handles enumeration ended on a closed connection");
+  };
+
+  const released = await stopAllHandlesForDag("dag-1", "s-1");
+
+  assert.deepEqual(
+    stopped, [],
+    "an enumeration that cannot be trusted must not be read as sole ownership",
+  );
   assert.equal(released, "unconfirmed");
 });

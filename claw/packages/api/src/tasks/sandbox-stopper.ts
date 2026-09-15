@@ -28,7 +28,7 @@ import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
-import { DAG_HANDLES_BUCKET, jsm, kvDagHandles } from "../infra/nats.js";
+import { DAG_HANDLES_BUCKET, jsm, kvDagHandles, nc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
 const logger = pino({ name: "sandbox-stopper" });
@@ -317,6 +317,21 @@ export const handleRegistry = {
     const out: string[] = [];
     for await (const key of iter) {
       if (key.startsWith(`${HANDLE_MAP_PREFIX}.`)) out.push(key.slice(HANDLE_MAP_PREFIX.length + 1));
+    }
+    // `for await` completing is not the same as the enumeration being complete.
+    // A connection that exhausts its reconnects and closes ends the iterator
+    // the way exhaustion does -- no error, just fewer keys -- so a caller that
+    // only checks for a throw reads a truncated list as the whole registry.
+    // Here that means zero DAGs to leader-check and a stop issued over a
+    // co-holder that was simply never delivered.
+    //
+    // This makes the failure loud. It does NOT make the enumeration verifiably
+    // complete: a truncation that leaves the connection healthy would still
+    // pass, and whether the server's consumer initialisation can drop a key is
+    // unverified. The guarantee this guard needs is not available from a
+    // registry keyed by DAG -- see the note on `otherDagHolding`.
+    if (nc.isClosed()) {
+      throw new Error("dag-handles enumeration ended on a closed connection");
     }
     return out;
   },
@@ -903,8 +918,22 @@ async function otherDagHolding(
   // issued. It is accepted rather than optimised because of what the two wrong
   // answers cost: a missed holder stops a sandbox another DAG is running on,
   // while the cost here is leader reads on a path that runs at teardown. A
-  // reverse index from workload to holders would make it cheap and is the
-  // right shape eventually; it is not a read-time patch.
+  // **This scan cannot be made fully correct, and should be replaced rather
+  // than hardened further.** It asks "who holds this workload" of a registry
+  // keyed by DAG, so the answer is assembled from an enumeration plus a read
+  // per entry, and every layer of that can be incomplete in a way that reads
+  // as "nobody". Two rounds of review have each found another such layer.
+  //
+  // The shape that answers it directly is ownership keyed BY WORKLOAD, with
+  // holders and state in one transactional record -- the existing Postgres row
+  // plus a holders table, coordinated under a workload row lock, so acquiring,
+  // releasing and last-holder-exits are decided in one place rather than
+  // inferred from a scan. A reverse index maintained by double-write, or a
+  // co-holder array on each DAG entry, only moves the missing window.
+  //
+  // Until then this is conservative in the direction that matters: it declines
+  // to stop when it cannot establish sole ownership, and an enumeration that
+  // ends on a closed connection raises rather than reading as empty.
   for (const dagRoot of await handleRegistry.listDagRoots()) {
     if (dagRoot === dagRootTaskId) continue;
     const authoritative = await handleRegistry.listForDagConsistent(dagRoot);
