@@ -40,7 +40,7 @@
  *   H14 releasing does not take a handle that has moved to another workload
  *   H15 a release scan that hangs does not wedge the caller
  *   H16 a rollback whose stop failed keeps the handle
- *   H17 a failed early registration leaves the workload findable either way
+ *   H17 a rollback whose first remedy fails keeps trying the other one
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -49,6 +49,7 @@ import { StringCodec } from "nats";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { rollbackUnregisterableWorkload } from "../src/sandbox/ensure-hands.js";
 import {
   bindDagHandleKvForTest,
   initDagHandles,
@@ -341,8 +342,8 @@ test("H7 the handle is registered while the workload is provisioning, not after"
   assert.notEqual(failure, "", "the early registration needs its own rollback log");
   assert.match(
     failure.slice(0, failure.indexOf("throw")),
-    /getSafeWorkloadProvider\(\)\.stop\(/,
-    "and that failure has to stop the workload before it rethrows, not just log it",
+    /await rollbackUnregisterableWorkload\(/,
+    "and that failure has to roll the workload back before it rethrows, not just log it",
   );
 });
 
@@ -513,61 +514,78 @@ test("H15 a release scan that hangs does not wedge the caller", async () => {
 });
 
 test("H16 a rollback whose stop failed keeps the handle", async () => {
-  // The failure branch my own previous fix introduced. Releasing the handle
+  // The failure branch my own earlier fix introduced. Releasing the handle
   // after a stop that did NOT land leaves a workload that exists with no
   // handle and no session entry -- findable by nothing, and strictly worse
   // than the stuck retry the release was added to prevent.
-  //
-  // Asserted on the source, because reaching that branch through `ensureHands`
-  // needs a provider, a cluster and three failed KV writes. What matters is
-  // structural and checkable here: the release is guarded by whether the stop
-  // succeeded, and the stop's failure is recorded rather than swallowed.
-  const src = readFileSync(
-    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
-    "utf-8",
-  );
-  const from = src.indexOf("pending_put_failed_rollback");
-  const block = src.slice(from, src.indexOf("throw new Error(`KV pending write failed", from));
-
-  assert.match(block, /pending_rollback_stop_failed/,
-    "a stop that did not land has to be recorded, not swallowed");
-  assert.match(block, /if \(stopped\) \{[\s\S]*?releaseHandlesForWorkload/,
-    "and the handle is only freed when the stop actually landed");
-  assert.equal(
-    /\}\)\.catch\(\(\) => \{\}\);[\s\S]*?releaseHandlesForWorkload/.test(block), false,
-    "the swallowing form must not come back",
-  );
+  const r = await rollbackCase({ stopFails: 99, putFails: 0 });
+  assert.equal(r.calls.release, 0, "a stop that never landed must not free the handle");
+  assert.equal(r.outcome, "recorded");
 });
 
-test("H17 a failed early registration leaves the workload findable either way", async () => {
-  // The sibling I missed when I gated the OTHER rollback on whether the stop
-  // landed. This branch runs when the early registration fails, and it returns
-  // before the session entry is written -- a consequence of ordering the
-  // handle write first -- so whatever it leaves behind is the only record.
-  //
-  // The registration failing does not say WHY, and the two reasons need
-  // opposite things:
-  //   - refused, because the name still belongs to an older workload: this
-  //     workload has no handle and never will, so a stop that FAILS must leave
-  //     a pending session entry for `reapPendingHands` to retry;
-  //   - committed but its ACK lost: the handle names THIS workload, so a stop
-  //     that SUCCEEDS must free the name, or every later attempt is refused
-  //     against a corpse.
-  const src = readFileSync(
-    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
-    "utf-8",
-  );
-  const from = src.indexOf("dag-handles.pending_register_failed_rollback");
-  const block = src.slice(from, src.indexOf("DAG handle registration failed", from));
 
-  assert.match(block, /pending_register_rollback_stop_failed/,
-    "a stop that did not land is recorded, not swallowed");
-  assert.match(block, /if \(stopped\) \{[\s\S]*?releaseHandlesForWorkload/,
-    "a stop that landed frees the name, for the lost-ACK case");
-  assert.match(block, /\} else \{[\s\S]*?kv\.put\(`hands\.\$\{sessionId\}`/,
-    "a stop that failed leaves a pending entry, so the workload stays findable");
-  assert.equal(
-    /stop\(\{[\s\S]*?\}\)\.catch\(\(\) => \{\}\)/.test(block), false,
-    "the swallowing form must not come back",
-  );
+const rollbackCase = async (opts: {
+  stopFails: number; putFails: number; releaseFails?: number;
+}) => {
+  const calls = { stop: 0, put: 0, release: 0 };
+  const puts: string[] = [];
+  const outcome = await rollbackUnregisterableWorkload({
+    sessionId: "s1", workloadId: "W1", namespace: "ns", platformKey: "pk",
+    pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W1" })),
+    kv: {
+      async put(key: string) {
+        calls.put += 1;
+        if (calls.put <= opts.putFails) throw new Error("kv down");
+        puts.push(key);
+        return 1;
+      },
+    },
+    deps: {
+      async stop() {
+        calls.stop += 1;
+        if (calls.stop <= opts.stopFails) throw new Error("503 from SaFE");
+      },
+      async release() {
+        calls.release += 1;
+        if (calls.release <= (opts.releaseFails ?? 0)) throw new Error("kv down");
+      },
+    },
+  });
+  return { outcome, calls, puts };
+};
+
+test("H17 a rollback whose first remedy fails keeps trying the other one", async () => {
+  // Round 28 found the hole this closes. The branch that runs when the early
+  // registration fails returns BEFORE the caller writes the session entry, so
+  // whatever it leaves behind is the only record of a workload that is running.
+  // It had one shot at each remedy, where the normal pending write gets three:
+  // a 503 from SaFE plus a single transient KV error left the workload live
+  // with no handle and no session entry -- nothing for a sweep to find.
+  //
+  // Either remedy is sufficient, so the loop stops at the first one that lands.
+  const a = await rollbackCase({ stopFails: 99, putFails: 1 });
+  assert.equal(a.outcome, "recorded", "a transient KV error must not end the rollback");
+  assert.deepEqual(a.puts, ["hands.s1"], "the session entry must be written");
+  assert.equal(a.calls.stop, 2, "and the stop retried alongside it");
+
+  // A stop that comes good on a later round is the better outcome: a workload
+  // that no longer exists needs no record at all.
+  const b = await rollbackCase({ stopFails: 1, putFails: 99 });
+  assert.equal(b.outcome, "stopped");
+  assert.equal(b.calls.release, 1, "a landed stop frees the name it may have taken");
+
+  // Both remedies failing every round is the one case with nothing left to try.
+  // It must not be reported as a successful rollback.
+  const c = await rollbackCase({ stopFails: 99, putFails: 99 });
+  assert.equal(c.outcome, "orphaned");
+  assert.equal(c.calls.stop, 3);
+  assert.equal(c.calls.put, 3);
+
+  // A stop that landed and a release that did not leaves the handle naming
+  // something that is gone, so the release is retried too.
+  const d = await rollbackCase({ stopFails: 0, putFails: 0, releaseFails: 1 });
+  assert.equal(d.outcome, "stopped");
+  assert.equal(d.calls.release, 2);
+  assert.deepEqual(d.puts, [], "a stop that landed needs no session entry");
 });
+

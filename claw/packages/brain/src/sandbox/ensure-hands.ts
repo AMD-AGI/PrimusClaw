@@ -1087,48 +1087,10 @@ async function provisionHands(
             err: (err as Error).message },
           "dag-handles.pending_register_failed_rollback",
         );
-        // Two outcomes, and each needs something different left behind. The
-        // registration having failed does not say which: a refusal means the
-        // name still belongs to an older workload, while a lost ACK means it
-        // may already name THIS one.
-        let stopped = false;
-        try {
-          await getSafeWorkloadProvider().stop({
-            provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-            namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-          });
-          stopped = true;
-        } catch (stopErr) {
-          logger.error(
-            { sessionId, workloadId, err: (stopErr as Error)?.message ?? String(stopErr) },
-            "dag-handles.pending_register_rollback_stop_failed",
-          );
-        }
-
-        if (stopped) {
-          // The registration may have committed and only its ACK been lost, in
-          // which case the handle names a workload that is now stopped and
-          // every later attempt is refused against a corpse. Keyed by workload,
-          // so it removes nothing if the registration really was refused.
-          await releaseHandlesForWorkload(workloadId).catch((e) => {
-            logger.error(
-              { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
-              "dag-handles.pending_register_rollback_release_failed",
-            );
-          });
-        } else {
-          // The workload is still running and nothing references it: the
-          // registration failed, and this branch returns before the session
-          // entry below is written. Write it now so `reapPendingHands` has
-          // something to find and retry -- without it the only record of this
-          // workload is a log line.
-          await kv.put(`hands.${sessionId}`, pendingPayload).catch((e) => {
-            logger.error(
-              { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
-              "hands.kv.pending_put_after_failed_rollback_failed",
-            );
-          });
-        }
+        await rollbackUnregisterableWorkload({
+          sessionId, workloadId, namespace: nsForSandbox, platformKey: apiKey,
+          pendingPayload, kv,
+        });
         throw new Error(`DAG handle registration failed for workload ${workloadId}, rolled back`);
       }
     }
@@ -1143,39 +1105,14 @@ async function provisionHands(
     }
     if (!ok) {
       logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-      // Whether the stop actually landed decides whether the handle may go.
-      // Swallowing the failure and releasing anyway leaves a workload that
-      // exists with no handle and no session entry -- findable by nothing, and
-      // strictly worse than the stuck retry this release was added to prevent.
-      let stopped = false;
-      try {
-        await getSafeWorkloadProvider().stop({
-          provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-          namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-        });
-        stopped = true;
-      } catch (stopErr) {
-        logger.error(
-          { sessionId, workloadId, err: (stopErr as Error)?.message ?? String(stopErr) },
-          "hands.kv.pending_rollback_stop_failed",
-        );
-      }
-      // Only then. The handle written moments ago names the workload just
-      // stopped, and this rollback is the only thing that will ever look at
-      // it: no session entry was written, so `reapPendingHands` has nothing to
-      // find, and the owning task is still running so no orphan sweep reaches
-      // it either. Left behind after a SUCCESSFUL stop, the next attempt's
-      // registration is refused and rolled back in turn, so a recovered KV
-      // never recovers the task. Left behind after a FAILED stop, it is the
-      // only remaining reference to a live workload -- so it stays.
-      if (stopped) {
-        await releaseHandlesForWorkload(workloadId).catch((e) => {
-          logger.error(
-            { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
-            "dag-handles.pending_rollback_release_failed",
-          );
-        });
-      }
+      // Same two remedies as the registration rollback above, so the same
+      // helper: whichever of stop / session-entry lands first is enough, and
+      // the pending write it retries is a fourth attempt at the one that just
+      // failed three times -- by now KV may have come back.
+      await rollbackUnregisterableWorkload({
+        sessionId, workloadId, namespace: nsForSandbox, platformKey: apiKey,
+        pendingPayload, kv,
+      });
       throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
     }
     logger.info({ sessionId, workloadId }, "hands.kv.pending");
@@ -1405,6 +1342,116 @@ async function provisionHands(
  * and redeliveries are densest, and the panel would report a provisioning
  * outage caused by the deploy that was in fact the deploy working.
  */
+
+/**
+ * A rollback attempt makes at most this many rounds of it. Both remedies are
+ * retried because the single thing that must not happen -- a live workload no
+ * record points at -- survives one transient failure of either.
+ */
+export const ROLLBACK_ATTEMPTS = 3;
+
+/**
+ * Undo a workload whose DAG handle could not be registered.
+ *
+ * The registration failing does not say WHY it failed, and the two reasons want
+ * opposite things:
+ *
+ *   - **Refused**, because the name still belongs to an older workload. This
+ *     workload has no handle and never will get one, so nothing in the handle
+ *     map will ever lead back to it.
+ *   - **Committed, ACK lost.** The handle already names THIS workload, so
+ *     leaving it in place means every later attempt is refused against a corpse.
+ *
+ * Two remedies, and EITHER one is enough. Stopping the workload is the better
+ * of them -- a workload that no longer exists needs no record -- so it is tried
+ * first each round. Failing that, the pending session entry makes it findable,
+ * which matters because this path returns before the caller writes that entry,
+ * so without it the only trace of a running workload is a log line and
+ * `reapPendingHands` has nothing to retry.
+ *
+ * Each round tries the stop, then the record; the loop ends the moment one of
+ * them lands. One-shotting either of them was the defect this replaces: the
+ * normal pending write retries three times, and the rollback's did not, so a
+ * single transient KV error on a workload whose stop had also failed left it
+ * running and unreferenced.
+ *
+ * Releasing the handle happens only after a stop that SUCCEEDED, and is keyed
+ * by workload, so it removes nothing if the registration really was refused.
+ * It is retried too: a stop that landed and a release that did not leaves the
+ * name pointing at something that is gone.
+ */
+export async function rollbackUnregisterableWorkload(args: {
+  sessionId: string;
+  workloadId: string;
+  namespace: string;
+  platformKey: string;
+  pendingPayload: Uint8Array;
+  kv: { put: (key: string, value: Uint8Array) => Promise<unknown> };
+  deps?: {
+    stop?: (workloadId: string, namespace: string, platformKey: string) => Promise<unknown>;
+    release?: (workloadId: string) => Promise<unknown>;
+  };
+}): Promise<"stopped" | "recorded" | "orphaned"> {
+  const { sessionId, workloadId, namespace, platformKey, pendingPayload, kv } = args;
+  const stop = args.deps?.stop ?? ((id: string, ns: string, key: string) =>
+    getSafeWorkloadProvider().stop({
+      provider: "safe-workload", id, sandboxName: id,
+      namespace: ns, handsBaseUrl: "", platformKey: key,
+    }));
+  const release = args.deps?.release ?? releaseHandlesForWorkload;
+
+  let stopped = false;
+  let recorded = false;
+  for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS && !stopped && !recorded; attempt++) {
+    try {
+      await stop(workloadId, namespace, platformKey);
+      stopped = true;
+      break;
+    } catch (stopErr) {
+      logger.error(
+        { sessionId, workloadId, attempt, err: (stopErr as Error)?.message ?? String(stopErr) },
+        "dag-handles.pending_register_rollback_stop_failed",
+      );
+    }
+    try {
+      await kv.put(`hands.${sessionId}`, pendingPayload);
+      recorded = true;
+    } catch (kvErr) {
+      logger.error(
+        { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },
+        "hands.kv.pending_put_after_failed_rollback_failed",
+      );
+      if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
+    }
+  }
+
+  if (stopped) {
+    for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS; attempt++) {
+      try {
+        await release(workloadId);
+        break;
+      } catch (e) {
+        logger.error(
+          { sessionId, workloadId, attempt, err: (e as Error)?.message ?? String(e) },
+          "dag-handles.pending_register_rollback_release_failed",
+        );
+        if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
+      }
+    }
+    return "stopped";
+  }
+  if (recorded) return "recorded";
+
+  // Neither remedy landed in any round: SaFE would not stop it and KV would not
+  // take the record. There is nowhere left to put a reference, so say so at a
+  // level somebody sweeps rather than pretending the rollback worked.
+  logger.error(
+    { sessionId, workloadId, namespace },
+    "dag-handles.pending_register_rollback_orphaned",
+  );
+  return "orphaned";
+}
+
 export async function ensureHands(
   sessionId: string,
   request: ExecuteRequest,
