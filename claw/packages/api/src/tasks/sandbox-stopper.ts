@@ -302,6 +302,25 @@ export const handleRegistry = {
     return handleMap().listAll();
   },
   /**
+   * Every DAG the registry has a key for, readable or not.
+   *
+   * `listAll` goes through `scanPrefix`, which drops a row whose read came
+   * back absent, tombstoned or empty -- correct for "what handles exist", and
+   * wrong for "who might hold this workload", because a row dropped for an
+   * unreadable read is exactly the row a stale replica produces. Anything that
+   * has to leader-check every other DAG has to start from the keys, not from
+   * the rows that survived being read.
+   */
+  async listDagRoots(): Promise<string[]> {
+    const kv = kvDagHandles as unknown as KvLike;
+    const iter = await kv.keys(`${HANDLE_MAP_PREFIX}.>`);
+    const out: string[] = [];
+    for await (const key of iter) {
+      if (key.startsWith(`${HANDLE_MAP_PREFIX}.`)) out.push(key.slice(HANDLE_MAP_PREFIX.length + 1));
+    }
+    return out;
+  },
+  /**
    * The same question as `listForDag`, asked of the stream leader.
    *
    * `kv.get` uses a direct read when the bucket allows one, and the client
@@ -874,13 +893,19 @@ async function otherDagHolding(
   // was already acknowledged. So before concluding nobody else holds this
   // workload, every other DAG is re-read from the leader.
   //
+  // From the KEYS, not from the rows above. `scanPrefix` drops a row whose read
+  // came back absent, tombstoned or empty, which is precisely what a stale
+  // replica produces -- so a co-holder can vanish from `rows` before any
+  // re-check sees it, and iterating `rows` would leader-check everything except
+  // the DAG that needed it.
+  //
   // This is the expensive path and it runs whenever a stop is about to be
   // issued. It is accepted rather than optimised because of what the two wrong
   // answers cost: a missed holder stops a sandbox another DAG is running on,
   // while the cost here is leader reads on a path that runs at teardown. A
   // reverse index from workload to holders would make it cheap and is the
   // right shape eventually; it is not a read-time patch.
-  for (const [dagRoot] of rows) {
+  for (const dagRoot of await handleRegistry.listDagRoots()) {
     if (dagRoot === dagRootTaskId) continue;
     const authoritative = await handleRegistry.listForDagConsistent(dagRoot);
     for (const info of Object.values(authoritative)) {

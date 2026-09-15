@@ -25,7 +25,7 @@
  *   L6 re-cancelling a finished DAG does not stop what a newer DAG reuses
  *   L7 a workload another DAG still holds is not stopped by this one's teardown
  *   L8 and one nobody else holds still is
- *   L9 a stale empty read of another DAG does not permit the stop
+ *   L9 a co-holder dropped by the scan does not permit the stop
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -78,6 +78,7 @@ function handleFor(owner: string, workloadId = "w-live"): void {
   // the snapshot says, the leader says.
   handleRegistry.listForDagConsistent = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  handleRegistry.listDagRoots = async () => [owner];
   handleRegistry.lookup = async (_d: string, n: string) =>
     live.has(n) ? { workload_id: live.get(n)! } : null;
   handleRegistry.destroy = async (_d: string, n: string) => {
@@ -327,21 +328,24 @@ test("L8 and one nobody else holds still is stopped", async () => {
   assert.equal(released, "confirmed");
 });
 
-test("L9 a stale empty read of another DAG does not permit the stop", async () => {
-  // The shared-holder guard is itself built on direct reads, so the answer it
-  // exists to give -- "nobody else holds this" -- can be wrong in the one
-  // direction that kills a live sandbox. D2 registered and was acknowledged;
-  // the scan reads a replica that has not caught up and reports an empty row.
+test("L9 a co-holder dropped by the scan does not permit the stop", async () => {
+  // The shared-holder guard is built on direct reads, so the answer it exists
+  // to give -- "nobody else holds this" -- can be wrong in the one direction
+  // that kills a live sandbox.
   //
-  // A holder seen on a direct read is fine, because that only makes the guard
-  // more conservative. Seeing none is what permits a stop, so that answer is
-  // re-read from the leader before it is believed.
+  // And the drop is total, which is what the first version of this test got
+  // wrong: it left `["dag-2", {}]` in the scan, so the leader re-check still
+  // had a DAG to look at. `scanPrefix` removes a row whose read came back
+  // absent, tombstoned or empty -- exactly what a stale replica produces -- so
+  // D2 is not in the rows at all. The re-check has to start from the enumerated
+  // KEYS or it will check everything except the DAG that needed it.
   db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
   handleFor("dag-1", "w-shared");
   handleRegistry.listAll = async () => [
     ["dag-1", { main: { workload_id: "w-shared" } }],
-    ["dag-2", {}],                       // the stale replica: D2 looks empty
+    // D2 is gone entirely: its read came back stale and the scan dropped it.
   ];
+  handleRegistry.listDagRoots = async () => ["dag-1", "dag-2"];
   handleRegistry.listForDagConsistent = async (dag: string) =>
     dag === "dag-2" ? { main: { workload_id: "w-shared" } } : {};
 

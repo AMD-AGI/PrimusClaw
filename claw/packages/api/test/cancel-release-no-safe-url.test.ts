@@ -72,6 +72,13 @@ test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", asy
     ({ main: { workload_id: "w-1" } });
   handleRegistry.lookup = async (): Promise<HandleInfo | null> => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => "w-1";
+  // The teardown asks whether another DAG holds this workload, and confirms an
+  // empty answer against the leader. Unstubbed, that threw on an uninitialised
+  // KV and returned `unconfirmed` before reaching the branch this file is
+  // about -- so the test passed while testing nothing.
+  handleRegistry.listAll = async () => [];
+  handleRegistry.listDagRoots = async () => [];
+  handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "w-1" } });
 
   let called = false;
   globalThis.fetch = (async () => {

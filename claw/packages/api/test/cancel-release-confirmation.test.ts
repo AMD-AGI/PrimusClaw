@@ -164,6 +164,7 @@ function stubHandles(handles: Record<string, string>): void {
   // stub agrees with itself: whatever `listForDag` says, the leader says too.
   handleRegistry.listForDagConsistent = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  handleRegistry.listDagRoots = async () => ["t-root"];
 }
 
 /**
@@ -307,6 +308,7 @@ test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_he
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
   handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "" } });
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.lookup = async () => ({ workload_id: "" });
   handleRegistry.destroy = async () => "";
   handleRegistry.listAll = async () => [];
@@ -527,6 +529,7 @@ test("R15 an unreadable handle registry is unconfirmed, never nothing_held", asy
   } as unknown as Parameters<typeof makeKvStore>[0]));
   handleRegistry.listForDag = (dag: string) => unreachable.listForDag(dag);
   handleRegistry.listForDagConsistent = (dag: string) => unreachable.listForDag(dag);
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.lookup = (dag: string, h: string) => unreachable.lookup(dag, h);
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
@@ -604,6 +607,7 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
   handleRegistry.listForDagConsistent = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.lookup = async (_dag: string, name: string) =>
     live.has(name) ? { workload_id: live.get(name)! } : null;
   handleRegistry.listAll = async () => [];
@@ -653,6 +657,7 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
   handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "w-1" } });
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.lookup = async () => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => { throw new Error("nats: request timeout"); };
   handleRegistry.listAll = async () => [];
@@ -678,6 +683,7 @@ test("R22 an empty snapshot is confirmed against the leader before nothing_held"
   // Here it would cost the answer: a DAG that holds a workload, reported as
   // holding nothing, with no stop ever issued.
   stubDb();
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.listForDag = async () => ({});            // the stale replica
   handleRegistry.listForDagConsistent = async () => ({     // what the leader has
     main: { workload_id: "w-registered" },
@@ -706,6 +712,7 @@ test("R23 a stale empty read after teardown does not become confirmed", async ()
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
   // The snapshot is what the teardown walks; the leader knows one more.
   handleRegistry.listForDagConsistent = async () => afterTeardown;
+  handleRegistry.listDagRoots = async () => ["t-root"];
 
   const r = await cancelTask("t-root");
 
@@ -751,6 +758,7 @@ test("R24 only a genuine absence reads as an absent key", async () => {
 test("R25 an unreachable registry keeps the DAG unconfirmed", async () => {
   stubDb();
   handleRegistry.listForDag = async () => ({});
+  handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.listForDagConsistent = async () => { throw new Error("nats: no responders"); };
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
