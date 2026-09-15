@@ -37,7 +37,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle } from "./handles.js";
+import { dagHoldsWorkload, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -236,6 +236,7 @@ export interface SandboxReuseEffects {
   // than Claw's, so it unwound nothing and reported success.
   unregisterSandbox: typeof unregisterSandbox;
   markHandsIdle: typeof markHandsIdle;
+  dagHoldsWorkload: typeof dagHoldsWorkload;
 }
 
 export interface EnsureHandsOptions {
@@ -260,6 +261,7 @@ export interface EnsureHandsOptions {
 }
 
 const realReuseEffects: SandboxReuseEffects = {
+  dagHoldsWorkload,
   destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
   unregisterSandbox, markHandsIdle,
 };
@@ -459,11 +461,38 @@ async function readReusableEntry(
  * treated as the caller's -- the pre-rollout behaviour, and the alternative is
  * refusing to rebuild a session that has no owner recorded.
  */
-function entryOwnedByAnother(info: Record<string, unknown>, request: ExecuteRequest): boolean {
+async function entryOwnedByAnother(
+  info: Record<string, unknown>,
+  request: ExecuteRequest,
+): Promise<boolean> {
   const mineRoot = request.dag_root_task_id ?? request.task_id ?? null;
   const entryRoot = typeof info.dagRootTaskId === "string" ? info.dagRootTaskId : null;
   if (!entryRoot || !mineRoot) return false;
-  return entryRoot !== mineRoot;
+  if (entryRoot === mineRoot) return false;
+
+  // Who WROTE the entry is not the same question as who holds the workload now.
+  // A task that reused another's sandbox registers its own handle on it and is
+  // from then on just as much a holder -- but the entry still names whoever
+  // created it. Refusing on that alone left such a task unable to rebuild a
+  // sandbox that had broken under it: the replace was skipped as somebody
+  // else's, and its own handle, still naming the dead workload, then refused
+  // the registration of the replacement. Two attempts, two rolled-back
+  // workloads, no way forward.
+  //
+  // So the handle registry decides. A read failure answers "not mine", which
+  // keeps the mis-stop this guard exists to prevent.
+  const workloadId = typeof info.workloadId === "string" ? info.workloadId : null;
+  if (!workloadId) return true;
+  try {
+    return !(await reuseEffects.dagHoldsWorkload(mineRoot, workloadId));
+  } catch (e) {
+    logger.warn(
+      { sessionId: request.session_id, workloadId, dagRoot: mineRoot,
+        err: (e as Error)?.message ?? String(e) },
+      "hands.kv.owner_check_failed",
+    );
+    return true;
+  }
 }
 
 export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHandsResult | null> {
@@ -492,7 +521,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       },
       "ensureHands.mn_replace_sandbox",
     );
-    if (entryOwnedByAnother(info, request)) {
+    if (await entryOwnedByAnother(info, request)) {
       logger.warn(
         { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
         "hands.kv.mn_replace_skipped_other_owner",
@@ -515,7 +544,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     // its own, which is what it would have done anyway.
     const entryTask = typeof info.taskId === "string" ? info.taskId : null;
     const mine = (!entryTask || !request.task_id || entryTask === request.task_id)
-      && !entryOwnedByAnother(info, request);
+      && !(await entryOwnedByAnother(info, request));
     logger.warn(
       { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)",
         entryTaskId: entryTask, taskId: request.task_id ?? null, mine },
@@ -542,7 +571,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       reason: "spec_changed",
       detail: "the sandbox image, resources or environment differ from the running sandbox",
     }).catch(() => {});
-    if (entryOwnedByAnother(info, request)) {
+    if (await entryOwnedByAnother(info, request)) {
       logger.warn(
         { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
         "hands.kv.spec_rebuild_skipped_other_owner",
@@ -591,7 +620,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   // Reap the referenced workload (stop in SaFE + delete KV) before recreating.
   // destroyHands reads workloadId + platformKey from the KV entry we just
   // observed; if either is missing it will just delete KV.
-  if (entryOwnedByAnother(info, request)) {
+  if (await entryOwnedByAnother(info, request)) {
     // Unhealthy to US, over a shared entry -- the probe that failed was of a
     // sandbox another DAG owns, and it is not ours to recreate.
     logger.warn(

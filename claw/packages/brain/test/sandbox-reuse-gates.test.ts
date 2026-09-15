@@ -107,6 +107,8 @@ function stubEffects(
   restartOk = true,
   /** When set, the restart refuses (never attempts) with this detail. */
   refusal?: string,
+  /** Whether the caller's DAG holds a handle on the entry's workload. */
+  holds?: boolean | (() => Promise<boolean>),
 ): {
   destroyed: string[];
   registered: Registration[];
@@ -121,6 +123,10 @@ function stubEffects(
       registered.push({ sessionId, target });
     }) as never,
     probeSandboxContainer: async () => ({ verdict: probe, reason: "exec_ok" as const }),
+    dagHoldsWorkload: (async () => {
+      if (typeof holds === "function") return holds();
+      return holds ?? false;
+    }) as never,
     restartHandsInSandbox: async () => {
       restartCalls.push(1);
       if (refusal) return { ok: false, detail: refusal, refused: true };
@@ -763,4 +769,47 @@ test("an entry with no owner recorded is replaced as before", async () => {
 
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(destroyed, ["s-1"], "refusing to rebuild an unowned session would be worse");
+});
+
+// Who WROTE the session entry is not who holds the workload now.
+//
+// A task that reused another's sandbox registers its own handle on it, and is
+// from then on just as much a holder -- but the entry still names whoever
+// created it. Round 35: refusing on that alone left such a task unable to
+// rebuild a sandbox that had broken under it. The replace was skipped as
+// somebody else's, and its own handle, still naming the dead workload, then
+// refused the registration of the replacement -- two attempts, two rolled-back
+// workloads, no way forward, while a brand new task succeeded.
+test("a task that reused a sandbox may still rebuild it when it breaks", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "holding a handle on it makes it yours to replace");
+});
+
+test("a task holding no handle on it still may not", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, false);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "this is still a sibling's live workload");
+});
+
+test("a registry that cannot be read answers 'not mine'", async () => {
+  // The conservative direction: the cost of being wrong here is the rebuild
+  // regression above, and the cost of being wrong the other way is stopping a
+  // workload somebody is using.
+  const { destroyed } = stubEffects("dead", true, undefined,
+    async () => { throw new Error("kv down"); });
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, []);
 });

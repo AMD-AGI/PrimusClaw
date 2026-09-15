@@ -154,6 +154,26 @@ const RELEASE_SCAN_TIMEOUT_MS = 10_000;
  * surfaces are writes that were genuinely refused -- which is the trade being
  * made on purpose, and the only one.
  */
+/**
+ * Does this DAG hold a handle naming this workload?
+ *
+ * The authoritative answer to "is this mine to tear down", and a different
+ * question from who first wrote the session entry. A task that REUSED another
+ * task's sandbox registers its own handle on that workload, and from then on it
+ * is as much a holder as the task that created it -- which is the case a check
+ * against the entry's original writer gets wrong.
+ */
+export async function dagHoldsWorkload(
+  dagRootTaskId: string,
+  workloadId: string,
+): Promise<boolean> {
+  const held = await getMap().listForDag(dagRootTaskId);
+  return Object.values(held).some((h) => {
+    const id = typeof h === "string" ? h : h?.workload_id;
+    return !!id && id === workloadId;
+  });
+}
+
 export async function replaceDagHandle(
   dagRootTaskId: string,
   handleName: string,

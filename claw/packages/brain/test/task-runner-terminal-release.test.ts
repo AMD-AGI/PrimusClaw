@@ -85,6 +85,10 @@ safe.unref();
 // root has no default, so without it a multi-node run is refused before it can
 // reach the release this file is about.
 process.env.SAFE_API_URL = `http://127.0.0.1:${(safe.address() as AddressInfo).port}`;
+// The lock-renewal tick is what brings the news that the lease is gone, and R10
+// is about what that tick records -- so it has to really run. 1s is the floor
+// the config enforces (MIN_RENEWAL_INTERVAL_MS).
+process.env.LOCK_REFRESH_INTERVAL_MS = "1000";
 
 const { bindTaskRunnerDeps, runHandleTask } = await import("../src/tasks/runner.js");
 const { AgentDoneDeliveryError } = await import("../src/tasks/callback.js");
@@ -207,6 +211,8 @@ interface Scenario {
    * elsewhere, and before the reap.
    */
   abortDuringHandler?: unknown;
+  /** Run inside the retryable-failure handler, before the reap. */
+  onHandlerEntered?: () => Promise<void>;
   nakThrows?: boolean;
   ackThrows?: boolean;
   sideEffects?: Partial<TaskRunnerSideEffects>;
@@ -221,11 +227,12 @@ async function run(scenario: Scenario) {
   });
   const kv = fakeKv();
   const sideEffects = stubSideEffects({
-    ...("abortDuringHandler" in scenario
+    ...("abortDuringHandler" in scenario || scenario.onHandlerEntered
       ? {
         markRetryPending: (async () => {
           safeCalls.push("markRetryPending");
           abortDuringHandlerCtrl?.abort(scenario.abortDuringHandler);
+          if (scenario.onHandlerEntered) await scenario.onHandlerEntered();
         }) as never,
       }
       : {}),
@@ -412,4 +419,51 @@ test("R9 an attempt that lost its lease does not reap the new attempt's workload
   await kept.settled;
   assert.ok(safeCalls.includes("reapPendingHands"),
     "a task that still holds its lock cleans up after itself");
+});
+
+test("R10 a lease lost after an ordinary abort is still not forgotten", async () => {
+  // Round 35. The only trace of a lost lease was the abort REASON -- and that
+  // slot is taken by whoever aborts first. A run interrupted normally and THEN
+  // superseded recorded nothing: the heartbeat saw `renewal=lost`, found the
+  // signal already aborted, and returned. Teardown read the successor's entry,
+  // asked whether it still held the lock, and was told yes -- reproduced as
+  // `renewal=lost` with `callbackValue=true`, ending in `stop(successor-W2)`.
+  //
+  // The renewal that brings the news is IN FLIGHT when the heartbeat timer is
+  // cleared: it was issued during the run and resolves while the failure
+  // handler is already going. That is what this models -- a renewal held open
+  // until the handler is running, then answering "lost".
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const lost = await run({
+    request: {
+      session_id: SESSION, task_id: "t-superseded", prompt: "go",
+      // Without a lease there is no heartbeat, and no heartbeat is the one
+      // thing this test cannot stub away.
+      run_lease: { url: "http://api.test/v1/internal/tasks/t-superseded/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));  // long enough for one tick
+      throw new Error("503 from upstream");
+    },
+    // The interrupt lands first and takes the abort reason; the lock has
+    // already moved, and the renewal is about to say so.
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      postRunLease: (async () => ({ status: "ok" })) as never,
+      refreshTaskLock: (async () => {
+        safeCalls.push("refreshTaskLock");
+        await answered;
+        return "lost";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();                                     // the renewal answers "lost"
+      await new Promise((r) => setTimeout(r, 50));   // let its .then run
+    },
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("refreshTaskLock"), "the heartbeat has to have ticked");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "an abort for another reason must not hide the lock having moved");
 });

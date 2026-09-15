@@ -244,6 +244,17 @@ export async function destroyHands(
   sessionId: string,
   known?: HandsProbeEntry,
   knownToken?: string,
+  /**
+   * Asked immediately before the stop, if given.
+   *
+   * Every caller that can lose its right to tear down between deciding to and
+   * doing it needs this asked LAST, not earliest. Checking in the caller and
+   * again after the reaper's own read still left this function's own read in
+   * between, and a lease can go during that one too -- so the check follows the
+   * reads down to the one irreversible step rather than being sprinkled above
+   * them. Callers with nothing to lose pass nothing and behave as before.
+   */
+  stillOwned?: () => boolean,
 ): Promise<void> {
   const kv = getHandsKv();
   const key = `hands.${sessionId}`;
@@ -259,6 +270,14 @@ export async function destroyHands(
     // unreadable/corrupt key is different: preserve all session state because
     // it may still belong to a live workload.
     if (!known && recorded.state === "missing") releaseLocalHandsState(sessionId);
+    return;
+  }
+
+  if (stillOwned && !stillOwned()) {
+    logger.warn(
+      { sessionId, workloadId: (target as { workloadId?: string })?.workloadId ?? null },
+      "hands.destroy_skipped_not_owned",
+    );
     return;
   }
 
@@ -412,6 +431,7 @@ export async function reapPendingHands(
       sessionId,
       info as HandsProbeEntry,
       typeof info.token === "string" ? info.token : undefined,
+      expected?.stillOwned,
     );
   } catch (e) {
     logger.warn({ err: e, sessionId }, "hands.reap_pending_failed");

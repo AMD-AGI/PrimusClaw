@@ -761,10 +761,17 @@ test("H22 the reaper's identity check is wired through every call site", async (
     "and only the wrapper calls the reaper itself");
   const wrapper = runnerSrc.slice(runnerSrc.indexOf("private async reapOwnPendingHands"));
   const body = wrapper.slice(0, wrapper.indexOf("\n  }"));
-  assert.match(body, /LEASE_LOST_ABORT_REASON/,
+  // Asked twice -- before the reap, and from inside it just before the stop --
+  // through the one predicate, so there is a single rule to keep true.
+  assert.match(body, /if \(!this\.stillOwnsLock\(\)\)/,
     "a holder that lost the lock must not tear anything down");
+  assert.match(body, /stillOwned: \(\) => this\.stillOwnsLock\(\)/,
+    "and it is asked again on the far side of the reaper's read");
   assert.match(body, /taskId: this\.request\.task_id/,
     "and the reap it does make is bound to this task");
+  const predicate = runnerSrc.slice(runnerSrc.indexOf("private stillOwnsLock()"));
+  assert.match(predicate.slice(0, predicate.indexOf("\n  }")), /LEASE_LOST_ABORT_REASON/,
+    "which is where the lease-lost rule itself lives");
   const ehSrc = readFileSync(
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
   const payload = ehSrc.slice(ehSrc.indexOf("const pendingPayload = sc.encode"));

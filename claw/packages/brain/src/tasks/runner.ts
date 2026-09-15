@@ -1037,6 +1037,12 @@ class TaskRunner {
   private platformFacts: PlatformFacts | null = null;
   // Workload id from this run's identity, never the DAG-shared session key.
   private handsWorkloadId = "";
+  /**
+   * Set the moment a renewal reports the lock gone, whatever else has happened
+   * to the abort signal by then. The abort reason cannot carry this on its own:
+   * only the first abort sets it, so any earlier one hides it.
+   */
+  private leaseLost = false;
   private multiNodeContext: MultiNodeContext | null = null;
   private inflightCkptHasData = false;
   private inflightCkptInProgress = false;
@@ -1600,8 +1606,24 @@ class TaskRunner {
    * whoever took it. The heartbeat has already aborted us by this point; this
    * failure handler simply had not been looking.
    */
+  /**
+   * Does this attempt still hold the session's lock?
+   *
+   * One expression, asked from two places -- before the reap and again from
+   * inside it, immediately before the stop -- because two copies of a rule are
+   * two things to keep true, and the second copy is the one that gets missed.
+   *
+   * Two ways to have lost it. The abort reason carries it when the lease loss
+   * is what aborted us; `leaseLost` carries it when something else had already
+   * aborted and taken that slot.
+   */
+  private stillOwnsLock(): boolean {
+    return !this.leaseLost
+      && this.abortCtrl.signal.reason !== LEASE_LOST_ABORT_REASON;
+  }
+
   private async reapOwnPendingHands(): Promise<void> {
-    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+    if (!this.stillOwnsLock()) {
       logger.warn(
         { sessionId: this.sessionId, taskId: this.request.task_id, lockKey: this.lockKey },
         "hands.reap_pending_skipped_lease_lost",
@@ -1613,7 +1635,7 @@ class TaskRunner {
       // Asked again on the far side of the reaper's KV read: this check and the
       // teardown are a round trip apart, which is long enough for the heartbeat
       // to notice, and the snapshot that comes back is then the successor's.
-      stillOwned: () => this.abortCtrl.signal.reason !== LEASE_LOST_ABORT_REASON,
+      stillOwned: () => this.stillOwnsLock(),
     });
   }
 
@@ -3474,6 +3496,12 @@ class TaskRunner {
       // wait to be told by a second worker turning up in its workspace.
       fx().refreshTaskLock(this.lockKey).then((renewal) => {
         const yielding = renewal === "lost" || renewal === "expired";
+        // Recorded before the early return. An abort that already happened for
+        // an ordinary reason -- a user interrupt, say -- used to swallow the
+        // news entirely, because the only trace of a lost lease was the abort
+        // REASON and that slot was taken. Teardown then read the successor's
+        // entry, asked whether it still held the lock, and was told yes.
+        if (yielding) this.leaseLost = true;
         if (!yielding || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey, renewal },
@@ -3573,7 +3601,7 @@ class TaskRunner {
         return;
       }
 
-      if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+      if (!this.stillOwnsLock()) {
         // A second replica already holds the lock and is running this task.
         outcome = "retryable";
         this.handleLeaseLost();

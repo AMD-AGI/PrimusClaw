@@ -123,3 +123,36 @@ test("a lease lost during the reaper's own read still stops the teardown", async
 
   assert.deepEqual(stopped, [], "the successor holds the lock, so its workload is not ours");
 });
+
+test("a lease lost during destroyHands' own read still stops the teardown", async () => {
+  // Round 35. Checking in the caller, and again after the reaper's read, still
+  // left destroyHands' OWN read in between -- and a lease can go during that
+  // one too: `checked=1, reads=2, stopped=W2, successorReady=true`.
+  //
+  // The answer is not another checkpoint. The question follows the reads down
+  // to the one irreversible step, so it is asked immediately before the stop.
+  let reads = 0;
+  let owned = true;
+  const stopped: string[] = [];
+  const kv = {
+    async get(key: string) {
+      reads += 1;
+      if (reads === 2) owned = false;  // the news arrives during the second read
+      return { key, value: sc.encode(JSON.stringify(pending("W2", "t-same"))), revision: 3 };
+    },
+    async delete() {},
+    async put() { return 1; },
+    async update() { return 4; },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  const provider = {
+    kind: "safe-workload",
+    async stop(t: { id?: string }) { stopped.push(String(t?.id)); },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+
+  await reapPendingHands(SESSION, { taskId: "t-same", stillOwned: () => owned });
+
+  assert.ok(reads >= 2, "this only means anything if the second read happened");
+  assert.deepEqual(stopped, [], "the successor's workload is not ours to stop");
+});
