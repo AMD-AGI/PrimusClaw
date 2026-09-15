@@ -1351,6 +1351,13 @@ async function provisionHands(
 export const ROLLBACK_ATTEMPTS = 3;
 
 /**
+ * Backoff for the detached recovery that runs when every synchronous round
+ * failed. Spread over ~8 minutes, because what it is waiting for is a SaFE or
+ * KV outage ending, and one attempt after that is enough.
+ */
+export const ORPHAN_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+
+/**
  * Undo a workload whose DAG handle could not be registered.
  *
  * The registration failing does not say WHY it failed, and the two reasons want
@@ -1390,6 +1397,10 @@ export async function rollbackUnregisterableWorkload(args: {
   deps?: {
     stop?: (workloadId: string, namespace: string, platformKey: string) => Promise<unknown>;
     release?: (workloadId: string) => Promise<unknown>;
+    /** Test seam: run the detached recovery inline instead of in the background. */
+    detach?: (fn: () => Promise<void>) => void;
+    /** Test seam: the backoff between recovery attempts. */
+    retryDelaysMs?: number[];
   };
 }): Promise<"stopped" | "recorded" | "orphaned"> {
   const { sessionId, workloadId, namespace, platformKey, pendingPayload, kv } = args;
@@ -1400,55 +1411,91 @@ export async function rollbackUnregisterableWorkload(args: {
     }));
   const release = args.deps?.release ?? releaseHandlesForWorkload;
 
-  let stopped = false;
-  let recorded = false;
-  for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS && !stopped && !recorded; attempt++) {
-    try {
-      await stop(workloadId, namespace, platformKey);
-      stopped = true;
-      break;
-    } catch (stopErr) {
-      logger.error(
-        { sessionId, workloadId, attempt, err: (stopErr as Error)?.message ?? String(stopErr) },
-        "dag-handles.pending_register_rollback_stop_failed",
-      );
-    }
-    try {
-      await kv.put(`hands.${sessionId}`, pendingPayload);
-      recorded = true;
-    } catch (kvErr) {
-      logger.error(
-        { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },
-        "hands.kv.pending_put_after_failed_rollback_failed",
-      );
-      if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
-    }
-  }
-
-  if (stopped) {
-    for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS; attempt++) {
+  const attemptRemedies = async (rounds: number): Promise<"stopped" | "recorded" | null> => {
+    let stopped = false;
+    let recorded = false;
+    for (let attempt = 1; attempt <= rounds && !stopped && !recorded; attempt++) {
       try {
-        await release(workloadId);
+        await stop(workloadId, namespace, platformKey);
+        stopped = true;
         break;
-      } catch (e) {
+      } catch (stopErr) {
         logger.error(
-          { sessionId, workloadId, attempt, err: (e as Error)?.message ?? String(e) },
-          "dag-handles.pending_register_rollback_release_failed",
+          { sessionId, workloadId, attempt, err: (stopErr as Error)?.message ?? String(stopErr) },
+          "dag-handles.pending_register_rollback_stop_failed",
         );
-        if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
+      }
+      try {
+        await kv.put(`hands.${sessionId}`, pendingPayload);
+        recorded = true;
+      } catch (kvErr) {
+        logger.error(
+          { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },
+          "hands.kv.pending_put_after_failed_rollback_failed",
+        );
+        if (attempt < rounds) await sleep(200);
       }
     }
-    return "stopped";
-  }
-  if (recorded) return "recorded";
+
+    if (stopped) {
+      for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS; attempt++) {
+        try {
+          await release(workloadId);
+          break;
+        } catch (e) {
+          logger.error(
+            { sessionId, workloadId, attempt, err: (e as Error)?.message ?? String(e) },
+            "dag-handles.pending_register_rollback_release_failed",
+          );
+          if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
+        }
+      }
+      return "stopped";
+    }
+    return recorded ? "recorded" : null;
+  };
+
+  const outcome = await attemptRemedies(ROLLBACK_ATTEMPTS);
+  if (outcome) return outcome;
 
   // Neither remedy landed in any round: SaFE would not stop it and KV would not
-  // take the record. There is nowhere left to put a reference, so say so at a
-  // level somebody sweeps rather than pretending the rollback worked.
+  // take the record. Nothing durable can be written, because those two ARE the
+  // only durable stores this process has -- so there is no record to leave for
+  // a sweep to find, and the caller is about to throw.
+  //
+  // What the exhausted case has that the caller does not is the workload id, so
+  // it keeps trying in the background. Both of these failures are transient by
+  // hypothesis -- a 503 and an unreachable KV -- and the moment either
+  // dependency comes back, one attempt is enough to either stop the workload or
+  // make it findable. Detached deliberately: the task this belonged to has
+  // already failed and must not wait on a recovery that may never come.
+  //
+  // What this does NOT survive is the process dying inside the retry window, and
+  // it cannot: recording the workload somewhere that outlives the process is
+  // exactly the workload-keyed durable ownership this PR defers.
   logger.error(
     { sessionId, workloadId, namespace },
     "dag-handles.pending_register_rollback_orphaned",
   );
+  const detach = args.deps?.detach ?? ((fn: () => Promise<void>) => { void fn().catch(() => {}); });
+  const delays = args.deps?.retryDelaysMs ?? ORPHAN_RETRY_DELAYS_MS;
+  detach(async () => {
+    for (const delay of delays) {
+      await sleep(delay);
+      const recovered = await attemptRemedies(1);
+      if (recovered) {
+        logger.warn(
+          { sessionId, workloadId, outcome: recovered },
+          "dag-handles.pending_register_rollback_orphan_recovered",
+        );
+        return;
+      }
+    }
+    logger.error(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_orphan_retry_exhausted",
+    );
+  });
   return "orphaned";
 }
 

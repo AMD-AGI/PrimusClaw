@@ -41,6 +41,7 @@
  *   H15 a release scan that hangs does not wedge the caller
  *   H16 a rollback whose stop failed keeps the handle
  *   H17 a rollback whose first remedy fails keeps trying the other one
+ *   H18 an exhausted rollback keeps trying until a dependency comes back
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -525,10 +526,11 @@ test("H16 a rollback whose stop failed keeps the handle", async () => {
 
 
 const rollbackCase = async (opts: {
-  stopFails: number; putFails: number; releaseFails?: number;
+  stopFails: number; putFails: number; releaseFails?: number; inlineRetry?: boolean;
 }) => {
   const calls = { stop: 0, put: 0, release: 0 };
   const puts: string[] = [];
+  let detached: Promise<void> | null = null;
   const outcome = await rollbackUnregisterableWorkload({
     sessionId: "s1", workloadId: "W1", namespace: "ns", platformKey: "pk",
     pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W1" })),
@@ -541,6 +543,10 @@ const rollbackCase = async (opts: {
       },
     },
     deps: {
+      // Runs the detached recovery inline with no delays, so the exhausted
+      // path is observable without waiting out its real backoff.
+      detach: opts.inlineRetry ? (fn) => { detached = fn(); } : () => {},
+      retryDelaysMs: [0, 0, 0],
       async stop() {
         calls.stop += 1;
         if (calls.stop <= opts.stopFails) throw new Error("503 from SaFE");
@@ -551,6 +557,7 @@ const rollbackCase = async (opts: {
       },
     },
   });
+  if (detached) await detached;
   return { outcome, calls, puts };
 };
 
@@ -587,5 +594,36 @@ test("H17 a rollback whose first remedy fails keeps trying the other one", async
   assert.equal(d.outcome, "stopped");
   assert.equal(d.calls.release, 2);
   assert.deepEqual(d.puts, [], "a stop that landed needs no session entry");
+});
+
+test("H18 an exhausted rollback keeps trying until a dependency comes back", async () => {
+  // Round 29. When every synchronous round fails, nothing durable can be
+  // written -- SaFE and KV ARE the only durable stores this process has, and
+  // both are what just failed. So the workload is live, unreferenced, and the
+  // caller is about to throw; `reapPendingHands` returns immediately on a
+  // session entry that was never written, and nothing else is looking.
+  //
+  // What the exhausted path still holds is the workload id. Both failures are
+  // transient by hypothesis, so it keeps trying: the round 29 repro restores
+  // the dependencies, and one attempt after that has to be enough.
+  const recovered = await rollbackCase({ stopFails: 3, putFails: 99, inlineRetry: true });
+  assert.equal(recovered.outcome, "orphaned", "the synchronous result is still a failure");
+  assert.equal(recovered.calls.stop, 4, "and the fourth stop -- after recovery -- lands");
+  assert.equal(recovered.calls.release, 1, "a stop that landed frees the name it may have taken");
+
+  // Recovery on the other remedy counts too: a findable workload is enough.
+  const viaKv = await rollbackCase({ stopFails: 99, putFails: 3, inlineRetry: true });
+  assert.deepEqual(viaKv.puts, ["hands.s1"], "the session entry lands on the retry");
+
+  // The retries are bounded, not a loop that runs forever.
+  const never = await rollbackCase({ stopFails: 99, putFails: 99, inlineRetry: true });
+  assert.equal(never.calls.stop, 6, "3 synchronous rounds + 3 retry attempts, then it stops");
+
+  // And without the seam, the caller is not made to wait on any of it: the
+  // task this belonged to has already failed.
+  const t0 = process.hrtime.bigint();
+  const detachedByDefault = await rollbackCase({ stopFails: 99, putFails: 99 });
+  assert.equal(detachedByDefault.outcome, "orphaned");
+  assert.ok(Number(process.hrtime.bigint() - t0) < 3e9, "the rollback must not block on recovery");
 });
 
