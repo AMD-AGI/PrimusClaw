@@ -692,7 +692,16 @@ export async function bindDagHandles(): Promise<KV> {
     let real: KV | null = null;
     const ensureBound = async (): Promise<KV> => (real ??= await bind());
     return new Proxy({} as KV, {
-      get(_t, prop: string) {
+      get(_t, prop) {
+        // `then` must stay absent. Returning a function for it makes this
+        // object a thenable, so the `await` that receives it calls
+        // `proxy.then(resolve, reject)` -- which binds the bucket and then
+        // invokes a `then` the real KV does not have. The awaited promise never
+        // settles, and the process either dies on the unhandled rejection or
+        // hangs in start-up. Same reasoning for the symbol keys a runtime
+        // probes when it inspects a value.
+        if (typeof prop !== "string") return undefined;
+        if (prop === "then" || prop === "catch" || prop === "finally") return undefined;
         return async (...args: unknown[]) => {
           const kv = await ensureBound();
           return (kv as unknown as Record<string, (...a: unknown[]) => unknown>)[prop](...args);

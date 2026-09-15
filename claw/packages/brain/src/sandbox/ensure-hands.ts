@@ -506,6 +506,31 @@ async function retainInsteadOfDestroying(
     verdict: answer.verdict,
     detail: answer.reason,
   });
+
+  // The DAG's handle goes with the DAG, not with the container it just gave up.
+  //
+  // Retention is a handover: the container stays alive for the work still in
+  // it, the retention record becomes the thing that owns it, and this session
+  // goes on to provision a replacement. Leaving the handle naming the retained
+  // workload makes that replacement unregisterable -- `replaceDagHandle`
+  // refuses to take a name from a workload still on record, which is right, and
+  // the rollback then stops the replacement. Every retry repeats it, so a
+  // recovery that was supposed to hand back a working sandbox hands back
+  // nothing, permanently.
+  //
+  // Safe to release by workload here: this is only reached when
+  // `entryOwnedByAnother` said no other DAG holds it, so the handles being
+  // freed are this DAG's own. The retained container keeps its reference in the
+  // retention record.
+  const retainedWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
+  if (retainedWorkload) {
+    await releaseHandlesForWorkload(retainedWorkload).catch((e) => {
+      logger.error(
+        { sessionId, workloadId: retainedWorkload, err: (e as Error)?.message ?? String(e) },
+        "hands.retain_handle_release_failed",
+      );
+    });
+  }
 }
 
 /**
@@ -945,7 +970,12 @@ export async function registerReusedDagHandle(
       // The order is still the right way round: reversed, the entry reads idle
       // while a live local registration still names it. It is not an atomic
       // handover and nothing here should be read as claiming one.
-      reuseEffects.unregisterSandbox(adoptedSession, identity);
+      //
+      // `releaseSlot: false`, which #35 made default true: this is the undo of
+      // an ADOPTION, so the sandbox it stops pinging is one somebody else built
+      // and is still running. Handing its ceiling slot back lets a new
+      // provision take a place the fleet has not actually vacated.
+      reuseEffects.unregisterSandbox(adoptedSession, identity, { releaseSlot: false });
       // `markHandsIdle` REPORTS its result rather than throwing -- `parked`,
       // `gone`, `skipped`, `superseded` or `failed` -- so a catch around it
       // establishes nothing, and which of those means "not undone" has to be
@@ -1785,7 +1815,12 @@ export async function rollbackUnregisterableWorkload(args: {
   // still ours, the write is revision-conditional, so a session entry that
   // appears between the read and the write is not overwritten either.
   const recordPending = async (): Promise<boolean> => {
-    const key = `hands.${sessionId}`;
+    // The canonical key, not the legacy spelling. #35 introduced
+    // `handsSessionKey` and a migration that resolves the two, and a rollback
+    // still writing the raw one reads past a live READY entry on the canonical
+    // key -- reports `recorded` over the top of it, and the next migration then
+    // promotes this pending row over that live sandbox on `createdAt`.
+    const key = handsSessionKey(sessionId);
     const cur = await kv.get(key);
     if (cur) {
       // A key that exists is replaced by revision, whatever state it is in.

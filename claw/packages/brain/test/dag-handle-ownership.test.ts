@@ -784,3 +784,47 @@ test("H22 the reaper's identity check is wired through every call site", async (
   assert.match(ehSrc, /taskId: request\.task_id \?\? null,\n\s+dagRootTaskId:/,
     "which means ensureHands has to pass it in");
 });
+
+test("H23 the merge's own four seams", async () => {
+  // Round 41 reviewed only the merge commit, and found four defects that exist
+  // in neither parent -- each side correct alone, wrong combined. They are
+  // checked structurally because each is a line whose CORRECTNESS comes from
+  // the other side of the merge, and the behaviour they change lives behind a
+  // cluster, a bucket migration or a Node microtask.
+  const eh = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
+
+  // B1: #35 introduced a canonical session key and a migration that resolves it
+  // against the legacy spelling. A rollback still writing the raw name reads
+  // past a live READY row on the canonical key, reports `recorded` over it, and
+  // the next migration promotes this pending row over that live sandbox.
+  const rollback = eh.slice(eh.indexOf("const recordPending = async"));
+  assert.match(rollback.slice(0, rollback.indexOf("};")), /handsSessionKey\(sessionId\)/,
+    "the rollback has to write the key everything else reads");
+  assert.equal(/const key = `hands\.\$\{sessionId\}`/.test(eh), false,
+    "and the legacy spelling must not come back");
+
+  // B2: retention is a handover. The container stays alive for its live work
+  // and the retention record owns it; leaving the handle on it makes the
+  // replacement unregisterable and the rollback then stops the replacement --
+  // every retry, permanently.
+  const retain = eh.slice(eh.indexOf("async function retainInsteadOfDestroying"));
+  assert.match(retain.slice(0, retain.indexOf("\n}")), /releaseHandlesForWorkload\(/,
+    "a handed-over container must not keep the DAG's handle");
+
+  // B4: #35 made `releaseSlot` default true. This call undoes an ADOPTION, so
+  // the sandbox it stops pinging is one somebody else built and is still
+  // running -- releasing its slot lets a provision take a place the fleet has
+  // not vacated.
+  assert.match(eh, /unregisterSandbox\(adoptedSession, identity, \{ releaseSlot: false \}\)/,
+    "undoing an adoption does not free the adopted sandbox's slot");
+
+  // B3: a `then` that is a function makes the lazy bind a thenable, so the
+  // await that receives it calls `proxy.then(resolve, reject)` and the promise
+  // never settles.
+  const nats = readFileSync(
+    fileURLToPath(new URL("../../api/src/infra/nats.ts", import.meta.url)), "utf-8");
+  const bind = nats.slice(nats.indexOf("export async function bindDagHandles"));
+  assert.match(bind.slice(0, bind.indexOf("\n}")), /prop === "then"/,
+    "the lazy bind must not look like a promise to await");
+});
