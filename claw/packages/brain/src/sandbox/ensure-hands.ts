@@ -1588,7 +1588,10 @@ export async function rollbackUnregisterableWorkload(args: {
   const attemptRemedies = async (rounds: number): Promise<"stopped" | "recorded" | null> => {
     let stopped = false;
     let recorded = false;
-    for (let attempt = 1; attempt <= rounds && !stopped && !recorded; attempt++) {
+    // `!recorded` only: a landed stop `break`s out two lines below, so testing
+    // `!stopped` here could never be false. Flagged by CodeQL, and correctly --
+    // the break is what ends that case, and the condition was decoration.
+    for (let attempt = 1; attempt <= rounds && !recorded; attempt++) {
       try {
         await stop(workloadId, namespace, platformKey);
         stopped = true;

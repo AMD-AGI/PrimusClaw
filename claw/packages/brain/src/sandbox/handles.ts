@@ -176,7 +176,8 @@ export function handleIdentityKey(
   info: { workload_id?: string; session_id?: string } | string | null | undefined,
 ): string | null {
   if (!info) return null;
-  if (typeof info === "string") return info || null;
+  // Non-empty by the guard above, so no `|| null` is needed here.
+  if (typeof info === "string") return info;
   if (info.workload_id) return info.workload_id;
   return info.session_id ? `sandbox-session:${info.session_id}` : null;
 }
