@@ -1393,7 +1393,11 @@ export async function rollbackUnregisterableWorkload(args: {
   namespace: string;
   platformKey: string;
   pendingPayload: Uint8Array;
-  kv: { put: (key: string, value: Uint8Array) => Promise<unknown> };
+  kv: {
+    get: (key: string) => Promise<{ value?: Uint8Array; revision: number; operation?: string } | null>;
+    create: (key: string, value: Uint8Array) => Promise<unknown>;
+    update: (key: string, value: Uint8Array, revision: number) => Promise<unknown>;
+  };
   deps?: {
     stop?: (workloadId: string, namespace: string, platformKey: string) => Promise<unknown>;
     release?: (workloadId: string) => Promise<unknown>;
@@ -1411,6 +1415,44 @@ export async function rollbackUnregisterableWorkload(args: {
     }));
   const release = args.deps?.release ?? releaseHandlesForWorkload;
 
+  // Writing the session entry is only a remedy while the entry is still THIS
+  // workload's to write. The background recovery below can wake long after the
+  // task that owned it failed and the session moved on to a new workload, and
+  // `hands.<sessionId>` holds one entry: writing the old pending payload over a
+  // live one takes the new workload's only reference to give the old one a
+  // reference that the new workload's own `ready` write then overwrites. Both
+  // end up unreferenced, and the loop -- having counted the write as success --
+  // has already exited.
+  //
+  // So it reads first, and declines when the entry names someone else. That is
+  // not a failure to retry: the entry is spoken for and will stay spoken for,
+  // and stopping the workload is the remedy that remains. Absent, tombstoned or
+  // still ours, the write is revision-conditional, so a session entry that
+  // appears between the read and the write is not overwritten either.
+  const recordPending = async (): Promise<boolean> => {
+    const key = `hands.${sessionId}`;
+    const cur = await kv.get(key);
+    const live = cur && cur.operation !== "DEL" && cur.operation !== "PURGE"
+      && (cur.value?.length ?? 0) > 0;
+    if (live && cur) {
+      let claimedByOther = false;
+      try {
+        claimedByOther = JSON.parse(sc.decode(cur.value!)).workloadId !== workloadId;
+      } catch { /* unparseable: nothing is relying on it, so it may be replaced */ }
+      if (claimedByOther) {
+        logger.warn(
+          { sessionId, workloadId },
+          "dag-handles.pending_register_rollback_session_reused",
+        );
+        return false;
+      }
+      await kv.update(key, pendingPayload, cur.revision);
+      return true;
+    }
+    await kv.create(key, pendingPayload);
+    return true;
+  };
+
   const attemptRemedies = async (rounds: number): Promise<"stopped" | "recorded" | null> => {
     let stopped = false;
     let recorded = false;
@@ -1426,8 +1468,7 @@ export async function rollbackUnregisterableWorkload(args: {
         );
       }
       try {
-        await kv.put(`hands.${sessionId}`, pendingPayload);
-        recorded = true;
+        recorded = await recordPending();
       } catch (kvErr) {
         logger.error(
           { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },

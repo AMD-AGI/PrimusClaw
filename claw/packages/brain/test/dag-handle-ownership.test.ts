@@ -42,6 +42,7 @@
  *   H16 a rollback whose stop failed keeps the handle
  *   H17 a rollback whose first remedy fails keeps trying the other one
  *   H18 an exhausted rollback keeps trying until a dependency comes back
+ *   H19 recovery does not take a session entry the session has moved on to
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -527,19 +528,35 @@ test("H16 a rollback whose stop failed keeps the handle", async () => {
 
 const rollbackCase = async (opts: {
   stopFails: number; putFails: number; releaseFails?: number; inlineRetry?: boolean;
+  /** A session entry already present when the rollback runs. */
+  sessionEntry?: { workloadId: string } | null;
 }) => {
   const calls = { stop: 0, put: 0, release: 0 };
   const puts: string[] = [];
   let detached: Promise<void> | null = null;
+  let row: { value: Uint8Array; revision: number } | null = opts.sessionEntry
+    ? { value: sc.encode(JSON.stringify(opts.sessionEntry)), revision: 7 }
+    : null;
+  const write = (value: Uint8Array) => {
+    calls.put += 1;
+    if (calls.put <= opts.putFails) throw new Error("kv down");
+    row = { value, revision: (row?.revision ?? 0) + 1 };
+    puts.push(JSON.parse(new TextDecoder().decode(value)).workloadId);
+  };
   const outcome = await rollbackUnregisterableWorkload({
     sessionId: "s1", workloadId: "W1", namespace: "ns", platformKey: "pk",
     pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W1" })),
     kv: {
-      async put(key: string) {
-        calls.put += 1;
-        if (calls.put <= opts.putFails) throw new Error("kv down");
-        puts.push(key);
+      async get() { return row ? { ...row, operation: "PUT" } : null; },
+      async create(_key: string, value: Uint8Array) {
+        if (row) throw new Error("wrong last sequence: key exists");
+        write(value);
         return 1;
+      },
+      async update(_key: string, value: Uint8Array, revision: number) {
+        if (row?.revision !== revision) throw new Error(`wrong last sequence: ${row?.revision}`);
+        write(value);
+        return row!.revision;
       },
     },
     deps: {
@@ -558,7 +575,7 @@ const rollbackCase = async (opts: {
     },
   });
   if (detached) await detached;
-  return { outcome, calls, puts };
+  return { outcome, calls, puts, finalEntry: row };
 };
 
 test("H17 a rollback whose first remedy fails keeps trying the other one", async () => {
@@ -572,7 +589,7 @@ test("H17 a rollback whose first remedy fails keeps trying the other one", async
   // Either remedy is sufficient, so the loop stops at the first one that lands.
   const a = await rollbackCase({ stopFails: 99, putFails: 1 });
   assert.equal(a.outcome, "recorded", "a transient KV error must not end the rollback");
-  assert.deepEqual(a.puts, ["hands.s1"], "the session entry must be written");
+  assert.deepEqual(a.puts, ["W1"], "the session entry must be written");
   assert.equal(a.calls.stop, 2, "and the stop retried alongside it");
 
   // A stop that comes good on a later round is the better outcome: a workload
@@ -613,7 +630,7 @@ test("H18 an exhausted rollback keeps trying until a dependency comes back", asy
 
   // Recovery on the other remedy counts too: a findable workload is enough.
   const viaKv = await rollbackCase({ stopFails: 99, putFails: 3, inlineRetry: true });
-  assert.deepEqual(viaKv.puts, ["hands.s1"], "the session entry lands on the retry");
+  assert.deepEqual(viaKv.puts, ["W1"], "the session entry lands on the retry");
 
   // The retries are bounded, not a loop that runs forever.
   const never = await rollbackCase({ stopFails: 99, putFails: 99, inlineRetry: true });
@@ -625,5 +642,33 @@ test("H18 an exhausted rollback keeps trying until a dependency comes back", asy
   const detachedByDefault = await rollbackCase({ stopFails: 99, putFails: 99 });
   assert.equal(detachedByDefault.outcome, "orphaned");
   assert.ok(Number(process.hrtime.bigint() - t0) < 3e9, "the rollback must not block on recovery");
+});
+
+test("H19 recovery does not take a session entry the session has moved on to", async () => {
+  // Round 30. The recovery can wake long after the task that owned W1 failed,
+  // by which time the same session may be creating W2 -- and `hands.<session>`
+  // holds ONE entry. Writing W1's old pending payload over W2's took W2's only
+  // reference to give W1 one that W2's own `ready` write then overwrote, so
+  // both ended up unreferenced -- and the loop, counting the write as success,
+  // had already exited. No process death, no exhausted window.
+  const moved = await rollbackCase({
+    stopFails: 99, putFails: 0, inlineRetry: true, sessionEntry: { workloadId: "W2" },
+  });
+  assert.deepEqual(moved.puts, [], "W2's entry must not be taken");
+  assert.equal(
+    JSON.parse(new TextDecoder().decode(moved.finalEntry!.value)).workloadId, "W2",
+    "the session entry still names the workload that is actually using it",
+  );
+  // Declining is not success: the entry is spoken for and will stay spoken for,
+  // so the stop is the remedy that remains, and it has to keep being tried.
+  assert.equal(moved.outcome, "orphaned");
+  assert.equal(moved.calls.stop, 6, "the rounds and the retries all still run");
+
+  // An entry this workload wrote itself is still its own to refresh.
+  const ours = await rollbackCase({
+    stopFails: 99, putFails: 0, sessionEntry: { workloadId: "W1" },
+  });
+  assert.deepEqual(ours.puts, ["W1"]);
+  assert.equal(ours.outcome, "recorded");
 });
 
