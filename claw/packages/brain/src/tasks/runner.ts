@@ -1608,7 +1608,13 @@ class TaskRunner {
       );
       return;
     }
-    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
+    await fx().reapPendingHands(this.sessionId, {
+      taskId: this.request.task_id,
+      // Asked again on the far side of the reaper's KV read: this check and the
+      // teardown are a round trip apart, which is long enough for the heartbeat
+      // to notice, and the snapshot that comes back is then the successor's.
+      stillOwned: () => this.abortCtrl.signal.reason !== LEASE_LOST_ABORT_REASON,
+    });
   }
 
   private async recoverInflightCheckpoint(reason: string): Promise<void> {

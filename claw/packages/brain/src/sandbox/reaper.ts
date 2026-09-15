@@ -368,7 +368,7 @@ export async function destroyHands(
  */
 export async function reapPendingHands(
   sessionId: string,
-  expected?: { taskId?: string | null },
+  expected?: { taskId?: string | null; stillOwned?: () => boolean },
 ): Promise<void> {
   try {
     const kv = getHandsKv();
@@ -391,6 +391,19 @@ export async function reapPendingHands(
         { sessionId, workloadId: info.workloadId, entryTaskId: info.taskId,
           taskId: expected.taskId },
         "hands.reap_pending_skipped_other_task",
+      );
+      return;
+    }
+    // Re-asked after the read, not only before it. The caller checks that it
+    // still holds the lock before calling -- but the check and the teardown are
+    // separated by a KV round trip, and that is exactly long enough for the
+    // heartbeat to notice the lease is gone. The snapshot that comes back then
+    // belongs to the successor, carrying the same task id, and passes the
+    // comparison above.
+    if (expected?.stillOwned && !expected.stillOwned()) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, taskId: expected.taskId ?? null },
+        "hands.reap_pending_skipped_lease_lost_mid_read",
       );
       return;
     }

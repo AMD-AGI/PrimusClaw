@@ -89,3 +89,37 @@ test("a READY entry is still left alone", async () => {
   const r = await reap({ ...pending("W3", "d1-task"), status: "ready" }, { taskId: "d1-task" });
   assert.deepEqual(r.stopped, [], "a healthy sandbox is kept for the next message");
 });
+
+test("a lease lost during the reaper's own read still stops the teardown", async () => {
+  // Round 34. The caller checks it still holds the lock before calling -- but
+  // that check and the teardown are a KV round trip apart, and that is exactly
+  // long enough for the heartbeat to notice the lease is gone. The snapshot
+  // that comes back is then the successor's, carrying the same task id, and it
+  // passes the identity comparison. Reproduced as
+  // `{"workload":"W2","leaseLost":true,"successorReady":true}`.
+  let owned = true;
+  const stopped: string[] = [];
+  const kv = {
+    async get(key: string) {
+      owned = false;  // the heartbeat notices while this read is in flight
+      return {
+        key,
+        value: sc.encode(JSON.stringify(pending("W2", "t-same"))),
+        revision: 3,
+      };
+    },
+    async delete() {},
+    async put() { return 1; },
+    async update() { return 4; },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  const provider = {
+    kind: "safe-workload",
+    async stop(t: { id?: string }) { stopped.push(String(t?.id)); },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+
+  await reapPendingHands(SESSION, { taskId: "t-same", stillOwned: () => owned });
+
+  assert.deepEqual(stopped, [], "the successor holds the lock, so its workload is not ours");
+});

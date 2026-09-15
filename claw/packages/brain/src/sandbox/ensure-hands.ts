@@ -441,6 +441,31 @@ async function readReusableEntry(
  * image or the resources and sent another message silently got the old sandbox
  * back with no indication anything had been ignored.
  */
+/**
+ * Is this session entry somebody else's to destroy?
+ *
+ * `hands.<sessionId>` is a single entry, and every replace branch below reads
+ * it, takes the workload it names, and stops it. That is right when a session
+ * runs one task at a time. Under a session-scoped run gate it is not: two DAG
+ * roots take different lock keys and run at once over this one entry, so the
+ * workload it names may be one a sibling is still creating -- or already
+ * promoted and using. Stopping it is a mis-stop, and no amount of passing the
+ * read identity along prevents it: pinning WHICH workload gets stopped is not
+ * evidence that it is the caller's to stop.
+ *
+ * The DAG root is the unit of ownership here, not the task: nodes of the same
+ * DAG are meant to share the session's sandbox, and reuse across them is the
+ * point. An entry written before these fields existed names nobody, and is
+ * treated as the caller's -- the pre-rollout behaviour, and the alternative is
+ * refusing to rebuild a session that has no owner recorded.
+ */
+function entryOwnedByAnother(info: Record<string, unknown>, request: ExecuteRequest): boolean {
+  const mineRoot = request.dag_root_task_id ?? request.task_id ?? null;
+  const entryRoot = typeof info.dagRootTaskId === "string" ? info.dagRootTaskId : null;
+  if (!entryRoot || !mineRoot) return false;
+  return entryRoot !== mineRoot;
+}
+
 export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHandsResult | null> {
   const { kv, sessionId, request, multiNodeContext, requestedSpec, onEvent, signal } = a;
   logger.info({ sessionId }, "ensureHands.kv_lookup");
@@ -467,6 +492,13 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       },
       "ensureHands.mn_replace_sandbox",
     );
+    if (entryOwnedByAnother(info, request)) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+        "hands.kv.mn_replace_skipped_other_owner",
+      );
+      return null;
+    }
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
     return null;
   }
@@ -482,7 +514,8 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     // is -- this task cannot reuse it either, so it falls through to creating
     // its own, which is what it would have done anyway.
     const entryTask = typeof info.taskId === "string" ? info.taskId : null;
-    const mine = !entryTask || !request.task_id || entryTask === request.task_id;
+    const mine = (!entryTask || !request.task_id || entryTask === request.task_id)
+      && !entryOwnedByAnother(info, request);
     logger.warn(
       { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)",
         entryTaskId: entryTask, taskId: request.task_id ?? null, mine },
@@ -509,6 +542,13 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       reason: "spec_changed",
       detail: "the sandbox image, resources or environment differ from the running sandbox",
     }).catch(() => {});
+    if (entryOwnedByAnother(info, request)) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+        "hands.kv.spec_rebuild_skipped_other_owner",
+      );
+      return null;
+    }
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
     return null;
   }
@@ -551,6 +591,15 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   // Reap the referenced workload (stop in SaFE + delete KV) before recreating.
   // destroyHands reads workloadId + platformKey from the KV entry we just
   // observed; if either is missing it will just delete KV.
+  if (entryOwnedByAnother(info, request)) {
+    // Unhealthy to US, over a shared entry -- the probe that failed was of a
+    // sandbox another DAG owns, and it is not ours to recreate.
+    logger.warn(
+      { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+      "hands.kv.unhealthy_rebuild_skipped_other_owner",
+    );
+    return null;
+  }
   await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
   return null;
 }
@@ -1216,6 +1265,9 @@ async function provisionHands(
   const kvKey = `hands.${sessionId}`;
   const readyPayload = sc.encode(JSON.stringify({
     status: "ready",
+    // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
+    taskId: request.task_id ?? null,
+    dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
     // The key the run lease is actually under. Not the session: the gate is
     // workspace-scoped by default, so a run holding files takes
     // `lock.ws.<workspaceId>`, and only an unbound run falls back to the DAG
@@ -1725,6 +1777,9 @@ async function ensureHandsAgentSandbox(
     // the agent-sandbox session later.
     await kv.put(`hands.${sessionId}`, sc.encode(JSON.stringify({
       status: "ready",
+      // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
+      taskId: request.task_id ?? null,
+      dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
       // The key the run lease is actually under -- see the note on the other
       // create path: workspace-gated by default, session only as a fallback.
       runScope: pickLockKey(request),

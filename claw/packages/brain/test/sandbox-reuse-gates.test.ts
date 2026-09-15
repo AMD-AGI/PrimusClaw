@@ -695,3 +695,72 @@ test("a pending entry with no task on it is cleaned up as before", async () => {
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(destroyed, ["s-1"]);
 });
+
+// Every replace branch reads the one shared session entry, takes the workload
+// it names, and stops it. Right when a session runs one task at a time; under a
+// session-scoped run gate two DAG roots run at once over that entry, so the
+// workload it names can be a sibling's -- already promoted and in use. Round 34
+// reproduced both remaining branches as
+// `stopped=[{"id":"W2","inUse":true,"currentStatus":"ready"}]`, the spec one
+// with no race at all: B builds image:1 and keeps using it, A asks for image:2
+// and the fingerprint comparison alone routes it into the rebuild.
+const OWNED_BY = (dagRootTaskId: string, over: Record<string, unknown> = {}) => ({
+  ...LIVE, specFingerprint: specOf(), dagRootTaskId, ...over,
+});
+/** A recorded fingerprint that parses but does not match -- the shape
+ *  evaluateReuse actually refuses on. A non-fingerprint string is treated as
+ *  unknown and reuses, which routes past this branch into the health check. */
+const STALE_SPEC = () => specOf().replace(/:[0-9a-f]+$/, ":ffffffffffffffff");
+const MINE = { ...REQUEST, task_id: "t-a", dag_root_task_id: "dag-a" };
+
+test("a spec rebuild does not stop a sandbox another DAG owns", async () => {
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-b", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null, "this task goes on to build its own");
+  assert.deepEqual(destroyed, [], "but not by stopping one a sibling DAG is using");
+});
+
+test("a multi-node replace does not stop a sandbox another DAG owns", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(OWNED_BY("dag-b") as never, {
+    request: MINE,
+    multiNodeContext: { serviceUrl: "http://mn.test" } as never,
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "multi-node replaces its own prior sandbox, not a sibling's");
+});
+
+test("an unhealthy sandbox another DAG owns is not recreated over", async () => {
+  // The probe that failed was of somebody else's sandbox.
+  const { destroyed } = stubEffects("dead", false);
+  stubHealth("fail");
+  const { a } = attempt(OWNED_BY("dag-b") as never, { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, []);
+});
+
+test("a task rebuilding its OWN DAG's sandbox still replaces it", async () => {
+  // Nodes of one DAG share the session's sandbox on purpose: this is the
+  // behaviour the guard must not break.
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own DAG's sandbox is its to rebuild");
+});
+
+test("an entry with no owner recorded is replaced as before", async () => {
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt({ ...LIVE, specFingerprint: STALE_SPEC() } as never, { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "refusing to rebuild an unowned session would be worse");
+});
