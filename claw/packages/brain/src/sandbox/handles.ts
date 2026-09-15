@@ -164,6 +164,24 @@ const RELEASE_SCAN_TIMEOUT_MS = 10_000;
  * against the entry's original writer gets wrong.
  */
 /**
+ * The key a handle is compared on.
+ *
+ * SaFE workloads are named by `workload_id`. An agent-sandbox is not -- it
+ * records `workload_id: ""` and carries the Router session id instead -- so
+ * comparing on the workload id alone silently matched nothing for those, and
+ * an ownership question asked about a Router sandbox got the answer "nobody
+ * else holds it" for free.
+ */
+export function handleIdentityKey(
+  info: { workload_id?: string; session_id?: string } | string | null | undefined,
+): string | null {
+  if (!info) return null;
+  if (typeof info === "string") return info || null;
+  if (info.workload_id) return info.workload_id;
+  return info.session_id ? `sandbox-session:${info.session_id}` : null;
+}
+
+/**
  * Does any DAG OTHER than this one hold a handle naming this workload?
  *
  * `dagHoldsWorkload` answers "am I a holder", which is the right question for
@@ -197,8 +215,7 @@ export async function workloadHeldByOtherDag(
   for (const [dagRoot, handles] of rows) {
     if (dagRoot === mineDagRootTaskId) continue;
     for (const info of Object.values(handles)) {
-      const id = typeof info === "string" ? info : info?.workload_id;
-      if (id && id === workloadId) return true;
+      if (handleIdentityKey(info) === workloadId) return true;
     }
   }
   return false;
@@ -209,10 +226,7 @@ export async function dagHoldsWorkload(
   workloadId: string,
 ): Promise<boolean> {
   const held = await getMap().listForDag(dagRootTaskId);
-  return Object.values(held).some((h) => {
-    const id = typeof h === "string" ? h : h?.workload_id;
-    return !!id && id === workloadId;
-  });
+  return Object.values(held).some((h) => handleIdentityKey(h) === workloadId);
 }
 
 export async function replaceDagHandle(

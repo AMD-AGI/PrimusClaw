@@ -37,7 +37,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { dagHoldsWorkload, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
+import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox } from "./bootstrap.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
@@ -482,7 +482,15 @@ async function entryOwnedByAnother(
   //
   // So the handle registry decides. A read failure answers "not mine", which
   // keeps the mis-stop this guard exists to prevent.
-  const workloadId = typeof info.workloadId === "string" ? info.workloadId : null;
+  // Not the workload id alone: an agent-sandbox entry records `workloadId: ""`
+  // and names its Router session instead, so keying on the workload id meant
+  // every ownership question about one was answered "nobody else holds it"
+  // without a single query being made -- and a Router sandbox another DAG was
+  // using got deleted on the strength of it.
+  const workloadId = handleIdentityKey({
+    workload_id: typeof info.workloadId === "string" ? info.workloadId : "",
+    session_id: typeof info.sessionId === "string" ? info.sessionId : "",
+  });
   if (!workloadId) return entryRoot !== mineRoot;
   try {
     // Two questions, and destroying needs both answered. The first is "am I

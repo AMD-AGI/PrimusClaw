@@ -876,3 +876,24 @@ test("the creator may still rebuild when nobody else holds it", async () => {
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(destroyed, ["s-1"], "its own sandbox, held by nobody else");
 });
+
+test("an agent-sandbox entry is identified by its Router session, not a blank workload id", async () => {
+  // Round 38. An agent-sandbox entry records `workloadId: ""` and names its
+  // Router session instead. Keying ownership on the workload id meant the
+  // question short-circuited before either query ran -- `holderQueries=0` --
+  // so a Router sandbox another DAG was using was deleted on the strength of
+  // an answer nobody had asked for.
+  const queries: string[] = [];
+  const { destroyed } = stubEffects("dead", true, undefined,
+    false,
+    async () => { queries.push("other"); return true; });
+  stubHealth("ok");
+  const { a } = attempt({
+    ...LIVE, specFingerprint: STALE_SPEC(), dagRootTaskId: "dag-a",
+    provider: "agent-sandbox", workloadId: "", sessionId: "router-R",
+  } as never, { request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" } });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(queries, ["other"], "the holder question has to actually be asked");
+  assert.deepEqual(destroyed, [], "another DAG is using that Router sandbox");
+});
