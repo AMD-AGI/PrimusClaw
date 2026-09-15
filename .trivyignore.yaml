@@ -1,0 +1,50 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Vulnerabilities the base-image gate is allowed to see and still pass.
+#
+# Read `.github/workflows/security.yml` first: the gate scans the *upstream*
+# base image of each Dockerfile's final stage, not the image we build from it.
+# So nothing this repository can write -- an `apt-get upgrade`, an extra layer,
+# a rebuild -- changes what that scan reports. The only lever is the digest pin,
+# and it only helps once upstream has published an image carrying the fix.
+#
+# An entry here therefore means exactly one thing: Debian has shipped the fix,
+# the image publisher has not rebuilt yet, and there is no action available in
+# this repository until they do. Anything else -- a vulnerability in a package
+# we install, in a dependency we pin, or one with no fix at all (which
+# `--ignore-unfixed` already drops) -- does not belong in this file.
+#
+# Every entry carries `expired_at`. Trivy stops honouring the entry from that
+# date, so the gate turns red again on its own and someone has to look: either
+# upstream has rebuilt and the entry is deleted, or it has not and the date is
+# pushed out deliberately, in a commit, with the reason updated. An exemption
+# that cannot expire is how a scan quietly stops being a scan.
+
+vulnerabilities:
+  # libpcre2 in Debian 12 (bookworm). Fixed in 10.42-1+deb12u1; both
+  # `node:26-bookworm-slim` and `python:3.14-slim-bookworm` still ship 10.42-1.
+  #
+  # Checked on 2026-09-15 rather than assumed: the newest `node:26-bookworm-slim`
+  # on Docker Hub at that point (sha256:cd9f682f...) was scanned with the same
+  # trivy 0.72.0 the gate uses and still reported both CVEs, and the newest
+  # `python:3.14-slim-bookworm` digest was byte-identical to the one pinned here
+  # -- upstream had not rebuilt either image. Bumping the pins was tried first
+  # and does not close these.
+  #
+  # Reachability, for the record: PCRE2 is linked by the base image's own
+  # userland (grep and friends). Neither the API/Brain process nor the memory
+  # services call into it -- Node uses V8's regex engine and CPython uses its
+  # own `re` -- so no request path in our code reaches this parser.
+  - id: CVE-2026-86145
+    statement: >-
+      pcre2 out-of-bounds write. Fixed in Debian as 10.42-1+deb12u1; the node
+      and python bookworm-slim images have not been rebuilt with it. No action
+      available here until they are -- the gate scans the upstream image.
+    expired_at: 2026-10-15
+
+  - id: CVE-2026-89161
+    statement: >-
+      pcre2 memory corruption in pcre2_jit_match. Same package, same fixed
+      version, same upstream-rebuild dependency as CVE-2026-86145.
+    expired_at: 2026-10-15
