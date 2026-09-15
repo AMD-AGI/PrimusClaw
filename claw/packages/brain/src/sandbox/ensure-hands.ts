@@ -1432,13 +1432,22 @@ export async function rollbackUnregisterableWorkload(args: {
   const recordPending = async (): Promise<boolean> => {
     const key = `hands.${sessionId}`;
     const cur = await kv.get(key);
-    const live = cur && cur.operation !== "DEL" && cur.operation !== "PURGE"
-      && (cur.value?.length ?? 0) > 0;
-    if (live && cur) {
+    if (cur) {
+      // A key that exists is replaced by revision, whatever state it is in.
+      // Splitting on "has a usable value" and routing the rest to `create` was
+      // a regression: the heartbeat re-`update`s tombstones it read, and NATS
+      // does not carry the DEL operation across an update, so the bucket holds
+      // a PUT with a zero-byte value. `create` allows an absent key or a
+      // tombstone -- not that -- so it conflicted on every attempt, where the
+      // unconditional `put` this replaced simply succeeded.
+      const live = cur.operation !== "DEL" && cur.operation !== "PURGE"
+        && (cur.value?.length ?? 0) > 0;
       let claimedByOther = false;
-      try {
-        claimedByOther = JSON.parse(sc.decode(cur.value!)).workloadId !== workloadId;
-      } catch { /* unparseable: nothing is relying on it, so it may be replaced */ }
+      if (live) {
+        try {
+          claimedByOther = JSON.parse(sc.decode(cur.value!)).workloadId !== workloadId;
+        } catch { /* unparseable: nothing is relying on it, so it may be replaced */ }
+      }
       if (claimedByOther) {
         logger.warn(
           { sessionId, workloadId },
@@ -1497,7 +1506,7 @@ export async function rollbackUnregisterableWorkload(args: {
   };
 
   const outcome = await attemptRemedies(ROLLBACK_ATTEMPTS);
-  if (outcome) return outcome;
+  if (outcome === "stopped") return outcome;
 
   // Neither remedy landed in any round: SaFE would not stop it and KV would not
   // take the record. Nothing durable can be written, because those two ARE the
@@ -1514,17 +1523,31 @@ export async function rollbackUnregisterableWorkload(args: {
   // What this does NOT survive is the process dying inside the retry window, and
   // it cannot: recording the workload somewhere that outlives the process is
   // exactly the workload-keyed durable ownership this PR defers.
-  logger.error(
-    { sessionId, workloadId, namespace },
-    "dag-handles.pending_register_rollback_orphaned",
-  );
+  //
+  // A session entry that WAS written does not end it either. `hands.<sessionId>`
+  // is one slot, owned by whichever workload the session is currently creating,
+  // and the next normal pending write takes it back unconditionally -- so a
+  // recovery that recorded W1 and exited left W1 unreferenced again the moment
+  // W2 finished provisioning, with nothing still trying. Only a landed stop
+  // means there is no longer a workload to keep track of.
+  if (!outcome) {
+    logger.error(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_orphaned",
+    );
+  } else {
+    logger.warn(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_recorded_pending_stop",
+    );
+  }
   const detach = args.deps?.detach ?? ((fn: () => Promise<void>) => { void fn().catch(() => {}); });
   const delays = args.deps?.retryDelaysMs ?? ORPHAN_RETRY_DELAYS_MS;
   detach(async () => {
     for (const delay of delays) {
       await sleep(delay);
       const recovered = await attemptRemedies(1);
-      if (recovered) {
+      if (recovered === "stopped") {
         logger.warn(
           { sessionId, workloadId, outcome: recovered },
           "dag-handles.pending_register_rollback_orphan_recovered",
@@ -1537,7 +1560,7 @@ export async function rollbackUnregisterableWorkload(args: {
       "dag-handles.pending_register_rollback_orphan_retry_exhausted",
     );
   });
-  return "orphaned";
+  return outcome ?? "orphaned";
 }
 
 export async function ensureHands(

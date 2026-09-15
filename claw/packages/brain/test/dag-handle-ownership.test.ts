@@ -43,6 +43,8 @@
  *   H17 a rollback whose first remedy fails keeps trying the other one
  *   H18 an exhausted rollback keeps trying until a dependency comes back
  *   H19 recovery does not take a session entry the session has moved on to
+ *   H20 a recorded entry does not end the recovery -- only a landed stop does
+ *   H21 an empty PUT is replaced, not create-conflicted forever
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -530,12 +532,19 @@ const rollbackCase = async (opts: {
   stopFails: number; putFails: number; releaseFails?: number; inlineRetry?: boolean;
   /** A session entry already present when the rollback runs. */
   sessionEntry?: { workloadId: string } | null;
+  /** Another workload takes the session slot after this many writes. */
+  stolenAfterPuts?: number;
+  /** The KV operation the existing entry carries. */
+  entryOperation?: string;
+  /** The existing entry is a zero-byte PUT. */
+  emptyValue?: boolean;
 }) => {
   const calls = { stop: 0, put: 0, release: 0 };
   const puts: string[] = [];
   let detached: Promise<void> | null = null;
+  const rowOp = opts.entryOperation ?? "PUT";
   let row: { value: Uint8Array; revision: number } | null = opts.sessionEntry
-    ? { value: sc.encode(JSON.stringify(opts.sessionEntry)), revision: 7 }
+    ? { value: opts.emptyValue ? new Uint8Array(0) : sc.encode(JSON.stringify(opts.sessionEntry)), revision: 7 }
     : null;
   const write = (value: Uint8Array) => {
     calls.put += 1;
@@ -547,7 +556,12 @@ const rollbackCase = async (opts: {
     sessionId: "s1", workloadId: "W1", namespace: "ns", platformKey: "pk",
     pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W1" })),
     kv: {
-      async get() { return row ? { ...row, operation: "PUT" } : null; },
+      async get() {
+        if (opts.stolenAfterPuts !== undefined && puts.length >= opts.stolenAfterPuts) {
+          row = { value: sc.encode(JSON.stringify({ workloadId: "W2" })), revision: 99 };
+        }
+        return row ? { ...row, operation: rowOp } : null;
+      },
       async create(_key: string, value: Uint8Array) {
         if (row) throw new Error("wrong last sequence: key exists");
         write(value);
@@ -628,9 +642,11 @@ test("H18 an exhausted rollback keeps trying until a dependency comes back", asy
   assert.equal(recovered.calls.stop, 4, "and the fourth stop -- after recovery -- lands");
   assert.equal(recovered.calls.release, 1, "a stop that landed frees the name it may have taken");
 
-  // Recovery on the other remedy counts too: a findable workload is enough.
+  // Recording makes it findable, but does NOT end the recovery -- see H20.
   const viaKv = await rollbackCase({ stopFails: 99, putFails: 3, inlineRetry: true });
-  assert.deepEqual(viaKv.puts, ["W1"], "the session entry lands on the retry");
+  assert.ok(viaKv.puts.length > 0 && viaKv.puts.every((w) => w === "W1"),
+    "the session entry lands once KV comes back");
+  assert.equal(viaKv.calls.stop, 6, "and the stop keeps being tried after it");
 
   // The retries are bounded, not a loop that runs forever.
   const never = await rollbackCase({ stopFails: 99, putFails: 99, inlineRetry: true });
@@ -670,5 +686,58 @@ test("H19 recovery does not take a session entry the session has moved on to", a
   });
   assert.deepEqual(ours.puts, ["W1"]);
   assert.equal(ours.outcome, "recorded");
+});
+
+test("H20 a recorded entry does not end the recovery -- only a landed stop does", async () => {
+  // Round 31, the mirror of H19. There, W1's recovery overwrote W2's entry.
+  // Here W1's recovery wins the race and writes FIRST, into an empty slot --
+  // CAS is satisfied, there is nobody to decline for -- and then W2 finishes
+  // provisioning and its own pending write takes the slot back, because that
+  // write is the normal unconditional one. W1 is unreferenced again, and the
+  // recovery, having counted its write as success, had already exited.
+  //
+  // `hands.<sessionId>` is ONE slot and it belongs to whichever workload the
+  // session is currently creating, so a recorded entry is never W1's to keep.
+  // Only a stop that landed means there is no longer a workload to track.
+  const taken = await rollbackCase({
+    stopFails: 99, putFails: 0, inlineRetry: true, stolenAfterPuts: 1,
+  });
+  // One synchronous round -- the record succeeded, which ends that phase -- and
+  // then all three retries, none of which stop trying just because it wrote.
+  assert.equal(taken.calls.stop, 4, "the stop has to keep being tried after the slot is lost");
+  assert.deepEqual(taken.puts, ["W1"], "and it declines to take the slot back");
+  assert.equal(taken.outcome, "recorded", "the synchronous result is unchanged");
+  assert.equal(
+    JSON.parse(new TextDecoder().decode(taken.finalEntry!.value)).workloadId, "W2",
+    "and the workload that took the slot keeps it",
+  );
+
+  // A stop that lands IS terminal -- there is nothing left to track.
+  const stopped = await rollbackCase({ stopFails: 3, putFails: 0, inlineRetry: true });
+  assert.equal(stopped.calls.stop, 4, "it stops trying the moment the stop lands");
+  assert.equal(stopped.calls.release, 1, "and frees the name that stop may have taken");
+});
+
+test("H21 an empty PUT is replaced, not create-conflicted forever", async () => {
+  // Round 31 (B). Splitting on "has a usable value" and routing everything else
+  // to `create` looked equivalent and was not. The heartbeat reads a tombstone
+  // and re-`update`s it, and NATS does not carry the DEL operation across an
+  // update -- so the bucket holds a PUT with a zero-byte value. `create` takes
+  // an absent key or a tombstone, not that, so it conflicted on every attempt
+  // where the unconditional `put` this replaced just succeeded.
+  //
+  // A key that exists is replaced by revision, whatever state it is in.
+  const empty = await rollbackCase({
+    stopFails: 99, putFails: 0, sessionEntry: { workloadId: "" }, emptyValue: true,
+  });
+  assert.deepEqual(empty.puts, ["W1"], "an empty PUT must not block the write");
+  assert.equal(empty.outcome, "recorded");
+
+  // A real tombstone is replaced the same way, and is nobody's claim.
+  const tombstoned = await rollbackCase({
+    stopFails: 99, putFails: 0, sessionEntry: { workloadId: "W2" },
+    entryOperation: "DEL",
+  });
+  assert.deepEqual(tombstoned.puts, ["W1"]);
 });
 
