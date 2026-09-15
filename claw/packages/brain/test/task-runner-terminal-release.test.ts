@@ -213,6 +213,8 @@ interface Scenario {
   abortDuringHandler?: unknown;
   /** Run inside the retryable-failure handler, before the reap. */
   onHandlerEntered?: () => Promise<void>;
+  /** Run inside the terminal handler, before the cluster is released. */
+  onTerminal?: () => Promise<void>;
   nakThrows?: boolean;
   ackThrows?: boolean;
   sideEffects?: Partial<TaskRunnerSideEffects>;
@@ -233,6 +235,14 @@ async function run(scenario: Scenario) {
           safeCalls.push("markRetryPending");
           abortDuringHandlerCtrl?.abort(scenario.abortDuringHandler);
           if (scenario.onHandlerEntered) await scenario.onHandlerEntered();
+        }) as never,
+      }
+      : {}),
+    ...(scenario.onTerminal
+      ? {
+        postAgentDone: (async () => {
+          safeCalls.push("postAgentDone");
+          await scenario.onTerminal!();
         }) as never,
       }
       : {}),
@@ -543,4 +553,43 @@ test("R12 a row that went terminal is still this worker's to clean up", async ()
   assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
   assert.ok(safeCalls.includes("reapPendingHands"),
     "nobody took this run over, so its half-created workload is still ours");
+});
+
+test("R13 a superseded attempt does not delete the cluster its successor adopted", async () => {
+  // Round 37. The sandbox teardown correctly refused -- and then the terminal
+  // handler went on to release the cluster anyway. The cluster is addressed by
+  // messageId, and a successor that takes the run over ADOPTS it under that
+  // same id, so the observed sequence was `hands.destroy_skipped_not_owned`
+  // followed by `DELETE /api/v1/workloads/M` against a Running, adopted
+  // cluster.
+  //
+  // One rule, asked everywhere something irreversible happens -- including a
+  // layer above the one the last two rounds were about.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const superseded = await run({
+    request: {
+      ...multiNodeRequest("t-cluster-superseded"),
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    },
+
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "superseded";
+      }) as never,
+    },
+    // The lease answers while the terminal handler is already running, which is
+    // after the dispatch that would otherwise route an aborted run elsewhere.
+    onTerminal: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await superseded.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.equal(safeCalls.includes(RELEASE_CALL), false,
+    "the successor is running on that cluster");
 });

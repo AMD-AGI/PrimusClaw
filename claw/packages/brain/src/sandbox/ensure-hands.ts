@@ -470,7 +470,6 @@ async function entryOwnedByAnother(
   const mineRoot = request.dag_root_task_id ?? request.task_id ?? null;
   const entryRoot = typeof info.dagRootTaskId === "string" ? info.dagRootTaskId : null;
   if (!entryRoot || !mineRoot) return false;
-  if (entryRoot === mineRoot) return false;
 
   // Who WROTE the entry is not the same question as who holds the workload now.
   // A task that reused another's sandbox registers its own handle on it and is
@@ -484,14 +483,21 @@ async function entryOwnedByAnother(
   // So the handle registry decides. A read failure answers "not mine", which
   // keeps the mis-stop this guard exists to prevent.
   const workloadId = typeof info.workloadId === "string" ? info.workloadId : null;
-  if (!workloadId) return true;
+  if (!workloadId) return entryRoot !== mineRoot;
   try {
-    // Two questions, and both have to be answered before destroying. Holding a
-    // handle says this DAG is A holder, which is what makes a rebuild its
-    // right; it does not say it is the ONLY one. The creator can still be
-    // running on the same workload -- reuse is the point -- and permission read
-    // off the first question alone stopped a sandbox it was using.
-    if (!(await reuseEffects.dagHoldsWorkload(mineRoot, workloadId))) return true;
+    // Two questions, and destroying needs both answered. The first is "am I
+    // entitled to this sandbox at all" -- true if I created it, and equally
+    // true if I merely reused it, because a reusing DAG registers its own
+    // handle and is from then on just as much a holder.
+    //
+    // The second is the one being entitled does not answer: is anyone ELSE
+    // holding it? Reuse is the point of the registry, so the answer is often
+    // yes -- and creating the workload does not exempt you from asking. A
+    // creator whose sandbox has since been reused by another DAG was skipping
+    // straight past both queries and stopping it underneath them.
+    const entitled = entryRoot === mineRoot
+      || await reuseEffects.dagHoldsWorkload(mineRoot, workloadId);
+    if (!entitled) return true;
     return await reuseEffects.workloadHeldByOtherDag(mineRoot, workloadId);
   } catch (e) {
     logger.warn(

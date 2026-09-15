@@ -846,3 +846,33 @@ test("a scan that cannot answer who else holds it refuses the destroy", async ()
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(destroyed, [], "a refused rebuild beats stopping a live workload");
 });
+
+test("the creator is not exempt from asking who else holds it", async () => {
+  // Round 37. My own predicate short-circuited on `entryRoot === mineRoot` and
+  // returned "mine" without asking either question -- so a creator whose
+  // sandbox had since been reused by another DAG stopped it underneath them:
+  // `stopped=[{id:"W1", bUsing:true}], holdsQueries=0, otherQueries=0`.
+  //
+  // Creating it answers the first question (am I entitled at all). It says
+  // nothing about the second.
+  const { destroyed } = stubEffects("dead", true, undefined, false, true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never, {
+    request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "another DAG reused it and is running on it");
+});
+
+test("the creator may still rebuild when nobody else holds it", async () => {
+  // The ordinary case, and the one the extra question must not break.
+  const { destroyed } = stubEffects("dead", true, undefined, false, false);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never, {
+    request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own sandbox, held by nobody else");
+});

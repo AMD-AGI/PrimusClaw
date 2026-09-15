@@ -2359,6 +2359,20 @@ class TaskRunner {
   /** Release the message-scoped cluster. */
   private async teardownRayJob(): Promise<void> {
     if (!isMultiNodeRequest(this.request)) return;
+    // The same rule the sandbox teardown follows, and it has to be here too:
+    // the cluster is addressed by messageId, and a successor that took this
+    // run over ADOPTS it under that same id. So a terminal handler that has
+    // already been told its sandbox is not its to stop would go on to delete
+    // the GPU cluster the successor is now running on -- which is what
+    // happened: `hands.destroy_skipped_not_owned` followed by
+    // `DELETE /api/v1/workloads/M` against a Running, adopted cluster.
+    if (!this.stillOwnsLock()) {
+      logger.warn(
+        { sessionId: this.sessionId, messageId: this.messageId, taskId: this.request.task_id },
+        "task.cluster_release_skipped_not_owned",
+      );
+      return;
+    }
     const namespace = this.multiNodeContext?.namespace ?? this.request.workspace_id?.trim();
     if (!namespace || !this.messageId) return;
     // A deployment without SaFE has no cluster to release. Reachable: a prompt
