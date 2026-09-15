@@ -390,7 +390,7 @@ async function recoverOrRetainUnusableSandbox(
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
     return null;
   }
-  await retainInsteadOfDestroying(kv, sessionId, info, live);
+  await retainInsteadOfDestroying(kv, sessionId, info, live, binding);
   return null;
 }
 
@@ -462,10 +462,19 @@ async function retainInsteadOfDestroying(
   sessionId: string,
   info: any,
   answer: LiveWorkAnswer,
+  binding: HandsBinding,
 ): Promise<void> {
   await reuseEffects.retainContainer({
     store: retentionStore(kv),
-    sessionKey: handsSessionKey(sessionId),
+    // The key this binding was read under, not one re-derived from the session
+    // id. `readReusableEntry` reads through both names, so during a rolling
+    // upgrade the binding it acted on can be the legacy one while the canonical
+    // key holds a different generation of the same session -- and re-deriving
+    // then deletes that live sibling's binding while leaving the retained
+    // container still bound to its own session, which is both halves of the
+    // mistake at once. `deleteExpiredRetryRecord` and `releaseRetention` state
+    // the same rule: act on the key that was walked, never on a recomputed one.
+    sessionKey: binding.key,
     generation: retentionGeneration(sessionId, info),
     binding: info,
     verdict: answer.verdict,

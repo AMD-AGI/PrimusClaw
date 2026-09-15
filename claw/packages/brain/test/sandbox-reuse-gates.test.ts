@@ -32,6 +32,7 @@ import {
   assertDagHandleAlive,
 } from "../src/sandbox/ensure-hands.js";
 import { resolveSandboxAction } from "../src/sandbox/params.js";
+import { handsSessionKey, legacyHandsKey } from "../src/sandbox/hands-key.js";
 
 const realFetch = globalThis.fetch;
 let restoreEffects: (() => void) | null = null;
@@ -114,11 +115,14 @@ function stubEffects(
   registered: Registration[];
   restartCalls: number[];
   retained: string[];
+  /** The session keys a retention released, which is the binding it unbound. */
+  retainedKeys: string[];
 } {
   const destroyed: string[] = [];
   const registered: Registration[] = [];
   const restartCalls: number[] = [];
   const retained: string[] = [];
+  const retainedKeys: string[] = [];
   restoreEffects = bindSandboxReuseEffects({
     destroyHands: async (sessionId: string) => { destroyed.push(sessionId); },
     registerSandbox: ((sessionId: string, target: Record<string, unknown>) => {
@@ -131,9 +135,13 @@ function stubEffects(
       return { ok: restartOk, detail: restartOk ? "healthy" : "started_but_unhealthy" };
     },
     countLiveWork: async () => ({ verdict: liveWork, classes: {}, reason: liveWork }),
-    retainContainer: async (input) => { retained.push(input.generation); return "retained"; },
+    retainContainer: async (input) => {
+      retained.push(input.generation);
+      retainedKeys.push(input.sessionKey);
+      return "retained";
+    },
   });
-  return { destroyed, registered, restartCalls, retained };
+  return { destroyed, registered, restartCalls, retained, retainedKeys };
 }
 
 /** The session ids passed to `registerSandbox`, for the cases that only count. */
@@ -697,6 +705,40 @@ test("a retention is keyed by the generation its shells' rows record", async () 
   assert.equal(await tryReuseSessionSandbox(a), null);
   assert.deepEqual(retained, [LIVE.handsUrl],
     "the retention key part must be the generation the rows carry, not another identifier");
+});
+
+test("a retention releases the key the binding was read under, not a re-derived one", async () => {
+  // The reuse path reads through both names a binding can sit under, so for the
+  // length of a rolling upgrade the binding it acted on can be the legacy one
+  // while the canonical key holds a different generation of the same session.
+  // Re-deriving the key here deleted that sibling's binding -- the sweeps walk
+  // `hands.*`, so the sandbox it named became reachable by nothing -- and left
+  // the retained container still bound to the session it was being unbound from.
+  const sessionId = "retained-rollout";
+  const legacyKey = legacyHandsKey(sessionId);
+  assert.notEqual(handsSessionKey(sessionId), legacyKey,
+    "this fixture only describes a rolling upgrade while the two names differ");
+  const enc = new TextEncoder();
+  const legacyOnlyKv = {
+    async get(key: string) {
+      if (key !== legacyKey) return null;
+      return {
+        key,
+        value: enc.encode(JSON.stringify({ ...LIVE, specFingerprint: specOf() })),
+        revision: 7,
+      };
+    },
+    async put() { return 1; },
+    async update() { return 8; },
+  } as unknown as KV;
+  const { destroyed, retainedKeys } = stubEffects("alive", false, "env_not_reproducible", "protected");
+  stubHealth("down");
+  const { a } = attempt(null, { kv: legacyOnlyKv, sessionId });
+
+  assert.equal(await tryReuseSessionSandbox(a), null, "the caller still gets a fresh sandbox");
+  assert.deepEqual(destroyed, [], "the live container is kept either way");
+  assert.deepEqual(retainedKeys, [legacyKey],
+    "the retention has to release the binding it acted on, never the canonical name");
 });
 
 test("a binding naming no endpoint is refused rather than retained under an address nothing resolves", async () => {

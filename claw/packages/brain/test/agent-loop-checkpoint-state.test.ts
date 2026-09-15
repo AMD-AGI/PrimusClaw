@@ -3,8 +3,8 @@
 
 // What does a resumed loop remember?
 //
-// The checkpoint used to carry the conversation and the counters but not three
-// pieces of in-memory state, so a resume silently changed behaviour:
+// The checkpoint used to carry the conversation and some of the counters but
+// not these pieces of in-memory state, so a resume silently changed behaviour:
 //
 //   - plan_mode is an authorization latch, not a preference. It confines the
 //     loop to a read-only allowlist until the user approves via
@@ -15,6 +15,10 @@
 //     infinite recovery loop against a doomed sandbox. Resetting either on
 //     resume means that budget never actually binds.
 //   - todo_state is the in-loop todo list, which just disappeared.
+//   - tool_ok_by_name is the succeeded half of the tool-call counts, reported
+//     alongside the attempts as one run's by_tool / by_tool_ok. Resetting it
+//     alone ships a pair describing different spans, and a rollout gate reading
+//     by_tool_ok >= 1 as proof a command ran then FAILs a healthy resumed run.
 //
 // Also pinned here: tool-call *inputs* are bounded before they enter the
 // conversation history (they were not, so one large write put the whole file
@@ -228,6 +232,80 @@ test("a sandbox tool that works again clears the recovery budget", async () => {
 
   assert.equal(seen[0]!.recoveries_used, 0,
     "a successful sandbox call means the repair held, so the budget resets");
+});
+
+test("a successful call made before the interruption is still one the run performed", async () => {
+  // The resumed turn is text-only on purpose, because that is the ordinary
+  // shape: the checkpoint's history already ends with the tool_result, so the
+  // model's natural continuation is to answer. There is no second call to
+  // re-earn the success with, and the run reports what it came back carrying.
+  const result = await agentLoop(
+    [{ role: "user", content: "hi" }],
+    TOOLS,
+    baseOpts({
+      resumeFrom: checkpointAt(3, {
+        tool_calls_by_name: { read: 1 },
+        tool_ok_by_name: { read: 1 },
+        total_tool_calls: 1,
+      }),
+      llmSession: scriptedSession([
+        { content: [text("already done")], stopReason: "end_turn" },
+      ]),
+    }),
+  );
+
+  assert.equal(result.toolStats.by_tool.read, 1,
+    "the attempt count carries, as it always has");
+  assert.equal(result.toolStats.by_tool_ok?.read, 1,
+    "and its succeeded half must carry with it, or the pair describes two "
+      + "different spans of the same run");
+});
+
+test("the successes carried into a resume are written back into its own checkpoint", async () => {
+  // Otherwise the count survives exactly one redelivery: the next interruption
+  // persists only what this process happened to see, and the run after that is
+  // back to reporting a span of its own.
+  const seen: CheckpointState[] = [];
+
+  await agentLoop(
+    [{ role: "user", content: "hi" }],
+    TOOLS,
+    baseOpts({
+      resumeFrom: checkpointAt(3, {
+        tool_calls_by_name: { read: 1 },
+        tool_ok_by_name: { read: 1 },
+        total_tool_calls: 1,
+      }),
+      onCheckpoint: async (s: CheckpointState) => { seen.push(s); },
+      llmSession: scriptedSession([
+        { content: [toolUse("t1", "read")], stopReason: "tool_use" },
+        { content: [text("done")], stopReason: "end_turn" },
+      ]),
+    }),
+  );
+
+  assert.ok(seen.length > 0, "a resumed run must still checkpoint");
+  assert.deepEqual(seen.at(-1)!.tool_ok_by_name, { read: 2 },
+    "the carried success and the one this process made are the same run's");
+});
+
+test("a checkpoint written before tool_ok_by_name existed resumes with an empty count", async () => {
+  // Deliberately not inferred from the attempts, nor from attempts minus
+  // error_count: either would credit a call whose outcome this checkpoint
+  // never recorded, which is the gate passing on a sandbox nothing touched.
+  const result = await agentLoop(
+    [{ role: "user", content: "hi" }],
+    TOOLS,
+    baseOpts({
+      resumeFrom: checkpointAt(3, { tool_calls_by_name: { read: 1 }, total_tool_calls: 1 }),
+      llmSession: scriptedSession([
+        { content: [text("already done")], stopReason: "end_turn" },
+      ]),
+    }),
+  );
+
+  assert.equal(result.toolStats.by_tool_ok?.read ?? 0, 0,
+    "an absent field must under-report rather than invent a success");
 });
 
 test("a large tool_use input is bounded in history but the tool still receives it whole", async () => {

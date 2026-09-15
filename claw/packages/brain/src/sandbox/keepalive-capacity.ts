@@ -80,11 +80,16 @@ export interface CapacityInput {
   /** A whole guarded tick's declared ceiling, in seconds. */
   sweepSpanSec: number;
   /**
-   * The longest a whole guarded tick can run: the ping phase's budget plus the
-   * one ping it lets start, and the failure phase's budget plus the one
-   * eviction it lets start. Fleet-size independent by construction -- the
-   * declared span has to cover it, or the span is a number the sweep routinely
-   * exceeds and every gap derived from it is short.
+   * The longest a whole guarded tick can run: the retention read phase's budget
+   * plus the one live-work read it lets start, the ping phase's budget plus the
+   * one ping it lets start, and the failure phase's budget plus the one eviction
+   * it lets start. Fleet-size independent by construction -- the declared span
+   * has to cover it, or the span is a number the sweep routinely exceeds and
+   * every gap derived from it is short.
+   *
+   * Each of those per-work ceilings has to be a bound something actually holds
+   * the call to, not merely a timeout that was asked for: a term naming a
+   * deadline nobody enforces buys this check nothing.
    */
   pingPhaseCeilingSec: number;
 }
@@ -143,9 +148,9 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
   if (input.sweepSpanSec <= input.pingPhaseCeilingSec) {
     throw new KeepaliveConfigRefused(
       `SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=${input.sweepSpanSec} does not cover a sweep's `
-      + `own worst case of ${input.pingPhaseCeilingSec}s -- the ping phase and the `
-      + "failure handling that follows it, each bounded by its own budget -- so the "
-      + "span every refresh gap is derived from is one the sweep routinely exceeds.",
+      + `own worst case of ${input.pingPhaseCeilingSec}s -- the retention reads, the ping `
+      + "phase and the failure handling that follows it, each bounded by its own budget -- "
+      + "so the span every refresh gap is derived from is one the sweep routinely exceeds.",
     );
   }
   const deadline = requirePositiveInteger(

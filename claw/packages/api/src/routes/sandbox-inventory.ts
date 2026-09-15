@@ -9,7 +9,7 @@
  * by, and only its endpoint is missing.
  */
 
-import type { HandleInfo } from "@claw/protocol";
+import { isRetentionEntry, type HandleInfo } from "@claw/protocol";
 
 export interface SandboxRow {
   session_id: string;
@@ -29,6 +29,26 @@ export interface SandboxRow {
    * that emptiness as a sandbox that exists and cannot be reached.
    */
   status: string;
+  /**
+   * Whether this row is a retained container rather than a session binding.
+   *
+   * It is reported and never filtered out: retaining a container deletes the
+   * session key once the reserved key is written, so this entry is the only
+   * record the bucket still holds for a physically live sandbox. Dropping it
+   * would leave a pre-change sandbox that no rollback allow-list built from
+   * this census ever names, which is the silently shortened fleet the whole
+   * route exists to refuse. What it is not is a session: `session_id` here is
+   * the reserved key part and answers to nothing, and the container is under
+   * standing orders never to be idled or reused -- so it never drains by
+   * waiting, and an operator told to wait one out is being told to wait
+   * forever.
+   *
+   * Read from the entry's value and never from its key, the way the keepalive
+   * census reads it. For the length of a rolling upgrade a replica that
+   * predates the retention scheme writes a genuine session binding under the
+   * reserved key, and a key-shaped test would report that binding as retained.
+   */
+  retained: boolean;
 }
 
 export interface DagHandleRow {
@@ -86,6 +106,7 @@ function rowFromEntry(sessionId: string, info: Record<string, unknown>, healthy:
     provider: (info.provider as string) || "",
     healthy,
     status: typeof info.status === "string" ? info.status : "",
+    retained: isRetentionEntry(info),
   };
 }
 

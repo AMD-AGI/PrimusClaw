@@ -19,7 +19,7 @@ import {
 } from "@claw/protocol";
 import pino from "pino";
 import { execInSandbox } from "./container-probe.js";
-import type { SandboxInstance } from "./provider.js";
+import { EXEC_TRANSPORT_SLACK_MS, type SandboxInstance } from "./provider.js";
 
 const logger = pino({ name: "sandbox-live-work-gate" });
 
@@ -33,7 +33,41 @@ export interface LiveWorkAnswer {
   reason: string;
 }
 
-const EXEC_TIMEOUT = "20s";
+/**
+ * Longest the gather command may run inside the container before the container
+ * runtime ends it.
+ *
+ * The *command's* deadline and nothing more. It is not the ceiling of the call
+ * a caller awaits, and reading it as one is how a sweep comes to declare a span
+ * it does not hold to -- see `LIVE_WORK_READ_CEILING_MS`.
+ */
+export const LIVE_WORK_EXEC_CEILING_MS = 20_000;
+const EXEC_TIMEOUT = `${LIVE_WORK_EXEC_CEILING_MS / 1000}s`;
+
+/**
+ * Longest one whole live-work read may take, enforced here rather than assumed
+ * of whoever answers it.
+ *
+ * The command timeout above travels to the runtime as a string and bounds the
+ * process, not the call. Every provider adds `EXEC_TRANSPORT_SLACK_MS` on top of
+ * it for the HTTP request that carries it -- deliberately, so the transport
+ * never gives up before the command it is waiting for could have finished -- and
+ * the SaFE path can then spend a further status lookup disambiguating a 404. So
+ * a Router that accepts the connection and goes quiet holds this call for half
+ * again as long as the command timeout suggests, without violating a single
+ * deadline it declared.
+ *
+ * That gap is load-bearing for the keepalive sweep, whose declared span carries
+ * a term for one of these reads: a term naming a timeout the provider does not
+ * actually honour is not a bound, and the span every refresh gap and the reclaim
+ * horizon are derived from is then a number the sweep routinely exceeds. Rather
+ * than restate the provider's arithmetic in that term and hope it stays true,
+ * the read arms the deadline itself and every caller inherits a real one. Both
+ * providers combine a caller's signal with their own through `AbortSignal.any`,
+ * so whichever fires first ends the call, and an abort surfaces here as an
+ * exception -- which is `unknown`, the verdict that keeps what it protects.
+ */
+export const LIVE_WORK_READ_CEILING_MS = LIVE_WORK_EXEC_CEILING_MS + EXEC_TRANSPORT_SLACK_MS;
 
 /**
  * Everything the classifier needs, in one command.
@@ -191,8 +225,13 @@ export async function countLiveWork(
   signal?: AbortSignal,
 ): Promise<LiveWorkAnswer> {
   let stdout: string;
+  // The caller's own reason to stop waiting, and this read's ceiling, are both
+  // reasons to stop waiting: composed rather than chosen between, so a caller
+  // that passes a signal does not thereby give up the bound.
+  const deadline = AbortSignal.timeout(LIVE_WORK_READ_CEILING_MS);
+  const until = signal ? AbortSignal.any([signal, deadline]) : deadline;
   try {
-    const result = await execInSandbox(inst, gatherCommand(stateDir), EXEC_TIMEOUT, signal);
+    const result = await execInSandbox(inst, gatherCommand(stateDir), EXEC_TIMEOUT, until);
     // A non-zero exit is a read that did not finish, over an unknown fraction
     // of the subtree: nothing in its stdout says which records are missing.
     if (result.exitCode !== 0) {

@@ -220,3 +220,45 @@ test("a pending binding that names nothing to delete by still fails the read", a
   assert.equal(inventory.ok, false);
   assert.equal(inventory.unreadable, 1);
 });
+
+test("a retained container is a row that says it is retained", async () => {
+  // Retaining a container writes the binding under `hands.retained-<gen>` and
+  // deletes the session key, so this entry is the only record the bucket still
+  // holds for a live sandbox: filtering it would hide a pre-change sandbox from
+  // every rollback step that builds its allow-list from this census. It is
+  // reported instead, and the one thing the entry already states -- that it is
+  // protected -- is carried through, because a retention is never on a clock
+  // and a gate that sees an ordinary session row will tell an operator to wait
+  // out something that will never drain.
+  const retained = JSON.stringify({
+    status: "ready", protected: true, workloadId: "wl-3",
+    handsUrl: "http://sb-3:9100/mcp", sandboxName: "sandbox-3", namespace: "ns-a",
+    provider: "agent-sandbox",
+  });
+  const entries = { "hands.sess-1": READY, "hands.retained-NB2HI4DTHIXS": retained };
+  const inventory = await collectSandboxInventory(deps({
+    handsKeys: async () => Object.keys(entries),
+    handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+  }));
+
+  assert.equal(inventory.ok, true, "a retained container is not a failed read");
+  assert.equal(inventory.sessions.length, 2, "nor a fleet one sandbox smaller");
+  const row = inventory.sessions.find((r) => r.retained)!;
+  assert.equal(row.sandbox_name, "sandbox-3",
+    "it still names what a rollback deletes by, which is why it is kept");
+  assert.equal(inventory.sessions.find((r) => r.session_id === "sess-1")!.retained, false,
+    "and an ordinary session binding is not mistaken for one");
+});
+
+test("retention is read from the entry's value, never from its key", async () => {
+  // A replica that predates the retention scheme writes a genuine session
+  // binding under the reserved key for the length of a rolling upgrade, so a
+  // key-shaped test would report a real session as protected and an operator
+  // would leave a session sandbox standing.
+  const entries = { "hands.retained-NB2HI4DTHIXS": READY };
+  const inventory = await collectSandboxInventory(deps({
+    handsKeys: async () => Object.keys(entries),
+    handsGet: async (key) => entries[key as keyof typeof entries] ?? null,
+  }));
+  assert.equal(inventory.sessions[0].retained, false);
+});

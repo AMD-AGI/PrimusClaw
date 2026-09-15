@@ -30,7 +30,8 @@ import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 import { instanceFromEntry } from "./container-probe.js";
-import { countLiveWork } from "./live-work-gate.js";
+import { LIVE_WORK_READ_CEILING_MS, countLiveWork } from "./live-work-gate.js";
+import type { SandboxInstance } from "./provider.js";
 import {
   ledgerKeyForRetention, reassertRetentions, releaseRetention,
 } from "./retain-container.js";
@@ -225,7 +226,7 @@ const localRegistry = new Map<string, RegisteredSandbox>();
 
 
 /**
- * One retained container's turn in the sweep.
+ * One retained container's turn in the walk.
  *
  * It is a target like any other -- pinged, its lifetime refreshed -- and it is
  * never probed for a shell count: its key names no session, so the owner a
@@ -234,18 +235,28 @@ const localRegistry = new Map<string, RegisteredSandbox>();
  *
  * What ends a retention is the evidence that caused it reaching zero, read the
  * same way it was taken. Without this the entry is permanent and the container
- * never returns to the ordinary lifetime machinery.
+ * never returns to the ordinary lifetime machinery. That read is the one
+ * expensive thing on this path, and it does not happen here: the walk enrols
+ * the retention and queues it, and `runRetentionReadPhase` decides whose turn it
+ * is once the whole walk is known. See `retentionDeferred` for why the decision
+ * cannot be made from inside the walk at all.
+ *
+ * Everything this does for a retention it does for every retention, with no
+ * branch on whether the read will be taken this sweep: target and identity go
+ * into the census, the record behind the projection is refreshed, and the
+ * projection is renewed. That is what makes a deferred read free -- the
+ * container is pinged and named to `renewAndReap` exactly as a read one is --
+ * and it is why the refreshes now precede the read rather than following it.
  *
  * @returns false where the sweep could not complete this entry, which is not
  * the same as an entry it completed and found nothing in.
  */
 async function sweepRetention(
   deps: KeepaliveDeps,
+  census: TargetCensus,
   key: string,
   entry: { value: Uint8Array; revision: number },
   info: HandsKvEntry,
-  targets: Map<string, RegisteredSandbox>,
-  seenIdentities: Set<string>,
 ): Promise<boolean> {
   const held = sandboxEntryFrom(info);
   if (!held) {
@@ -258,17 +269,17 @@ async function sweepRetention(
   // reached through a session binding or a DAG handle a second roster slot and
   // a second ping a sweep.
   const identity = sandboxRegistryKey(held);
-  seenIdentities.add(identity);
-  if (!targets.has(identity)) targets.set(identity, { sessionId, entry: held });
+  census.seenIdentities.add(identity);
+  if (!census.targets.has(identity)) census.targets.set(identity, { sessionId, entry: held });
 
+  const ledgerKey = ledgerKeyForRetention(key);
   const inst = instanceFromEntry(sessionId, info as never);
-  const live = inst
-    ? await countLiveWork(inst, HANDS_STATE_DIR)
-    : { verdict: "unknown" as const, classes: {}, reason: "entry_unaddressable" };
-  if (live.verdict === "clear") {
-    await releaseRetention(retentionStore(deps.kv), key, ledgerKeyForRetention(key));
-    return true;
-  }
+  // An entry nothing can be addressed through is not queued at all rather than
+  // queued and answered `unknown` every sweep: a read that can never be taken
+  // would otherwise hold a place in the queue for as long as the entry exists,
+  // and the bound the queue states is a number of turns.
+  if (inst) census.retentionReads.set(key, { key, ledgerKey, inst });
+  else logger.warn({ key }, "keepalive.retention_unreadable");
 
   // The record behind the projection, which this bucket expires like everything
   // else in it: written once when the retention was taken and never again, it
@@ -288,10 +299,22 @@ async function sweepRetention(
   // write it back in that middle window, and the next `reassertRetentions`
   // would restore a retention whose work had already finished.
   //
+  // Both refreshes now run ahead of the read rather than only on the branch
+  // where the read said the retention still holds, and that is safe on the same
+  // argument: they extend the lifetime of a retention that is still held at the
+  // moment they run -- nothing has read anything yet, and `unknown` is what an
+  // unread retention is worth -- while the only irreversible act, the release,
+  // still happens strictly after a read that answered `clear`. A release that
+  // follows them in this sweep deletes what they just refreshed, and one that
+  // another replica interleaves with them settles as removed by the ordering
+  // above, unchanged. What the old order bought was skipping two writes on the
+  // sweep that released; what it cost was that the writes could not be reached
+  // at all without first spending the read.
+  //
   // Its failure is not the projection's. The projection is the live protection
   // and this is only what repairs it, so a record that could not be refreshed
   // is logged and the sweep goes on to the refresh that matters.
-  await refreshRetentionLedger(deps.kv, ledgerKeyForRetention(key), entry.value);
+  await refreshRetentionLedger(deps.kv, ledgerKey, entry.value);
 
   try {
     await deps.kv.update(key, entry.value, entry.revision);
@@ -302,6 +325,195 @@ async function sweepRetention(
     return false;
   }
   return true;
+}
+
+/**
+ * The reads a sweep may take, in the order they are owed.
+ *
+ * The same shape `orderedPingTargets` uses, for the same reason: everything
+ * still waiting leads, in the order it has been waiting, and everything else
+ * follows. What it buys here is that the schedule stops being a function of the
+ * walk.
+ *
+ * That matters because the walk is not an order at all. `KV.keys()` enumerates
+ * the last value per subject in stream-sequence order, so a key moves to the
+ * back of the next walk every time anything writes it -- and this sweep writes
+ * them itself: the projection refresh above touches every retention, and
+ * `pingSandbox` writes the `hands.` record of every retention it pinged, from a
+ * ping phase that rotates its own batch whenever its budget runs out. A scheme
+ * that decides whose turn it is from a position in that walk -- a resume point,
+ * a cursor, "everything from here on" -- is reading a permutation that its own
+ * writes reshuffle between sweeps, and an unread retention carried ahead of the
+ * resume point is skipped for being ahead of it, sweep after sweep, while its
+ * refreshes keep it alive and its ping keeps its admission slot.
+ *
+ * A queue cannot be reshuffled by a write. Every retention still owed a read is
+ * ahead of every retention that has had one, whatever order the keyspace is
+ * handed over in, so each sweep the position of a waiting retention strictly
+ * decreases by the number of reads that sweep took -- at least one, because the
+ * budget bars *starting* a read and the phase begins with the budget whole. With
+ * R retentions present, every one of them is read within R sweeps.
+ *
+ * Counted over the sweeps the walk could read it, which is the only kind of
+ * sweep that could have served it. A key this walk failed to read is not in
+ * `reads` and so is not offered here, and `rebuildRetentionQueue` leaves it
+ * where it was waiting rather than dropping it; the reads that sweep does take
+ * come from the same queue in the same order, so on every sweep a waiting
+ * retention IS visible the phase reads either it or something ahead of it, and
+ * what it reads leaves the queue -- released, or re-entering behind it. Nothing
+ * enters ahead of it: a key deferred keeps the place it had, and a key seen for
+ * the first time follows every key already waiting.
+ */
+function orderedRetentionReads(reads: Map<string, RetentionRead>): RetentionRead[] {
+  const waiting = retentionDeferred.filter((key) => reads.has(key));
+  const waitingSet = new Set(waiting);
+  return [
+    ...waiting.map((key) => reads.get(key)!),
+    ...[...reads.entries()].filter(([key]) => !waitingSet.has(key)).map(([, read]) => read),
+  ];
+}
+
+/**
+ * Read live-work evidence out of as many retained containers as the budget
+ * allows, and release the ones whose work has finished.
+ *
+ * A phase of its own, after the walk, rather than a decision taken inside it.
+ * Three things follow from that and none of them followed from the alternative:
+ *
+ *   - The order is the queue's, not the keyspace's. Whose turn it is cannot be
+ *     decided until the whole set of retentions is known, and inside the walk it
+ *     is not known.
+ *   - The budget is the phase's own wall clock, armed when the phase starts.
+ *     Inside the walk the same budget had to be metered over the reads by hand,
+ *     because a deadline armed at the top of the census is spent by the store
+ *     round trips the walk makes -- and a store slow enough to retire it before
+ *     the first retention is reached leaves nothing to read any of them with, on
+ *     this sweep or any sweep after it. Here there is nothing else inside the
+ *     phase to spend it.
+ *   - The term it contributes to `keepaliveSweepCeilingSec()` is the phase's
+ *     whole span, which is what a term in that sum has to be.
+ *
+ * Serial, like the evictions in the failure phase: these reads are the thing
+ * being bounded, and starting several at once would make the bound a function of
+ * how many containers are stuck rather than of the budget.
+ */
+async function runRetentionReadPhase(
+  deps: KeepaliveDeps, census: TargetCensus, scanComplete: boolean,
+): Promise<boolean> {
+  const ordered = orderedRetentionReads(census.retentionReads);
+  const clock = deps.now ?? Date.now;
+  const deadline = clock() + CENSUS_READ_BUDGET_MS;
+  const deferred: string[] = [];
+  let complete = true;
+  let taken = 0;
+  let released = 0;
+  for (const target of ordered) {
+    // Barring the start of a read is the whole of the budget's authority; it
+    // never interrupts one, which is why the ceiling pairs it with the ceiling
+    // of a single read. At the head of the phase the budget is whole, so a sweep
+    // always takes at least one read however long that read then holds -- which
+    // is the forward progress the bound in `orderedRetentionReads` rests on.
+    //
+    // A read not taken is deferred rather than guessed at, and the deferral
+    // costs this entry nothing: its target and its identity went into the census
+    // during the walk, so the container is pinged this sweep and named to
+    // `renewAndReap` like every other target, and both its records were
+    // refreshed there too. `unknown` is the verdict that keeps a retention, so
+    // all a deferral delays is the release of one whose work has already
+    // finished -- and a retention held one sweep too long protects, where one
+    // released on a guess destroys the work it was taken for.
+    if (clock() >= deadline) {
+      deferred.push(target.key);
+      continue;
+    }
+    taken += 1;
+    // Per entry, as the walk this phase was lifted out of already did. One
+    // container's read or release is nothing to the rest of the fleet: a store
+    // that refuses a delete, or a provider call that throws rather than timing
+    // out, used to cost that entry its turn and no more, because every entry in
+    // `collectKvTargets` is wrapped. Let it out of this loop instead and the
+    // sweep exits before the roster is renewed and before a single ping goes
+    // out -- so one unreachable retained container leaves every live sandbox in
+    // the fleet without the refresh its idle deadline is proven against, and
+    // does so again on every sweep for as long as the store keeps refusing.
+    //
+    // The entry is counted against the census rather than retried here: an
+    // incomplete census is what stops `renewAndReap` from reaping on a fleet it
+    // could not read whole, and a release that failed is exactly the case where
+    // this sweep's account of the fleet is not to be trusted. The retention
+    // stands meanwhile, which is the safe direction -- it protects work that may
+    // already be finished rather than reclaiming work that is not.
+    try {
+      const live = await countLiveWork(target.inst, HANDS_STATE_DIR);
+      if (live.verdict !== "clear") continue;
+      // The only irreversible act on this path, and it still happens only after
+      // a read that answered `clear`, on this sweep, about this container.
+      await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
+      released += 1;
+    } catch (err) {
+      complete = false;
+      logger.warn(
+        { err: (err as Error)?.message, key: target.key },
+        "keepalive.retention_read_failed",
+      );
+    }
+  }
+  retentionDeferred = rebuildRetentionQueue(
+    retentionDeferred, census.retentionReads, deferred, scanComplete,
+  );
+  if (deferred.length) {
+    logger.warn(
+      { taken, released, deferred: deferred.length, total: ordered.length,
+        budgetMs: CENSUS_READ_BUDGET_MS },
+      "keepalive.census_read_deferred",
+    );
+  }
+  return complete;
+}
+
+/**
+ * The queue the next sweep inherits: every retention still owed a read, in the
+ * order it has been owed.
+ *
+ * Rebuilt rather than pruned, because the rebuild is what keeps a released or
+ * expired key out without a separate pruning step to forget. What the rebuild
+ * cannot do on its own is tell the two reasons a key is missing apart. A
+ * retention another replica released is gone, and a rebuild that drops it is
+ * right. A retention whose `hands.` record this walk could not read is still
+ * there -- still refreshed by whoever can read it, still pinged, still holding
+ * its admission slot -- and a rebuild that drops it forgets a waiting position
+ * that was earned. The key then re-enters at the BACK the next sweep the store
+ * answers for it, and with reads that outlast the budget ahead of it that is a
+ * livelock and not a delay: the sweeps it is visible for are spent on the
+ * containers ahead of it, and the sweeps that would have advanced it are the
+ * ones that forget it. Its work has finished and it holds a slot forever.
+ *
+ * So absence removes a key only from a walk that was COMPLETE, which is the one
+ * state in which absence is evidence: `collectKvTargets` reports false the
+ * moment any key could not be read, and a walk that read every key and did not
+ * name this one is a walk saying it is gone. Anything else keeps it. A key kept
+ * this way costs a queue position and nothing else -- it is not in `reads`, so
+ * `orderedRetentionReads` never offers it and no sweep spends a read on it --
+ * and it leaves on the first complete walk that does not name it, which is the
+ * same filter that keeps a released one out.
+ *
+ * Order is the old queue's: a key kept or deferred holds the place it had, and
+ * keys waiting for the first time follow in the order the phase deferred them.
+ * That is what makes the position of a waiting retention monotone, which is
+ * what the bound in `orderedRetentionReads` rests on.
+ */
+function rebuildRetentionQueue(
+  previous: string[],
+  reads: Map<string, RetentionRead>,
+  deferred: string[],
+  scanComplete: boolean,
+): string[] {
+  const deferredSet = new Set(deferred);
+  const kept = previous.filter(
+    (key) => deferredSet.has(key) || (!scanComplete && !reads.has(key)),
+  );
+  const keptSet = new Set(kept);
+  return [...kept, ...deferred.filter((key) => !keptSet.has(key))];
 }
 
 /**
@@ -737,6 +949,90 @@ const BG_PROBE_RESERVE_ATTEMPTS = 8;
 const BG_VERDICT_WRITE_ATTEMPTS = 64;
 
 /**
+ * How long the retention read phase may go on starting live-work reads.
+ *
+ * A budget rather than a count, and for the same reason the failure phase has
+ * one: each retention's read awaits a container exec, so a fleet of
+ * unresponsive retained containers makes an unbudgeted phase fleet-sized -- and
+ * the declared sweep span, which every refresh gap and the reclaim horizon are
+ * derived from, becomes a number the sweep routinely exceeds.
+ *
+ * Sized by subtraction, not by taste. What the declared span has to cover is the
+ * phase's whole worst case, which is this budget plus `LIVE_WORK_READ_CEILING_MS`
+ * for the one read the budget lets start; `keepaliveCensusPhaseCeilingSec()` is
+ * that sum and 50s is what the span was already sized for. The per-read term used
+ * to name the container's 20s command timeout, which the provider does not hold
+ * the awaited call to -- it adds transport slack on top, and the SaFE path can
+ * add a status lookup after that -- so the real term is 35s and the honest budget
+ * at an unchanged phase ceiling is 15s. Paying for a true term out of the budget
+ * rather than out of the span is deliberate: the span is what the operator's
+ * config envelope is checked against, and moving it a second time would narrow
+ * that envelope again for a correction that costs the schedule nothing.
+ *
+ * It costs the schedule nothing because what the budget buys is throughput, not
+ * progress. Progress is one read a sweep, which is guaranteed at any budget at
+ * all -- the budget bars the *starting* of a read and the phase starts with it
+ * whole -- and that guarantee is the whole of the bound in
+ * `orderedRetentionReads`. What 15s still buys is hundreds of reads a sweep from
+ * containers that answer, which is every sweep in which nothing is wrong, and
+ * one read a sweep from a fleet that will not answer, which is the case the
+ * bound is stated for.
+ *
+ * Metered by the phase's own wall clock, which it can be because the phase runs
+ * after the walk and contains nothing but these reads. Metering it inside the
+ * walk was the only thing that made the number mean what its name says while the
+ * walk was also spending it on store round trips.
+ */
+const CENSUS_READ_BUDGET_MS = 15_000;
+/**
+ * Every retention the last read phase left unread, in the order it deferred
+ * them.
+ *
+ * The whole queue rather than a resume point, and this is the correction the
+ * previous three rounds were each one step short of. A resume point is a
+ * position in the walk, and the walk is `KV.keys()` -- last value per subject in
+ * stream-sequence order, which is to say ordered by each key's most recent
+ * write. This sweep writes those keys: it refreshes every retention's
+ * projection, and `pingSandbox` rewrites the `hands.` record of every retention
+ * it managed to ping, out of a ping phase that rotates its own batch whenever
+ * its budget runs out. So consecutive sweeps are handed different permutations,
+ * an unread retention can be carried ahead of the saved resume point, and being
+ * ahead of it is exactly what the resume point takes as "has already had its
+ * turn". It is skipped, refreshed, pinged, and skipped again -- holding an
+ * admission slot after its work has finished, which is the leak this whole
+ * mechanism exists to close.
+ *
+ * A queue is not a position, so nothing a write does to the keyspace can move
+ * anything in it. The order is only ever "how long have you waited", the walk
+ * decides nothing but where a retention first entered, and the bound in
+ * `orderedRetentionReads` follows from the queue alone.
+ *
+ * It is also not a set, which is where the round before this one stopped: a set
+ * records that a read was deferred and not how long it has been waiting, so with
+ * four stuck containers and two reads a sweep the membership check alternates
+ * between the first two pairs forever and the tail never comes up.
+ *
+ * Process-local, like every other rotation state here (`pingDeferred`,
+ * `bgProbeCursor`). A restart empties it, which starts the cycle over from the
+ * walk order: at most one extra cycle of waiting for a retention that was near
+ * the front, and never a release, since nothing in the queue decides a verdict
+ * -- an unread retention is `unknown`, and `unknown` keeps what it protects.
+ */
+let retentionDeferred: string[] = [];
+/**
+ * The point at which a census's own store latency is worth saying out loud.
+ *
+ * Reported, not enforced. The discovery half of a census is every handle record
+ * the sweep has to renew and every target it has to name to `renewAndReap`;
+ * cutting it off at a budget would drop the tail of the keyspace out of both,
+ * which costs a live sandbox its refresh -- a worse outcome than the slow sweep
+ * it would be protecting the span from. So the reads are held apart from it in
+ * a phase of their own and the latency itself is surfaced, because a census
+ * whose store round trips alone cost as much as the entire bounded read phase
+ * is a store problem, and nothing this file can schedule its way out of.
+ */
+const CENSUS_DISCOVERY_REPORT_MS = CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS;
+/**
  * Ping concurrency cap. Unlike probes, pings are queued rather than skipped.
  */
 const PING_MAX_IN_FLIGHT = 16;
@@ -789,12 +1085,48 @@ export function keepalivePingPhaseCeilingSec(): number {
 }
 
 /**
- * The whole guarded tick's worst case: the ping phase, plus the failure phase
- * and the one eviction its budget lets start. Fleet-size independent, which is
- * the property the declared span has to have.
+ * The longest the retention read phase can run: its budget bars the *starting*
+ * of a read, so the one read already in flight when it expires runs on for its
+ * own ceiling.
+ *
+ * `LIVE_WORK_READ_CEILING_MS` and not the container's command timeout. The
+ * timeout is the deadline of the process inside the container; the call this
+ * phase awaits is bounded by the provider's transport deadline on top of it,
+ * and on the SaFE path by a status lookup after that. Naming the smaller number
+ * would be naming a timeout nothing holds the awaited call to, which is not a
+ * bound -- so the read arms that ceiling itself, and this term is a deadline
+ * enforced on this side of the call rather than one hoped for.
+ */
+export function keepaliveCensusPhaseCeilingSec(): number {
+  return Math.ceil((CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS) / 1000);
+}
+
+/**
+ * The whole guarded tick's worst case: the retention read phase, then the ping
+ * phase, then the failure phase. Fleet-size independent, which is the property
+ * the declared span has to have -- every phase that awaits per-target work has
+ * to appear here, or the span every refresh gap and the reclaim horizon are
+ * derived from is a number the sweep routinely exceeds.
+ *
+ * Each term is a budget paired with the ceiling of the one piece of work that
+ * budget lets start, because a budget bars the *starting* of work and never
+ * interrupts what is already in flight; each phase runs its work serially, so
+ * one is all that can be in flight when the budget expires. The census walk
+ * itself carries no term, and deliberately: it starts no container work at all,
+ * only store round trips, whose latency is the store's bound and not one this
+ * file can state. `CENSUS_DISCOVERY_REPORT_MS` is what happens to it instead.
+ * The read phase running after the walk rather than inside it is what makes
+ * that split honest -- a term sized for container work cannot be quietly spent
+ * on store latency if the phase it bounds contains no store latency.
+ *
+ * Of the three per-work ceilings this sums, the read's is enforced locally
+ * (`LIVE_WORK_READ_CEILING_MS` is armed by the read itself). The ping and stop
+ * ceilings are still the deadlines handed to the provider, so a provider that
+ * ignores its own timeout under-runs those two the way an omitted phase would.
  */
 export function keepaliveSweepCeilingSec(): number {
-  return keepalivePingPhaseCeilingSec()
+  return keepaliveCensusPhaseCeilingSec()
+    + keepalivePingPhaseCeilingSec()
     + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
 }
 
@@ -836,6 +1168,10 @@ export function resetBackgroundWorkStateForTest(): void {
   bgProbeInFlight.clear();
   bgGeneration.clear();
   bgProbeCursor = 0;
+  // Rotation state like the cursor above it: a queue left by one test names keys
+  // the next one never walks, and its first read phase would order itself around
+  // retentions that do not exist.
+  retentionDeferred = [];
 }
 
 /** Age cached verdicts and unknown streaks by `ms` for reap tests. */
@@ -1432,11 +1768,27 @@ async function forEachWithLimit<T>(
   await Promise.all(workers);
 }
 
+/** One retained container the walk enrolled, and everything its read needs. */
+interface RetentionRead {
+  /** The projection key, which is the key the walk saw and the queue's identity. */
+  key: string;
+  ledgerKey: string;
+  inst: SandboxInstance;
+}
+
 interface TargetCensus {
   targets: Map<string, RegisteredSandbox>;
   seenIdentities: Set<string>;
   probeCandidates: ProbeCandidate[];
   stats: TickStats;
+  /**
+   * Every retention the walk found, keyed by its projection key.
+   *
+   * Collected rather than acted on, the way `probeCandidates` is: which of them
+   * this sweep can afford to read is a question about the whole set, and the
+   * walk does not know the whole set until it ends.
+   */
+  retentionReads: Map<string, RetentionRead>;
 }
 
 type HandsRecord = { value: Uint8Array; revision: number };
@@ -1446,7 +1798,12 @@ async function collectTargets(
   seenIdentities: Set<string>,
   stats: TickStats,
 ): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
-  const census: TargetCensus = { targets: new Map(), seenIdentities, probeCandidates: [], stats };
+  const clock = deps.now ?? Date.now;
+  const censusStartedAt = clock();
+  const census: TargetCensus = {
+    targets: new Map(), seenIdentities, probeCandidates: [], stats,
+    retentionReads: new Map(),
+  };
   for (const [key, registered] of localRegistry) {
     if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
     census.targets.set(key, registered);
@@ -1454,7 +1811,37 @@ async function collectTargets(
   const kvComplete = await collectKvTargets(deps, census);
   const dagComplete = await collectDagTargets(deps, census);
   stats.probes += dispatchProbes(deps, census.probeCandidates);
-  return { targets: census.targets, complete: kvComplete && dagComplete };
+  // Accounted apart from the reads, and only accounted: the reads happen after
+  // this line, inside a phase with a budget of its own, so this is the census
+  // time that budget deliberately cannot be spent on -- and a walk this
+  // expensive is a store to look at rather than a schedule to tighten.
+  const discoveryMs = Math.max(0, clock() - censusStartedAt);
+  if (discoveryMs >= CENSUS_DISCOVERY_REPORT_MS) {
+    logger.warn(
+      { discoveryMs, retentions: census.retentionReads.size, budgetMs: CENSUS_READ_BUDGET_MS },
+      "keepalive.census_discovery_slow",
+    );
+  }
+  // After the walk, and before anything the tick does with the targets: whose
+  // turn it is needs the whole set, and the budget needs a phase that holds
+  // nothing but the reads it bounds. Nothing downstream changes either way --
+  // a retention released here was already entered into `targets` and
+  // `seenIdentities` by the walk, so it is pinged and named to `renewAndReap`
+  // this sweep like any other target, and gives its slot back on the next one.
+  //
+  // A walk that found no retention does not enter the phase at all, and leaves
+  // the queue exactly as it was. Not entering is what keeps a sweep over a
+  // fleet with no retentions in it the sweep it was before this phase existed;
+  // leaving the queue alone is because "no retentions this sweep" is not
+  // evidence that the queue is stale -- the scan above may simply have failed,
+  // and throwing the waiting order away on a transient store fault would cost a
+  // cycle for nothing. A key that really is gone leaves the queue the next time
+  // a read phase rebuilds it, which is the same filter that keeps a released
+  // one out.
+  const readsComplete = census.retentionReads.size
+    ? await runRetentionReadPhase(deps, census, kvComplete)
+    : true;
+  return { targets: census.targets, complete: kvComplete && dagComplete && readsComplete };
 }
 
 async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -1492,7 +1879,7 @@ async function collectKvTarget(
   const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
   if (info.status && info.status !== "ready") return true;
   if (isRetentionEntry(info)) {
-    return sweepRetention(deps, key, e, info, census.targets, census.seenIdentities);
+    return sweepRetention(deps, census, key, e, info);
   }
   const identity = entryIdentity(info);
   census.seenIdentities.add(identity);

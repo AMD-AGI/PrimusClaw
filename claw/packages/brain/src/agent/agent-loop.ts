@@ -751,7 +751,13 @@ class AgentLoopRunner {
       ? { ...resumeFrom.usage }
       : { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 };
     this.errorCount = resumeFrom?.error_count ?? 0;
-    this.toolOkByName = {};
+    // Restored beside its attempt count, not reset: the two are reported as one
+    // run's `by_tool` / `by_tool_ok`, so carrying only the attempts would ship a
+    // pair describing different spans. See CheckpointState.tool_ok_by_name for
+    // why an absent field stays empty rather than being inferred.
+    this.toolOkByName = resumeFrom?.tool_ok_by_name
+      ? { ...resumeFrom.tool_ok_by_name }
+      : {};
     this.toolCallsByName = resumeFrom
       ? { ...resumeFrom.tool_calls_by_name }
       : {};
@@ -1596,6 +1602,7 @@ class AgentLoopRunner {
           text_parts: [...this.textParts],
           error_count: this.errorCount,
           tool_calls_by_name: { ...this.toolCallsByName },
+          tool_ok_by_name: { ...this.toolOkByName },
           total_tool_calls: this.totalToolCalls,
           elapsed_ms_before: Date.now() - this.startTime,
           setup_commands: [...this.setupCommands],
