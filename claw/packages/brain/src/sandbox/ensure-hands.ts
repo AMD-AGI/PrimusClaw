@@ -1037,6 +1037,14 @@ async function provisionHands(
   // / health. Rollback (stop) if the KV write fails so we never leak a workload.
   // Owned here so SafeWorkloadProvider stays KV-free.
   const onProvisioned = async (workloadId: string): Promise<void> => {
+    // Built up front: the registration branch below needs it on its failure
+    // path, and it describes the workload rather than anything that happens
+    // after, so there is nothing to wait for.
+    const pendingPayload = sc.encode(JSON.stringify({
+      status: "pending", workloadId, sandboxImage,
+      platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
+      createdAt: new Date().toISOString(),
+    }));
     // Phase (A) for the DAG handle, written BEFORE the session entry below.
     //
     // Both records are made in this hook for the same reason: the workload
@@ -1079,19 +1087,52 @@ async function provisionHands(
             err: (err as Error).message },
           "dag-handles.pending_register_failed_rollback",
         );
-        await getSafeWorkloadProvider().stop({
-          provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-          namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-        }).catch(() => {});
+        // Two outcomes, and each needs something different left behind. The
+        // registration having failed does not say which: a refusal means the
+        // name still belongs to an older workload, while a lost ACK means it
+        // may already name THIS one.
+        let stopped = false;
+        try {
+          await getSafeWorkloadProvider().stop({
+            provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+            namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
+          });
+          stopped = true;
+        } catch (stopErr) {
+          logger.error(
+            { sessionId, workloadId, err: (stopErr as Error)?.message ?? String(stopErr) },
+            "dag-handles.pending_register_rollback_stop_failed",
+          );
+        }
+
+        if (stopped) {
+          // The registration may have committed and only its ACK been lost, in
+          // which case the handle names a workload that is now stopped and
+          // every later attempt is refused against a corpse. Keyed by workload,
+          // so it removes nothing if the registration really was refused.
+          await releaseHandlesForWorkload(workloadId).catch((e) => {
+            logger.error(
+              { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
+              "dag-handles.pending_register_rollback_release_failed",
+            );
+          });
+        } else {
+          // The workload is still running and nothing references it: the
+          // registration failed, and this branch returns before the session
+          // entry below is written. Write it now so `reapPendingHands` has
+          // something to find and retry -- without it the only record of this
+          // workload is a log line.
+          await kv.put(`hands.${sessionId}`, pendingPayload).catch((e) => {
+            logger.error(
+              { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
+              "hands.kv.pending_put_after_failed_rollback_failed",
+            );
+          });
+        }
         throw new Error(`DAG handle registration failed for workload ${workloadId}, rolled back`);
       }
     }
 
-    const pendingPayload = sc.encode(JSON.stringify({
-      status: "pending", workloadId, sandboxImage,
-      platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
-      createdAt: new Date().toISOString(),
-    }));
     let ok = false;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try { await kv.put(`hands.${sessionId}`, pendingPayload); ok = true; break; }

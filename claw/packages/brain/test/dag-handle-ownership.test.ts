@@ -40,6 +40,7 @@
  *   H14 releasing does not take a handle that has moved to another workload
  *   H15 a release scan that hangs does not wedge the caller
  *   H16 a rollback whose stop failed keeps the handle
+ *   H17 a failed early registration leaves the workload findable either way
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -534,6 +535,39 @@ test("H16 a rollback whose stop failed keeps the handle", async () => {
     "and the handle is only freed when the stop actually landed");
   assert.equal(
     /\}\)\.catch\(\(\) => \{\}\);[\s\S]*?releaseHandlesForWorkload/.test(block), false,
+    "the swallowing form must not come back",
+  );
+});
+
+test("H17 a failed early registration leaves the workload findable either way", async () => {
+  // The sibling I missed when I gated the OTHER rollback on whether the stop
+  // landed. This branch runs when the early registration fails, and it returns
+  // before the session entry is written -- a consequence of ordering the
+  // handle write first -- so whatever it leaves behind is the only record.
+  //
+  // The registration failing does not say WHY, and the two reasons need
+  // opposite things:
+  //   - refused, because the name still belongs to an older workload: this
+  //     workload has no handle and never will, so a stop that FAILS must leave
+  //     a pending session entry for `reapPendingHands` to retry;
+  //   - committed but its ACK lost: the handle names THIS workload, so a stop
+  //     that SUCCEEDS must free the name, or every later attempt is refused
+  //     against a corpse.
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
+    "utf-8",
+  );
+  const from = src.indexOf("dag-handles.pending_register_failed_rollback");
+  const block = src.slice(from, src.indexOf("DAG handle registration failed", from));
+
+  assert.match(block, /pending_register_rollback_stop_failed/,
+    "a stop that did not land is recorded, not swallowed");
+  assert.match(block, /if \(stopped\) \{[\s\S]*?releaseHandlesForWorkload/,
+    "a stop that landed frees the name, for the lost-ACK case");
+  assert.match(block, /\} else \{[\s\S]*?kv\.put\(`hands\.\$\{sessionId\}`/,
+    "a stop that failed leaves a pending entry, so the workload stays findable");
+  assert.equal(
+    /stop\(\{[\s\S]*?\}\)\.catch\(\(\) => \{\}\)/.test(block), false,
     "the swallowing form must not come back",
   );
 });
