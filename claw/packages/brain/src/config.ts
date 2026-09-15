@@ -1025,6 +1025,11 @@ export const HANDS_BOOTSTRAP_START_TIMEOUT = env("HANDS_BOOTSTRAP_START_TIMEOUT"
  */
 export const HANDS_ENV_FILE_WAIT_SEC = envInt("HANDS_ENV_FILE_WAIT_SEC", 30, { min: 1 });
 
+// Forwarded verbatim; bootstrap must not choose an isolation posture for the deployment.
+export const HANDS_CHILD_ISOLATION_ENV = [
+  "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX", "HANDS_CHILD_ISOLATION",
+] as const;
+
 // --- Server ---
 export const EXECUTOR_HOST = env("EXECUTOR_HOST", "0.0.0.0");
 export const EXECUTOR_PORT = envInt("EXECUTOR_PORT", 8100);
@@ -1098,6 +1103,13 @@ export const SANDBOX_KEEPALIVE_INTERVAL_SEC = envInt("SANDBOX_KEEPALIVE_INTERVAL
 // failures, so a transient control-plane outage cannot tear down a healthy
 // long-running sandbox. Default 0 (disabled).
 export const SANDBOX_KEEPALIVE_FAIL_LIMIT = envInt("SANDBOX_KEEPALIVE_FAIL_LIMIT", 0);
+// N_max for the proven keepalive refresh-gap bound; invalid or absent refuses startup.
+export const SANDBOX_KEEPALIVE_TARGET_CEILING = env("SANDBOX_KEEPALIVE_TARGET_CEILING");
+// Counted inside the ceiling so recovered targets can be admitted before service.
+export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONCILE_RESERVE");
+// Deployment-declared because not every provider exposes its idle deadline.
+export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC");
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 300, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can
@@ -1568,6 +1580,11 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
  * every command to be planned as if it had ten hours.
  */
 export const BASH_FOREGROUND_DEFAULT_SEC = envInt("BASH_DEFAULT_TIMEOUT_SEC", 120);
+
+// Shared with Hands so the reap grace and the client deadline cannot diverge.
+export const BG_SHELL_REAP_GRACE_MS = envInt(
+  "BG_SHELL_REAP_GRACE_MS", 2_000, { min: 250, max: 60_000 },
+);
 
 /**
  * The ceiling on one `wait` call, mirroring Hands' WAIT_MAX_SEC.

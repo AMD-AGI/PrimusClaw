@@ -21,6 +21,13 @@ if [ ! -f "$HANDS_DIST" ]; then
 fi
 
 WORKSPACE="$(mktemp -d)"
+# Hands files its background-shell records here and refuses to start if it
+# cannot: a process serving shells it keeps no record of leaves every later
+# destroy gate reading an empty count as an empty sandbox. Its own directory,
+# not one under $WORKSPACE -- the workspace is synced, and a sync must not be
+# able to carry the records out or overwrite them. The built-in default is a
+# system path a CI runner has no business writing to.
+STATE_DIR="$(mktemp -d)"
 # A random per-run token: the demo also asserts that a wrong token is rejected,
 # so a fixed placeholder would make that check meaningless.
 TOKEN="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
@@ -35,14 +42,16 @@ cleanup() {
     kill "$HANDS_PID" 2>/dev/null || true
     wait "$HANDS_PID" 2>/dev/null || true
   fi
-  rm -rf "$WORKSPACE"
+  rm -rf "$WORKSPACE" "$STATE_DIR"
 }
 trap cleanup EXIT
 
 echo "workspace: $WORKSPACE"
 echo "port:      $PORT"
+echo "state:     $STATE_DIR"
 
 WORKSPACE_PATH="$WORKSPACE" MCP_PORT="$PORT" AUTH_INTERNAL_TOKEN="$TOKEN" \
+HANDS_STATE_DIR="$STATE_DIR" \
   node "$HANDS_DIST" > "$WORKSPACE/hands.log" 2>&1 &
 HANDS_PID=$!
 

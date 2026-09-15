@@ -82,6 +82,14 @@ verify-claw:
 	@cd claw && npm ci
 	@echo "==> Claw: build"
 	@cd claw && npm run build
+	@# After the build and before the suites: it compiles `test` against the
+	@# emitted .d.ts of the packages those tests import, so it needs both the
+	@# install above and the build above it. That is also why it is not in
+	@# verify-lint -- which runs first, on a tree that may have no node_modules,
+	@# and whose other guards are all plain text scans.
+	@echo "==> Claw: lint: tests must resolve"
+	@bash claw/scripts/lint-tests-must-resolve.sh --self-test
+	@bash claw/scripts/lint-tests-must-resolve.sh --all
 	@echo "==> Claw: test"
 	@cd claw && npm test
 	@# CI runs the example as a smoke test on every change to Hands, so a broken

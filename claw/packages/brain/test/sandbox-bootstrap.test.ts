@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
+  HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
 import { CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL } from "../src/config.js";
@@ -334,6 +335,9 @@ test(`a Hands that is slow to read the file is waited for, not killed (${shell})
 });
 }
 
+/** Every metacharacter, backslash included: a partial list matches too much. */
+const escapeRegex = (s: string): string => s.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+
 test("the guard counts in the shell rather than through seq", () => {
   // Every image is probed now, not only the ones whose name we recognise, and
   // an image without coreutils has no `seq`: `for _ in $(seq N)` expands to an
@@ -346,10 +350,16 @@ test("the guard counts in the shell rather than through seq", () => {
     "a Hands that catches TERM still holds the port while it handles it");
   assert.doesNotMatch(cmd, /kill -9 --/,
     "dash rejects -- after a signal option, so SIGKILL names the group without it");
-  assert.match(cmd, /: > \/workspace\/hands\.log \|\|/,
+  assert.match(cmd, new RegExp(`: > ${escapeRegex(HANDS_LOG_PATH)} \\|\\|`),
     "the log truncate is a statement of its own so $! is the setsid process, not a helper shell");
-  assert.doesNotMatch(cmd, /: > \/workspace\/hands\.log &&/,
+  assert.doesNotMatch(cmd, new RegExp(`: > ${escapeRegex(HANDS_LOG_PATH)} &&`),
     "&& ... & is what made $! a bash subshell on images whose /bin/sh is bash");
+  // Everything Hands writes about a shell names it, and the workspace is
+  // writable by every run identity in the sandbox and synced out besides. The
+  // log lives in the Hands-owned state area and its parent is created there
+  // owner-only before anything writes it.
+  assert.doesNotMatch(cmd, /\/workspace\/hands\.log/, "the log is not in the shared workspace");
+  assert.match(cmd, new RegExp(`mkdir -p ${escapeRegex(HANDS_STATE_DIR)} && chmod 700`));
 });
 
 test("the production probe carries a bound", () => {
@@ -388,4 +398,34 @@ test("a write that fails on a later source still removes the file", async (t) =>
   );
   assert.match(r.cmds[r.cmds.length - 1]!, /^rm -f /,
     "the first write already placed the keys; throwing must not leave them");
+});
+
+test("the child-isolation declaration reaches the sandbox, and nothing is substituted", () => {
+  // Hands' whole environment is the one this builds, so a range declared
+  // anywhere else reaches nothing -- and with background shells on, Hands
+  // refuses to start unless one of these states a posture. A default supplied
+  // here would be this path deciding the isolation posture for the deployment.
+  const kept = {
+    HANDS_CHILD_UID_MIN: process.env.HANDS_CHILD_UID_MIN,
+    HANDS_CHILD_UID_MAX: process.env.HANDS_CHILD_UID_MAX,
+    HANDS_CHILD_ISOLATION: process.env.HANDS_CHILD_ISOLATION,
+  };
+  delete process.env.HANDS_CHILD_UID_MIN;
+  delete process.env.HANDS_CHILD_UID_MAX;
+  delete process.env.HANDS_CHILD_ISOLATION;
+  try {
+    assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_CHILD"),
+      "an undeclared posture stays undeclared");
+
+    process.env.HANDS_CHILD_UID_MIN = "65500";
+    process.env.HANDS_CHILD_UID_MAX = "65533";
+    const env = handsBaseEnv(SESSION, PORT, TOKEN);
+    assert.match(env, /HANDS_CHILD_UID_MIN=65500/);
+    assert.match(env, /HANDS_CHILD_UID_MAX=65533/);
+  } finally {
+    for (const [key, value] of Object.entries(kept)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

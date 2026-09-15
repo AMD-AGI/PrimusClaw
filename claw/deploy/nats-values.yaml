@@ -196,6 +196,22 @@ config:
                   - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
+                  # DAG_HANDLES, read-only: the sandbox census reads the live
+                  # DAG handles brain writes, and a fleet inventory missing them
+                  # licenses a rollback that leaves sandboxes running. No
+                  # STREAM.CREATE/UPDATE and no $KV publish subject -- the
+                  # attach is bindOnly precisely so api never becomes this
+                  # bucket's creator and pins its replica count.
+                  - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_DAG_HANDLES.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_DAG_HANDLES"
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES"
+                  - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.INFO.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_DAG_HANDLES.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_DAG_HANDLES.>"
+                  - "$JS.FC.KV_DAG_HANDLES.>"
               subscribe:
                 allow:
                   # Reply inboxes, subscribe only. Nobody gets publish on

@@ -407,6 +407,14 @@ export interface ToolStats {
   total_calls: number;
   error_calls: number;
   by_tool: Record<string, number>;
+  /**
+   * Calls of each tool that came back without an error.
+   *
+   * `by_tool` counts attempts and is incremented before the tool runs, so a
+   * blocked, refused or failed call is indistinguishable in it from one that
+   * did the work. Absent on results produced before this existed.
+   */
+  by_tool_ok?: Record<string, number>;
 }
 
 /** Artifact emitted by an executed Task (uploaded blob reference). */

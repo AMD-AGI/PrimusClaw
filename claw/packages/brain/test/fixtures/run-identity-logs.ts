@@ -58,6 +58,8 @@ function scriptOneWait(): void {
 }
 
 const hands = {
+  classifyShell: async () => ({ shellClass: "running", collectorLive: false }),
+  async callToolFull(name: string) { return { text: await this.callTool(name), isError: false }; },
   async callTool(name: string) {
     if (name !== "wait") return "ok";
     await new Promise((r) => setTimeout(r, 20));
