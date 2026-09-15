@@ -25,7 +25,7 @@
  */
 
 import pino from "pino";
-import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import { DOORBELL_SEMANTICS_MAX, DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 
@@ -115,14 +115,28 @@ export function setDoorbellLatch(next: DoorbellLatch): void {
  * A value that does not parse is `invalid` rather than absent: a corrupt
  * assertion is not the same fact as no assertion, and folding them together
  * would hide a rollout writing garbage.
+ *
+ * A well-formed number past the protocol's ceiling is refused on the same
+ * terms. The gate is `version >= this binary's own`, so a floor with no upper
+ * bound is an automatic yes: every number a wrong write can leave in the key --
+ * a pasted timestamp, a truncated id, a typo'd "100" -- reads as "the fleet can
+ * take a doorbell" and sends one to a fleet that asserted nothing. The other
+ * two readers of a semantics number this process did not produce,
+ * `doorbellSemanticsOf` and `doorbellSemanticsFrom`, already bound it; this one
+ * is fed by a KV key whose writer is outside the process entirely.
  */
 export function latchFromOperation(operation: string, value: string | null): DoorbellLatch {
   if (operation === "DEL" || operation === "PURGE") return { state: "revoked" };
   const raw = (value ?? "").trim();
   const parsed = Number(raw);
-  if (!/^\d+$/.test(raw) || !Number.isInteger(parsed) || parsed < 1) {
+  if (
+    !/^\d+$/.test(raw) || !Number.isInteger(parsed)
+    || parsed < 1 || parsed > DOORBELL_SEMANTICS_MAX
+  ) {
+    // `max` is in the record because a refused "65" is perfectly parseable, and
+    // the event name alone would send the operator looking for a bad byte.
     logger.error(
-      { key: DOORBELL_SEMANTICS_KEY, value: raw.slice(0, 64) },
+      { key: DOORBELL_SEMANTICS_KEY, value: raw.slice(0, 64), max: DOORBELL_SEMANTICS_MAX },
       "doorbell.floor_unparseable",
     );
     return { state: "invalid", value: raw.slice(0, 64) };

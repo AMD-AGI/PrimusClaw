@@ -571,6 +571,49 @@ async function ensureConcurrentIndex(
   }
 }
 
+/**
+ * {@link ensureConcurrentIndex} for the call sites that have nothing to retry.
+ * Exported for tests.
+ *
+ * The warn that function ends in is only reached when the build *returns* and
+ * the index is still unusable, which `IF NOT EXISTS` makes a narrow case. The
+ * commoner ending is the build raising -- 40P01 when it deadlocks against a
+ * writer of the table it is indexing, 53100 when the sort runs out of room,
+ * 57P01 when a failover takes the session, 57014 if it ever outlives the
+ * ceiling above -- and that error walks straight out through the `finally`,
+ * past the remaining DDL and past `assertSchema`, the check that exists to
+ * catch exactly the incomplete state it produces. Which is the half-run
+ * migration the warn was written to avoid, arrived at by the one path the warn
+ * cannot see.
+ *
+ * So a build that raises is reported here for the same reason every other index
+ * in this migration is created with `.catch(() => {})`: an index is a
+ * performance property and a migration that stops halfway is a correctness one.
+ * The indexes whose absence *is* a correctness problem are not left to this --
+ * `assertSchema` refuses to serve on those at the end, with the rest of the
+ * schema applied and the reason named, rather than here with an opaque
+ * Postgres error and two hundred lines of DDL unapplied.
+ *
+ * Only what Postgres raised, though, which is what a `code` on the error means.
+ * The name guard inside is a caller bug rather than a data condition, and the
+ * one outcome this must not produce is a booted pod that quietly logged an
+ * unvalidated identifier on its way into DDL.
+ *
+ * {@link ensureChatTurnClaimIndex} deliberately does not come through here: it
+ * catches the throw itself, because for that index a raised build is the signal
+ * to reconcile and try again rather than to give up.
+ */
+export async function ensureConcurrentIndexOrWarn(
+  client: pg.PoolClient,
+  name: string,
+  createSql: string,
+): Promise<void> {
+  await ensureConcurrentIndex(client, name, createSql).catch((err: unknown) => {
+    if (typeof (err as { code?: unknown })?.code !== "string") throw err;
+    logger.warn({ index: name, err }, "db.concurrent_index_build_failed");
+  });
+}
+
 const TURN_DEBRIS_MESSAGE =
   "a retried dispatch opened this row a second time for the same message; the turn "
   + "belongs to the row that holds it, and this one is closed so it can never be claimed";
@@ -1451,7 +1494,7 @@ export async function initDb(): Promise<void> {
        WHERE lease_expires_at IS NOT NULL
          AND status IN ('preparing','running','cancelling')`,
     ).catch(() => {});
-    await ensureConcurrentIndex(
+    await ensureConcurrentIndexOrWarn(
       client,
       "idx_tasks_platform_facts_pending",
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
@@ -1496,7 +1539,7 @@ export async function initDb(): Promise<void> {
     // GET /v1/runs?state=terminal&since= -- partial on the three terminal
     // statuses and ordered by the exact keyset cursor. The task id is the stable
     // tiebreaker when one statement completes many rows at the same timestamp.
-    await ensureConcurrentIndex(
+    await ensureConcurrentIndexOrWarn(
       client,
       "idx_tasks_terminal_completed_task_v2",
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
@@ -1511,7 +1554,7 @@ export async function initDb(): Promise<void> {
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
     await ensureChatTurnClaimIndex(client);
-    await ensureConcurrentIndex(
+    await ensureConcurrentIndexOrWarn(
       client,
       A2A_EXECUTION_INDEX,
       `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${A2A_EXECUTION_INDEX}

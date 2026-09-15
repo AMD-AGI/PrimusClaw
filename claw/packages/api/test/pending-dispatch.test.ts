@@ -170,7 +170,15 @@ function harness(opts: {
       rec.sql.push({ text, params });
       return { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 };
     }
-    if (/SELECT status, failure_reason/.test(text)) {
+    // Matched on the reach expression rather than on the leading column list,
+    // and ahead of the completion probe below rather than after it. The
+    // classification is one statement that asks about the run row AND about a
+    // recorded completion for that row's message, so it both selects through a
+    // table alias and mentions `claw_session_events` -- either of which would
+    // have sent it to the wrong arm of this labeller and answered it with the
+    // wrong stub row. The single entry the sequences below still expect is the
+    // assertion that it stayed one statement.
+    if (/AS reached/.test(text)) {
       rec.calls.push("inspect-handoff");
       rec.sql.push({ text, params });
       return { rows: [], rowCount: 0 };
@@ -518,8 +526,10 @@ test("P7 a published turn clears the queue row, then marks the session running",
     rec.calls,
     // The receipt saying a message may exist is durable before the publish
     // that may create one; the sequence naming that message lands after it.
+    // No clear between the reservation and the open: the row this branch
+    // opens *is* the reserved one, so the identity stands until the delete.
     [
-      "lookup", "bind", "reserve-handoff", "inspect-handoff", "clear-handoff",
+      "lookup", "bind", "reserve-handoff", "inspect-handoff",
       "open", "arm-publish", "publish", "record-seq",
       "delete-pending", "mark-running",
     ],
@@ -557,7 +567,7 @@ test("P8 a row that could not be opened does not publish", async () => {
   assert.ok(!rec.calls.includes("delete-pending"), "the queue row stays for the retry");
   assert.deepEqual(
     rec.calls,
-    ["lookup", "bind", "reserve-handoff", "inspect-handoff", "clear-handoff", "open"],
+    ["lookup", "bind", "reserve-handoff", "inspect-handoff", "open"],
   );
 });
 
@@ -800,7 +810,13 @@ test("P7b the gate the replay takes names the turn that took it", async () => {
 
 /** The publish-state receipts written on the run row, in the order they were written. */
 function publishStates(rec: Recorder): unknown[] {
-  return rec.sql.filter((q) => /dispatch_compensation/.test(q.text)).map((q) => q.params[1]);
+  // Matched on the write's own path rather than on the word: the handoff
+  // inspection reads the same receipt to tell a row that never published from
+  // one that owns the turn, and a filter on `dispatch_compensation` alone
+  // counts that read as a write of `undefined`.
+  return rec.sql
+    .filter((q) => /\{dispatch_compensation,publish\}/.test(q.text))
+    .map((q) => q.params[1]);
 }
 
 test("P6c a publish the server refused leaves the row denying any message exists", async () => {

@@ -21,7 +21,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { RUN_CLAIM_FENCE_LOCK_ID, RUN_CLAIM_FENCE_SQL } from "../src/infra/db.js";
+import {
+  RUN_CLAIM_FENCE_LOCK_ID,
+  RUN_CLAIM_FENCE_SQL,
+  ensureConcurrentIndexOrWarn,
+} from "../src/infra/db.js";
 
 const SRC = readFileSync(new URL("../src/infra/db.ts", import.meta.url), "utf8");
 const FN = SRC.slice(
@@ -234,4 +238,72 @@ test("a rebuild from an INVALID index says so", () => {
   // outside unless it is logged, and a boot that quietly restarts a half-hour
   // index build is the kind of thing an operator finds out about from latency.
   assert.match(FN, /db\.concurrent_index_rebuilding_from_invalid/);
+});
+
+// A build that *raises* never reaches the warn above: the error leaves through
+// the `finally` that restores the timeout, out of initDb, and out of main()
+// into process.exit(1) -- with the remaining DDL unapplied and assertSchema,
+// the check written for exactly that state, never run. These drive the wrapper
+// rather than the source text, because the thing at stake is which errors it
+// lets past, and a grep of the body cannot tell.
+
+/** A client that answers every statement, except the ones a test names. */
+function fakeClient(raise?: { on: RegExp; err: Error }) {
+  const seen: string[] = [];
+  return {
+    seen,
+    client: {
+      query: async (text: string) => {
+        seen.push(text.trim());
+        if (raise && raise.on.test(text)) throw raise.err;
+        return { rows: [], rowCount: 0 };
+      },
+    } as never,
+  };
+}
+
+test("a build that raises is reported, and the migration carries on", async () => {
+  // 57014 is the ending this function's own ceiling is sized against, and the
+  // one the file's comments anticipate; 40P01 and 53100 arrive the same way.
+  const { seen, client } = fakeClient({
+    on: /CREATE INDEX CONCURRENTLY/,
+    err: Object.assign(new Error("canceling statement due to statement timeout"), {
+      code: "57014",
+    }),
+  });
+  await assert.doesNotReject(
+    () => ensureConcurrentIndexOrWarn(client, "idx_x", "CREATE INDEX CONCURRENTLY idx_x ON t(a)"),
+    "the statements below it in initDb still run",
+  );
+  const timeouts = seen.filter((t) => t.startsWith("SET statement_timeout"));
+  assert.equal(timeouts.length, 2, "the ceiling is raised for the build and given back");
+  assert.notEqual(timeouts[0], timeouts[1], "given back to the migration's own budget");
+  assert.equal(seen.at(-1), timeouts[1],
+    "and given back after the raise, not skipped by it");
+});
+
+test("but a caller bug still stops the process", async () => {
+  // The name guard is not a data condition: it catches an identifier that was
+  // about to be interpolated into DDL unvalidated. Reporting that one and
+  // booting is the outcome this wrapper must not produce.
+  const { seen, client } = fakeClient();
+  await assert.rejects(
+    () => ensureConcurrentIndexOrWarn(client, "bad-name", "CREATE INDEX CONCURRENTLY x ON t(a)"),
+    /unsafe index name/,
+  );
+  assert.deepEqual(seen, [], "and it stops before issuing anything");
+});
+
+test("every index initDb builds concurrently goes through the wrapper", () => {
+  // The wrapper is defined above initDb on purpose, so this slice sees the
+  // migration's own call sites and not the wrapper's own delegation -- nor
+  // ensureChatTurnClaimIndex's, which catches the throw itself to drive its
+  // retry and would be silently reduced to a single pass by the swallow here.
+  const INIT = SRC.slice(SRC.indexOf("export async function initDb"));
+  assert.equal([...INIT.matchAll(/await ensureConcurrentIndex\(/g)].length, 0,
+    "no call site in the migration may let a raised build abort it");
+  assert.equal([...INIT.matchAll(/await ensureConcurrentIndexOrWarn\(/g)].length, 3);
+  assert.match(CHAT_TURN_FN, /await ensureConcurrentIndex\(/,
+    "the chat-turn builder is the exception, and catches the throw itself");
+  assert.match(SRC, /db\.concurrent_index_build_failed/, "the reported ending is named");
 });

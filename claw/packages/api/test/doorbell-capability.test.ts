@@ -17,7 +17,7 @@ import "./doorbell-dispatch-on-env.js";
 
 import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import { DOORBELL_SEMANTICS_MAX, DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 
 import {
   beginDoorbellDispatch, closeDoorbellLatch, doorbellGateOpen, doorbellInFlight, doorbellLatch,
@@ -68,7 +68,15 @@ test("a watch that dies closes the gate rather than serving its last value", () 
 });
 
 test("an unparseable value is invalid, which is not the same fact as absent", () => {
-  for (const bad of ["", "  ", "one", "-1", "0", "1.5", "1e3", "01x"]) {
+  // A number past the protocol's ceiling is refused on the same terms as a
+  // string that is not a number at all. The gate compares `>=`, so nothing
+  // downstream can tell an asserted floor from a pasted timestamp, and the
+  // largest of these is not even the number the writer wrote.
+  const bads = [
+    "", "  ", "one", "-1", "0", "1.5", "1e3", "01x",
+    String(DOORBELL_SEMANTICS_MAX + 1), "20260915", "999999999999999999999",
+  ];
+  for (const bad of bads) {
     setDoorbellLatch(latchFromOperation("PUT", bad));
     assert.equal(doorbellLatch().state, "invalid", `expected ${JSON.stringify(bad)} to be invalid`);
     assert.equal(doorbellGateOpen(), false);
@@ -129,7 +137,7 @@ test("the floor a latch carries is the number the operator wrote, not one near i
   // a doorbell -- and a Brain that cannot parse this binary's semantics is
   // handed one. Nothing downstream can recover the operator's number, so it is
   // pinned at the only place it is produced.
-  for (const asserted of [1, 2, 7, 64]) {
+  for (const asserted of [1, 2, 7, DOORBELL_SEMANTICS_MAX]) {
     assert.deepEqual(
       latchFromOperation("PUT", String(asserted)),
       { state: "floor", version: asserted },
