@@ -14,6 +14,7 @@ const { db } = await import("../src/infra/db.js");
 const { dispatchTaskToBrain, sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
 const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
 const { startHarness, seedSession } = await import("./scenario-harness.js");
+const { openDoorbellBarrier, closedDoorbellBarrier } = await import("./doorbell-barrier-stub.js");
 
 let h: Harness;
 let query: typeof db.query;
@@ -25,7 +26,8 @@ const user: UserInfo = {
 
 before(async () => {
   h = await startHarness();
-  await h.sql("ALTER TABLE claw_sessions ADD COLUMN IF NOT EXISTS config JSONB");
+  // `claw_sessions.config` is declared by the scenario harness DDL (it matches
+  // initDb's base CREATE TABLE); this suite only writes to it.
   query = db.query;
 });
 beforeEach(async () => {
@@ -71,7 +73,10 @@ function dispatchPorts(doorbell: boolean, expectedKey: string): string[] {
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
-  sessionDispatchPorts.doorbellDispatch = doorbell;
+  // A token-issuing barrier, not a boolean: the port answers a dispatch with a
+  // release handle (or null for the fat path) so a rollback can observe a
+  // publisher that read the gate open and has not let go yet.
+  sessionDispatchPorts.doorbellDispatch = doorbell ? openDoorbellBarrier : closedDoorbellBarrier;
   sessionDispatchPorts.admit = async () => ({ kind: "admit" });
   sessionDispatchPorts.publishSse = () => { steps.push("event"); };
   sessionDispatchPorts.openChatRun = (async () => {
@@ -84,6 +89,15 @@ function dispatchPorts(doorbell: boolean, expectedKey: string): string[] {
     steps.push("publish");
   };
   sessionDispatchPorts.failChatRunDispatch = async () => "closed";
+  // The fat path's publish bookkeeping, which reaches rows this suite's `db`
+  // stub does not serve: `recordPublishState` throws "not armed" on an empty
+  // result and would fail the dispatch before it ever reaches the credentials
+  // this suite is about. Neutralised, not asserted on -- the arming, the
+  // sequence and the refusal note are dispatch-binding's subject, not this
+  // suite's.
+  sessionDispatchPorts.recordPublishState = async () => {};
+  sessionDispatchPorts.recordDispatchSeq = async () => {};
+  sessionDispatchPorts.noteRefusedPublish = async () => {};
   return steps;
 }
 
@@ -133,7 +147,11 @@ for (const doorbell of [false, true]) {
     assert.equal(result.kind === "publish_failed" ? result.error.message : "", "session.credentials_stamp_failed");
     assert.equal(rolledBack, true);
     assert.deepEqual(steps, []);
-    assert.equal(await config(), null);
+    // The row's untouched value, not NULL: `claw_sessions.config` defaults to
+    // an empty object, so "nothing was stamped" is an empty config rather than
+    // an absent one. What the rollback has to guarantee is that no credential
+    // reached it.
+    assert.deepEqual(await config(), {});
   });
 
   test(`${path} chat with no platform key does not trust caller config or gain a new rejection`, async () => {

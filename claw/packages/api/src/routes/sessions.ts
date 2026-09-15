@@ -3,15 +3,17 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
-import { db } from "../infra/db.js";
+import { db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { asJsonObject, dispatchTaskToBrain } from "../sessions/dispatch.js";
+import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
-import { forceIdleAfterInterrupt, interruptUnstartedChatRuns } from "../tasks/chat-run.js";
-import { nc, kv } from "../infra/nats.js";
+import {
+  forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
+} from "../tasks/chat-run.js";
+import { kv } from "../infra/nats.js";
 import { getUser } from "../auth/middleware.js";
 import {
   canAccessSession,
@@ -23,12 +25,17 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import {
-  interruptSubject, isUserEnvKeyAllowed,
+  isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
 } from "@claw/protocol";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
+import { metrics } from "../infra/metrics.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
+import {
+  acquireAdmissionLock, envAdmitLimits, sessionTreeShape, treeCeilingRefusal,
+  type AdmissionAsk,
+} from "../tasks/admission.js";
 import { S3_BUCKET, UPLOAD_TTL_DAYS } from "../config.js";
 import { getS3Client } from "../infra/s3-client.js";
 import type { S3Client } from "@aws-sdk/client-s3";
@@ -38,8 +45,180 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
+import { handsSessionKey } from "@claw/protocol";
 
 const logger = pino({ name: "sessions" });
+
+interface SessionCreateRefusal {
+  statusCode: number;
+  response: { ok: false; error: string; reason?: string };
+}
+
+export interface NewSessionRow {
+  sessionId: string;
+  name: string;
+  userId: string;
+  mode: string;
+  agentStatus: string;
+  systemPrompt: string;
+  config: Record<string, unknown>;
+  parentSid: string | null;
+  role: string;
+  /**
+   * The turn this row is born holding the gate for, or null when it is born
+   * idle. Set together with `agentStatus: "running"` or not at all: a session
+   * gated with no marker is one `releaseSessionGateIfLastRun` cannot hand back
+   * once ownership is enforced, and it waits out `reapStuckSessions` instead.
+   */
+  gateMessageId?: string | null;
+}
+
+// A value rather than a boolean, carrying the parent it was issued for, so a
+// witness cannot be reused for a parent other than the one authorised.
+export interface ParentAuthorisation {
+  /** The parent this witness authorises, or null when the create named none. */
+  readonly parentSid: string | null;
+}
+
+/**
+ * Write the session row, refusing to record a parent nobody authorised.
+ *
+ * The witness is required at the write, not only at the call sites: a child row
+ * is what grants visibility of a parent's tree, so a path that wrote the link
+ * having checked nothing would attach across tenants silently.
+ */
+export async function insertSessionRow(
+  q: StatementRunner,
+  row: NewSessionRow,
+  parentAuth: ParentAuthorisation,
+): Promise<void> {
+  if (row.parentSid !== parentAuth.parentSid) {
+    throw new Error("session.create.parent_not_authorised");
+  }
+  await q.query(
+    `INSERT INTO claw_sessions
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
+    [
+      row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
+      row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
+      row.gateMessageId ?? null,
+    ],
+  );
+}
+
+/**
+ * Whether this caller may attach the child to the parent it named.
+ *
+ * Called on every create, so the request body never decides whether an
+ * authorisation happens: "no parent was named" is an answer this returns.
+ * Every other arm fails closed.
+ */
+export async function resolveParentAuthorisation(
+  q: StatementRunner,
+  parentSid: string | null,
+  user: ReturnType<typeof getUser>,
+): Promise<SessionCreateRefusal | ParentAuthorisation> {
+  if (!parentSid) return { parentSid: null };
+  if (!user) {
+    return { statusCode: 401, response: { ok: false, error: "authentication required" } };
+  }
+  const parent = (await q.query(
+    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+    [parentSid],
+  )).rows[0] as { user_id?: string | null } | undefined;
+  if (!parent) return { statusCode: 404, response: { ok: false, error: "parent_session_not_found" } };
+  if (!canWriteSessionAsOperator(parent.user_id, user)) {
+    return { statusCode: 403, response: { ok: false, error: "parent_session_access_denied" } };
+  }
+  return { parentSid };
+}
+
+function isRefusal(
+  result: SessionCreateRefusal | ParentAuthorisation,
+): result is SessionCreateRefusal {
+  return "statusCode" in result;
+}
+
+// The two shapes differ only in where the parent is read: a create that names
+// a parent grows a tree somebody may be racing, so it takes the lock. Whether
+// it also carries a first message is not the question -- a node the ceiling
+// never saw is exactly the child idled into the tree that `sessionTreeShape`
+// is written to bound, and it would be paid for later by every session in the
+// tree, whose next turn is the one the ceiling finally refuses.
+async function createSessionRow(
+  row: NewSessionRow,
+  parentSid: string | null,
+  user: ReturnType<typeof getUser>,
+): Promise<SessionCreateRefusal | null> {
+  if (parentSid) return admitParentedSessionCreate(parentSid, user, row);
+  const parentAuth = await resolveParentAuthorisation(db, parentSid, user);
+  if (isRefusal(parentAuth)) return parentAuth;
+  await insertSessionRow(db, row, parentAuth);
+  return null;
+}
+
+/**
+ * The parent read, the tree decision and the INSERT are one transaction whose
+ * first statement is the lock: outside it two child creates each read a tree the
+ * other has already grown. The shape is prospective, and both bounds are checked
+ * because a write that adds no level still adds a node.
+ */
+export async function admitParentedSessionCreate(
+  parentSid: string,
+  user: ReturnType<typeof getUser>,
+  row: NewSessionRow,
+): Promise<SessionCreateRefusal | null> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    try {
+      await acquireAdmissionLock(client);
+      const parentAuth = await resolveParentAuthorisation(client, parentSid, user);
+      if (isRefusal(parentAuth)) {
+        await client.query("ROLLBACK");
+        return parentAuth;
+      }
+      // The walk is what a tree ceiling costs, so a fleet that meters no tree
+      // does not pay it: with no tree bound the ask below carries no run,
+      // sandbox or GPU either, and the decision is a no-op on it.
+      let ask: AdmissionAsk = { origin: "chat", newRunRoots: 0, sandboxes: 0, gpuNodes: 0 };
+      const limits = envAdmitLimits();
+      if (limits.treeMaxNodes > 0 || limits.treeMaxDepth > 0) {
+        const shape = await sessionTreeShape(parentSid, client);
+        ask = {
+          ...ask,
+          treeRootId: shape.rootId,
+          treeNodeCount: shape.nodeCount + 1,
+          treeDepth: shape.depth + 1,
+        };
+      }
+      // The tree bounds and nothing else. This write adds a node, never a run:
+      // asking the full decision would put it against the fleet's run, sandbox
+      // and GPU ceilings, and an operator lowering ADMIT_HARD_RUNS below current
+      // occupancy would then start refusing idle child-session setup that starts
+      // no work -- while the same create with no parent still succeeded. A run
+      // meets a run cap when it is dispatched.
+      const refusal = treeCeilingRefusal(ask, limits);
+      if (refusal) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 429,
+          response: { ok: false, error: "admission_rejected", reason: refusal },
+        };
+      }
+      await insertSessionRow(client, row, parentAuth);
+      await client.query("COMMIT");
+      return null;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 
 // --- Zip download constants & state ---
 //
@@ -674,20 +853,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       });
     }
 
-    if (parentSid) {
-      if (!user) {
-        return reply.status(401).send({ ok: false, error: "authentication required" });
-      }
-      const parent = (await db.query(
-        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-        [parentSid],
-      )).rows[0] as { user_id?: string | null } | undefined;
-      if (!parent) {
-        return reply.status(404).send({ ok: false, error: "parent_session_not_found" });
-      }
-      if (!canWriteSessionAsOperator(parent.user_id, user)) {
-        return reply.status(403).send({ ok: false, error: "parent_session_access_denied" });
-      }
+    if (parentSid && !user) {
+      return reply.status(401).send({ ok: false, error: "authentication required" });
     }
 
     // --- Parse optional message up-front so validation errors don't
@@ -811,20 +978,32 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // Insert session (+ pre-flip to 'running' when message is present,
         // so the row is born consistent with its dispatch state). Single
         // INSERT: no transaction needed because there's no row to lock yet.
+        //
+        // "Consistent" has to include which turn holds the gate. The pre-flip
+        // is the one path that gates a session without going through
+        // `takeSessionGate`, so it is the one path that used to leave the
+        // marker null -- and a null marker is not a row
+        // `releaseSessionGateIfLastRun` can hand back once ownership is
+        // enforced. The turn's own id is therefore minted here rather than
+        // inside the dispatch, and the same one is handed to it.
+        const firstMessageId = firstMessage ? newChatMessageId() : null;
         const initialStatus = firstMessage ? "running" : "idle";
-        await db.query(
-          `INSERT INTO claw_sessions
-           (session_id, name, user_id, mode, agent_status, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
-          [
-            sessionId,
-            (name as string || "").slice(0, 255),
-            userId, mode, initialStatus,
-            (system_prompt as string || ""),
-            JSON.stringify(sessionConfig),
-            parentSid, role,
-          ],
-        );
+        const newRow: NewSessionRow = {
+          sessionId,
+          name: (name as string || "").slice(0, 255),
+          userId, mode, agentStatus: initialStatus,
+          systemPrompt: (system_prompt as string || ""),
+          config: sessionConfig,
+          parentSid, role,
+          gateMessageId: firstMessageId,
+        };
+        // A create with no parent grows no existing tree; every create that
+        // names one adds a node to it, so it is decided against the ceiling
+        // before the row is written.
+        const refused = await createSessionRow(newRow, parentSid, user);
+        if (refused) {
+          return { statusCode: refused.statusCode, response: refused.response };
+        }
 
         const dispMode = mode.replace(/-harness$/, "");
 
@@ -838,6 +1017,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, response);
+          metrics.onSessionCreated("ok");
           return { statusCode: 200, response };
         }
 
@@ -861,6 +1041,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         const dispatch = await dispatchTaskToBrain(
           {
             sessionId, userId, user,
+            messageId: firstMessageId ?? undefined,
             content: firstMessage.content,
             messageType: firstMessage.messageType,
             toolIds: firstMessage.toolIds,
@@ -872,6 +1053,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             mcpServers: firstMessage.mcpServers,
             capturedUserEnvSnapshot: userEnvSnapshot,
             capturedSessionEnv: sessionEnv,
+            reconcileAction: "delete_created_session",
           },
           async () => {
             // Strict rollback: remove the session row + its UserMessage event
@@ -899,7 +1081,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [sessionId]);
           },
         );
-        if (dispatch.kind === "publish_failed") {
+        if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
+          // An unknown verdict runs no rollback, so the session outlives this 503.
+          // A settled failure deleted its row; counting it would name no session.
+          if (dispatch.kind === "publish_unknown") metrics.onSessionCreated("ok");
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
           return { statusCode: 503, response: errResp };
@@ -931,7 +1116,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           },
         };
         if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, okResp);
+        metrics.onSessionCreated("ok");
         return { statusCode: 200, response: okResp };
+      } catch (err) {
+        metrics.onSessionCreated("error");
+        throw err;
       } finally {
         if (idemLock) await releaseIdempotencyLock(idemLock);
       }
@@ -1020,7 +1209,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!row) return reply;
     const session = mapSessionForDisplay(row);
     try {
-      const kvEntry = await kv.get(`hands.${req.params.id}`);
+      const kvEntry = await kv.get(handsSessionKey(req.params.id));
       if (kvEntry) {
         const info = JSON.parse(new TextDecoder().decode(kvEntry.value));
         if (info.workloadId) (session as any).sandbox_workload_id = info.workloadId;
@@ -1150,19 +1339,27 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // admin boundary as the dedicated control endpoint.
     if (messageType === "interrupt") {
       const row = (await db.query(
-        "SELECT user_id, agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        "SELECT user_id, agent_status, agent_gate_message_id FROM claw_sessions "
+        + "WHERE session_id = $1 AND deleted_at IS NULL",
         [sessionId],
       )).rows[0];
       if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
       if (!canWriteSessionAsOperator(row.user_id, user)) {
         return reply.status(403).send({ ok: false, error: "access denied" });
       }
-      try { nc.publish(interruptSubject(sessionId)); } catch { /* ignore publish errors */ }
-      await interruptUnstartedChatRuns(sessionId);
+      // The forced-idle timer below would hand back a gate nothing cancelled.
+      try {
+        await stopSessionRuns(sessionId);
+      } catch {
+        return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
+      }
       // If Brain is running, set a timeout to force idle if exec_complete
       // doesn't arrive within 30s (e.g. Brain stuck in a2a_call HTTP fetch).
       if (row.agent_status === "running") {
         const sid = sessionId;
+        // Captured now, not read when the timer fires: a turn armed for one
+        // message must not idle a later one that took the gate in between.
+        const gateOwner = (row.agent_gate_message_id ?? null) as string | null;
         setTimeout(async () => {
           try {
             const check = await db.query(
@@ -1170,7 +1367,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
               [sid],
             );
             if (check.rows[0]?.agent_status === "running") {
-              const released = await forceIdleAfterInterrupt(sid);
+              const released = await forceIdleAfterInterrupt(sid, gateOwner);
               if (released) logger.warn({ sessionId: sid }, "interrupt.forced_idle_after_timeout");
               else logger.info({ sessionId: sid }, "interrupt.forced_idle_declined_live_lease");
             }
@@ -1195,6 +1392,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // can inject user_env without re-reading the DB. Queue path freezes it
     // onto claw_pending_messages directly and leaves this map empty.
     let capturedUserEnvSnapshot: Record<string, string> = {};
+
+    // Minted before the gate is taken, so marker and turn are one string.
+    const turnMessageId = newChatMessageId();
 
     // Transaction: lock row → check status → queue or dispatch
     const client = await db.pool.connect();
@@ -1270,7 +1470,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // Hoisted via outer-scope variable defined after the try/finally block.
       capturedUserEnvSnapshot = userEnvSnapshot;
 
-      await client.query("UPDATE claw_sessions SET agent_status = 'running', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL", [sessionId]);
+      await takeSessionGate(sessionId, turnMessageId, client);
       await client.query("COMMIT");
     } catch (e) {
       await client.query("ROLLBACK");
@@ -1283,10 +1483,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // phantom 'running' spinner is left behind (mirrors the publish-failure
     // rollback below). The transaction above already committed 'running'.
     if (isClientGone(req)) {
-      await db.query(
-        "UPDATE claw_sessions SET agent_status = 'idle', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-        [sessionId],
-      );
+      await releaseSessionGateForTurn(sessionId, turnMessageId);
       logger.warn({ sessionId, userId }, "message.client_gone_pre_dispatch");
       return reply.status(499).send({ ok: false, error: "client_closed_request" });
     }
@@ -1304,15 +1501,13 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         workspaceId, mcpServers,
         capturedUserEnvSnapshot,
         capturedSessionEnv: sessionEnv,
+        messageId: turnMessageId,
       },
       async () => {
-        await db.query(
-          "UPDATE claw_sessions SET agent_status = 'idle', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
-          [sessionId],
-        );
+        await releaseSessionGateForTurn(sessionId, turnMessageId);
       },
     );
-    if (dispatch.kind === "publish_failed") {
+    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
       return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
     }
     if (dispatch.kind === "rejected") {

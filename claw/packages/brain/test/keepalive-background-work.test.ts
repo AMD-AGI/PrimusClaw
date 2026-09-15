@@ -202,15 +202,49 @@ test("the probe is asked for the session, which is the owner Hands files shells 
   );
 });
 
-test("no background work leaves the existing expiry untouched", async () => {
+test("a confirmed zero expires the handle, once a window has passed since it", async () => {
+  // The clock restarts at every answer that is not a confirmed zero, so the
+  // window an expiry is judged on is one the sandbox was observed idle across.
+  // Without moving the clock this reads as "kept", which is what an unanswered
+  // stretch is supposed to look like.
   const { kv, deleted } = fakeKv();
+  let clock = Date.now();
+  const deps = { kv, countActiveShells: async () => 0, now: () => clock };
 
-  await sweepUntilProbed({ kv, countActiveShells: async () => 0 });
+  await runKeepaliveTickForTest(deps);
+  await new Promise((r) => setImmediate(r));
+  clock += 2 * 60 * 60 * 1000;
+  await runKeepaliveTickForTest(deps);
 
   assert.ok(
     deleted.includes(`hands.${SESSION}`),
     "a sandbox nobody is using still has to be reclaimed; this check must not "
       + "turn every finished turn into a held pod",
+  );
+});
+
+test("an unknown resets the idle clock, so one zero after it expires nothing", async () => {
+  // A TTL refresh alone left the clock running through the whole unanswered
+  // stretch, so a single confirmed zero afterwards expired a handle whose
+  // idleness was never observed across the window it was expired on.
+  const { kv, deleted } = fakeKv();
+  stubPingableProvider();
+  let clock = Date.now();
+  let answers = 0;
+  const countActiveShells = async () => {
+    if (answers++ < 4) throw new Error("hands unreachable");
+    return 0;
+  };
+
+  for (let i = 0; i < 6; i++) {
+    await runKeepaliveTickForTest({ kv, countActiveShells, now: () => clock });
+    await new Promise((r) => setImmediate(r));
+    clock += 60 * 1000;
+  }
+
+  assert.ok(
+    !deleted.includes(`hands.${SESSION}`),
+    "the window was never observed idle end to end, so nothing may be expired on it",
   );
 });
 
@@ -231,24 +265,28 @@ test("a probe that cannot answer holds the handle instead of expiring it", async
   );
 });
 
-test("a probe that never answers eventually stops holding the handle", async () => {
+test("a probe that never answers holds the handle at every streak length", async () => {
+  // A sandbox nobody can read is not a sandbox with nothing in it, and only the
+  // second may release a container. A tolerance converting one into the other
+  // reclaims a pod full of orphaned work on the strength of a question nobody
+  // ever got an answer to; what the streak buys is a report, not a licence.
   const { kv, deleted } = fakeKv();
   stubPingableProvider();
+  let clock = Date.now();
 
-  // Unknown is for a blip, not forever: a sandbox that has stopped answering
-  // entirely would otherwise be pinned until its absolute deadline.
   for (let i = 0; i < 16; i++) {
     await runKeepaliveTickForTest({
       kv,
       countActiveShells: async () => { throw new Error("hands unreachable"); },
+      now: () => clock,
     });
     await new Promise((r) => setImmediate(r));
-    if (deleted.includes(`hands.${SESSION}`)) break;
+    clock += 5 * 60 * 1000;
   }
 
   assert.ok(
-    deleted.includes(`hands.${SESSION}`),
-    "a permanently unreachable Hands must not hold a handle open indefinitely",
+    !deleted.includes(`hands.${SESSION}`),
+    "an unanswered probe became an idle verdict; it may only ever stay unknown",
   );
 });
 
@@ -367,25 +405,7 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   // still in flight when the swap happens writes under the key it started with,
   // which nothing reads any more, instead of overwriting the new pod's state.
   let workloadId = "wl-1";
-  const idleSince = IDLED_A_MOMENT_AGO;
-  const kv = {
-    async keys(filter = ">") {
-      const key = `hands.${SESSION}`;
-      const matched = filterToRegExp(filter).test(key) ? [key] : [];
-      return (async function* () { yield* matched; })();
-    },
-    async get(key: string) {
-      if (key !== `hands.${SESSION}`) return null;
-      // `idleSince` is fixed rather than re-stamped per read: a KV whose stored
-      // entry changes every time it is looked at is not one, and here it would
-      // move the idle period under the sweep between the two ticks this test is
-      // about. Inside the reuse window, which is all it has to be.
-      const v = { ...ENTRY, workloadId, idleSince };
-      return { key, value: sc.encode(JSON.stringify(v)), revision: 1 };
-    },
-    async delete() {}, async put() { return 1; },
-    async update(_k: string, _v: unknown, rev: number) { return rev + 1; },
-  } as unknown as KV;
+  const { kv, revision } = fakeKv({ idleSince: IDLED_A_MOMENT_AGO });
   stubPingableProvider();
   const asked: string[] = [];
   const deps = {
@@ -394,7 +414,10 @@ test("an answer about a replaced sandbox does not land on its successor", async 
   };
 
   await sweepUntilProbed(deps);
-  workloadId = "wl-2";                       // reuse failed; a new pod took over
+  workloadId = "wl-2";
+  await kv.update(`hands.${SESSION}`, sc.encode(JSON.stringify({
+    ...ENTRY, workloadId, idleSince: IDLED_A_MOMENT_AGO,
+  })), revision());
   await runKeepaliveTickForTest(deps);
   await new Promise((r) => setImmediate(r));
 
@@ -803,4 +826,46 @@ test("handing a handle back to the idle pool re-opens the question", async () =>
   await new Promise((r) => setImmediate(r));
   await runKeepaliveTickForTest(deps);
   assert.ok(asked > 0, "the handle going back into the pool must discard the old answer");
+});
+
+test("provider and record evidence stay within the asynchronous probe limit", async () => {
+  const status = Promise.withResolvers<void>();
+  const records = Promise.withResolvers<void>();
+  let statusReads = 0;
+  let recordReads = 0;
+  const provider = {
+    async get() {
+      statusReads += 1;
+      await status.promise;
+      return { running: true, healthy: true, state: "running" };
+    },
+    async exec(_inst: unknown, command: string) {
+      if (command.includes("epoch.json")) {
+        recordReads += 1;
+        await records.promise;
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider });
+  const deps = {
+    kv: manyIdleHandles(24),
+    countActiveShells: async () => { throw new Error("unreachable"); },
+  };
+  try {
+    await runKeepaliveTickForTest(deps);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(statusReads, 8);
+    await runKeepaliveTickForTest(deps);
+    assert.equal(statusReads, 8, "waiting for provider status must keep the probe slots reserved");
+    status.resolve();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(recordReads, 8);
+    await runKeepaliveTickForTest(deps);
+    assert.equal(statusReads, 8, "waiting for records must keep the same slots reserved");
+  } finally {
+    status.resolve();
+    records.resolve();
+    await new Promise((r) => setImmediate(r));
+  }
 });

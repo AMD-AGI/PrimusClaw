@@ -14,9 +14,10 @@
  *
  * Coverage:
  *   P1 the row exists before the message does
- *   P2 the lease travels with the turn
+ *   P2 the lease and row identity travel with the turn
  *   P3 the turn names the files it writes, and says it was required to
  *   P3b a replayed turn is published under the same id, so the stream sees one
+ *   P3c two sessions sharing a message id are two turns, not one
  *   P4 an unbindable turn is refused before anything is opened for it
  *   P5 a refusal that does not clear is abandoned, visibly, and stops retrying
  *   P5b a queue row that has already gone is not replayed and not retried
@@ -34,26 +35,44 @@
  *   P10 a doorbell replay publishes a wakeup, not the execute request
  *   P11 a queued doorbell replay does not publish, and still clears the pending row
  *   P12 a hard admission refusal abandons the pending row
+ *   P13 a refused turn names the row it terminalized
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { db } from "../src/infra/db.js";
+import { registry } from "../src/infra/metrics.js";
 import {
   dispatchPendingMessage,
   pendingDispatchPorts,
 } from "../src/tasks/pending-dispatch.js";
-import { RUN_DOORBELL_KIND } from "@claw/protocol";
+import { doorbellDedupId, RUN_DOORBELL_KIND } from "@claw/protocol";
+import { openDoorbellBarrier } from "./doorbell-barrier-stub.js";
+
 import { randomBytes } from "node:crypto";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 
 const originalQuery = db.query;
-const originalPorts = { ...pendingDispatchPorts };
+// Doorbell closed unless a test opens it. These cases are about fat dispatch,
+// and they used to reach it by inheriting a default that was off -- so the day
+// dispatch shipped on, every one of them silently changed which branch it
+// exercised. Saying it here keeps each test's subject its own to declare; the
+// doorbell cases below still override this port explicitly.
+const originalPorts = { ...pendingDispatchPorts, doorbellDispatch: () => null };
+Object.assign(pendingDispatchPorts, originalPorts);
 
 afterEach(() => {
   db.query = originalQuery;
   Object.assign(pendingDispatchPorts, originalPorts);
 });
+
+async function dispatchedMessages(outcome: "ok" | "error"): Promise<number> {
+  const text = await registry.metrics();
+  const line = text.split("\n").find((sample) =>
+    sample.startsWith("claw_api_message_dispatched_total{")
+    && sample.includes(`outcome="${outcome}"`));
+  return line ? Number(line.slice(line.lastIndexOf(" ") + 1)) : 0;
+}
 
 interface Recorder {
   calls: string[];
@@ -82,6 +101,10 @@ function harness(opts: {
   countThrows?: Error;
   /** What the queue row's delete does, when the database refuses it. */
   deleteThrows?: Error;
+  /** Whether this message already has a completion event at all, processed or not. */
+  completionPublished?: boolean;
+  /** What publishing the refusal's events does, when the stream is gone. */
+  publishEventThrows?: Error;
 } = {}): Recorder {
   const rec: Recorder = {
     calls: [], sql: [], published: [], failed: [], opened: [], events: [],
@@ -101,6 +124,7 @@ function harness(opts: {
   ) => {
     rec.calls.push("event");
     rec.events.push(event);
+    if (opts.publishEventThrows) throw opts.publishEventThrows;
   }) as unknown as typeof pendingDispatchPorts.publishSessionEvent;
 
   pendingDispatchPorts.bindWorkspace = (async () => {
@@ -118,6 +142,9 @@ function harness(opts: {
     rec.calls.push("publish");
     if (opts.publishThrows) throw opts.publishThrows;
     rec.published.push({ subject, task: JSON.parse(payload), msgId });
+    // A stream sequence, because the row records which message carries it and
+    // a stub answering nothing would hide that write.
+    return rec.published.length;
   }) as typeof pendingDispatchPorts.publish;
 
   pendingDispatchPorts.failChatRunDispatch = (async (
@@ -136,8 +163,41 @@ function harness(opts: {
         ? { rows: [], rowCount: 0 }
         : { rows: [{ bind_attempts: opts.bindAttempts }], rowCount: 1 };
     }
+    if (/SET dispatch_task_id = COALESCE/.test(text)) {
+      // A queue row that is present and carries no identity yet. No row back
+      // means another drain has taken the message, which is a different case.
+      rec.calls.push("reserve-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 };
+    }
+    // Matched on the reach expression rather than on the leading column list,
+    // and ahead of the completion probe below rather than after it. The
+    // classification is one statement that asks about the run row AND about a
+    // recorded completion for that row's message, so it both selects through a
+    // table alias and mentions `claw_session_events` -- either of which would
+    // have sent it to the wrong arm of this labeller and answered it with the
+    // wrong stub row. The single entry the sequences below still expect is the
+    // assertion that it stayed one statement.
+    if (/AS reached/.test(text)) {
+      rec.calls.push("inspect-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [], rowCount: 0 };
+    }
+    if (/FROM claw_session_events/.test(text)) {
+      rec.calls.push("completion-probe");
+      rec.sql.push({ text, params });
+      return { rows: opts.completionPublished ? [{ "?column?": 1 }] : [], rowCount: opts.completionPublished ? 1 : 0 };
+    }
+    if (/SET dispatch_task_id = NULL/.test(text)) {
+      rec.calls.push("clear-handoff");
+      rec.sql.push({ text, params });
+      return { rows: [{ id: params[0] }], rowCount: 1 };
+    }
     const isDelete = /DELETE/.test(text);
-    rec.calls.push(isDelete ? "delete-pending" : "mark-running");
+    const step = /dispatch_compensation/.test(text)
+      ? "arm-publish"
+      : /dispatch_seq/.test(text) ? "record-seq" : "mark-running";
+    rec.calls.push(isDelete ? "delete-pending" : step);
     rec.sql.push({ text, params });
     if (isDelete && opts.deleteThrows) throw opts.deleteThrows;
     return { rows: [], rowCount: 1 };
@@ -177,10 +237,12 @@ test("P1 the row exists before the message does", async () => {
   );
 });
 
-test("P2 the lease travels with the turn", async () => {
+test("P2 the lease and row identity travel with the turn", async () => {
   const rec = harness();
   await dispatchPendingMessage(input());
+  assert.equal(rec.opened[0].dispatch, "fat");
   assert.deepEqual(rec.published[0].task.run_lease, { url: "http://api/lease", token: "t0ken" });
+  assert.equal(rec.published[0].task.task_id, "ktsk_1");
 });
 
 test("P3 the turn names the files it writes, and says it was required to", async () => {
@@ -205,10 +267,24 @@ test("P3b the turn is published under the queue row's id, so a replay is one tur
   await dispatchPendingMessage(input({ messageId }));
   await dispatchPendingMessage(input({ messageId }));
 
+  const expected = doorbellDedupId("s-1", messageId);
   assert.deepEqual(
-    rec.published.map((p) => p.msgId), [messageId, messageId],
+    rec.published.map((p) => p.msgId), [expected, expected],
     "both attempts have to claim the same identity for the stream to see one",
   );
+});
+
+test("P3c two sessions sharing a message id are two turns, not one", async () => {
+  // The duplicate window is a property of the whole stream and the chat message
+  // id is a bare millisecond stamp, so the raw id makes the second session's
+  // turn a duplicate of the first: admitted, given a row, and never woken.
+  const rec = harness();
+  const messageId = "claw-1700000000000";
+  await dispatchPendingMessage(input({ messageId, sessionId: "s-1" }));
+  await dispatchPendingMessage(input({ messageId, sessionId: "s-2" }));
+
+  const [first, second] = rec.published.map((p) => p.msgId);
+  assert.notEqual(first, second);
 });
 
 test("P4 an unbindable turn is refused before anything is opened for it", async () => {
@@ -413,7 +489,9 @@ test("P6 the queue row survives a failed publish", async () => {
   // the failure this ordering exists to prevent: the retry has to find the row
   // still there.
   const rec = harness({ publishThrows: refusal("no responders") });
+  const before = await dispatchedMessages("error");
   await assert.rejects(() => dispatchPendingMessage(input()), /no responders/);
+  assert.equal(await dispatchedMessages("error") - before, 1);
   assert.ok(
     !rec.calls.includes("delete-pending"),
     "the queue row was deleted for a message that never went out",
@@ -441,17 +519,35 @@ test("P6b a publish that only timed out keeps its row", async () => {
 
 test("P7 a published turn clears the queue row, then marks the session running", async () => {
   const rec = harness();
+  const before = await dispatchedMessages("ok");
   const result = await dispatchPendingMessage(input());
 
   assert.deepEqual(
     rec.calls,
-    ["lookup", "bind", "open", "publish", "delete-pending", "mark-running"],
+    // The receipt saying a message may exist is durable before the publish
+    // that may create one; the sequence naming that message lands after it.
+    // No clear between the reservation and the open: the row this branch
+    // opens *is* the reserved one, so the identity stands until the delete.
+    [
+      "lookup", "bind", "reserve-handoff", "inspect-handoff",
+      "open", "arm-publish", "publish", "record-seq",
+      "delete-pending", "mark-running",
+    ],
   );
   assert.equal(result.runId, "ktsk_1");
-  assert.deepEqual(rec.sql[0].params, [42], "the row deleted is the one that was replayed");
-  assert.match(rec.sql[1].text, /agent_status = 'running'/);
+  assert.equal(await dispatchedMessages("ok") - before, 1);
+  // Found by what the statement is, not by how many precede it: the receipt
+  // and sequence writes sit between them.
+  const deleted = rec.sql.find((q) => /DELETE FROM claw_pending_messages/.test(q.text));
+  // Parameterised since the write moved behind `applySessionGateTransition`;
+  // the status is params[2] rather than a literal.
+  const gate = rec.sql.find((q) =>
+    /UPDATE claw_sessions/.test(q.text) && /agent_gate_message_id = \$2/.test(q.text));
+  assert.deepEqual(deleted?.params, [42], "the row deleted is the one that was replayed");
+  assert.ok(gate, "the session is marked running");
+  assert.equal(gate!.params[2], "running");
   assert.match(
-    rec.sql[1].text, /deleted_at IS NULL/,
+    gate!.text, /deleted_at IS NULL/,
     "a session deleted mid-replay must not be resurrected as running",
   );
 });
@@ -469,7 +565,10 @@ test("P8 a row that could not be opened does not publish", async () => {
 
   assert.equal(rec.published.length, 0, "an untracked message is worse than a retry");
   assert.ok(!rec.calls.includes("delete-pending"), "the queue row stays for the retry");
-  assert.deepEqual(rec.calls, ["lookup", "bind", "open"]);
+  assert.deepEqual(
+    rec.calls,
+    ["lookup", "bind", "reserve-handoff", "inspect-handoff", "open"],
+  );
 });
 
 test("P9 a turn that cannot be serialised is a publish that certainly failed", async () => {
@@ -494,7 +593,7 @@ test("P9 a turn that cannot be serialised is a publish that certainly failed", a
 function enableDoorbellCrypto(): void {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
-  pendingDispatchPorts.doorbellDispatch = true;
+  pendingDispatchPorts.doorbellDispatch = openDoorbellBarrier;
 }
 
 test("P10 a doorbell replay publishes a wakeup, not the execute request", async () => {
@@ -525,7 +624,7 @@ test("P11 a queued doorbell replay does not publish, and still clears the pendin
 });
 
 test("P12 a hard admission refusal abandons the pending row", async () => {
-  pendingDispatchPorts.doorbellDispatch = true;
+  pendingDispatchPorts.doorbellDispatch = openDoorbellBarrier;
   pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
   const rec = harness();
   const result = await dispatchPendingMessage(input());
@@ -537,3 +636,214 @@ test("P12 a hard admission refusal abandons the pending row", async () => {
   assert.ok(rec.events.some((e) => e.type === "exec_complete" && e.failure_reason === "runs_hard_limit"));
 });
 
+
+test("P12b the same refusal holds when the capability gate is shut", async () => {
+  // The fallback. `beginDoorbellDispatch` declines for an operator revocation
+  // and for a KV watch that merely died, and this branch opened and published
+  // without consulting admission at all -- so a transient watch failure
+  // disabled every configured ceiling for exactly the turns a full fleet most
+  // needs to meter: a message is pending because its session was already busy.
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, null, "a shut gate is slower, never a way past the ceiling");
+  assert.equal(rec.published.length, 0);
+  assert.ok(!rec.calls.includes("open"), "and nothing is written for a run that was refused");
+  assert.ok(rec.calls.includes("delete-pending"), "the queue row does not retry a hard refusal");
+  assert.ok(rec.events.some((e) => e.type === "exec_complete" && e.failure_reason === "runs_hard_limit"));
+});
+
+test("P12c a shut gate still dispatches the turn the ceiling admits", async () => {
+  // The positive control. Without it P12b holds just as well against a fat
+  // branch that refuses every pending replay once the gate is shut.
+  pendingDispatchPorts.admit = async () => ({ kind: "admit" });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, "ktsk_1");
+  assert.equal(rec.published.length, 1, "the fat fallback still publishes what it admitted");
+});
+
+test("P12d a soft queue on the fat fallback publishes rather than parking the row", async () => {
+  // Deliberately not P11's deferral, and asserted so it cannot be "fixed" into
+  // one: deferring leaves the row at `queued` for a claimer, and no claimer
+  // takes a fat row -- `peekNextQueued` and `reapExpiredQueuedRuns` both filter
+  // `metadata->>'dispatch' = 'doorbell'`. It would be run by nobody and reaped
+  // by nobody, with the session's gate shut behind it.
+  pendingDispatchPorts.admit = async () => ({ kind: "queue", position: 2 });
+  const rec = harness();
+
+  const result = await dispatchPendingMessage(input());
+
+  assert.equal(result.runId, "ktsk_1", "the turn runs; it is not parked where nothing runs it");
+  assert.equal(rec.published.length, 1);
+});
+
+test("P12e a fat pending run persists the topology admission counts it by", async () => {
+  // `usageFor` sums `input->'topology'->'nodes'` over live rows. With no spec
+  // the column is `{}`, so a fat GPU run counted zero nodes against every
+  // later decision for the whole time it executed.
+  pendingDispatchPorts.admit = async () => ({ kind: "admit" });
+  const rec = harness();
+
+  await dispatchPendingMessage({
+    ...input(),
+    task: { ...input().task, topology: { nodes: 4, backend: "rayjob" }, llm_api_key: "sk-secret" },
+  } as Parameters<typeof dispatchPendingMessage>[0]);
+
+  const spec = rec.opened[0]?.spec as Record<string, unknown> | undefined;
+  assert.deepEqual(spec?.topology, { nodes: 4, backend: "rayjob" }, "the figure admission reads");
+  assert.equal(spec?.dispatch, "fat", "and the row names the path that opened it");
+  assert.ok(!("llm_api_key" in (spec ?? {})), "nothing rehydrates a fat row, so no secret is stored");
+});
+
+test("P12f a refusal names itself on the gate so its own completion drains the queue", async () => {
+  // The refusal publishes a completion, and `releaseSessionGateIfLastRun`
+  // matches that completion's message against the marker once ownership is
+  // enforced. Against a null marker it matches nothing, so the release returns
+  // false and `handleComplete` skips the drain -- the next parked message waits
+  // for an event that never comes, and the session is left `failed`, which is
+  // not a state `drainOrphanedPendingMessages` picks up either.
+  //
+  // Conditional, so a drain racing a turn that already holds the gate does not
+  // rename it: that is the same defect moved onto a run that is executing.
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+  const rec = harness();
+
+  await dispatchPendingMessage(input());
+
+  const take = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = \$2/.test(s.text));
+  assert.ok(take, "the refusal claims the gate before it publishes");
+  assert.match(
+    take.text, /agent_gate_message_id IS NULL/,
+    "and only where no turn is named already",
+  );
+  assert.equal(take.params[1], input().messageId, "under the refused message's own name");
+});
+
+test("P12g but not when this message already has a completion the consumer will discard", async () => {
+  // The gate a refusal takes is released by the completion it publishes, and
+  // `completionAlreadyProcessed` keys on (session, message) -- so a second
+  // refusal of the same message publishes an event the consumer discards. A
+  // gate taken under it has no releaser left, and the session sits `running`
+  // with every later message queued behind it.
+  //
+  // The state is reachable from one swallowed delete: the first refusal's
+  // completion reopens the session, and the drain finds the row still queued.
+  const rec = harness({ completionPublished: true });
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+
+  await dispatchPendingMessage(input());
+
+  const take = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = \$2/.test(s.text));
+  assert.equal(take, undefined, "no gate is taken for a refusal nothing will release");
+  assert.ok(rec.calls.includes("delete-pending"), "and the queue row is still cleared");
+});
+
+test("P12h a refusal that cannot publish gives back the gate it took", async () => {
+  // Taking the gate is a promise that something hands it back. When the publish
+  // throws there is no completion at all, so the promise has to be kept here:
+  // otherwise the message stays queued behind a gate held under its own name,
+  // and the completion that opened the session can no longer match it either.
+  const rec = harness({ publishEventThrows: new Error("nats down") });
+  pendingDispatchPorts.admit = async () => ({ kind: "reject", reason: "runs_hard_limit" });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /nats down/);
+
+  const release = rec.sql.find((s) =>
+    /UPDATE claw_sessions/.test(s.text) && /agent_gate_message_id = NULL/.test(s.text));
+  assert.ok(release, "the gate it took is handed back");
+  assert.match(
+    release.text, /agent_gate_message_id IS NOT DISTINCT FROM \$3/,
+    "and only while it still names this turn",
+  );
+  assert.equal(
+    release.params[3], false,
+    "with the backstop escape off, so it cannot open a gate it does not hold",
+  );
+  assert.equal(release.params[2], input().messageId, "the turn it names is this one");
+});
+
+test("P13 a refused turn names the row it terminalized", async () => {
+  // The refusal's `exec_complete` is what the consumer routes on. Without the
+  // row's id, a message-scoped terminal event can be read as belonging to a
+  // sibling row that carries holder evidence.
+  const rec = harness({ bound: undefined, bindAttempts: 6 });
+
+  await dispatchPendingMessage(input());
+
+  assert.deepEqual(
+    rec.events.map((e) => e.task_id), ["ktsk_1", "ktsk_1", "ktsk_1"],
+    "every event of the turn names it, not only the completion",
+  );
+  assert.equal(rec.failed[0].runId, "ktsk_1", "and it is the row this refusal closed");
+});
+
+test("P7b the gate the replay takes names the turn that took it", async () => {
+  // A gate held under nobody's name is one no run-scoped release can open: the
+  // completion of this very turn compares the marker against its own message
+  // id, matches nothing, and leaves the session busy for ever.
+  const rec = harness();
+  await dispatchPendingMessage(input({ messageId: "claw-1700000000042" }));
+
+  // Written through `applySessionGateTransition`, so the status is a parameter
+  // rather than a literal. The property is unchanged and still the point: one
+  // statement sets both, so no window holds the status without the marker.
+  const gate = rec.sql.find((q) =>
+    /UPDATE claw_sessions/.test(q.text) && /agent_gate_message_id = \$2/.test(q.text));
+  assert.ok(gate, "the session is marked running");
+  assert.match(
+    gate!.text, /SET agent_status = \$3, agent_gate_message_id = \$2/,
+    "the flip and the marker are one statement, so no window holds one without the other",
+  );
+  assert.equal(gate!.params[2], "running", "and the status it writes is running");
+  assert.deepEqual(
+    gate!.params.slice(0, 2), ["s-1", "claw-1700000000042"],
+    "the gate is taken under the id of the turn that was just published",
+  );
+});
+
+/** The publish-state receipts written on the run row, in the order they were written. */
+function publishStates(rec: Recorder): unknown[] {
+  // Matched on the write's own path rather than on the word: the handoff
+  // inspection reads the same receipt to tell a row that never published from
+  // one that owns the turn, and a filter on `dispatch_compensation` alone
+  // counts that read as a write of `undefined`.
+  return rec.sql
+    .filter((q) => /\{dispatch_compensation,publish\}/.test(q.text))
+    .map((q) => q.params[1]);
+}
+
+test("P6c a publish the server refused leaves the row denying any message exists", async () => {
+  // The receipt, not just the row: `attempted` is what every reconciler reads
+  // as "a message may be on the stream", and a publish the server itself
+  // refused has to withdraw that admission here, where the failure is still
+  // known to be certain.
+  const rec = harness({ publishThrows: refusal("no responders") });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /no responders/);
+
+  assert.deepEqual(
+    publishStates(rec), ["attempted", "refused"],
+    "left at attempted, the reapers have no proof the row is orphaned and never close it",
+  );
+});
+
+test("P6d a publish that only timed out leaves the row admitting a message may exist", async () => {
+  // The other half of the same guard: a timeout says the reply is missing, not
+  // the message, so withdrawing the admission here would have the row deny a
+  // turn that is already executing against it.
+  const rec = harness({ publishThrows: new Error("TIMEOUT") });
+
+  await assert.rejects(() => dispatchPendingMessage(input()), /TIMEOUT/);
+
+  assert.deepEqual(
+    publishStates(rec), ["attempted"],
+    "a refused receipt over an uncertain publish is a row that denies its own live turn",
+  );
+});

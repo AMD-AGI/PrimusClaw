@@ -21,7 +21,7 @@
  * `internalTaskAuth`.
  */
 import { createHash } from "node:crypto";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, PG_INT4_MAX } from "@claw/utils";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import pino from "pino";
 import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/index.js";
@@ -31,7 +31,7 @@ import { getTask, transitionStatus } from "../tasks/db.js";
 import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { bankQueuedTime, mergeRenewal, openAttemptRecordFor } from "../tasks/run-time-ledger.js";
 
@@ -187,11 +187,20 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
   }
 }
 
+/**
+ * Name the sandbox this run is holding on the row that granted its lease.
+ *
+ * `token` null is the acquisition's shape rather than a missing value: a fat
+ * row's first lease clears `attempt_id` (see acquireFatLease), so there is no
+ * attempt for the write to fence against even when the body carried one, and
+ * the legacy arm below -- owner, live lease, the row's own bearer -- is the
+ * whole of the evidence there is.
+ */
 async function recordLeaseSandbox(
   taskId: string,
   brainId: string,
   sandbox: SandboxHandle,
-  token: AttemptToken,
+  token: AttemptToken | null,
   authorization: string | undefined,
 ): Promise<void> {
   const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
@@ -215,11 +224,11 @@ async function recordLeaseSandbox(
         taskId, brainId,
         sandbox.provider === "safe-workload" ? sandbox.handle : null,
         JSON.stringify(sandbox), RENEWABLE_STATUSES,
-        token.ok ? token.attemptId : null,
-        token.ok ? token.claimCount : null,
-        token.ok ? token.deliverySeq : null,
-        token.ok ? token.deliveryCount : null,
-        token.ok ? null : createHash("sha256").update(bearer).digest("hex"),
+        token?.ok ? token.attemptId : null,
+        token?.ok ? token.claimCount : null,
+        token?.ok ? token.deliverySeq : null,
+        token?.ok ? token.deliveryCount : null,
+        token?.ok ? null : createHash("sha256").update(bearer).digest("hex"),
       ],
     );
   } catch (err) {
@@ -238,6 +247,17 @@ interface RunLeaseBody {
   /** Cumulative milliseconds this run has spent waiting, as the worker sees it. */
   waited_ms?: number;
   waits?: number;
+  /**
+   * This POST is a delivery being accepted, not a lease being extended. It
+   * skips renewal outright, so a live same-owner redelivery is refused rather
+   * than quietly extending a lease it was not sent to extend.
+   */
+  accept?: true;
+  /**
+   * The generation an acceptance quotes. Beside the attempt token rather than
+   * instead of it: this one fences the claim, that one fences the delivery.
+   */
+  run_claim?: number;
   /** The attempt token (§8). Fail-closed: an omitted field is not a zero. */
   attempt_id?: string;
   claim_count?: number;
@@ -245,6 +265,23 @@ interface RunLeaseBody {
   delivery_count?: number;
   /** This attempt's running per-state totals, absent on an identity-only tick. */
   run_time?: unknown;
+}
+
+/**
+ * A generation this endpoint may bind to `claim_count`, or null for absent.
+ *
+ * Bounded by the column rather than by sign alone: a larger integer reaches
+ * the fence's `$n::int`, Postgres raises 22003, and a malformed body is then
+ * answered as a server fault with no fence applied at all -- which is the one
+ * outcome a generation exists to prevent. `run_claim` and the attempt token's
+ * `claim_count` bind the same column, so they take the same bound.
+ */
+function generationOf(value: unknown): number | null | "invalid" {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isInteger(value)
+    && value >= 0 && value <= PG_INT4_MAX
+    ? value
+    : "invalid";
 }
 
 /** The attempt token, or the field that was missing from it. */
@@ -330,8 +367,22 @@ function noteLeaseDisagreement(taskId: string, requestedSec: number): void {
 }
 
 /**
- * `unavailable` is not a status: the fence never ran, so nothing may be banked,
- * while the caller is still told it is live.
+ * `unavailable` is not a status: the write threw, so whether the fence ran is
+ * unknown to this process and nothing may be banked against it.
+ *
+ * It is answered with a 503 rather than a 200 carrying `status: "unknown"`.
+ * The statement is a single autocommit UPDATE, so a dropped connection leaves
+ * the row's fate genuinely undecided -- and a 200 asserts a success that did
+ * not happen. It also lands wrong on the caller: `askRunLease` reads a 2xx
+ * body into `{kind: "granted"}` whatever the status says, and today only the
+ * accident that `"unknown"` is absent from `RENEWABLE_STATUSES` stops a
+ * delivery from being accepted on a lease nobody granted. A 5xx is classified
+ * `unresolved` instead -- which is what this outcome is, and what that type is
+ * documented to mean: it says nothing about who holds the row, so a mid-run
+ * heartbeat waits for the next tick and an acceptance treats it as a delivery
+ * it did not take. Retrying is safe: the UPDATE is idempotent, since a second
+ * application finds `attempt_id` already equal and stops incrementing the
+ * generation.
  */
 type RenewalOutcome =
   | { kind: "accepted"; status: string }
@@ -347,6 +398,29 @@ function runPhasePatch(body: RunLeaseBody): string {
     waits: Math.max(Math.floor(Number(body.waits) || 0), 0),
     at: new Date().toISOString(),
   });
+}
+
+/**
+ * The generation this caller quotes, which is `run_claim` whenever it sends one.
+ *
+ * The attempt token's own `claim_count` is the claim path's answer, and on the
+ * fat path there is no claim to count: the Brain mints that attempt with a zero
+ * and carries the generation the acceptance issued in `run_claim` instead.
+ *
+ * One definition rather than one per fence, because everything downstream of
+ * the renewal has to agree with it. The UPDATE binds it to `claim_count`;
+ * `reportIsCurrent` compares the nested report against the row's own column;
+ * so the gate between them has to read the same value, or it refuses the
+ * holder its own coverage on a body the fence just accepted.
+ *
+ * `generationOf` cannot answer "invalid" here: the route refuses an
+ * out-of-range generation with a 400 before either statement runs.
+ */
+function quotedGeneration(
+  body: RunLeaseBody,
+  token: Extract<AttemptToken, { ok: true }>,
+): number {
+  return (generationOf(body.run_claim) as number | null) ?? token.claimCount;
 }
 
 /** Renew the lease and return whether its attempt fence was applied. */
@@ -410,7 +484,10 @@ async function renewRunLease(
         runPhasePatch(body),
         RENEWABLE_STATUSES,
         token.attemptId,
-        token.claimCount,
+        // Fencing on the attempt token's zero instead refuses a fat holder its
+        // own heartbeat, which stands the worker down mid-turn and hands the
+        // delivery back to be run again.
+        quotedGeneration(body, token),
         token.deliverySeq,
         token.deliveryCount,
       ],
@@ -425,6 +502,7 @@ async function renewRunLease(
 
 async function renewLegacyRunLease(
   taskId: string, body: RunLeaseBody, authorization: string | undefined,
+  runClaim: number | null,
 ): Promise<RenewalOutcome> {
   const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
   const tokenHash = createHash("sha256").update(bearer).digest("hex");
@@ -444,18 +522,80 @@ async function renewLegacyRunLease(
           AND status = ANY($5::text[])
           -- Claim rotation can race authentication; fence the bearer again here.
           AND internal_token_hash = $6
-          -- Generation never clears, so entering the attempt protocol closes this bridge.
-          AND attempt_generation = 0
-          AND attempt_id IS NULL
-          AND settled_attempt_id IS NULL
-          AND (delivery_seq, delivery_count) = (0, 0)
+          -- Generation never clears, so entering the attempt protocol closes this
+          -- bridge -- except for the holder an acceptance just installed.
+          --
+          -- A pre-gate renewal carries no attempt token (the acceptance does not
+          -- issue one; the first in-run heartbeat opens it), so every one of them
+          -- arrives here. On a row acquireFatLease took over from a worker that
+          -- had run an attempt, the counters below are all non-zero and none of
+          -- them is cleared by the takeover: the new holder is refused 409 on its
+          -- very first heartbeat, and a 409 is the one answer the pre-gate stands
+          -- down on -- so the redelivery that just took the row walks away from it
+          -- and the row waits out its whole lease with nobody executing.
+          --
+          -- The second arm is that window and only that window. What keeps it
+          -- narrow is attempt_id IS NULL: the counters it skips are the attempt
+          -- protocol's fences, and a worker holding a live attempt must not
+          -- renew in a shape that checks none of them. Between an acceptance and
+          -- the first in-run heartbeat no attempt is open, which is exactly when
+          -- a pre-gate renewal is legitimate and no other caller is in it.
+          --
+          -- The owner and generation conjuncts are written out for a reader, not
+          -- because this arm is where they bite: the fenced claim_count test and
+          -- the ownership block below already refuse every caller they would.
+          -- Deleting either from here changes no outcome; deleting attempt_id
+          -- IS NULL opens the bridge to a live attempt.
+          AND (
+            (
+              attempt_generation = 0
+              AND attempt_id IS NULL
+              AND settled_attempt_id IS NULL
+              AND (delivery_seq, delivery_count) = (0, 0)
+            )
+            OR (
+              lease_owner = $2
+              AND $7::int IS NOT NULL
+              AND COALESCE(claim_count, 0) = $7::int
+              AND attempt_id IS NULL
+            )
+          )
+          -- A fenced row admits no renewal that omits the generation. Only
+          -- acquireFatLease sets the flag, so a row that never went through an
+          -- acceptance renews exactly as it did before.
+          AND (
+            COALESCE(claim_count, 0) = $7::int
+            OR ($7::int IS NULL AND metadata->>'lease_fenced' IS DISTINCT FROM 'true')
+          )
           AND (
             lease_owner = $2
-            OR (COALESCE(metadata->>'dispatch', '') <> 'doorbell'
-                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < NOW()))
+            OR (
+              (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < NOW())
+              AND (
+                -- Outside the fat set -- a doorbell row, a non-chat task --
+                -- takeover here is exactly what it has always been.
+                NOT (${FAT_TARGET_SQL})
+                -- Inside it, taking a lease this caller does not hold is an
+                -- acceptance, and acceptance has arms of its own: a fenced
+                -- holder, the sibling test, a generation to issue. The one
+                -- shape this bridge may still take is the row that predates
+                -- all of it -- a holder that cannot quote a generation, whose
+                -- lapse is therefore the only evidence there is, and which
+                -- carries no fence to respect. Genuinely lapsed, though: owner
+                -- with no expiry and expiry with no owner are states no writer
+                -- produces, and judging them is the acquisition's job.
+                OR (metadata->>'lease_fenced' IS DISTINCT FROM 'true'
+                    AND lease_owner IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at < NOW())
+              )
+            )
           )
         RETURNING status`,
-      [taskId, body.brain_id, leaseSec, runPhasePatch(body), RENEWABLE_STATUSES, tokenHash],
+      [
+        taskId, body.brain_id, leaseSec, runPhasePatch(body), RENEWABLE_STATUSES, tokenHash,
+        runClaim,
+      ],
     );
     const status = (r.rows[0] as { status?: string } | undefined)?.status;
     return status ? { kind: "accepted", status } : { kind: "refused" };
@@ -483,7 +623,7 @@ async function mergeRenewalCoverage(
     return;
   }
   const report = decoded?.report;
-  if (report && !sameAttemptToken(report, token)) {
+  if (report && !sameAttemptToken(report, body, token)) {
     logger.warn(
       { taskId, tokenAttemptId: token.attemptId, reportAttemptId: report.attemptId },
       "run_lease.run_time_token_mismatch",
@@ -506,10 +646,15 @@ async function mergeRenewalCoverage(
 /** Whether a nested report speaks for the attempt the lease body presented. */
 function sameAttemptToken(
   report: { attemptId: string; claimCount: number; deliverySeq: number; deliveryCount: number },
+  body: RunLeaseBody,
   token: Extract<AttemptToken, { ok: true }>,
 ): boolean {
   return report.attemptId === token.attemptId
-    && report.claimCount === token.claimCount
+    // The generation the renewal above committed under, not the token's own:
+    // the report has to quote the row's `claim_count` because that is what the
+    // ledger's own fence compares it against, and on the fat path the token
+    // carries a zero instead.
+    && report.claimCount === quotedGeneration(body, token)
     && report.deliverySeq === token.deliverySeq
     && report.deliveryCount === token.deliveryCount;
 }
@@ -530,11 +675,64 @@ function sameAttemptToken(
 type LeaseRefusal = "superseded" | "terminal" | "missing" | "unexplained";
 
 /**
+ * A refusal, and the settlement it leaves to the caller.
+ *
+ * `reason` keeps exactly the meaning it has always had, so a Brain too old to
+ * know the fields beside it reads this body the way it always did. That is the
+ * point of saying it this way rather than by inventing a fourth `reason`: an
+ * unknown reason falls into the `superseded` default, which would have the
+ * refused caller bounce its delivery for its whole redelivery budget, and the
+ * two sides of a rolling upgrade do not deploy in a fixed order.
+ */
+interface LeaseRefusalAnswer {
+  reason: LeaseRefusal;
+  /** See `stoppedAndUnheld`: the caller is the only one that can settle it. */
+  stop?: "cancelling";
+  /** The row's own generation, which the completion `stop` asks for is fenced on. */
+  claim_count?: number;
+}
+
+/**
+ * Whether a refused acceptance is the only thing left that can settle the row.
+ *
+ * A Stop taken before anyone accepted parks the row at `cancelling` and leaves
+ * the confirmation to the delivery still in flight: nothing subscribes to a
+ * run's interrupt subject until that run starts, so the row is the only place
+ * the Stop can be told, and this POST is the only time it is read. Told plain
+ * `terminal`, that delivery acks itself away -- nothing emits the interrupted
+ * completion, the stopped turn is recorded nowhere, and the row waits out a
+ * reaper.
+ *
+ * Only an acceptance is told, because its arrival is the proof that the
+ * delivery is unheld and about to be discarded; a renewal is somebody's own
+ * heartbeat and means what it always meant. And only while `lease_owner` is
+ * null: a holder whose lease merely lapsed is still running its own interrupt,
+ * and a second worker closing the row under it is precisely the damage the
+ * ordering in `classifyRow` exists to prevent.
+ */
+function stoppedAndUnheld(
+  row: RefusalRow | undefined,
+  reason: LeaseRefusal,
+  declaredAccept: boolean,
+): boolean {
+  return declaredAccept && reason === "terminal"
+    && row?.status === "cancelling" && row.lease_owner === null;
+}
+
+/**
  * The statuses a live run can be in. Shared by both UPDATEs above and by the
  * classification below rather than repeated, because the answer the caller
  * acts on is only sound while all three agree on what "still running" means.
  */
 const RENEWABLE_STATUSES = ["preparing", "running", "cancelling"];
+
+/**
+ * The statuses a caller that holds nothing yet may be granted a lease from.
+ * Narrower than the renewable set: an owner may renew through its own
+ * cancellation, but a Brain arriving at a row the user has already stopped
+ * must not start executing it.
+ */
+const ACQUIRABLE_STATUSES = ["preparing", "running"];
 
 /**
  * Which of the three refusals this row is.
@@ -561,43 +759,285 @@ const RENEWABLE_STATUSES = ["preparing", "running", "cancelling"];
  * `unexplained` costs the caller a resume rather than the turn.
  */
 function classifyRow(
-  row: { status: string; lease_owner: string | null; lease_live: boolean | null } | undefined,
+  row: RefusalRow | undefined,
   brainId: string | undefined,
+  runClaim: number | null,
 ): LeaseRefusal {
   if (!row) return "missing";
   if (row.lease_live && row.lease_owner !== (brainId || null)) return "superseded";
-  if (!RENEWABLE_STATUSES.includes(row.status)) return "terminal";
+  // A sibling row holding the same logical message is the other worker this
+  // caller must not touch anything on, whatever this row's own status says.
+  if (row.sibling_holds) return "superseded";
+  // Every classification follows a refused acquisition -- an established
+  // owner's renewal of its own `cancelling` row succeeds and never arrives
+  // here -- so a row this caller may not acquire is over as far as it is
+  // concerned, and a Brain that has not accepted has nothing to hand back.
+  if (!ACQUIRABLE_STATUSES.includes(row.status)) return "terminal";
+  // `brain_id` is a pod name, so a pod that took a row over from itself is
+  // indistinguishable from its own previous attempt by owner alone: the
+  // generation is the only thing that names the loser.
+  if (row.lease_fenced && runClaim !== row.claim_count) return "superseded";
   return "unexplained";
+}
+
+interface RefusalRow {
+  status: string;
+  lease_owner: string | null;
+  lease_live: boolean | null;
+  sibling_holds?: boolean | null;
+  lease_fenced?: boolean | null;
+  claim_count?: number | null;
+}
+
+/**
+ * At most one row per `(session_id, message_id)` may ever carry holder
+ * evidence. Holder evidence rather than a status list: a replayed queued
+ * message opens a second row and both are `preparing` with null holder
+ * columns, and a status test would refuse both.
+ */
+const SIBLING_HOLDER_SQL = `EXISTS (
+  SELECT 1 FROM claw_tasks sibling
+   WHERE sibling.session_id = claw_tasks.session_id
+     AND sibling.origin = 'chat'
+     AND sibling.task_id <> claw_tasks.task_id
+     AND sibling.metadata->>'message_id' IS NOT NULL
+     AND sibling.metadata->>'message_id' = claw_tasks.metadata->>'message_id'
+     AND (
+           sibling.lease_owner IS NOT NULL
+        OR sibling.lease_expires_at IS NOT NULL
+        OR COALESCE(sibling.claim_count, 0) > 0
+     )
+)`;
+
+/**
+ * The rows whose first lease is an acceptance: a fat chat delivery, or a
+ * legacy one from before the marker existed, which is the same thing.
+ */
+const FAT_TARGET_SQL = `origin = 'chat'
+  AND (metadata->>'dispatch' = 'fat' OR metadata->>'dispatch' IS NULL)`;
+
+/** What an acquisition did to the row, or null when it matched none. */
+interface LeaseGrant {
+  status: string;
+  /** The row's generation, present only where the statement returns one. */
+  claimCount?: number;
+}
+
+function grantFrom(rows: unknown[]): LeaseGrant | null {
+  const row = rows[0] as { status?: string; claim_count?: number | null } | undefined;
+  if (!row?.status) return null;
+  return typeof row.claim_count === "number"
+    ? { status: row.status, claimCount: row.claim_count }
+    : { status: row.status };
+}
+
+/**
+ * Take a fat row's lease, which is how a worker accepts the delivery.
+ *
+ * `$5` is the acceptance discriminator: true for a body declaring `accept`,
+ * and again for a flagless first lease whose renewal matched nothing -- an old
+ * Brain, for which this endpoint supplies the acceptance semantics. Only the
+ * declaration itself proves the caller will be fenced and will quote the
+ * generation this statement issues, so the takeover arm demands it: a fresh
+ * redelivery holds the lease URL and nothing else, and requiring a prior
+ * generation there would name a value no admissible taker can hold.
+ *
+ * Two target shapes and no others: a pristine row, or a fully lapsed lease
+ * whose holder was fenced. Owner with no expiry, expiry with no owner, and a
+ * generation with neither are states no writer here produces, so each is
+ * undefined rather than takeable.
+ *
+ * This is the only writer of `metadata.lease_fenced`, which the completion
+ * gate, the dispatch guard and the refusal classifier all read.
+ */
+async function acquireFatLease(
+  q: Querier,
+  taskId: string,
+  body: RunLeaseBody,
+  leaseSec: number,
+  declaredAccept: boolean,
+): Promise<LeaseGrant | null> {
+  const r = await q(
+    `UPDATE claw_tasks
+        SET lease_owner      = $2,
+            lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
+            heartbeat_at     = NOW(),
+            claim_count      = COALESCE(claim_count, 0) + 1,
+            -- The incoming worker's attempt is not the outgoing one's, and this
+            -- statement is what makes the difference unobservable if it does not
+            -- say so: the takeover arm renews the lease into the future, and the
+            -- renewal may only replace a non-null attempt_id when the lease has
+            -- lapsed. A taken-over row would therefore refuse its new holder's
+            -- every heartbeat under the dead worker's token until the lease it
+            -- just granted runs out. Cleared rather than assigned because the
+            -- acceptance does not carry one; the first heartbeat opens it, and a
+            -- null column is exactly the adoption arm's legitimate target, and
+            -- settled_attempt_id still remembers what was spent.
+            attempt_id       = NULL,
+            metadata         = jsonb_set(
+                                 CASE
+                                   WHEN metadata->'dispatch_compensation'->>'version' = '1'
+                                    AND metadata->'dispatch_compensation'->>'state' = 'armed'
+                                   THEN COALESCE(metadata, '{}'::jsonb) - 'dispatch_compensation'
+                                   ELSE COALESCE(metadata, '{}'::jsonb)
+                                 END || jsonb_build_object('lease_fenced', $6::boolean),
+                                 '{run_phase}',
+                                 COALESCE(metadata->'run_phase', '{}'::jsonb) || $4::jsonb,
+                                 true
+                               )
+      WHERE task_id = $1
+        AND $5::boolean
+        AND ${FAT_TARGET_SQL}
+        AND status = ANY($7::text[])
+        AND (
+              (lease_owner IS NULL AND lease_expires_at IS NULL
+               AND COALESCE(claim_count, 0) = 0)
+           OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < NOW()
+               AND metadata->>'lease_fenced' = 'true' AND $6::boolean)
+           -- A lease its own holder gave back. settleFinishedClaim with
+           -- release_lease writes exactly this -- owner null, expiry stamped in
+           -- the past -- and it is what every fat retry leaves behind, because
+           -- nakAfterAttempt settles and releases before naking. Without an
+           -- arm for it the shape matches neither of the two above: the first
+           -- wants a null expiry and a zero generation, the second wants an
+           -- owner. So the redelivery's acceptance answered 409 for good and
+           -- the turn could never resume. The row is unheld by the same
+           -- evidence the first arm trusts; what tells it apart is a generation
+           -- already spent, which is a released lease and not a fresh row.
+           --
+           -- Gated on the acceptance flag, like the takeover arm beside it.
+           -- Taking a lease is a deliberate act and a redelivery says so: the
+           -- pre-gate declares accept on the one POST that opens it.
+           --
+           -- Ungated, this arm is reachable by any caller whose renewal matched
+           -- nothing -- including a late legacy callback from the brain whose
+           -- own settlement released this lease. The settled-token fence below
+           -- does not stop it: that fence compares the token the caller quotes,
+           -- and a legacy renewal quotes none, so it passes trivially and the
+           -- callback restores an attempt the row had already settled. The flag
+           -- is the only thing on the wire that separates a redelivery taking
+           -- an unheld row from a straggler still talking about a finished one.
+           OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < NOW() AND $6::boolean)
+        )
+        -- Whatever arm matched, a caller quoting a token this row has already
+        -- settled is the one caller settled_attempt_id exists to turn away. The
+        -- pre-gate's acceptance carries no token at all, so this costs a real
+        -- one nothing; it is here so the fence does not depend on nobody
+        -- thinking to send one.
+        AND ($8::text IS NULL OR $8 IS DISTINCT FROM settled_attempt_id)
+        AND NOT ${SIBLING_HOLDER_SQL}
+      RETURNING status, claim_count`,
+    [
+      taskId, body.brain_id, leaseSec, runPhasePatch(body), true, declaredAccept,
+      ACQUIRABLE_STATUSES, body.attempt_id ?? null,
+    ],
+  );
+  return grantFrom(r.rows);
+}
+
+/** The immutable identity an acquisition needs before it can lock or choose. */
+interface LeaseTarget {
+  sessionId: string | null;
+  messageId: string | null;
+  fat: boolean;
+}
+
+async function readLeaseTarget(taskId: string): Promise<LeaseTarget | null> {
+  const r = await db.query(
+    `SELECT session_id,
+            metadata->>'message_id' AS message_id,
+            (${FAT_TARGET_SQL}) AS fat
+       FROM claw_tasks WHERE task_id = $1`,
+    [taskId],
+  );
+  const row = r.rows[0] as
+    | { session_id?: string | null; message_id?: string | null; fat?: boolean | null }
+    | undefined;
+  if (!row) return null;
+  return {
+    sessionId: row.session_id ?? null,
+    messageId: row.message_id ?? null,
+    fat: row.fat === true,
+  };
+}
+
+/**
+ * Acquire a lease, taking the per-message lock a fat acquisition needs.
+ *
+ * READ COMMITTED reads the sibling test's rows from a snapshot and locks
+ * nothing, so two acquisitions for one logical message can each miss the
+ * other's uncommitted evidence and both succeed. The lock is taken in the
+ * transaction that runs the UPDATE rather than as a conjunct inside it,
+ * because a conjunct is evaluated per candidate row and the planner is free to
+ * evaluate the sibling subquery first -- which is the read the lock exists to
+ * order. A null `message_id` takes none: it names no logical message to be the
+ * second holder of.
+ *
+ * Only fat rows come here. Everything else -- a doorbell row, a non-chat task
+ * -- is served by the renewals, both of which already take an unheld or lapsed
+ * lease, so restoring a separate ordinary acquisition would add a third writer
+ * of `lease_owner` saying what those two already say.
+ */
+async function acquireRunLease(
+  taskId: string,
+  body: RunLeaseBody,
+  leaseSec: number,
+  declaredAccept: boolean,
+): Promise<LeaseGrant | null> {
+  const target = await readLeaseTarget(taskId);
+  if (!target?.fat) return null;
+  if (!target.messageId || !target.sessionId) {
+    return acquireFatLease(db.query as Querier, taskId, body, leaseSec, declaredAccept);
+  }
+  return inTransaction(async (q) => {
+    await q("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+      target.sessionId, target.messageId,
+    ]);
+    return acquireFatLease(q, taskId, body, leaseSec, declaredAccept);
+  });
 }
 
 async function classifyLeaseRefusal(
   taskId: string,
   brainId: string | undefined,
-): Promise<LeaseRefusal> {
+  // Absent under the attempt protocol, which fences on the token rather than
+  // on a quoted generation; the classifier then judges on the holder alone.
+  runClaim: number | null = null,
+  declaredAccept = false,
+): Promise<LeaseRefusalAnswer> {
   try {
     const r = await db.query(
-      `SELECT status, lease_owner, lease_expires_at > NOW() AS lease_live
+      `SELECT status, lease_owner, lease_expires_at > NOW() AS lease_live,
+              claim_count,
+              metadata->>'lease_fenced' = 'true' AS lease_fenced,
+              ${SIBLING_HOLDER_SQL} AS sibling_holds
          FROM claw_tasks WHERE task_id = $1`,
       [taskId],
     );
-    const row = r.rows[0] as
-      | { status: string; lease_owner: string | null; lease_live: boolean | null }
-      | undefined;
-    const refusal = classifyRow(row, brainId);
+    const row = r.rows[0] as RefusalRow | undefined;
+    const reason = classifyRow(row, brainId, runClaim);
     logger.warn(
       {
         taskId,
         caller: brainId ?? null,
         status: row?.status ?? "missing",
         leaseOwner: row?.lease_owner ?? null,
-        refusal,
+        refusal: reason,
       },
       "run.lease_renew_refused",
     );
-    return refusal;
+    if (!stoppedAndUnheld(row, reason, declaredAccept)) return { reason };
+    // The row's generation, not the caller's: the caller has none -- its
+    // acceptance was refused -- and the completion it is being asked for is
+    // fenced against this column. A fat retry that released its lease left a
+    // fenced, non-zero row behind, and a completion quoting nothing is refused
+    // as superseded, which would settle nothing after all.
+    return { reason, stop: "cancelling", claim_count: Number(row?.claim_count ?? 0) };
   } catch (err) {
     logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_refusal_unexplained");
-    return "unexplained";
+    return { reason: "unexplained" };
   }
 }
 
@@ -719,6 +1159,18 @@ function registerLeaseRoute(app: FastifyInstance): void {
     async (req, reply) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
+      // Before the body is routed to either statement, because a value the
+      // fence cannot hold must be refused rather than bound: both branches
+      // bind it to the same `claim_count` column.
+      for (const field of ["run_claim", "claim_count"] as const) {
+        if (Object.hasOwn(body, field) && generationOf(body[field]) === "invalid") {
+          logger.warn({ taskId, field }, "run_lease.generation_out_of_range");
+          return reply.status(400).send({
+            ok: false,
+            error: `${field} must be an integer between 0 and ${PG_INT4_MAX}`,
+          });
+        }
+      }
       const sandbox = parseSandboxHandle(body.sandbox);
       if (body.sandbox !== undefined && !sandbox) {
         return reply.status(400).send({
@@ -735,9 +1187,17 @@ function registerLeaseRoute(app: FastifyInstance): void {
           ok: false, error: `attempt token incomplete: ${token.missing} is required`,
         });
       }
-      const outcome = token.ok
-        ? await renewRunLease(taskId, body, token)
-        : await renewLegacyRunLease(taskId, body, req.headers.authorization);
+      // A declared acceptance is not a renewal and must not be served as one:
+      // it is sent to take a delivery, and extending a lease it already holds
+      // would report success for something it did not take.
+      const declaredAccept = body.accept === true;
+      // Checked above, so "invalid" cannot reach here.
+      const runClaim = generationOf(body.run_claim) as number | null;
+      const outcome: RenewalOutcome = declaredAccept
+        ? { kind: "refused" }
+        : token.ok
+          ? await renewRunLease(taskId, body, token)
+          : await renewLegacyRunLease(taskId, body, req.headers.authorization, runClaim);
       if (outcome.kind === "accepted") {
         if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
           await recordLeaseSandbox(taskId, body.brain_id, sandbox, token, req.headers.authorization);
@@ -745,15 +1205,51 @@ function registerLeaseRoute(app: FastifyInstance): void {
         if (token.ok) await mergeRenewalCoverage(taskId, body, token);
         return { ok: true, status: outcome.status };
       }
-      // Nothing was banked: the fence never matched, so the coverage this body
-      // carries belongs to a ledger this caller may no longer write.
-      if (outcome.kind === "unavailable") return { ok: true, status: "unknown" };
+      // Nothing was banked: whether the fence matched is unknown, so the
+      // coverage this body carries belongs to a ledger this caller may no
+      // longer write. Said as a 5xx, because the request did not succeed and
+      // a retry is both safe and the right next move -- see RenewalOutcome.
+      if (outcome.kind === "unavailable") {
+        return reply.status(503).send({ ok: false, status: "unknown" });
+      }
+      // Nothing to renew is not the same as nothing to take. A fat row's first
+      // lease IS the acceptance of its delivery, and a flagless first lease
+      // from a Brain that predates the flag gets the same semantics, which is
+      // why the discriminator is not the flag alone.
+      let grant: LeaseGrant | null;
+      try {
+        grant = await acquireRunLease(taskId, body, leaseSecondsFromBody(body), declaredAccept);
+      } catch (err) {
+        logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_acquire_failed");
+        return reply.status(503).send({ ok: false, status: "unknown" });
+      }
+      if (grant) {
+        // The same write the accepted arm above makes, because an acquisition
+        // is a lease too and a body that names a sandbox names it here on the
+        // one POST that matters most: a fat chat row's first lease. Skipping
+        // it drops the handle for the whole window before the first heartbeat
+        // -- which is precisely when a run dies of `sandbox_pending_timeout`
+        // or an OOM, and precisely the failure whose platform reason this
+        // handle is what makes reachable.
+        //
+        // Fenced token-less whatever the body carried: `acquireFatLease` has
+        // just set `attempt_id` to NULL, so an attempt-shaped fence would
+        // match nothing.
+        if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
+          await recordLeaseSandbox(taskId, body.brain_id, sandbox, null, req.headers.authorization);
+        }
+        return grant.claimCount === undefined
+          ? { ok: true, status: grant.status }
+          : { ok: true, status: grant.status, claim_count: grant.claimCount };
+      }
       // Told which of the three refusals it was, because "two workers on one
       // run" and "this run was cancelled" ask the refused worker for opposite
       // things: one must give its sandbox and its delivery back, the other
       // must leave both alone, because they are the live worker's now.
-      const reason = await classifyLeaseRefusal(taskId, body.brain_id);
-      return reply.status(409).send({ ok: false, error: "run is not active", reason });
+      const refusal = await classifyLeaseRefusal(
+        taskId, body.brain_id, runClaim, declaredAccept,
+      );
+      return reply.status(409).send({ ok: false, error: "run is not active", ...refusal });
     },
   );
 }
@@ -776,3 +1272,4 @@ function registerBackendMcpRoute(app: FastifyInstance): void {
     },
   );
 }
+

@@ -47,29 +47,8 @@ var (
 		[]string{"port", "status_code"},
 	)
 
-	// Split by which credential was rejected, because the two mean opposite
-	// things and are indistinguishable from the status code alone.
-	//
-	// stage="caller" is the caller's own SaFE credential: their problem, and
-	// the expected steady-state noise from expired cookies. stage="envd" is
-	// the Router's own JWT being refused by the sandbox, which no caller can
-	// cause or fix -- the Router overwrites Authorization before proxying, so
-	// the caller's credential never reaches EnvD. That one means Router and
-	// EnvD disagree about the signing key, i.e. every exec in the cluster is
-	// failing, and it is the signal worth alerting on.
-	// Readiness as a durable record, because the probe result is not one.
-	//
-	// A failing readiness probe removes this pod from every Service that selects
-	// it and is then thrown away: kubelet discards the response body, so the
-	// `reason` the handler carefully assembles reaches nobody. On 2026-09-06 the
-	// controlplane sat not-ready for 72 minutes, took the whole sandbox router
-	// down with it, and left no evidence of which check failed -- liveness is an
-	// unconditional 200 so nothing restarted, and by the time anyone looked the
-	// container log had rotated past the window.
-	//
-	// The gauge answers "was it ready" over any past window; the counter answers
-	// "which check, and how did it fail". Both survive in whatever scrapes them,
-	// which is the point: the state itself is transient.
+	// Kubelet discards probe response bodies; these metrics preserve readiness
+	// state and failure reasons in monitoring history.
 	routerReady = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "router_ready",
@@ -88,6 +67,16 @@ var (
 		[]string{"check", "reason"},
 	)
 
+	// Split by which credential was rejected, because the two mean opposite
+	// things and are indistinguishable from the status code alone.
+	//
+	// stage="caller" is the caller's own SaFE credential: their problem, and
+	// the expected steady-state noise from expired cookies. stage="envd" is
+	// the Router's own JWT being refused by the sandbox, which no caller can
+	// cause or fix -- the Router overwrites Authorization before proxying, so
+	// the caller's credential never reaches EnvD. That one means Router and
+	// EnvD disagree about the signing key, i.e. every exec in the cluster is
+	// failing, and it is the signal worth alerting on.
 	sandboxAuthRejections = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "router_sandbox_auth_rejections_total",

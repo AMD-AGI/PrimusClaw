@@ -28,6 +28,8 @@
  * something smaller.
  */
 
+import { PG_INT4_MAX } from "@claw/utils";
+
 /** The engines a multi-node run can be provisioned onto. */
 export const TOPOLOGY_BACKENDS = ["rayjob", "infera"] as const;
 export type TopologyBackend = (typeof TOPOLOGY_BACKENDS)[number];
@@ -136,8 +138,12 @@ export function validateTopology(input: unknown): TopologyValidation {
   for (const field of NUMERIC_FIELDS) {
     const v = raw[field];
     if (v === undefined) continue;
-    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || !Number.isInteger(v)) {
-      errors.push(`topology.${field} must be a non-negative whole number`);
+    // The upper bound is `int4`, not taste: admission sums these across rows
+    // and `claw_tasks.input->'topology'->>'nodes'` is cast to an integer there,
+    // so a value the column cannot express aborts the aggregate for every run.
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || !Number.isInteger(v)
+        || v > PG_INT4_MAX) {
+      errors.push(`topology.${field} must be a whole number between 0 and ${PG_INT4_MAX}`);
     }
   }
   for (const field of STRING_FIELDS) {

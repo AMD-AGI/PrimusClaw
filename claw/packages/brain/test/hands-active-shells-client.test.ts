@@ -18,11 +18,18 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
+import { verifyScopeCredential } from "@claw/utils";
 import { countActiveShells } from "../src/clients/hands.js";
 
 const TOKEN = "test-token";
 
-/** A Hands that replies however the test says. Returns its MCP-shaped url. */
+/**
+ * A Hands that replies however the test says.
+ *
+ * `owners` records the scope each request actually proved, taken from the
+ * credential the way the real route takes it -- the body no longer carries one,
+ * so reading it there would assert nothing.
+ */
 async function handsReplying(
   reply: (req: { owner?: unknown }) => { status?: number; body?: string },
 ): Promise<{ url: string; server: Server; owners: unknown[] }> {
@@ -33,7 +40,9 @@ async function handsReplying(
     req.on("end", () => {
       let parsed: { owner?: unknown } = {};
       try { parsed = JSON.parse(Buffer.concat(chunks).toString()); } catch { /* keep {} */ }
-      owners.push(parsed.owner);
+      const presented = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      const verified = verifyScopeCredential(presented, TOKEN);
+      owners.push(verified.ok ? verified.scope.owner : null);
       const { status = 200, body = "" } = reply(parsed);
       res.writeHead(status, { "content-type": "application/json" });
       res.end(body);
@@ -56,7 +65,27 @@ async function hands(reply: Parameters<typeof handsReplying>[0]) {
 test("a well-formed count is the answer, and the owner asked about travels with it", async () => {
   const h = await hands(() => ({ body: JSON.stringify({ running: 3 }) }));
   assert.equal(await countActiveShells(h.url, TOKEN, "sess-1"), 3);
-  assert.deepEqual(h.owners, ["sess-1"], "the count must be about the session asked for");
+  assert.deepEqual(h.owners, ["sess-1"], "the count must be about the session the credential proves");
+});
+
+test("the scope is proved by the credential, and the body states none", async () => {
+  // The route takes owner and run from the verified credential alone. A body
+  // still stating either is refused there, so a client that keeps sending one
+  // breaks every count -- which is what this pins.
+  const bodies: unknown[] = [];
+  const h = await hands((body) => {
+    bodies.push(body);
+    return { body: JSON.stringify({ running: 1 }) };
+  });
+  await countActiveShells(h.url, TOKEN, "sess-2");
+  assert.deepEqual(bodies, [{}], "no scope field travels in the body");
+});
+
+test("a credential minted for one owner does not verify as another", async () => {
+  const h = await hands(() => ({ body: JSON.stringify({ running: 0 }) }));
+  await countActiveShells(h.url, TOKEN, "sess-a");
+  await countActiveShells(h.url, TOKEN, "sess-b");
+  assert.deepEqual(h.owners, ["sess-a", "sess-b"]);
 });
 
 test("a confirmed zero is reported as a zero, since that is what frees a sandbox", async () => {

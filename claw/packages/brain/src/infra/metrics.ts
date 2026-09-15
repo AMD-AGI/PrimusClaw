@@ -26,6 +26,13 @@ import type { HandsRecoveryAction } from "../agent/index.js";
  */
 export type SandboxRecoveryDecision = HandsRecoveryAction | "failed" | "exhausted";
 
+/**
+ * Why a doorbell was acked without a claim. A malformed declared version and
+ * one this binary is simply too old for are separate values: the first is a
+ * corrupt or forged payload, the second a fleet below its floor.
+ */
+export type DoorbellDeclineReason = "kill_switch" | "semantics_malformed" | "semantics_unsupported";
+
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-brain" });
 collectDefaultMetrics({ register: registry });
@@ -72,6 +79,45 @@ const taskDuration = new Histogram({
 });
 
 // Hands-binary HTTP fallback (sandbox bootstrap downloads).
+/**
+ * Foreground bash commands the sandbox stopped at their granted second.
+ *
+ * The one operator-readable signal a tightened foreground ceiling causally
+ * emits. A clamped command comes back to the model as a tool result rather than
+ * ending its run, so nothing about the run's own terminal state moves with the
+ * ceiling and a killed-run count measures something else entirely. `clamped`
+ * separates a command that met the ceiling it asked past -- the regression a
+ * rollout is watching for -- from one that simply ran out of its own timeout.
+ */
+const bashForegroundTimeoutTotal = new Counter({
+  name: "claw_bash_foreground_timeout_total",
+  help: "Foreground bash commands killed at their granted timeout, by whether the request was clamped to the ceiling.",
+  labelNames: ["clamped"] as const,
+  registers: [registry],
+});
+// Both label combinations exist from startup, so a rollout reading the rate
+// before any clamped timeout has happened reads zero rather than finding no
+// series at all -- an absent series and a quiet window are the same text to a
+// log scraper, and one of them is a stop condition with no reading.
+bashForegroundTimeoutTotal.inc({ clamped: "true" }, 0);
+bashForegroundTimeoutTotal.inc({ clamped: "false" }, 0);
+
+/**
+ * Park sites that could not park under a usable key.
+ *
+ * The ledger helper cannot report this: a missing entry is the legitimate
+ * sub-agent case there. Only the call site knows it holds its own execution
+ * slot and can name the key it passed, which is the difference between a
+ * missing key and a wrong one -- and a wrong one held the slot for the whole
+ * of every wait with nothing recorded anywhere.
+ */
+const parkKeyUnusableTotal = new Counter({
+  name: "claw_brain_park_key_unusable_total",
+  help: "Park attempts from a run holding its own execution slot whose park key was absent or unknown to the run-phase ledger.",
+  labelNames: ["site", "reason"] as const,
+  registers: [registry],
+});
+
 const handsBinaryDownloadTotal = new Counter({
   name: "claw_brain_hands_binary_download_total",
   help: "GET /internal/assets/hands-binary by outcome.",
@@ -479,6 +525,20 @@ const deliveryRefusedTotal = new Counter({
   registers: [registry],
 });
 
+const doorbellDeclinedTotal = new Counter({
+  name: "claw_brain_doorbell_declined_total",
+  help: "Doorbells this pod acked without claiming, by reason.",
+  labelNames: ["reason"] as const, // DoorbellDeclineReason
+  registers: [registry],
+});
+
+const doorbellClaimOutcomeTotal = new Counter({
+  name: "claw_brain_doorbell_claim_outcome_total",
+  help: "Wire-side doorbell claim attempts by outcome.",
+  labelNames: ["outcome"] as const, // "miss" | "terminated"
+  registers: [registry],
+});
+
 const gateInflight = new Gauge({
   name: "claw_brain_gate_inflight",
   help: "Tasks holding an execution slot on this pod.",
@@ -544,6 +604,16 @@ const sessionCleanupIncompleteTotal = new Counter({
 });
 
 export const metrics = {
+  /** One park site that could not park under a key the ledger knows. */
+  onParkKeyUnusable(site: string, reason: "absent" | "untracked"): void {
+    parkKeyUnusableTotal.inc({ site, reason });
+  },
+
+  /** One foreground bash command stopped at its granted second. */
+  onBashForegroundTimeout(clamped: boolean): void {
+    bashForegroundTimeoutTotal.inc({ clamped: clamped ? "true" : "false" });
+  },
+
   /**
    * One LLM turn's cache accounting.
    *
@@ -796,6 +866,12 @@ export const metrics = {
   },
   onDeliveryRefused(reason: "surplus" | "drain"): void {
     deliveryRefusedTotal.inc({ reason });
+  },
+  onDoorbellDeclined(reason: DoorbellDeclineReason): void {
+    doorbellDeclinedTotal.inc({ reason });
+  },
+  onDoorbellClaimOutcome(outcome: "miss" | "terminated"): void {
+    doorbellClaimOutcomeTotal.inc({ outcome });
   },
   setDeliveryGauges(state: {
     inflight: number;

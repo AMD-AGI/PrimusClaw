@@ -13,17 +13,23 @@
 
 import { db, MarketplaceDb } from "../infra/db.js";
 import { canViewPlugin, formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
-import { js, sc, nc } from "../infra/nats.js";
+import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
-import { openChatRun, failChatRunDispatch } from "../tasks/chat-run.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
-import { handOffAssembledRun } from "../tasks/run-dispatch.js";
-import { decideAdmission } from "../tasks/admission.js";
+import {
+  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
+  SWEEPABLE_RUN_STATUSES,
+} from "../tasks/chat-run.js";
+import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
+import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
+import type { PoolClient } from "pg";
+import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
+import { admissionAskFor } from "../tasks/run-dispatch.js";
+import { stripRunSecrets } from "../tasks/run-spec.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -40,13 +46,16 @@ const logger = pino({ name: "session-dispatch" });
 export const sessionDispatchPorts = {
   openChatRun,
   failChatRunDispatch,
-  doorbellDispatch: RUN_DOORBELL_DISPATCH,
+  recordPublishState,
+  recordDispatchSeq,
+  noteRefusedPublish,
+  doorbellDispatch: beginDoorbellDispatch,
   admit: decideAdmission,
   publishSse(sessionId: string, payload: string): void {
     nc.publish(`sse.${eventSubject(sessionId)}`, sc.encode(payload));
   },
-  async publishTask(subject: string, payload: string): Promise<void> {
-    await js.publish(subject, sc.encode(payload));
+  async publishTask(subject: string, payload: string, msgId?: string): Promise<number> {
+    return (await js.publish(subject, sc.encode(payload), msgId ? { msgID: msgId } : undefined)).seq;
   },
 };
 
@@ -72,6 +81,10 @@ export interface DispatchInput {
   mcpServers: Record<string, Record<string, unknown>> | undefined;
   capturedUserEnvSnapshot: Record<string, string>;
   capturedSessionEnv: Record<string, string>;
+  /** Supplied by a caller that took the gate, so marker and turn are one string. */
+  messageId?: string;
+  /** Cleanup owed if a doorbell publish is left for reconciliation. */
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   /**
    * The environment this run declares it needs (node count, per-node shape,
    * backend). Validated by the route, so by the time it reaches here it is
@@ -98,7 +111,12 @@ export type DispatchResult =
   | { kind: "dispatched"; messageId: string; sandboxImage: string | undefined; runId: string }
   | { kind: "queued"; messageId: string; sandboxImage: string | undefined; queuePosition: number; runId: string }
   | { kind: "rejected"; messageId: string; reason: string }
-  | { kind: "publish_failed"; messageId: string; error: Error };
+  | { kind: "publish_failed"; messageId: string; error: Error }
+  /**
+   * Nothing is settled: unlike `publish_failed` no cleanup has run, and the row
+   * may still be claimable, so the caller must not idle or delete the session.
+   */
+  | { kind: "publish_unknown"; messageId: string; error: Error };
 
 /**
  * Brain-dispatch helper shared by native `POST /v1/sessions[/:id/messages]`
@@ -114,6 +132,10 @@ export type DispatchResult =
  * last: the rollback cannot take back an event that has already been published
  * to subscribers.
  */
+export function newChatMessageId(): string {
+  return `claw-${Date.now()}`;
+}
+
 export async function dispatchTaskToBrain(
   input: DispatchInput,
   onPublishFailure: () => Promise<void>,
@@ -124,7 +146,7 @@ export async function dispatchTaskToBrain(
     mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
   } = input;
 
-  const messageId = `claw-${Date.now()}`;
+  const messageId = input.messageId ?? newChatMessageId();
   let subject = "";
   // Shadow row for this turn, written before anything is published so a
   // process that dies mid-dispatch leaves a record rather than nothing. Not
@@ -273,58 +295,119 @@ export async function dispatchTaskToBrain(
     task.files_workspace_id = filesWorkspaceId;
     task.files_workspace_required = true;
 
-    if (sessionDispatchPorts.doorbellDispatch) {
-      const result = await dispatchByDoorbell({
-        task,
-        sessionId,
-        userId,
-        messageId,
-        prompt: content,
-        workspaceId,
-        filesWorkspaceId,
-        pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-        sandboxImage: finalSandboxImage,
-        rememberTaskId: (taskId) => { runTaskId = taskId; },
-      });
-      if (result.kind === "rejected") {
-        // The delete is the whole rollback, and it is enough. A refused turn
-        // was reported as leaving an unanswered UserMessage on any open
-        // stream, which would need the live push above to have reached a
-        // reader -- and it does not. `publishSse` writes to
-        // `sse.events.<sessionId>` on core NATS, and that subject has two
-        // publishers in this repository and no subscriber at all: both SSE
-        // routes read the JetStream `events.<sessionId>` subject through
-        // `createSessionSubscription`, which only `publishEvent` feeds.
-        //
-        // So nothing is announced here on purpose. Publishing the refusal
-        // through `publishEvent` instead would reach readers and also persist,
-        // leaving an assistant reply in history beside the UserMessage this
-        // statement just removed -- worse than the silence. Verified against
-        // the cluster: a rejected create leaves no session event, no task row,
-        // no conversation turn, and an idle session.
-        //
-        // The dead `sse.` channel is a real defect, but a wider one than this
-        // branch: it is also why a client already connected never sees its own
-        // UserMessage until it reconnects and replays history.
-        await db.query(
-          "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
-          [messageId, sessionId],
-        );
-        await onPublishFailure();
+    // The delete is the whole rollback. Nothing is announced on purpose:
+    // `publishSse` writes to a core-NATS subject no SSE route subscribes to,
+    // and announcing through `publishEvent` instead would persist an assistant
+    // reply beside the UserMessage this statement removes.
+    //
+    // Shared with the fat fallback below deliberately. A refusal there used to
+    // roll the session back without removing the event, so the transcript kept
+    // a user turn the fleet had refused: the next send replayed it as history
+    // and the UI showed a message that was never answered and never will be.
+    // The refusal is the same refusal, so the rollback is the same rollback.
+    const rollbackRefusedTurn = async (): Promise<void> => {
+      await db.query(
+        "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
+        [messageId, sessionId],
+      );
+      await onPublishFailure();
+    };
+
+    const doorbellToken = sessionDispatchPorts.doorbellDispatch();
+    if (doorbellToken) {
+      try {
+        const result = await dispatchByDoorbell({
+          task,
+          sessionId,
+          userId,
+          messageId,
+          prompt: content,
+          workspaceId,
+          filesWorkspaceId,
+          pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+          sandboxImage: finalSandboxImage,
+          reconcileAction: input.reconcileAction,
+          rememberTaskId: (taskId) => { runTaskId = taskId; },
+        });
+        if (result.kind === "rejected") {
+          await rollbackRefusedTurn();
+        }
+        return result;
+      } finally {
+        doorbellToken.release();
       }
-      return result;
     }
 
-    const run = await sessionDispatchPorts.openChatRun({
-      sessionId,
-      userId,
-      messageId,
-      prompt: content,
-      workspaceId,
-      filesWorkspaceId,
-      pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
-      sandboxImage: finalSandboxImage,
+    // Admission is asked here and not only on the doorbell branch.
+    //
+    // Every ceiling used to live inside `dispatchByDoorbell`, so the fallback
+    // this branch is -- taken whenever `beginDoorbellDispatch` declines, which
+    // includes a revoked floor and a KV watch that merely died -- opened and
+    // published a run without consulting any of them. A configured ceiling was
+    // therefore disabled by a transient failure it has nothing to do with, in
+    // silence: no refusal, no counter, no log line. Verified against the
+    // cluster at `ADMIT_HARD_RUNS=1` with one run already occupying it: gate
+    // open, three turns gave 1x200 and 2x429; gate closed, the same three all
+    // returned 200 and ran.
+    //
+    // Decided and inserted under one lock, for the reason `handOffUncounted`
+    // states: creation order and commit order have to be the same order, or two
+    // creates that each cleared the check are both admitted against one slot.
+    const fatAsk = await admissionAskFor({
+      task, sessionId, userId, messageId, prompt: content,
+      publish: async () => undefined,
+    } as Parameters<typeof admissionAskFor>[0]);
+    const fatOpen = await withOwnedAdmissionLock(async (client: PoolClient) => {
+      const admission = await sessionDispatchPorts.admit(fatAsk, client);
+      if (admission.kind === "reject") return { admission } as const;
+      return {
+        admission,
+        run: await sessionDispatchPorts.openChatRun({
+          dispatch: "fat",
+          sessionId,
+          userId,
+          messageId,
+          prompt: content,
+          workspaceId,
+          filesWorkspaceId,
+          pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+          sandboxImage: finalSandboxImage,
+          // Secret-free, and narrower than the doorbell path's spec on purpose:
+          // nothing rehydrates a fat row from `input` -- it is published on the
+          // wire -- so sealing credentials into it would store a secret no
+          // reader wants. What admission does read is `input->'topology'`, and
+          // with no spec at all that read returns nothing for the whole life of
+          // the run: a fat GPU run counted zero nodes against every later
+          // decision, so the GPU ceiling admitted past itself for as long as
+          // any fat run was executing.
+          spec: { ...stripRunSecrets(task), dispatch: "fat" },
+          client,
+        }),
+      } as const;
     });
+    if (fatOpen.admission.kind === "reject") {
+      await rollbackRefusedTurn();
+      return { kind: "rejected", messageId, reason: fatOpen.admission.reason };
+    }
+    // A soft ceiling is deliberately not honoured here, and the log line says
+    // so rather than the queueing happening silently.
+    //
+    // Deferring means leaving the row at `queued` unpublished for a claimer to
+    // take, and on this path no claimer exists: `peekNextQueued` and
+    // `reapExpiredQueuedRuns` both filter `metadata->>'dispatch' = 'doorbell'`,
+    // and the session-stuck reaper refuses to reopen a session that still has a
+    // `queued` chat row. A deferred fat turn would therefore be run by nobody,
+    // reaped by nobody, and hold its session's gate shut forever -- strictly
+    // worse than exceeding a threshold whose whole purpose is smoothing. The
+    // hard ceiling above still refuses, so the fleet limit is enforced; it is
+    // only the queueing threshold that this path cannot implement.
+    if (fatOpen.admission.kind === "queue") {
+      logger.warn(
+        { sessionId, messageId, position: fatOpen.admission.position },
+        "message.fat_soft_admission_not_deferred",
+      );
+    }
+    const run = fatOpen.run;
     // Publishing without a row leaves a session `running` with no deadline,
     // no lease, and nothing for a sweeper to reap -- a worse failure than
     // refusing the turn. openChatRun reports insert errors by returning null
@@ -333,10 +416,18 @@ export async function dispatchTaskToBrain(
       throw new Error("chat_run.open_failed");
     }
     runTaskId = run.taskId;
+    task.task_id = run.taskId;
     task.run_lease = run.lease;
 
     subject = taskSubject();
-    await sessionDispatchPorts.publishTask(subject, JSON.stringify(task));
+    // A gate, not a note: an unrecorded `attempted` leaves a row denying a
+    // message already on the stream, so a throw here must stop the publish.
+    await sessionDispatchPorts.recordPublishState(run.taskId, "attempted");
+    const payload = JSON.stringify(task);
+    const seq = await publishRunMessage(
+      () => sessionDispatchPorts.publishTask(subject, payload),
+    );
+    await sessionDispatchPorts.recordDispatchSeq(run.taskId, seq);
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
     return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage, runId: run.taskId };
   } catch (err: any) {
@@ -349,8 +440,14 @@ export async function dispatchTaskToBrain(
     // is running, so the next message dispatches on top of it. The doorbell
     // path reads this same verdict; leaving the default path deaf to it is the
     // asymmetry, not a different problem.
+    if (runTaskId && publishCertainlyFailed(err)) {
+      await sessionDispatchPorts.noteRefusedPublish(runTaskId);
+    }
     const verdict = await sessionDispatchPorts.failChatRunDispatch(
-      runTaskId, String(err?.message ?? err),
+      runTaskId,
+      String(err?.message ?? err),
+      undefined,
+      { statuses: SWEEPABLE_RUN_STATUSES },
     );
     // Only a worker actually holding the row earns the silence. A compensation
     // that could not run establishes nothing, and rolling back is the answer
@@ -366,6 +463,16 @@ export async function dispatchTaskToBrain(
       // executing -- so the caller gets the same handle it would have got had
       // the publish returned cleanly, rather than a success it cannot name.
       return { kind: "dispatched", messageId, sandboxImage: undefined, runId: runTaskId };
+    }
+    // An unknown verdict is not a settled state, so the rollback that a
+    // `closed` one earns would delete the user's message out from under a run
+    // that may still execute.
+    if (verdict === "unknown") {
+      logger.error(
+        { err, sessionId, messageId, subject, runTaskId },
+        "message.dispatch_unknown_awaiting_reconcile",
+      );
+      return { kind: "publish_unknown", messageId, error: err };
     }
     try {
       await onPublishFailure();
@@ -387,12 +494,18 @@ async function dispatchByDoorbell(input: {
   filesWorkspaceId?: string;
   pluginId?: number;
   sandboxImage: string | undefined;
+  reconcileAction?: "idle_existing_session" | "delete_created_session";
   rememberTaskId: (taskId: string) => void;
 }): Promise<DispatchResult> {
   const { rememberTaskId, ...handOff } = input;
   const result = await handOffAssembledRun({
     ...handOff,
-    publish: (subject, payload) => sessionDispatchPorts.publishTask(subject, payload),
+    path: "chat",
+    reconcileAction: input.reconcileAction,
+    // The third argument is the dedup id; without it the doorbell has no
+    // duplicate-window protection.
+    publish: (subject, payload, msgId) =>
+      sessionDispatchPorts.publishTask(subject, payload, msgId),
     openRun: sessionDispatchPorts.openChatRun,
     // Forwards the verdict. Swallowing it here would restore the bug one layer
     // up: handOffAssembledRun would read every compensation as successful and
@@ -400,12 +513,15 @@ async function dispatchByDoorbell(input: {
     failRun: async (taskId, reason, failureReason) => {
       if (taskId) rememberTaskId(taskId);
       return sessionDispatchPorts.failChatRunDispatch(
-        taskId, reason, failureReason ?? "dispatch_failed",
+        taskId,
+        reason,
+        failureReason ?? "dispatch_failed",
+        { statuses: SWEEPABLE_RUN_STATUSES },
       );
     },
     admit: sessionDispatchPorts.admit,
   });
-  if (result.kind === "dispatched" || result.kind === "queued") {
+  if (result.kind === "dispatched" || result.kind === "queued" || result.kind === "publish_unknown") {
     rememberTaskId(result.taskId);
   }
   if (result.kind === "open_failed") throw new Error("chat_run.open_failed");
@@ -424,6 +540,17 @@ async function dispatchByDoorbell(input: {
       sandboxImage,
       queuePosition: result.queuePosition,
       runId: result.taskId,
+    };
+  }
+  if (result.kind === "publish_unknown") {
+    logger.error(
+      { sessionId: input.sessionId, messageId: input.messageId, runTaskId: result.taskId },
+      "message.dispatch_unknown_awaiting_reconcile",
+    );
+    return {
+      kind: "publish_unknown",
+      messageId: input.messageId,
+      error: new Error("task dispatch outcome unknown"),
     };
   }
   logger.info(

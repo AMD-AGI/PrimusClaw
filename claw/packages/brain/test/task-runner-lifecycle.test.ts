@@ -290,6 +290,18 @@ test("a clean run acks, reports success and drops the checkpoint", async () => {
   assert.ok(r.calls.includes("releaseTaskLock"), "the task lock must be released in finally");
 });
 
+test("a fat request emits its task identity on exec_complete", async () => {
+  const r = await runScenario({
+    request: { task_id: "task-fat-complete", message_id: MESSAGE },
+    engineBehavior: async () => result(),
+  });
+
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.completion?.failed, false);
+  assert.equal(r.completion?.task_id, "task-fat-complete");
+  assert.equal(r.completion?.message_id, MESSAGE);
+});
+
 // ── fatal ────────────────────────────────────────────────────────────────
 
 test("a non-retryable error acks with failed=true and a presentable reason", async () => {
@@ -501,6 +513,39 @@ test("a chat turn leaves its background shells running", async () => {
   assert.deepEqual(r.verdicts, ["ack"]);
   assert.ok(!r.calls.includes("hands.reapShells"), "the next turn is expected to poll them");
 });
+
+for (const taskId of [undefined, "task-chat"]) {
+  for (const resumed of [false, true]) {
+    test(`chat client keeps its row identity with task ${taskId ?? "absent"}, resumed ${resumed}`, async () => {
+      const constructed: Parameters<TaskRunnerSideEffects["makeHandsClient"]>[] = [];
+      const deadline = new Date(Date.now() + 60_000).toISOString();
+      const r = await runScenario({
+        taskId,
+        request: { deadline_at: deadline },
+        deliveryCount: resumed ? 2 : 1,
+        ...(resumed ? { seedCheckpoint: {} } : {}),
+        engineBehavior: attachThen(async () => result()),
+        sideEffects: {
+          makeHandsClient: (...args) => {
+            constructed.push(args);
+            return {
+              close: async () => {},
+              reconcileOutstandingStarts: async () => ({ confirmed: [], released: [], unresolved: [] }),
+            } as never;
+          },
+        },
+      });
+
+      assert.deepEqual(r.verdicts, ["ack"]);
+      assert.equal(constructed.length, 1);
+      const [, , owner, rowRun, deadlineAt, shellRun] = constructed[0];
+      assert.equal(owner, SESSION);
+      assert.equal(rowRun, taskId ?? MESSAGE);
+      assert.equal(deadlineAt, deadline);
+      assert.equal(shellRun, "");
+    });
+  }
+}
 
 test("the shells are asked for once, however many steps could ask", async () => {
   // Two steps of a successful node want them stopped: the snapshot, so it is not

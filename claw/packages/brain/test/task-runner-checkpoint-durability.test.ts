@@ -132,7 +132,13 @@ function stubSideEffects(calls: string[], over: Partial<TaskRunnerSideEffects> =
     destroyHands: record("destroyHands", undefined),
     reapPendingHands: record("reapPendingHands", undefined),
     probeSandboxContainer: record("probeSandboxContainer", "dead"),
-    unregisterSandbox: ((..._a: unknown[]) => { calls.push("unregisterSandbox"); }) as never,
+    unregisterSandbox: ((..._a: unknown[]) => {
+      // The third argument is the only part of this call that is not local to
+      // the pod: it decides whether the sandbox's admission slot is handed back
+      // to the fleet, so the timeline records which of the two calls this was.
+      const opts = _a[2] as { releaseSlot?: boolean } | undefined;
+      calls.push(`unregisterSandbox:${opts?.releaseSlot === false ? "keptSlot" : "releasedSlot"}`);
+    }) as never,
     markHandsIdle: ((..._a: unknown[]) => { calls.push("markHandsIdle"); return Promise.resolve({ outcome: "parked" }); }) as never,
     markRetryPending: record("markRetryPending", undefined),
     syncWorkspaceToS3: record("syncWorkspaceToS3",
@@ -310,6 +316,30 @@ test("losing the lease stands the run down without disturbing the replica that h
     "the message is left to ack_wait, which produces the redelivery task-dispatch stands down");
   assert.ok(r.calls.includes("releaseTaskLock"),
     "release still runs, and is holder-checked so it will not take the holder's lock");
+});
+
+test("standing down leaves the sandbox's admission slot with the sandbox", async () => {
+  // The keepalive half of the stand-down is local -- dropping this pod's ping
+  // entry -- with one exception: the admission slot that entry carries is a
+  // fleet-shared roster record. The holder reached this same container through
+  // ensureHands' reuse path, which registers locally and claims no slot of its
+  // own, so releasing it here takes the live sandbox off the roster entirely
+  // and hands its place at the ceiling to the next provisioning. The slot goes
+  // where the sandbox goes, and the sandbox is still in use.
+  const r = await runScenario({
+    seedCheckpoint: true,
+    async engineBehavior(_signal, extras, abortCtrl) {
+      await extras!.attachHands!();   // the run that loses the lease has a sandbox
+      abortCtrl.abort(LEASE_LOST_ABORT_REASON);
+      throw new Error("aborted mid-turn");
+    },
+  });
+
+  assert.ok(
+    r.calls.includes("unregisterSandbox:keptSlot"),
+    `the sandbox is still a ping target the sweep reconciles back in, so its slot `
+    + `must stay claimed: ${r.calls.join(" -> ")}`,
+  );
 });
 
 test("a row that went terminal underneath the run gives everything back", async () => {

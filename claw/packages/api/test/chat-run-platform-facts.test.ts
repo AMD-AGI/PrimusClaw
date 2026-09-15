@@ -23,7 +23,8 @@ let h: Harness;
 
 before(async () => {
   h = await startHarness();
-  await h.sql("ALTER TABLE claw_sessions ADD COLUMN config JSONB");
+  // `claw_sessions.config` is declared by the scenario harness DDL (it matches
+  // initDb's base CREATE TABLE); this suite only writes to it.
   app = Fastify();
   app.addHook("onRequest", async (req) => {
     Object.assign(req, { user: { userId: "user-1", roles: [] } });

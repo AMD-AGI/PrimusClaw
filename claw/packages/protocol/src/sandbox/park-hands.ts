@@ -12,6 +12,7 @@
  */
 
 import { isRevisionConflict } from "@claw/utils";
+import { handsSessionKey } from "./hands-key.js";
 
 /**
  * The revision-aware slice of a NATS KV bucket this needs. Duck-typed so utils
@@ -167,7 +168,7 @@ export async function parkHandsAfterRun(
   sessionId: string,
   expectWorkloadId?: string | null,
 ): Promise<RunEndedParkResult> {
-  const key = `hands.${sessionId}`;
+  const key = handsSessionKey(sessionId);
   try {
     const entry = await kv.get(key);
     if (!entry) return { outcome: "gone" };

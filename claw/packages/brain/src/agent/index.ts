@@ -11,7 +11,7 @@ const logger = pino({ name: "engine" });
 /** Snapshot of agent-loop execution state, persisted to NATS KV for
  *  cross-Brain resume after SIGTERM or sandbox rebuild.
  *
- *  The three fields below `setup_commands` are optional on purpose: payloads
+ *  The optional fields below `setup_commands` are optional on purpose: payloads
  *  written before they existed are still schema-version 3 and must stay
  *  readable, so a reader that finds them absent falls back to the pre-existing
  *  behaviour rather than rejecting the checkpoint. New writers always set them.
@@ -65,6 +65,27 @@ export interface CheckpointState {
    *  same reason as `rebuilds_used`: a run that resumes with this reset can
    *  repair-without-progress indefinitely, one resume at a time. */
   recoveries_used?: number;
+  /**
+   * The succeeded half of `tool_calls_by_name`.
+   *
+   * Carried for the same reason the attempts are, and the pair is the point:
+   * the loop reports the two side by side as one run's `by_tool` /
+   * `by_tool_ok`, so restoring only the attempts ships a pair describing
+   * different spans -- the whole run against whatever followed the last
+   * redelivery. A rollout gate reads `by_tool_ok >= 1` as the machinery's own
+   * proof that a command ran (deploy/rollout-lib.sh, settle_verdict), and a
+   * run interrupted after its successful call and then resumed reports zero
+   * there while perfectly healthy, which is byte-identical to the
+   * failed-command shape the gate exists to catch.
+   *
+   * Absent on a checkpoint written before this field existed, and such a
+   * resume starts the count empty -- the pre-existing behaviour. It must stay
+   * that way: seeding it from `tool_calls_by_name`, or from attempts minus
+   * `error_count`, would credit calls whose outcome the checkpoint never
+   * recorded, which is the gate passing on a sandbox nothing touched. This
+   * number may only ever under-report.
+   */
+  tool_ok_by_name?: Record<string, number>;
 }
 
 /**

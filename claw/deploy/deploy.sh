@@ -648,9 +648,56 @@ if default_sandbox_image:
 for _key, _var in (
     ("sessionTimeout", "AGENT_SANDBOX_SESSION_TIMEOUT"),
     ("maxSessionDuration", "AGENT_SANDBOX_MAX_SESSION_DURATION"),
+    ("bashMaxTimeoutSec", "BASH_MAX_TIMEOUT_SEC"),
 ):
     if env(_var):
         values["brain"][_key] = env(_var)
+
+# Doorbell dispatch and the admission ceilings, for the same reason: this
+# script installs the whole release from a values file it builds here, so a key
+# wired only into render_chart never reaches a fresh deploy. Unset forwards
+# nothing and the chart default stands.
+for _key, _var in (
+    ("runDoorbellDispatch", "RUN_DOORBELL_DISPATCH"),
+    ("brainDoorbellExecution", "BRAIN_DOORBELL_EXECUTION"),
+    ("runFatPreparingReconcile", "RUN_FAT_PREPARING_RECONCILE"),
+):
+    _raw = env(_var)
+    if not _raw:
+        continue
+    # Refused rather than coerced: anything unrecognised read as false would
+    # turn the Brain kill-switch off while looking like it had been set.
+    if _raw not in ("true", "false"):
+        raise SystemExit(f"{_var} must be true or false, got {_raw!r}")
+    values.setdefault("features", {})[_key] = _raw == "true"
+
+for _key, _var in (
+    ("admitSoftRuns", "ADMIT_SOFT_RUNS"),
+    ("admitHardRuns", "ADMIT_HARD_RUNS"),
+    ("admitSoftSandboxes", "ADMIT_SOFT_SANDBOXES"),
+    ("admitHardSandboxes", "ADMIT_HARD_SANDBOXES"),
+    ("admitSoftGpuNodes", "ADMIT_SOFT_GPU_NODES"),
+    ("admitHardGpuNodes", "ADMIT_HARD_GPU_NODES"),
+    ("admitTreeMaxNodes", "ADMIT_TREE_MAX_NODES"),
+    ("admitTreeMaxDepth", "ADMIT_TREE_MAX_DEPTH"),
+):
+    if env(_var):
+        values["api"][_key] = env(_var)
+
+# Not part of the brain loop further up: that one writes into values["brain"],
+# which the builder created. There is no "features" key to write into, so an
+# enablement added to that loop would be dropped without a word.
+for _key, _var in (
+    ("backgroundShell", "BG_SHELL_ENABLED"),
+    ("keepaliveTargetCeiling", "SANDBOX_KEEPALIVE_TARGET_CEILING"),
+    ("keepaliveReconcileReserve", "SANDBOX_KEEPALIVE_RECONCILE_RESERVE"),
+    ("keepaliveIdleDeadlineSec", "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC"),
+    ("childUidMin", "HANDS_CHILD_UID_MIN"),
+    ("childUidMax", "HANDS_CHILD_UID_MAX"),
+    ("childIsolation", "HANDS_CHILD_ISOLATION"),
+):
+    if env(_var):
+        values.setdefault("features", {})[_key] = env(_var)
 
 if sandbox_workload_namespace:
     values["secret"]["sandboxNamespace"] = sandbox_workload_namespace

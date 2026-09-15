@@ -243,10 +243,17 @@ for (const sandbox of [SAFE_SANDBOX, AGENT_SANDBOX]) {
     const res = await postTaskRoute("lease", { brain_id: "worker-a", lease_seconds: 45, sandbox });
 
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), { ok: true, status: "running" });
+    // A pristine fat chat row's first lease is an acceptance, not a renewal,
+    // and an acceptance issues the generation it answers with -- so the body
+    // carries the `claim_count` this holder must quote from here on.
+    assert.deepEqual(res.json(), { ok: true, status: "running", claim_count: 1 });
     const run = await storedRun();
-    assert.equal(run.brain_id, "worker-a");
+    // The acceptance records the holder in `lease_owner` only. `brain_id` is
+    // the executing worker and is stamped by the first renewal or by the
+    // `running` status event -- acquireFatLease deliberately claims neither it
+    // nor an `attempt_id`, because accepting a delivery is not yet running it.
     assert.equal(run.lease_owner, "worker-a");
+    assert.equal(run.brain_id, null);
     assert.equal(run.sandbox_workload_id, sandbox.provider === "safe-workload" ? sandbox.handle : null);
     assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, sandbox);
   });
@@ -361,8 +368,12 @@ test("an uncertain lease result cannot attach a sandbox even for the recorded ow
     before: async () => { throw new Error("temporary database failure"); },
   });
 
-  assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.json(), { ok: true, status: "unknown" });
+  // An undecided write is answered 5xx rather than a 2xx carrying
+  // `status: "unknown"`: `askRunLease` reads any 2xx as `{kind: "granted"}`
+  // whatever the status says, so a 200 here would hand a delivery a lease
+  // nobody granted. A 5xx classifies as `unresolved`, which is what this is.
+  assert.equal(res.statusCode, 503);
+  assert.deepEqual(res.json(), { ok: false, status: "unknown" });
   assert.deepEqual(await storedRun(), original);
 });
 

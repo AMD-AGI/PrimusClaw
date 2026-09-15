@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 
+import { PG_INT4_MAX } from "@claw/utils";
+
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { db } from "../src/infra/db.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
@@ -51,7 +53,7 @@ after(async () => {
 function stubClaimable(): void {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks")) {
+    if (/UPDATE claw_tasks/.test(sql)) {
       return {
         rows: [{
           task_id: "ktsk_1",
@@ -141,7 +143,7 @@ test("a missing run is 404", async () => {
 test("a held lease is 409", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks")) return { rows: [], rowCount: 0 };
+    if (/UPDATE claw_tasks/.test(sql)) return { rows: [], rowCount: 0 };
     return { rows: [{ status: "preparing", lease_expires_at: "2099-01-01" }], rowCount: 1 };
   }) as typeof db.query;
   const res = await app.inject({
@@ -156,7 +158,7 @@ test("a held lease is 409", async () => {
 test("a row that cannot be hydrated is 422", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("lease_owner")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("lease_owner")) {
       return {
         rows: [{
           task_id: "ktsk_1",
@@ -215,7 +217,7 @@ test("fail-claim by a non-holder is 409", async () => {
 test("fail-claim by the holder ends the row", async () => {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("origin = 'chat'")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("origin = 'chat'")) {
       return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
@@ -270,7 +272,27 @@ test("fail-claim can mark an unbound claimed run as workspace_unbound", async ()
   assert.equal(reason, "workspace_unbound");
 });
 
-test("fail-claim ignores an unknown reason and keeps session_deleted", async () => {
+// A reason the API does not know is a holder asking for something this build
+// cannot do. Defaulting it to `session_deleted` would close the row for good
+// on a guess, so the request is refused and no statement runs.
+test("fail-claim refuses an unknown reason instead of defaulting it", async () => {
+  let touched = false;
+  db.query = (async () => {
+    touched = true;
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/fail-claim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", reason: "not_a_reason" },
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, "reason_invalid");
+  assert.equal(touched, false, "a refused body reaches no statement");
+});
+
+test("fail-claim still defaults an absent reason to session_deleted", async () => {
   let reason: unknown;
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
@@ -284,10 +306,127 @@ test("fail-claim ignores an unknown reason and keeps session_deleted", async () 
     method: "POST",
     url: "/v1/internal/tasks/ktsk_1/fail-claim",
     headers: { authorization: `Bearer ${TOKEN}` },
-    payload: { brain_id: "brain-7", reason: "not_a_reason" },
+    payload: { brain_id: "brain-7" },
   });
   assert.equal(res.statusCode, 200);
   assert.equal(reason, "session_deleted");
+});
+
+// The generation fence is `($3::int IS NULL OR claim_count = $3)`, so a
+// malformed count coerced to absent releases whatever generation the row is
+// on -- including a turn a later holder is running. One past the column's own
+// range is the same class: it reached the statement and Postgres answered
+// `22003`, which the route reported as a 500.
+for (const [label, claimCount] of [
+  ["a string", "malformed"],
+  ["a fraction", 1.9],
+  ["a negative", -1],
+  ["null", null],
+  ["NaN", Number.NaN],
+  ["one past int4", PG_INT4_MAX + 1],
+  ["Number.MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
+] as const) {
+  for (const route of ["unclaim", "fail-claim"] as const) {
+    test(`${route} refuses ${label} claim_count rather than dropping the fence`, async () => {
+      let touched = false;
+      db.query = (async () => {
+        touched = true;
+        return { rows: [], rowCount: 0 };
+      }) as typeof db.query;
+      const res = await app.inject({
+        method: "POST",
+        url: `/v1/internal/tasks/ktsk_1/${route}`,
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: { brain_id: "brain-7", claim_count: claimCount },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.json().error, "claim_count_invalid");
+      assert.equal(touched, false, "a refused body reaches no statement");
+    });
+  }
+}
+
+for (const route of ["unclaim", "fail-claim"] as const) {
+  test(`${route} accepts the largest generation the column can hold`, async () => {
+    let seen: unknown;
+    db.query = (async (text: string, params: unknown[] = []) => {
+      if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+        seen = params.find((p) => p === PG_INT4_MAX);
+        return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }) as typeof db.query;
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/internal/tasks/ktsk_1/${route}`,
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { brain_id: "brain-7", claim_count: PG_INT4_MAX },
+    });
+    assert.equal(res.statusCode, 200);
+    assert.equal(seen, PG_INT4_MAX, "the boundary itself is a generation, not a malformed body");
+  });
+}
+
+test("unclaim passes an integer claim_count through to the fence", async () => {
+  // `applyTaskStatusTransition` builds its own values first and appends the
+  // caller's after them, so the fence's position is the writer's business.
+  // What this test is about is that an integer reaches the CAS at all.
+  let seen: unknown[] = [];
+  db.query = (async (text: string, params: unknown[] = []) => {
+    if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+      seen = params;
+      return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/unclaim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7", claim_count: 3, reason: "retry" },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.ok(seen.includes(3), `the fence took no integer: ${JSON.stringify(seen)}`);
+});
+
+// `unspecified` is a metric label for a body that named no reason. A body that
+// names it is a client inventing a protocol value, which is version skew.
+for (const reason of ["unspecified", "not_a_reason", "", 7, null] as const) {
+  test(`unclaim refuses ${JSON.stringify(reason)} as a reason`, async () => {
+    let touched = false;
+    db.query = (async () => {
+      touched = true;
+      return { rows: [], rowCount: 0 };
+    }) as typeof db.query;
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/internal/tasks/ktsk_1/unclaim",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { brain_id: "brain-7", reason },
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, "reason_invalid");
+    assert.equal(touched, false, "a refused body reaches no statement");
+  });
+}
+
+test("unclaim with no reason is accepted and writes no last_release", async () => {
+  let seen: unknown = "unset";
+  db.query = (async (text: string, params: unknown[] = []) => {
+    if (/UPDATE claw_tasks/.test(text.replace(/\s+/g, " "))) {
+      seen = params[3];
+      return { rows: [{ task_id: "ktsk_1" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/internal/tasks/ktsk_1/unclaim",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { brain_id: "brain-7" },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(seen, null, "absence stays absent rather than becoming a reason");
 });
 
 test("fail-claim rejects a run lease token", async () => {
@@ -305,7 +444,7 @@ test("exhausted claims are 422 max_retries_exceeded", async () => {
   runClaimPorts.publishSessionEvent = async () => {};
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
-    if (sql.startsWith("UPDATE claw_tasks") && sql.includes("claim_count")) {
+    if (/UPDATE claw_tasks/.test(sql) && sql.includes("claim_count")) {
       return {
         rows: [{
           task_id: "ktsk_1",
@@ -373,9 +512,13 @@ test("the claim route reports the row's generation, and the settle routes read i
     payload: { brain_id: "brain-7", claim_count: 4, reason: "lock_contention" },
   });
   assert.equal(released.statusCode, 200);
-  const upd = seen.find((q) => /SET status = 'queued'/.test(q.sql));
+  const upd = seen.find((q) => q.sql.includes(
+    "SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'queued' END",
+  ));
   assert.ok(upd, "the release ran");
   assert.ok(upd?.params.includes(4), "and it carried the parsed generation into the CAS");
-  assert.match(String(upd?.params.find((p) => typeof p === "string" && p.includes("last_release"))),
-    /lock_contention/, "and the reason");
+  // The key is spelled in the statement and the reason is bound beside it, so
+  // that the same UPDATE can also restamp `queued_since`.
+  assert.match(upd!.sql, /last_release/, "the statement records the reason under that key");
+  assert.ok(upd?.params.includes("lock_contention"), "and the reason reached it");
 });

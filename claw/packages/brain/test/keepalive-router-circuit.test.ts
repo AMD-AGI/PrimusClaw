@@ -82,7 +82,7 @@ test("a single gone response reaches the verdict and jumps the counter", async (
   try {
     await runKeepaliveTickForTest({ kv: emptyKv() });
     assert.ok(execs > 0, `precondition: the sandbox was pinged (execs=${execs})`);
-    const v = lastVerdictForTest("s-solo");
+    const v = lastVerdictForTest("wl-solo");
     assert.ok(v, "the failure must reach the verdict at all");
     assert.equal(v.gone, true, "a lone gone is not suppressed");
     assert.equal(v.fails, 1, "and jumps straight to the limit");

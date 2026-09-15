@@ -83,7 +83,9 @@ async function renew(runTime: RunTimeReport): Promise<void> {
   assert.equal(response.statusCode, 200);
 }
 
-async function assertSettled(status: "queued" | "failed" = "queued"): Promise<RunTimeLedgerEntry> {
+async function assertSettled(
+  status: "queued" | "failed" | "cancelled" = "queued",
+): Promise<RunTimeLedgerEntry> {
   const row = await runRow(h, TASK);
   assert.equal(row.status, status);
   assert.equal(row.lease_owner, null);
@@ -161,14 +163,20 @@ test("fail-claim can close a held attempt before its first successful heartbeat"
   assert.equal((await runRow(h, TASK)).failure_reason, "claim_abandoned");
 });
 
-test("a cancelling claim rolls back adoption when release cannot change its status", async () => {
+test("releasing a claim the user stopped closes the row instead of requeueing it", async () => {
   await claim();
   assert.ok(await transitionStatus(TASK, ["preparing"], "cancelling"));
-  const before = await runRow(h, TASK);
 
-  assert.equal((await release(report())).statusCode, 409);
+  assert.equal((await release(report())).statusCode, 200);
 
-  assert.deepEqual(await runRow(h, TASK), before);
+  // The release is the fast way out of a stopped row: put back on the queue it
+  // would be claimed again within the second -- `peekNextQueued` has no
+  // cancellation term to consult -- and left at `cancelling` nothing but
+  // `reapLostLeases` would reach it, a whole grace period later with the
+  // session's gate shut throughout.
+  const ledger = await assertSettled("cancelled");
+  assert.equal((await runRow(h, TASK)).failure_reason, "cancelled");
+  assert.ok(ledger.attempts[0].endedAtDb, "and the attempt ends with the row");
 });
 
 test("another attempt cannot release the current claim's recorded attempt", async () => {

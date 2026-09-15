@@ -12,7 +12,8 @@
  * The legacy chat path (no `task_id`) is unaffected.
  */
 import type {
-  ExecuteRequest, ExecuteResult, RunPhase, RunTimeReport, RunWaitReason,
+  ExecuteRequest, ExecuteResult, RunLeaseRequest, RunLeaseResponse, RunPhase,
+  RunTimeReport, RunWaitReason,
 } from "@claw/protocol";
 import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
@@ -153,8 +154,26 @@ export interface LeaseRenewal {
   /** Cumulative wall-clock the run has spent waiting rather than executing. */
   waitedMs: number;
   waits: number;
-  /** Fences this renewal against the attempt the row currently holds. */
-  attempt: RunAttemptToken;
+  /**
+   * The generation the acceptance issued this delivery. Omitted, never
+   * invented, when the acceptance was served by an API that returned none --
+   * and required on every renewal of a row that was fenced, because
+   * `brain_id` is a pod name and cannot tell one attempt from its successor.
+   */
+  runClaim?: number;
+  /**
+   * That this POST is the delivery's acceptance rather than a renewal of a
+   * lease already held. Only an acceptance may open a generation.
+   */
+  accept?: true;
+  /**
+   * Fences this renewal against the attempt the row currently holds.
+   *
+   * Absent on the doorbell fat pre-gate, which takes the lease before any
+   * attempt exists to fence against -- the generation it quotes is what
+   * separates it from a predecessor there.
+   */
+  attempt?: RunAttemptToken;
   /** Absent for the opening tick, which has closed no interval to report. */
   runTime?: RunTimeReport;
 }
@@ -180,6 +199,23 @@ export function sandboxForLease(entry: SandboxEntry | null): LeaseRenewal["sandb
 export type LeaseRefused = "gone" | "superseded";
 
 /**
+ * A 409, and the settlement it sometimes leaves to the refused caller.
+ *
+ * `stop` is the one refusal that is not "let go of this": the row was stopped
+ * before anybody accepted the delivery, so nothing else exists that can report
+ * the interrupt, and acking it away leaves the turn recorded nowhere. It is
+ * said beside `refusal` rather than as a third value of it, so an API that
+ * does not send it is read exactly as it was before.
+ */
+export interface LeaseRefusal {
+  refusal: LeaseRefused;
+  /** The stopped row this caller must settle rather than walk away from. */
+  stop?: "cancelling";
+  /** That row's generation, which the completion it asks for is fenced on. */
+  claimCount?: number;
+}
+
+/**
  * Which refusal a 409 was, defaulting to the one that touches nothing.
  *
  * An API too old to say -- the window of a rolling upgrade -- reads as
@@ -189,9 +225,17 @@ export type LeaseRefused = "gone" | "superseded";
  * its budget runs out. Giving a live worker's sandbox and message away costs
  * that worker's turn.
  */
-async function readRefusal(resp: Response): Promise<LeaseRefused> {
-  const body = (await resp.json().catch(() => null)) as { reason?: string } | null;
-  return body?.reason === "terminal" || body?.reason === "missing" ? "gone" : "superseded";
+async function readRefusal(resp: Response): Promise<LeaseRefusal> {
+  const body = (await resp.json().catch(() => null)) as {
+    reason?: string; stop?: string; claim_count?: unknown;
+  } | null;
+  const refusal: LeaseRefused =
+    body?.reason === "terminal" || body?.reason === "missing" ? "gone" : "superseded";
+  return {
+    refusal,
+    ...(body?.stop === "cancelling" ? { stop: "cancelling" as const } : {}),
+    ...(typeof body?.claim_count === "number" ? { claimCount: body.claim_count } : {}),
+  };
 }
 
 /**
@@ -217,8 +261,38 @@ export async function postRunLease(
   request: ExecuteRequest,
   renewal: LeaseRenewal,
 ): Promise<string | LeaseRefused | null> {
+  const answer = await askRunLease(request, renewal);
+  if (answer.kind === "granted") return answer.status;
+  return answer.kind === "refused" ? answer.refusal : null;
+}
+
+/**
+ * What one lease POST came back with.
+ *
+ * `unresolved` is deliberately not a refusal and not a grant: a timeout, a
+ * 5xx, or a body this worker cannot read says nothing about who holds the row.
+ * A mid-run heartbeat waits for the next tick; an acceptance, which has
+ * nothing to fall back on, must treat it as a delivery it did not take.
+ */
+export type LeaseAnswer =
+  | { kind: "granted"; status: string; claimCount?: number }
+  | ({ kind: "refused" } & LeaseRefusal)
+  | { kind: "unresolved" };
+
+/**
+ * Post one lease body and read the answer.
+ *
+ * The generation is sent on every renewal any owner makes, the runner's
+ * execution heartbeat included: the row refuses a generation-less renewal once
+ * it is fenced, so an owner that stopped quoting it would be classified
+ * `superseded` on its next tick and abort a run nobody had taken over.
+ */
+export async function askRunLease(
+  request: ExecuteRequest,
+  renewal: LeaseRenewal,
+): Promise<LeaseAnswer> {
   const lease = request.run_lease;
-  if (!lease?.url) return null;
+  if (!lease?.url) return { kind: "unresolved" };
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
@@ -236,30 +310,40 @@ export async function postRunLease(
         wait_reason: renewal.waitReason,
         waited_ms: renewal.waitedMs,
         waits: renewal.waits,
-        attempt_id: renewal.attempt.attemptId,
-        claim_count: renewal.attempt.claimCount,
-        delivery_seq: renewal.attempt.deliverySeq,
-        delivery_count: renewal.attempt.deliveryCount,
+        ...(renewal.accept ? { accept: true } : {}),
+        ...(renewal.runClaim === undefined ? {} : { run_claim: renewal.runClaim }),
+        ...(renewal.attempt ? {
+          attempt_id: renewal.attempt.attemptId,
+          claim_count: renewal.attempt.claimCount,
+          delivery_seq: renewal.attempt.deliverySeq,
+          delivery_count: renewal.attempt.deliveryCount,
+        } : {}),
         run_time: renewal.runTime,
-      }),
+      } satisfies RunLeaseRequest),
       signal: controller.signal,
     });
     // 409 is the one rejection that means something: this worker is not the
     // one the row recognises. Any other failure is just a failure, and a worker
     // must not stand down because the API had a bad moment.
-    if (resp.status === 409) return await readRefusal(resp);
+    if (resp.status === 409) return { kind: "refused", ...await readRefusal(resp) };
     if (!resp.ok) {
       logger.warn({ status: resp.status }, "run.lease_renew_rejected");
-      return null;
+      return { kind: "unresolved" };
     }
-    const body = (await resp.json().catch(() => null)) as { status?: string } | null;
-    return body?.status ?? null;
+    const body = (await resp.json().catch(() => null)) as RunLeaseResponse | null;
+    if (!body?.status) return { kind: "unresolved" };
+    // A 2xx carrying no `claim_count` is a successful lease served by an API
+    // that predates the generation, never a malformed one: this worker then
+    // holds no generation and must omit it rather than invent one.
+    return typeof body.claim_count === "number"
+      ? { kind: "granted", status: body.status, claimCount: body.claim_count }
+      : { kind: "granted", status: body.status };
   } catch (error) {
     logger.warn(
       { err: error instanceof Error ? error.message : String(error) },
       "run.lease_renew_failed",
     );
-    return null;
+    return { kind: "unresolved" };
   } finally {
     clearTimeout(timeout);
   }
