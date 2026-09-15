@@ -39,6 +39,7 @@ export function bindClusterReclaimForTest(
 
 import { metrics } from "../infra/metrics.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { releaseHandlesForWorkload } from "./handles.js";
 import {
   getHandsKv,
   revokeHandsToken,
@@ -254,6 +255,24 @@ export async function destroyHands(
   try {
     await stopNamedSandbox(sessionId, target);
     metrics.onSandboxStop("ok");
+    // Whoever stops a workload frees its handle. Registration refuses to point
+    // a handle away from a workload still on record -- which is what stops a
+    // redelivery overwriting a live one -- so a handle left naming something
+    // that has been stopped blocks the replacement instead of leaking it.
+    //
+    // Contained: this is bookkeeping that makes the next step possible, and it
+    // must never be why a teardown reports failure. If it does not land, the
+    // next registration refuses and the turn fails visibly, with the handle
+    // still naming the stopped workload for a sweep to find.
+    const stoppedWorkload = (target as { workloadId?: string }).workloadId;
+    if (stoppedWorkload) {
+      await releaseHandlesForWorkload(stoppedWorkload).catch((e: unknown) => {
+        logger.warn(
+          { sessionId, workloadId: stoppedWorkload, err: (e as Error)?.message ?? String(e) },
+          "dag-handles.release_after_stop_failed",
+        );
+      });
+    }
   } catch (cause) {
     // Counted before the rethrow: the caller turns this into a replacement
     // decision and never reports the teardown itself, so this is the only

@@ -173,9 +173,14 @@ export async function replaceDagHandle(
       }
       row = parsed as Record<string, unknown>;
     }
-    const prevEntry = getHandleEntry(row, handleName) as
-      { workload_id?: string } | undefined;
-    const previous = prevEntry?.workload_id;
+    // A legacy entry is the bare workload id, which the protocol still
+    // accepts. Read as an object it answers `undefined`, and the refusal below
+    // then treats the only reference to a live workload as absent -- the exact
+    // overwrite this refusal exists to prevent, on the oldest rows.
+    const prevRaw = getHandleEntry(row, handleName);
+    const previous = typeof prevRaw === "string"
+      ? prevRaw
+      : (prevRaw as { workload_id?: string } | undefined)?.workload_id;
     // Refuse to take the name from a DIFFERENT workload that is still on
     // record. `create` refused this too, and replacing that refusal with an
     // unconditional write is what let a redelivery -- whose `hands.<session>`
@@ -252,28 +257,30 @@ function isRevisionConflict(e: unknown): boolean {
  * handle map, because a sibling owns `hands.<sessionId>`, always answered no.
  */
 /**
- * Drop this DAG's handle when it names `workloadId`, because that workload has
- * just been stopped.
+ * Free every handle naming `workloadId`, because it has just been stopped.
  *
- * The other half of `replaceDagHandle` refusing to take a name from a workload
- * still on record: whoever stops one removes its handle, so the name is free
- * for the replacement and the refusal never fires on an ordinary rebuild. Left
- * in place, the entry would name a workload that is gone -- which a later
- * teardown stops, hears 404 for, and counts as released, so the leak is not
- * here; the breakage would be the next registration being refused.
+ * The counterpart to `replaceDagHandle` refusing to take a name from a
+ * workload still on record. Sited here, by workload rather than by handle,
+ * because the callers that stop one do not all know which DAG named it:
+ * `reapPendingHands` has a session and a workload id and nothing else, and it
+ * stops workloads on the ordinary retryable-provisioning path. Leaving the
+ * handle behind there turns a routine retry into a permanent failure -- the
+ * redelivered task cannot register, because the name still points at the
+ * workload the reaper stopped.
  *
- * Conditional on the id: a handle that has already moved on to something else
- * belongs to whoever moved it, and this must not remove that.
+ * Scans, for the same reason the Backend's shared-holder check does: the
+ * question is "who names this workload", and the registry is keyed the other
+ * way round. Teardown is not a hot path.
  */
-export async function releaseDagHandle(
-  dagRootTaskId: string,
-  handleName: string,
-  workloadId: string,
-): Promise<void> {
-  const current = await lookupDagHandle(dagRootTaskId, handleName);
-  if (!current || current.workload_id !== workloadId) return;
-  await getMap().destroy(dagRootTaskId, handleName);
-  logger.info({ dagRootTaskId, handleName, workloadId }, "dag-handles.released");
+export async function releaseHandlesForWorkload(workloadId: string): Promise<void> {
+  if (!workloadId) return;
+  for (const [dagRoot, handles] of await getMap().listAll()) {
+    for (const [name, info] of Object.entries(handles)) {
+      if (info.workload_id !== workloadId) continue;
+      await getMap().destroy(dagRoot, name);
+      logger.info({ dagRootTaskId: dagRoot, handleName: name, workloadId }, "dag-handles.released");
+    }
+  }
 }
 
 export async function isValidDagHandleToken(token: string): Promise<boolean> {

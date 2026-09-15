@@ -12,7 +12,6 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "../agent/index.js";
-import { releaseDagHandle } from "../sandbox/handles.js";
 import type { NatsEmitter } from "../events/emitter.js";
 import { HandsClient, isHandsNetworkError } from "../clients/hands.js";
 import {
@@ -1409,30 +1408,9 @@ class TaskRunner {
     if (this.abortCtrl.signal.aborted) {
       throw new Error("sandbox recovery aborted after destroy");
     }
-    // The handle still names the sandbox just stopped, and the replacement
-    // about to be built cannot take that name while it does -- registration
-    // refuses to point a handle away from a workload still on record, which is
-    // what stops a redelivery quietly overwriting a live one. Whoever stops a
-    // workload frees its handle; this is that, for the rebuild path.
-    //
-    // Wholly contained, including the spec read: this is cleanup that makes
-    // the next step possible, and it must never be the reason a rebuild does
-    // not happen. If it does not land, the registration below refuses and the
-    // turn fails with the handle still naming the stopped workload -- visible,
-    // and recoverable by a sweep.
-    try {
-      const rebuildDagRoot = this.request.dag_root_task_id ?? this.request.task_id;
-      const rebuildAction = resolveSandboxAction(this.request);
-      const rebuildHandle = "handle" in rebuildAction ? rebuildAction.handle : undefined;
-      if (rebuildDagRoot && rebuildHandle && this.handsIdentity?.workloadId) {
-        await releaseDagHandle(rebuildDagRoot, rebuildHandle, this.handsIdentity.workloadId);
-      }
-    } catch (e) {
-      logger.warn(
-        { sessionId: this.sessionId, err: (e as Error)?.message ?? String(e) },
-        "sandbox.rebuild_handle_release_failed",
-      );
-    }
+    // The handle naming the sandbox just stopped is freed by `destroyHands`
+    // itself, which is where every stop goes through -- rebuild here, and the
+    // retryable-provisioning reap that would otherwise strand a redelivery.
     // Best-effort close of the dead client (its socket is likely already
     // wedged; ignore failures).
     const oldHands = this.hands;

@@ -34,7 +34,8 @@
  *   H8 Brain's own row writer stores a `__proto__` handle too
  *   H9 a handle is not taken from a workload still on record
  *   H10 re-registering the same workload is allowed, and enriches it
- *   H11 releasing a handle frees the name, and only for the workload named
+ *   H11 releasing by workload frees the name, and only for the workload named
+ *   H12 a legacy bare-string entry still counts as a workload on record
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -47,7 +48,7 @@ import {
   bindDagHandleKvForTest,
   initDagHandles,
   lookupDagHandle,
-  releaseDagHandle,
+  releaseHandlesForWorkload,
   replaceDagHandle,
 } from "../src/sandbox/handles.js";
 
@@ -112,7 +113,7 @@ test("H1 a rebuild takes the name once the old workload is released", async () =
   // step is what H9 forbids, and it is forbidden because the map is the only
   // reference to a workload nobody stopped.
   await replaceDagHandle("dag-1", "main", { workload_id: "W-old" });
-  await releaseDagHandle("dag-1", "main", "W-old");
+  await releaseHandlesForWorkload("W-old");
   await replaceDagHandle("dag-1", "main", { workload_id: "W-new" });
 
   assert.equal(
@@ -136,7 +137,7 @@ test("H3 replace leaves other handles of the same DAG alone", async () => {
   await replaceDagHandle("dag-3", "train", { workload_id: "W-train" });
   await replaceDagHandle("dag-3", "eval", { workload_id: "W-eval" });
 
-  await releaseDagHandle("dag-3", "train", "W-train");
+  await releaseHandlesForWorkload("W-train");
   await replaceDagHandle("dag-3", "train", { workload_id: "W-train-2" });
 
   assert.equal((await lookupDagHandle("dag-3", "train"))?.workload_id, "W-train-2");
@@ -366,22 +367,41 @@ test("H10 re-registering the same workload is allowed, and enriches it", async (
   assert.equal(held?.hands_url, "http://h", "the second write enriches rather than being refused");
 });
 
-test("H11 releasing a handle frees the name, and only for the workload named", async () => {
+test("H11 releasing by workload frees the name, and only for the workload named", async () => {
   // The other half of the refusal: whoever stops a workload frees its handle,
-  // which is why an ordinary rebuild never meets the refusal above.
+  // which is why an ordinary rebuild never meets the refusal above. Keyed by
+  // workload rather than by handle, because the callers that stop one do not
+  // all know which DAG named it -- `reapPendingHands` has a session and an id.
   await replaceDagHandle("dag-11", "main", { workload_id: "W-old" });
 
-  await releaseDagHandle("dag-11", "main", "W-someone-else");
+  await releaseHandlesForWorkload("W-someone-else");
   assert.equal(
     (await lookupDagHandle("dag-11", "main"))?.workload_id, "W-old",
     "a handle that has moved on belongs to whoever moved it",
   );
 
-  await releaseDagHandle("dag-11", "main", "W-old");
+  await releaseHandlesForWorkload("W-old");
   assert.equal(await lookupDagHandle("dag-11", "main"), null);
   await replaceDagHandle("dag-11", "main", { workload_id: "W-new" });
   assert.equal(
     (await lookupDagHandle("dag-11", "main"))?.workload_id, "W-new",
     "and the freed name is available to the replacement",
   );
+});
+
+test("H12 a legacy bare-string entry still counts as a workload on record", async () => {
+  // The protocol accepts `{main: "W-old"}` -- the workload id with no wrapper.
+  // Read as an object it answers `undefined`, so the refusal saw no previous
+  // workload and let a replacement take the only reference to a live one. The
+  // oldest rows are exactly the ones most likely to name something long-lived.
+  const legacy = fakeJs({ "dag-handles.dag-12": { main: "W-legacy" } });
+  const restore = bindDagHandleKvForTest(legacy.kv as never);
+  try {
+    await assert.rejects(
+      () => replaceDagHandle("dag-12", "main", { workload_id: "W-new" }),
+      /still names W-legacy/,
+    );
+  } finally {
+    restore();
+  }
 });
