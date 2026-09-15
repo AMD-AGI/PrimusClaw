@@ -47,6 +47,9 @@
  *   R18 a handle is on record before its stop runs, not after it fails
  *   R19 a destroy whose response was lost is recorded, not forgotten
  *   R22 an empty snapshot is confirmed against the leader before `nothing_held`
+ *   R23 a stale empty read AFTER teardown does not become `confirmed` either
+ *   R24 only a genuine absence reads as an absent key
+ *   R25 an unreachable registry keeps the DAG `unconfirmed`
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -688,4 +691,69 @@ test("R22 an empty snapshot is confirmed against the leader before nothing_held"
     "a workload the leader knows about must not be reported as never held",
   );
   assert.deepEqual(stopped, [], "this call stopped nothing, and does not claim to have");
+});
+
+test("R23 a stale empty read after teardown does not become confirmed", async () => {
+  // The sibling of R22, and the one I missed: the re-read that lets a teardown
+  // answer `confirmed` is just as final when it comes back empty. A direct
+  // read can land on a replica whose newest version of the row is older, or a
+  // tombstone from an earlier generation of it, while the leader still holds a
+  // handle this teardown never saw -- so `confirmed` would name a workload
+  // nobody stopped.
+  stubDb();
+  stubHandles({ main: "w-1" });
+  const afterTeardown = { late: { workload_id: "w-late" } };
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+  // The snapshot is what the teardown walks; the leader knows one more.
+  handleRegistry.listForDagConsistent = async () => afterTeardown;
+
+  const r = await cancelTask("t-root");
+
+  assert.deepEqual(stopped, ["w-1"], "it stops what it could see");
+  assert.equal(
+    r.released, "unconfirmed",
+    "and does not call that a released DAG while the leader still holds a handle",
+  );
+});
+
+test("R24 only a genuine absence reads as an absent key", async () => {
+  // The safety property of the leader read, tested directly rather than
+  // through a stub that replaces the whole method -- which is what made the
+  // first version of this test pass with the discrimination reverted to text
+  // matching.
+  //
+  // `no message found` (10037) is absence and is an answer. `stream not found`
+  // (10059) is the registry being unreachable, which is no evidence a workload
+  // was released. Both arrive with `code: "404"` and with messages a text
+  // match cannot safely separate.
+  const { isNoMessageFound } = await import("../src/tasks/sandbox-stopper.js");
+
+  assert.equal(
+    isNoMessageFound(Object.assign(new Error("no message found"), {
+      code: "404", api_error: { err_code: 10037 },
+    })),
+    true,
+    "the key is not there, which is the answer",
+  );
+  assert.equal(
+    isNoMessageFound(Object.assign(new Error("stream not found"), {
+      code: "404", api_error: { err_code: 10059 },
+    })),
+    false,
+    "a registry that is not there says nothing about a workload",
+  );
+  assert.equal(
+    isNoMessageFound(new Error("connection refused")), false,
+    "and neither does a connection that failed",
+  );
+});
+
+test("R25 an unreachable registry keeps the DAG unconfirmed", async () => {
+  stubDb();
+  handleRegistry.listForDag = async () => ({});
+  handleRegistry.listForDagConsistent = async () => { throw new Error("nats: no responders"); };
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+
+  assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+  assert.deepEqual(stopped, []);
 });

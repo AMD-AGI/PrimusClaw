@@ -83,6 +83,22 @@ function handleMap(): DagHandleMap {
  * decision deserves to be exercised directly rather than only through a NATS
  * server.
  */
+/**
+ * Whether a JetStream error means the key is genuinely not there.
+ *
+ * `no message found` (10037) is absence and is an answer. `stream not found`
+ * (10059) is the registry itself being unreachable, which is no evidence that
+ * a workload was released -- and both arrive with `code: "404"` and messages
+ * a text match cannot safely separate, so the structured code is the only
+ * thing that distinguishes them.
+ *
+ * Exported because that distinction is the whole safety property here, and a
+ * test that stubs the read around it proves nothing about it.
+ */
+export function isNoMessageFound(e: unknown): boolean {
+  return (e as { api_error?: { err_code?: number } })?.api_error?.err_code === 10037;
+}
+
 export function makeKvStore(kv: KvLike): KVStore {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
@@ -302,9 +318,7 @@ export const handleRegistry = {
     try {
       sm = await jsm.streams.getMessage(`KV_${DAG_HANDLES_BUCKET}`, { last_by_subj: `$KV.${DAG_HANDLES_BUCKET}.${key}` });
     } catch (e) {
-      // "no messages" is the key genuinely not being there, which is the
-      // answer. Anything else is an unknown and must not read as empty.
-      if (/no message|not found/i.test(errText(e))) return {};
+      if (isNoMessageFound(e)) return {};
       throw e;
     }
     if (!sm || sm.data.length === 0) return {};
@@ -920,6 +934,19 @@ export async function stopAllHandlesForDag(
       logger.warn(
         { dagRootTaskId, handles: left },
         "sandbox.handles_registered_during_teardown",
+      );
+      return "unconfirmed";
+    }
+    // Empty here is final too -- it is what lets this call answer `confirmed`
+    // -- so it gets the same leader confirmation the `nothing_held` branch
+    // does. A direct read can land on a replica whose newest version of this
+    // row is older, or a tombstone from an earlier generation of it, while the
+    // leader still holds a handle this teardown never saw and never stopped.
+    const stillHeld = Object.keys(await handleRegistry.listForDagConsistent(dagRootTaskId));
+    if (stillHeld.length > 0) {
+      logger.warn(
+        { dagRootTaskId, handles: stillHeld },
+        "sandbox.stale_empty_handle_read",
       );
       return "unconfirmed";
     }

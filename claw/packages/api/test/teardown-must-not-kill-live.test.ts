@@ -72,6 +72,11 @@ function handleFor(owner: string, workloadId = "w-live"): void {
   ];
   handleRegistry.listForDag = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  // The teardown confirms an empty read against the leader before it may
+  // answer `confirmed` or `nothing_held`. The stub agrees with itself: what
+  // the snapshot says, the leader says.
+  handleRegistry.listForDagConsistent = async () =>
+    Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
   handleRegistry.lookup = async (_d: string, n: string) =>
     live.has(n) ? { workload_id: live.get(n)! } : null;
   handleRegistry.destroy = async (_d: string, n: string) => {
