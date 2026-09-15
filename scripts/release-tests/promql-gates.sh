@@ -24,8 +24,29 @@ if [ -z "$promtool" ] && [ -x "$repo_root/.tools/bin/promtool" ]; then
 fi
 promtool="${promtool:-promtool}"
 
+# Install it rather than only naming the installer. "Missing promtool is fatal
+# rather than a skip" is about never reporting a pass this suite did not run --
+# it is not a reason to stop at printing a command. The only caller that had an
+# install step in front of it was lint.yaml; release-gates.yml runs
+# `make release-verify` on a bare ubuntu runner, and `make verify-lint` runs on
+# whatever a contributor happens to have. Both aborted here under `set -e`,
+# taking every later gate -- Helm lint/render, the image build, the Hands
+# self-check, the migration smoke -- with them, for a missing tool rather than
+# for anything the release got wrong.
+#
+# Safe to do unasked: install-promtool.sh is idempotent and pins the version by
+# digest, so this is a no-op when the binary is already there and a verified
+# download when it is not. PROMTOOL=... still wins, and an install that fails
+# leaves the original refusal below.
+if ! command -v "$promtool" >/dev/null 2>&1; then
+  bash "$repo_root/scripts/release-tests/install-promtool.sh" >&2 || true
+  [ -z "${PROMTOOL:-}" ] && [ -x "$repo_root/.tools/bin/promtool" ] \
+    && promtool="$repo_root/.tools/bin/promtool"
+fi
+
 command -v "$promtool" >/dev/null 2>&1 || {
-  echo "error: promtool is required for the rollout gate tests but was not found." >&2
+  echo "error: promtool is required for the rollout gate tests but was not found," >&2
+  echo "       and installing it failed. Check network access, or set PROMTOOL=..." >&2
   echo "  Run: bash scripts/release-tests/install-promtool.sh" >&2
   exit 1
 }
