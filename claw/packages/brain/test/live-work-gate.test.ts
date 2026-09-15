@@ -92,13 +92,37 @@ test("a sandbox filing no records is unknown, never a count of zero", async () =
   assert.equal(answer.reason, "no_epoch_marker");
 });
 
-test("an unreadable subtree is unknown, and so is a missing one", async () => {
-  for (const subtree of ["empty", "missing"]) {
-    sandboxAnswering(transcript({ marker: MARKER, subtree, pids: [7] }));
-    assert.equal((await countLiveWork(INST, STATE_DIR)).verdict, "unknown", subtree);
-    restore?.();
-    restore = null;
-  }
+test("a subtree that is not there at all is unknown", async () => {
+  // `missing` is the state root itself being absent, which is a sandbox this
+  // read cannot say anything about. `empty` is a different answer and is
+  // covered below.
+  sandboxAnswering(transcript({ marker: MARKER, subtree: "missing", pids: [7] }));
+  const answer = await countLiveWork(INST, STATE_DIR);
+  assert.equal(answer.verdict, "unknown");
+  assert.equal(answer.reason, "subtree_missing");
+});
+
+test("a sandbox that never filed a record is clear, not unknown", async () => {
+  // `scopes/` is created by the first `claimRecord`, not by `mintEpoch`, so a
+  // sandbox that has never started a background shell reports `SUBTREE empty`
+  // -- and with background shells switched off that is every sandbox there is.
+  // Reading it as `unknown` left `countLiveWork` unable to ever answer `clear`,
+  // and the two callers that need `clear` to let go both stopped letting go:
+  // an idle handle was refreshed instead of expired, and a container was
+  // retained instead of destroyed. Hands' own `subtreeReadable()` calls this
+  // readable; this is the same answer from the other side of the exec.
+  sandboxAnswering(transcript({ marker: MARKER, subtree: "empty", pids: [7] }));
+  const answer = await countLiveWork(INST, STATE_DIR);
+  assert.equal(answer.verdict, "clear");
+  assert.equal(answer.reason, "no_live_work");
+});
+
+test("an empty subtree is clear even where the process table could not be read", async () => {
+  // A process table is evidence about the records in it, and there are none --
+  // requiring it here would put every never-used sandbox straight back into
+  // `unknown` on any container where `ls /proc` fails.
+  sandboxAnswering(transcript({ marker: MARKER, subtree: "empty", pids: [] }));
+  assert.equal((await countLiveWork(INST, STATE_DIR)).verdict, "clear");
 });
 
 test("a record that will not parse refuses the whole answer", async () => {
@@ -199,7 +223,11 @@ test("a value that parses but is not a record refuses the whole answer", async (
 test("no readable process table is unknown, not an empty count", async () => {
   // The process state is half the evidence every class turns on. A count taken
   // without it is one taken with the deciding half missing.
-  sandboxAnswering(transcript({ marker: MARKER, records: [], pids: [] }));
+  //
+  // Driven with a record present, which is what makes the table evidence about
+  // anything: with none filed there is nothing for it to decide, and demanding
+  // it there would make every sandbox that never ran a shell unknown again.
+  sandboxAnswering(transcript({ marker: MARKER, records: [running()], pids: [] }));
   const answer = await countLiveWork(INST, STATE_DIR);
   assert.equal(answer.verdict, "unknown");
   assert.equal(answer.reason, "process_table_unreadable");

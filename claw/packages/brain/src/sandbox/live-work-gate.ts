@@ -249,17 +249,35 @@ export async function countLiveWork(
     return { verdict: "unknown", classes: {}, reason: (e as Error).message };
   }
 
-  // A sandbox filing no records has shells this cannot see; an unreadable
-  // marker leaves the same question unanswered. Neither is zero.
-  if (!state.marker || state.subtree !== "ok") {
+  // An unreadable marker leaves the question unanswered, and so does a subtree
+  // this could not open. An `empty` subtree is neither: it is the state dir
+  // standing with no `scopes/` under it, which is what a sandbox that has filed
+  // no record looks like -- and filing no record is exactly zero shells.
+  //
+  // `scopes/` is created lazily, by the first `claimRecord`; `mintEpoch` makes
+  // only the state root. So every sandbox that has never started a background
+  // shell reports `SUBTREE empty` -- which, with BG_SHELL_ENABLED off, is every
+  // sandbox in the fleet. Reading that as `unknown` made `countLiveWork` answer
+  // `unknown` for all of them and never `clear`, and the two callers that need
+  // `clear` to let go both stopped letting go: `collectIdleTarget` refreshes an
+  // idle handle instead of expiring it, and `ensure-hands` retains a container
+  // instead of destroying it. The fleet then only ever grows.
+  //
+  // Hands' own `subtreeReadable()` has always said this: absent `scopes/` with
+  // the state root present is readable, not indeterminate. This is the same
+  // answer, read from the other side of the exec.
+  if (!state.marker || (state.subtree !== "ok" && state.subtree !== "empty")) {
     return {
       verdict: "unknown",
       classes: {},
       reason: !state.marker ? "no_epoch_marker" : `subtree_${state.subtree ?? "unreadable"}`,
     };
   }
-  // No process table is no evidence about any record in it.
-  if (state.livePids.size === 0) {
+  // No process table is no evidence about any record in it -- but a sandbox
+  // that filed no records has nothing for the table to be evidence about, and
+  // asking for it anyway would put the `empty` subtree above straight back into
+  // `unknown` whenever `ls /proc` fails.
+  if (state.records.length > 0 && state.livePids.size === 0) {
     return { verdict: "unknown", classes: {}, reason: "process_table_unreadable" };
   }
 
