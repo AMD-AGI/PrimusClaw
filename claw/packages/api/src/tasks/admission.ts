@@ -519,6 +519,7 @@ export async function withOwnedAdmissionLock<T>(
 ): Promise<T> {
   const client = await db.pool.connect();
   const effects: Array<() => void> = [];
+  let broken = false;
   try {
     await client.query("BEGIN");
     try {
@@ -528,11 +529,22 @@ export async function withOwnedAdmissionLock<T>(
       for (const effect of effects) effect();
       return result;
     } catch (err) {
-      await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
+      await client.query("ROLLBACK").catch(() => { broken = true; });
       throw err;
     }
   } finally {
-    client.release();
+    // Destroyed, not returned, when the rollback itself failed -- the same rule
+    // `inTransaction` follows, and for a sharper reason here. The transaction
+    // this could not end holds `pg_advisory_xact_lock(ADMISSION_LOCK_KEY)`,
+    // which Postgres releases only when the transaction does, and every create,
+    // retry, expansion and claim in the fleet queues behind that one key. Handed
+    // back to the pool the connection is idle in a transaction nobody will
+    // finish, so admission stops fleet-wide until
+    // `idle_in_transaction_session_timeout` kills the session a minute later --
+    // or, if the pool lends it out first, the next caller's `BEGIN` joins the
+    // open transaction instead of starting one. The throw above is the report;
+    // this is the cleanup it cannot do by itself.
+    client.release(broken);
   }
 }
 
@@ -543,6 +555,7 @@ export async function withAdmissionTransaction<T>(
 ): Promise<T> {
   const client = await db.pool.connect();
   const effects: Array<() => void> = [];
+  let broken = false;
   try {
     await client.query("BEGIN");
     await acquireAdmissionLock(client);
@@ -551,10 +564,14 @@ export async function withAdmissionTransaction<T>(
     if (commit) for (const effect of effects) effect();
     return value;
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => { /* the throw below is the report */ });
+    await client.query("ROLLBACK").catch(() => { broken = true; });
     throw err;
   } finally {
-    client.release();
+    // Discarded on a failed rollback, exactly as in `withOwnedAdmissionLock`:
+    // this helper takes the same fleet-wide admission lock, so a connection
+    // returned still inside its transaction withholds that key from every other
+    // admission decision until something else kills the session.
+    client.release(broken);
   }
 }
 

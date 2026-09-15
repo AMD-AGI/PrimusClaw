@@ -192,6 +192,28 @@ rg -q 'Clear the admission ceilings first' "$err" \
   || bad "the ordering refusal must state the rule, got: $(cat "$err")"
 ok "the ordering refusal states the rule"
 
+echo "==> the preflight reads the dispatch switch the way the Deployment does"
+
+# One values document, two readings, is how a render refuses a pod that would
+# have served or passes one that will not start. api-deployment.yaml renders
+# RUN_DOORBELL_DISPATCH through `dig "runDoorbellDispatch" true`, so an absent
+# key means dispatch is ON; admission-preflight.yaml read the same key with
+# `get`, where absent is nil -- and `ne true nil` is not a verdict at all but a
+# Go "incompatible types for comparison" error, so the render died on an
+# internal type error while the Deployment it was guarding would have come up
+# with dispatch on and the ceiling perfectly legal.
+#
+# `null` is how an operator's values file deletes a key helm's coalescing would
+# otherwise supply from the chart, and values.schema.json does not require this
+# one -- so absent is a shape the chart has to have an answer for.
+absent_switch=("${rollout_base[@]}" --set-string api.admitHardRuns=2
+  --set features.runDoorbellDispatch=null)
+renders "a ceiling renders when the dispatch key is deleted" "$tmp/absent-switch.yaml" \
+  "${absent_switch[@]}"
+[ "$(doorbell_env_of api-deployment.yaml "${absent_switch[@]}")" = 'value: "true"' ] \
+  || bad "the deleted switch does not reach the API container as on, so the preflight above passed the wrong pod"
+ok "the preflight and the API container read the absent switch the same way"
+
 echo "==> the rollback ordering, one step at a time"
 
 # Forward: the fully-enabled shape is legal. Back: clearing the ceilings is

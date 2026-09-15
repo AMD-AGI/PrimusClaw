@@ -8,6 +8,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
 import pino from "pino";
@@ -32,6 +33,93 @@ import {
 const logger = pino({ name: "plugin-from-message" });
 
 const SAFE_SKILL_NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Refuse a staging directory that another local account could have prepared
+ * for us: a symlink (or any non-directory) standing in for the directory, a
+ * directory owned by somebody else, or one left readable/writable by group or
+ * other. `process.getuid` is absent on Windows, where the ownership half of
+ * this simply does not apply; the mode check still runs.
+ */
+function assertPrivateDir(dir: string): void {
+  // lstat, never stat: the whole point is to see the symlink rather than
+  // follow it to the directory it is impersonating.
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`plugin work dir is not a real directory: ${dir}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null && st.uid !== uid) {
+    throw new Error(`plugin work dir is owned by uid ${st.uid}, not ${uid}: ${dir}`);
+  }
+  if ((st.mode & 0o077) !== 0) {
+    throw new Error(`plugin work dir is accessible by other users: ${dir}`);
+  }
+}
+
+/**
+ * Create `workRoot` (and every missing component below the OS temp dir) as a
+ * directory only this user can open, then return a fresh staging directory
+ * inside it whose name cannot be guessed. All plugin assets for this run are
+ * written under the returned path.
+ *
+ * This deliberately is NOT `fs.mkdirSync(workRoot, { recursive: true })`.
+ * `workRoot` lives in the shared OS temp dir (engine.ts uses os.tmpdir()
+ * because BRAIN_SESSION_ROOT can point at a read-only path) and its leading
+ * components are entirely predictable -- `<tmp>/claw-plugin-work/<session>`.
+ * On any host where a second local account can write to /tmp, that account can
+ * create `<tmp>/claw-plugin-work` before Brain ever starts: as a symlink
+ * aimed somewhere else, or as a directory it owns and keeps world-writable.
+ * `mkdir -p` accepts whatever it finds, and every plugin download below
+ * (downloadS3File / syncS3PrefixToLocal) then writes S3 bytes through those
+ * planted entries with Brain's privileges -- arbitrary file overwrite in one
+ * direction, and in the other a window to read or swap the skill and hook
+ * scripts in the moment between download and upload into the sandbox, i.e.
+ * code execution inside the agent's session.
+ *
+ * So the rule is: every component we are responsible for is created 0700, and
+ * anything that already exists must pass assertPrivateDir or we stage nothing
+ * at all. Failing closed here aborts the run, which is the correct outcome --
+ * a /tmp in that state is either under attack or misconfigured, and silently
+ * continuing would write plugin payloads somewhere we did not choose. Please
+ * do not simplify this back into a single recursive mkdir.
+ */
+export function createPrivateStagingRoot(workRoot: string): string {
+  const abs = path.resolve(workRoot);
+  const tmpRoot = path.resolve(os.tmpdir());
+  // Where our responsibility starts. Under the OS temp dir it starts at the
+  // temp dir itself: /tmp is world-writable by design (its sticky bit only
+  // stops other users from replacing entries that already exist and are
+  // ours), so every single component below it is ours to create and to
+  // verify. A workRoot somewhere else is a path an operator configured, and
+  // its existing directories are theirs -- /, /var, /srv and friends are
+  // root-owned and world-readable on purpose and must not be rejected here --
+  // so there we anchor at the deepest component that already exists and
+  // verify only what we create below it.
+  let anchor = tmpRoot;
+  if (abs !== tmpRoot && !abs.startsWith(`${tmpRoot}${path.sep}`)) {
+    anchor = abs;
+    while (!fs.existsSync(anchor) && path.dirname(anchor) !== anchor) {
+      anchor = path.dirname(anchor);
+    }
+  }
+  let cur = anchor;
+  for (const part of path.relative(anchor, abs).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    try {
+      // No `recursive`: recursive mkdir silently accepts an existing entry at
+      // every level, and we need to inspect each one as we go.
+      fs.mkdirSync(cur, { mode: 0o700 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    assertPrivateDir(cur);
+  }
+  // Unguessable leaf, on top of the checks above: mkdtemp creates with 0700
+  // and fails rather than reuse, so even a future relaxation of the ancestor
+  // checks leaves nothing at a path an attacker can predict and pre-create.
+  return fs.mkdtempSync(path.join(abs, "run-"));
+}
 
 interface PluginToolRow {
   id: number;
@@ -246,7 +334,7 @@ export async function resolvePluginToolsFromMessage(
     return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {} };
   }
 
-  fs.mkdirSync(workRoot, { recursive: true });
+  const stageRoot = createPrivateStagingRoot(workRoot);
 
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
@@ -282,7 +370,7 @@ export async function resolvePluginToolsFromMessage(
         toolName && SAFE_SKILL_NAME.test(toolName)
           ? toolName
           : skillNameFromS3Key(s3Key, String(tool.id));
-      const skillDir = path.join(workRoot, "skills", name);
+      const skillDir = path.join(stageRoot, "skills", name);
       try {
         if (onEvent) {
           await onEvent({
@@ -342,7 +430,7 @@ export async function resolvePluginToolsFromMessage(
         continue;
       }
       const base = path.basename(s3Key);
-      const outPath = path.join(workRoot, "rules", `${tool.id}-${base}`);
+      const outPath = path.join(stageRoot, "rules", `${tool.id}-${base}`);
       try {
         await downloadS3File(s3Key, outPath, S3_PLUGINS_BUCKET);
         const body = fs.readFileSync(outPath, "utf-8").trim();
@@ -376,7 +464,7 @@ export async function resolvePluginToolsFromMessage(
         continue;
       }
       const prefix = s3Key.endsWith("/") ? s3Key : `${s3Key}/`;
-      const localHooks = path.join(workRoot, "hooks", String(tool.id));
+      const localHooks = path.join(stageRoot, "hooks", String(tool.id));
       const sandboxDir = `${SANDBOX_HOOKS_ROOT}/${tool.id}`;
       try {
         if (onEvent) {
@@ -415,7 +503,7 @@ export async function resolvePluginToolsFromMessage(
 
         // Upload everything except hooks.json itself — that one stays on
         // Brain for registry building; scripts go into the sandbox.
-        const uploadRoot = fs.mkdtempSync(path.join(workRoot, `hooks-upload-${tool.id}-`));
+        const uploadRoot = fs.mkdtempSync(path.join(stageRoot, `hooks-upload-${tool.id}-`));
         try {
           for (const entry of fs.readdirSync(localHooks, { withFileTypes: true })) {
             if (entry.name === "hooks.json") continue;

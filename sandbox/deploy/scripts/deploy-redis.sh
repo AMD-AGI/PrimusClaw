@@ -182,4 +182,10 @@ echo "    helm upgrade --install agent-sandbox ./deploy/helm \\"
 echo "      --namespace agent-sandbox-system --create-namespace \\"
 echo "      --set controlplane.image.tag=<tag> \\"
 echo "      --set controlplane.config.envdInjectorImage=primussafe/agent-sandbox-envd-injector:<tag> \\"
-echo "      --set redis.deploy=false  # (we just deployed Redis above)"
+echo "      --set redis.deploy=false \\"
+echo "      --set redis.secret.create=false  # (we just deployed Redis and its Secret above)"
+# redis.secret.create=false is not optional here. It defaults to true, and the chart would then
+# re-render Secret/agent-sandbox-redis from .Values.redis.password -- overwriting the 32-char
+# password this script just generated. Since that value is now guarded by `required` in
+# templates/secret.yaml, omitting the flag fails the upgrade loudly instead of silently
+# replacing a good password with a blank one, but the correct answer is still to skip the Secret.

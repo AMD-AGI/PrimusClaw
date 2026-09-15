@@ -15,7 +15,7 @@ from .clients.control_plane import ControlPlaneClient
 from .clients.data_plane import DataPlaneClient
 from .exceptions import SandboxError
 from .files import Files
-from .session import ExecResult, SessionManager
+from .session import SessionManager
 
 
 class Sandbox:
@@ -158,6 +158,10 @@ class Sandbox:
             try:
                 self._cp.delete_sandbox(self._session_id)
             except Exception:
+                # Best effort. close() must leave the client usable and must not mask the
+                # caller's own exception when it runs from a `with` block unwinding on error.
+                # The sandbox has a server-side TTL, so a failed delete leaks nothing
+                # permanently; the local handles below are cleared either way.
                 pass
             self._session_id = None
             self._sandbox_name = None
@@ -588,6 +592,9 @@ class PortForward:
                 try:
                     c.close()
                 except Exception:
+                    # Already-closed or reset sockets raise here; we are tearing the forward
+                    # down anyway. Swallow so one bad connection cannot stop the remaining
+                    # ones from being closed.
                     pass
             self._conns.clear()
         if self._thread:

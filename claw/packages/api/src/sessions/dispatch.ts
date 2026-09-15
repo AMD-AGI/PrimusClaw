@@ -20,8 +20,8 @@ import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import {
-  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
-  SWEEPABLE_RUN_STATUSES,
+  clearDispatchReconcile, failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq,
+  recordPublishState, SWEEPABLE_RUN_STATUSES,
 } from "../tasks/chat-run.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
@@ -365,6 +365,19 @@ export async function dispatchTaskToBrain(
           filesWorkspaceId,
           pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
           sandboxImage: finalSandboxImage,
+          // Forwarded here for the same reason the doorbell branch forwards it,
+          // and it was missing here alone. The action is what arms the row:
+          // `insertTask` writes `dispatch_reconcile_at` only when
+          // `dispatch_reconcile_action` is non-null, so a fat row opened
+          // without one is invisible to `reconcileAmbiguousDispatches` for
+          // ever. The `publish_unknown` this function can return then settles
+          // nothing and asks nobody to: the caller is told not to roll back --
+          // that is the whole point of the kind -- and no sweep can finish the
+          // cleanup it deferred, so the created session, its `UserMessage` and
+          // its `running` gate outlive the 503 with no owner. The fat orphan
+          // reaper closes the row hours later and still never runs the action,
+          // because the action is the part that deletes the session.
+          reconcileAction: input.reconcileAction,
           // Secret-free, and narrower than the doorbell path's spec on purpose:
           // nothing rehydrates a fat row from `input` -- it is published on the
           // wire -- so sealing credentials into it would store a secret no
@@ -421,6 +434,26 @@ export async function dispatchTaskToBrain(
       () => sessionDispatchPorts.publishTask(subject, payload),
     );
     await sessionDispatchPorts.recordDispatchSeq(run.taskId, seq);
+    // And handed back the moment the outcome is settled, which is the other
+    // half of arming it. A marker left on a row that dispatched cleanly is not
+    // inert: `resolveAmbiguousDispatch` reads a fat row as never executed --
+    // nothing on this path increments `claim_count`, that is the doorbell
+    // claim's counter -- so at the horizon it would run the stored action
+    // against a healthy turn and, for a create, delete the session the user is
+    // talking in. False is the answer `clearDispatchReconcile` gives after a
+    // takeover, and it means the same thing here as on the doorbell side: the
+    // outcome is no longer this caller's to report.
+    if (run.reconcileToken && !await clearDispatchReconcile(run.taskId, run.reconcileToken)) {
+      logger.error(
+        { sessionId, messageId, subject, runTaskId },
+        "message.dispatch_unknown_awaiting_reconcile",
+      );
+      return {
+        kind: "publish_unknown",
+        messageId,
+        error: new Error("task dispatch outcome unknown"),
+      };
+    }
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
     return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage, runId: run.taskId };
   } catch (err: any) {

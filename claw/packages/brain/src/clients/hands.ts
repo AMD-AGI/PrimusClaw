@@ -885,9 +885,24 @@ export class HandsClient {
       .map((c) => c.text!)
       .join("\n");
     // Durable before the result reaches the caller, so a crash after the spawn
-    // cannot leave a shell nothing attests to.
+    // cannot leave a shell nothing attests to -- attempted first, but never
+    // allowed to replace the answer. `advanceRow` throws when the CAS loses
+    // eight times or the bucket is unreachable, and a throw here turns a spawn
+    // that happened into an error: the caller never sees the text, which is the
+    // only place the shell id appears, so the model is left with a live process
+    // it can neither poll nor kill. Swallowing costs nothing the throw did not
+    // already cost -- either way the row stands at `dispatched`, which is the
+    // state both the next replay and `reconcileOutstandingStarts` are written
+    // to settle by probing the sandbox for the record this spawn just filed.
     if (address && store && !isError) {
-      await advanceRow(store, address, this.generation, "spawn_confirmed", start.carry);
+      try {
+        await advanceRow(store, address, this.generation, "spawn_confirmed", start.carry);
+      } catch (err) {
+        logger.warn(
+          { err: String(err), shellId: fixed.shell_id },
+          "bg_start.confirm_write_failed",
+        );
+      }
     }
     // The caller is told the id it sent, or the one minted for it -- never the
     // wire form, which is Brain's business and an id nothing else can reproduce.

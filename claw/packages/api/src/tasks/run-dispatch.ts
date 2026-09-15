@@ -154,6 +154,25 @@ async function openAdmittedRun(
  * would tell the caller the turn was declined while claim-next runs it, and the
  * caller's rollback would then delete the `UserMessage` out from under it. It
  * is retried once, and a throw routes the caller to its dispatch-failure path.
+ *
+ * The last attempt goes through `failRun` rather than a third `discard`, and
+ * the reason is the wrapper rather than the verb. `discardRun` is a bare
+ * compensation: `dispatchByDoorbell` wires `rememberTaskId` into `failRun`
+ * only, so a throw raised from here used to leave the caller's `runTaskId` at
+ * null even though the row exists -- `publishCertainlyFailed` was skipped,
+ * `failChatRunDispatch(null, ...)` answered `closed` because there is no row to
+ * look at, and the create path's rollback then deleted the session and its
+ * `UserMessage` while the row stayed `queued`, unheld and perfectly claimable.
+ * claim-next takes it seconds later and Brain answers a message, in a session,
+ * that no longer exists. Telling the caller the id is what lets its catch read
+ * a real verdict and answer `publish_unknown` instead of rolling back.
+ *
+ * Terminalizing rather than erasing is the honest second choice, not a
+ * relaxation of "a refused turn leaves nothing behind": that criterion is what
+ * the two DELETEs were for, and once both have failed the alternative on offer
+ * is not a clean row but an open one that runs the turn the fleet just refused.
+ * `resolveAmbiguousDispatch` settles the same row the same way when it gets
+ * there first, so this is the sweeper's answer taken one round trip earlier.
  */
 async function discardRefusedRun(
   input: HandOffInput,
@@ -163,6 +182,9 @@ async function discardRefusedRun(
   const discard = input.discardRun ?? discardChatRunDispatch;
   let verdict = await discard(taskId);
   if (verdict === "unknown") verdict = await discard(taskId);
+  if (verdict === "unknown") {
+    verdict = await (input.failRun ?? failChatRunDispatch)(taskId, reason);
+  }
   if (verdict === "held") {
     return heldByWorker(taskId, input.messageId, input.sessionId, "hard_limit_exceeded");
   }
