@@ -20,13 +20,15 @@
  *
  * Both KV destroy and SaFE workload stop are idempotent.
  */
-import { DagHandleMap, HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
+import {
+  DagHandleMap, HANDLE_MAP_PREFIX, setHandleEntry, type HandleInfo,
+} from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { SAFE_API_URL } from "../config.js";
-import { kvDagHandles } from "../infra/nats.js";
+import { DAG_HANDLES_BUCKET, jsm, kvDagHandles } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
 const logger = pino({ name: "sandbox-stopper" });
@@ -282,6 +284,40 @@ export const handleRegistry = {
   },
   listAll(): Promise<Array<[string, Record<string, HandleInfo>]>> {
     return handleMap().listAll();
+  },
+  /**
+   * The same question as `listForDag`, asked of the stream leader.
+   *
+   * `kv.get` uses a direct read when the bucket allows one, and the client
+   * documents those as possibly stale: on a multi-replica cluster a read can
+   * land on a replica that has not yet seen a registration the writer already
+   * had acknowledged. Everywhere else on this path that costs a retry or a
+   * conservative `unconfirmed`. In one place it costs the answer -- the branch
+   * that concludes a DAG holds nothing at all -- so that branch asks the
+   * leader before saying so.
+   */
+  async listForDagConsistent(dagRootTaskId: string): Promise<Record<string, HandleInfo>> {
+    const key = `${HANDLE_MAP_PREFIX}.${dagRootTaskId}`;
+    let sm;
+    try {
+      sm = await jsm.streams.getMessage(`KV_${DAG_HANDLES_BUCKET}`, { last_by_subj: `$KV.${DAG_HANDLES_BUCKET}.${key}` });
+    } catch (e) {
+      // "no messages" is the key genuinely not being there, which is the
+      // answer. Anything else is an unknown and must not read as empty.
+      if (/no message|not found/i.test(errText(e))) return {};
+      throw e;
+    }
+    if (!sm || sm.data.length === 0) return {};
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(sm.data));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`handle map entry ${key} is not a JSON object`);
+    }
+    const out: Record<string, HandleInfo> = {};
+    for (const [name, raw] of Object.entries(parsed as Record<string, unknown>)) {
+      const info = typeof raw === "string" ? { workload_id: raw } : raw;
+      if (info && typeof info === "object") setHandleEntry(out, name, info as HandleInfo);
+    }
+    return out;
   },
 };
 
@@ -830,6 +866,24 @@ export async function stopAllHandlesForDag(
   }
 
   if (handles.length === 0) {
+    // An empty snapshot is the one reading that decides an answer rather than
+    // bounding one, so it is confirmed against the leader before being
+    // believed. A direct read may be behind a registration the writer already
+    // had acknowledged, and answering `nothing_held` on that is a workload
+    // reported released with no stop ever issued.
+    try {
+      const authoritative = Object.keys(await handleRegistry.listForDagConsistent(dagRootTaskId));
+      if (authoritative.length > 0) {
+        logger.warn(
+          { dagRootTaskId, handles: authoritative },
+          "sandbox.stale_empty_handle_read",
+        );
+        return "unconfirmed";
+      }
+    } catch (e) {
+      logger.warn({ dagRootTaskId, err: errText(e) }, "sandbox.handle_list_failed");
+      return "unconfirmed";
+    }
     try {
       return (await unreleasedRecord.any(dagRootTaskId)) ? "unconfirmed" : "nothing_held";
     } catch (e) {

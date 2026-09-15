@@ -46,6 +46,7 @@
  *   R17 a handle that leaked earlier is not confirmed away by a later teardown
  *   R18 a handle is on record before its stop runs, not after it fails
  *   R19 a destroy whose response was lost is recorded, not forgotten
+ *   R22 an empty snapshot is confirmed against the leader before `nothing_held`
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -155,6 +156,11 @@ function stubHandles(handles: Record<string, string>): void {
   handleRegistry.listAll = async () => [
     ["t-root", Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]))],
   ];
+  // The branch that answers `nothing_held` confirms an empty snapshot against
+  // the leader first, because a direct read may be behind a registration. The
+  // stub agrees with itself: whatever `listForDag` says, the leader says too.
+  handleRegistry.listForDagConsistent = async () =>
+    Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
 }
 
 /**
@@ -297,6 +303,7 @@ test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_he
   // green with the branch returning exactly the wrong value.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
+  handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "" } });
   handleRegistry.lookup = async () => ({ workload_id: "" });
   handleRegistry.destroy = async () => "";
   handleRegistry.listAll = async () => [];
@@ -516,6 +523,7 @@ test("R15 an unreadable handle registry is unconfirmed, never nothing_held", asy
     get: async () => { throw new Error("nats: no responders"); },
   } as unknown as Parameters<typeof makeKvStore>[0]));
   handleRegistry.listForDag = (dag: string) => unreachable.listForDag(dag);
+  handleRegistry.listForDagConsistent = (dag: string) => unreachable.listForDag(dag);
   handleRegistry.lookup = (dag: string, h: string) => unreachable.lookup(dag, h);
 
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
@@ -591,6 +599,8 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
   }) as typeof db.query;
   handleRegistry.listForDag = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
+  handleRegistry.listForDagConsistent = async () =>
+    Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
   handleRegistry.lookup = async (_dag: string, name: string) =>
     live.has(name) ? { workload_id: live.get(name)! } : null;
   handleRegistry.listAll = async () => [];
@@ -639,6 +649,7 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   // checkable; a false clear on a live GPU is neither.
   stubDb();
   handleRegistry.listForDag = async () => ({ main: { workload_id: "w-1" } });
+  handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "w-1" } });
   handleRegistry.lookup = async () => ({ workload_id: "w-1" });
   handleRegistry.destroy = async () => { throw new Error("nats: request timeout"); };
   handleRegistry.listAll = async () => [];
@@ -655,4 +666,26 @@ test("R19 a destroy whose response was lost is recorded, not forgotten", async (
   // it inventing the one answer it must never invent.
   handleRegistry.listForDag = async () => ({});
   assert.equal((await cancelTask("t-root")).released, "unconfirmed");
+});
+
+test("R22 an empty snapshot is confirmed against the leader before nothing_held", async () => {
+  // `kv.get` takes a direct read when the bucket allows one, and those may be
+  // behind a registration the writer already had acknowledged. Everywhere else
+  // on this path a stale read costs a retry or a conservative `unconfirmed`.
+  // Here it would cost the answer: a DAG that holds a workload, reported as
+  // holding nothing, with no stop ever issued.
+  stubDb();
+  handleRegistry.listForDag = async () => ({});            // the stale replica
+  handleRegistry.listForDagConsistent = async () => ({     // what the leader has
+    main: { workload_id: "w-registered" },
+  });
+  const { stopped } = stubSafe(() => new Response("", { status: 200 }));
+
+  const r = await cancelTask("t-root");
+
+  assert.equal(
+    r.released, "unconfirmed",
+    "a workload the leader knows about must not be reported as never held",
+  );
+  assert.deepEqual(stopped, [], "this call stopped nothing, and does not claim to have");
 });

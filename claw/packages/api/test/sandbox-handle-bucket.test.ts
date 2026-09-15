@@ -55,8 +55,11 @@ test("B1 Brain's handle writer and the API's handle reader name the same bucket"
 test("B2 the stopper reads the DAG handles binding, not the short-lived registry", () => {
   const stopper = read("../src/tasks/sandbox-stopper.ts");
 
+  // The binding, not the shape of the import line: this guard is about which
+  // bucket the stopper reads, and pinning the exact import list made it fail
+  // when a second name was added beside it.
   assert.match(
-    stopper, /import \{ kvDagHandles \} from "\.\.\/infra\/nats\.js"/,
+    stopper, /import \{[^}]*\bkvDagHandles\b[^}]*\} from "\.\.\/infra\/nats\.js"/s,
     "the handle map is built over the DAG handles bucket",
   );
   // `kv` is BRAIN_REGISTRY: five-minute TTL, sized for `lock.<key>`. A handle
