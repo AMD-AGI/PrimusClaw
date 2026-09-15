@@ -1585,6 +1585,32 @@ class TaskRunner {
   }
 
   /** Recover the latest in-flight workspace checkpoint into the session prefix. */
+  /**
+   * Reap a PENDING entry this attempt left behind -- and only this attempt's.
+   *
+   * The entry records the task that wrote it, which keeps a failing task off a
+   * sibling DAG's workload. It cannot tell two ATTEMPTS of the same task apart:
+   * a delivery whose lease expired is redelivered under the same task_id, so
+   * the new attempt's entry carries the identity the old attempt compares
+   * against, and the old one stops a workload the new one is using.
+   *
+   * The lock is what separates them. Losing the lease means this session has
+   * moved to another holder, and a holder that no longer has the lock has no
+   * business tearing anything down -- whatever it would reap now belongs to
+   * whoever took it. The heartbeat has already aborted us by this point; this
+   * failure handler simply had not been looking.
+   */
+  private async reapOwnPendingHands(): Promise<void> {
+    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+      logger.warn(
+        { sessionId: this.sessionId, taskId: this.request.task_id, lockKey: this.lockKey },
+        "hands.reap_pending_skipped_lease_lost",
+      );
+      return;
+    }
+    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
+  }
+
   private async recoverInflightCheckpoint(reason: string): Promise<void> {
     // The destination is the session prefix a delete has just emptied, so this
     // is the same hazard as a late workspace flush, only with a whole snapshot
@@ -3022,7 +3048,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands left a PENDING entry
     // (no-op when the entry is READY — a healthy sandbox is kept for the
     // retry to reuse). Done BEFORE nak so the retry starts clean.
-    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
+    await this.reapOwnPendingHands();
     // Flush a per-attempt transcript before NAK so the JSONL captures
     // events of THIS attempt even if the next delivery / pod loses state.
     this.transcriptLog.push({
@@ -3068,7 +3094,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
-    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
+    await this.reapOwnPendingHands();
     // Classify sandbox-originated failures so the frontend can render a
     // dedicated banner (and so the user sees a readable reason rather than
     // a raw stack-trace tail). Non-sandbox errors fall through with the

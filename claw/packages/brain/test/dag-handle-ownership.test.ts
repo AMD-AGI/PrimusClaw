@@ -743,20 +743,28 @@ test("H21 an empty PUT is replaced, not create-conflicted forever", async () => 
 });
 
 
-test("H22 the reaper's identity check is wired through both call sites", async () => {
+test("H22 the reaper's identity check is wired through every call site", async () => {
   // The rule itself is exercised against the real function in
-  // reap-pending-task-identity.test.ts. What is left to check here is the
-  // wiring, which that test cannot see: the entry has to record who wrote it,
-  // and every caller has to supply the identity it gets compared against. A
-  // guard nobody passes an expectation to is a guard that never fires.
+  // reap-pending-task-identity.test.ts, and the lease guard against the real
+  // runner in task-runner-terminal-release.test.ts (R9). What is left here is
+  // the wiring neither can see: the entry has to record who wrote it, and no
+  // failure path may reach the reaper except through the one method that
+  // supplies the identity and checks the lease. A guard nobody routes through
+  // is a guard that never fires.
   const runnerSrc = readFileSync(
     fileURLToPath(new URL("../src/tasks/runner.ts", import.meta.url)), "utf-8");
   assert.equal(
-    (runnerSrc.match(/reapPendingHands\(this\.sessionId, \{ taskId: this\.request\.task_id \}\)/g) || []).length,
-    2, "both failure paths have to pass it");
+    (runnerSrc.match(/await this\.reapOwnPendingHands\(\)/g) || []).length, 2,
+    "both failure paths go through the wrapper");
   assert.equal(
-    (runnerSrc.match(/reapPendingHands\(this\.sessionId\)/g) || []).length,
-    0, "and neither may call it without one");
+    (runnerSrc.match(/fx\(\)\.reapPendingHands\(/g) || []).length, 1,
+    "and only the wrapper calls the reaper itself");
+  const wrapper = runnerSrc.slice(runnerSrc.indexOf("private async reapOwnPendingHands"));
+  const body = wrapper.slice(0, wrapper.indexOf("\n  }"));
+  assert.match(body, /LEASE_LOST_ABORT_REASON/,
+    "a holder that lost the lock must not tear anything down");
+  assert.match(body, /taskId: this\.request\.task_id/,
+    "and the reap it does make is bound to this task");
   const ehSrc = readFileSync(
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
   const payload = ehSrc.slice(ehSrc.indexOf("const pendingPayload = sc.encode"));

@@ -647,3 +647,51 @@ test("a session whose sandbox was torn down builds a new one instead of failing"
     "no entry means no reuse -- and the caller builds a sandbox, which is what "
     + "the turn needs");
 });
+
+// A pending entry is not automatically this task's leftover.
+//
+// Under a session-scoped run gate two DAG roots take different lock keys and
+// run at the same time over one `hands.<sessionId>` entry. So the pending entry
+// a lazily-attaching task finds may be a sibling's create still in flight --
+// and destroying it stopped a workload the sibling went on to promote and use.
+// Round 33 reproduced exactly that: `stopped=[{id:"W2", inUse:true,
+// currentStatus:"ready"}], deleted=true`.
+const PENDING_OF = (taskId?: string) => ({
+  status: "pending" as const,
+  handsUrl: "http://hands.test:9100/mcp",
+  token: "tok-existing",
+  workloadId: "wl-sibling",
+  ...(taskId === undefined ? {} : { taskId }),
+});
+
+test("a pending entry another task wrote is left where it is", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF("t-sibling") as never, {
+    request: { ...REQUEST, task_id: "t-mine" },
+  });
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.equal(result, null, "this task still goes on to create its own");
+  assert.deepEqual(destroyed, [], "but not over the top of a sibling's workload");
+});
+
+test("a pending entry this task wrote is still cleaned up", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF("t-mine") as never, {
+    request: { ...REQUEST, task_id: "t-mine" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own leftover is exactly what this branch is for");
+});
+
+test("a pending entry with no task on it is cleaned up as before", async () => {
+  // It predates the field, so it can only have come from a process running
+  // before this rollout. Leaving those would leak them.
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF() as never, { request: { ...REQUEST, task_id: "t-mine" } });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"]);
+});

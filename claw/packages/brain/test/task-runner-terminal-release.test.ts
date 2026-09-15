@@ -88,7 +88,7 @@ process.env.SAFE_API_URL = `http://127.0.0.1:${(safe.address() as AddressInfo).p
 
 const { bindTaskRunnerDeps, runHandleTask } = await import("../src/tasks/runner.js");
 const { AgentDoneDeliveryError } = await import("../src/tasks/callback.js");
-const { activeAbort, RUN_ROW_TERMINAL_ABORT_REASON } =
+const { activeAbort, RUN_ROW_TERMINAL_ABORT_REASON, LEASE_LOST_ABORT_REASON } =
   await import("../src/tasks/abort-registry.js");
 
 /**
@@ -195,10 +195,18 @@ function stubSideEffects(
   };
 }
 
+let abortDuringHandlerCtrl: AbortController | null = null;
+
 interface Scenario {
   request: ExecuteRequest;
   /** Set before the run, the way a refused lease renewal sets it mid-run. */
   abortReason?: unknown;
+  /**
+   * Set from inside the retryable-failure handler, which is where the heartbeat
+   * actually aborts: after the dispatch that routes an already-aborted run
+   * elsewhere, and before the reap.
+   */
+  abortDuringHandler?: unknown;
   nakThrows?: boolean;
   ackThrows?: boolean;
   sideEffects?: Partial<TaskRunnerSideEffects>;
@@ -212,7 +220,17 @@ async function run(scenario: Scenario) {
     ackThrows: scenario.ackThrows,
   });
   const kv = fakeKv();
-  const sideEffects = stubSideEffects(scenario.sideEffects);
+  const sideEffects = stubSideEffects({
+    ...("abortDuringHandler" in scenario
+      ? {
+        markRetryPending: (async () => {
+          safeCalls.push("markRetryPending");
+          abortDuringHandlerCtrl?.abort(scenario.abortDuringHandler);
+        }) as never,
+      }
+      : {}),
+    ...scenario.sideEffects,
+  });
   const engine: Engine = {
     async execute() {
       safeCalls.push("engine.execute");
@@ -226,6 +244,7 @@ async function run(scenario: Scenario) {
   });
 
   const abortCtrl = new AbortController();
+  abortDuringHandlerCtrl = abortCtrl;
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
   if ("abortReason" in scenario) abortCtrl.abort(scenario.abortReason);
@@ -357,4 +376,40 @@ test("R6 a batch node hands the cluster back before it reaps its shells", async 
   assert.ok(released >= 0, "a multi-node message owes its cluster back");
   assert.ok(reaped >= 0, "and a finished batch node owes its background shells");
   assert.ok(released < reaped, `the cluster goes first, in: ${calls.join(" -> ")}`);
+});
+
+test("R9 an attempt that lost its lease does not reap the new attempt's workload", async () => {
+  // Round 33. The pending entry records the task that wrote it, which keeps a
+  // failing task off a SIBLING DAG's workload -- but it cannot separate two
+  // ATTEMPTS of the same task. A delivery whose lease expires is redelivered
+  // under the same task_id, so the new attempt's entry carries exactly the
+  // identity the old attempt compares against, and the old one stops a workload
+  // the new one is using. Reproduced with both holders acquiring, the real
+  // heartbeat aborting the first, and `stopSawReady=true`.
+  //
+  // The lease goes at the moment the heartbeat notices, which is INSIDE the
+  // failure handler -- past the dispatch that would have routed an
+  // already-aborted run to the interrupt branch. So this aborts from
+  // `markRetryPending`, which is where that handler sits when the heartbeat
+  // fires, rather than before the run: setting it up front tests the interrupt
+  // path, which never reaches the reaper at all and passes with the guard
+  // deleted.
+  const lost = await run({
+    request: { session_id: SESSION, task_id: "t-redelivered", prompt: "go" } as ExecuteRequest,
+    engineBehavior: async () => { throw new Error("503 from upstream"); },
+    abortDuringHandler: LEASE_LOST_ABORT_REASON,
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("markRetryPending"), "the handler really did run");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "the workload it would reap belongs to whoever took the lock");
+
+  // Any other failure still reaps -- that is what the function is for.
+  const kept = await run({
+    request: { session_id: SESSION, task_id: "t-plain", prompt: "go" } as ExecuteRequest,
+    engineBehavior: async () => { throw new Error("503 from upstream"); },
+  });
+  await kept.settled;
+  assert.ok(safeCalls.includes("reapPendingHands"),
+    "a task that still holds its lock cleans up after itself");
 });

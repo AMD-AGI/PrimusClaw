@@ -472,11 +472,25 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   }
 
   if (info.status !== "ready") {
+    // "Stale" is an assumption, and under a session-scoped run gate it is
+    // sometimes wrong: two DAG roots take different lock keys and run at once
+    // over this one entry, so a pending entry can be a sibling's create still
+    // in flight rather than this task's own leftover. Destroying it stopped a
+    // workload the sibling went on to promote and use.
+    //
+    // Whoever wrote it says so on the entry. Somebody else's is left where it
+    // is -- this task cannot reuse it either, so it falls through to creating
+    // its own, which is what it would have done anyway.
+    const entryTask = typeof info.taskId === "string" ? info.taskId : null;
+    const mine = !entryTask || !request.task_id || entryTask === request.task_id;
     logger.warn(
-      { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)" },
-      "hands.kv.stale_pending_found",
+      { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)",
+        entryTaskId: entryTask, taskId: request.task_id ?? null, mine },
+      mine ? "hands.kv.stale_pending_found" : "hands.kv.pending_belongs_to_other_task",
     );
-    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    if (mine) {
+      await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    }
     return null;
   }
 
