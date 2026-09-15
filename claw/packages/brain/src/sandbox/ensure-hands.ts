@@ -1661,6 +1661,10 @@ export function makeOnProvisioned(deps: {
       try {
         await replaceDagHandle(deps.dagRootTaskId, deps.handleName, {
           workload_id: workloadId,
+          // Not serving yet: SaFE has an id for it, but it can still be queued
+          // for a GPU. Readers that ping what a handle names have to be able to
+          // tell this row from one that finished provisioning.
+          pending: true,
           platform_key: deps.apiKey || "",
           image: deps.sandboxImage ?? undefined,
           namespace: deps.namespace,

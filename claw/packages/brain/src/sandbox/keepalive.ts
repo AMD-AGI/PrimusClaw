@@ -2002,6 +2002,14 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
           namespace: info.namespace,
           userId: info.user_id,
         };
+        // A handle written before its workload can serve anything is not a
+        // ping target. The registration happens as soon as SaFE assigns an id,
+        // so this row can name a workload still queued for a GPU: exec against
+        // it returns a perfectly ordinary 404, which counts as a failure, and
+        // enough sweeps of ordinary queueing then evict a workload that was
+        // never unhealthy. The session-row scan already skips PENDING for the
+        // same reason.
+        if (info.pending) continue;
         const usable = entry.provider === "agent-sandbox"
           ? !!entry.sessionId : !!(entry.workloadId && entry.platformKey);
         if (!usable) continue;

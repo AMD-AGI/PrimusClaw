@@ -837,3 +837,51 @@ test("H23 the merge's own four seams", async () => {
   assert.match(bind.slice(0, bind.indexOf("\n}")), /prop === "then"/,
     "the lazy bind must not look like a promise to await");
 });
+
+test("H24 a handle written before its workload can serve anything is not a ping target", async () => {
+  // Round 42's fifth merge defect, and the same shape as the other four: fine
+  // in each parent, wrong combined. This PR registers the handle the moment
+  // SaFE assigns an id -- deliberately, because a cancel arriving before that
+  // reads the DAG as holding nothing -- and #35 added a keepalive census that
+  // walks DAG_HANDLES. Together, keepalive execs a workload still queued for a
+  // GPU, gets an ordinary 404, counts it as a failure, and after
+  // SANDBOX_KEEPALIVE_FAIL_LIMIT sweeps destroys a workload that was never
+  // unhealthy: `{"pings":1,"stops":1,"handlesAfter":[]}`.
+  //
+  // Each parent was safe: this PR's keepalive did not scan DAG_HANDLES and
+  // skipped PENDING session rows; #35's handles only appeared once READY.
+  const eh = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
+  const decl = eh.slice(eh.indexOf("export function makeOnProvisioned"));
+  // Past the deps type literal, whose own `\n})` would end the slice early.
+  const hook = decl.slice(decl.indexOf("}): (workloadId: string) => Promise<void> {"));
+  assert.match(hook.slice(0, hook.indexOf("\n}")), /pending: true,/,
+    "the early registration has to say the workload is not serving yet");
+
+  const ka = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/keepalive.ts", import.meta.url)), "utf-8");
+  // The DAG census specifically -- `census.seenIdentities.add` appears in three
+  // scans, and the other two do not read DAG_HANDLES at all.
+  const end = ka.indexOf("keepalive.dag_handle_scan_failed");
+  assert.notEqual(end, -1, "expected the DAG handle scan");
+  const census = ka.slice(ka.lastIndexOf("for await", end), end);
+  assert.match(census, /if \(info\.pending\) continue;/,
+    "and the census that pings what handles name has to skip those");
+  // The DAG census's own `add`, which is the last one before the scan's catch;
+  // an earlier one in this slice belongs to the session-row scan above it.
+  assert.ok(
+    census.indexOf("if (info.pending) continue;") < census.lastIndexOf("census.seenIdentities.add"),
+    "skipped before it becomes a ping target, not after",
+  );
+
+  // The flag has to clear, or a sandbox that finished provisioning is never
+  // pinged again. `replaceDagHandle` writes the row it is given, and the
+  // registrations at the end of ensureHands do not carry it.
+  for (const marker of ["hands_url: reused.handsUrl", "hands_url: handsUrl"]) {
+    const at = eh.indexOf(marker);
+    assert.notEqual(at, -1, `expected a final registration at ${marker}`);
+    const block = eh.slice(eh.lastIndexOf("replaceDagHandle(", at), at);
+    assert.equal(/pending:/.test(block), false,
+      "a registration that carries an endpoint must not still be marked pending");
+  }
+});

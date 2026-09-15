@@ -30,6 +30,18 @@ export const HANDLE_MAP_PREFIX = "dag-handles";
  */
 export interface HandleInfo {
   workload_id: string;
+  /**
+   * Written before the workload can serve anything.
+   *
+   * The handle is registered the moment SaFE assigns an id -- deliberately,
+   * because a cancel arriving before that reads the DAG as holding nothing --
+   * but at that point the workload may still be Pending, queued for a GPU. A
+   * reader that treats every handle as a live endpoint will exec against it,
+   * get a 404 for a container that does not exist yet, and count that as a
+   * sandbox failing. Cleared when the registration at the end of ensureHands
+   * replaces this row with the connection fields.
+   */
+  pending?: boolean;
   hands_url?: string;
   token?: string;
   platform_key?: string;
