@@ -142,7 +142,7 @@ test("a publish failure closes the row that was already opened", async () => {
 test("a post-insert hard exceed fails the row rather than ringing a doorbell", async () => {
   withCrypto();
   let published = 0;
-  const failed: Array<{ taskId: string; reason: string }> = [];
+  const discarded: string[] = [];
   const result = await handOffAssembledRun({
     task: { ...TASK },
     sessionId: "s-1",
@@ -151,16 +151,19 @@ test("a post-insert hard exceed fails the row rather than ringing a doorbell", a
     prompt: "hello",
     publish: async () => { published += 1; },
     openRun: (async () => ({ taskId: "ktsk_1" })) as never,
-    failRun: (async (taskId: string, reason: string) => {
-      failed.push({ taskId, reason });
+    failRun: (async () => { throw new Error("a refusal is discarded, not failed"); }) as never,
+    discardRun: (async (taskId: string) => {
+      discarded.push(taskId);
       return "closed";
     }) as never,
     admit: async () => ({ kind: "admit" as const }),
     hardAfterInsert: async () => "runs_hard_limit",
   });
-  assert.deepEqual(result, { kind: "rejected", reason: "runs_hard_limit" });
+  assert.deepEqual(result, { kind: "rejected", reason: "runs_hard_limit", taskId: "ktsk_1" });
   assert.equal(published, 0);
-  assert.deepEqual(failed, [{ taskId: "ktsk_1", reason: "runs_hard_limit" }]);
+  // Erased, not recorded at `failed`: a turn the fleet declined is not a fault
+  // the caller should find a row for.
+  assert.deepEqual(discarded, ["ktsk_1"]);
 });
 
 test("an open that returns nothing is reported as open_failed, not dispatched", async () => {
@@ -193,7 +196,7 @@ test("a hard limit does not refuse a turn a worker is already running", async ()
     openRun: (async () => ({ taskId: "t1" })) as never,
     admit: (async () => ({ kind: "dispatch" })) as never,
     hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
-    failRun: (async () => "held") as never,
+    discardRun: (async () => "held") as never,
   });
   assert.deepEqual(result, { kind: "dispatched", taskId: "t1", messageId: "m1" });
 });
@@ -209,9 +212,11 @@ test("a hard limit still refuses a turn nothing has started", async () => {
     openRun: (async () => ({ taskId: "t1" })) as never,
     admit: (async () => ({ kind: "dispatch" })) as never,
     hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
-    failRun: (async () => "closed") as never,
+    discardRun: (async () => "closed") as never,
   });
-  assert.deepEqual(result, { kind: "rejected", reason: "fleet at the hard ceiling" });
+  assert.deepEqual(result, {
+    kind: "rejected", reason: "fleet at the hard ceiling", taskId: "t1",
+  });
 });
 
 test("a failed doorbell publish does not unwind a run claim-next already took", async () => {
@@ -246,7 +251,32 @@ test("a recheck that throws does not unwind a run claim-next already took", asyn
   assert.deepEqual(result, { kind: "dispatched", taskId: "t1", messageId: "m1" });
 });
 
-test("a compensation that could not run still refuses the turn", async () => {
+test("a discard that could not establish anything throws rather than refusing", async () => {
+  // `unknown` is a row still open, still unheld and still claimable. Answering
+  // `rejected` over it tells the caller the turn was declined while claim-next
+  // runs it, and the caller's rollback then deletes the UserMessage out from
+  // under the turn. Nor is it `dispatched`: nothing said a worker has it.
+  let attempts = 0;
+  await assert.rejects(
+    handOffAssembledRun({
+      task: { prompt: "hi" },
+      sessionId: "s1",
+      userId: "u1",
+      messageId: "m1",
+      prompt: "hi",
+      publish: async () => {},
+      openRun: (async () => ({ taskId: "t1" })) as never,
+      admit: (async () => ({ kind: "dispatch" })) as never,
+      hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
+      discardRun: (async () => { attempts += 1; return "unknown"; }) as never,
+    }),
+    /could not discard refused run t1/,
+  );
+  assert.equal(attempts, 2, "retried once before giving up");
+});
+
+test("a discard that succeeds on the retry refuses without throwing", async () => {
+  let attempts = 0;
   const result = await handOffAssembledRun({
     task: { prompt: "hi" },
     sessionId: "s1",
@@ -257,9 +287,10 @@ test("a compensation that could not run still refuses the turn", async () => {
     openRun: (async () => ({ taskId: "t1" })) as never,
     admit: (async () => ({ kind: "dispatch" })) as never,
     hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
-    failRun: (async () => "unknown") as never,
+    discardRun: (async () => (++attempts === 1 ? "unknown" : "closed")) as never,
   });
-  // Not `dispatched`: nothing said a worker has it, and claiming otherwise
-  // would report a turn as running on the strength of a failed statement.
-  assert.deepEqual(result, { kind: "rejected", reason: "fleet at the hard ceiling" });
+  assert.deepEqual(result, {
+    kind: "rejected", reason: "fleet at the hard ceiling", taskId: "t1",
+  });
+  assert.equal(attempts, 2);
 });

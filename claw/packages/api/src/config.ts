@@ -332,24 +332,117 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
  * at claim time, instead of putting the full execute request on JetStream.
  *
- * Off by default: a rolling fleet must keep serving fat messages until every
- * Brain replica understands the doorbell. See packages/api/src/tasks/run-claim.ts.
+ * On by default. The capability floor keeps each API on fat dispatch until the
+ * fleet explicitly asserts support for this binary's semantics version.
  */
-export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", false);
+export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
+
+/**
+ * The deployment's assertion that every Brain able to receive `tasks.execute`
+ * takes a durable SQL holder before its execution gate.
+ *
+ * Not a switch over one sweeper pass: it is the first evidence arm of the
+ * shared no-delivery guard, and asserting it does not adjust the other arms but
+ * makes them irrelevant -- every unheld fat row becomes eligible on the
+ * assertion alone, whatever its receipt says and whether or not the durable can
+ * be read. `reconcile-on-fleet-arm.test.ts` is what that means, stated.
+ *
+ * On by default, which is a statement about the deployment this default is
+ * written for and not about any deployment. Enabling it before every API
+ * replica and every Brain is new -- and before the longest delayed in-process
+ * callback an old replica can have armed has expired -- lets a reaper close a
+ * delivery that is about to execute. A fleet rolling up from a release that
+ * predates the durable holder must therefore set this to `false` for the
+ * duration of the rollout and unset it afterwards; the off-side suites
+ * (`reconcile-off-*.test.ts`, `doorbell-gate-ownership-legacy.test.ts`, and the
+ * receipt and settlement suites that name it in their headers) are what that
+ * configuration still owes, and they declare it rather than inherit it.
+ */
+export const RUN_FAT_PREPARING_RECONCILE = envBool("RUN_FAT_PREPARING_RECONCILE", true);
 
 /**
  * Cluster-wide admission ceilings. Zero means that dimension is not enforced.
  * Soft: further runs sit at `queued` for claim-next. Hard: the create is refused.
- * Counted by run-tree root so a recursive DAG cannot multiply a tenant's quota.
+ *
+ * Fleet-wide, not a per-tenant quota: `claw_tasks` carries no owner column.
+ * Only the run dimension is keyed by run-tree root; sandboxes count per row and
+ * GPU nodes sum per row, so a 20-node DAG is one run root and up to twenty
+ * sandbox units.
  */
-export const ADMIT_SOFT_RUNS = envInt("ADMIT_SOFT_RUNS", 0, { min: 0 });
-export const ADMIT_HARD_RUNS = envInt("ADMIT_HARD_RUNS", 0, { min: 0 });
-export const ADMIT_SOFT_SANDBOXES = envInt("ADMIT_SOFT_SANDBOXES", 0, { min: 0 });
-export const ADMIT_HARD_SANDBOXES = envInt("ADMIT_HARD_SANDBOXES", 0, { min: 0 });
-export const ADMIT_SOFT_GPU_NODES = envInt("ADMIT_SOFT_GPU_NODES", 0, { min: 0 });
-export const ADMIT_HARD_GPU_NODES = envInt("ADMIT_HARD_GPU_NODES", 0, { min: 0 });
-export const ADMIT_TREE_MAX_NODES = envInt("ADMIT_TREE_MAX_NODES", 0, { min: 0 });
-export const ADMIT_TREE_MAX_DEPTH = envInt("ADMIT_TREE_MAX_DEPTH", 0, { min: 0 });
+// Strict where `envInt`'s defaults are dangerous: both a blank line and a
+// fractional value would otherwise degrade to the fallback `0`, which is the
+// value that means "not enforced" and the one a `> 0` test never sees.
+const ADMIT_BOUNDS = { min: 0, wholeNumbersOnly: true, blankIsRefused: true } as const;
+
+export const ADMIT_SOFT_RUNS = envInt("ADMIT_SOFT_RUNS", 0, ADMIT_BOUNDS);
+export const ADMIT_HARD_RUNS = envInt("ADMIT_HARD_RUNS", 0, ADMIT_BOUNDS);
+export const ADMIT_SOFT_SANDBOXES = envInt("ADMIT_SOFT_SANDBOXES", 0, ADMIT_BOUNDS);
+export const ADMIT_HARD_SANDBOXES = envInt("ADMIT_HARD_SANDBOXES", 0, ADMIT_BOUNDS);
+export const ADMIT_SOFT_GPU_NODES = envInt("ADMIT_SOFT_GPU_NODES", 0, ADMIT_BOUNDS);
+export const ADMIT_HARD_GPU_NODES = envInt("ADMIT_HARD_GPU_NODES", 0, ADMIT_BOUNDS);
+export const ADMIT_TREE_MAX_NODES = envInt("ADMIT_TREE_MAX_NODES", 0, ADMIT_BOUNDS);
+export const ADMIT_TREE_MAX_DEPTH = envInt("ADMIT_TREE_MAX_DEPTH", 0, ADMIT_BOUNDS);
+
+const ADMIT_CEILINGS: ReadonlyArray<readonly [string, number]> = [
+  ["ADMIT_SOFT_RUNS", ADMIT_SOFT_RUNS],
+  ["ADMIT_HARD_RUNS", ADMIT_HARD_RUNS],
+  ["ADMIT_SOFT_SANDBOXES", ADMIT_SOFT_SANDBOXES],
+  ["ADMIT_HARD_SANDBOXES", ADMIT_HARD_SANDBOXES],
+  ["ADMIT_SOFT_GPU_NODES", ADMIT_SOFT_GPU_NODES],
+  ["ADMIT_HARD_GPU_NODES", ADMIT_HARD_GPU_NODES],
+  ["ADMIT_TREE_MAX_NODES", ADMIT_TREE_MAX_NODES],
+  ["ADMIT_TREE_MAX_DEPTH", ADMIT_TREE_MAX_DEPTH],
+];
+
+// With the doorbell off the metered paths are the batch ones, so an operator
+// setting a ceiling would meter DAG and task work while interactive chat
+// bypasses it entirely -- not a fleet ceiling at all.
+for (const [key, value] of ADMIT_CEILINGS) {
+  if (value > 0 && !RUN_DOORBELL_DISPATCH) {
+    reportSettingProblem(
+      `${key}=${value} requires RUN_DOORBELL_DISPATCH=true; `
+      + `with the doorbell off, chat dispatch is not admitted and the ceiling is not a fleet ceiling`,
+    );
+  }
+}
+
+// A soft ceiling above its hard ceiling can never fire, the hard refusal being
+// evaluated first, so the operator's queueing threshold is silently dead.
+for (const [softKey, soft, hardKey, hard] of [
+  ["ADMIT_SOFT_RUNS", ADMIT_SOFT_RUNS, "ADMIT_HARD_RUNS", ADMIT_HARD_RUNS],
+  ["ADMIT_SOFT_SANDBOXES", ADMIT_SOFT_SANDBOXES, "ADMIT_HARD_SANDBOXES", ADMIT_HARD_SANDBOXES],
+  ["ADMIT_SOFT_GPU_NODES", ADMIT_SOFT_GPU_NODES, "ADMIT_HARD_GPU_NODES", ADMIT_HARD_GPU_NODES],
+] as ReadonlyArray<readonly [string, number, string, number]>) {
+  if (soft > 0 && hard > 0 && soft > hard) {
+    reportSettingProblem(
+      `${softKey}=${soft} is above ${hardKey}=${hard}, so it can never defer a run the hard ceiling admits`,
+    );
+  }
+}
+
+/** Refused `ADMIT_*` settings, selected by the key prefix every message begins with. */
+export function admissionSettingProblems(): readonly string[] {
+  return envSettingProblems().filter((problem) => problem.startsWith("ADMIT_"));
+}
+
+/**
+ * Refuse to boot on any malformed or unenforceable admission ceiling.
+ *
+ * Fatal rather than logged because every degraded `ADMIT_*` value is `0`, which
+ * silently switches off the dimension the operator was tightening.
+ *
+ * @param log the caller's logger; this module has none of its own, constants
+ *   here being evaluated before one exists.
+ * @throws when any `ADMIT_*` setting was refused.
+ */
+export function assertAdmissionSettings(
+  log: { error: (obj: object, msg: string) => void },
+): void {
+  const problems = admissionSettingProblems();
+  if (!problems.length) return;
+  log.error({ problems }, "startup.admission_settings_refused");
+  throw new Error(`refused admission settings: ${problems.join("; ")}`);
+}
 
 // --- Skill evolution evidence sampling (E1) ---
 // How many sole-skill exec_complete trajectories to feed the evolve LLM as evidence.

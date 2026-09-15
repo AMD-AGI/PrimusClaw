@@ -33,7 +33,7 @@ function keyOf(raw: string): RunIdentityKey {
   return raw as RunIdentityKey;
 }
 
-function taskIdFromLease(request: ExecuteRequest): { id: string | null; shapeMiss: boolean } {
+export function taskIdFromLease(request: ExecuteRequest): { id: string | null; shapeMiss: boolean } {
   const url = request.run_lease?.url;
   if (!url) return { id: null, shapeMiss: false };
   const match = LEASE_TASK_ID.exec(url);

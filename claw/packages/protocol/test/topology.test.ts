@@ -17,6 +17,7 @@
  * Hence a declared field, and hence strictness about it: rejecting an unknown
  * key is the entire behavioural difference from the regular expression.
  */
+import { PG_INT4_MAX } from "@claw/utils";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -87,4 +88,16 @@ test("a declaration that is not an object is refused rather than coerced", () =>
   for (const bad of [null, 4, "nodes=4", ["nodes"], true]) {
     assert.equal(validateTopology(bad).ok, false, `${JSON.stringify(bad)} should not validate`);
   }
+});
+
+test("a node count past what int4 can hold is refused, not carried into admission", () => {
+  // Not taste: admission sums `input->'topology'->>'nodes'` across rows with an
+  // integer cast, so a value the column cannot express does not fail this one
+  // request -- it aborts the aggregate, and with it every run in the fleet.
+  const messages = errs({ nodes: PG_INT4_MAX + 1, backend: "rayjob" });
+  assert.ok(
+    messages.some((m) => m.includes("nodes") && m.includes(String(PG_INT4_MAX))),
+    messages.join("; "),
+  );
+  ok({ nodes: PG_INT4_MAX, backend: "rayjob" });
 });

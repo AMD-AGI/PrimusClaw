@@ -65,7 +65,15 @@
 // refusal would burn the delivery budget in seconds and report healthy work as
 // poisoned.
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
+import { isRunDoorbell, type ExecuteRequest } from "@claw/protocol";
 import type { JsMsg } from "nats";
+
+import { settleClaimedRun } from "../clients/run-claim.js";
+import { BRAIN_ID, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS } from "../config.js";
+import { askRunLease, type LeaseRenewal } from "../tasks/callback.js";
+import { taskIdFromLease } from "../tasks/run-identity.js";
 
 /**
  * How long a delivery refused during a drain waits before coming back.
@@ -131,6 +139,177 @@ export class DeliveryResidency {
   }
 }
 
+/**
+ * Why a delivery must not enter the task handler after all.
+ *
+ * Each is a conclusion the row reached while this pod was queued for a slot,
+ * which is the window nothing else can observe: the interrupt subject a
+ * Stop publishes on has no subscriber until the run starts, so the lease is
+ * the only channel a Stop can reach a queued delivery through.
+ */
+export type DeliveryStop = "cancelling" | "gone" | "superseded";
+
+/** What the first lease POST concluded. */
+export type Acceptance =
+  /**
+   * This delivery is this pod's to finish with. `stop` is set when the row is
+   * already over, which the answer reaches two ways: a lease granted on a row
+   * the user had stopped, and a lease refused by a stopped row nobody holds.
+   * Neither is a run, and both leave the settlement to this delivery.
+   */
+  | { kind: "held"; runClaim?: number; stop?: DeliveryStop }
+  /** Terminal or missing: nobody holds anything, so the delivery is settled. */
+  | { kind: "gone" }
+  /** Taken, or no answer at all. Neither is a lease, so nothing may run. */
+  | { kind: "refused" };
+
+/** The pre-gate lease renewal, which is also the stop channel. */
+export interface PreGateHeartbeat {
+  /** Idempotent: the handoff and the delivery's `finally` both call it. */
+  stop(): void;
+}
+
+/**
+ * The lease half of a fat delivery, injected so this module stays free of the
+ * event emitter and the HTTP client.
+ */
+export interface FatPreGate {
+  /** The fat, non-doorbell delivery this message is, or null for anything else. */
+  target(msg: JsMsg): FatTarget | null;
+  /** The first lease: `accept: true`, waited on until the answer is conclusive. */
+  accept(target: FatTarget): Promise<Acceptance>;
+  heartbeat(
+    target: FatTarget, runClaim: number | undefined, onStop: (stop: DeliveryStop) => void,
+  ): PreGateHeartbeat;
+  /** The interrupted completion a delivery stopped before the handler settles with. */
+  settleStopped(target: FatTarget, runClaim: number | undefined): Promise<void>;
+  /** Give an accepted lease back, so a redelivery may take it at once. */
+  release(target: FatTarget, runClaim: number | undefined): Promise<void>;
+}
+
+/** The parsed delivery, which is what every step of the protocol acts on. */
+export type FatTarget = ExecuteRequest;
+
+/**
+ * The generation, and the renewal handoff, for the delivery the handler is
+ * running under.
+ *
+ * Carried out of band rather than threaded through the handler signature
+ * because every layer between here and the runner would otherwise have to know
+ * about a fact only the lease cares about. The generation belongs to the
+ * delivery for its whole life: `postRunLease` sends it on every renewal any
+ * owner makes, and every `exec_complete` names it.
+ */
+export interface FatDeliveryContext {
+  runClaim?: number;
+  /**
+   * The runner has started its own lease renewal and owns it from here. Until
+   * it is called the delivery layer keeps renewing, so the two owners overlap
+   * rather than leaving the lease unrenewed between them.
+   */
+  handOffRenewal(): void;
+}
+
+const fatDeliveryContext = new AsyncLocalStorage<FatDeliveryContext>();
+
+/** The delivery the calling handler is running under, if it is a fat one. */
+export function currentFatDelivery(): FatDeliveryContext | undefined {
+  return fatDeliveryContext.getStore();
+}
+
+/**
+ * Hold the first lease before this delivery queues for an execution slot.
+ *
+ * Returns null when the delivery must not run, having already been settled.
+ */
+async function preGateLease(
+  msg: JsMsg, deps: DeliveryDeps, target: FatTarget,
+): Promise<Extract<Acceptance, { kind: "held" }> | null> {
+  const acceptance = await deps.fatPreGate!.accept(target);
+  if (acceptance.kind === "gone") {
+    msg.ack();
+    return null;
+  }
+  if (acceptance.kind === "refused") {
+    msg.nak(deps.surplusNakMs(msg.info?.deliveryCount ?? 1));
+    return null;
+  }
+  return acceptance;
+}
+
+/**
+ * Start renewing the pre-gate lease and expose the stop it may raise.
+ *
+ * The renewal is also the stop channel, which is what makes a Stop durable for
+ * a delivery no interrupt subject can reach yet: nothing subscribes for this
+ * run until the handler starts, and the row is the only thing that can be told
+ * in the meantime.
+ */
+function armPreGate(
+  deps: DeliveryDeps,
+  target: FatTarget,
+  runClaim: number | undefined,
+  initial: DeliveryStop | null,
+): { heartbeat: PreGateHeartbeat | null; signal: Promise<DeliveryStop>; raised(): DeliveryStop | null } {
+  let raised = initial;
+  let resolveStop!: (reason: DeliveryStop) => void;
+  const signal = new Promise<DeliveryStop>((resolve) => { resolveStop = resolve; });
+  if (initial) {
+    resolveStop(initial);
+    return { heartbeat: null, signal, raised: () => raised };
+  }
+  const heartbeat = deps.fatPreGate!.heartbeat(target, runClaim, (reason) => {
+    raised ??= reason;
+    resolveStop(reason);
+  });
+  return { heartbeat, signal, raised: () => raised };
+}
+
+/**
+ * Settle a delivery the row ended while it was queued for a slot.
+ *
+ * A Stop is settled visibly as well as durably: the interrupted completion is
+ * what moves the row from `cancelling` to `cancelled` and hands the session
+ * gate back, so a delivery that merely acked would leave the turn open. The
+ * other two are losses rather than stops -- `gone` is a row nobody holds and
+ * nothing is waiting for, `superseded` belongs to the worker that took it and
+ * this one touches none of it.
+ */
+async function settleStopped(
+  msg: JsMsg, deps: DeliveryDeps, target: FatTarget,
+  runClaim: number | undefined, stop: DeliveryStop,
+): Promise<void> {
+  if (stop === "cancelling") {
+    await deps.fatPreGate!.settleStopped(target, runClaim);
+    msg.ack();
+    return;
+  }
+  if (stop === "gone") msg.ack();
+  else msg.nak(deps.surplusNakMs(msg.info?.deliveryCount ?? 1));
+}
+
+/**
+ * Wait for a slot, or for the row to say the delivery is over.
+ *
+ * `ExecutionGate.acquire` has no cancellation and counts the slot as it hands
+ * it over, so a delivery the stop signal frees must not walk away from a queued
+ * acquire: that slot would be granted to nobody and lost for the pod's life.
+ * The release is attached to the still-pending acquisition instead, leaving
+ * exactly one releaser for every acquire -- the delivery's own `finally` when
+ * the gate won, that continuation when the stop did.
+ *
+ * @returns whether this delivery now holds a slot.
+ */
+async function raceGateAgainstStop(
+  deps: DeliveryDeps, stopped: Promise<DeliveryStop>,
+): Promise<boolean> {
+  const acquired = deps.gate.acquire();
+  const won = await Promise.race([acquired.then(() => true), stopped.then(() => false)]);
+  if (won) return true;
+  void acquired.then(() => deps.gate.release()).catch(() => {});
+  return false;
+}
+
 export interface DeliveryDeps {
   /** Start telling the server this delivery is being worked on; returns the stop. */
   keepAlive(msg: JsMsg): () => void;
@@ -163,6 +342,11 @@ export interface DeliveryDeps {
    * the run lives on the row and an idle replica will claim-next.
    */
   isWakeup?(msg: JsMsg): boolean;
+  /**
+   * The durable holder protocol for fat deliveries. Optional: a pod wired
+   * without one runs every delivery the way it always did.
+   */
+  fatPreGate?: FatPreGate;
 }
 
 /**
@@ -203,6 +387,7 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
   let taken = false;
   let slotHeld = false;
   let stopHeartbeat = (): void => {};
+  let preGate: PreGateHeartbeat | null = null;
   try {
     if (deps.isDraining()) {
       deps.onRefuse?.("drain");
@@ -225,6 +410,17 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
       msg.nak(deps.surplusNakMs(deliveries));
       return;
     }
+    // The first lease before anything else this pod might have to give back.
+    // A delivery refused here was never accepted and holds no durable state,
+    // which is what lets it be handed straight back to the fleet.
+    const target = deps.fatPreGate?.target(msg) ?? null;
+    const acceptance = target ? await preGateLease(msg, deps, target) : null;
+    if (target && !acceptance) return;
+    const arm = target && acceptance
+      ? armPreGate(deps, target, acceptance.runClaim, acceptance.stop ?? null)
+      : null;
+    preGate = arm?.heartbeat ?? null;
+
     // Past here the pod is holding this delivery whether or not it had room:
     // a message with no budget left to spend is kept rather than refused.
     // Counted even over the ceiling, otherwise finishing an in-ceiling run
@@ -233,19 +429,212 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
     deps.residency.take();
     taken = true;
     stopHeartbeat = deps.keepAlive(msg);
-    await deps.gate.acquire();
-    slotHeld = true;
-    if (deps.isDraining()) {
+
+    if (!target || !acceptance || !arm) {
+      await deps.gate.acquire();
+      slotHeld = true;
+      if (deps.isDraining()) {
+        deps.onRefuse?.("drain");
+        msg.nak(DRAIN_NAK_MS);
+        return;
+      }
+      await deps.handle(msg);
+      return;
+    }
+
+    const runClaim = acceptance.runClaim;
+    if (!arm.raised()) slotHeld = await raceGateAgainstStop(deps, arm.signal);
+    if (deps.isDraining() && !arm.raised()) {
       deps.onRefuse?.("drain");
+      // The lease goes back with the message. This pod has held it since before
+      // the gate -- renewed across the whole queue wait, which is as long as
+      // another run -- and a redelivery that finds it live is classified
+      // `superseded` and naks in turn, so the turn stands still for the rest of
+      // the TTL on a pod that already knows it will not run it. Renewal stopped
+      // first, then the release, then the nak: the order `nakAfterAttempt` uses,
+      // for the same reason. `preGate.stop()` is `clearInterval`, so the
+      // `finally` calling it again costs nothing, and the release reports its
+      // own failures rather than raising them, so the nak always follows.
+      preGate?.stop();
+      await deps.fatPreGate!.release(target, runClaim);
       msg.nak(DRAIN_NAK_MS);
       return;
     }
-    await deps.handle(msg);
+    // The handler must not run once a signal has been raised, whichever of the
+    // two resolved the race: a Stop the user made is durable on the row, and
+    // starting the turn now would burn a sandbox on work already withdrawn.
+    const stop = arm.raised();
+    if (stop) {
+      await settleStopped(msg, deps, target, runClaim, stop);
+      return;
+    }
+    await fatDeliveryContext.run(
+      { runClaim, handOffRenewal: () => arm.heartbeat?.stop() },
+      () => deps.handle(msg),
+    );
   } catch (err) {
     deps.onError(err);
   } finally {
     stopHeartbeat();
+    preGate?.stop();
     if (slotHeld) deps.gate.release();
     if (taken) deps.residency.leave();
   }
+}
+
+/** What the concrete pre-gate needs that this module cannot reach on its own. */
+export interface FatPreGateDeps {
+  /** Publish an event for a session, as the task emitter does. */
+  emit(sessionId: string, event: Record<string, unknown>): Promise<void>;
+  /** The lease POST. A seam so a test can answer it without a server. */
+  ask?: typeof askRunLease;
+  /** The settle-and-release POST. A seam so a test can answer it without a server. */
+  settle?: typeof settleClaimedRun;
+  brainId?: string;
+  leaseTtlMs?: number;
+  heartbeatMs?: number;
+}
+
+/** The statuses a row may answer a lease with and still be this pod's to run. */
+const RENEWABLE_STATUSES = new Set(["preparing", "running", "cancelling"]);
+
+const PRE_GATE_INTERRUPT_TEXT = "[Interrupted by user before any turn completed]";
+
+/**
+ * The durable holder protocol for fat chat deliveries.
+ *
+ * Acceptance is the first lease: one statement that writes owner, expiry and
+ * generation, so there is no window in which this pod is queued for an
+ * execution slot with nothing on the row to say so.
+ */
+export function createFatPreGate(deps: FatPreGateDeps): FatPreGate {
+  const ask = deps.ask ?? askRunLease;
+  const settle = deps.settle ?? settleClaimedRun;
+  const brainId = deps.brainId ?? BRAIN_ID;
+  const leaseSeconds = Math.ceil((deps.leaseTtlMs ?? RUN_LEASE_TTL_MS) / 1000);
+  const heartbeatMs = deps.heartbeatMs ?? RUN_LEASE_HEARTBEAT_MS;
+  const body = (runClaim: number | undefined, accept?: true): LeaseRenewal => ({
+    brainId,
+    leaseSeconds,
+    // The delivery is queued for a slot rather than running, which is exactly
+    // the distinction the phase was added to measure.
+    phase: "waiting",
+    waitedMs: 0,
+    waits: 0,
+    ...(runClaim === undefined ? {} : { runClaim }),
+    ...(accept ? { accept } : {}),
+  });
+
+  const runTaskIdOf = (request: ExecuteRequest): string =>
+    request.task_id || taskIdFromLease(request).id || "";
+
+  return {
+    target(msg) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(new TextDecoder().decode(msg.data));
+      } catch {
+        return null;
+      }
+      if (!payload || typeof payload !== "object" || isRunDoorbell(payload)) return null;
+      const request = payload as ExecuteRequest;
+      if (!request.run_lease?.url) return null;
+      // The marker, or the shape a fat message published before the marker
+      // existed has: a chat delivery carries no `callback_url`, and a DAG or
+      // script run that carries one is not this path's work.
+      return request.run_lease.accept_before_execution === true || !request.callback_url
+        ? request
+        : null;
+    },
+
+    async accept(target) {
+      const answer = await ask(target, body(undefined, true));
+      if (answer.kind === "refused") {
+        // A row stopped before anybody accepted it. Nothing else will emit the
+        // completion that moves it off `cancelling` -- the interrupt subject
+        // has no subscriber until a run starts, and this delivery is the last
+        // thing holding it -- so it is settled visibly rather than acked away.
+        // The generation is the row's own, quoted back so the completion is
+        // admissible on a row a previous attempt left fenced.
+        if (answer.stop === "cancelling") {
+          return {
+            kind: "held",
+            stop: "cancelling",
+            ...(answer.claimCount === undefined ? {} : { runClaim: answer.claimCount }),
+          };
+        }
+        return answer.refusal === "gone" ? { kind: "gone" } : { kind: "refused" };
+      }
+      // No verdict is not a lease. A mid-run heartbeat may wait for the next
+      // tick; an acceptance has nothing to fall back on, and treating one as
+      // success is how a delivery reaches the gate holding nothing.
+      if (answer.kind !== "granted" || !RENEWABLE_STATUSES.has(answer.status)) {
+        return { kind: "refused" };
+      }
+      return {
+        kind: "held",
+        ...(answer.claimCount === undefined ? {} : { runClaim: answer.claimCount }),
+        ...(answer.status === "cancelling" ? { stop: "cancelling" as const } : {}),
+      };
+    },
+
+    heartbeat(target, runClaim, onStop) {
+      const timer = setInterval(() => {
+        void ask(target, body(runClaim)).then((answer) => {
+          if (answer.kind === "refused") return onStop(answer.refusal);
+          if (answer.kind === "granted" && answer.status === "cancelling") {
+            return onStop("cancelling");
+          }
+          // Anything else is transient: the next tick asks again, and the
+          // lease outlives several of them.
+        }).catch(() => { /* askRunLease already logs; a failure is not a verdict */ });
+      }, heartbeatMs);
+      timer.unref?.();
+      return { stop: () => clearInterval(timer) };
+    },
+
+    async settleStopped(target, runClaim) {
+      await deps.emit(target.session_id, {
+        type: "exec_complete",
+        session_id: target.session_id,
+        message_id: target.message_id ?? "",
+        user_id: target.user_id || "default",
+        final_text: PRE_GATE_INTERRUPT_TEXT,
+        interrupted: true,
+        failed: false,
+        turns: 0,
+        // Recovered from the lease URL when the message does not carry one.
+        // A fat message published before `task_id` was added to the wire has
+        // only the lease, and this completion is how the API settles the row:
+        // emitted without an id it routes by session and message alone, which
+        // the stopped row's own `cancelling` status is not enough to match --
+        // so the interrupt the user asked for lands nowhere and the row waits
+        // for a reaper. `run_lease.url` names the task in its path, which is
+        // the same recovery the runner makes for the same legacy shape.
+        ...(runTaskIdOf(target) ? { task_id: runTaskIdOf(target) } : {}),
+        ...(runClaim === undefined ? {} : { run_claim: runClaim }),
+      });
+    },
+
+    async release(target, runClaim) {
+      const taskId = runTaskIdOf(target);
+      // Nothing to fence with is nothing to release. An acceptance that issued
+      // no generation came from an API that predates them, and owner alone
+      // cannot say which of this pod's leases on the row is being given back --
+      // `brain_id` is a pod name, the same string for every lease it ever takes
+      // here. Left to lapse instead, which is what happened before this
+      // release existed.
+      if (!taskId || runClaim === undefined) return;
+      // Owner null, expiry stamped in the past: the shape `acquireFatLease`'s
+      // released-lease arm is written for, so the redelivery accepts at once.
+      // Under this pre-gate's own `brainId`, because that is the owner the
+      // acceptance wrote and the settle fences on it -- a mismatch answers 409,
+      // which this client reads as success, and the lease would leak silently.
+      // One attempt, because the message is coming back in DRAIN_NAK_MS either
+      // way and the retry ladder is longer than the shutdown that may be
+      // running underneath it: a release still in flight when the process exits
+      // takes the nak with it.
+      await settle(taskId, runClaim, undefined, true, { brainId, attempts: 1 });
+    },
+  };
 }

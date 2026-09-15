@@ -22,7 +22,7 @@ const UNLIMITED: AdmitLimits = {
   treeMaxNodes: 0, treeMaxDepth: 0,
 };
 
-const ASK: AdmissionAsk = { origin: "chat", wantsSandbox: false, gpuNodes: 0 };
+const ASK: AdmissionAsk = { origin: "chat", newRunRoots: 1, sandboxes: 0, gpuNodes: 0 };
 const EMPTY: AdmissionUsage = {
   runRoots: 0, executingRoots: 0,
   sandboxes: 0, executingSandboxes: 0,
@@ -86,7 +86,7 @@ test("a sandbox run is queued when the sandbox soft ceiling is full", () => {
   // that is executing is also occupying.
   const usage: AdmissionUsage = { ...EMPTY, sandboxes: 1, executingSandboxes: 1 };
   assert.deepEqual(
-    decideFromUsage(usage, { ...ASK, wantsSandbox: true }, 0, { ...UNLIMITED, softSandboxes: 1 }),
+    decideFromUsage(usage, { ...ASK, sandboxes: 1 }, 0, { ...UNLIMITED, softSandboxes: 1 }),
     { kind: "queue", position: 1 },
   );
 });
@@ -94,7 +94,7 @@ test("a sandbox run is queued when the sandbox soft ceiling is full", () => {
 test("a sandbox hard ceiling refuses rather than queues", () => {
   const usage: AdmissionUsage = { ...EMPTY, sandboxes: 1 };
   assert.deepEqual(
-    decideFromUsage(usage, { ...ASK, wantsSandbox: true }, 0, { ...UNLIMITED, hardSandboxes: 1 }),
+    decideFromUsage(usage, { ...ASK, sandboxes: 1 }, 0, { ...UNLIMITED, hardSandboxes: 1 }),
     { kind: "reject", reason: "sandboxes_hard_limit" },
   );
 });
@@ -170,7 +170,7 @@ test("post-insert sandbox and gpu hard ceilings ignore runs that did not ask for
     null,
   );
   assert.equal(
-    hardExceededByUsage(usage, { ...ASK, wantsSandbox: true }, { ...UNLIMITED, hardSandboxes: 1 }),
+    hardExceededByUsage(usage, { ...ASK, sandboxes: 1 }, { ...UNLIMITED, hardSandboxes: 1 }),
     "sandboxes_hard_limit",
   );
   assert.equal(
@@ -185,11 +185,11 @@ test("a hard sandbox ceiling counts a queued run's sandbox, a soft one does not"
   // committed to it, the soft ceiling is not.
   const usage: AdmissionUsage = { ...EMPTY, sandboxes: 1, executingSandboxes: 0 };
   assert.deepEqual(
-    decideFromUsage(usage, { ...ASK, wantsSandbox: true }, 0, { ...UNLIMITED, hardSandboxes: 1 }),
+    decideFromUsage(usage, { ...ASK, sandboxes: 1 }, 0, { ...UNLIMITED, hardSandboxes: 1 }),
     { kind: "reject", reason: "sandboxes_hard_limit" },
   );
   assert.deepEqual(
-    decideFromUsage(usage, { ...ASK, wantsSandbox: true }, 0, { ...UNLIMITED, softSandboxes: 1 }),
+    decideFromUsage(usage, { ...ASK, sandboxes: 1 }, 0, { ...UNLIMITED, softSandboxes: 1 }),
     { kind: "admit" },
   );
 });
@@ -203,13 +203,13 @@ test("the post-insert recheck sees this row on every dimension, not just runs", 
     ...EMPTY, runRoots: 1, sandboxes: 1, gpuNodes: 4,
   };
   assert.equal(
-    hardExceededByUsage(afterInsert, { ...ASK, wantsSandbox: true }, { ...UNLIMITED, hardSandboxes: 1 }),
+    hardExceededByUsage(afterInsert, { ...ASK, sandboxes: 1 }, { ...UNLIMITED, hardSandboxes: 1 }),
     null,
     "at the ceiling is not past it",
   );
   const twoRacedIn: AdmissionUsage = { ...afterInsert, sandboxes: 2, gpuNodes: 8 };
   assert.equal(
-    hardExceededByUsage(twoRacedIn, { ...ASK, wantsSandbox: true }, { ...UNLIMITED, hardSandboxes: 1 }),
+    hardExceededByUsage(twoRacedIn, { ...ASK, sandboxes: 1 }, { ...UNLIMITED, hardSandboxes: 1 }),
     "sandboxes_hard_limit",
   );
   assert.equal(

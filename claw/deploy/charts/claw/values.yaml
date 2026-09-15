@@ -636,10 +636,33 @@ features:
   childUidMax: ""
   childIsolation: ""
   # Chat dispatch publishes a doorbell and injects credentials at claim time
-  # instead of putting the full execute request on the shared durable. Off
-  # until every Brain replica understands the doorbell: a mixed fleet must
-  # keep serving fat messages.
-  runDoorbellDispatch: false
+  # instead of putting the full execute request on the shared durable. On by
+  # default, while the runtime gate stays closed until the fleet explicitly
+  # asserts a capability floor at least as high as the API's semantics version.
+  # Set false to roll Doorbell back, and leave brainDoorbellExecution true so
+  # Brain keeps draining the rows already queued.
+  runDoorbellDispatch: true
+  # Whether a Brain replica executes doorbell runs at all: with this false it
+  # declines a doorbell on the wire and its claim-next loop takes no doorbell
+  # row. On by default -- a kill-switch that ships killed is not a kill-switch.
+  #
+  # This and the value above render the same RUN_DOORBELL_DISPATCH environment
+  # variable, one per deployment, because they answer different questions. A
+  # rollback sets runDoorbellDispatch false and needs Brain to keep draining the
+  # rows already queued, which one shared Secret key cannot express.
+  brainDoorbellExecution: true
+  # The API's assertion that every Brain able to receive `tasks.execute` takes
+  # a durable SQL holder before its execution gate. Read only by the API, which
+  # is why it renders as container-level env on that Deployment alone.
+  #
+  # On by default, which is a statement about a fleet whose replicas are all
+  # new. Asserted while an old replica can still execute without taking a
+  # holder, the reaper that reconciles unheld fat `preparing` rows closes a
+  # delivery that is about to run. A fleet rolling up from a release that
+  # predates the durable holder sets this false before the first new API
+  # replica starts and clears it once every API and Brain replica is new; the
+  # order is in claw/docs/doorbell-rollout.md, precondition 3.
+  runFatPreparingReconcile: true
 
 # Fallback sandbox for sessions that name neither an image nor a size. The API
 # migration seeds these into the resources table as the type='default' row when

@@ -17,6 +17,8 @@
  * dispatch -- two rows for one message, only one of them ever leased -- put the
  * hour back that this release exists to remove.
  */
+import "./reconcile-off-env.js";
+
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -116,9 +118,12 @@ function sessionUpdates(seen: SeenQuery[]): SeenQuery[] {
 
 /** The statement that closes the rows a retried dispatch left unclaimed. */
 function siblingClose(seen: SeenQuery[]): SeenQuery | undefined {
-  // Identified by the predicate that pairs the two id arrays: both reaps go
-  // through the one statement that writes a status.
-  return seen.find((q) => /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql));
+  // Identified by the predicate that pairs the two id arrays -- and by being
+  // the statement that WRITES, because the pass reads the same predicate first
+  // to learn which of these rows were still on the queue.
+  return seen.find((q) =>
+    /unnest\(\$\d+::text\[\], \$\d+::text\[\]\)/.test(q.sql)
+    && /^UPDATE claw_tasks SET status/.test(q.sql));
 }
 
 test("a conversation whose run was given up on can be spoken to again", async () => {
@@ -128,7 +133,9 @@ test("a conversation whose run was given up on can be spoken to again", async ()
   const updates = sessionUpdates(seen);
   assert.equal(updates.length, 1, "the row was closed but the gate was left shut");
   assert.match(updates[0].sql, /agent_status = 'idle'/);
-  assert.deepEqual(updates[0].params, [["s-1"]]);
+  // The turn travels with the session: occupancy alone cannot tell this run's
+  // gate from one a newer turn took while the reaper was deciding.
+  assert.deepEqual(updates[0].params, [["s-1"], ["claw-pending-7"], false]);
 });
 
 test("the gate stays shut while anything is still executing", async () => {

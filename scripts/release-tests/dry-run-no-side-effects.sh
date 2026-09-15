@@ -22,7 +22,14 @@ exit 0
 EOF
 cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "get" && "${2:-}" == "sc" ]]; then exit 0; fi
+# A read is not a mutation, and the render refuses to proceed on one it cannot
+# make. Under --ignore-not-found an absent object is a successful empty reply,
+# so answer that and leave every non-read call to the refusal below.
+if [[ "${1:-}" == "get" ]]; then
+  [[ "${2:-}" == "sc" ]] && exit 0
+  case " $* " in *" --ignore-not-found "*) exit 0 ;; esac
+  exit 1
+fi
 echo "unexpected mutating kubectl call during dry-run: $*" >&2
 exit 97
 EOF
