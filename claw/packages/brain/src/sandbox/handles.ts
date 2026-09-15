@@ -102,6 +102,21 @@ export async function lookupDagHandle(
 const REGISTER_CAS_ATTEMPTS = 5;
 
 /**
+ * Ceiling on the handle cleanup that follows a stop.
+ *
+ * `listAll()` drives an ordered consumer, and the SDK rebuilds and retries it
+ * indefinitely when JetStream is unavailable while the core connection stays
+ * healthy -- the iterator never ends. This runs inside teardown and inside the
+ * pending-write rollback, and a task's own abort does not interrupt an await,
+ * so without a ceiling a cleanup can wedge a rebuild or the NAK behind it.
+ *
+ * Expiring leaves the handle in place, which is the safe direction: the
+ * workload is already stopped, so the stale entry costs a refused registration
+ * that a later sweep clears, not a lost reference to something live.
+ */
+const RELEASE_SCAN_TIMEOUT_MS = 10_000;
+
+/**
  * Point an existing handle at a different workload, or create it if absent.
  *
  * `DagHandleMap.create` refuses a name that already maps elsewhere so a
@@ -279,7 +294,22 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
   const dec = new TextDecoder();
   const enc = new TextEncoder();
 
-  for (const [dagRoot, handles] of await getMap().listAll()) {
+  // Bounded: the caller is on a teardown path and an abort cannot interrupt an
+  // await. What the enumeration goes on doing afterwards is not cancellable
+  // here; what matters is that the caller stops waiting on it.
+  let timer: NodeJS.Timeout;
+  const rows = await Promise.race([
+    getMap().listAll().finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`dag-handles release scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
+        RELEASE_SCAN_TIMEOUT_MS,
+      );
+      timer.unref?.();
+    }),
+  ]);
+
+  for (const [dagRoot, handles] of rows) {
     const names = Object.entries(handles)
       .filter(([, info]) => info.workload_id === workloadId)
       .map(([name]) => name);

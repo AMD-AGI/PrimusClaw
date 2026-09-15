@@ -1102,24 +1102,39 @@ async function provisionHands(
     }
     if (!ok) {
       logger.error({ sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-      await getSafeWorkloadProvider().stop({
-        provider: "safe-workload", id: workloadId, sandboxName: workloadId,
-        namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
-      }).catch(() => {});
-      // The handle written moments ago names the workload just stopped, and
-      // this rollback is the only thing that will ever look at it: no session
-      // entry was written, so `reapPendingHands` has nothing to find, and the
-      // owning task is still running so no orphan sweep reaches it either.
-      // Left behind, the next attempt's registration is refused -- the name
-      // still points at a workload on record -- and rolled back in turn, so a
-      // recovered KV never recovers the task. Whoever stops a workload frees
-      // its handle; this path stops one too.
-      await releaseHandlesForWorkload(workloadId).catch((e) => {
+      // Whether the stop actually landed decides whether the handle may go.
+      // Swallowing the failure and releasing anyway leaves a workload that
+      // exists with no handle and no session entry -- findable by nothing, and
+      // strictly worse than the stuck retry this release was added to prevent.
+      let stopped = false;
+      try {
+        await getSafeWorkloadProvider().stop({
+          provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+          namespace: nsForSandbox, handsBaseUrl: "", platformKey: apiKey,
+        });
+        stopped = true;
+      } catch (stopErr) {
         logger.error(
-          { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
-          "dag-handles.pending_rollback_release_failed",
+          { sessionId, workloadId, err: (stopErr as Error)?.message ?? String(stopErr) },
+          "hands.kv.pending_rollback_stop_failed",
         );
-      });
+      }
+      // Only then. The handle written moments ago names the workload just
+      // stopped, and this rollback is the only thing that will ever look at
+      // it: no session entry was written, so `reapPendingHands` has nothing to
+      // find, and the owning task is still running so no orphan sweep reaches
+      // it either. Left behind after a SUCCESSFUL stop, the next attempt's
+      // registration is refused and rolled back in turn, so a recovered KV
+      // never recovers the task. Left behind after a FAILED stop, it is the
+      // only remaining reference to a live workload -- so it stays.
+      if (stopped) {
+        await releaseHandlesForWorkload(workloadId).catch((e) => {
+          logger.error(
+            { sessionId, workloadId, err: (e as Error)?.message ?? String(e) },
+            "dag-handles.pending_rollback_release_failed",
+          );
+        });
+      }
       throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
     }
     logger.info({ sessionId, workloadId }, "hands.kv.pending");

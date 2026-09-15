@@ -38,6 +38,8 @@
  *   H12 a legacy bare-string entry still counts as a workload on record
  *   H13 releasing does not delete a handle registered while it decided
  *   H14 releasing does not take a handle that has moved to another workload
+ *   H15 a release scan that hangs does not wedge the caller
+ *   H16 a rollback whose stop failed keeps the handle
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -475,5 +477,63 @@ test("H14 releasing does not take a handle that has moved to another workload", 
   assert.equal(
     (await lookupDagHandle("dag-14", "main"))?.workload_id, "W-newer",
     "a handle that has moved on is not removed on a stale read of the old workload",
+  );
+});
+
+test("H15 a release scan that hangs does not wedge the caller", async () => {
+  // `listAll()` drives an ordered consumer, and the SDK rebuilds and retries it
+  // indefinitely when JetStream is unavailable while the core connection stays
+  // healthy. This runs inside teardown and inside the pending-write rollback,
+  // and a task's own abort does not interrupt an await -- so unbounded, a
+  // cleanup can wedge the rebuild or the NAK behind it.
+  //
+  // Expiring leaves the handle in place, which is the safe direction: the
+  // workload is already stopped, so a stale entry costs a refused registration
+  // that a later sweep clears, not a lost reference to something live.
+  const restore = bindDagHandleKvForTest({
+    async get() { return null; },
+    async create() { return 1; },
+    async update() { return 1; },
+    async put() { return 1; },
+    async delete() {},
+    async keys() { return new Promise(() => { /* never settles */ }); },
+  } as never);
+  const started = process.hrtime.bigint();
+  try {
+    await assert.rejects(
+      () => releaseHandlesForWorkload("W-any"),
+      /release scan exceeded/,
+    );
+  } finally {
+    restore();
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 30_000, `must not wait indefinitely (waited ${Math.round(elapsedMs)}ms)`);
+});
+
+test("H16 a rollback whose stop failed keeps the handle", async () => {
+  // The failure branch my own previous fix introduced. Releasing the handle
+  // after a stop that did NOT land leaves a workload that exists with no
+  // handle and no session entry -- findable by nothing, and strictly worse
+  // than the stuck retry the release was added to prevent.
+  //
+  // Asserted on the source, because reaching that branch through `ensureHands`
+  // needs a provider, a cluster and three failed KV writes. What matters is
+  // structural and checkable here: the release is guarded by whether the stop
+  // succeeded, and the stop's failure is recorded rather than swallowed.
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
+    "utf-8",
+  );
+  const from = src.indexOf("pending_put_failed_rollback");
+  const block = src.slice(from, src.indexOf("throw new Error(`KV pending write failed", from));
+
+  assert.match(block, /pending_rollback_stop_failed/,
+    "a stop that did not land has to be recorded, not swallowed");
+  assert.match(block, /if \(stopped\) \{[\s\S]*?releaseHandlesForWorkload/,
+    "and the handle is only freed when the stop actually landed");
+  assert.equal(
+    /\}\)\.catch\(\(\) => \{\}\);[\s\S]*?releaseHandlesForWorkload/.test(block), false,
+    "the swallowing form must not come back",
   );
 });
