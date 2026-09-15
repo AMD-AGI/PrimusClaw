@@ -1047,28 +1047,54 @@ test("an agent-sandbox entry is identified by its Router session, not a blank wo
   assert.deepEqual(destroyed, [], "another DAG is using that Router sandbox");
 });
 
-test("a retention whose handle release fails leaves everything retryable", async () => {
-  // Round 42. Releasing AFTER `retainContainer` looked equivalent and was not:
-  // `retainContainer` deletes the session binding, and the binding is what
-  // brings the next attempt back through this path. One failed delete then
-  // stripped the only way to retry, so the stale handle rolled back every
-  // replacement for good -- `stopped=[W-new-1, W-new-2]`.
+test("a retention lands its reference before it gives up the handle", async () => {
+  // This assertion has been both ways round, and round 43 settled it.
   //
-  // Released first, a failure leaves the binding, the handle and the container
-  // as they were, and the next attempt walks in and tries again.
-  const retained: unknown[] = [];
+  // It first said "release first, so a failed release leaves everything as it
+  // was and the next attempt retries". That premise is false: a delete whose
+  // ACK is lost has committed. The container then ends with no handle, no
+  // retention record and no session binding, because the caller goes on to
+  // provision a replacement whose own pending write takes the binding. The same
+  // window opens on a crash between the two, and for a DAG that REUSED the
+  // container its handle was also its way back into this path.
+  //
+  // So the reference that replaces the handle has to exist before the handle
+  // can go. A release that then fails leaves a stale handle -- recoverable,
+  // because a registration refused by a RETAINED workload may take the name
+  // (see H25 and `mayTakeFrom`).
+  const order: string[] = [];
   restoreEffects = bindSandboxReuseEffects({
-    releaseHandlesForWorkload: (async () => { throw new Error("kv down"); }) as never,
-    retainContainer: (async (args: unknown) => { retained.push(args); }) as never,
+    retainContainer: (async () => { order.push("retain"); }) as never,
+    releaseHandlesForWorkload: (async () => { order.push("release"); }) as never,
     probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" }),
     restartHandsInSandbox: async () => ({ ok: false, detail: "refused", refused: true }),
     countLiveWork: (async () => ({ verdict: "protected", classes: {}, reason: "shells" })) as never,
-    destroyHands: (async () => {}) as never,
+    destroyHands: (async () => { order.push("destroy"); }) as never,
   });
   stubHealth("fail");
   const { a } = attempt({ ...LIVE, specFingerprint: specOf(), workloadId: "W-old" } as never);
 
   assert.equal(await tryReuseSessionSandbox(a), null);
-  assert.deepEqual(retained, [],
-    "the binding must not be deleted while the handle still names the container");
+  assert.deepEqual(order, ["retain", "release"],
+    "the retention record has to exist before the handle naming it is freed");
+});
+
+test("a retention whose handle release fails still retains the container", async () => {
+  // The failure this ordering is FOR: the release throwing must not cost the
+  // container its retention record, because that record is now its only
+  // reference. The stale handle it leaves behind is the recoverable half.
+  const order: string[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    retainContainer: (async () => { order.push("retain"); }) as never,
+    releaseHandlesForWorkload: (async () => { throw new Error("kv down"); }) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" }),
+    restartHandsInSandbox: async () => ({ ok: false, detail: "refused", refused: true }),
+    countLiveWork: (async () => ({ verdict: "protected", classes: {}, reason: "shells" })) as never,
+    destroyHands: (async () => { order.push("destroy"); }) as never,
+  });
+  stubHealth("fail");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf(), workloadId: "W-old" } as never);
+
+  assert.equal(await tryReuseSessionSandbox(a), null, "a failed release must not fail the turn");
+  assert.deepEqual(order, ["retain"], "the container keeps the reference that replaced its handle");
 });

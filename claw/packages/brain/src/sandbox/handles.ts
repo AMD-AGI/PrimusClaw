@@ -234,6 +234,17 @@ export async function replaceDagHandle(
   dagRootTaskId: string,
   handleName: string,
   info: HandleInfo,
+  /**
+   * Lets a caller say a name may be taken despite still being on record.
+   *
+   * The one case is a RETAINED workload: retention hands the container to the
+   * retention store and frees the name, and when that free does not land -- a
+   * lost ACK, a crash between the two -- the stale handle would otherwise
+   * refuse every replacement for the life of the DAG. Asked of the caller
+   * rather than looked up here, because retention lives in the hands bucket and
+   * this module owns a different one.
+   */
+  opts?: { mayTakeFrom?: (previousWorkloadId: string) => Promise<boolean> },
 ): Promise<void> {
   const kv = _kvBucket;
   if (!kv) throw new Error("dag-handles.not_initialized -- call initDagHandles(js) at boot");
@@ -291,7 +302,22 @@ export async function replaceDagHandle(
     // workload removes its handle when they stop it -- see `runRebuild` --
     // so this refusal is not on the path of an ordinary rebuild.
     if (previous && info.workload_id && previous !== info.workload_id) {
-      throw new Error(
+      // Unless the workload it names has been RETAINED -- handed over to the
+      // retention store because work was still running in it while this session
+      // moved on. That hand-over frees the name, and normally does so itself;
+      // this is the recovery for when that delete did not land, or its ACK was
+      // lost, or the process died between the two. Without it a stale handle
+      // refuses every replacement for the life of the DAG.
+      //
+      // Checked here rather than trusted from the release, because "the release
+      // threw" does not mean "the delete did not happen", and the durable
+      // retention record is the thing that actually settles whose it is.
+      if (opts?.mayTakeFrom && await opts.mayTakeFrom(previous)) {
+        logger.warn(
+          { dagRootTaskId, handleName, previous, workloadId: info.workload_id },
+          "dag-handles.taking_name_from_retained_workload",
+        );
+      } else throw new Error(
         `dag-handle ${handleName} for ${dagRootTaskId} still names ${previous}; `
         + `refusing to point it at ${info.workload_id} before that one is released`,
       );

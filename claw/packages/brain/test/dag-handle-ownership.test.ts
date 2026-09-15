@@ -804,12 +804,11 @@ test("H23 the merge's own four seams", async () => {
     "the rollback has to write the canonical key");
   assert.equal(/const key = `hands\.\$\{sessionId\}`/.test(eh), false,
     "and the legacy spelling must not come back");
-  // Round 42: writing the canonical name is only half of it. The occupancy
-  // check has to read through BOTH names, the way `readReusableEntry` does --
-  // a live binding held under the legacy name is invisible to a single read,
-  // and the migration then deletes it as the older of the pair.
-  assert.match(body, /readHandsEntry\(/,
-    "the occupancy check has to read through both names, not just one");
+  // Rounds 42 and 43: writing the canonical name is only half of it. The
+  // occupancy check has to consider BOTH names -- a live binding held under the
+  // legacy one is invisible otherwise, and the migration then deletes it as the
+  // older of the pair. H25 pins the shape that check ended up with; here it is
+  // enough that it writes back the key it was read under.
   assert.match(body, /found\?\.key/,
     "and update the key it was read under, never a re-derived one");
 
@@ -884,4 +883,46 @@ test("H24 a handle written before its workload can serve anything is not a ping 
     assert.equal(/pending:/.test(block), false,
       "a registration that carries an endpoint must not still be marked pending");
   }
+});
+
+test("H25 what round 43 found the halves of", async () => {
+  const eh = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
+  const hs = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/handles.ts", import.meta.url)), "utf-8");
+
+  // B1: `readHandsEntry` is canonical-first and returns the first non-null it
+  // finds -- right for "which binding is in force", wrong for "is this slot
+  // free". With both keys present and the canonical one a tombstone, an empty
+  // PUT or this workload's own row, it never sees another workload holding the
+  // legacy name, and the migration then deletes that live binding as the older
+  // of the pair. Both names are read.
+  const rec = eh.slice(eh.indexOf("const recordPending = async"));
+  const body = rec.slice(0, rec.indexOf("\n  };"));
+  assert.match(body, /const names = \[key, `hands\.\$\{sessionId\}`\]/,
+    "the occupancy check reads both names");
+  assert.equal(/readHandsEntry\(/.test(body), false,
+    "and not through the canonical-first reader, which stops at the first hit");
+
+  // B2: retention lands BEFORE the handle is freed. Releasing first was an
+  // attempt to keep a failed release retryable, on the premise that a throw
+  // means the delete did not happen -- it does not, a lost ACK has committed,
+  // and the container then ends with no handle, no retention record and no
+  // binding.
+  const retain = eh.slice(eh.indexOf("async function retainInsteadOfDestroying"));
+  const rbody = retain.slice(0, retain.indexOf("\n}"));
+  assert.ok(rbody.indexOf("retainContainer({") < rbody.indexOf("releaseHandlesForWorkload("),
+    "the reference that replaces the handle has to exist before the handle goes");
+
+  // ...which is only safe because a stale handle is now recoverable: a
+  // registration refused by a RETAINED workload takes the name anyway.
+  assert.match(hs, /opts\?\.mayTakeFrom && await opts\.mayTakeFrom\(previous\)/,
+    "a name held by a retained workload can be taken");
+  assert.equal((eh.match(/mayTakeFrom: retainedTaker\(/g) || []).length, 4,
+    "and every registration path supplies that, or the stale handle is forever");
+  const taker = eh.slice(eh.indexOf("function retainedTaker"));
+  assert.match(taker.slice(0, taker.indexOf("\n}")), /RETENTION_LEDGER_FILTER/,
+    "answered from the ledger, which a failed handle release cannot invalidate");
+  assert.match(taker.slice(0, taker.indexOf("\n}")), /return false;\n\s+\}\n\s+\};/,
+    "and an unreadable ledger is not a licence to take the name");
 });

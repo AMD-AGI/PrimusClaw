@@ -58,6 +58,7 @@ import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
+import { RETENTION_LEDGER_FILTER } from "./retain-container.js";
 import {
   admitSandbox, assertFleetCensused, type AdmissionHold,
 } from "./admission.js";
@@ -485,6 +486,38 @@ async function recoverUnhealthyReuse(
  * found here -- the count decides which container it gets, never what it is
  * told -- so the finding reaches operator telemetry alone.
  */
+/**
+ * A workload that has been retained no longer owns the handle naming it.
+ *
+ * Read from the retention ledger, which is what `retainContainer` writes first
+ * and what a lost projection is restored from -- so it is the durable answer to
+ * "was this container handed over", and the one thing a failed handle release
+ * cannot invalidate.
+ */
+function retainedTaker(kv: ReuseAttempt["kv"]): (previousWorkloadId: string) => Promise<boolean> {
+  return async (previousWorkloadId: string): Promise<boolean> => {
+    if (!previousWorkloadId) return false;
+    try {
+      const store = retentionStore(kv);
+      for (const ledgerKey of await store.keys(RETENTION_LEDGER_FILTER)) {
+        const held = await store.read(ledgerKey);
+        if (!held) continue;
+        const record = JSON.parse(held.value) as { workloadId?: string };
+        if (record?.workloadId === previousWorkloadId) return true;
+      }
+      return false;
+    } catch (e) {
+      // Unreadable is not "retained": refusing the registration keeps the
+      // handle naming something that may still be nobody's to take.
+      logger.warn(
+        { previousWorkloadId, err: (e as Error)?.message ?? String(e) },
+        "dag-handles.retention_check_failed",
+      );
+      return false;
+    }
+  };
+}
+
 async function retainInsteadOfDestroying(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -492,47 +525,22 @@ async function retainInsteadOfDestroying(
   answer: LiveWorkAnswer,
   binding: HandsBinding,
 ): Promise<void> {
-  // The DAG's handle goes with the DAG, not with the container it gives up.
+  // Retention BEFORE the handle release, and this order has been both ways now.
   //
-  // Retention is a handover: the container stays alive for the work still in
-  // it, the retention record becomes what owns it, and this session provisions
-  // a replacement. Leaving the handle naming the retained workload makes that
-  // replacement unregisterable -- `replaceDagHandle` refuses to take a name
-  // from a workload still on record, which is right -- and the rollback then
-  // stops the replacement, every retry, permanently.
+  // Releasing first was an attempt to keep a failed release retryable, on the
+  // premise that a throw means the delete did not happen. It does not: a delete
+  // whose ACK is lost has committed, and the caller then provisions a
+  // replacement that registers cleanly and overwrites the session entry --
+  // leaving the retained container with no handle, no retention record and no
+  // binding. The same window opens on a crash between the two, and for a DAG
+  // that REUSED this container the handle was also its own way back into this
+  // path, so losing it first makes the next attempt skip retention entirely.
   //
-  // BEFORE `retainContainer`, and that ordering is the whole recovery story.
-  // `retainContainer` deletes the session binding, and the binding is what
-  // brings the next attempt back through this path: release afterwards and a
-  // single failed delete strips the only way to ever retry it, so the stale
-  // handle rolls back every replacement for good -- reproduced as
-  // `stopped=[W-new-1, W-new-2]`. Released first, a failure leaves the binding,
-  // the handle and the container exactly as they were, and the next attempt
-  // walks in and tries again.
-  //
-  // Nothing is unreferenced in between: the session binding still names the
-  // container until `retainContainer` removes it.
-  //
-  // Safe to release by workload here: this is only reached when
-  // `entryOwnedByAnother` said no other DAG holds it, so these are this DAG's
-  // own handles.
-  const retainedWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
-  if (retainedWorkload) {
-    try {
-      await reuseEffects.releaseHandlesForWorkload(retainedWorkload);
-    } catch (e) {
-      logger.error(
-        { sessionId, workloadId: retainedWorkload, err: (e as Error)?.message ?? String(e) },
-        "hands.retain_handle_release_failed",
-      );
-      // Not retained. The caller still provisions a replacement and that
-      // replacement is still refused by the stale handle -- but the binding
-      // survives, so the next attempt reaches this line again instead of
-      // finding nothing left to act on.
-      return;
-    }
-  }
-
+  // Retaining first means the reference that replaces the handle exists before
+  // the handle can go. What that costs is a failed release leaving a stale
+  // handle -- which `registerReusedDagHandle` and the create-path registration
+  // recover from, by noticing the name belongs to a retained workload and
+  // freeing it there.
   await reuseEffects.retainContainer({
     store: retentionStore(kv),
     // The key this binding was read under, not one re-derived from the session
@@ -549,6 +557,24 @@ async function retainInsteadOfDestroying(
     verdict: answer.verdict,
     detail: answer.reason,
   });
+
+  // The DAG's handle goes with the DAG, not with the container it gives up.
+  // Leaving it naming the retained workload makes the replacement
+  // unregisterable -- `replaceDagHandle` refuses to take a name from a workload
+  // still on record, which is right -- so it is freed here, and if that does
+  // not land the registration path frees it instead.
+  //
+  // Safe to release by workload: this is only reached when
+  // `entryOwnedByAnother` said no other DAG holds it.
+  const retainedWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
+  if (retainedWorkload) {
+    await reuseEffects.releaseHandlesForWorkload(retainedWorkload).catch((e) => {
+      logger.warn(
+        { sessionId, workloadId: retainedWorkload, err: (e as Error)?.message ?? String(e) },
+        "hands.retain_handle_release_failed",
+      );
+    });
+  }
 }
 
 /**
@@ -944,7 +970,7 @@ export async function registerReusedDagHandle(
       namespace: identity.namespace,
       session_id: identity.sessionId,
       user_id: identity.userId,
-    });
+    }, { mayTakeFrom: retainedTaker(kv) });
   } catch (e) {
     // Not swallowed. Adopting a sandbox whose ownership could not be recorded
     // hands this DAG a workload that Backend's teardown cannot find: a cancel
@@ -1518,7 +1544,7 @@ async function provisionHands(
         // deployment default when the field is missing, so a workspace-scoped
         // sandbox would be polled where it is not and expire while still live.
         namespace: nsForSandbox,
-      });
+      }, { mayTakeFrom: retainedTaker(kv) });
     } catch (e) {
       // Was non-fatal, on the reasoning that a DAG can still complete without
       // reuse. It can -- but the handle is also the only record Backend has of
@@ -1668,7 +1694,7 @@ export function makeOnProvisioned(deps: {
           platform_key: deps.apiKey || "",
           image: deps.sandboxImage ?? undefined,
           namespace: deps.namespace,
-        });
+        }, { mayTakeFrom: retainedTaker(deps.kv) });
       } catch (err) {
         logger.error(
           { sessionId: deps.sessionId, workloadId, dagRoot: deps.dagRootTaskId,
@@ -1845,8 +1871,26 @@ export async function rollbackUnregisterableWorkload(args: {
     // this writes a newer pending on the canonical name, and the migration then
     // deletes the live binding as the older of the pair. Before the merge the
     // two names were the same string and one read saw everything.
+    // BOTH keys, read explicitly -- not `readHandsEntry`, which is
+    // canonical-first and returns the first non-null it finds. That is right for
+    // "which binding is in force" and wrong for "is this slot free": when the
+    // canonical key holds a tombstone, an empty PUT, or this workload's own
+    // row, the read-through stops there and never sees another workload holding
+    // the legacy name. The migration then merges the two by `createdAt` and
+    // deletes that live binding as the older of the pair.
     const key = handsSessionKey(sessionId);
-    const found = await readHandsEntry(kv as never, sessionId);
+    const names = [key, `hands.${sessionId}`].filter((n, i, a) => a.indexOf(n) === i);
+    let found: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
+    for (const name of names) {
+      const e = await kv.get(name);
+      if (!e) continue;
+      const usable = e.operation !== "DEL" && e.operation !== "PURGE"
+        && (e.value?.length ?? 0) > 0;
+      // A row that names somebody else decides the answer wherever it is found,
+      // so it wins over a tombstone the other name happens to hold.
+      if (usable) { found = { key: name, entry: e }; break; }
+      found ??= { key: name, entry: e };
+    }
     const cur = found?.entry ?? null;
     if (cur) {
       // A key that exists is replaced by revision, whatever state it is in.
@@ -2196,7 +2240,7 @@ async function ensureHandsAgentSandbox(
           hands_url: handsUrl,
           token: handsToken,
           image: workloadImage,
-        });
+        }, { mayTakeFrom: retainedTaker(kv) });
       } catch (e) {
         // Same reasoning as the SaFE path, rollback included: the sandbox is
         // created and registered for keepalive by now, so failing the turn
