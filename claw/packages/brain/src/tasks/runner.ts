@@ -3022,7 +3022,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands left a PENDING entry
     // (no-op when the entry is READY — a healthy sandbox is kept for the
     // retry to reuse). Done BEFORE nak so the retry starts clean.
-    await fx().reapPendingHands(this.sessionId);
+    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
     // Flush a per-attempt transcript before NAK so the JSONL captures
     // events of THIS attempt even if the next delivery / pod loses state.
     this.transcriptLog.push({
@@ -3068,7 +3068,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
-    await fx().reapPendingHands(this.sessionId);
+    await fx().reapPendingHands(this.sessionId, { taskId: this.request.task_id });
     // Classify sandbox-originated failures so the frontend can render a
     // dedicated banner (and so the user sees a readable reason rather than
     // a raw stack-trace tail). Non-sandbox errors fall through with the

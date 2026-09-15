@@ -366,13 +366,34 @@ export async function destroyHands(
  * etc.) — in that case the sandbox is healthy and should be kept so the
  * user's next message can reuse it; this function is a no-op for READY.
  */
-export async function reapPendingHands(sessionId: string): Promise<void> {
+export async function reapPendingHands(
+  sessionId: string,
+  expected?: { taskId?: string | null },
+): Promise<void> {
   try {
     const kv = getHandsKv();
     const entry = await kv.get(`hands.${sessionId}`);
     if (!entry) return;
     const info = JSON.parse(sc.decode(entry.value));
     if (info.status !== "pending") return;
+    // Whose workload this is decides whether it may be stopped. A session can
+    // hold more than one DAG at once under a session-scoped run gate, and
+    // `hands.<sessionId>` is a single slot, so the entry a failing task finds
+    // may have been written by a sibling DAG that is still creating -- or, if
+    // the read and the teardown straddle its promotion, still USING -- the
+    // workload it names. Reaping on the session alone stopped it.
+    //
+    // A pending entry with no task on it predates this field and can only have
+    // come from a process that was running before this rollout; it is reaped as
+    // before, because the alternative is leaking every such workload.
+    if (expected?.taskId && info.taskId && info.taskId !== expected.taskId) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, entryTaskId: info.taskId,
+          taskId: expected.taskId },
+        "hands.reap_pending_skipped_other_task",
+      );
+      return;
+    }
     logger.warn({ sessionId, workloadId: info.workloadId }, "hands.reap_pending");
     await destroyHands(
       sessionId,

@@ -45,6 +45,7 @@
  *   H19 recovery does not take a session entry the session has moved on to
  *   H20 a recorded entry does not end the recovery -- only a landed stop does
  *   H21 an empty PUT is replaced, not create-conflicted forever
+ *   H22 the reaper's identity check is wired through both call sites
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -741,3 +742,24 @@ test("H21 an empty PUT is replaced, not create-conflicted forever", async () => 
   assert.deepEqual(tombstoned.puts, ["W1"]);
 });
 
+
+test("H22 the reaper's identity check is wired through both call sites", async () => {
+  // The rule itself is exercised against the real function in
+  // reap-pending-task-identity.test.ts. What is left to check here is the
+  // wiring, which that test cannot see: the entry has to record who wrote it,
+  // and every caller has to supply the identity it gets compared against. A
+  // guard nobody passes an expectation to is a guard that never fires.
+  const runnerSrc = readFileSync(
+    fileURLToPath(new URL("../src/tasks/runner.ts", import.meta.url)), "utf-8");
+  assert.equal(
+    (runnerSrc.match(/reapPendingHands\(this\.sessionId, \{ taskId: this\.request\.task_id \}\)/g) || []).length,
+    2, "both failure paths have to pass it");
+  assert.equal(
+    (runnerSrc.match(/reapPendingHands\(this\.sessionId\)/g) || []).length,
+    0, "and neither may call it without one");
+  const ehSrc = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)), "utf-8");
+  const payload = ehSrc.slice(ehSrc.indexOf("const pendingPayload = sc.encode"));
+  assert.match(payload.slice(0, payload.indexOf("}));")), /taskId: request\.task_id/,
+    "and the entry has to record who wrote it");
+});

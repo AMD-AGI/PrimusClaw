@@ -1042,6 +1042,12 @@ async function provisionHands(
     // after, so there is nothing to wait for.
     const pendingPayload = sc.encode(JSON.stringify({
       status: "pending", workloadId, sandboxImage,
+      // Who this entry belongs to. `hands.<sessionId>` is one slot and a
+      // session can hold more than one DAG at a time under a session-scoped run
+      // gate, so a failing task must be able to tell its own half-created
+      // workload from a sibling's live one before reaping it.
+      taskId: request.task_id ?? null,
+      dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
       platformKey: apiKey, token: handsToken, namespace: nsForSandbox,
       createdAt: new Date().toISOString(),
     }));
