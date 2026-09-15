@@ -14,6 +14,9 @@ import {
   resolveTaskStreamMaxAgeNs, resolveTombstoneTtlMs, taskSubject,
 } from "@claw/protocol";
 import pino from "pino";
+import {
+  closeDoorbellLatch, DOORBELL_SEMANTICS_KEY, latchFromOperation, setDoorbellLatch,
+} from "../tasks/doorbell-gate.js";
 
 const logger = pino({ name: "nats" });
 export const sc = StringCodec();
@@ -26,6 +29,7 @@ export let kvCkpt: KV;
 export let kvSystemEnv: KV;
 export let kvTombstones: KV;
 export let kvDagHandles: KV;
+export let kvDoorbellFloor: KV;
 
 // Stream + subject names are stable across environments. Multi-account
 // isolation at the NATS server level keeps each environment's messages
@@ -50,6 +54,18 @@ export const SYSTEM_ENV_BUCKET = "SYSTEM_ENV";
 // session -- a task the queue can still redeliver, and every event still held
 // on the event stream, whichever of the two windows is the longer.
 export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
+// The fleet's asserted doorbell-semantics floor. Its own bucket, and one with
+// no expiry, because it is an operator assertion about the fleet rather than
+// coordination state: the registry's five-minute TTL is chosen for `lock.<key>`
+// and aging the floor out of it produced two failures at once -- a running
+// replica whose in-memory latch never learned the key had gone kept publishing
+// doorbells, while any replica that restarted read nothing and fell back to fat.
+// The fleet then disagreed with itself about the wire format, which is the one
+// thing the floor exists to prevent. Durability is also what makes a revocation
+// survive a restart: the delete is a tombstone a new watcher replays, whereas an
+// entry that merely ages out delivers no operation at all.
+export const DOORBELL_FLOOR_BUCKET = "DOORBELL_FLOOR";
+const DOORBELL_FLOOR_TTL_MS = 0;
 /**
  * Sandbox handle registry, per DAG. Brain is the only writer of handle
  * entries -- see `brain/src/sandbox/handles.ts` -- and this side is the only
@@ -210,9 +226,65 @@ export function tombstoneTtlMs(
  * unknown rather than guessed, because the two guesses are not symmetric: one
  * leaves a spare row behind, the other loses the message.
  */
+/**
+ * How far the task durable has settled, read once per sweeper tick.
+ *
+ * `ack_floor.stream_seq` covers both ways a delivery can still be live: never
+ * delivered is still pending, and held unacked behind a pod's execution gate is
+ * still outstanding. `lastSeq` supports the whole-stream form, for a row that
+ * attempted a publish but could not record which sequence it got.
+ *
+ * @returns null on any error or unreadable consumer or stream, which every
+ *   caller must read as "not settled" -- handing a session back on the strength
+ *   of an unreadable durable is the failure this exists to prevent.
+ */
+export async function taskDeliverySettlement(): Promise<
+  { ackFloor: number; lastSeq: number } | null
+> {
+  try {
+    const [consumer, stream] = await Promise.all([
+      jsm.consumers.info(TASK_STREAM, TASK_CONSUMER_NAME),
+      jsm.streams.info(TASK_STREAM),
+    ]);
+    const ackFloor = Number(consumer.ack_floor?.stream_seq);
+    const lastSeq = Number(stream.state?.last_seq);
+    if (!Number.isFinite(ackFloor) || !Number.isFinite(lastSeq)) return null;
+    return { ackFloor, lastSeq };
+  } catch (err) {
+    logger.warn({ err }, "nats.task_delivery_settlement_unreadable");
+    return null;
+  }
+}
+
 export function publishCertainlyFailed(err: unknown): boolean {
   const e = err as { code?: string; api_error?: unknown } | null;
   return e?.code === "503" || e?.api_error !== undefined;
+}
+
+/**
+ * Follow the fleet's asserted doorbell-semantics floor.
+ *
+ * Re-read on every delivery rather than cached from the first, and a watch that
+ * throws or ends closes the gate: a floor whose feed is dead is an assertion
+ * nobody can revoke. An entry that merely ages out delivers no operation at
+ * all, so the latch is changed only by a write or a delete that actually
+ * arrives -- which is why revocation is an explicit, verified operator step.
+ */
+function startDoorbellSemanticsWatch(bucket: KV): void {
+  void (async () => {
+    try {
+      const watcher = await bucket.watch({ key: DOORBELL_SEMANTICS_KEY });
+      for await (const entry of watcher) {
+        setDoorbellLatch(latchFromOperation(
+          entry.operation,
+          entry.operation === "PUT" ? sc.decode(entry.value) : null,
+        ));
+      }
+      closeDoorbellLatch("watch ended");
+    } catch (err) {
+      closeDoorbellLatch(String((err as Error)?.message ?? err));
+    }
+  })();
 }
 
 export async function initNats(): Promise<void> {
@@ -261,6 +333,11 @@ export async function initNats(): Promise<void> {
   kvTombstones = buckets.tombstones;
   kvSystemEnv = buckets.systemEnv;
   kvDagHandles = buckets.dagHandles;
+  kvDoorbellFloor = buckets.doorbellFloor;
+  // Last, once every handle above is published, because this one does not end
+  // with the call: the watch runs for the life of the process, keeping the
+  // in-memory doorbell latch tracking the fleet's asserted floor.
+  startDoorbellSemanticsWatch(kvDoorbellFloor);
 
   logger.info(
     {
@@ -292,6 +369,8 @@ export interface KvBuckets {
   checkpoints: KV;
   tombstones: KV;
   systemEnv: KV;
+  doorbellFloor: KV;
+  /** Bound rather than provisioned; brain owns it. See `bindDagHandles`. */
   dagHandles: KV;
 }
 
@@ -335,6 +414,11 @@ export async function ensureKvBuckets(
     systemEnv: await ensure(SYSTEM_ENV_BUCKET, {
       ttl: SYSTEM_ENV_TTL_MS,
       replicas: SYSTEM_ENV_REPLICAS,
+    }),
+    // Doorbell capability floor: an operator assertion, so it does not expire.
+    doorbellFloor: await ensure(DOORBELL_FLOOR_BUCKET, {
+      ttl: DOORBELL_FLOOR_TTL_MS,
+      replicas: BRAIN_REGISTRY_REPLICAS,
     }),
     // DAG sandbox handles. Brain owns this bucket: it creates it at boot and
     // writes every row. This side attaches to destroy rows -- whoever stops a

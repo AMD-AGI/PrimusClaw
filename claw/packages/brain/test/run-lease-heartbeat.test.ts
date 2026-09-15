@@ -307,3 +307,52 @@ test("a lease renewal that merely fails is not a verdict", async () => {
   });
   assert.equal(abortCtrl.signal.aborted, false);
 });
+
+test("a run the user stopped learns it from its own renewal, not from the wire", async () => {
+  // The Stop that never reaches its holder. The interrupt is core NATS and
+  // at-most-once, and every pod with no abort registered for the address drops
+  // it -- which this pod is between the claim writing the lease and
+  // `activeAbort` being populated two KV round trips later. A Stop landing in
+  // that window moves the row to `cancelling` and then has nothing left to
+  // reach, because the durable half deliberately leaves a held row to its
+  // holder. Without this the turn runs to completion and answers a user who
+  // asked it to stop; the same is true of any lost publish, a pod restarting
+  // or a blip on the subject.
+  //
+  // `postRunLease` has returned the row's status all along for exactly this
+  // purpose, and the fat delivery path already stops on it.
+  let observed: AbortSignal | undefined;
+  const { abortCtrl } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    leaseVerdict: () => "cancelling",
+    engineBehavior: async (extras) => {
+      observed = (extras as { signal?: AbortSignal } | undefined)?.signal;
+      await new Promise((r) => setTimeout(r, 30));
+      return result();
+    },
+  });
+
+  assert.equal(abortCtrl.signal.aborted, true, "a stopped row must stop its worker");
+  // Deliberately the generic reason: `cancelling` is not a terminal row and
+  // this replica still owns everything it holds, so the ending that reads as a
+  // user interrupt is the true account. The two named reasons would file it as
+  // a reap or a takeover and put the wrong sentence in the transcript.
+  assert.notEqual(abortCtrl.signal.reason, RUN_ROW_TERMINAL_ABORT_REASON);
+  assert.notEqual(abortCtrl.signal.reason, LEASE_LOST_ABORT_REASON);
+  if (observed) assert.equal(observed.aborted, true, "the engine sees the stop too");
+});
+
+test("but a run whose row is merely running is left alone", async () => {
+  // The positive control. Without it the case above holds just as well against
+  // a heartbeat that aborts on every renewal it reads.
+  const { abortCtrl } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    leaseVerdict: () => "running",
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return result();
+    },
+  });
+
+  assert.equal(abortCtrl.signal.aborted, false, "a live row is not a stop");
+});

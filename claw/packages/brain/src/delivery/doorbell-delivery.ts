@@ -10,13 +10,14 @@
  * on the queue after the same delay the fat path would have nacked for.
  */
 
+import type { RunUnclaimReason } from "@claw/protocol";
 import type { JsMsg } from "nats";
 import type { RunTimeReport } from "@claw/protocol";
 
 import { failClaimedRun, settleClaimedRun, unclaimRun } from "../clients/run-claim.js";
 
 /** Why a claimed row is going back. Only contention is a wait; the rest are faults. */
-export type RetryReason = "lock_contention" | "retry" | "drain";
+export type RetryReason = RunUnclaimReason;
 
 export interface ClaimedDeliveryActions {
   retryLater: (

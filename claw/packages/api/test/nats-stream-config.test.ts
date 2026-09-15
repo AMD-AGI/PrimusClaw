@@ -24,18 +24,20 @@
  * message, so the count is reconciled to the exact figure in both directions,
  * while shortening a retention deletes history and is therefore refused.
  *
- * Two KV buckets are reconciled the same way, each for a reason of its own.
- * DAG_HANDLES because its TTL is not this process's setting at all -- brain
- * may have created the bucket. And the tombstone bucket because its TTL has to
- * cover whatever the event stream actually keeps, so an operator who
- * lengthened it by hand was correcting the code rather than
+ * One KV bucket is reconciled the same way, and for a reason of its own: the
+ * tombstone bucket's TTL has to cover whatever the event stream actually keeps,
+ * so an operator who lengthened it by hand was correcting the code rather than
  * drifting from it. Reconciling that in both directions narrowed it back on the
  * next start, which left no configuration in which a widened event stream and a
  * tombstone that covered it could both exist. Every other bucket's TTL is a
  * setting this code is the authority on, and refusing to shorten one of those is
  * how a bucket comes to outlive the deadlines derived from the same number.
- * Whatever the code cannot read for itself, it reads off the stream instead --
- * which is the last part here.
+ *
+ * DAG_HANDLES is not reconciled from here in either direction, which is the
+ * other way a TTL can stop being this process's business: the bucket is Brain's,
+ * so this side binds to it and never states an opinion about its configuration
+ * at all. Whatever the code cannot read for itself, it reads off the stream
+ * instead -- which is the last part here.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -301,7 +303,7 @@ test("the two ensureStream call sites in the source each name their own replica 
   // that the reconciliation is correct and nothing at all about the number it
   // is given. `initNats` is where that number is chosen, and it needs a live
   // NATS connection -- it connects, opens a JetStream manager and provisions
-  // the consumer and four buckets before it returns -- so there is no seam to
+  // the consumer and five buckets before it returns -- so there is no seam to
   // assert the two calls through. That leaves the source, as with the
   // tombstone bucket's `retentionMeasured` below.
   //
@@ -486,15 +488,17 @@ test("the tombstone bucket is the one bucket whose TTL is never narrowed", async
 });
 
 test("only the one bucket whose TTL this process does not own asks for widenOnly", async () => {
-  // The conclusion of this whole change, and the thing nothing else holds: a
-  // bucket whose TTL is a setting this code is the authority on must be given
-  // `exact`, because one handed `widenOnly` as well is a bucket a shortened
-  // setting can no longer reach -- silently, since refusing to narrow is by
-  // design invisible from outside. Reading the wiring is what used to have to
-  // catch that.
+  // The conclusion of this whole change, and the thing nothing else holds: every
+  // other bucket's TTL is a setting this code is the authority on, so a bucket
+  // whose TTL is a setting must be given `exact` -- one handed `widenOnly` as
+  // well is a bucket a shortened setting can no longer reach, silently, since
+  // refusing to narrow is by design invisible from outside. Reading the wiring is
+  // what used to have to catch that.
   //
   // One bucket is legitimately not a setting: BRAIN_TOMBSTONES' TTL is derived
-  // from the event stream's retention.
+  // from the event stream's retention. DOORBELL_FLOOR's zero is a setting like
+  // the rest of them, which is why it is asserted below by its value rather than
+  // given a policy of its own.
   //
   // DAG_HANDLES is not in this list at all any more. It is not this process's
   // bucket -- Brain creates and writes it, this side only binds to destroy rows
@@ -513,8 +517,9 @@ test("only the one bucket whose TTL this process does not own asks for widenOnly
   assert.equal(bound, 1, "DAG_HANDLES is attached, not ensured");
   assert.deepEqual(
     calls.map((c) => c.name),
-    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV"],
-    "every bucket this process opens goes through here, or the guard below sees less than it claims",
+    ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV", "DOORBELL_FLOOR"],
+    "every bucket this process configures goes through here, or the guards below see less than "
+    + "they claim",
   );
   assert.deepEqual(
     calls.filter((c) => c.opts.ttlPolicy === "widenOnly").map((c) => c.name),
@@ -529,6 +534,20 @@ test("only the one bucket whose TTL this process does not own asks for widenOnly
     calls.find((c) => c.name === "DAG_HANDLES"), undefined,
     "Brain owns this bucket; this side binds to it and never configures it",
   );
+  assert.deepEqual(Object.keys(buckets).sort(),
+    ["checkpoints", "dagHandles", "doorbellFloor", "registry", "systemEnv", "tombstones"],
+    "and every one of them is handed back, since initNats holds all six -- the five it "
+    + "configures and the one it binds");
+  // The floor is an operator assertion about the fleet, not coordination state,
+  // and the two failures a TTL on it produces are not symmetrical: a running
+  // replica never learns the key aged out and goes on publishing doorbells,
+  // while any replica that restarts reads nothing and falls back to fat. The
+  // fleet then disagrees with itself about the wire format -- the one thing the
+  // floor exists to prevent. Zero is also what lets a revocation survive a
+  // restart, since the delete stays a tombstone the next watcher replays.
+  const floor = calls.find((c) => c.name === "DOORBELL_FLOOR");
+  assert.ok(floor, "the floor bucket is provisioned here or nowhere");
+  assert.equal(floor.opts.ttl, 0, "an asserted floor must not age out from under the fleet");
 });
 
 test("the bucket's own line says whether that retention was measured or assumed", () => {
@@ -632,5 +651,54 @@ test("the refusal reaches the log rather than being computed and dropped", () =>
   assert.match(
     src,
     /if \(refusal\) logger\.warn\(refusal, "nats\.kv_bucket_ttl_narrowing_refused"\)/,
+  );
+});
+
+/**
+ * The body of a top-level function in `source`, comments removed.
+ *
+ * Same reason as `ensureStreamSites` above: an identifier written in prose is
+ * not code that runs, and the question here is about one function rather than
+ * about the file, so the scan walks from that function's opening brace to its
+ * match instead of searching the whole source.
+ */
+function functionBody(source: string, name: string): string {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+  const at = code.search(new RegExp(`function\\s+${name}\\s*\\(`));
+  assert.notEqual(at, -1, `could not find ${name} in the source`);
+  const open = code.indexOf("{", code.indexOf(")", at));
+  let depth = 0;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === "{") depth += 1;
+    else if (code[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return code.slice(open + 1, i);
+    }
+  }
+  throw new Error(`${name} is never closed`);
+}
+
+test("initNats starts the floor watch on the bucket it just provisioned", () => {
+  // The doorbell latch has exactly one writer in this process, and it is the
+  // watch: nothing else ever calls `setDoorbellLatch`. Provisioning the bucket
+  // and not watching it is therefore silent -- no error, no warning, and a
+  // gauge that reads `unknown` for the life of the pod, which is
+  // indistinguishable from a fleet that never asserted a floor. Every doorbell
+  // is declined against that latch, so the whole capability is off and nothing
+  // says so.
+  //
+  // Read off the source for the same reason the two `ensureStream` sites are:
+  // `startDoorbellSemanticsWatch` is module-private and `initNats` is the only
+  // caller, and `initNats` connects to a live NATS server, opens a JetStream
+  // manager and provisions a consumer and five buckets before it returns. There
+  // is no seam, and the `nats` package's `connect` is an ESM binding no test in
+  // this suite can substitute.
+  const src = readFileSync(fileURLToPath(new URL("../src/infra/nats.ts", import.meta.url)), "utf-8");
+
+  assert.match(
+    functionBody(src, "initNats"),
+    /startDoorbellSemanticsWatch\(kvDoorbellFloor\)/,
+    "start-up provisions the doorbell floor bucket and never watches it, so the "
+    + "latch stays at unknown, every doorbell is declined, and no error is raised",
   );
 });

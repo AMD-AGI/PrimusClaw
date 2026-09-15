@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import type { RunTimeReport } from "./run-time.js";
+
 import type { EnvironmentTopology } from "./topology.js";
 
 /** Conversation message for LLM API. */
@@ -168,6 +170,80 @@ export interface RunLease {
   url: string;
   /** Bearer token scoped to this run; the same per-run token the callbacks use. */
   token: string;
+  /**
+   * That the worker must hold this lease before it waits for an execution slot.
+   *
+   * Additive: a message published before the marker existed is recognised by
+   * its shape instead — a non-doorbell request carrying `run_lease` and no
+   * `callback_url` — so an in-flight legacy payload still pre-leases.
+   */
+  accept_before_execution?: true;
+}
+
+/** What one lease POST asks of the row. */
+export interface RunLeaseRequest {
+  brain_id: string;
+  lease_seconds?: number;
+  phase?: RunPhase;
+  wait_reason?: RunWaitReason;
+  waited_ms?: number;
+  waits?: number;
+  /**
+   * That this POST is the worker's acceptance of the delivery rather than a
+   * renewal of a lease it already holds. Only an acceptance may open a
+   * generation, and only a caller that sends it will quote one afterwards.
+   */
+  accept?: true;
+  /**
+   * The generation the acceptance issued this worker. Omitted, never invented,
+   * when the acceptance was served by an API that returned none.
+   */
+  run_claim?: number;
+  /**
+   * Which attempt this renewal speaks for, and how many the row has seen.
+   *
+   * Beside `run_claim` rather than instead of it: the generation fences a
+   * delivery against a stale acceptance, while these fence one attempt
+   * against its own successor -- `brain_id` is a pod name and cannot tell the
+   * two apart.
+   *
+   * On the fat path the two are carried by different fields of the same body.
+   * A fat delivery takes no claim, so its attempt is minted with `claim_count`
+   * zero and discriminated by the delivery pair; the generation the acceptance
+   * issued travels in `run_claim`. A renewal is therefore fenced on
+   * `run_claim` whenever it sends one, and on the attempt's own `claim_count`
+   * only when it does not -- fencing a fat holder on its attempt's zero
+   * refuses it its own heartbeat.
+   */
+  attempt_id?: string;
+  claim_count?: number;
+  delivery_seq?: number;
+  delivery_count?: number;
+  /** The interval this tick closed. Absent on the opening one, which closed none. */
+  run_time?: RunTimeReport;
+}
+
+/** What the lease endpoint answers a caller it accepted. */
+export interface RunLeaseResponse {
+  ok: true;
+  status: string;
+  /**
+   * The row's generation. Absent from an API that predates it, which is a
+   * successful acceptance carrying no generation rather than a malformed one.
+   */
+  claim_count?: number;
+}
+
+/**
+ * Which row and which generation a completion is reporting for.
+ *
+ * Both additive on `exec_complete`: a completion that names neither is one
+ * from a worker whose acceptance issued neither, and is admissible only while
+ * the row it names is unfenced.
+ */
+export interface ExecCompleteRunIdentity {
+  task_id?: string;
+  run_claim?: number;
 }
 
 /** What a run is doing right now, as reported with each lease renewal. */
@@ -179,7 +255,7 @@ export type RunWaitReason = "approval" | "background_command";
 /** Brain task execution request (Backend Dispatcher → Brain HTTP). */
 export interface ExecuteRequest {
   // ── Task identity ─────────────────────────────────────────────────────
-  /** Required for task-system dispatch (Phase 4+); legacy chat path leaves this undefined and engines fall back to `session_id`/`message_id` for log correlation. */
+  /** Required for task-system dispatch (Phase 4+); older API replicas without chat task-ID forwarding leave this undefined during a rolling deploy, and engines fall back to `session_id`/`message_id` for log correlation. */
   task_id?: string;
   session_id: string;
   /** Idempotency key for engine-level deduplication. */

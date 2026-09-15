@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import { StringCodec, type JsMsg, type KV } from "nats";
-import type { ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import type { ExecCompleteRunIdentity, ExecuteRequest, ExecuteResult } from "@claw/protocol";
+import { currentFatDelivery } from "../delivery/dispatch.js";
 import {
   HandsRebuildFailed,
   HandsRecoveryBudgetExhausted,
@@ -70,7 +71,7 @@ import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
-import { resolveRunIdentity, type RunIdentity } from "./run-identity.js";
+import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
   activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
@@ -230,6 +231,32 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
 }
 
 /**
+ * Which row and which generation a completion is reporting for.
+ *
+ * The generation belongs to the delivery rather than to any one phase of it,
+ * so it is read from the delivery context the handler runs under. Omitted,
+ * never invented, when the acceptance was served by an API that issued none:
+ * a completion carrying a generation the row never handed out would close a
+ * row this run does not own.
+ */
+function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
+  const runClaim = currentFatDelivery()?.runClaim;
+  // A fat payload published by an API that predates the field carries no
+  // `task_id`, only the lease URL -- and the URL names the row, which is why
+  // `resolveRunIdentity` already reads it. Without the same fallback here such
+  // a run reports a completion that names nothing, and an unnamed completion is
+  // closed by `closeUnnamedChatRun`, whose predicate excludes a fenced row --
+  // which this row is, because the pre-gate accepted it and every acceptance
+  // fences. The turn finishes, its answer reaches the user, and the row stays
+  // open until a reaper decides the worker was lost.
+  const taskId = request.task_id || taskIdFromLease(request).id || undefined;
+  return {
+    ...(taskId ? { task_id: taskId } : {}),
+    ...(runClaim === undefined ? {} : { run_claim: runClaim }),
+  };
+}
+
+/**
  * Resolve a task whose JetStream delivery budget is exhausted.
  *
  * DAG tasks must use the same durable callback/outbox handoff as every other
@@ -257,6 +284,7 @@ export async function resolvePoisonedTask(
     skills_used: {},
     prompt: request.prompt,
     delivery_count: msg.info.deliveryCount,
+    ...runIdentity(request),
   };
   if (messageId) event.message_id = messageId;
 
@@ -864,7 +892,9 @@ type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
  * The claim a doorbell run holds, or null for a fat delivery that took none.
  *
  * Its generation is the discriminator the fat path gets from the delivery pair
- * instead; a row only ever has one of the two advancing.
+ * instead, so the attempt is minted with a zero there. That zero is not the
+ * row's generation: a fat acceptance does issue one, and the runner quotes it
+ * back in `run_claim` beside this token rather than folding it in here.
  */
 export type RunClaim = { claimCount: number } | null;
 
@@ -2725,6 +2755,7 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     // Persist the user-visible completion event before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
@@ -3140,6 +3171,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     await deliverAgentDone(
       this.kvCkpt,
@@ -3367,6 +3399,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request),
     });
     // Every failed run asks the platform, not only one that reached the rebuild
     // path: a sandbox can vanish in ways that surface as an ordinary tool error,
@@ -3510,6 +3543,25 @@ class TaskRunner {
    * `beginRun` and it: a report that measured nothing must not advance the
    * row's watermark, and the interval stays visibly unbanked.
    */
+  /**
+   * The generation this attempt actually holds on the row.
+   *
+   * Two dispatch shapes keep it in two places. A claimed doorbell carries it in
+   * `attempt.claimCount`, minted from the claim. A fat delivery's acceptance
+   * mints one too -- `acquireFatLease` does `claim_count + 1` -- but hands it
+   * back out of band, in the pre-gate context, because `attempt.claimCount` was
+   * fixed at 0 when a fat delivery genuinely took no claim.
+   *
+   * It does take one now, so 0 is a stale answer, and every fence that reads it
+   * refuses: the settle behind a nak returns `not_holder`, its coverage is
+   * never banked, and the row keeps this attempt's token and a live lease that
+   * turns the redelivery's first heartbeat away until the lease lapses. The
+   * renewal path already asks the context; these are the two that did not.
+   */
+  private heldGeneration(): number {
+    return currentFatDelivery()?.runClaim ?? this.attempt.claimCount;
+  }
+
   private coverageReport(): { runTime: RunTimeReport } | null {
     if (!this.coverageOpened) return null;
     const snapshot = runTimeOf(this.runIdentity.key);
@@ -3520,7 +3572,7 @@ class TaskRunner {
       runTime: {
         key: this.runIdentity.key,
         attemptId: this.attempt.attemptId,
-        claimCount: this.attempt.claimCount,
+        claimCount: this.heldGeneration(),
         deliverySeq: this.attempt.deliverySeq,
         deliveryCount: this.attempt.deliveryCount,
         // Differences, never instants, so the database's own budget bounds them.
@@ -3552,7 +3604,7 @@ class TaskRunner {
     if (this.claimed) this.declareCoverage();
     else if (this.request.task_id) {
       await fx().settleRunAttempt(
-        this.request.task_id, this.attempt.claimCount, this.coverageReport()?.runTime, true,
+        this.request.task_id, this.heldGeneration(), this.coverageReport()?.runTime, true,
       );
     }
     this.msg.nak(delayMs);
@@ -3578,6 +3630,7 @@ class TaskRunner {
     if (!this.request.run_lease?.url) return null;
     const tick = () => {
       const phase = phaseOf(this.runIdentity.key);
+      const runClaim = currentFatDelivery()?.runClaim;
       const coverage = this.coverageReport();
       // Only from the second tick onward, by construction rather than because
       // the clock happened not to advance since `beginRun`.
@@ -3590,6 +3643,7 @@ class TaskRunner {
         waitedMs: phase.waitedMs,
         waits: phase.waits,
         attempt: this.attempt,
+        ...(runClaim === undefined ? {} : { runClaim }),
         ...(coverage ?? {}),
       }).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
@@ -3601,6 +3655,36 @@ class TaskRunner {
         // went terminal leaves this worker holding a sandbox and a delivery
         // nobody else can release; a row another worker took over leaves it
         // holding neither, whatever it still has handles for.
+        // A Stop this run never heard on the wire.
+        //
+        // The interrupt is core NATS and at-most-once, and it is dropped by
+        // every pod with no abort registered for the address -- which this pod
+        // is, from the moment the claim writes the lease until `activeAbort`
+        // is populated two KV round trips later. A Stop landing in there wrote
+        // `cancelling` on the row and then had nothing left to reach: the
+        // durable half deliberately leaves a held row to its holder, and the
+        // holder was not listening yet. Anything else that loses the publish
+        // -- a pod restarting, a blip on the subject -- ends the same way.
+        //
+        // `postRunLease` has answered with the row's status all along, for
+        // exactly this ("so a caller can notice a run that has been
+        // cancelled"), and the fat delivery path already stops on it. This is
+        // the doorbell half of the same answer, one heartbeat behind at worst.
+        //
+        // Aborted with no reason on purpose: `cancelling` is not a terminal
+        // row and this replica still owns everything it holds, so the generic
+        // branch -- the one that files the ending as a user interrupt -- is
+        // the true account of what happened.
+        if (status === "cancelling") {
+          if (this.abortCtrl.signal.aborted) return;
+          logger.info(
+            { sessionId: this.sessionId, messageId: this.messageId,
+              taskId: this.request.task_id },
+            "run.stop_seen_on_renewal",
+          );
+          this.abortCtrl.abort();
+          return;
+        }
         const refused = status === "gone" || status === "superseded";
         // Recorded before the early return, exactly as the lock renewal does.
         // `superseded` means another worker holds this run, which is the same
@@ -3627,6 +3711,9 @@ class TaskRunner {
   }
 
   private startDeliveryHeartbeat(): void {
+    // keepAlive must be much shorter than the consumer's ack_wait to avoid
+    // redelivery while a task is still making progress. That is
+    // TASK_CONSUMER_ACK_WAIT_NS, two minutes, against the ten seconds here.
     this.keepAlive = setInterval(() => {
       try { this.msg.working(); } catch {}
       fx().refreshTaskLock(this.lockKey).then((renewal) => {
@@ -3668,6 +3755,17 @@ class TaskRunner {
     await this.resolvePlatformKey();
 
     this.pendingResumeCkpt = await this.readKvCheckpoint();
+    // Armed only here, after the checkpoint read directly above, and not when
+    // the run was set up. A deadline that is already past on arrival -- a
+    // redelivery of a run whose budget expired while it was queued, which is
+    // the resumed case this reports on -- fires on the next tick, and armed
+    // any earlier that tick lands before `pendingResumeCkpt` is assigned, so
+    // the run's turn count reads as zero in the one log line that exists to
+    // say how far it had got. What this gives up is the deadline's cover over
+    // three awaits, not one -- the taskResumed emit, the platform-key fetch
+    // and the checkpoint read. None of them observes the abort signal, so
+    // arming earlier could not have cut any of them short, and both KV reads
+    // are inside try/catch behind the client's own request timeout.
     this.cancelDeadline = this.armDeadline();
     if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
       await this.attachHands();
@@ -3790,9 +3888,18 @@ class TaskRunner {
   }
 
   async run(): Promise<void> {
+    // Every terminal ending sets this -- the catch through `failureOutcome`,
+    // the happy path here -- and the `finally` reports it once. Recording it
+    // inside each terminal branch instead would mean nine call sites and a
+    // silent gap the first time a tenth is added, and the gap would read as
+    // "no tasks ran", which is the same shape as an outage.
     const runStartedAt = Date.now();
     let outcome: TaskOutcome | null = null;
     const leaseTimer = this.startLeaseHeartbeat();
+    // Only once this run's own renewal is armed, so the two owners overlap:
+    // the delivery layer keeps the lease alive until this line, and a gap
+    // between them is a lease another pod could take the row over on.
+    if (leaseTimer) currentFatDelivery()?.handOffRenewal();
     this.startDeliveryHeartbeat();
     try {
       await this.executeRun();

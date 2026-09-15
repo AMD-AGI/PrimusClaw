@@ -63,6 +63,40 @@ jobs:
       - name: Run lint-metrics-must-register
         run: |
           bash claw/scripts/lint-metrics-must-register.sh --all
+          bash claw/scripts/lint-metrics-must-register.sh --self-test
+
+  startup-calls-rollout-assert:
+    name: enforce main() asserts the rollout config before it listens
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      # The self-test boots the real index.ts, which resolves @claw/* through
+      # each package's dist, so this guard needs the workspaces installed and
+      # built rather than the bare tree the other lint jobs scan.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: claw/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: claw
+
+      - name: Build workspaces
+        run: npm run build
+        working-directory: claw
+
+      - name: Run lint-startup-calls-rollout-assert
+        run: |
+          bash claw/scripts/lint-startup-calls-rollout-assert.sh --all
+          bash claw/scripts/lint-startup-calls-rollout-assert.sh --self-test
 
   llm-settings-must-be-deployable:
     name: enforce that every LLM_*/PROMPT_CACHE_* setting reaches a cluster
@@ -159,6 +193,22 @@ jobs:
       - name: Run lint-no-nullish-env-default
         run: |
           bash claw/scripts/lint-no-nullish-env-default.sh --all
+
+  promql-rollout-gates:
+    name: evaluate the rollout gates against the PromQL engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install promtool
+        run: |
+          bash scripts/release-tests/install-promtool.sh
+
+      - name: Run promql-gates
+        run: |
+          bash scripts/release-tests/promql-gates.sh
 
   gofmt:
     name: gofmt (Sandbox)

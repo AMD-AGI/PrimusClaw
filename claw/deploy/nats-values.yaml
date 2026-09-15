@@ -158,6 +158,7 @@ config:
                   - "$JS.FC.PRIMUS_CLAW_EVENTS.>"
                   - "$JS.FC.KV_BRAIN_REGISTRY.>"
                   - "$JS.FC.KV_DAG_HANDLES.>"
+                  - "$JS.FC.KV_DOORBELL_FLOOR.>"
                   # KV writes. A put, update or delete is a publish.
                   - "$KV.BRAIN_REGISTRY.hands.*"
                   - "$KV.BRAIN_REGISTRY.lock.>"
@@ -177,21 +178,26 @@ config:
                   # `dag-handles.<dag_root_task_id>`: one token, and a task id
                   # contains no dots. This is the same grant brain holds.
                   - "$KV.DAG_HANDLES.dag-handles.*"
+                  # The fleet's doorbell-semantics floor: one named key, in a
+                  # bucket of its own rather than in BRAIN_REGISTRY, because it
+                  # is an operator assertion and must not age out. This grant
+                  # covers both the set and the delete -- a revocation is a
+                  # tombstone the watchers replay, so it has to be publishable.
+                  - "$KV.DOORBELL_FLOOR.brain.doorbell_semantics"
                   - "$KV.BRAIN_TOMBSTONES.deleted.*"
                   - "$KV.SYSTEM_ENV.current"
                   # Bucket lifecycle. api creates and reconciles five buckets,
                   # including BRAIN_CHECKPOINTS -- provisioning only; see the
                   # note under that bucket's absence from the data lists.
+                  # DOORBELL_FLOOR is the fifth, and the newest: the floor is an
+                  # operator assertion about the whole fleet, so api provisions
+                  # it with no TTL rather than letting it age out of a bucket
+                  # sized for `lock.<key>`.
                   #
-                  # DAG_HANDLES is the exception brain's own block describes: it
-                  # is the one bucket brain creates. api reconciles it anyway,
-                  # with `ttl: 0` and `widenOnly` so it can widen a bucket
-                  # somebody created narrow but never narrow brain's, and so
-                  # replica drift on a bucket first opened without options can
-                  # be corrected -- which only api does, being the side that
-                  # implements the reconcile. CREATE is needed for the ordering where
-                  # api starts first on a fresh cluster.
-                  - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
+                  # DAG_HANDLES is deliberately NOT among them, which is why it
+                  # has no CREATE or UPDATE anywhere in this list. Brain creates
+                  # that bucket; api only binds to it. Its grants are grouped
+                  # together further down, with the reasoning for the split.
                   - "$JS.API.STREAM.INFO.KV_BRAIN_REGISTRY"
                   - "$JS.API.STREAM.CREATE.KV_BRAIN_REGISTRY"
                   - "$JS.API.STREAM.UPDATE.KV_BRAIN_REGISTRY"
@@ -204,6 +210,9 @@ config:
                   - "$JS.API.STREAM.INFO.KV_SYSTEM_ENV"
                   - "$JS.API.STREAM.CREATE.KV_SYSTEM_ENV"
                   - "$JS.API.STREAM.UPDATE.KV_SYSTEM_ENV"
+                  - "$JS.API.STREAM.INFO.KV_DOORBELL_FLOOR"
+                  - "$JS.API.STREAM.CREATE.KV_DOORBELL_FLOOR"
+                  - "$JS.API.STREAM.UPDATE.KV_DOORBELL_FLOOR"
                   # KV reads: direct get, plus the non-direct fallback taken
                   # when a bucket predates allow_direct.
                   - "$JS.API.DIRECT.GET.KV_BRAIN_REGISTRY"
@@ -215,6 +224,9 @@ config:
                   - "$JS.API.DIRECT.GET.KV_DAG_HANDLES"
                   - "$JS.API.DIRECT.GET.KV_DAG_HANDLES.>"
                   - "$JS.API.STREAM.MSG.GET.KV_DAG_HANDLES"
+                  - "$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR"
+                  - "$JS.API.DIRECT.GET.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.STREAM.MSG.GET.KV_DOORBELL_FLOOR"
                   # kv.keys() and kv.watch() build ordered ephemeral consumers
                   # and tear them down again; without DELETE each sweep leaks
                   # one, and every teardown here is a bare .catch(() => {}).
@@ -223,19 +235,36 @@ config:
                   - "$JS.API.CONSUMER.INFO.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.MSG.NEXT.KV_BRAIN_REGISTRY.>"
                   - "$JS.API.CONSUMER.DELETE.KV_BRAIN_REGISTRY.>"
-                  # The sweeper's orphan-handle pass and the sandbox census are
-                  # both kv.keys() over this bucket, so it needs the same
-                  # ordered-consumer lifecycle.
+                  # The floor is followed with kv.watch() on a single key, so
+                  # it needs that lifecycle too: a watch that ends or throws
+                  # closes the doorbell gate, which is safe but costs the fleet
+                  # its fast path until the watcher comes back.
+                  - "$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR"
+                  - "$JS.API.CONSUMER.CREATE.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.INFO.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.MSG.NEXT.KV_DOORBELL_FLOOR.>"
+                  - "$JS.API.CONSUMER.DELETE.KV_DOORBELL_FLOOR.>"
+                  # DAG_HANDLES. The sweeper's orphan-handle pass and the
+                  # sandbox census are both kv.keys() over this bucket, so it
+                  # needs the same ordered-consumer lifecycle -- and the census
+                  # reads earn their place on their own: it reads the live DAG
+                  # handles brain writes, and a fleet inventory missing them
+                  # licenses a rollback that leaves sandboxes running.
                   #
-                  # Rows are writable, the STREAM is not. Whoever stops a
-                  # workload frees its handle, and since the cancel teardown
-                  # this side is one of the things that stops them -- a handle
-                  # left naming a stopped workload blocks the replacement's
-                  # registration instead of leaking it. But no STREAM.CREATE or
-                  # UPDATE: `ensureKvBucket` corrects drift as well as creating,
-                  # so an attach from here carrying its own replica setting
-                  # would rewrite Brain's bucket on every boot. Brain owns the
-                  # bucket; this side binds to it.
+                  # Rows are writable, the STREAM is not -- this is the one
+                  # place the two features that met here disagreed, and the
+                  # narrower rule is "cannot create or reconfigure", not
+                  # "cannot write". Whoever stops a workload frees its handle,
+                  # and since the cancel teardown this side is one of the things
+                  # that stops them -- a handle left naming a stopped workload
+                  # blocks the replacement's registration instead of leaking it.
+                  # But no STREAM.CREATE or UPDATE: `ensureKvBucket` corrects
+                  # drift as well as creating, so an attach from here carrying
+                  # its own replica setting would rewrite Brain's bucket on
+                  # every boot, and on an api-first cluster would create it with
+                  # a count Brain never chose. The attach is bindOnly precisely
+                  # so api never becomes this bucket's creator and pins its
+                  # replica count. Brain owns the bucket; this side binds to it.
                   - "$JS.API.STREAM.INFO.KV_DAG_HANDLES"
                   - "$KV.DAG_HANDLES.dag-handles.*"
                   - "$JS.API.CONSUMER.CREATE.KV_DAG_HANDLES"

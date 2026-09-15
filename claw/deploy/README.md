@@ -176,6 +176,28 @@ kubectl rollout restart deployment/primus-claw-api -n primus-claw
 kubectl rollout restart deployment/primus-claw-brain -n primus-claw
 ```
 
+### Doorbell Dispatch and Admission Ceilings
+
+Before rolling an API image that ships `RUN_DOORBELL_DISPATCH=true`, apply or
+re-apply the NATS values for the environment. `deploy/deploy.sh` without
+`--skip-nats` renders `deploy/nats-values.yaml`, waits for the NATS Helm upgrade,
+and only then applies the API Deployment. `deploy/upgrade.sh` does not touch
+NATS, so use it only after the NATS values apply has completed separately.
+Without the new `DOORBELL_FLOOR` KV grants, API startup fails and the pods
+crash-loop.
+
+`features.runDoorbellDispatch` ships on, while the eight `api.admit*` ceilings
+ship at `"0"`. The runtime capability floor keeps dispatch on the fat path until
+the fleet explicitly asserts support. Raising ceilings and rolling Doorbell back
+follow a strict order -- clear the ceilings first, disable Doorbell second, or
+the API refuses to start. See [`../docs/doorbell-rollout.md`](../docs/doorbell-rollout.md).
+
+`features.brainDoorbellExecution` is the Brain-side kill-switch and renders the
+same `RUN_DOORBELL_DISPATCH` variable on the Brain deployment. It ships **on**,
+and a rollback of `features.runDoorbellDispatch` must leave it on: a Brain
+reading it false claims no doorbell row, so the queued backlog the rollback is
+waiting to drain would strand instead.
+
 ### Grafana Dashboard
 
 `charts/claw/dashboards/claw-brain.json` is a Grafana dashboard for the Brain's
@@ -315,3 +337,6 @@ Requires `boto3` (`pip install boto3`). See `deploy/minio-lifecycle.py` for user
 | `minio-lifecycle.py` | S3 bucket lifecycle rules script (boto3) |
 | `charts/claw/dashboards/claw-brain.json` | Grafana dashboard for the Brain metrics (installed by the chart when `grafanaDashboard.enabled`, or imported by hand) |
 | `charts/claw/templates/servicemonitor.yaml` | Prometheus Operator ServiceMonitors for API and Brain (`serviceMonitor.enabled`) |
+| `charts/claw/values.schema.json` | JSON Schema for the Doorbell switch and the eight admission ceilings, enforced by `helm lint`/`template`/`upgrade` |
+| `charts/claw/templates/admission-preflight.yaml` | Render-time refusal of a soft ceiling above its hard ceiling, and of any ceiling set while Doorbell dispatch is off |
+| `promql/rollout-gates.test.yaml` | `promtool test rules` fixture for the rollout gates in `../docs/doorbell-rollout.md`, under both scrape modes |

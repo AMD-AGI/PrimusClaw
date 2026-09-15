@@ -498,6 +498,18 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
   // 1. CAS into preparing.
   const locked = await transitionStatus(taskId, ["queued"], "preparing");
   if (!locked) return { ok: false, reason: "not_queued" };
+  return await dispatchPreparedRow(locked);
+}
+
+/**
+ * Everything after the `queued → preparing` CAS, for a row already reserved.
+ *
+ * Two entries, one body: the scheduler now takes that transition itself, on the
+ * transaction that counted the headroom, so running the CAS again over its row
+ * would answer `not_queued` for work it had just admitted.
+ */
+export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<DispatchResult> {
+  const taskId = locked.task_id;
   // Chat runs are claimed, not published. The scheduler should not have
   // picked this row; putting it back is cheaper than a fat message that
   // bypasses the doorbell and arrives without credentials.

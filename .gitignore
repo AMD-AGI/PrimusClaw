@@ -26,6 +26,9 @@ test_*.py
 **/.env
 !**/.env.example
 
+# Pinned verification tools fetched by scripts/release-tests/install-promtool.sh
+.tools/
+
 # Build artifacts
 **/dist/
 **/node_modules/

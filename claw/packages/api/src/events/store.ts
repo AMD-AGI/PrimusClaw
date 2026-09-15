@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { ConsumerMessages, JsMsg } from "nats";
+import { db } from "../infra/db.js";
 import { js, jsm, sc, EVENT_STREAM } from "../infra/nats.js";
 import { eventSubject } from "@claw/protocol";
 import { redactPublicJson } from "./redaction.js";
@@ -191,4 +192,76 @@ export async function createSessionSubscriptionReady(sessionId: string): Promise
   const sub = createSessionSubscription(sessionId);
   const ok = await sub.ready();
   return ok ? sub : null;
+}
+
+/**
+ * Whether this message has already had a completion published for it at all.
+ *
+ * A different question from `completionAlreadyProcessed`, and the one a refusal
+ * has to ask. That one requires `processed_at`, which the consumer writes only
+ * after `handleComplete` returns -- and the drain that reaches a second refusal
+ * runs *inside* `handleComplete`. So at the moment the second refusal decides,
+ * the first completion is mid-flight with `processed_at` still NULL, and the
+ * processed-only test answers "no" for a completion that is about to be marked
+ * processed and will therefore discard everything after it.
+ *
+ * Existence is the right test because the discard is decided later: whichever
+ * of the two is marked processed first makes the other one skipped, so a
+ * completion published while another already exists can never be the one that
+ * releases a gate.
+ */
+export async function completionAlreadyPublished(
+  sessionId: string,
+  messageId: string,
+): Promise<boolean> {
+  if (!messageId) return false;
+  const r = await db.query(
+    `SELECT 1 FROM claw_session_events
+      WHERE session_id = $1
+        AND event = 'exec_complete'
+        AND data->>'message_id' = $2
+        AND deleted_at IS NULL
+      LIMIT 1`,
+    [sessionId, messageId],
+  );
+  return !!r.rowCount;
+}
+
+/**
+ * Whether this turn's completion has already been handled, under any delivery.
+ *
+ * The `processed_at` gate keys on the event id, which is derived from the
+ * JetStream sequence, so it recognises redeliveries of one published message and
+ * nothing else. Brain publishes the same completion more than once: a run picked
+ * back up after being interrupted emits exec_complete again, under a new
+ * sequence and therefore a new event id, which conflicts with nothing and is
+ * handled from scratch. What that repeated is not only the conversation turn --
+ * the queued message waiting behind this one was dispatched a second time as
+ * well, as a second run.
+ *
+ * The message id is what stays the same across all of it, because it names the
+ * user's message rather than the delivery. An event without one falls back to
+ * the per-delivery gate: the answer here would be "some other completion of this
+ * session was processed", which is true of nearly every event and would drop
+ * real work.
+ *
+ * Only a row marked processed counts. An attempt that died half way through
+ * leaves `processed_at` NULL deliberately, and the retry has to finish it.
+ */
+export async function completionAlreadyProcessed(
+  sessionId: string,
+  messageId: string,
+): Promise<boolean> {
+  if (!messageId) return false;
+  const r = await db.query(
+    `SELECT 1 FROM claw_session_events
+      WHERE session_id = $1
+        AND event = 'exec_complete'
+        AND data->>'message_id' = $2
+        AND processed_at IS NOT NULL
+        AND deleted_at IS NULL
+      LIMIT 1`,
+    [sessionId, messageId],
+  );
+  return !!r.rowCount;
 }

@@ -290,6 +290,18 @@ test("a clean run acks, reports success and drops the checkpoint", async () => {
   assert.ok(r.calls.includes("releaseTaskLock"), "the task lock must be released in finally");
 });
 
+test("a fat request emits its task identity on exec_complete", async () => {
+  const r = await runScenario({
+    request: { task_id: "task-fat-complete", message_id: MESSAGE },
+    engineBehavior: async () => result(),
+  });
+
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.completion?.failed, false);
+  assert.equal(r.completion?.task_id, "task-fat-complete");
+  assert.equal(r.completion?.message_id, MESSAGE);
+});
+
 // ── fatal ────────────────────────────────────────────────────────────────
 
 test("a non-retryable error acks with failed=true and a presentable reason", async () => {

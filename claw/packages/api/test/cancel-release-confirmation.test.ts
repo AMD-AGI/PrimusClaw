@@ -59,6 +59,7 @@ import type { HandleInfo } from "@claw/protocol";
 process.env.SAFE_API_URL = "http://safe.test";
 
 const { db } = await import("../src/infra/db.js");
+const { stubDb: stubBothDbPaths } = await import("./support/db-stub.js");
 const { handleRegistry, unreleasedRecord, stopAllHandlesForDag, stopSandboxByHandle } =
   await import("../src/tasks/sandbox-stopper.js");
 const { cancelTask } = await import("../src/tasks/lifecycle.js");
@@ -347,21 +348,34 @@ test("R9 a non-root cancel omits the field rather than guessing at it", async ()
   // handle was ever recorded, which was never checked; `unconfirmed` would
   // report a failed attempt that was never made. Absent is the true answer, and
   // it is also what keeps the response identical for callers who predate this.
-  db.query = (async (text: string) => {
-    const sql = text.replace(/\s+/g, " ").trim();
+  // Both database paths, not just `db.query`: this is the only case in the file
+  // that reaches the non-root branch, and that branch settles the row through
+  // `transitionCancellation`, which runs `inTransaction` -- a pooled connection
+  // of its own that a `db.query` stub never sees. Stubbing one path alone let
+  // the transaction through to a real database and failed on a table that does
+  // not exist here. See test/support/db-stub.ts, which exists for exactly this.
+  const stub = stubBothDbPaths((sql) => {
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
-      return {
-        rows: [{ ...DAG_ROOT, task_id: "t-mid", dag_node_id: "n-mid" }],
-        rowCount: 1,
-      };
+      return [{ ...DAG_ROOT, task_id: "t-mid", dag_node_id: "n-mid" }];
+    }
+    // `transitionCancellation`'s prior-state read, under the row's own lock.
+    if (sql.startsWith("SELECT status AS prior_status")) {
+      return [{ prior_status: "running", prior_dispatch: null, prior_queued_since: null }];
     }
     if (sql.startsWith("UPDATE claw_tasks SET status")) {
-      return { rows: [{ task_id: "t-mid" }], rowCount: 1 };
+      return [{ task_id: "t-mid", status: "cancelling", origin: "chat" }];
     }
-    return { rows: [], rowCount: 0 };
-  }) as typeof db.query;
+    return [];
+  });
 
   const r = await cancelTask("t-mid");
+  stub.restore();
+
+  // The branch really was the one under test: a transaction was opened, which
+  // only the non-root path does. Without this the assertion below would also
+  // pass for a run that returned early and never settled anything.
+  assert.ok(stub.connections > 0, "the non-root branch settles the row in a transaction");
+  assert.equal(r.cancelled, 1, "and the row was transitioned");
 
   assert.equal("released" in r, false, "no sandbox was touched, so nothing is established");
 });
