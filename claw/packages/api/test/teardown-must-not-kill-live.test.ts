@@ -25,6 +25,7 @@
  *   L6 re-cancelling a finished DAG does not stop what a newer DAG reuses
  *   L7 a workload another DAG still holds is not stopped by this one's teardown
  *   L8 and one nobody else holds still is
+ *   L9 a stale empty read of another DAG does not permit the stop
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -324,4 +325,28 @@ test("L8 and one nobody else holds still is stopped", async () => {
 
   assert.deepEqual(stopped, ["w-solo"]);
   assert.equal(released, "confirmed");
+});
+
+test("L9 a stale empty read of another DAG does not permit the stop", async () => {
+  // The shared-holder guard is itself built on direct reads, so the answer it
+  // exists to give -- "nobody else holds this" -- can be wrong in the one
+  // direction that kills a live sandbox. D2 registered and was acknowledged;
+  // the scan reads a replica that has not caught up and reports an empty row.
+  //
+  // A holder seen on a direct read is fine, because that only makes the guard
+  // more conservative. Seeing none is what permits a stop, so that answer is
+  // re-read from the leader before it is believed.
+  db.query = (async () => ({ rows: [{ config: {} }], rowCount: 1 })) as typeof db.query;
+  handleFor("dag-1", "w-shared");
+  handleRegistry.listAll = async () => [
+    ["dag-1", { main: { workload_id: "w-shared" } }],
+    ["dag-2", {}],                       // the stale replica: D2 looks empty
+  ];
+  handleRegistry.listForDagConsistent = async (dag: string) =>
+    dag === "dag-2" ? { main: { workload_id: "w-shared" } } : {};
+
+  const released = await stopAllHandlesForDag("dag-1", "s-1");
+
+  assert.deepEqual(stopped, [], "the sandbox D2 is running on must survive");
+  assert.equal(released, "unconfirmed");
 });

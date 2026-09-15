@@ -646,7 +646,26 @@ export async function stopSandboxByHandle(
     );
     return "unconfirmed";
   }
-  if (known === null) return "nothing_held";
+  if (known === null) {
+    // Missing on a direct read is not the same as never registered: it may be
+    // a replica behind an acknowledged write, an old tombstone, or a mapping an
+    // earlier failed teardown removed while leaving its record behind. The DAG
+    // aggregate folds this into `unconfirmed` and `agent_done` discards it, so
+    // nothing external reads it today -- but it is the same terminal-answer-on
+    // -an-empty-read shape as the two branches above, and the next caller to
+    // use this return value would inherit it.
+    try {
+      const authoritative = await handleRegistry.listForDagConsistent(dagRootTaskId);
+      if (Object.prototype.hasOwnProperty.call(authoritative, handleName)) return "unconfirmed";
+      return (await unreleasedRecord.any(dagRootTaskId)) ? "unconfirmed" : "nothing_held";
+    } catch (e) {
+      logger.warn(
+        { dagRootTaskId, handleName, err: errText(e) },
+        "sandbox.handle_lookup_failed",
+      );
+      return "unconfirmed";
+    }
+  }
   if (!known.workload_id) {
     // agent-sandbox handles are registered with `workload_id: ""` (Brain's
     // ensureHands), and this path has never had a way to stop one. Something
@@ -838,9 +857,33 @@ async function otherDagHolding(
   workloadId: string,
 ): Promise<string | null> {
   if (!workloadId) return null;
-  for (const [dagRoot, handles] of await handleRegistry.listAll()) {
+  const rows = await handleRegistry.listAll();
+
+  // A holder found on a direct read is enough: a stale read that SHOWS one
+  // only makes this more conservative, and conservative here means declining
+  // to stop.
+  for (const [dagRoot, handles] of rows) {
     if (dagRoot === dagRootTaskId) continue;
     for (const info of Object.values(handles)) {
+      if (info.workload_id === workloadId) return dagRoot;
+    }
+  }
+
+  // Finding none is the load-bearing answer -- it is what permits a stop -- and
+  // the scan under it is direct reads, which may be behind a registration that
+  // was already acknowledged. So before concluding nobody else holds this
+  // workload, every other DAG is re-read from the leader.
+  //
+  // This is the expensive path and it runs whenever a stop is about to be
+  // issued. It is accepted rather than optimised because of what the two wrong
+  // answers cost: a missed holder stops a sandbox another DAG is running on,
+  // while the cost here is leader reads on a path that runs at teardown. A
+  // reverse index from workload to holders would make it cheap and is the
+  // right shape eventually; it is not a read-time patch.
+  for (const [dagRoot] of rows) {
+    if (dagRoot === dagRootTaskId) continue;
+    const authoritative = await handleRegistry.listForDagConsistent(dagRoot);
+    for (const info of Object.values(authoritative)) {
       if (info.workload_id === workloadId) return dagRoot;
     }
   }
