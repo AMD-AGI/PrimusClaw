@@ -55,7 +55,7 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { handsSessionKey, isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 import { readHandsEntry as readSessionBinding } from "./registry.js";
 
 const logger = pino({ name: "sandbox-reaper" });
@@ -386,6 +386,22 @@ async function sweepStaleHands(): Promise<void> {
         info = JSON.parse(sc.decode(entry.value));
       } catch { continue; }
 
+      // A retained container's projection lives in this keyspace too, and it
+      // is a copy of the binding it was made from -- same status, same
+      // handsUrl, same token -- so it passes every filter below as though it
+      // were a session's handle. It is not one. The key names a sandbox
+      // generation, so `sessionIdFromHandsKey` hands back a session id no
+      // session has, the failure counts pile up under that fabricated id, and
+      // where an operator has turned eviction on the destroy that follows stops
+      // the container the retention exists to protect and deletes the
+      // projection with it -- the live work the retention was taken for, gone,
+      // on the evidence of a health check that a container busy with that work
+      // can fail. A retention ends one way only: the keepalive sweep reading
+      // positive evidence out of the container that its work has finished.
+      // keepalive's own walk makes exactly this check before it treats an entry
+      // as a session's.
+      if (isRetentionEntry(info)) continue;
+
       // PENDING entries are owned by an in-flight ensureHands (legitimately
       // polling a slow GPU queue, or bootstrapping hands). Policy: wait
       // indefinitely — never reap. If the creator dies, the handleTask KV
@@ -433,6 +449,11 @@ async function sweepStaleHands(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, "sweeper.pass_failed");
   }
+}
+
+/** One health-sweep pass, for tests: the interval version is fire-and-forget. */
+export async function sweepStaleHandsForTest(): Promise<void> {
+  await sweepStaleHands();
 }
 
 export function startSandboxSweeper(): void {
@@ -495,6 +516,15 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
         if (!entry) continue;
         info = JSON.parse(sc.decode(entry.value));
       } catch { continue; }
+
+      // Not a session's handle -- see the health sweep above for what this
+      // keyspace also holds. A projection carries the idle markers of the
+      // binding it was copied from and nothing refreshes them, so it reads as
+      // reclaimable from the moment it is taken and stays that way for as long
+      // as the retention lives; what it would then ask to reclaim is keyed by a
+      // session id that never existed, so every sweep spends a control-plane
+      // lookup on it for as long as the work it protects runs.
+      if (isRetentionEntry(info)) continue;
 
       if (!eligibleForClusterReclaim(info, Date.now())) continue;
       // The entry says idle; the run lease says whether anyone is using it.

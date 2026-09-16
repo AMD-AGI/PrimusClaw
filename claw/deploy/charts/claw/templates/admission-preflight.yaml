@@ -34,7 +34,19 @@
 {{-   end }}
 {{- end }}
 {{- if $configured }}
-{{-   if ne true (get (.Values.features | default dict) "runDoorbellDispatch") }}
+{{- /*
+  Read the switch exactly as api-deployment.yaml renders it: `dig` with a
+  default of true, not `get`. This check exists to predict what the pod will
+  do, and the pod's RUN_DOORBELL_DISPATCH comes from that `dig`, so any other
+  reading of the same values document predicts a different pod than the one
+  that will start. With the key absent -- values.schema.json does not require
+  it, and a null in an operator's values file deletes it from the coalesced
+  map -- `get` returned nil, which made `ne true nil` an "incompatible types
+  for comparison" template error rather than either outcome: the render died
+  on a Go type error while the Deployment it was guarding would have come up
+  with dispatch on and the ceilings perfectly legal.
+*/ -}}
+{{-   if ne true (dig "runDoorbellDispatch" true (.Values.features | default dict)) }}
 {{-     fail (printf "%s is non-zero while features.runDoorbellDispatch is not true. Clear the admission ceilings first and disable Doorbell dispatch second, or apply one change that sets both together." (join ", " $configured)) }}
 {{-   end }}
 {{- end }}

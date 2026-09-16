@@ -27,6 +27,7 @@ import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+  retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
@@ -705,6 +706,25 @@ async function handleComplete(
           "exec_complete.not_admissible_for_row",
         );
         return;
+      }
+      // `settled`: a report this row still admits, on a row something else
+      // already terminalized. The close had no transition to splice its record
+      // into -- see `retireDispatchReconcileForReport` -- so the record is made
+      // here, where the discriminator the close lacks has just been computed
+      // for a different purpose and would otherwise be thrown away. That is the
+      // same mistake `resolveAmbiguousDispatch` was carrying one level down.
+      //
+      // The sweeper's own announcement is excluded explicitly. It arrives with
+      // `provenance` null and so cannot reach this line today, but the reason
+      // it must never retire anything -- the sweeper terminalized the row
+      // itself, and its completion is not a worker's report -- belongs here
+      // rather than being inherited from a check three functions away.
+      if (event.completion_source !== "sweeper"
+        && await retireDispatchReconcileForReport(provenance)) {
+        logger.info(
+          { sessionId, messageId, taskId: provenance },
+          "exec_complete.retired_reconcile_for_closed_row",
+        );
       }
     }
   }

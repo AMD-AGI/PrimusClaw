@@ -274,13 +274,44 @@ function armPreGate(
  * other two are losses rather than stops -- `gone` is a row nobody holds and
  * nothing is waiting for, `superseded` belongs to the worker that took it and
  * this one touches none of it.
+ *
+ * The emit is a JetStream publish, so it can fail, and what used to happen on
+ * that failure was nothing anybody chose. The throw left here for
+ * `runDelivery`'s catch, which logs it and returns: the `ack` below is skipped,
+ * no `nak` is sent in its place, and the `finally` stops the `working()`
+ * keepalive -- so the message is not lost, but it is not handled either. It
+ * sits until the server takes it back a full `ack_wait` later (two minutes),
+ * having spent one delivery of the budget on a Stop the user is watching for.
+ * Worse at the end of the budget than in the middle of it: the poison guard
+ * that turns an exhausted message into a visible failure lives inside
+ * `handleTask`, past `deps.handle`, and a stopped delivery returns before it --
+ * so the last attempt is followed by no event at all, and the only thing left
+ * is the API's `reapLostLeases`, which closes `cancelling` to `cancelled` once
+ * this pod's lease lapses. That backstop is why this is a delay rather than a
+ * hang, and it is also why it went unnoticed.
+ *
+ * So the retry is made explicit, in the order the drain branch below already
+ * uses and for the same reason: renewal stopped, then the lease handed back,
+ * then the nak. Naking without the release would be worse than the accidental
+ * wait it replaces -- the redelivery would find this pod's lease live, classify
+ * itself `superseded`, and nak in turn for the rest of the TTL. The error is
+ * still re-thrown, because `onError` is how every failure in this module is
+ * reported and a silent retry loop is the one thing worse than a slow one.
  */
 async function settleStopped(
   msg: JsMsg, deps: DeliveryDeps, target: FatTarget,
   runClaim: number | undefined, stop: DeliveryStop,
+  preGate: PreGateHeartbeat | null,
 ): Promise<void> {
   if (stop === "cancelling") {
-    await deps.fatPreGate!.settleStopped(target, runClaim);
+    try {
+      await deps.fatPreGate!.settleStopped(target, runClaim);
+    } catch (err) {
+      preGate?.stop();
+      await deps.fatPreGate!.release(target, runClaim);
+      msg.nak(deps.surplusNakMs(msg.info?.deliveryCount ?? 1));
+      throw err;
+    }
     msg.ack();
     return;
   }
@@ -465,7 +496,7 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
     // starting the turn now would burn a sandbox on work already withdrawn.
     const stop = arm.raised();
     if (stop) {
-      await settleStopped(msg, deps, target, runClaim, stop);
+      await settleStopped(msg, deps, target, runClaim, stop, preGate);
       return;
     }
     await fatDeliveryContext.run(

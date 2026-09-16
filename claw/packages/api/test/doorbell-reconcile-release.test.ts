@@ -253,3 +253,86 @@ test("a doorbell turn into a session that already existed owes an idle, not a de
     "which is only true while the row records the cleanup this path actually owes",
   );
 });
+
+/**
+ * The fallback the gate takes whenever `beginDoorbellDispatch` declines --
+ * a revoked floor, or a KV watch that merely died -- publishes the whole task
+ * on the wire instead of ringing a doorbell. Everything else about the turn is
+ * the same, the owed cleanup included, and the marker is what records it:
+ * `insertTask` writes `dispatch_reconcile_at` only where
+ * `dispatch_reconcile_action` is non-null, and `reconcileAmbiguousDispatches`
+ * selects on nothing else. A fat row that never armed one is therefore a row no
+ * sweep can reach, and `publish_unknown` -- the answer that exists precisely to
+ * say "do not roll back, someone else will" -- would name nobody.
+ */
+test("a fat fallback arms the marker at open and hands it back at dispatch", { skip }, async () => {
+  gate.setDoorbellLatch({ state: "revoked" });
+  assert.equal(gate.doorbellGateOpen(), false);
+  let armed: { action: unknown; at: unknown; taskId: string } | undefined;
+  ports.publishTask = async (_subject, payload) => {
+    const taskId = (JSON.parse(payload) as { task_id: string }).task_id;
+    const row = await runRow(taskId);
+    armed = { action: row.dispatch_reconcile_action, at: row.dispatch_reconcile_at, taskId };
+    return 1;
+  };
+
+  const response = await createWithMessage();
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(checkedDeadlines, 1, "and the deadline is written with the same precision");
+  assert.ok(armed, "the fat branch publishes the task itself");
+  assert.equal(armed.action, "delete_created_session", "the create path owes a delete here too");
+  assert.notEqual(armed.at, null, "which is only reachable through dispatch_reconcile_at");
+  // Released on the way out, for the reason the doorbell path releases: nothing
+  // on this path increments `claim_count`, so a marker left on a healthy fat row
+  // reads to `resolveAmbiguousDispatch` as a turn that never executed, and the
+  // stored action would delete the session the user is talking in.
+  const settled = await runRow(armed.taskId);
+  assert.equal(settled.metadata.dispatch, "fat");
+  assert.equal(settled.dispatch_reconcile_at, null);
+  assert.equal(settled.dispatch_reconcile_action, null);
+  assert.equal(await sweeper.reconcileAmbiguousDispatches(), 0, "nothing is left owing");
+});
+
+test("a fat publish_unknown leaves a session reconciliation can still clean up", { skip }, async () => {
+  gate.setDoorbellLatch({ state: "revoked" });
+  let taskId = "";
+  ports.openChatRun = async (input) => {
+    const run = await originalPorts.openChatRun(input);
+    assert.ok(run);
+    taskId = run.taskId;
+    return run;
+  };
+  ports.publishTask = async () => { throw new Error("stream unavailable"); };
+  // The compensation could not establish anything, which is the only way this
+  // path answers `publish_unknown`: no rollback has run, so the session, its
+  // UserMessage and its running gate are all still there, owed to whoever picks
+  // the row up.
+  ports.failChatRunDispatch = async () => "unknown";
+
+  const response = await createWithMessage();
+
+  assert.equal(response.statusCode, 503, response.body);
+  // The fat branch reports the publish error itself rather than the doorbell
+  // branch's manufactured one; the kind is what the caller acts on.
+  assert.equal(response.json().detail, "stream unavailable");
+  const { rows: [before] } = await client.query(
+    "SELECT deleted_at FROM claw_sessions WHERE session_id = (SELECT session_id FROM claw_tasks WHERE task_id = $1)",
+    [taskId],
+  );
+  assert.equal(before.deleted_at, null, "nothing was rolled back, as the kind promises");
+
+  await expireDispatch(taskId);
+  assert.equal(
+    await sweeper.reconcileAmbiguousDispatches(), 1,
+    "a fat row with no marker is invisible here, and this turn would be owed to nobody",
+  );
+
+  const row = await runRow(taskId);
+  assert.equal(row.status, "failed");
+  assert.equal(row.dispatch_reconcile_at, null);
+  const { rows: [session] } = await client.query(
+    "SELECT deleted_at FROM claw_sessions WHERE session_id = $1", [row.session_id],
+  );
+  assert.notEqual(session.deleted_at, null, "and the session the create minted is taken back");
+});

@@ -52,7 +52,20 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve working directory
+	// Resolve working directory.
+	//
+	// sanitizePath here is not trying to contain the command — this endpoint hands the
+	// caller an argv and running it is the endpoint's whole purpose. What it contains is
+	// the *cwd*, so that a relative or absolute working_dir cannot quietly land a build,
+	// or an `rm -rf .`, in / or in EnvD's own directories. Do not drop it as redundant.
+	//
+	// The boundary that actually confines the caller is the sandbox Pod — the container
+	// filesystem and the uid EnvD runs as — plus the Router-signed JWT that jwtMiddleware
+	// binds to *this* Pod's downward-API session id, so one sandbox's token cannot drive
+	// another's processes. Two further properties are load-bearing and easy to lose:
+	// the command is built as argv (no shell), so nothing in req.Command is re-parsed for
+	// metacharacters, and stripEnvDProxyGroup below drops EnvDProxyGID so the child's
+	// traffic is subject to the egress proxy rules that EnvD itself is exempt from.
 	workDir := s.workspace
 	if req.WorkingDir != "" {
 		abs, err := sanitizePath(s.workspace, req.WorkingDir)
@@ -138,6 +151,9 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Same reasoning as handleExecute: sanitizePath confines the cwd, not the command,
+	// and argv-form exec plus stripEnvDProxyGroup are what keep this child no more
+	// privileged than EnvD's caller already is.
 	workDir := s.workspace
 	if req.WorkingDir != "" {
 		abs, err := sanitizePath(s.workspace, req.WorkingDir)

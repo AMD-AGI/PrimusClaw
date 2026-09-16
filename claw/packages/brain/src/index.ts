@@ -13,7 +13,9 @@ import {
   workspaceSigtermSyncSemaphore,
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
-import { validateKeepaliveCapacity } from "./sandbox/keepalive-capacity.js";
+import {
+  validateKeepaliveCapacity, type CapacitySettings,
+} from "./sandbox/keepalive-capacity.js";
 import { keepalivePingsPerSweep, keepaliveSweepCeilingSec } from "./sandbox/keepalive.js";
 import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
@@ -715,8 +717,28 @@ function installCleanupSubscriber(): void {
   })();
 }
 
-async function startBackgroundRuntime(): Promise<void> {
-  startWatchdog();
+/**
+ * Prove the keepalive capacity settings, before this pod takes any work.
+ *
+ * The contract here is a refusal, not a degradation: an undeclared or
+ * non-numeric ceiling throws `KeepaliveConfigRefused` and `main`'s catch ends
+ * the process, because a number nobody declared cannot be the one the refresh
+ * gap was proven against. A refusal is only a refusal while the pod is still
+ * empty, and this ran from `startBackgroundRuntime` -- after `startTaskDelivery`
+ * had already opened the durable consumer and started the claim-next loop. So
+ * the pod exited holding deliveries it had begun working and rows it had
+ * claimed, none of which a `process.exit` hands back: the messages return at
+ * ack_wait and the rows at lease expiry, minutes of a turn the user is waiting
+ * on, spent on a misconfiguration that was knowable before the first
+ * connection was opened.
+ *
+ * Safe this early because every input is a module constant or a pure function
+ * over module constants -- nothing here reads `kv`, the engine or the NATS
+ * connection, which `initializeInfrastructure` is what sets up. What the proof
+ * yields is carried to `startBackgroundRuntime`, where it is first *used*: by
+ * `bindAdmission` and the roster, which do need the bucket.
+ */
+function proveKeepaliveCapacity(): CapacitySettings {
   const capacity = validateKeepaliveCapacity({
     bgShellEnabled: BG_SHELL_ENABLED,
     keepaliveIntervalSec: SANDBOX_KEEPALIVE_INTERVAL_SEC,
@@ -736,6 +758,11 @@ async function startBackgroundRuntime(): Promise<void> {
       "keepalive.capacity_proven",
     );
   }
+  return capacity;
+}
+
+async function startBackgroundRuntime(capacity: CapacitySettings): Promise<void> {
+  startWatchdog();
   await bindAdmission(kv, capacity);
   await startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
   startSandboxSweeper();
@@ -825,12 +852,16 @@ async function startHttpServer(deliveryResidency: DeliveryResidency): Promise<vo
 }
 
 async function main(): Promise<void> {
+  // First, and before any connection: see `proveKeepaliveCapacity`. A pod that
+  // refuses its own configuration must refuse it while it is still holding
+  // nothing.
+  const capacity = proveKeepaliveCapacity();
   const jsm = await initializeInfrastructure();
   const deliveryResidency = await startTaskDelivery(jsm);
   installSignalHandlers();
   installInterruptSubscriber();
   installCleanupSubscriber();
-  await startBackgroundRuntime();
+  await startBackgroundRuntime(capacity);
   await startHttpServer(deliveryResidency);
 }
 

@@ -66,6 +66,26 @@ const BG_SHELL_DISABLED_MESSAGE =
   "Error: background shells are disabled in this deployment. "
   + "Run the command in the foreground with an appropriate bash timeout instead.";
 
+/** What `route()` fills in for its caller; see its `outcome` parameter. */
+type RouteOutcome = { isError: boolean; structured?: Record<string, unknown> };
+
+/**
+ * Answer with a refusal, recorded as one.
+ *
+ * `by_tool_ok` is counted from `outcome.isError` and from nothing else -- the
+ * result text is deliberately not read, because a failure's wording is the
+ * tool's to choose. That makes an error branch which returns its message and
+ * leaves the bit alone indistinguishable from work that was done: a run whose
+ * every search was refused ships the same `by_tool_ok` as one whose every
+ * search answered, and that is the number `deploy/rollout-lib.sh` gates on.
+ * Every error return in `route()` and its helpers goes through here, so a
+ * branch added later cannot quietly be written without the bit.
+ */
+function refuse(outcome: RouteOutcome | undefined, text: string): string {
+  if (outcome) outcome.isError = true;
+  return text;
+}
+
 /**
  * Tools handled by the engine loop BEFORE calling router.route().
  * They need loop state mutation, custom onEvent payloads, or NATS suspension.
@@ -170,6 +190,17 @@ export class ToolRouter {
    * is the reading that costs a slot for one call rather than for a timeout.
    */
   async classifyShell(shellId: string): Promise<ShellClassProbe> {
+    // Only background-shell calls are ever classified here, and with
+    // `BG_SHELL_ENABLED` off `route()` refuses every one of them below, before
+    // any sandbox is reached -- so this probe must not be the thing that
+    // reaches one. On a lazily-attached run `requireHands()` would provision a
+    // whole sandbox on behalf of a call that is about to be turned away; on a
+    // run that has none it throws "No sandbox is attached to this run", and the
+    // loop reports that in place of the refusal the model needs to read to stop
+    // retrying -- both out of a resumed transcript that merely still contains a
+    // `wait`. A refused call never runs, so it can never block: a settled class
+    // is the truthful answer and hands back no execution slot.
+    if (!BG_SHELL_ENABLED) return { shellClass: "refused", collectorLive: false };
     return (await this.requireHands()).classifyShell(shellId);
   }
 
@@ -236,13 +267,15 @@ export class ToolRouter {
   }
 
   /** Dispatch to Brain-hosted web tool services. */
-  private async networkTool(name: string, input: Record<string, unknown>): Promise<string> {
+  private async networkTool(
+    name: string, input: Record<string, unknown>, outcome?: RouteOutcome,
+  ): Promise<string> {
     if (name === "web_search") {
-      if (!this.webServices.webSearch) return "Error: web search disabled";
+      if (!this.webServices.webSearch) return refuse(outcome, "Error: web search disabled");
       return this.webServices.webSearch.execute(input);
     }
     if (name === "web_fetch") {
-      if (!this.webServices.webFetch) return "Error: web fetch disabled";
+      if (!this.webServices.webFetch) return refuse(outcome, "Error: web fetch disabled");
       return this.webServices.webFetch.execute(input);
     }
     throw new Error(`Unknown network tool: ${name}`);
@@ -260,7 +293,7 @@ export class ToolRouter {
      * anticipate as a success. Anything that needs to know whether the work
      * happened reads this instead.
      */
-    outcome?: { isError: boolean; structured?: Record<string, unknown> },
+    outcome?: RouteOutcome,
     /** Replay-stable identity of this call site; sealed on the reference row. */
     ctx?: { stepIdentity?: string },
   ): Promise<string> {
@@ -268,7 +301,7 @@ export class ToolRouter {
       throw new Error(`${name} must be handled by engine loop, not router`);
     }
 
-    if (BRAIN_NETWORK_TOOLS.has(name)) return this.networkTool(name, input);
+    if (BRAIN_NETWORK_TOOLS.has(name)) return this.networkTool(name, input, outcome);
 
     // Backend-side MCP routing (task-design.md §7.5). When the tool's
     // plugin_tools row declares config.scope='backend' AND the engine wired
@@ -284,7 +317,7 @@ export class ToolRouter {
         { signal },
       );
       if (out.isError) {
-        return out.error || out.text || `backend tool '${name}' reported isError`;
+        return refuse(outcome, out.error || out.text || `backend tool '${name}' reported isError`);
       }
       return out.text;
     }
@@ -295,7 +328,7 @@ export class ToolRouter {
       const content = input.content as string || "";
       const blocked = scanContent(content, 2000);
       if (blocked) {
-        return `Error: memory not saved — blocked by safety check (${blocked}).`;
+        return refuse(outcome, `Error: memory not saved — blocked by safety check (${blocked}).`);
       }
       this.pendingMemories.push({
         category: input.category as string,
@@ -309,7 +342,7 @@ export class ToolRouter {
       const skillName = input.skill_name as string || "";
       const blocked = scanContent(content, 5000);
       if (blocked) {
-        return `Error: skill '${skillName}' not saved — blocked by safety check (${blocked}).`;
+        return refuse(outcome, `Error: skill '${skillName}' not saved — blocked by safety check (${blocked}).`);
       }
       this.pendingSkills.push({
         skill_name: skillName,
@@ -323,9 +356,9 @@ export class ToolRouter {
       const filePath = input.file_path as string || "";
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
-      if (pathErr) return `Error: invalid file_path — ${pathErr}.`;
+      if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
       const blocked = scanContent(content, 10 * 1024);
-      if (blocked) return `Error: file content blocked by safety check (${blocked}).`;
+      if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "add", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
       });
@@ -336,9 +369,9 @@ export class ToolRouter {
       const filePath = input.file_path as string || "";
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
-      if (pathErr) return `Error: invalid file_path — ${pathErr}.`;
+      if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
       const blocked = scanContent(content, 10 * 1024);
-      if (blocked) return `Error: file content blocked by safety check (${blocked}).`;
+      if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "update", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
       });
@@ -348,7 +381,7 @@ export class ToolRouter {
       const skillName = input.skill_name as string || "";
       const filePath = input.file_path as string || "";
       const pathErr = validateSubFilePath(filePath);
-      if (pathErr) return `Error: invalid file_path — ${pathErr}.`;
+      if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
       this.pendingSkillFileMutations.push({
         action: "remove", skill_name: skillName, file_path: filePath,
       });
@@ -356,8 +389,7 @@ export class ToolRouter {
     }
 
     if (!BG_SHELL_ENABLED && isBackgroundShellCall(name, input)) {
-      if (outcome) outcome.isError = true;
-      return BG_SHELL_DISABLED_MESSAGE;
+      return refuse(outcome, BG_SHELL_DISABLED_MESSAGE);
     }
 
     if (isSandboxTool(name)) {
