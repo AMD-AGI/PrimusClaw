@@ -524,3 +524,53 @@ test("one call site arriving twice at once resolves to one shell, not two", asyn
   assert.equal(new Set(ids).size, 1, `two shells for one intent: ${JSON.stringify(ids)}`);
   assert.equal((await bgRowStore()!.keys("bgshell.*.*.*")).length, 1, "one intent, one row");
 });
+
+test("a bucket that fails the confirming write loses the row, never the shell id", async () => {
+  // The confirming write is the last thing between a spawn that happened and
+  // the caller. `advanceRow` throws where the bucket is unreachable or the CAS
+  // loses eight times, and a throw there turned a started shell into an error:
+  // the text is the only place its id appears, so the model was left with a
+  // live process it could neither poll nor kill.
+  const realUpdate = bucket.update.bind(bucket);
+  let updates = 0;
+  bucket.update = async (key: string, value: Uint8Array, expected: number) => {
+    updates += 1;
+    // `issued` creates, `dispatched` is the first update, `spawn_confirmed` the
+    // second -- so the wobble lands exactly on the confirming write.
+    if (updates >= 2) throw new Error("kv: no responders available for BG_HANDLE_ROWS");
+    return realUpdate(key, value, expected);
+  };
+
+  const { hands, sent } = pod();
+  const text = await hands.callTool("bash", START);
+
+  assert.equal(sent.length, 1, "precondition: the spawn really did go out");
+  assert.match(text, /Started background shell trainer/,
+    "the answer carrying the shell id must survive a bookkeeping failure");
+  assert.equal(await rowState(), "dispatched", "and the row is left where it stood");
+});
+
+test("the row left at dispatched by that failure still settles, and not as a refusal", async () => {
+  // The state the swallowed write leaves behind is one the resolver already
+  // knows how to finish: the spawn filed its record, so the next replay of the
+  // same start probes, finds it, and answers with the existing shell.
+  const realUpdate = bucket.update.bind(bucket);
+  let updates = 0;
+  bucket.update = async (key: string, value: Uint8Array, expected: number) => {
+    updates += 1;
+    if (updates >= 2) throw new Error("kv: no responders available for BG_HANDLE_ROWS");
+    return realUpdate(key, value, expected);
+  };
+  await pod().hands.callTool("bash", START);
+  assert.equal(await rowState(), "dispatched");
+
+  bucket.update = realUpdate;
+  recordAnswer = { marker: true, subtreeReadable: true, present: true };
+  const replay = pod();
+  const text = await replay.hands.callTool("bash", START);
+
+  assert.equal(replay.sent.length, 0, "nothing is run a second time");
+  assert.match(text, /already started by this request/);
+  assert.doesNotMatch(text, /cannot be determined/,
+    "the shell exists and the sandbox says so; refusing here would strand it");
+});

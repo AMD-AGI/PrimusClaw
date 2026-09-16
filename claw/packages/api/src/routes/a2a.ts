@@ -1594,6 +1594,25 @@ async function handleLegacyInvoke(
     return { success: false, error: "admission_deferred" };
   }
 
+  // Published unconditionally, unlike the two `handleSendMessage` paths, which
+  // publish only for `opened`. Both readings are the same statement here:
+  // `rejected` and `deferred` have returned above, `admitLegacyInvoke` never
+  // produces an `error`, and its `duplicate` arm cannot be reached. `duplicate`
+  // is `openChatRun` returning null on the untargeted `ON CONFLICT DO NOTHING`
+  // it uses for `origin = 'a2a'`, and every identity that clause can collide on
+  // is minted fresh for this request: the `claw_tasks` primary key is a new
+  // ULID, and the one unique index that carries a caller's identity is
+  // (session_id, metadata->>'message_id'), whose halves this path invents a
+  // statement earlier as `a2a-${randomUUID()}` and the spec's randomUUID
+  // messageId. The session row goes in on the same transaction with no
+  // ON CONFLICT of its own, so even a colliding session id would throw here
+  // rather than settle as a duplicate. There is therefore no reachable state in
+  // which this publishes a second execution for a run that already has one, and
+  // none in which the guard below declines a rollback that was owed. Keep the
+  // guard nonetheless: it is what makes that argument checkable at the line
+  // rather than assumed, and the day this path starts accepting a
+  // caller-supplied task or message id it is the difference between a skipped
+  // compensation and a `taskId` that does not exist.
   try {
     const payload = { session_id: target.taskId, prompt: text, history: [], user_id: "a2a" };
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));

@@ -19,6 +19,31 @@ import (
 
 const maxUploadSize = 32 << 20 // 32 MB
 
+// Trust model for the file endpoints in this file.
+//
+// Every handler below takes a caller-supplied path and hands it to the filesystem, so
+// each one MUST route that path through sanitizePath(s.workspace, …) before it touches
+// disk. Those calls are not redundant with filepath.Clean and must not be removed:
+// sanitizePath joins the path onto the workspace root and rejects anything that resolves
+// outside it, which is what stops "../../etc/passwd", a leading "/", and any percent-
+// encoding net/http has already decoded out of r.URL.Path from naming a file the caller
+// never asked the sandbox for.
+//
+// What sanitizePath is NOT is the security boundary. EnvD's job is to read and write the
+// caller's files, and the very same JWT that reaches these handlers also reaches
+// /api/execute, which hands that caller an arbitrary argv running as this uid. The
+// boundary that actually confines them is the sandbox Pod — container filesystem and uid —
+// together with jwtMiddleware binding the Router-signed token to *this* Pod's downward-API
+// session id, so one sandbox's token cannot read another sandbox's workspace.
+//
+// One known consequence of the lexical check: sanitizePath does not resolve symlinks, so a
+// symlink the caller planted inside the workspace can still be followed out of it. That is
+// accepted deliberately — resolving them would break legitimate symlinks into mounted
+// volumes (model and package caches), and it grants the caller nothing they cannot already
+// get from /api/execute. If these endpoints ever become reachable by a principal that is
+// NOT allowed to execute commands, that reasoning expires and containment has to become a
+// real one (openat2 with RESOLVE_BENEATH, or an equivalent).
+
 // handleFiles routes file operations based on method.
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {

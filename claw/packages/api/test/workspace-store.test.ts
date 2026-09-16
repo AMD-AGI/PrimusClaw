@@ -29,7 +29,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { db } from "../src/infra/db.js";
+import { db, type Querier } from "../src/infra/db.js";
 import {
   acquireRef,
   claimWriter,
@@ -297,6 +297,62 @@ test("a reference that could not be taken is not handed back as one that was", a
   assert.equal(await recordRunUse("s-1", "u-1", "ktsk_9", "kws_1"), undefined);
   assert.ok(!seen.some((q) => /SET writer_run_id\s+= \$2/.test(q.sql)),
     "and the write side must not be claimed for a reference the run does not hold");
+});
+
+/** A caller's open transaction: the same recorder, with one statement refused. */
+function callerTx(refuse: RegExp): Querier {
+  return (async (text: string, params: unknown[] = []) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    seen.push({ sql, params });
+    if (refuse.test(sql)) throw new Error("current transaction is aborted");
+    return { rows: [], rowCount: 0 };
+  }) as unknown as Querier;
+}
+
+test("a reference that failed on the caller's transaction is raised, not answered", async () => {
+  // Best-effort is a promise about the pool. On a transaction the caller owns,
+  // the failed statement has already aborted it, so `false` is not "the
+  // reference was not taken" -- it is "nothing you do after this commits". The
+  // caller is `openChatRun`, which passes its insert's client and re-raises for
+  // exactly this case; swallowing the error here is what stops it ever seeing
+  // one. It then returns a task id, a lease and a reconcile token, its COMMIT
+  // is turned into a silent ROLLBACK, and the fat dispatch publishes a full
+  // execute payload naming a row that does not exist.
+  stubDb();
+  await assert.rejects(
+    () => acquireRef("kws_1", "run", "ktsk_9", callerTx(/^INSERT INTO claw_workspace_refs/)),
+    /current transaction is aborted/,
+    "the owner of the transaction is the only one who can decide what to do about it",
+  );
+  await assert.rejects(
+    () => recordRunUse(
+      "s-1", "u-1", "ktsk_9", "kws_1", callerTx(/^INSERT INTO claw_workspace_refs/),
+    ),
+    /current transaction is aborted/,
+    "and it must travel the whole way out, not be re-swallowed one frame up",
+  );
+});
+
+test("the write side answers the same way, for the same reason", async () => {
+  // A null claim means "could not tell" to a caller on the pool and "your
+  // transaction is dead" to one that passed its own, and `recordRunUse` does
+  // nothing with it but log contention -- so this is the second way an aborted
+  // transaction reaches `openChatRun` as a success.
+  stubDb();
+  await assert.rejects(
+    () => claimWriter("kws_1", "ktsk_9", callerTx(/^UPDATE claw_workspaces SET writer_run_id/)),
+    /current transaction is aborted/,
+  );
+});
+
+test("on the pool, both of them still refuse to fail a conversation", async () => {
+  // The other half of the rule, and the one the module header promises: nothing
+  // here may be the reason a chat turn does not run when the statement failed
+  // on a connection of its own.
+  failingDb();
+  assert.equal(await acquireRef("kws_1", "run", "ktsk_9"), false);
+  assert.equal(await claimWriter("kws_1", "ktsk_9"), null);
+  assert.equal(await recordRunUse("s-1", "u-1", "ktsk_9", "kws_1"), undefined);
 });
 
 test("the strict release reports the failures the best-effort one swallows", async () => {

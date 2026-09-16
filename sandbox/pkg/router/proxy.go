@@ -107,6 +107,34 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 		return
 	}
 
+	// The destination is not caller-chosen, and this check is what keeps it that
+	// way observable at the point it matters. targetURL is assembled by
+	// determineUpstreamURL from the PodIP / EntryPoints recorded for the session
+	// -- server-side state written by Workload Manager from the Pod status, never
+	// from anything in the request. The only caller-controlled parts, the request
+	// path and query, are appended *after* the authority, where they cannot move
+	// the request to another host: "http://10.0.0.1:8080/@evil.com/x" still dials
+	// 10.0.0.1. So a caller cannot steer this proxy at an arbitrary host, and a
+	// static analyser flagging the caller-tainted path as SSRF is reading the
+	// concatenation, not the URL grammar.
+	//
+	// The guard stays because this handler mints a Router-signed JWT a few lines
+	// below and hands it to whatever address the session record names. A record
+	// with an empty PodIP and no matching EntryPoint produces "http://:8080/...",
+	// which Go dials as the *local* host on 8080 -- the Router's own port -- and
+	// that is reachable today from a sandbox whose Pod has lost its IP. Sending a
+	// valid sandbox credential there is not a leak to an attacker, but it is a
+	// credential going somewhere nobody intended, and 8080 is exactly the port
+	// port_proxy refuses to expose for the same reason. Fail closed instead of
+	// discovering it in an EnvD audit log.
+	if (outReq.URL.Scheme != "http" && outReq.URL.Scheme != "https") || outReq.URL.Hostname() == "" {
+		log.Error("proxy: refusing to proxy to an upstream with no resolvable host",
+			"target", targetURL, "session_id", sessionID,
+			"hint", "the session record has no PodIP and no matching EntryPoint; the sandbox Pod is probably not Running")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "sandbox upstream address is not available"})
+		return
+	}
+
 	// Copy request headers (skip hop-by-hop)
 	for key, vals := range r.Header {
 		switch key {

@@ -76,7 +76,13 @@ export interface BgRowStore {
   read(key: string): Promise<{ value: string; revision: number } | null>;
   /** False where the revision moved; the caller re-reads and re-decides. */
   write(key: string, value: string, expectedRevision: number | null): Promise<boolean>;
-  delete(key: string, expectedRevision: number): Promise<void>;
+  /**
+   * False where the revision moved, on the same terms as `write`: the row was
+   * rewritten after it was read, so this delete is not the one that decides its
+   * fate. A lost race is an answer, never a failure -- a delete that raised it
+   * would abandon whatever the caller was walking.
+   */
+  delete(key: string, expectedRevision: number): Promise<boolean>;
   keys(filter: string): Promise<string[]>;
 }
 
@@ -163,7 +169,9 @@ export async function readRunRows(
  * this delete belongs to a dispatch that is happening now, and removing it
  * would strand that one in place of the finished send it was meant to release.
  *
- * @returns false where no row was there to release.
+ * @returns false where no row was there to release, and equally where the row
+ * moved on under a dispatch that is still happening -- in both cases this call
+ * released nothing, which is the only thing its caller acts on.
  */
 export async function releaseRow(
   store: BgRowStore, address: BgHandleAddress,
@@ -171,8 +179,7 @@ export async function releaseRow(
   const key = rowKey(address);
   const entry = await store.read(key);
   if (!entry) return false;
-  await store.delete(key, entry.revision);
-  return true;
+  return await store.delete(key, entry.revision);
 }
 
 /**
@@ -191,9 +198,15 @@ export async function deleteRunRows(
     // Conditioned on the revision just read: a row rewritten between the walk
     // and this delete belongs to something that is still happening, and
     // removing it would strand whatever wrote it.
+    //
+    // Skipped, not raised. This is the run's last pass over its own rows, and
+    // they sit in a bucket with no expiry: a contended row that ended the loop
+    // would take every row after it with it, and nothing would come back for
+    // them. One row left to its live writer is the intended cost; the rest of
+    // the run's rows are not.
     const entry = await store.read(key);
     if (!entry) continue;
-    await store.delete(key, entry.revision);
+    if (!await store.delete(key, entry.revision)) continue;
     deleted += 1;
   }
   return deleted;

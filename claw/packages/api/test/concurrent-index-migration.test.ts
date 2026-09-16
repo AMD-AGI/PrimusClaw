@@ -24,6 +24,7 @@ import { readFileSync } from "node:fs";
 import {
   RUN_CLAIM_FENCE_LOCK_ID,
   RUN_CLAIM_FENCE_SQL,
+  ensureChatTurnClaimIndex,
   ensureConcurrentIndexOrWarn,
 } from "../src/infra/db.js";
 
@@ -306,4 +307,120 @@ test("every index initDb builds concurrently goes through the wrapper", () => {
   assert.match(CHAT_TURN_FN, /await ensureConcurrentIndex\(/,
     "the chat-turn builder is the exception, and catches the throw itself");
   assert.match(SRC, /db\.concurrent_index_build_failed/, "the reported ending is named");
+});
+
+/**
+ * The fence path, driven statement by statement.
+ *
+ * `ensureChatTurnClaimIndex` runs in the middle of `initDb`, roughly two
+ * hundred lines of DDL and `assertSchema` below it, and every ending asserted
+ * here is about what it does to that sequence rather than about the index.
+ */
+function fenceClient(opts: {
+  raise?: { on: RegExp; err: unknown };
+  answers?: Array<[RegExp, Array<Record<string, unknown>>]>;
+} = {}): { seen: string[]; client: pgPoolClient } {
+  const seen: string[] = [];
+  return {
+    seen,
+    client: {
+      query: async (text: string) => {
+        const sql = text.replace(/\s+/g, " ").trim();
+        seen.push(sql);
+        if (opts.raise?.on.test(sql)) throw opts.raise.err;
+        for (const [re, rows] of opts.answers ?? []) {
+          if (re.test(sql)) return { rows, rowCount: rows.length };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    } as never,
+  };
+}
+type pgPoolClient = Parameters<typeof ensureChatTurnClaimIndex>[0];
+
+const ATTEMPTS = Number(/CHAT_TURN_INDEX_ATTEMPTS = (\d+)/.exec(SRC)![1]);
+const BUILD = /CREATE UNIQUE INDEX CONCURRENTLY/;
+const AMBIGUOUS_PROBE = /HAVING COUNT\(\*\) FILTER/;
+
+test("a turn two executions hold refuses to serve without aborting the migration", async () => {
+  // The reconcile's refusal is a plain Error with no `code`, so the retry
+  // classifier rethrows it -- and from here that throw leaves `initDb`, taking
+  // the remaining DDL and `assertSchema` with it. That is the half-run
+  // migration the two catches around the build exist to prevent, reached by the
+  // one path neither of them covers. The refusal itself is not lost: nothing
+  // builds the index, so assertChatTurnClaimIndex refuses at the end instead,
+  // with the whole schema applied.
+  const { seen, client } = fenceClient({
+    answers: [[AMBIGUOUS_PROBE, [{ session_id: "s1", message_id: "m1" }]]],
+  });
+
+  await assert.doesNotReject(
+    () => ensureChatTurnClaimIndex(client),
+    "the DDL below this call, and the schema check at the end, still run",
+  );
+  assert.ok(!seen.some((t) => BUILD.test(t)),
+    "and nothing builds a uniqueness index over a turn it has just refused");
+  assert.equal(
+    seen.filter((t) => t.startsWith("SELECT pg_advisory_lock")).length, 1,
+    "the refusal is reported once rather than retried, so the one error an "
+    + "operator has to read is not buried under two more copies",
+  );
+  assert.equal(
+    seen.filter((t) => t.startsWith("SELECT pg_advisory_unlock")).length, 1,
+    "and the fence is let go on the way out, or every claim in the fleet stalls",
+  );
+});
+
+test("a lock ceiling the reconcile could not give back is not inherited by the build", async () => {
+  // The reconcile borrows a five-second lock_timeout. The RESET that gives it
+  // back was allowed to fail silently on the grounds that the next statement
+  // would fail loudly -- but the next statement is the concurrent build, which
+  // sets statement_timeout and never touches lock_timeout. It would run a
+  // build sized for thirty minutes under a five-second ceiling, raise 55P03,
+  // and have it read as a build failure: three drop-and-rebuild attempts
+  // chasing a setting this function leaked.
+  const { seen, client } = fenceClient({
+    raise: {
+      on: /^RESET lock_timeout$/,
+      err: Object.assign(new Error("canceling statement due to user request"), {
+        code: "57014",
+      }),
+    },
+  });
+
+  await assert.doesNotReject(() => ensureChatTurnClaimIndex(client));
+  assert.equal(seen.filter((t) => BUILD.test(t)).length, 0,
+    "no build may start under a ceiling this function set and cannot prove it gave back");
+  assert.equal(
+    seen.filter((t) => t.startsWith("SET lock_timeout")).length, ATTEMPTS,
+    "each attempt issues the SET and the RESET again, so a failed restore is "
+    + "recoverable rather than terminal",
+  );
+});
+
+test("a reconcile that lost a row lock is still retried, and still builds", async () => {
+  // The lock-wait classes are the ones this loop exists for, and narrowing the
+  // rethrow above must not have narrowed them too.
+  let first = true;
+  const seen: string[] = [];
+  const client = {
+    query: async (text: string) => {
+      const sql = text.replace(/\s+/g, " ").trim();
+      seen.push(sql);
+      if (AMBIGUOUS_PROBE.test(sql) && first) {
+        first = false;
+        throw Object.assign(new Error("canceling statement due to lock timeout"), {
+          code: "55P03",
+        });
+      }
+      if (/SELECT i.indisvalid/.test(sql) && !first) {
+        return { rows: [{ indisvalid: true }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  } as never as pgPoolClient;
+
+  await assert.doesNotReject(() => ensureChatTurnClaimIndex(client));
+  assert.equal(seen.filter((t) => t.startsWith("SELECT pg_advisory_lock")).length, 2,
+    "the second attempt is what 55P03 asks for");
 });

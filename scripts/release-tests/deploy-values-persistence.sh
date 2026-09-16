@@ -460,10 +460,38 @@ PY
 
 run_rollout_upgrade "release-test-r2"
 
-grep -q "patch secret primus-claw-secrets" "$kubectl_capture" && {
-  echo "an upgrade with no ceiling set still patched the Secret" >&2
-  exit 1
-}
+# Blanking the ceilings has to reach the Secret as "0", not as silence.
+#
+# This asserted the opposite until the pair was found: that an upgrade with
+# every key blank issued no patch at all. That silence is what made a cleared
+# ceiling unrepresentable on the upgrade path. render_chart forwards no --set,
+# so the Deployment rolls with the cleared values and its rollout-config
+# annotation moves, while the Secret those new pods read keeps the numbers from
+# before -- and nothing else rewrites that Secret on this path. The pod then
+# boots on a non-zero ceiling with dispatch off, the one pair the API's startup
+# gate refuses, so a rollback an operator performed by blanking the values file
+# ends as a CrashLoopBackOff with no serving API. Setting the keys to "0" by
+# hand always worked; what did not was the blank that values.example.env's own
+# idiom teaches. A full deploy never had the problem -- secret.yaml renders
+# `| default 0`, so a blank has always been "0" there -- and the patch is now
+# the same statement on the upgrade path.
+python3 - "$kubectl_capture" <<'PY'
+import json, re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+patches = [(i, l) for i, l in enumerate(lines) if "patch secret primus-claw-secrets" in l]
+assert len(patches) == 1, f"expected one Secret patch, got {len(patches)}"
+index, line = patches[0]
+applies = [i for i, l in enumerate(lines) if l.startswith("apply ")]
+assert applies, "no kubectl apply was captured"
+assert index < applies[0], "the Secret patch ran after the Deployment apply"
+payload = json.loads(re.search(r"-p (\{.*\})", line).group(1))
+assert payload["stringData"] == {
+    "ADMIT_HARD_GPU_NODES": "0", "ADMIT_HARD_RUNS": "0",
+    "ADMIT_HARD_SANDBOXES": "0", "ADMIT_SOFT_GPU_NODES": "0",
+    "ADMIT_SOFT_RUNS": "0", "ADMIT_SOFT_SANDBOXES": "0",
+    "ADMIT_TREE_MAX_DEPTH": "0", "ADMIT_TREE_MAX_NODES": "0",
+}, payload["stringData"]
+PY
 api_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" | tail -1)"
 case "$api_render" in
   *"--set-string api.admit"*|*"--set features."*)

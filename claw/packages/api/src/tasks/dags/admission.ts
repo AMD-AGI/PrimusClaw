@@ -159,16 +159,48 @@ interface TemplateRef {
   raw: string;
 }
 
-/** Extract every `${a.b.c}` token from a JSON-encodable value. */
+/**
+ * Extract every `${a.b.c}` token from a JSON-encodable value.
+ *
+ * SECURITY: scanned with `indexOf` rather than matched with `/\$\{([^}]+)\}/g`,
+ * which is what this was. That regex is quadratic on a string of unclosed
+ * openers: `[^}]+` cannot cross a `}`, so with no `}` anywhere the engine
+ * starts at every `${`, consumes the entire remaining string, fails, and gives
+ * it back one character at a time. `"${".repeat(n)` is the worst case --
+ * measured, 160 KB of it blocks the event loop for 4.2s, and it grows with the
+ * square from there.
+ *
+ * The subject is a DAG node's `prompt` / `script` / `sandbox`, which arrive
+ * verbatim in a task-submission body and are bounded only by the API's 4 MiB
+ * `bodyLimit`. This runs during admission, before anything about the DAG has
+ * been accepted, so an unauthenticated-shaped mistake is not required -- any
+ * caller who may submit a task may submit that string.
+ *
+ * The scan is token-for-token identical to the regex: `[^}]+` can only ever
+ * end at the first `}` after the opener, which is exactly `indexOf("}", ...)`,
+ * and `+` requires that `}` not be adjacent to the opener (so `${}` matched
+ * nothing then and matches nothing now).
+ */
 function collectRefsFromValue(value: unknown, into: TemplateRef[]): void {
   if (typeof value === "string") {
-    const re = /\$\{([^}]+)\}/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(value)) !== null) {
-      const expr = m[1].trim();
+    let i = 0;
+    while (i < value.length) {
+      const open = value.indexOf("${", i);
+      if (open < 0) break;
+      const close = value.indexOf("}", open + 2);
+      if (close < 0) break;
+      if (close === open + 2) {
+        // `${}` -- the regex's `+` rejected an empty expression and so do we.
+        // Resume one past the opener, as the engine's lastIndex bump did.
+        i = open + 1;
+        continue;
+      }
+      i = close + 1;
+      const raw = value.slice(open, close + 1);
+      const expr = value.slice(open + 2, close).trim();
       const dot = expr.indexOf(".");
       if (dot < 0) continue;
-      into.push({ upstream: expr.slice(0, dot), path: expr.slice(dot + 1), raw: m[0] });
+      into.push({ upstream: expr.slice(0, dot), path: expr.slice(dot + 1), raw });
     }
     return;
   }
