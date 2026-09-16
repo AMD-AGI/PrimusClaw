@@ -64,6 +64,9 @@ func (r *jobRegistry) add(shimPID int, command []string) {
 		return
 	}
 	r.mu.Lock()
+	if len(r.jobs) == 0 {
+		r.lost = false
+	}
 	r.jobs[shimPID] = trackedJob{shimPID: shimPID, hands: isHandsCommand(command)}
 	r.mu.Unlock()
 }
@@ -91,9 +94,6 @@ func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.lost {
-		return jobSnapshot{lost: true}, nil
-	}
 	count := 0
 	for _, j := range r.jobs {
 		if j.hands {
@@ -107,7 +107,7 @@ func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 		// A non-Hands shim exits once its tree is empty, so a live shim is user work.
 		count++
 	}
-	return jobSnapshot{count: count}, nil
+	return jobSnapshot{count: count, lost: r.lost}, nil
 }
 
 // handleJobs reports whether any tracked user task process remains.

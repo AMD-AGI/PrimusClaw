@@ -71,6 +71,12 @@ export interface SandboxExecResult {
   stderr: string;
 }
 
+/** Options for a provider exec. */
+export interface SandboxExecOptions {
+  /** When true, EnvD does not register this execute as a user job. */
+  untracked?: boolean;
+}
+
 /**
  * Milliseconds meant by an `exec` timeout string (`"5s"`, `"10m"`, `"1h"`).
  *
@@ -99,6 +105,7 @@ export interface SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
 }

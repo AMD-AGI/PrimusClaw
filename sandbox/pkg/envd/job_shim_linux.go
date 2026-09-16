@@ -45,6 +45,9 @@ func runJobShim() {
 	cmd.Env = os.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	cancelled := make(chan os.Signal, 1)
+	signal.Notify(cancelled, syscall.SIGTERM)
+
 	if err := cmd.Start(); err != nil {
 		writeControlInt(control, 0)
 		writeControlInt(control, 1)
@@ -53,8 +56,6 @@ func runJobShim() {
 	}
 	writeControlInt(control, cmd.Process.Pid)
 
-	cancelled := make(chan os.Signal, 1)
-	signal.Notify(cancelled, syscall.SIGTERM)
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 
@@ -115,6 +116,7 @@ func (s *Server) startTrackedCommand(
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
+	track bool,
 ) (primaryPID int, exitCh <-chan int, cancel func(), err error) {
 	self, err := os.Executable()
 	if err != nil {
@@ -151,7 +153,9 @@ func (s *Server) startTrackedCommand(
 		_ = shim.Wait()
 		return 0, nil, nil, fmt.Errorf("job shim failed to start primary command")
 	}
-	s.jobs.add(shim.Process.Pid, command)
+	if track {
+		s.jobs.add(shim.Process.Pid, command)
+	}
 
 	ch := make(chan int, 1)
 	go func() {

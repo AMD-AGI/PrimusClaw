@@ -236,7 +236,10 @@ function probeUserProcesses(
   if (deps.countActiveShells) {
     return deps.countActiveShells(info.handsUrl!, info.token!, sessionId);
   }
-  return inspectSandboxJobs(info).then(async (result) => {
+  return inspectSandboxJobs({
+    ...info,
+    sessionId: info.sessionId || sessionId,
+  }).then(async (result) => {
     await persistJobsIdentity(deps, sessionId, result);
     return result.count;
   });
@@ -968,6 +971,7 @@ const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
  * and are rotated into later sweeps.
  */
 const BG_PROBE_MAX_IN_FLIGHT = 8;
+const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
 
 /**
  * Reservation deadline for a probe and its verdict write. It is shorter than
@@ -1382,15 +1386,15 @@ function peekBackgroundWork(
 }
 
 /** Whether the handle contains enough control-plane identity to query EnvD jobs. */
-function canProbeJobs(info: HandsKvEntry): boolean {
+function canProbeJobs(info: HandsKvEntry, sessionId: string): boolean {
   return info.provider === "agent-sandbox"
-    ? !!info.sessionId
+    ? !!(info.sessionId || sessionId)
     : !!(info.workloadId && info.platformKey);
 }
 
 /** Whether this sandbox identity needs a new background-work probe. */
-function needsProbe(identity: string, info: HandsKvEntry): boolean {
-  if (!canProbeJobs(info)) return false;
+function needsProbe(identity: string, info: HandsKvEntry, sessionId: string): boolean {
+  if (!canProbeJobs(info, sessionId)) return false;
   // A verdict from another idle period cannot suppress a fresh probe.
   const cached = usableCachedVerdict(identity, info);
   if (cached && cached.state !== "unknown" && Date.now() - cached.at < BG_PROBE_REFRESH_MS) return false;
@@ -1578,7 +1582,14 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
       await invalidateProbeVerdict(deps, probe);
       if (probeIsStale(probe)) return;
       if (err instanceof SandboxTerminalProbeError) {
-        await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        if (err.state === "absent") {
+          logger.info(
+            { sessionId, workloadId: info.workloadId, reason: err.reason },
+            "keepalive.jobs_probe_absent",
+          );
+        } else {
+          await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        }
       } else if (err instanceof SandboxRuntimeTerminalError) {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
       } else if (err instanceof SandboxTrackingLostError) {
@@ -1855,6 +1866,8 @@ interface RetentionRead {
   inst: SandboxInstance;
 }
 
+type HandsRecord = { value: Uint8Array; revision: number };
+
 interface TargetCensus {
   targets: Map<string, RegisteredSandbox>;
   seenIdentities: Set<string>;
@@ -1868,9 +1881,8 @@ interface TargetCensus {
    * walk does not know the whole set until it ends.
    */
   retentionReads: Map<string, RetentionRead>;
+  idleExpiries: Array<{ candidate: ProbeCandidate; record: HandsRecord }>;
 }
-
-type HandsRecord = { value: Uint8Array; revision: number };
 
 async function collectTargets(
   deps: KeepaliveDeps,
@@ -1882,12 +1894,16 @@ async function collectTargets(
   const census: TargetCensus = {
     targets: new Map(), seenIdentities, probeCandidates: [], stats,
     retentionReads: new Map(),
+    idleExpiries: [],
   };
   for (const [key, registered] of localRegistry) {
     if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
     census.targets.set(key, registered);
   }
   const kvComplete = await collectKvTargets(deps, census);
+  await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, (item) =>
+    expireIdleTarget(deps, item.candidate, item.record, census.stats),
+  );
   const dagComplete = await collectDagTargets(deps, census);
   stats.probes += dispatchProbes(deps, census.probeCandidates);
   // Accounted apart from the reads, and only accounted: the reads happen after
@@ -1968,6 +1984,9 @@ async function collectKvTarget(
       { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
       "keepalive.sandbox_terminal_recorded",
     );
+    await destroyHands(sessionId, info).catch((err) => {
+      logger.warn({ err, sessionId }, "keepalive.terminal_stop_retry");
+    });
     return true;
   }
   if (isRetentionEntry(info)) {
@@ -2008,18 +2027,23 @@ async function collectIdleTarget(
   else stats.bgIdle += 1;
   if (peeked.source === "mem") stats.fromMem += 1;
   else if (peeked.source === "handle") stats.fromHandle += 1;
-  else if (peeked.source === "none") stats.fromNone += 1;
+  else if (!canProbeJobs(info, sessionId)) stats.fromNoHands += 1;
+  else stats.fromNone += 1;
   const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
-  if (needsProbe(identity, info)) census.probeCandidates.push(candidate);
-  if (bgWork === "running" || bgWork === "unknown") {
-    const seenAt = bgWork === "running" ? peeked.at ?? Date.now() : (deps.now ?? Date.now)();
+  if (needsProbe(identity, info, sessionId)) census.probeCandidates.push(candidate);
+  if (bgWork === "running") {
+    const seenAt = peeked.at ?? Date.now();
     await refreshIdleSince(deps, key, e.revision, info, seenAt);
+    return false;
+  }
+  if (bgWork === "unknown" && canProbeJobs(info, sessionId)) {
+    await refreshIdleSince(deps, key, e.revision, info, (deps.now ?? Date.now)());
     return false;
   }
   const expired = bgWork === "gone"
     || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
   if (expired) {
-    await expireIdleTarget(deps, candidate, { ...e, value }, stats);
+    census.idleExpiries.push({ candidate, record: { ...e, value } });
   }
   else {
     stats.withinWindow += 1;
@@ -2042,6 +2066,14 @@ async function expireIdleTarget(
   const { key, identity, sessionId, info } = candidate;
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     stats.keptLocal += 1;
+    return;
+  }
+  if (!canProbeJobs(info, sessionId)) {
+    logger.info(
+      { sessionId, workloadId: info.workloadId },
+      "keepalive.idle_reclaim_jobs_identity_absent",
+    );
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
     return;
   }
   if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
@@ -2080,9 +2112,26 @@ async function expireIdleTarget(
     );
   } catch (err) {
     if (err instanceof SandboxTerminalProbeError) {
-      await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      if (err.state === "absent") {
+        await destroyHands(sessionId, info).catch((stopErr) => {
+          logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
+        });
+        stats.expired += 1;
+        logger.info(
+          { sessionId, workloadId: info.workloadId, reason: err.reason },
+          "keepalive.idle_handle_absent",
+        );
+      } else {
+        await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        await destroyHands(sessionId, info).catch((stopErr) => {
+          logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
+        });
+      }
     } else if (err instanceof SandboxRuntimeTerminalError) {
       await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      await destroyHands(sessionId, info).catch((stopErr) => {
+        logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
+      });
     } else if (err instanceof SandboxTrackingLostError) {
       logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
       if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
@@ -2432,7 +2481,11 @@ async function pingSandbox(
         throw new SandboxGoneError(`sandbox workload state=${status.state}`);
       }
       if (status.state !== "running") {
-        throw new Error(`sandbox workload state=${status.state ?? "unknown"}`);
+        logger.info(
+          { sessionId, state: status.state ?? "unknown" },
+          "keepalive.agent_sandbox_state_unknown",
+        );
+        return null;
       }
     } else {
       await getSafeWorkloadProvider().exec({
@@ -2442,7 +2495,7 @@ async function pingSandbox(
         namespace: entry.namespace ?? "",
         handsBaseUrl: "",
         platformKey: entry.platformKey!,
-      }, "date -Iseconds > /tmp/keepalive_ts", "15s");
+      }, "date -Iseconds > /tmp/keepalive_ts", "15s", undefined, { untracked: true });
     }
     failCounts.delete(targetKey);
     const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);

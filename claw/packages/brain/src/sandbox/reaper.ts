@@ -467,9 +467,10 @@ export function eligibleForClusterReclaim(
   if (info.keepalive !== false) return false;
   if (info.sessionDeleted === true) return true;
   const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-  const quiescedAt = typeof info.quiescedAt === "number" ? info.quiescedAt : 0;
   const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
-  const reuseWindowStart = quiescedAt || workSeenAt || idleSince;
+  const reuseWindowStart = typeof info.quiescedAt === "number"
+    ? info.quiescedAt
+    : Math.max(idleSince, workSeenAt);
   return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
 }
 

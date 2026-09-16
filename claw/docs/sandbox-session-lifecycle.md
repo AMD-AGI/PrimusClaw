@@ -117,11 +117,11 @@ envd (PID 1, always running)
 - HTTP can return as soon as the shell exits. Request cancellation does not stop the shim or its descendants. A command timeout sends SIGTERM to the shim, which stops only the primary process group.
 - The shim stays alive until every user descendant of that job has exited.
 - EnvD records the **shim PID** (the Hands start job marks the Hands PID as infrastructure).
-- `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty.
+- `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty. `tracking_lost` clears when the registry is empty and a new tracked job starts.
 
-**User work remains**: a live non-Hands shim exists, or the Hands job shim still has a non-zombie PID other than Hands.
+**User work remains**: a live tracked non-Hands shim exists, or the Hands job shim still has a non-zombie PID other than Hands.
 
-**No user work remains**: only Hands (and idle shims) remain.
+**No user work remains**: only Hands (and idle shims) remain. Brain keepalive pings, container probes, and live-work reads send `untracked` execute and are not user jobs.
 
 EnvD exposes a read-only `GET /api/jobs`. Brain uses only that API. It does not scan the container `/proc` and does not query InferaDeployment / RayJob.
 
@@ -206,6 +206,7 @@ EnvD exiting stops `codeinterpreter`. That is an abnormal sandbox death and fail
 | EnvD jobs API unreachable | unknown, wait (and only if already Running) |
 | `GET /api/jobs` is 404 / 405 / 501 | no Brain idle reclaim; workload timeout stops the sandbox |
 | jobs `tracking_lost` | unknown, wait; not idle |
+| Workload absent (GC / 404) | stop/release the handle; not a frontend sandbox failure |
 | Pod UID or EnvD instance id changed | **failure to the frontend** (`sandbox_instance_replaced`) |
 | EnvD exited 0 without Brain stop | **failure to the frontend** (`sandbox_envd_exited`) |
 | Pending longer than `SANDBOX_PENDING_TIMEOUT_SECONDS` | **failure to the frontend** (`sandbox_pending_timeout`) |
@@ -234,6 +235,7 @@ OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_c
 | Router briefly unreachable | unknown | Running | wait, do not reclaim |
 | jobs API 404 / 405 / 501 | absent | Running | no Brain reclaim; workload timeout |
 | jobs tracking_lost | unknown | Running | wait, do not reclaim |
+| Workload absent | — | absent | stop/release handle; not a frontend failure |
 | Pod replaced under the same name | — | Running or terminal | failure `sandbox_instance_replaced` |
 | EnvD exit 0 without Brain stop | — | Succeeded | failure `sandbox_envd_exited` |
 | reclaim vs new message | empty | Running | CAS `closing`; loser does not reuse |

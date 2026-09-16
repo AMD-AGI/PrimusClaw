@@ -262,6 +262,8 @@ test("an EnvD exit 0 without an explicit stop is a sandbox environment failure",
     "sandbox_envd_exited",
   );
 });
+
+test("timeout is read from the terminal condition", () => {
   assert.equal(
     classifyWorkloadTerminalReason({ conditions: [{ type: "AdminStopped", message: "the workload has timed out" }] }),
     "sandbox_timed_out",

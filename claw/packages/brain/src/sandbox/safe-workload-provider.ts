@@ -39,6 +39,7 @@ import type {
   SandboxInstance,
   SandboxStatus,
   SandboxExecResult,
+  SandboxExecOptions,
 } from "./provider.js";
 
 const logger = pino({ name: "safe-workload-provider" });
@@ -186,6 +187,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult> {
     const ns = inst.namespace?.trim() || SANDBOX_NAMESPACE;
     const routerConfigured = SANDBOX_ROUTER_URL.trim();
@@ -202,7 +204,11 @@ export class SafeWorkloadProvider implements SandboxProvider {
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ command: ["sh", "-c", command], timeout }),
+      body: JSON.stringify({
+        command: ["sh", "-c", command],
+        timeout,
+        ...(opts?.untracked ? { untracked: true } : {}),
+      }),
       // `timeout` is only the command's deadline inside the container; it says
       // nothing about a Router that accepts the connection and then goes quiet.
       // Without a cap here that fetch inherits undici's 5-minute header
@@ -219,21 +225,20 @@ export class SafeWorkloadProvider implements SandboxProvider {
     if (!resp.ok) {
       const errBody = await resp.text();
       const msg = `sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`;
-      // A dead pod normally appears as Router 502, not 404. Confirm every
-      // failed data-plane response through the independent Workload API so a
-      // SaFE terminal phase becomes a session failure instead of a rebuild.
-      const status = await this.get(inst, signal);
-      if (status.state === "terminal") {
-        throw new SandboxRuntimeTerminalError(
-          status.reason ?? "sandbox_workload_terminal",
-          `sandbox workload entered terminal phase: ${msg}`,
-        );
-      }
-      if (status.state === "absent") {
-        throw new SandboxGoneError(msg);
-      }
-      if (status.state === "running") {
-        throw new SandboxExecRouteUnavailableError(msg);
+      if (resp.status === 404 || resp.status === 410) {
+        const status = await this.get(inst, signal);
+        if (status.state === "terminal") {
+          throw new SandboxRuntimeTerminalError(
+            status.reason ?? "sandbox_workload_terminal",
+            `sandbox workload entered terminal phase: ${msg}`,
+          );
+        }
+        if (status.state === "absent") {
+          throw new SandboxGoneError(msg);
+        }
+        if (status.state === "running") {
+          throw new SandboxExecRouteUnavailableError(msg);
+        }
       }
       throw new Error(msg);
     }

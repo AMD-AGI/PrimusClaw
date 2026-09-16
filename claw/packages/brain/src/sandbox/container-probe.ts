@@ -150,7 +150,7 @@ async function defaultExec(
   const provider = inst.provider === "agent-sandbox"
     ? getAgentSandboxProvider()
     : getSafeWorkloadProvider();
-  return provider.exec(inst, command, timeout, signal);
+  return provider.exec(inst, command, timeout, signal, { untracked: true });
 }
 
 const realEffects: ContainerProbeEffects = {

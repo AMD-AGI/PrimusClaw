@@ -231,3 +231,23 @@ test("a KV failure is swallowed rather than escaping the cleanup handler", async
   bindStub({ entry: { status: "ready" }, updateError: new Error("CONNECTION_CLOSED") });
   await parkForIdleReclaim(SID);
 });
+
+test("cluster reclaim uses the later of idleSince and workSeenAt", () => {
+  const now = 1_000_000;
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS,
+      workSeenAt: now - 1,
+    }, now),
+    false,
+  );
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
+      workSeenAt: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
+    }, now),
+    true,
+  );
+});

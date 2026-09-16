@@ -144,10 +144,12 @@ x-session-id: sess_xxx
 
 - `command` (`[]string`, required), `timeout` (default `60s`), `working_dir`
   (relative to workspace `/home/sandbox`; path traversal rejected with `400`),
-  `env` (merged into the environment).
+  `env` (merged into the environment), `untracked` (omit this execute from
+  `GET /api/jobs` user-process accounting).
 - Response (always `200`): `{ stdout, stderr, exit_code, duration, start_time, end_time }`.
   Check `exit_code` for success. Notable codes: `124` timeout, `126` not
-  executable, `127` not found, `137` OOM-killed.
+  executable, `127` not found, `137` OOM-killed. A command that reaches its
+  `timeout` reports `124` even when the process is stopped with SIGKILL.
 
 ### Execute (streaming, SSE)
 

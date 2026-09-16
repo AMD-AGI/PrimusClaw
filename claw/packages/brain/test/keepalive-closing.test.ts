@@ -166,3 +166,105 @@ test("a sandbox without GET /api/jobs is not idle-reclaimed", async () => {
     restore();
   }
 });
+
+test("a recorded terminalReason stops the sandbox instead of leaking it", async () => {
+  const { kv, store } = storeKv({
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "wl-term",
+    platformKey: "pk",
+    namespace: "ns",
+    terminalReason: "sandbox_instance_replaced",
+  });
+  bindHandsKv(kv);
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+    assert.ok(stopped.includes("wl-term"), "terminalReason must stop the sandbox");
+    assert.equal(store.has(`hands.${SESSION}`), false);
+  } finally {
+    restoreRetry();
+    restore();
+  }
+});
+
+test("a handle without platformKey does not reset its idle clock", async () => {
+  const { kv, store } = storeKv({
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "wl-1",
+    namespace: "ns",
+    keepalive: false,
+    idleSince: 1,
+    quiescedAt: 1,
+  });
+  bindHandsKv(kv);
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0, now: () => 1_000_000 });
+    assert.equal(stopped.length, 0);
+    const left = store.get(`hands.${SESSION}`);
+    assert.ok(left);
+    const info = JSON.parse(sc.decode(left.value)) as { idleSince?: number };
+    assert.equal(info.idleSince, 1, "incomplete identity must not refresh idleSince");
+  } finally {
+    restore();
+  }
+});
+
+test("an absent workload is reaped without a frontend sandbox failure", async () => {
+  const { kv } = storeKv({
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "wl-1",
+    platformKey: "pk",
+    namespace: "ns",
+    handsUrl: "http://sandbox:9100/mcp",
+    token: "tok",
+    keepalive: false,
+    idleSince: 0,
+    quiescedAt: 0,
+  });
+  bindHandsKv(kv);
+  const events: Array<{ status?: string; reason?: string }> = [];
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: false, state: "absent" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    const { SandboxTerminalProbeError } = await import("../src/sandbox/job-probe.js");
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async () => {
+        throw new SandboxTerminalProbeError("absent", "sandbox_workload_absent");
+      },
+      emitSandboxFailure: async (_sid, evt) => { events.push(evt); },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(stopped.includes("wl-1"));
+    assert.equal(events.length, 0, "absent is not a frontend sandbox failure");
+  } finally {
+    restoreRetry();
+    restore();
+  }
+});

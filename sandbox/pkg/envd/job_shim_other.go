@@ -19,6 +19,7 @@ func (s *Server) startTrackedCommand(
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
+	track bool,
 ) (int, <-chan int, func(), error) {
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = workDir
@@ -30,7 +31,9 @@ func (s *Server) startTrackedCommand(
 	if err := cmd.Start(); err != nil {
 		return 0, nil, func() {}, err
 	}
-	s.jobs.add(cmd.Process.Pid, command)
+	if track {
+		s.jobs.add(cmd.Process.Pid, command)
+	}
 	go func() {
 		err := cmd.Wait()
 		if err != nil {

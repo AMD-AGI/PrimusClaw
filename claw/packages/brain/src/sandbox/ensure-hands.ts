@@ -609,9 +609,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       sessionId,
       identity,
       hasToken ? info.token : undefined,
-    ).catch((err) => {
-      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
-    });
+    );
     throw new SandboxProvisionTerminalError(
       info.terminalReason,
       `sandbox workload entered terminal phase (${info.terminalReason})`,

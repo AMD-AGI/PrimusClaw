@@ -67,7 +67,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 	_, exitCh, stop, err := s.startTrackedCommand(
-		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr, !req.Untracked,
 	)
 	exitCode := 0
 	if err == nil {
@@ -76,12 +76,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		select {
 		case exitCode = <-exitCh:
 		case <-timer.C:
-			stop()
-			select {
-			case exitCode = <-exitCh:
-			case <-time.After(time.Second):
-				exitCode = 124
-			}
+			exitCode = finalizeTimedOutCommand(exitCh, stop)
 			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
 		case <-r.Context().Done():
 			// HTTP cancellation does not stop the tracked tree.
@@ -168,6 +163,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		s.buildChildEnv(req.Env),
 		stream.writer("stdout"),
 		stream.writer("stderr"),
+		!req.Untracked,
 	)
 	if err != nil {
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)
@@ -183,12 +179,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	select {
 	case exitCode = <-exitCh:
 	case <-timer.C:
-		stop()
-		select {
-		case exitCode = <-exitCh:
-		case <-time.After(time.Second):
-			exitCode = 124
-		}
+		exitCode = finalizeTimedOutCommand(exitCh, stop)
 	case <-r.Context().Done():
 		stream.deactivate()
 		return
@@ -223,7 +214,19 @@ func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 	return env
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// GNU timeout's documented execute timeout status.
+const executeTimeoutExitCode = 124
+
+// finalizeTimedOutCommand stops the tracked tree and always reports 124,
+// including when the shim surfaces SIGKILL as -1.
+func finalizeTimedOutCommand(exitCh <-chan int, stop func()) int {
+	stop()
+	select {
+	case <-exitCh:
+	case <-time.After(time.Second):
+	}
+	return executeTimeoutExitCode
+}
 
 func sseWrite(w http.ResponseWriter, f http.Flusher, event string, data interface{}) {
 	b, _ := json.Marshal(data)

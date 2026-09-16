@@ -14,6 +14,8 @@ type ExecuteRequest struct {
 	Timeout    string            `json:"timeout,omitempty"` // e.g. "60s"
 	WorkingDir string            `json:"working_dir,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	// Untracked omits this execute from GET /api/jobs user-process accounting.
+	Untracked bool `json:"untracked,omitempty"`
 }
 
 // ExecuteResponse is the result of a synchronous execution.

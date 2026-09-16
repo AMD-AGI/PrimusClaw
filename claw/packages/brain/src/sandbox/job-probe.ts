@@ -78,8 +78,11 @@ function instanceFromEntry(entry: JobProbeEntry): SandboxInstance {
 
 /** Refuse to inspect jobs unless the control plane confirms Running. */
 function requireRunning(status: SandboxStatus): void {
-  if (status.state === "terminal" || status.state === "absent") {
-    throw new SandboxTerminalProbeError(status.state, status.reason);
+  if (status.state === "terminal") {
+    throw new SandboxTerminalProbeError(status.state, status.reason ?? "sandbox_workload_terminal");
+  }
+  if (status.state === "absent") {
+    throw new SandboxTerminalProbeError(status.state, status.reason ?? "sandbox_workload_absent");
   }
   if (!status.running || status.state === "unknown") {
     throw new Error(`sandbox jobs probe requires Running, state=${status.state || "unknown"}`);
