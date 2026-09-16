@@ -441,14 +441,15 @@ test("the ping fan-out is bounded too, not just the probes", async () => {
   let live = 0;
   const provider = {
     kind: "safe-workload",
-    async exec() {
+    // The ping is a control-plane status read, so that is where the fan-out is.
+    async get() {
       live += 1;
       peak = Math.max(peak, live);
       await new Promise((r) => setImmediate(r));
       live -= 1;
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return { running: true, healthy: true };
     },
-    async get() { return { running: true, healthy: true }; },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     async stop() {},
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
@@ -457,7 +458,12 @@ test("the ping fan-out is bounded too, not just the probes", async () => {
   await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
 
   assert.ok(peak > 0, "nothing was pinged at all");
-  assert.ok(peak <= 16, `${peak} pings were in flight at once`);
+  // Both phases reach the control plane through this one read, and they overlap:
+  // the probes a sweep dispatches are still in flight when the ping phase
+  // starts. Each is bounded on its own -- 8 probes, 16 pings -- so the ceiling
+  // the shared pool actually sees is the sum, and it is that sum that must not
+  // grow with the size of the fleet.
+  assert.ok(peak <= 24, `${peak} control-plane reads were in flight at once`);
 });
 
 test("a probe still in the air when a task takes the sandbox back is discarded", async () => {
@@ -506,11 +512,11 @@ test("a target's record is renewed before it waits its turn to be pinged", async
   let revisionAtPing: number | null = null;
   const provider = {
     kind: "safe-workload",
-    async exec() {
+    async get() {
       revisionAtPing = revision();
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return { running: true, healthy: true };
     },
-    async get() { return { running: true, healthy: true }; },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     async stop() {},
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });

@@ -62,7 +62,9 @@ import {
   type HandsProbeEntry,
 } from "./container-probe.js";
 import { checkHandsHealth } from "./hands-health.js";
-import { parseExecTimeoutMs, type SandboxInstance } from "./provider.js";
+import {
+  parseExecTimeoutMs, type SandboxExecOptions, type SandboxInstance,
+} from "./provider.js";
 
 const logger = pino({ name: "sandbox-hands-restart" });
 
@@ -268,7 +270,7 @@ async function killAndRelaunch(
     () => controller.abort(new Error(HANDS_RESTART_DEADLINE)),
     deadlineMs,
   );
-  const execCapped = async (cmd: string, timeout: string) => {
+  const execCapped = async (cmd: string, timeout: string, opts?: SandboxExecOptions) => {
     const remaining = deadlineAt - Date.now();
     if (remaining <= 0) throw new Error(HANDS_RESTART_DEADLINE);
     const call = execInSandbox(
@@ -276,6 +278,7 @@ async function killAndRelaunch(
       cmd,
       timeoutWithinBudget(timeout, remaining),
       controller.signal,
+      opts,
     );
     call.catch(() => {});
     let onAbort: (() => void) | undefined;
@@ -293,7 +296,10 @@ async function killAndRelaunch(
     }
   };
   try {
-    await execCapped(stopStaleHandsCmd(), STOP_TIMEOUT);
+    // Clearing the port is housekeeping, so it stays out of the job roster. The
+    // relaunch below does not: the shim it registers is what makes the restarted
+    // Hands and everything it spawns visible to GET /api/jobs.
+    await execCapped(stopStaleHandsCmd(), STOP_TIMEOUT, { untracked: true });
     await bootstrapHandsInSandbox(
       execCapped,
       attempt.sessionId,

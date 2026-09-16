@@ -85,12 +85,13 @@ beforeEach(() => {
   resetBackgroundWorkStateForTest();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      // Only the keepalive's own refresh counts as a ping: a retention's
-      // live-work read reaches the container through the same exec channel.
-      async exec(inst: { id: string }, cmd: string) {
-        if (cmd.includes("keepalive_ts")) pinged.push(inst.id);
-        return { exitCode: 0, stdout: "", stderr: "" };
+      // The ping is a control-plane status read, which is what separates it
+      // from a retention's live-work read: that one enters the container.
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        return { running: true, healthy: true, state: "running" };
       },
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     } as unknown as SandboxProvider,
   });
 });

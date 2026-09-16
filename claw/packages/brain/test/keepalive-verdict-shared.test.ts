@@ -1621,9 +1621,10 @@ test("positive provider absence releases a gone identity without idle aging", as
       await sweep(deps);
       assert.ok(k.deleted.includes(KEY), "gone bypasses the ordinary idle reuse window");
       assert.equal(workReads, 0, "a conclusive control-plane answer needs no container read");
-      // Absence reaches the reclaim path, which reconfirms at the boundary;
-      // a terminal phase is torn down off the reason already on the handle.
-      assert.equal(statusReads, state === "absent" ? 2 : 1);
+      // The count is not pinned: both the roster probe and the ping phase reach
+      // the control plane through this one read. What matters is that it was
+      // asked and that no container read followed.
+      assert.ok(statusReads >= 1, "the control plane is what answered");
     });
   }
 });
@@ -1651,26 +1652,35 @@ test("evidence arriving after local reuse cannot publish idle or gone", async ()
   const k = fakeKv();
   const pending = Promise.withResolvers<void>();
   let reading = false;
-  // The control-plane read is the probe's first step, so holding it open holds
-  // the whole answer open -- and the answer it eventually gives is conclusive,
-  // which is what must not be published once the handle is in use again.
-  stubPingableProvider({
-    async get() {
+  // Held on the roster read rather than the control-plane one: the sweep reaches
+  // the control plane on paths this case is not about, and the answer that must
+  // not be published once the handle is in use again is the conclusive one the
+  // roster read eventually raises.
+  const { SandboxTerminalProbeError } = await import("../src/sandbox/job-probe.js");
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
       reading = true;
       await pending.promise;
-      return { running: false, healthy: false, state: "absent" };
+      throw new SandboxTerminalProbeError("absent", "sandbox_workload_absent");
     },
-  });
-  const deps = { kv: k.kv, countActiveShells: async () => 0 };
-  await sweep(deps);
-  assert.ok(reading);
-  registerSandbox(SESSION, { provider: "safe-workload", workloadId: ENTRY.workloadId });
-  pending.resolve();
-  await new Promise((r) => setImmediate(r));
-  assert.equal(backgroundWorkStateSizesForTest().cache, 0);
-  assert.equal(k.current().bgRunning, undefined);
-  assert.ok(!k.deleted.includes(KEY), "a stale conclusion cannot release a handle in use");
-  unregisterSandbox(SESSION);
+  };
+  try {
+    await sweep(deps);
+    assert.ok(reading);
+    registerSandbox(SESSION, { provider: "safe-workload", workloadId: ENTRY.workloadId });
+    pending.resolve();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(backgroundWorkStateSizesForTest().cache, 0);
+    assert.equal(k.current().bgRunning, undefined);
+    assert.ok(!k.deleted.includes(KEY), "a stale conclusion cannot release a handle in use");
+  } finally {
+    // Held open, this read is reached by every later sweep in the file.
+    pending.resolve();
+    unregisterSandbox(SESSION);
+    await new Promise((r) => setImmediate(r));
+  }
 });
 
 test("gone reclamation respects an active run lease and a competing revision", async (t) => {

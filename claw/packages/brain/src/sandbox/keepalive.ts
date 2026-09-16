@@ -2487,40 +2487,45 @@ async function pingSandbox(
   if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return null;
 
   try {
-    if (isAgent) {
-      const status = await getAgentSandboxProvider().get({
+    // A control-plane status read on both providers, and no command in the
+    // container. The exec this replaced on the safe-workload path wrote
+    // /tmp/keepalive_ts to refresh the Router's LastActivity for the sandbox
+    // idle-GC; Brain's reclaim replaced that controller, reads idleness from
+    // the EnvD roster, and nothing consumes the timestamp. What a sweep still
+    // wants of a live sandbox is whether its workload is still Running, which
+    // this asks without entering the container.
+    const status = isAgent
+      ? await getAgentSandboxProvider().get({
         provider: "agent-sandbox",
         id: entry.sessionId!,
         sandboxName: entry.sandboxName ?? "",
         namespace: entry.namespace ?? "",
         handsBaseUrl: "",
         userId: entry.userId,
-      });
-      if (status.state === "terminal") {
-        throw new SandboxRuntimeTerminalError(
-          status.reason ?? "sandbox_workload_terminal",
-          `sandbox workload state=${status.state}`,
-        );
-      }
-      if (status.state === "absent") {
-        throw new SandboxGoneError(`sandbox workload state=${status.state}`);
-      }
-      if (status.state !== "running") {
-        logger.info(
-          { sessionId, state: status.state ?? "unknown" },
-          "keepalive.agent_sandbox_state_unknown",
-        );
-        return null;
-      }
-    } else {
-      await getSafeWorkloadProvider().exec({
+      })
+      : await getSafeWorkloadProvider().get({
         provider: "safe-workload",
         id: entry.workloadId!,
         sandboxName: entry.workloadId!,
         namespace: entry.namespace ?? "",
         handsBaseUrl: "",
         platformKey: entry.platformKey!,
-      }, "date -Iseconds > /tmp/keepalive_ts", "15s", undefined, { untracked: true });
+      });
+    if (status.state === "terminal") {
+      throw new SandboxRuntimeTerminalError(
+        status.reason ?? "sandbox_workload_terminal",
+        `sandbox workload state=${status.state}`,
+      );
+    }
+    if (status.state === "absent") {
+      throw new SandboxGoneError(`sandbox workload state=${status.state}`);
+    }
+    if (status.state !== "running") {
+      logger.info(
+        { sessionId, provider: entry.provider ?? "safe-workload", state: status.state ?? "unknown" },
+        "keepalive.sandbox_state_unknown",
+      );
+      return null;
     }
     failCounts.delete(targetKey);
     const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
