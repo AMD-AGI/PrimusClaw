@@ -890,14 +890,11 @@ export const RUN_LEASE_TTL_MS = envInt(
  */
 export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
 
-// Post-task sandbox reuse window. When a task finishes we stop pinging the pod
-// (so the control-plane sandbox-idle-gc-controller reclaims it after its own
-// ~15min idle timeout — no extra GPU cost) but keep the `hands.<sid>` KV entry
-// marked keepalive:false so the next user message within this window reuses the
-// still-alive pod without a cold start. Completes the intent of commit a7dffbf6,
-// which was broken by the eager kv.delete on task completion. Keep this <= the
-// control-plane idle timeout so the handle expires around when the pod dies.
-export const SANDBOX_IDLE_REUSE_MS = envInt("SANDBOX_IDLE_REUSE_MS", 15 * 60 * 1000);
+// Post-task idle reclaim window. After GET /api/jobs is empty and the
+// workload is Running, Brain waits this long from quiescedAt then CAS-es
+// ready→closing and destroyHands. Operators set SANDBOX_IDLE_REUSE_SECONDS
+// (default 900). Values below 1s are refused and this default is used.
+export const SANDBOX_IDLE_REUSE_MS = envInt("SANDBOX_IDLE_REUSE_SECONDS", 15 * 60, { min: 1 }) * 1000;
 // Mirror of CHECKPOINT_TTL_MS; kept as a distinct symbol so call-sites that
 // attach to the BRAIN_CHECKPOINTS bucket read the bucket-scoped constant
 // (matches BRAIN_REGISTRY_TTL_MS naming).

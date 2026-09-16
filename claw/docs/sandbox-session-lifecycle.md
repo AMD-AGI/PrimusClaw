@@ -153,7 +153,7 @@ That terminal phase is the sandbox Pod / codeinterpreter, not InferaDeployment o
 - A sandbox that is not yet Running does not enter DRAINING / QUIESCED.
 - Pending ends only by becoming Running, a SaFE sandbox terminal failure, or the Pending timeout below.
 
-When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain records `quiescedAt` and keeps the sandbox for 15 minutes. A new message or a new execute job clears that clock. Probes continue during QUIESCED. `unknown` and `tracking_lost` do not trigger reclaim.
+When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain records `quiescedAt` and keeps the sandbox for `SANDBOX_IDLE_REUSE_SECONDS` (default 15 minutes). A new message or a new execute job clears that clock. Probes continue during QUIESCED. `unknown` and `tracking_lost` do not trigger reclaim.
 
 Reclaim and reuse compete on one CAS: `ready` → `closing`. A handle in `closing` is not reused. Stale jobs answers are discarded when the sandbox identity or idle generation changes.
 
@@ -184,6 +184,7 @@ Claw has a separate queue cap, unrelated to idle 15 minutes:
 
 | Config | Default | Role |
 |--------|---------|------|
+| `SANDBOX_IDLE_REUSE_SECONDS` | **15 minutes** (`900`) | Running sandbox, empty `GET /api/jobs`, no in-flight message. Clock starts at `quiescedAt`. Then CAS `ready`→`closing` and `destroyHands`. |
 | `SANDBOX_PENDING_TIMEOUT_SECONDS` | **3 hours** | Sandbox Workload **phase=Pending** queued longer than this → terminal failure `sandbox_pending_timeout` to the frontend. The clock stops after leaving Pending (scheduled). Image pull is not Pending. `0` waits on the queue indefinitely. |
 | `SANDBOX_POLL_TIMEOUT_MS` | 1 hour | Ends only when SaFE **status is unreadable** (sustained 5xx, network failure, no phase), reason `sandbox_status_unreadable`. Readable Pending does not trigger it. |
 | SaFE Workload `timeout` | value on the task request (e.g. 46800s) | Hard cap from **StartTime / Running**, excluding queue time. |
