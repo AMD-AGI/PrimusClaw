@@ -178,8 +178,10 @@ AGENT_SANDBOX_SESSION_TIMEOUT="${AGENT_SANDBOX_SESSION_TIMEOUT:-}"
 AGENT_SANDBOX_MAX_SESSION_DURATION="${AGENT_SANDBOX_MAX_SESSION_DURATION:-}"
 
 # Doorbell dispatch and the eight admission ceilings. Empty means the chart
-# default -- "0" for a ceiling, false for API dispatch, true for Brain
+# default -- "0" for a ceiling, true for API dispatch, true for Brain
 # execution -- and forwards no --set at all, so the shipped default stands.
+# Both switches ship ON, so blank is not a canary: leaving RUN_DOORBELL_DISPATCH
+# empty gives every API replica doorbell dispatch. Write "false" to hold it off.
 # Recorded here for the same reason as the two above: upgrade.sh re-renders
 # from this file alone, so a ceiling staged through the chart and not written
 # down is reverted by the next ordinary upgrade, mid-canary and with no error.
@@ -900,8 +902,21 @@ DRY_RUN="${DRY_RUN:-false}"
 # The eight ceilings reach a pod only through the shared Secret, and
 # render_chart never renders it: it passes --set secret.create=false and
 # --show-only, under which secret.yaml is empty. A merge patch on stringData
-# sets exactly the configured keys and leaves the rest of the Secret -- the
-# cluster-resolved credentials among them -- as they are.
+# sets the eight keys and leaves the rest of the Secret -- the cluster-resolved
+# credentials among them -- as they are.
+#
+# All eight every time, blank written as "0", rather than only the ones with a
+# value. A blank means the chart default and the chart default is "0":
+# secret.yaml renders `| default 0` for each of these, so a full deploy already
+# writes "0" for a blank and only this patch used to disagree. Omitting a blank
+# made clearing a ceiling unrepresentable on the upgrade path -- nothing else
+# rewrites this Secret there -- so an operator who blanked the ceilings as step
+# R1 of the rollback (claw/docs/doorbell-rollout.md) left the old numbers in the
+# Secret while the Deployment rolled with the new switch. The pod then read a
+# non-zero ceiling with dispatch off, which is the one state the startup gate
+# refuses, and the rollback became a CrashLoopBackOff. Setting "0" explicitly
+# works either way and is what the procedure says to do; writing the ceilings
+# down as "0" here is what makes blanking them mean the same thing.
 #
 # The Doorbell values are deliberately absent: they render as container-level
 # env on each Deployment, so the apply that follows this carries them.
@@ -915,11 +930,11 @@ keys = {
     "ADMIT_SOFT_GPU_NODES", "ADMIT_HARD_GPU_NODES",
     "ADMIT_TREE_MAX_NODES", "ADMIT_TREE_MAX_DEPTH",
 }
-configured = {k: os.environ[k] for k in sorted(keys) if os.environ.get(k)}
-print(json.dumps({"stringData": configured}) if configured else "")
+ceilings = {k: (os.environ.get(k) or "0") for k in sorted(keys)}
+print(json.dumps({"stringData": ceilings}))
 PY
 )"
-  [ -n "$payload" ] || return 0
+  [ -n "$payload" ] || fail "could not build the admission Secret patch"
   if $DRY_RUN; then
     log "[dry-run] kubectl patch secret primus-claw-secrets -n $NAMESPACE"
     kubectl patch secret primus-claw-secrets -n "$NAMESPACE" --type=merge -p "$payload" --dry-run=client

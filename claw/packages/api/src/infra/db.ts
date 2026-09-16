@@ -721,8 +721,11 @@ async function reconcileDuplicateChatTurns(client: pg.PoolClient): Promise<void>
  * outcome is recovered from rather than prevented -- the next attempt's
  * reconcile closes the spare and {@link ensureConcurrentIndex} drops the
  * unusable object before rebuilding.
+ *
+ * Exported for tests: what it guarantees is which statements it issues in which
+ * order, and every one of the endings below is unreachable from `initDb` alone.
  */
-async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
+export async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
   // Probed before the fence, not under it. The fence is exclusive and every
   // claim takes it shared, so taking it at all stalls the fleet's claims until
   // it is let go -- and this function runs on every boot: every restart, every
@@ -741,6 +744,8 @@ async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
 
   for (let attempt = 1; attempt <= CHAT_TURN_INDEX_ATTEMPTS; attempt++) {
     await client.query("SELECT pg_advisory_lock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
+    // Per attempt, and read before the build below rather than after it.
+    let lockTimeoutRestored = true;
     try {
       // Bounded, because a claim blocked on the fence on the admission-lock
       // path is holding the `FOR UPDATE` tuple lock its preceding statement
@@ -752,19 +757,60 @@ async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<void> {
       try {
         await reconcileDuplicateChatTurns(client);
       } finally {
-        await client.query("RESET lock_timeout")
-          .catch(() => { /* the next statement will fail loudly enough */ });
+        // Recorded rather than swallowed, because the reason given for
+        // swallowing it -- the next statement will fail loudly enough -- is not
+        // true of this one. The next statement is the concurrent build below:
+        // it sets `statement_timeout` and never touches `lock_timeout`, so it
+        // would succeed in saying nothing and then run the whole CREATE INDEX
+        // CONCURRENTLY under this five-second ceiling. A concurrent build waits
+        // out every transaction older than itself on claw_tasks and exceeds
+        // five seconds as a matter of course, so it would raise 55P03 -- which
+        // this function reads as "somebody else had the row" -- and all three
+        // attempts would drop and rebuild a perfectly buildable index chasing a
+        // setting this block leaked.
+        lockTimeoutRestored = await client.query("RESET lock_timeout").then(
+          () => true,
+          (err: unknown) => {
+            logger.warn({ err, attempt }, "db.chat_turn_reconcile_lock_timeout_leaked");
+            return false;
+          },
+        );
       }
     } catch (err) {
-      // Only the lock-wait classes. `reconcileDuplicateChatTurns` refuses a
-      // turn held by two live executions, and retrying that refusal three times
-      // before reporting it would bury the one error an operator has to read.
-      if (!CLAIM_FENCE_RETRY_CODES.has((err as { code?: string })?.code ?? "")) throw err;
+      // Only the lock-wait classes are retried. `reconcileDuplicateChatTurns`
+      // refuses a turn held by two live executions, and retrying that refusal
+      // three times before reporting it would bury the one error an operator
+      // has to read.
+      if (!CLAIM_FENCE_RETRY_CODES.has((err as { code?: string })?.code ?? "")) {
+        // Reported here rather than rethrown, for the same reason the build
+        // below is caught: this runs in the middle of `initDb`, and the refusal
+        // it raises carries no `code`, so an error leaving this function takes
+        // the remaining DDL and `assertSchema` with it. That is the half-run
+        // migration the two catches around the build exist to prevent, arrived
+        // at by the one path neither of them covers -- and the worse version of
+        // it, because the operator is left with an incomplete schema *and* a
+        // deployment that will not say what else is missing.
+        //
+        // The refusal is deferred, not dropped. Nothing builds the index after
+        // this, so `assertChatTurnClaimIndex` refuses to serve at the end of
+        // the migration -- the same answer, with the whole schema applied --
+        // and the groups that caused it are already named in the
+        // `db.chat_turn_holders_ambiguous` error above.
+        logger.error({ err, attempt }, "db.chat_turn_reconcile_failed");
+        return;
+      }
       logger.warn({ err, attempt }, "db.chat_turn_reconcile_retry");
       continue;
     } finally {
       await client.query("SELECT pg_advisory_unlock($1)", [RUN_CLAIM_FENCE_LOCK_ID]);
     }
+    // Starting the build under a ceiling this function set and cannot prove it
+    // gave back is the misattribution described above, so the attempt ends
+    // here instead. The next one issues both the SET and the RESET again, which
+    // is what makes a failed restore recoverable rather than terminal; if none
+    // of them restores it, the fall-through below is the same refusal every
+    // other exhausted path takes.
+    if (!lockTimeoutRestored) continue;
     try {
       await ensureConcurrentIndex(
         client,

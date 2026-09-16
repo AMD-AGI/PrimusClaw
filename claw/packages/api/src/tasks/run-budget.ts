@@ -204,9 +204,28 @@ const BUDGET_SECONDS_SQL = `NULLIF(
  * stamps a fresh `queued_at` on every transition into `queued`, and banks the
  * segment just ended into `queued_ms_accrued` first -- which the standalone
  * reset did not, so a requeued row used to lose the wait it had already served.
+ *
+ * `clock_timestamp()` and not `NOW()`, which is the instant the *transaction*
+ * began rather than the instant this statement runs. Both requeue writers can
+ * be inside one: `releaseClaim` puts its run-time settlement and this
+ * transition in a single transaction, and the settlement's statements run
+ * first. Under `NOW()` the marker is backdated to before them, so the next exit
+ * reports the settlement's own duration as time the row spent waiting on the
+ * queue -- a wait that never happened, added to every requeued run, in exactly
+ * the series the doorbell rollout's bounded-waits gate takes its p99 from
+ * (`claw_api_run_queue_wait_seconds_bucket{outcome="claimed"}`). The size of
+ * the error is the length of the transaction, so it grows exactly as the
+ * transaction picks up more work, which is the direction this code moves in.
+ *
+ * It is also the clock every other queue stamp already keeps: `queued_at` is
+ * written `clock_timestamp()` by `applyTaskStatusTransition`, by the requeue
+ * arm of `releaseClaim` in the same `setSql` list as this fragment, by the
+ * retry clone in `lifecycle.ts`, and by the column's own default. These two
+ * mark one instant, and a sojourn measured against a marker its own row's
+ * `queued_at` disagrees with is not measuring anything.
  */
 export function requeueSojournSql(inner: string): string {
-  return `jsonb_set(${inner}, '{queued_since}', to_jsonb(NOW()::text))`;
+  return `jsonb_set(${inner}, '{queued_since}', to_jsonb(clock_timestamp()::text))`;
 }
 
 /** How many of these rows were leaving the queue, as opposed to execution. */

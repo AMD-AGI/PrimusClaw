@@ -4,8 +4,13 @@
 import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { claimNextRun, claimRun, failClaimedRun, unclaimRun } from "../src/clients/run-claim.js";
+
+const run = promisify(execFile);
 
 const originalFetch = globalThis.fetch;
 const originalApiUrl = process.env.INTERNAL_BACKEND_URL;
@@ -147,4 +152,45 @@ test("every claim declares the doorbell semantics this binary implements", async
       "a claim may only ask for rows this binary knows how to read",
     );
   }
+});
+
+test("a holder action with nowhere to post says so rather than returning quietly", async () => {
+  // `claimRun` and `claimNextRun` already throw on a missing base -- see the
+  // test above -- and the three holder actions were the ones that read it as
+  // nothing to do. Every one of them is settling a row, so a silent return
+  // reports that the row was settled.
+  //
+  // The case that makes it matter is a fat-only deployment, where the pre-gate
+  // takes its lease through the payload's `run_lease.url` and releases it
+  // through this pod's INTERNAL_BACKEND_URL, which is empty there. The release
+  // then does nothing at all: the lease stays live for its TTL, the redelivery
+  // it was released for is refused `superseded`, and a Stop arriving meanwhile
+  // cannot be answered either, since `stoppedAndUnheld` wants a null owner.
+  // Posting to the URL from the payload is not the repair -- `apiBase` says why
+  // the cluster token only ever goes to the address this replica knows -- so
+  // the deployment is what has to change, and it can only change if somebody is
+  // told.
+  //
+  // A child process, because pino writes to fd 1 through sonic-boom and no
+  // in-process stub sees it. Same shape as deadline-log-turns.test.ts.
+  const { stdout } = await run(process.execPath, [
+    fileURLToPath(new URL("../../../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+    fileURLToPath(new URL("./fixtures/run-claim-no-api-url.ts", import.meta.url)),
+  ], { timeout: 60_000, env: { ...process.env, INTERNAL_BACKEND_URL: "" } });
+
+  const line = stdout.split("\n").find((l) => l.includes("run.settle_attempt_failed.no_api_url"));
+  assert.ok(
+    line,
+    `a release that reached no API left no record of it.\nstdout:\n${stdout}`,
+  );
+  const record = JSON.parse(line) as Record<string, unknown>;
+  assert.equal(record.level, 50, "a lease left live with nobody told is an error, not a note");
+  assert.equal(record.taskId, "ktsk_fat", "the row whose lease is still held");
+  assert.equal(record.action, "settle-attempt");
+  assert.equal(record.hasApiBase, false, "and it names the configuration that has to change");
+  assert.match(
+    stdout, /FIXTURE released/,
+    "the release must still return: the drain branch naks immediately after it, and a "
+    + "throw here would take the nak with it",
+  );
 });
