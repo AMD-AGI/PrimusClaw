@@ -553,12 +553,29 @@ export async function dispatchTaskToBrain(
  * objects for collection. RUN_FAT_PREPARING_RECONCILE does not gate that arm, so
  * turning the rollout flag off only postpones it to the next tick.
  *
- * Unfenced is correct rather than merely expedient: `publishRunMessage` returned
- * a sequence and `recordDispatchSeq` banked it, so the question this marker was
- * armed to answer is already answered and the cleanup it stores is owed to
- * nobody -- there is no contending writer whose decision this could overwrite,
- * only a token that moved. Idempotent for the same reason, so a marker somebody
- * else already retired still reads as released.
+ * Unfenced against the *token* is correct rather than merely expedient:
+ * `publishRunMessage` returned a sequence and `recordDispatchSeq` banked it, so
+ * the question this marker was armed to answer is already answered and the
+ * cleanup it stores is owed to nobody -- there is no contending writer whose
+ * decision this could overwrite, only a token that moved. Idempotent for the
+ * same reason, so a marker somebody else already retired still reads as
+ * released. That last part matters more than it used to: `closeChatRun` now
+ * retires the marker in the statement that terminalizes a row a worker reported
+ * on, so on a fast turn the marker can legitimately be gone before this runs,
+ * and reading that as a failure would answer 503 for a turn that dispatched and
+ * has already been answered.
+ *
+ * There is exactly one writer it is NOT idempotent against, and it is the one
+ * whose decision this genuinely would overwrite: the reconciler taking the
+ * marker in order to delete the session this create minted. That take stamps
+ * `dispatch_reconcile_deleted` on the row in the same statement that clears the
+ * marker, and this declines on it. The two then contend on one row's lock, so
+ * the ordering is total and observable from both sides -- if this UPDATE gets
+ * there first the reconciler's take matches nothing and it abandons the delete,
+ * and if the take got there first this matches nothing and the caller answers
+ * `publish_unknown` rather than handing back HTTP 200 and a session id that is
+ * about to stop existing. Reporting a turn as dispatched into a session being
+ * deleted is not a smaller lie than reporting a dispatched turn as unknown.
  *
  * Swallowing the error and returning false is what leaves the old behaviour in
  * place for a disarm that never reached Postgres: the caller falls back to
@@ -570,7 +587,8 @@ async function releaseDispatchedFatReconcile(taskId: string): Promise<boolean> {
       `UPDATE claw_tasks
           SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
               metadata = metadata - 'dispatch_reconcile_token'
-        WHERE task_id = $1`,
+        WHERE task_id = $1
+          AND COALESCE((metadata->>'dispatch_reconcile_deleted')::boolean, false) = false`,
       [taskId],
     );
     return (r.rowCount ?? 0) > 0;

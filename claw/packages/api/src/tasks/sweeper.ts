@@ -1446,6 +1446,21 @@ const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
  * and too wide -- a row that truly never ran is closed `dispatch_unconfirmed`
  * by `reapOrphanedFatRuns` and `run_budget_exhausted` by
  * `reapExpiredDoorbellRuns`, and those cleanups are owed.
+ *
+ * All of which was still a proxy, and the third one to fail. Holder evidence is
+ * written on the fat path by the lease heartbeat, and `startLeaseHeartbeat` is
+ * un-awaited with its rejection swallowed: one failed POST during the rolling
+ * restart plus a turn shorter than the heartbeat period leaves a row that
+ * executed and answered the user with all three columns empty. The pattern
+ * across all three attempts is the same -- each signal is an artefact of HOW
+ * the run was serviced, and each is absent on some legitimate path -- so the
+ * decision has stopped being taken from a signal at all. `closeChatRun` now
+ * retires the marker in the statement that terminalizes a row a worker reported
+ * on (see `RETIRE_DISPATCH_RECONCILE_SQL`): the act of completing is the
+ * record, so a turn that ran is not here to be classified. `hasHolderEvidence`
+ * stays as defence in depth for a row whose report never arrived, and the
+ * delete arm below carries the floor for when even that is silent -- but
+ * neither is load bearing any more, and neither should be made so again.
  */
 async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean> {
   const executed = hasHolderEvidence(row);
@@ -1458,10 +1473,16 @@ async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean
     );
     if (verdict !== "closed") return false;
   }
-  const refused = !executed
-    && row.failure_reason === "dispatch_failed"
-    && TERMINAL_STATUSES.has(row.status);
-  if (refused || !executed) {
+  // One condition, not two. This used to read `if (refused || !executed)` over a
+  // `refused` defined as `!executed && failure_reason = 'dispatch_failed' && ...`
+  // -- a conjunction beginning with `!executed`, so the disjunction was
+  // identically `!executed` and the variable was dead. It is worth naming why it
+  // was there: the function had computed a "who closed this row" discriminator,
+  // which is the right question, and then thrown it away in favour of the row
+  // property beside it. Asking that question where it can actually be answered
+  // -- at the close, by the reporter -- is what `RETIRE_DISPATCH_RECONCILE_SQL`
+  // now does, and there is nothing left for a second term here to add.
+  if (!executed) {
     await releaseRunUse(row.task_id, false);
     if (!await runCleanupAction(row)) return false;
   }
@@ -1512,12 +1533,12 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
     //     status list cannot, because a completed turn is in no status a status
     //     list of live states would name.
     //   - The publisher can have handed the marker back after the take.
-    //     `releaseDispatchedFatReconcile` is unfenced and reports success to a
-    //     request that then answers HTTP 200, so a disarm committed between the
-    //     take and here is an explicit revocation of this cleanup that the
-    //     snapshot cannot carry. Checked as part of the same probe: a
-    //     successful marker update has to be able to stop the delete, or it
-    //     establishes nothing.
+    //     `releaseDispatchedFatReconcile` reports success to a request that then
+    //     answers HTTP 200, so a disarm committed between the take and here is
+    //     an explicit revocation of this cleanup that the snapshot cannot carry.
+    //     Settled below by taking the marker rather than reading it, which is
+    //     what makes "a successful marker update stops the delete" a statement
+    //     this code can actually keep.
     const occupied = await db.query(
       `SELECT 1 FROM claw_tasks
         WHERE session_id = $1 AND origin = 'chat'
@@ -1529,12 +1550,87 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
       [row.session_id],
     );
     if (occupied.rowCount) return true;
-    const stillArmed = await db.query(
-      `SELECT 1 FROM claw_tasks
-        WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL LIMIT 1`,
+    // The floor, and the only guard here that measures the harm rather than
+    // guessing at the cause. Everything above asks "did this dispatch execute";
+    // this asks the question that actually decides whether the write may be
+    // made, which is "is there a conversation in here to destroy". The two
+    // outcomes are not symmetric and the code should say so: a session left
+    // behind is a leak an operator can collect, and the hourly session reaper
+    // and `sweepSessionCleanups` are already in the business of collecting; a
+    // session deleted is a user's conversation gone, its content tombstoned and
+    // its workspace objects scheduled, with nothing that undoes it. So where
+    // the evidence is ambiguous this fails towards the leak.
+    //
+    // `is_placeholder` is what keeps the floor from swallowing the cleanups
+    // that are genuinely owed. `recordCompletionTurns` is the sole writer of
+    // this table, and it marks the assistant turn a *sweeper*-synthesized
+    // completion produces as a placeholder -- so a turn that is not one is an
+    // answer a worker actually produced and the user actually saw. A session
+    // holding only the placeholder an `announceRunFailure` wrote is still a
+    // session whose turn never ran, and is still taken back.
+    //
+    // Evidence, not a fence, and second on purpose: the completion consumer
+    // closes the row before it records turns, so there is a window in which an
+    // answered turn has no turn row yet. That window belongs to the close-side
+    // record in `RETIRE_DISPATCH_RECONCILE_SQL`, which lands inside the close's
+    // own statement and therefore strictly before the window opens. This
+    // catches what is left -- a report that closed no row, or a row some reaper
+    // terminalized out from under a turn that had already answered.
+    const answered = await db.query(
+      `SELECT 1 FROM claw_conversation_turns
+        WHERE session_id = $1 AND deleted_at IS NULL
+          AND role = 'assistant' AND NOT is_placeholder
+        LIMIT 1`,
+      [row.session_id],
+    );
+    if (answered.rowCount) {
+      logger.warn(
+        { sessionId: row.session_id, taskId: row.task_id },
+        "sweeper.reconcile_delete_session_answered",
+      );
+      return true;
+    }
+    // The revocation check, and it is now the marker itself rather than a look
+    // at it. It used to be a SELECT, under a comment claiming that "a
+    // successful marker update has to be able to stop the delete, or it
+    // establishes nothing" -- which a SELECT cannot deliver, because it sees
+    // only a disarm that committed before the read and the commit it guards
+    // comes after. Taking the marker makes the claim true: whoever clears
+    // `dispatch_reconcile_at` first wins, and the loser's own UPDATE matches no
+    // row and says so. That is both halves of the race in one statement -- this
+    // pass does not delete after a revocation, and `releaseDispatchedFatReconcile`
+    // cannot report a release, and so cannot answer HTTP 200 `dispatched`, once
+    // the delete has taken the marker.
+    //
+    // The stamp is what the other party reads, and it is needed because "the
+    // marker is gone" is by itself ambiguous now: `closeChatRun` retires it
+    // benignly on every turn a worker reports, and that must still leave
+    // `releaseDispatchedFatReconcile` free to answer `dispatched`. Only this
+    // statement writes it, only ever on the row it is about to delete the
+    // session for, and the publisher declines exactly on it -- so the two
+    // contend on one row's lock and neither can act on a stale reading of the
+    // other. It is durable rather than in-process on purpose: the publisher
+    // that has to read it is in a different process from the sweeper.
+    //
+    // Which reverses the "settle, then clear the marker" order the rest of this
+    // pass keeps, and that is the cost: a crash between this statement and the
+    // commit below leaves a session nobody comes back for, where the old order
+    // would have retried it on the next tick. Taken the same way as the floor
+    // above, and for the same reason -- a delete that has already been made
+    // wrongly cannot be retried, while a collection that was missed is exactly
+    // what the session reaper is for.
+    const took = await db.query(
+      `UPDATE claw_tasks
+          SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
+              metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb),
+                '{dispatch_reconcile_deleted}', 'true'::jsonb
+              )
+        WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+        RETURNING task_id`,
       [row.task_id],
     );
-    if (!stillArmed.rowCount) {
+    if (!took.rowCount) {
       logger.warn(
         { sessionId: row.session_id, taskId: row.task_id },
         "sweeper.reconcile_delete_session_revoked",
@@ -1564,11 +1660,23 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
   return true;
 }
 
+/**
+ * Retire the marker once the action has run, and report whether this row is
+ * settled -- which is not the same as whether this statement changed anything.
+ *
+ * Unfenced on `dispatch_reconcile_at` on purpose. The delete arm takes the
+ * marker itself, as the fence that decides the race with the publisher, so by
+ * the time a delete returns success the column is already NULL and a fenced
+ * statement here would answer "not settled" for the one action that most
+ * certainly is -- leaving the pass reporting nothing resolved while the session
+ * it just deleted is gone. The question this return value is asked is "is this
+ * row still owed a reconciliation", and a row with no marker is not.
+ */
 async function clearReconcileMarker(taskId: string): Promise<boolean> {
   const r = await db.query(
     `UPDATE claw_tasks
         SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
-      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+      WHERE task_id = $1
       RETURNING task_id`,
     [taskId],
   );

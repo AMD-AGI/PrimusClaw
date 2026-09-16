@@ -36,6 +36,16 @@
  * mandates it for exactly this mixed-version window, and it protects nothing
  * here. Its only consumer in this pass is the arm that closes a *non-terminal*
  * row, and every row below is terminal by the time the pass sees it.
+ *
+ * The holder evidence these rows carry is no longer what saves them. It turned
+ * out to be absent on a legitimate path of its own -- `startLeaseHeartbeat` is
+ * un-awaited and swallows its rejection, so a turn shorter than the heartbeat
+ * period whose first POST failed writes none of the three columns -- and the
+ * record is now written by the act of completing instead: `closeChatRun`
+ * retires the marker in the statement that terminalizes the row. That is why
+ * the first two cases no longer find a marker to expire. What they assert about
+ * the session is unchanged, which is the point; `fat-reconcile-worker-report`
+ * covers the shape where no holder evidence exists at all.
  */
 
 import assert from "node:assert/strict";
@@ -165,8 +175,16 @@ async function legacyBrainCompletes(row: { task_id: string; session_id: string; 
     "a legacy fat turn completes without ever incrementing the doorbell counter",
   );
   assert.equal(closed.lease_owner, "brain-legacy", "and the close leaves the holder evidence on the row");
-  assert.notEqual(closed.dispatch_reconcile_at, null, "with the marker still armed");
-  assert.equal(closed.dispatch_reconcile_action, "delete_created_session");
+  // Retired by the close itself. This used to assert the opposite -- that the
+  // marker survived a worker's report and the reconciler had to decide what to
+  // do with it -- which was the premise the round-2 fix was written against,
+  // not an outcome anything wanted. Holder evidence turned out to be absent on
+  // a legitimate path of its own (an un-awaited heartbeat that never landed),
+  // so the record moved to the one fact that is not an artefact of how the run
+  // was serviced: a worker reported an outcome for this row. The three
+  // behavioural assertions below are unchanged.
+  assert.equal(closed.dispatch_reconcile_at, null, "the report is what retires the marker");
+  assert.equal(closed.dispatch_reconcile_action, null);
   return closed;
 }
 
@@ -206,11 +224,11 @@ test("a legacy fat turn answered through the held branch is not reconciled away"
   assert.equal(row.dispatch_reconcile_action, "delete_created_session");
 
   const closed = await legacyBrainCompletes(row);
-  assert.equal(await expireArmedMarker(closed.task_id), 1);
   assert.equal(
-    await sweeper.reconcileAmbiguousDispatches(), 1,
+    await expireArmedMarker(closed.task_id), 0,
     "the row is settled and its marker retired, so it does not stay eligible for ever",
   );
+  assert.equal(await sweeper.reconcileAmbiguousDispatches(), 0, "and nothing is owing");
 
   const session = await sessionRow(row.session_id);
   assert.equal(
@@ -244,8 +262,8 @@ test("a legacy fat turn answered after a 503 publish_unknown is not reconciled a
   await legacyBrainHolds(row.task_id);
   const closed = await legacyBrainCompletes(row);
 
-  assert.equal(await expireArmedMarker(closed.task_id), 1);
-  assert.equal(await sweeper.reconcileAmbiguousDispatches(), 1);
+  assert.equal(await expireArmedMarker(closed.task_id), 0);
+  assert.equal(await sweeper.reconcileAmbiguousDispatches(), 0);
 
   const session = await sessionRow(row.session_id);
   assert.equal(

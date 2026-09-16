@@ -674,6 +674,77 @@ interface ClosedRow {
   queued_since: string | null;
 }
 
+/**
+ * Retire the dispatch reconcile marker, in the statement that terminalizes the
+ * row a worker just reported on.
+ *
+ * This is the answer to a question three earlier signals got wrong, and it is
+ * worth writing down why, because each of them looked sufficient at the time.
+ * The marker is armed by `insertTask` before the publish and is supposed to be
+ * handed back by the publisher once the publish is decided; when the publisher
+ * never gets to say -- a lost token, a `held` catch arm, a 503 `publish_unknown`
+ * whose request is gone -- `resolveAmbiguousDispatch` runs the stored cleanup at
+ * the horizon, and for a create that cleanup deletes the session. So the
+ * reconciler has to decide "did this dispatch ever reach anyone", and it kept
+ * being handed a proxy:
+ *
+ *   - `claim_count > 0`: written by `takeClaim` (doorbell only) and by
+ *     `acquireFatLease`, which sits behind the `accept` flag. A Brain that
+ *     predates that flag runs a whole fat turn at zero.
+ *   - holder evidence -- `lease_owner`, `lease_expires_at`, `claim_count`: on a
+ *     pre-`accept` Brain the only writer of those is the lease heartbeat, and
+ *     `startLeaseHeartbeat` is un-awaited with its rejection swallowed. One
+ *     failed POST plus a turn shorter than the heartbeat period and the row has
+ *     no holder evidence at all, having executed and answered the user.
+ *   - the publisher-side disarms: correct where they apply, but they are per
+ *     branch, and the branch that matters most has no request left to patch.
+ *
+ * What they have in common is that every one of them is an artefact of HOW the
+ * run was serviced, and each is absent on some legitimate path. The fact that
+ * is not an artefact is this one: a worker reported an outcome for this row.
+ * That report can only exist if the message reached a worker, which is exactly
+ * and only what the marker was armed to ask. It is not recorded anywhere on the
+ * row today -- it lives in the call site and is thrown away -- so record it, by
+ * letting the act of completing retire the marker rather than by inferring from
+ * a trace the lease machinery happened to leave.
+ *
+ * Deliberately not a new column. The fact needs no independent lifetime: the
+ * only reader is the reconciler, the only question is "is this cleanup still
+ * owed", and clearing the marker answers it in the vocabulary every existing
+ * reader already speaks -- `releaseDispatchedFatReconcile` makes the identical
+ * statement for a banked publish sequence, and `runCleanupAction`'s delete arm
+ * already re-reads the marker precisely so a revocation can stop it. A column
+ * would be a second encoding of the same fact and a migration on a hot table
+ * besides; the write we already make is the record.
+ *
+ * Spliced into the transition's own SET list rather than issued after it, so
+ * the record and the terminalization are one statement. That is what makes it
+ * scoped: it fires for exactly the rows this close moved off an open status, so
+ * a superseded or duplicate report -- which `closeNamedChatRun`'s generation
+ * fence already refuses -- retires nothing, and a sweeper-synthesized
+ * completion retires nothing either, because the sweeper terminalizes the row
+ * first and the consumer's close then matches no row at all.
+ *
+ * It fires for `failed` and `cancelled` as well as `completed`, and that is a
+ * decision rather than an oversight. `resolvePoisonedTask` reports `failed` for
+ * a delivery whose JetStream budget ran out without the turn ever executing --
+ * a worker reporting a non-execution. It still proves the message was
+ * delivered, repeatedly, which is the whole of what this marker asks; and that
+ * path emits a terminal event the user can see, which `recordCompletionTurns`
+ * writes into the conversation as a real turn. Rolling the session back under
+ * an answer the user has already been shown is the failure this whole sequence
+ * is about. A session left behind is a leak someone can collect; a session
+ * deleted is a conversation gone. Where a worker has spoken at all, we keep it.
+ *
+ * The one thing this gives up: an `idle_existing_session` marker is retired too,
+ * so a close whose gate release then fails leaves the session `running` until
+ * `reapStuckSessions` notices instead of until the horizon. That backstop
+ * already exists and is the designed owner of exactly that state.
+ */
+const RETIRE_DISPATCH_RECONCILE_SQL = `dispatch_reconcile_at = NULL,
+        dispatch_reconcile_action = NULL,
+        metadata = COALESCE(metadata, '{}'::jsonb) - 'dispatch_reconcile_token'`;
+
 export async function closeChatRun(
   sessionId: string,
   messageId: string | undefined,
@@ -755,6 +826,7 @@ async function closeNamedChatRun(
     );
     const closed = await applyTaskStatusTransition(outcome, {
       extra: { failure_reason: reason, error_message: message },
+      setSql: [RETIRE_DISPATCH_RECONCILE_SQL],
       where: `task_id = $1
           AND session_id = $2
           AND origin IN ('chat','a2a')
@@ -799,6 +871,7 @@ async function closeUnnamedChatRun(
   );
   const moved = await applyTaskStatusTransition(outcome, {
     extra: { failure_reason: reason, error_message: message },
+    setSql: [RETIRE_DISPATCH_RECONCILE_SQL],
     where: `session_id = $1
         AND origin IN ('chat','a2a')
         AND metadata->>'lease_fenced' IS DISTINCT FROM 'true'
