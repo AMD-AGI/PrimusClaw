@@ -120,6 +120,46 @@ async function renewAtLeaseBoundary(
   }
 }
 
+/** The row's physical tuple, which a write replaces even when no value changes. */
+async function rowVersion(): Promise<unknown> {
+  const rows = await h.sql("SELECT ctid::text AS version FROM claw_tasks WHERE task_id = $1", [TASK_ID]);
+  assert.equal(rows.length, 1);
+  return rows[0]!.version;
+}
+
+/**
+ * Renew, reading the row's tuple either side of the sandbox write itself.
+ *
+ * The statements around it write the row too -- the renewal ahead of it, the
+ * run-time ledger behind it -- so the tuple has to be read where the write is,
+ * not where the request ends.
+ */
+async function renewAroundSandboxWrite(body: Record<string, unknown>) {
+  const query = db.query;
+  let before: unknown;
+  let after: unknown;
+  db.query = (async (sql: string, params?: unknown[]) => {
+    if (!(sql.includes("'{sandbox}'") && sql.includes("FOR UPDATE"))) return query(sql, params);
+    before = await rowVersion();
+    const result = await query(sql, params);
+    after = await rowVersion();
+    return result;
+  }) as typeof db.query;
+  try {
+    const res = await renew(body);
+    return { res, before, after };
+  } finally {
+    db.query = query;
+  }
+}
+
+/** Accept the delivery the way a fat chat row's first lease does. */
+async function acceptDelivery(brainId = "worker-a") {
+  const res = await postTaskRoute("lease", { brain_id: brainId, lease_seconds: 45, accept: true });
+  assert.equal(res.statusCode, 200);
+  return res.json() as { claim_count: number };
+}
+
 test("a chat run's lease token records the worker without a callback URL", async () => {
   const res = await renew({ brain_id: "worker-a" });
 
@@ -292,16 +332,26 @@ const INVALID_SANDBOXES = [
 ];
 
 for (const { label, value } of INVALID_SANDBOXES) {
-  test(`a sandbox with ${label} is rejected before lease renewal`, async () => {
+  test(`a sandbox with ${label} is dropped without refusing the renewal`, async () => {
+    await setLeaseOwner("worker-a", 600);
+    await setSandbox(SAFE_SANDBOX);
     const original = await storedRun();
 
     const res = await renew({ brain_id: "worker-a", sandbox: value });
 
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.json().ok, false);
-    assert.match(res.json().error, /sandbox\.provider.*safe-workload.*agent-sandbox/);
-    assert.match(res.json().error, /sandbox\.handle.*non-empty string.*1024/);
-    assert.deepEqual(await storedRun(), original);
+    // The lease is the request; the sandbox names what is running it. Answered
+    // 400, this renewal reaches `askRunLease` as `unresolved`, the worker
+    // never renews again, and a healthy run is reaped as `worker_lost` over a
+    // field that only ever fed a diagnostic.
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json(), { ok: true, status: "running" });
+    const run = await storedRun();
+    // Renewed, on this worker's own lease rather than the 600s one it had.
+    assert.notDeepEqual(run.lease_expires_at, original.lease_expires_at);
+    assert.equal(run.lease_live, true);
+    // And dropped rather than stored: nothing unparsed reached the row.
+    assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
+    assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, SAFE_SANDBOX);
   });
 }
 
@@ -413,4 +463,88 @@ test("sandbox metadata from older rows can be absent or malformed", () => {
   }
   assert.deepEqual(parseSandboxHandle(SAFE_SANDBOX), SAFE_SANDBOX);
   assert.deepEqual(parseSandboxHandle(AGENT_SANDBOX), AGENT_SANDBOX);
+});
+
+// A fat chat delivery is accepted before any attempt exists, so the acceptance
+// is what mints the row's generation and the Brain's attempt token carries a
+// zero for the whole turn. Fencing the sandbox write on that zero is fencing
+// on a generation the row stopped carrying at acceptance.
+test("a fat delivery's first heartbeat records the sandbox it is holding", async () => {
+  const accepted = await acceptDelivery("worker-a");
+  assert.equal(accepted.claim_count, 1);
+
+  const res = await renew({
+    brain_id: "worker-a", run_claim: accepted.claim_count, sandbox: SAFE_SANDBOX,
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { ok: true, status: "running" });
+  const run = await storedRun();
+  assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
+  assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, SAFE_SANDBOX);
+});
+
+test("a fat delivery's later heartbeats keep the sandbox they recorded", async () => {
+  const accepted = await acceptDelivery("worker-a");
+  await renew({ brain_id: "worker-a", run_claim: accepted.claim_count, sandbox: SAFE_SANDBOX });
+
+  const second = await renew({
+    brain_id: "worker-a", run_claim: accepted.claim_count, sandbox: SAFE_SANDBOX,
+  });
+
+  assert.equal(second.statusCode, 200);
+  const run = await storedRun();
+  assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
+  assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, SAFE_SANDBOX);
+});
+
+test("a heartbeat repeating the recorded sandbox leaves the row's tuple alone", async () => {
+  const accepted = await acceptDelivery("worker-a");
+  const first = await renewAroundSandboxWrite({
+    brain_id: "worker-a", run_claim: accepted.claim_count, sandbox: SAFE_SANDBOX,
+  });
+  assert.equal(first.res.statusCode, 200);
+  // The handle was not there and the write put it there.
+  assert.notEqual(first.before, undefined);
+  assert.notEqual(first.after, first.before);
+
+  const second = await renewAroundSandboxWrite({
+    brain_id: "worker-a", run_claim: accepted.claim_count, sandbox: SAFE_SANDBOX,
+  });
+
+  assert.equal(second.res.statusCode, 200);
+  // Renewals arrive every few seconds for the whole fleet and the handle
+  // changes at most once a turn: repeating it must leave no new tuple version.
+  assert.notEqual(second.before, undefined);
+  assert.equal(second.after, second.before);
+  assert.equal((await storedRun()).sandbox_workload_id, SAFE_SANDBOX.handle);
+});
+
+test("an acceptance taking over a settled attempt records its sandbox", async () => {
+  // What a fat retry leaves behind: the lease released, the spent attempt
+  // remembered, and a generation already issued. `acquireFatLease` clears
+  // `attempt_id` and none of the rest, so a fence reading the generation or
+  // the settled attempt as evidence of "no attempt open" refuses the taker.
+  await h.sql(
+    `UPDATE claw_tasks
+        SET lease_owner = NULL,
+            lease_expires_at = NOW() - INTERVAL '1 second',
+            claim_count = 1,
+            attempt_generation = 1,
+            attempt_id = NULL,
+            settled_attempt_id = 'attempt-1',
+            metadata = jsonb_build_object('lease_fenced', true)
+      WHERE task_id = $1`,
+    [TASK_ID],
+  );
+
+  const res = await postTaskRoute("lease", {
+    brain_id: "worker-b", lease_seconds: 45, accept: true, sandbox: SAFE_SANDBOX,
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { ok: true, status: "running", claim_count: 2 });
+  const run = await storedRun();
+  assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
+  assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, SAFE_SANDBOX);
 });

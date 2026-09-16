@@ -45,7 +45,7 @@ beforeEach(async () => {
      VALUES ('run-1', 'session-1', 'chat', 'running', 'chat', $1)`,
     [createHash("sha256").update(TOKEN).digest("hex")],
   );
-  platformBackfillPorts.readHandsEntry = async () => assert.fail("persisted ownership needs no KV lookup");
+  platformBackfillPorts.readHandsKey = async () => assert.fail("persisted ownership needs no KV lookup");
 });
 
 afterEach(() => {
@@ -130,7 +130,7 @@ test("a retained pending KV handle reaches the run view without a callback or st
   await h.sql("UPDATE claw_sessions SET config = '{}'::jsonb");
   await h.sql("UPDATE claw_tasks SET created_at = NOW() - INTERVAL '2 minutes'");
   let kvReads = 0;
-  platformBackfillPorts.readHandsEntry = async () => {
+  platformBackfillPorts.readHandsKey = async () => {
     kvReads++;
     return {
       operation: "PUT",

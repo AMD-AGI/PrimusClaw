@@ -41,7 +41,7 @@ WORKDIR /app
 # a working image.
 ARG EXTRA_CA_CERT_URLS=""
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates git openssl \
+ && apt-get install -y --no-install-recommends curl ca-certificates git openssl unzip \
  && rm -rf /var/lib/apt/lists/* \
  && if [ -n "$EXTRA_CA_CERT_URLS" ]; then \
       i=0; \
@@ -64,6 +64,31 @@ RUN apt-get update \
     else \
       echo "no extra CA anchors requested (EXTRA_CA_CERT_URLS empty)."; \
     fi
+
+# Bun is downloaded HERE, in the stage that just installed the EXTRA_CA_CERT_URLS
+# anchors, and the compile stage below takes the binary from this stage instead
+# of fetching its own. Those anchors exist in exactly two places -- this stage,
+# and `runtime`, which copies them -- so a fetch from any other stage has only
+# the public trust store to verify against. Behind the TLS-intercepting proxy
+# the block above exists to support, that fetch cannot validate the certificate
+# the proxy substitutes and the image build dies on
+# "curl: (60) SSL certificate problem". `npm ci` below reaches the registry over
+# the same intercepted HTTPS and survives only because it, too, runs after this
+# block. Keep new downloads in this stage; packages/api/test/dockerfile-ca-anchors.test.ts
+# reads the stage graph and fails when one appears anywhere else.
+#
+# The archive is pinned and its checksum verified rather than piping
+# https://bun.sh/install into a shell: that installer is unversioned, so the
+# toolchain compiling the shipped Hands binary would otherwise be whatever
+# upstream published most recently.
+ARG BUN_VERSION=1.3.14
+ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
+RUN curl -fsSL -o /tmp/bun.zip \
+      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
+ && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
+ && unzip -q /tmp/bun.zip -d /tmp/bun \
+ && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
+ && rm -rf /tmp/bun.zip /tmp/bun
 
 # Copy only the manifests first so `npm ci` layer caches on deps.
 COPY package.json package-lock.json ./
@@ -102,21 +127,19 @@ RUN npm run build -w packages/utils \
 FROM almalinux:8-minimal@sha256:6cafa4a66d9a241a580cb6f2a20744f03ed1d1c4a882bb9eef81075c8131c8a8 AS bun-builder
 WORKDIR /app
 
-# Bun is installed from a pinned release archive whose checksum is verified,
-# rather than by piping https://bun.sh/install into a shell. That installer is
-# unversioned, so the toolchain compiling the shipped Hands binary would
-# otherwise be whatever upstream published most recently.
-ARG BUN_VERSION=1.3.14
-ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
-RUN microdnf install -y curl unzip ca-certificates \
- && microdnf clean all \
- && curl -fsSL -o /tmp/bun.zip \
-      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
- && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
- && unzip -q /tmp/bun.zip -d /tmp/bun \
- && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
- && rm -rf /tmp/bun.zip /tmp/bun \
- && bun --version
+# Nothing in this stage touches the network, and that is the point. This base
+# has only the public trust store -- the EXTRA_CA_CERT_URLS anchors live in
+# `builder` and in `runtime` -- so a download added here is the one step of the
+# build a TLS-intercepting proxy breaks. The Bun toolchain therefore arrives as
+# a binary from `builder`, which fetched and checksummed it with the anchors
+# installed, and every other input below is copied from that stage too.
+# Compiling for this stage's own platform needs no network of its own: the base
+# used here before (debian:bullseye-slim) carried no ca-certificates package at
+# all and built the same --target in CI. Cross-compiling to another --target is
+# the documented way to make Bun go and get a second runtime, and would take
+# this property with it.
+COPY --from=builder /usr/local/bin/bun /usr/local/bin/bun
+RUN bun --version
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages ./packages

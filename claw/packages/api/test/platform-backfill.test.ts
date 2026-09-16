@@ -5,6 +5,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
+import { handsSessionKey, sessionIdFromHandsKey } from "@claw/protocol";
 
 // Set before the first import of config.ts, which reads the environment once at
 // module scope. With it unset the backfill is inert by design -- a deployment
@@ -42,6 +43,7 @@ interface Harness {
   updates: unknown[][];
   fetched: string[];
   authorization: string[];
+  /** Registry keys, exactly as the KV store would be asked for them. */
   kvReads: string[];
   handles: unknown[][];
   diagnostics: Array<Record<string, unknown>>;
@@ -68,15 +70,15 @@ function harness(opts: HarnessOptions = {}): Harness {
     queries: [], updates: [], fetched: [], authorization: [],
     kvReads: [], handles: [], diagnostics: [],
   };
-  platformBackfillPorts.readHandsEntry = (async (sessionId: string) => {
-    h.kvReads.push(sessionId);
+  platformBackfillPorts.readHandsKey = (async (key: string) => {
+    h.kvReads.push(key);
     if (opts.kvError) throw new Error("KV unavailable");
     if (!opts.hands && opts.kvRaw === undefined) return null;
     return {
       value: sc.encode(opts.kvRaw ?? JSON.stringify(opts.hands)),
       operation: opts.kvOperation ?? "PUT",
     };
-  }) as typeof platformBackfillPorts.readHandsEntry;
+  }) as typeof platformBackfillPorts.readHandsKey;
   platformBackfillPorts.cannotRead = (fields) => { h.diagnostics.push(fields); };
   db.query = (async (text: string, params: unknown[] = []) => {
     h.queries.push(text);
@@ -367,7 +369,7 @@ const PENDING_HANDS = {
 test("a pending legacy KV handle and its trusted key recover an unstamped chat run", async () => {
   const h = harness({ claimed: [KV_RUN], hands: PENDING_HANDS, config: {} });
   assert.equal(await backfillPlatformFacts([KV_RUN]), 1);
-  assert.deepEqual(h.kvReads, ["s-kv"], "handle and key share one KV read");
+  assert.deepEqual(h.kvReads, ["hands.s-kv"], "handle and key share one KV read");
   assert.deepEqual(h.fetched, ["http://safe.test/api/v1/workloads/wl-pending"]);
   assert.deepEqual(h.authorization, ["Bearer pk-from-brain"]);
   assert.deepEqual(h.handles, [[
@@ -559,4 +561,49 @@ test("the per-sweep cap and five-reader concurrency bound also apply to KV fallb
   assert.equal(h.fetched.length, 50);
   assert.equal(h.kvReads.length, 50);
   assert.equal(peak, 5);
+});
+
+test("the per-sweep cap goes to rows carrying a handle before rows that must be looked up", async () => {
+  // A node reclaim hands over its whole batch at once, mixed. Array position
+  // decided the cap before this: fifty rows with nothing recorded on them were
+  // enough to spend every claim -- each raising platform_facts_attempts and
+  // deferring the retry -- and push every row that did name its sandbox past
+  // MAX_PER_SWEEP, where the drain only picks up the subset it selects.
+  const lookup = Array.from({ length: 50 }, (_, i) => ({
+    task_id: `no-handle-${i}`, session_id: `s-${i}`, origin: "chat",
+  }));
+  const recorded = Array.from({ length: 10 }, (_, i) => ({
+    task_id: `handle-${i}`, session_id: `s-h-${i}`, sandbox_workload_id: `wl-${i}`,
+  }));
+  const rows = [...lookup, ...recorded];
+  // The KV store holds nothing for the handle-less rows, so every read they
+  // spend the cap on is a read that could not have answered.
+  const h = harness({ claimed: rows });
+
+  assert.equal(await backfillPlatformFacts(rows), 10);
+  assert.deepEqual(
+    h.fetched.map((url) => url.slice(url.lastIndexOf("/") + 1)).sort(),
+    recorded.map((row) => row.sandbox_workload_id).sort(),
+    "every recorded handle was asked about",
+  );
+  assert.deepEqual(
+    h.updates.map((params) => params[0]).sort(),
+    recorded.map((row) => row.task_id).sort(),
+    "and their rows are the ones that gained facts",
+  );
+  assert.equal(h.kvReads.length, 40, "the handle-less rows take only what the cap has left");
+});
+
+test("the KV fallback asks for the registry key the session's binding is written under", async () => {
+  // hands-key.ts re-keys the session ids that would otherwise collide with a
+  // retained-container binding, and every writer goes through it. A call site
+  // pasting `hands.` in front of the id reads an address nothing writes.
+  const sessionId = "retained-gvrpf";
+  const row = { ...KV_RUN, session_id: sessionId };
+  const h = harness({ claimed: [row], hands: PENDING_HANDS, config: {} });
+
+  assert.equal(await backfillPlatformFacts([row]), 1);
+  assert.deepEqual(h.kvReads, [handsSessionKey(sessionId)]);
+  assert.notDeepEqual(h.kvReads, [`hands.${sessionId}`], "the raw id is not a registry key");
+  assert.equal(sessionIdFromHandsKey(h.kvReads[0]), sessionId, "and it decodes back to the session");
 });

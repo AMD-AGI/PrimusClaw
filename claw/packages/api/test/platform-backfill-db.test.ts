@@ -6,6 +6,7 @@ import test, { before, beforeEach, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
 import { StringCodec } from "nats";
+import { handsSessionKey } from "@claw/protocol";
 
 process.env.SAFE_API_URL = "http://safe.test";
 const { db } = await import("../src/infra/db.js");
@@ -55,10 +56,11 @@ beforeEach(async () => {
     const r = await pg.query(sql, params);
     return { rows: r.rows, rowCount: r.rows.length || r.affectedRows || 0 };
   }) as typeof db.query;
-  platformBackfillPorts.readHandsEntry = (async (sessionId: string) => {
-    const value = hands.get(sessionId);
+  // Keyed by registry key, which is what the port is handed.
+  platformBackfillPorts.readHandsKey = (async (key: string) => {
+    const value = hands.get(key);
     return value ? { value: sc.encode(JSON.stringify(value)), operation: "PUT" } : null;
-  }) as typeof platformBackfillPorts.readHandsEntry;
+  }) as typeof platformBackfillPorts.readHandsKey;
   platformBackfillPorts.cannotRead = (fields) => { diagnostics.push(fields); };
   globalThis.fetch = (async (url: string | URL | Request) => {
     fetched.push(String(url));
@@ -122,7 +124,7 @@ test("the drain selects actual sandbox failures, including KV-only rows, and exc
   ];
   for (const reason of reasons) await seed(reason, reason);
   await seed("pending-kv", "sandbox_workload_terminal", { handle: null, config: {} });
-  hands.set("pending-kv", {
+  hands.set(handsSessionKey("pending-kv"), {
     status: "pending", workloadId: "wl-pending", platformKey: "brain-key",
     createdAt: new Date(Date.now() - 120_000).toISOString(),
   });
@@ -184,7 +186,7 @@ test("concurrent claims fetch once and transient failures obey exponential backo
 
 test("a retry keeps the pinned handle when the session KV moves to a replacement", async () => {
   await seed("pinned", "sandbox_workload_terminal", { handle: null, config: {}, metadata: { other: "kept" } });
-  hands.set("pinned", {
+  hands.set(handsSessionKey("pinned"), {
     workloadId: "wl-original", platformKey: "original-key",
     createdAt: new Date(Date.now() - 120_000).toISOString(),
   });
@@ -196,7 +198,7 @@ test("a retry keeps the pinned handle when the session KV moves to a replacement
   assert.deepEqual((await row("pinned")).metadata, {
     other: "kept", sandbox: { provider: "safe-workload", handle: "wl-original" },
   });
-  hands.set("pinned", { workloadId: "wl-replacement", platformKey: "replacement-key", createdAt: new Date().toISOString() });
+  hands.set(handsSessionKey("pinned"), { workloadId: "wl-replacement", platformKey: "replacement-key", createdAt: new Date().toISOString() });
   await pg.exec("UPDATE claw_tasks SET platform_facts_next_retry_at = NOW() - INTERVAL '1 second'");
   assert.equal(await drainPendingPlatformFacts(), 0);
   assert.deepEqual(fetched, ["http://safe.test/api/v1/workloads/wl-original"]);
@@ -206,7 +208,7 @@ test("a retry keeps the pinned handle when the session KV moves to a replacement
 
 test("the fallback cannot overwrite ownership that arrives after its KV read", async () => {
   await seed("race", "sandbox_workload_terminal", { handle: null });
-  platformBackfillPorts.readHandsEntry = (async () => {
+  platformBackfillPorts.readHandsKey = (async () => {
     await pg.query(
       "UPDATE claw_tasks SET metadata = $1::jsonb, sandbox_workload_id = $2 WHERE task_id = 'race'",
       [JSON.stringify({ sandbox: { provider: "safe-workload", handle: "wl-authoritative" } }), "wl-authoritative"],
@@ -214,7 +216,7 @@ test("the fallback cannot overwrite ownership that arrives after its KV read", a
     return { operation: "PUT", value: sc.encode(JSON.stringify({
       workloadId: "wl-stale", createdAt: new Date(Date.now() - 120_000).toISOString(),
     })) };
-  }) as typeof platformBackfillPorts.readHandsEntry;
+  }) as typeof platformBackfillPorts.readHandsKey;
   assert.equal(await drainPendingPlatformFacts(), 0);
   assert.deepEqual(fetched, []);
   assert.equal((await row("race")).sandbox_workload_id, "wl-authoritative");

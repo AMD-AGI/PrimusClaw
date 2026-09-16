@@ -3,7 +3,7 @@
 
 /** Best-effort platform attribution for terminal runs, including chat callbacks. */
 import pino from "pino";
-import { platformFactsFromWorkloadDetail, type PlatformFacts } from "@claw/protocol";
+import { handsSessionKey, platformFactsFromWorkloadDetail, type PlatformFacts } from "@claw/protocol";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { kv, sc } from "../infra/nats.js";
@@ -14,7 +14,16 @@ const logger = pino({ name: "platform-backfill" });
 
 /** One GET each, capped: this runs inside the sweeper tick. */
 const FETCH_TIMEOUT_MS = 10_000;
-/** Bound bursts from a node loss; the drain revisits deferred rows. */
+/**
+ * Bound bursts from a node loss.
+ *
+ * What falls past the cap is deferred, not uniformly recoverable:
+ * drainPendingPlatformFacts revisits only rows left `failed` with one of its
+ * sandbox/liveness reasons inside the hour, and reapStaleTasks also closes rows
+ * as `cancelled` and with `run_budget_exhausted`, which it never selects. So the
+ * cap has to be spent on the rows most likely to answer -- see the ordering in
+ * backfillPlatformFacts.
+ */
 const MAX_PER_SWEEP = 50;
 /** Concurrent reads. Small: SaFE is shared, and nothing here is urgent. */
 const CONCURRENCY = 5;
@@ -36,7 +45,13 @@ export interface SweptRow {
 
 /** Shared connection and diagnostic seam; never opens another NATS client. */
 export const platformBackfillPorts = {
-  readHandsEntry: (sessionId: string) => kv.get(`hands.${sessionId}`),
+  // Keyed, not session-scoped: `handsSessionKey` is the single mapping from a
+  // session id to its registry key -- it re-keys the ids that would otherwise
+  // collide with a retained-container binding -- and a seam that accepted the
+  // id would put a second copy of that mapping behind a stub, which is how the
+  // hand-built `hands.${sessionId}` that used to live here survived unnoticed.
+  // The one caller is readHandsEntry below.
+  readHandsKey: (key: string) => kv.get(key),
   cannotRead: (fields: Record<string, unknown>) => {
     logger.warn(fields, "platform_backfill.cannot_read");
   },
@@ -83,7 +98,7 @@ interface HandsEntry {
 async function readHandsEntry(row: SweptRow): Promise<HandsEntry | null> {
   if (!row.session_id) return null;
   try {
-    const entry = await platformBackfillPorts.readHandsEntry(row.session_id);
+    const entry = await platformBackfillPorts.readHandsKey(handsSessionKey(row.session_id));
     if (!entry || entry.operation === "DEL" || entry.operation === "PURGE") return null;
     const value: unknown = JSON.parse(sc.decode(entry.value));
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -290,6 +305,11 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
   return read ? storePlatformRead(row, resolved.sandbox, read) : false;
 }
 
+/** The row names its own sandbox, so no KV entry has to be found for it. */
+function carriesSandboxIdentity(row: SweptRow): boolean {
+  return Boolean(row.sandbox_workload_id) || row.metadata?.sandbox != null;
+}
+
 /**
  * Record what the platform says about each offered terminal run.
  *
@@ -298,7 +318,28 @@ async function readAndStore(row: SweptRow): Promise<boolean> {
  * does.
  */
 export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
-  const candidates = rows.slice(0, MAX_PER_SWEEP);
+  // Rows that already carry a sandbox identity take the cap first.
+  //
+  // Ordering, not the `rows.filter((r) => r.sandbox_workload_id)` that used to
+  // stand here. That filter predates the KV fallback: a chat row with no
+  // recorded handle is now attributable from Brain's registry entry, and
+  // drainPendingPlatformFacts deliberately selects exactly those rows, so
+  // dropping them here again would hand them straight back unclaimed on every
+  // tick -- holding the drain's LIMIT open forever and never resolving.
+  //
+  // Position must still not be what decides who gets the reads. A handle-less
+  // row spends the same claim -- one UPDATE that raises the attempt count and
+  // defers the next retry by up to RETRY_MAX_SEC -- on a KV read that may find
+  // nothing, or on a non-chat row that resolveSandbox refuses outright; a row
+  // holding its own handle is the read that is certain to be possible. With the
+  // batch taken in array order a reap could spend all fifty on the first kind
+  // and drop the second kind past the cap, where, per MAX_PER_SWEEP, nothing
+  // necessarily comes back for it. Deferring costs a handle-less row nothing in
+  // return: unclaimed, it keeps its NULL retry stamp, so the drain still sees it
+  // in the fresh lane rather than a backed-off one.
+  const candidates = rows.filter(carriesSandboxIdentity)
+    .concat(rows.filter((row) => !carriesSandboxIdentity(row)))
+    .slice(0, MAX_PER_SWEEP);
   if (candidates.length === 0) return 0;
   if (rows.length > MAX_PER_SWEEP) {
     logger.warn(
