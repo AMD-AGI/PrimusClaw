@@ -1589,13 +1589,11 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
             { sessionId, workloadId: info.workloadId, reason: err.reason },
             "keepalive.jobs_probe_absent",
           );
-          // An absent workload is released here rather than left for the idle
-          // window: the probe records no verdict, so the window would keep
-          // being refreshed and never reach the reclaim path. Absence is not a
-          // session failure, so no terminal reason is published.
-          await destroyHands(sessionId, info).catch((stopErr) => {
-            logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
-          });
+          // Published as a verdict rather than acted on here. Absence is not a
+          // session failure, so it carries no terminal reason; recording it is
+          // what lets the reclaim path act on it under the run-lease and
+          // revision guards a teardown from inside the probe would bypass.
+          await recordProbeVerdict(deps, probe, "gone");
         } else {
           await reportTerminalFailure(deps, sessionId, identity, err.reason);
         }

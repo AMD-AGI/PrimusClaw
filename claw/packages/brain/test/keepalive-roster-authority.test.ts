@@ -239,6 +239,9 @@ test("gone evidence releases admission only after the binding delete succeeds", 
         safeWorkload: {
           async get() { return { running: false, healthy: false, state: "absent" }; },
           async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+          // Releasing a gone workload still goes through the stop path, and the
+          // slot is handed back only once the binding delete has landed.
+          async stop() {},
         } as unknown as SandboxProvider,
       });
       const countActiveShells = async () => { throw new Error("unreachable"); };

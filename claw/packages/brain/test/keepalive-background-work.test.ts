@@ -208,6 +208,9 @@ test("a confirmed zero expires the handle, once a window has passed since it", a
   // Without moving the clock this reads as "kept", which is what an unanswered
   // stretch is supposed to look like.
   const { kv, deleted } = fakeKv();
+  // The roster is only read once the control plane confirms Running, and the
+  // reclaim stops the workload before it clears the record.
+  stubPingableProvider();
   let clock = Date.now();
   const deps = { kv, countActiveShells: async () => 0, now: () => clock };
 
@@ -828,44 +831,26 @@ test("handing a handle back to the idle pool re-opens the question", async () =>
   assert.ok(asked > 0, "the handle going back into the pool must discard the old answer");
 });
 
-test("provider and record evidence stay within the asynchronous probe limit", async () => {
-  const status = Promise.withResolvers<void>();
-  const records = Promise.withResolvers<void>();
-  let statusReads = 0;
-  let recordReads = 0;
-  const provider = {
-    async get() {
-      statusReads += 1;
-      await status.promise;
-      return { running: true, healthy: true, state: "running" };
-    },
-    async exec(_inst: unknown, command: string) {
-      if (command.includes("epoch.json")) {
-        recordReads += 1;
-        await records.promise;
-      }
-      return { exitCode: 0, stdout: "", stderr: "" };
-    },
-  } as unknown as SandboxProvider;
-  restoreProviders = bindSandboxProviders({ safeWorkload: provider });
+test("outstanding roster reads stay within the asynchronous probe limit", async () => {
+  const outstanding = Promise.withResolvers<void>();
+  let reads = 0;
+  stubPingableProvider();
   const deps = {
     kv: manyIdleHandles(24),
-    countActiveShells: async () => { throw new Error("unreachable"); },
+    countActiveShells: async () => {
+      reads += 1;
+      await outstanding.promise;
+      return 0;
+    },
   };
   try {
     await runKeepaliveTickForTest(deps);
     await new Promise((r) => setImmediate(r));
-    assert.equal(statusReads, 8);
+    assert.equal(reads, 8, "more handles than slots must not all be asked at once");
     await runKeepaliveTickForTest(deps);
-    assert.equal(statusReads, 8, "waiting for provider status must keep the probe slots reserved");
-    status.resolve();
-    await new Promise((r) => setImmediate(r));
-    assert.equal(recordReads, 8);
-    await runKeepaliveTickForTest(deps);
-    assert.equal(statusReads, 8, "waiting for records must keep the same slots reserved");
+    assert.equal(reads, 8, "a read still outstanding keeps its slot reserved");
   } finally {
-    status.resolve();
-    records.resolve();
+    outstanding.resolve();
     await new Promise((r) => setImmediate(r));
   }
 });

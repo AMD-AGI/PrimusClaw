@@ -123,6 +123,11 @@ beforeEach(() => {
         onPing?.();
         return { exitCode: 0, stdout: "", stderr: "" };
       },
+      // The roster is read only once the control plane confirms Running, and an
+      // expiry stops the workload before it clears the record. Tests about
+      // either answer rebind a provider of their own.
+      async get() { return { running: true, healthy: true, state: "running" }; },
+      async stop() {},
     } as unknown as SandboxProvider,
   });
 });
@@ -986,6 +991,17 @@ test("a parked handle that expires gives its slot back", async () => {
   const hold = await admitSandbox("sess-park");
   await hold.bind(identity);
   kv.seed("hands.sess-park", retained("wl-park"));
+
+  // The roster is read only once the control plane confirms Running, and the
+  // expiry stops the workload before it clears the record.
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async get() { return { running: true, healthy: true, state: "running" }; },
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+      async stop() {},
+    } as unknown as SandboxProvider,
+  });
 
   // The background-work probe answers a tick behind, so the idle verdict this
   // expiry depends on lands on a later sweep than the one that asks for it --

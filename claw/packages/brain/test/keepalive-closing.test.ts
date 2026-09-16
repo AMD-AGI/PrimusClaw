@@ -253,14 +253,18 @@ test("an absent workload is reaped without a frontend sandbox failure", async ()
   const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
   try {
     const { SandboxTerminalProbeError } = await import("../src/sandbox/job-probe.js");
-    await runKeepaliveTickForTest({
+    const deps = {
       kv,
       countActiveShells: async () => {
         throw new SandboxTerminalProbeError("absent", "sandbox_workload_absent");
       },
       emitSandboxFailure: async (_sid, evt) => { events.push(evt); },
-    });
+    };
+    // Two sweeps: the probe publishes absence as a verdict, and the sweep that
+    // reads it back releases the handle under the ordinary reclaim guards.
+    await runKeepaliveTickForTest(deps);
     await new Promise((r) => setImmediate(r));
+    await runKeepaliveTickForTest(deps);
     assert.ok(stopped.includes("wl-1"));
     assert.equal(events.length, 0, "absent is not a frontend sandbox failure");
   } finally {
