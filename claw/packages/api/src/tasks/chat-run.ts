@@ -1024,8 +1024,16 @@ async function verdictForUnmatchedRow(
  * Deliberately broader than "is a lease live": an expired or released holder
  * belongs to the lease and retry lifecycle, not to a pass that reclassifies a
  * run as one that never executed.
+ *
+ * Exported because it is the definition, not a local helper: `unheldOpenRowSql`
+ * below binds exactly these three columns, `reapOrphanedFatRuns` and
+ * `finalizeDispatchCompensations` scan on them, and
+ * `resolveAmbiguousDispatch` decides a session's existence from them. Those
+ * readers asking the same question in their own words is how the drift
+ * recorded a few lines down happened once already, so there is one predicate
+ * and every reader calls it.
  */
-function hasHolderEvidence(row: {
+export function hasHolderEvidence(row: {
   lease_owner?: string | null;
   lease_expires_at?: unknown;
   claim_count?: unknown;

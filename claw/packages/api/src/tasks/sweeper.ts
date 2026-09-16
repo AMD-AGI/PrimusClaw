@@ -52,7 +52,7 @@ import {
 } from "../workspace/store.js";
 import {
   ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
-  noDeliveryInFlightSql,
+  hasHolderEvidence, noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 
@@ -1355,6 +1355,15 @@ export async function reconcileAmbiguousDispatches(limit = 100): Promise<number>
       WHERE t.task_id = due.task_id
       RETURNING t.task_id, t.session_id, t.status, t.failure_reason,
                 COALESCE(t.claim_count, 0) AS claim_count,
+                -- Read here, in the statement that takes the row, rather
+                -- than in a SELECT of their own: claim_count alone answers
+                -- "did a worker ever have this row" only for a doorbell
+                -- claim, and these two are the other two arms of
+                -- hasHolderEvidence. Adding them to a RETURNING the take
+                -- already computes costs nothing and keeps the whole decision
+                -- on one atomic snapshot of the row, taken under the same
+                -- lock that revoked the publisher's token.
+                t.lease_owner, t.lease_expires_at,
                 t.dispatch_reconcile_action AS action,
                 t.metadata->>'message_id' AS message_id`,
     [limit, DISPATCH_RECONCILE_LEASE_SEC],
@@ -1378,6 +1387,8 @@ interface AmbiguousDispatch {
   status: string;
   failure_reason: string | null;
   claim_count: number;
+  lease_owner: string | null;
+  lease_expires_at: Date | null;
   action: string | null;
   message_id: string | null;
 }
@@ -1391,9 +1402,53 @@ const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
  * A row that is held, or was ever claimed, belongs to execution: it loses the
  * marker without any session rollback, because rolling one back would idle or
  * delete a session whose turn is running.
+ *
+ * "Was ever claimed" used to be the whole of it -- `claim_count > 0` -- and
+ * that is a doorbell-only counter. `takeClaim` writes it, and on the fat path
+ * the only writer is `acquireFatLease`, which sits behind the `accept` flag. A
+ * Brain that predates that flag runs a whole fat turn without ever reaching it:
+ * its attempt token quotes `claim_count = 0`, `renewRunLease`'s `claim_count =
+ * $7` fence matches that zero and renews, and the completion is admitted
+ * because no `lease_fenced` was ever written. The row then goes terminal at
+ * zero. So on a fat row `claim_count > 0` still proves execution, while
+ * `claim_count = 0` proves nothing at all -- it is silence, and this function
+ * was reading silence as "this dispatch never ran" and deleting the
+ * conversation the user had just been answered in. That is the fleet shape of
+ * a rolling upgrade, which moves API before Brain.
+ *
+ * The decision has to live here and not in the publisher. Three publisher
+ * branches now return without a failure while the marker is armed -- the lost
+ * fence, the `held` catch arm, and a 503 `publish_unknown` whose request is
+ * gone before the turn even runs -- and the last of those has no branch left
+ * to patch: the marker outliving a request is the entire reason the marker
+ * exists. Disarming at each site is a per-branch patch of a decision made
+ * here; every future branch would be a fresh instance of the same bug. The
+ * publisher-side disarms stay because they retire a marker promptly on a path
+ * that has proof the publish landed, but they are an optimisation, not the
+ * thing that prevents the delete.
+ *
+ * The evidence used instead is the one three other readers in this codebase
+ * already use for this exact question, and it is now literally the same
+ * function: `unheldOpenRowSql` binds these three columns as the CAS that
+ * decides a row is unheld, `reapOrphanedFatRuns` scans on them under a comment
+ * that says outright that status is not holder evidence, and
+ * `finalizeDispatchCompensations` uses all three even though it only ever sees
+ * terminal rows. Every route a worker takes a fat row through writes one of
+ * them -- `renewLegacyRunLease` and `renewRunLease` for a pre-`accept` Brain,
+ * `acquireFatLease` for a current one -- while `insertTask` and the publish
+ * path write neither, and a terminal transition preserves both. Which is why
+ * the narrower alternatives were all rejected on measurement rather than
+ * taste: `started_at` is stamped at open on a row nothing has published yet,
+ * `completed_at` is stamped by every terminalization including this pass's own
+ * compensation, the dispatch receipt reads `attempted` identically on the
+ * completed legacy row and on the genuinely undecided one (that identity is
+ * why the marker exists), and a `failure_reason` whitelist is both too narrow
+ * and too wide -- a row that truly never ran is closed `dispatch_unconfirmed`
+ * by `reapOrphanedFatRuns` and `run_budget_exhausted` by
+ * `reapExpiredDoorbellRuns`, and those cleanups are owed.
  */
 async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean> {
-  const executed = row.claim_count > 0;
+  const executed = hasHolderEvidence(row);
   if (!executed && !TERMINAL_STATUSES.has(row.status)) {
     const verdict = await failChatRunDispatch(
       row.task_id,
@@ -1441,13 +1496,51 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
     return true;
   }
   if (row.action === "delete_created_session") {
+    // Re-read, and wider than the status list it started as, because this is
+    // the last statement before an irreversible write and the snapshot the
+    // decision was taken on is by then as old as a `releaseRunUse` and
+    // whatever the rest of the batch did. Two things can have changed under
+    // it, and the caller's snapshot can see neither:
+    //
+    //   - A worker can have arrived after the take. `reconcileAmbiguousDispatches`
+    //     reads `status`, `claim_count` and the two lease columns in the UPDATE
+    //     that claims the row and never reads them again, so a heartbeat that
+    //     lands one statement later is invisible to every guard above. Holder
+    //     evidence on ANY chat row of this session is occupancy in the sense
+    //     this check already means -- "later work has adopted the session" --
+    //     and it catches the turn that completed at `claim_count = 0`, which a
+    //     status list cannot, because a completed turn is in no status a status
+    //     list of live states would name.
+    //   - The publisher can have handed the marker back after the take.
+    //     `releaseDispatchedFatReconcile` is unfenced and reports success to a
+    //     request that then answers HTTP 200, so a disarm committed between the
+    //     take and here is an explicit revocation of this cleanup that the
+    //     snapshot cannot carry. Checked as part of the same probe: a
+    //     successful marker update has to be able to stop the delete, or it
+    //     establishes nothing.
     const occupied = await db.query(
       `SELECT 1 FROM claw_tasks
         WHERE session_id = $1 AND origin = 'chat'
-          AND status IN ('queued','preparing','running','cancelling') LIMIT 1`,
+          AND (status IN ('queued','preparing','running','cancelling')
+               OR lease_owner IS NOT NULL
+               OR lease_expires_at IS NOT NULL
+               OR COALESCE(claim_count, 0) > 0)
+        LIMIT 1`,
       [row.session_id],
     );
     if (occupied.rowCount) return true;
+    const stillArmed = await db.query(
+      `SELECT 1 FROM claw_tasks
+        WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL LIMIT 1`,
+      [row.task_id],
+    );
+    if (!stillArmed.rowCount) {
+      logger.warn(
+        { sessionId: row.session_id, taskId: row.task_id },
+        "sweeper.reconcile_delete_session_revoked",
+      );
+      return true;
+    }
     // The durable deletion, not a bare `deleted_at`. Hiding the row is only the
     // first of the things a delete owes: `sweepSessionCleanups` selects on
     // `cleanup_state = 'pending'`, so a session soft-deleted without it is one
