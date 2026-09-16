@@ -1421,11 +1421,54 @@ class TaskRunner {
    */
   private async capturePlatformFacts(): Promise<void> {
     if (this.platformFacts) return;
+    const identity = this.handsIdentity ?? await this.pendingHandsIdentity();
     const facts = await fx().fetchPlatformFacts(
-      this.handsIdentity?.workloadId,
-      this.handsIdentity?.platformKey ?? this.platformKey,
+      identity?.workloadId,
+      identity?.platformKey ?? this.platformKey,
     ).catch(() => null);
     if (facts) this.platformFacts = facts;
+  }
+
+  /**
+   * The workload of a provision that never came back, out of its own KV record.
+   *
+   * `handsIdentity` is assigned from what `ensureHands` returns, so it is still
+   * null for every failure that happens before the sandbox is ready -- which is
+   * the entire pre-ready family (sandbox_exited_before_ready, sandbox_gone,
+   * sandbox_pending_timeout, sandbox_workload_terminal, ...), and precisely the
+   * family where the platform is the only witness: the run did not fail, the
+   * cluster took it. Asking about `undefined` returns null on the first line of
+   * `fetchPlatformFacts`, so those runs were booked as ordinary failures.
+   *
+   * The id does exist by then, and durably: the provider mints it and the
+   * provision writes a PENDING entry naming it before it starts waiting for the
+   * pod (ensure-hands' onProvisioned), because a workload nobody has recorded
+   * is a workload nobody can reap. That entry is the only copy of the id this
+   * worker holds, and the caller is one line away from destroying it.
+   *
+   * PENDING only, deliberately, and it is the same test `reapPendingHands`
+   * applies a moment later -- so what this reads is exactly the workload that
+   * is about to be stopped. A READY entry is the opposite case twice over: it
+   * cannot be this attempt's (a READY entry means `ensureHands` returned, and
+   * then `handsIdentity` is set and this is never reached), so it belongs to a
+   * live sandbox some earlier message built and this run never attached to, and
+   * SaFE answers for a live workload with the node it is happily running on --
+   * which would record a placement, and an ending, for a run that had neither.
+   *
+   * Null on anything unreadable. An absent entry, an unreachable bucket and a
+   * corrupt payload all mean the same thing here: we cannot name the workload,
+   * so we ask about nothing and record nothing, exactly as before.
+   */
+  private async pendingHandsIdentity(): Promise<HandsProbeEntry | null> {
+    try {
+      const entry = await readHandsEntry(this.kv, this.sessionId);
+      if (!entry) return null;
+      const info = JSON.parse(entry.value) as HandsProbeEntry & { status?: string };
+      return info.status === "pending" && info.workloadId ? info : null;
+    } catch (e) {
+      logger.warn({ err: e, sessionId: this.sessionId }, "platform_facts.pending_identity_unreadable");
+      return null;
+    }
   }
 
   /**
@@ -3297,6 +3340,27 @@ class TaskRunner {
       errorMessage: String(err?.message ?? err).slice(0, 500),
     }, "task.failed");
     await this.recoverInflightCheckpoint("from_failed_task_checkpoint");
+    // Before the reap, and not merely "somewhere on the failure path".
+    //
+    // Every failed run asks the platform, not only one that reached the rebuild
+    // path: a sandbox can vanish in ways that surface as an ordinary tool error,
+    // and a run that fails for its own reasons simply gets nothing back. No-op
+    // when the facts were already read at the probe.
+    //
+    // It used to be asked after the completion event, ~90 lines below, and by
+    // then the reap on the next line had stopped the workload and deleted the
+    // only record of which workload it was -- so the one failure family that
+    // has a platform account to collect, a sandbox that died during its own
+    // provisioning, was the one family that could never collect it. Asking here
+    // is the property `capturePlatformFacts` claims for itself: the pod's own
+    // account of its ending still exists, and Claw has not yet changed the
+    // workload's state itself.
+    //
+    // The reap is delayed by one GET capped at FETCH_TIMEOUT_MS (10s) and
+    // wrapped in `.catch`, never by a failure of the read -- a bounded wait
+    // ahead of the reap is not new either, `recoverInflightCheckpoint` above
+    // already takes one.
+    await this.capturePlatformFacts();
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
@@ -3389,11 +3453,6 @@ class TaskRunner {
       delivery_count: this.msg.info.deliveryCount,
       ...runIdentity(this.request),
     });
-    // Every failed run asks the platform, not only one that reached the rebuild
-    // path: a sandbox can vanish in ways that surface as an ordinary tool error,
-    // and a run that fails for its own reasons simply gets nothing back. No-op
-    // when the facts were already read at the probe.
-    await this.capturePlatformFacts();
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.
     await deliverAgentDone(
