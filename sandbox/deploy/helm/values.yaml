@@ -68,18 +68,17 @@ redis:
   # while holding the session records EnvD reads per-user OPENAI_API_KEYs from.
   #
   # install.sh never reaches that state: it generates or reuses a 32-char
-  # password and passes it in a values file. The exposed path is a hand-run
+  # password and passes it in a values file. The exposed path was a hand-run
   # `helm install`, which is what the header of this file, build-images.sh and
-  # deploy-redis.sh all print -- so until the guard below exists, pass
-  # --set redis.password=... by hand on every direct helm invocation.
+  # deploy-redis.sh all print.
   #
-  # The guard belongs in templates/secret.yaml, which should wrap this in
-  # `required` so render fails loudly, the way memory-service's
-  # postgres-secret.yaml and the claw chart's secret.yaml already do. Do not
-  # "fix" this line by deleting the key instead: a missing key renders through
-  # `quote` as the same empty string, silencing the scanner without closing the
-  # hole.
-  password: ""
+  # There is deliberately NO `password` key here. templates/secret.yaml wraps it
+  # in `required`, the way memory-service's postgres-secret.yaml and the claw
+  # chart's secret.yaml do, so an unset password fails the render with a message
+  # naming this file rather than shipping an open store. Carrying `password: ""`
+  # as a documented default would defeat that: `required` accepts an empty
+  # string, so the guard would pass and the blank would reach redis-server. Set
+  # it with --set redis.password=... or in your own values file.
   db: 1                           # DB 1, isolated from legacy sandbox (DB 0)
   secret:
     create: true                  # false = skip creating Secret, reuse external Secret named agent-sandbox-redis
