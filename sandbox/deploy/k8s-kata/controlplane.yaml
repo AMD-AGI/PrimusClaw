@@ -162,6 +162,7 @@ spec:
             - --gc-interval=15s
             - --default-ttl=24h
             - --session-timeout=15m
+            - --enable-idle-gc=false
             - --leader-elect=true
             - --extensions=true
             - --namespace=agent-sandbox-system

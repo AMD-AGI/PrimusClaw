@@ -23,8 +23,10 @@ import {
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
 import {
+  classifyWorkloadTerminalReason,
   SandboxExecRouteUnavailableError,
   SandboxGoneError,
+  SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
 } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
@@ -37,6 +39,7 @@ import type {
   SandboxInstance,
   SandboxStatus,
   SandboxExecResult,
+  SandboxExecOptions,
 } from "./provider.js";
 
 const logger = pino({ name: "safe-workload-provider" });
@@ -103,6 +106,8 @@ export class SafeWorkloadProvider implements SandboxProvider {
       displayName: sandboxWorkloadName(),
       groupVersionKind: { kind: "Sandbox", version: "v1" },
       priority: SANDBOX_WORKLOAD_PRIORITY,
+      // After the sandbox Pod reaches Succeeded/Failed (codeinterpreter exited),
+      // SaFE maps that to a terminal workload phase and this TTL deletes it.
       ttlSecondsAfterFinished: params.ttlSec ?? 10,
       workspace: ns,
       labels: params.labels ?? {},
@@ -164,7 +169,12 @@ export class SafeWorkloadProvider implements SandboxProvider {
       const phase = String(info.phase ?? "").toLowerCase();
       if (phase === "running") return { running: true, healthy: true, state: "running" };
       if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(phase)) {
-        return { running: false, healthy: false, state: "terminal" };
+        return {
+          running: false,
+          healthy: false,
+          state: "terminal",
+          reason: classifyWorkloadTerminalReason(info),
+        };
       }
       return { running: false, healthy: false, state: "unknown" };
     } catch {
@@ -177,6 +187,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult> {
     const ns = inst.namespace?.trim() || SANDBOX_NAMESPACE;
     const routerConfigured = SANDBOX_ROUTER_URL.trim();
@@ -193,7 +204,11 @@ export class SafeWorkloadProvider implements SandboxProvider {
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ command: ["sh", "-c", command], timeout }),
+      body: JSON.stringify({
+        command: ["sh", "-c", command],
+        timeout,
+        ...(opts?.untracked ? { untracked: true } : {}),
+      }),
       // `timeout` is only the command's deadline inside the container; it says
       // nothing about a Router that accepts the connection and then goes quiet.
       // Without a cap here that fetch inherits undici's 5-minute header
@@ -211,12 +226,14 @@ export class SafeWorkloadProvider implements SandboxProvider {
       const errBody = await resp.text();
       const msg = `sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`;
       if (resp.status === 404 || resp.status === 410) {
-        // A Router 404 can mean a missing workload, but it can also mean a
-        // wrong namespace, an old Router without this route, or a bad ingress
-        // path. Confirm through the independent workload API before licensing
-        // any caller to destroy the sandbox.
         const status = await this.get(inst, signal);
-        if (status.state === "absent" || status.state === "terminal") {
+        if (status.state === "terminal") {
+          throw new SandboxRuntimeTerminalError(
+            status.reason ?? "sandbox_workload_terminal",
+            `sandbox workload entered terminal phase: ${msg}`,
+          );
+        }
+        if (status.state === "absent") {
           throw new SandboxGoneError(msg);
         }
         if (status.state === "running") {

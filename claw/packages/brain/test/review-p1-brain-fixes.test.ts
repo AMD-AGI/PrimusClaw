@@ -70,6 +70,39 @@ test("terminated is a conclusive workload phase", async () => {
   );
 });
 
+test("a transient exec 5xx does not look up the Workload API", async () => {
+  let calls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/api/v1/workloads/")) {
+      return { ok: true, status: 200, json: async () => ({ phase: "Running" }) } as Response;
+    }
+    return { ok: false, status: 502, text: async () => "bad gateway" } as Response;
+  }) as typeof globalThis.fetch;
+
+  await assert.rejects(
+    () => new SafeWorkloadProvider().exec(INSTANCE, "true", "1s"),
+    /HTTP 502/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("keepalive-style untracked exec is sent on the execute body", async () => {
+  let body = "";
+  globalThis.fetch = (async (_input, init) => {
+    body = String(init?.body ?? "");
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ exit_code: 0, stdout: "", stderr: "" }),
+    } as Response;
+  }) as typeof globalThis.fetch;
+
+  await new SafeWorkloadProvider().exec(INSTANCE, "true", "1s", undefined, { untracked: true });
+  assert.match(body, /"untracked":true/);
+});
+
 test("the shipped chart does not opt every sandbox into automatic eviction", async () => {
   const values = await import("node:fs/promises")
     .then((fs) => fs.readFile(new URL("../../../deploy/charts/claw/values.yaml", import.meta.url), "utf8"));

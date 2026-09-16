@@ -61,12 +61,20 @@ export interface SandboxStatus {
   podIp?: string;
   /** Whether the provider could distinguish absence from a control-plane error. */
   state?: "running" | "terminal" | "absent" | "unknown";
+  /** Stable reason when state is terminal. */
+  reason?: string;
 }
 
 export interface SandboxExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+/** Options for a provider exec. */
+export interface SandboxExecOptions {
+  /** When true, EnvD does not register this execute as a user job. */
+  untracked?: boolean;
 }
 
 /**
@@ -97,6 +105,7 @@ export interface SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
 }

@@ -56,6 +56,9 @@ type Server struct {
 	policySyncer  *PolicySyncer  // §4.1: periodic policy pull from WM
 	auditReporter *egressAuditReporter
 	drainTimeout  time.Duration
+	jobs          *jobRegistry
+	podUID        string
+	instanceID    string
 }
 
 // Config holds EnvD configuration.
@@ -107,6 +110,9 @@ func New(cfg Config) (*Server, error) {
 		tmuxHeight:    cfg.TMuxHeight,
 		egressEnabled: cfg.EgressEnabled,
 		drainTimeout:  cfg.ShutdownDrainTimeout,
+		jobs:          newJobRegistry(),
+		podUID:        strings.TrimSpace(os.Getenv("POD_UID")),
+		instanceID:    newEnvDInstanceID(),
 	}
 
 	if cfg.EgressEnabled {
@@ -142,6 +148,7 @@ func (s *Server) Handler() http.Handler {
 	// Command execution
 	mux.HandleFunc("/api/execute", s.handleExecute)
 	mux.HandleFunc("/api/execute/stream", s.handleExecuteStream)
+	mux.HandleFunc("/api/jobs", s.handleJobs)
 
 	// Session (tmux)
 	mux.HandleFunc("/api/session/create", s.handleSessionCreate)

@@ -33,6 +33,7 @@ import type {
   SandboxInstance,
   SandboxStatus,
   SandboxExecResult,
+  SandboxExecOptions,
 } from "./provider.js";
 
 const logger = pino({ name: "agent-sandbox-provider" });
@@ -305,8 +306,12 @@ export class AgentSandboxProvider implements SandboxProvider {
       }
       if (!resp.ok) return { running: false, healthy: false, state: "unknown" };
       const d = (await resp.json()) as { status?: string; healthy?: boolean; podIp?: string };
-      if (d.status === "running") {
+      const status = String(d.status ?? "").toLowerCase();
+      if (status === "running") {
         return { running: true, healthy: !!d.healthy, podIp: d.podIp, state: "running" };
+      }
+      if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(status)) {
+        return { running: false, healthy: false, podIp: d.podIp, state: "terminal" };
       }
       return { running: false, healthy: false, state: "unknown" };
     } catch {
@@ -319,12 +324,17 @@ export class AgentSandboxProvider implements SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult> {
     const path = `/v1/namespaces/${inst.namespace}/code-interpreters/${inst.sandboxName}/invocations/api/execute`;
     const resp = await this.routerFetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-session-id": inst.id },
-      body: JSON.stringify({ command: ["sh", "-c", command], timeout }),
+      body: JSON.stringify({
+        command: ["sh", "-c", command],
+        timeout,
+        ...(opts?.untracked ? { untracked: true } : {}),
+      }),
       timeoutMs: parseExecTimeoutMs(timeout) + EXEC_TRANSPORT_SLACK_MS,
       userId: inst.userId,
       signal,

@@ -14,6 +14,8 @@ type ExecuteRequest struct {
 	Timeout    string            `json:"timeout,omitempty"` // e.g. "60s"
 	WorkingDir string            `json:"working_dir,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	// Untracked omits this execute from GET /api/jobs user-process accounting.
+	Untracked bool `json:"untracked,omitempty"`
 }
 
 // ExecuteResponse is the result of a synchronous execution.
@@ -100,6 +102,16 @@ type GPUDevice struct {
 	MemoryUsed  string `json:"memory_used"`
 	Utilization int    `json:"utilization"`
 	Temperature int    `json:"temperature"`
+}
+
+// JobsResponse is the response from GET /api/jobs.
+type JobsResponse struct {
+	// UserProcesses is true when any tracked execute still has a live user PID.
+	UserProcesses    bool   `json:"user_processes"`
+	UserProcessCount int    `json:"user_process_count"`
+	TrackingLost     bool   `json:"tracking_lost"`
+	PodUID           string `json:"pod_uid,omitempty"`
+	InstanceID       string `json:"instance_id"`
 }
 
 // GPUStatusResponse is the response from GET /api/gpu/status.

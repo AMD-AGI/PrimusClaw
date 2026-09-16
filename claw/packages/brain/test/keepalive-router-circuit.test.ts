@@ -91,3 +91,29 @@ test("a single gone response reaches the verdict and jumps the counter", async (
     restore();
   }
 });
+
+test("an unknown agent-sandbox state does not count as a keepalive failure", async () => {
+  const { lastVerdictForTest } = await import("../src/sandbox/keepalive.js") as {
+    lastVerdictForTest: (part: string) => { fails: number; gone: boolean } | null;
+  };
+  const provider = {
+    kind: "agent-sandbox",
+    async get() { return { running: false, healthy: false, state: "unknown" }; },
+    async exec() { throw new Error("exec must not run for agent-sandbox ping"); },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  registerSandbox("s-unknown", {
+    provider: "agent-sandbox",
+    sessionId: "s-unknown",
+    sandboxName: "sbx",
+    namespace: "ns",
+  });
+  try {
+    await runKeepaliveTickForTest({ kv: emptyKv() });
+    assert.equal(lastVerdictForTest("s-unknown"), null);
+  } finally {
+    unregisterSandbox("s-unknown");
+    restore();
+  }
+});

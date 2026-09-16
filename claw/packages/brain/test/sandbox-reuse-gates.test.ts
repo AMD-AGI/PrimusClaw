@@ -58,6 +58,7 @@ interface Entry {
   sandboxName?: string;
   namespace?: string;
   userId?: string;
+  terminalReason?: string;
 }
 
 function fakeKv(entry: Entry | null): { kv: KV; puts: string[] } {
@@ -783,4 +784,21 @@ test("reuse is refused while the fleet is uncounted, and registers nothing", asy
     // A ceiling of zero binds no roster, which is this module's off state.
     await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
   }
+});
+
+test("a failed terminal cleanup is retryable rather than a permanent session failure", async () => {
+  restoreEffects = bindSandboxReuseEffects({
+    destroyHands: async () => { throw new Error("stop failed"); },
+    registerSandbox: (() => {}) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive", reason: "exec_ok" as const }),
+    restartHandsInSandbox: async () => ({ ok: true, detail: "healthy" }),
+    countLiveWork: async () => ({ verdict: "clear", classes: {}, reason: "clear" }),
+    retainContainer: async () => "retained",
+  });
+  const { a } = attempt({
+    ...LIVE,
+    specFingerprint: specOf(),
+    terminalReason: "sandbox_timed_out",
+  });
+  await assert.rejects(() => tryReuseSessionSandbox(a), /stop failed/);
 });

@@ -737,7 +737,11 @@ async function startBackgroundRuntime(): Promise<void> {
     );
   }
   await bindAdmission(kv, capacity);
-  await startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
+  await startSandboxKeepalive({
+    kv,
+    ...rosterDeps(kv, capacity),
+    emitSandboxFailure: (sessionId, event) => emitter.emit(sessionId, event),
+  });
   startSandboxSweeper();
   startMultiNodeSweeper();
 }

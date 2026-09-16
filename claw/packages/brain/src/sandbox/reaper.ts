@@ -460,6 +460,7 @@ export function eligibleForClusterReclaim(
     sessionDeleted?: unknown;
     idleSince?: unknown;
     workSeenAt?: unknown;
+    quiescedAt?: unknown;
   },
   now: number,
 ): boolean {
@@ -467,8 +468,9 @@ export function eligibleForClusterReclaim(
   if (info.sessionDeleted === true) return true;
   const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
   const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
-  // Keep this reuse window aligned with keepalive.ts: observed work extends it.
-  const reuseWindowStart = Math.max(idleSince, workSeenAt);
+  const reuseWindowStart = typeof info.quiescedAt === "number"
+    ? info.quiescedAt
+    : Math.max(idleSince, workSeenAt);
   return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
 }
 
