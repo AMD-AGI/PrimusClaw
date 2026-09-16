@@ -1301,7 +1301,24 @@ test("a slow handle release cannot push the phase past its declared ceiling", as
   kv.seed(key, value);
   kv.seed(ledgerKeyForRetention(key), value);
 
+  // The container has to answer `clear`, or the sweep never reaches the release
+  // at all -- which is what the guard below caught the first time this test ran.
   let now = 0;
+  const CLEAR = 'MARKER {"epoch":"e1","bearer":{"pid":7,"startToken":"t7"}}\nSUBTREE ok\nPROCS 7';
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async exec(_inst: { id: string }, command: string) {
+        if (!command.includes("MARKER")) {
+          now += 100;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: CLEAR, stderr: "" };
+      },
+      async stop() {},
+    } as unknown as SandboxProvider,
+  });
+
   let reachedRelease = false;
   const startedAt = Date.now();
   await runKeepaliveTickForTest({
