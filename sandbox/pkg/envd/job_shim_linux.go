@@ -181,7 +181,9 @@ func (s *Server) startTrackedCommand(
 	}
 	go func() {
 		waitErr := shim.Wait()
-		if supervisorDiedUnexpectedly(waitErr) {
+		// Only a tracked tree contributes to the jobs roster, so only its
+		// supervisor dying leaves descendants unaccounted for.
+		if track && supervisorDiedUnexpectedly(waitErr) {
 			s.jobs.markLost()
 		}
 		s.jobs.remove(shim.Process.Pid)

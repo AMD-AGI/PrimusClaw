@@ -13,24 +13,34 @@ const inst: SandboxInstance = {
   namespace: "default", handsBaseUrl: "", userId: "user-1",
 };
 
-test("get distinguishes explicit absence from every unknown provider outcome", async (t) => {
-  const cases = [
-    ...[404, 410].map((status) => ({ name: `HTTP ${status}`, status, body: "", state: "absent" })),
-    ...[400, 401, 403, 429, 500, 502, 503].map((status) => ({
-      name: `HTTP ${status}`, status, body: '{"status":"running"}', state: "unknown",
+test("get separates absence, terminal and unknown provider outcomes", async (t) => {
+  const unknown = { running: false, healthy: false, state: "unknown" };
+  // A finished session is conclusive, and reports the address it last held.
+  const terminal = { running: false, healthy: false, podIp: undefined, state: "terminal" };
+  const cases: Array<{ name: string; status: number; body: string; expected: unknown }> = [
+    ...[404, 410].map((status) => ({
+      name: `HTTP ${status}`, status, body: "",
+      expected: { running: false, healthy: false, state: "absent" },
     })),
-    ...["pending", "stopped", "failed", "completed", ""].map((status) => ({
+    ...[400, 401, 403, 429, 500, 502, 503].map((status) => ({
+      name: `HTTP ${status}`, status, body: '{"status":"running"}', expected: unknown,
+    })),
+    ...["pending", ""].map((status) => ({
       name: `session status ${JSON.stringify(status)}`, status: 200,
-      body: JSON.stringify({ status }), state: "unknown",
+      body: JSON.stringify({ status }), expected: unknown,
+    })),
+    ...["stopped", "failed", "completed"].map((status) => ({
+      name: `session status ${JSON.stringify(status)}`, status: 200,
+      body: JSON.stringify({ status }), expected: terminal,
     })),
     ...["null", "{}", "[]", "invalid json"].map((body) => ({
-      name: `body ${body}`, status: 200, body, state: "unknown",
+      name: `body ${body}`, status: 200, body, expected: unknown,
     })),
   ];
   for (const c of cases) {
     await t.test(c.name, async (t) => {
       t.mock.method(globalThis, "fetch", async () => new Response(c.body, { status: c.status }));
-      assert.deepEqual(await provider.get(inst), { running: false, healthy: false, state: c.state });
+      assert.deepEqual(await provider.get(inst), c.expected);
     });
   }
 });

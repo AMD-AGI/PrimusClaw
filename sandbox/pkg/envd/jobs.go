@@ -58,17 +58,29 @@ func isHandsCommand(command []string) bool {
 	return false
 }
 
-// add records a newly started job shim.
+// add records a newly started job shim. Tracking loss clears when the registry
+// holds no user job, the resident Hands supervisor not counting as one.
 func (r *jobRegistry) add(shimPID int, command []string) {
 	if r == nil || shimPID <= 0 {
 		return
 	}
 	r.mu.Lock()
-	if len(r.jobs) == 0 {
+	if !r.hasUserJobLocked() {
 		r.lost = false
 	}
 	r.jobs[shimPID] = trackedJob{shimPID: shimPID, hands: isHandsCommand(command)}
 	r.mu.Unlock()
+}
+
+// hasUserJobLocked reports whether a tracked job other than the Hands
+// supervisor remains. Callers hold the mutex.
+func (r *jobRegistry) hasUserJobLocked() bool {
+	for _, j := range r.jobs {
+		if !j.hands {
+			return true
+		}
+	}
+	return false
 }
 
 // remove forgets a shim after all descendants have exited.

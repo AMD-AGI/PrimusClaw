@@ -66,7 +66,12 @@ test("terminated is a conclusive workload phase", async () => {
 
   assert.deepEqual(
     await new SafeWorkloadProvider().get(INSTANCE),
-    { running: false, healthy: false, state: "terminal" },
+    {
+      running: false,
+      healthy: false,
+      state: "terminal",
+      reason: "sandbox_workload_terminal",
+    },
   );
 });
 

@@ -1587,6 +1587,13 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
             { sessionId, workloadId: info.workloadId, reason: err.reason },
             "keepalive.jobs_probe_absent",
           );
+          // An absent workload is released here rather than left for the idle
+          // window: the probe records no verdict, so the window would keep
+          // being refreshed and never reach the reclaim path. Absence is not a
+          // session failure, so no terminal reason is published.
+          await destroyHands(sessionId, info).catch((stopErr) => {
+            logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
+          });
         } else {
           await reportTerminalFailure(deps, sessionId, identity, err.reason);
         }
@@ -1813,6 +1820,12 @@ async function persistVerdict(
  * Move the idle clock forward on a handle whose sandbox is still working.
  * `idleSince` follows the measurement anchor; `workSeenAt` gives the reuse window
  * a current local clock. The update is conditional and best-effort.
+ *
+ * `workObserved` separates a witnessed user process from a verdict that could
+ * not be read. Only the former discards `quiescedAt`, so an unreadable probe
+ * leaves the idle window accumulated so far in place: the jobs probe crosses
+ * the control plane and the Router, and each unanswered hop would otherwise
+ * restart a window that only a confirmed empty roster is allowed to close.
  */
 async function refreshIdleSince(
   deps: KeepaliveDeps,
@@ -1820,6 +1833,7 @@ async function refreshIdleSince(
   revision: number,
   info: HandsKvEntry,
   seenAt: number,
+  workObserved = true,
 ): Promise<void> {
   try {
     // Keep the verdict anchor monotonic and no later than its measurement.
@@ -1832,12 +1846,12 @@ async function refreshIdleSince(
       ...info,
       idleSince,
       workSeenAt: (deps.now ?? Date.now)(),
-      quiescedAt: undefined,
+      ...(workObserved ? { quiescedAt: undefined } : {}),
     }));
     await deps.kv.update(key, next, revision);
     // Keep the scan copy aligned for probes dispatched later in this tick.
     info.idleSince = idleSince;
-    delete info.quiescedAt;
+    if (workObserved) delete info.quiescedAt;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
@@ -2037,7 +2051,7 @@ async function collectIdleTarget(
     return false;
   }
   if (bgWork === "unknown" && canProbeJobs(info, sessionId)) {
-    await refreshIdleSince(deps, key, e.revision, info, (deps.now ?? Date.now)());
+    await refreshIdleSince(deps, key, e.revision, info, (deps.now ?? Date.now)(), false);
     return false;
   }
   const expired = bgWork === "gone"

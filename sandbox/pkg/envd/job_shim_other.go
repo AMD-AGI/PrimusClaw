@@ -36,7 +36,9 @@ func (s *Server) startTrackedCommand(
 	}
 	go func() {
 		err := cmd.Wait()
-		if err != nil {
+		// Only a tracked tree contributes to the jobs roster, so only its
+		// supervisor dying leaves descendants unaccounted for.
+		if track && err != nil {
 			if _, ok := err.(*exec.ExitError); !ok {
 				s.jobs.markLost()
 			}
