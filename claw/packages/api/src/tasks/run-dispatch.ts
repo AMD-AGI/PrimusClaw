@@ -22,7 +22,8 @@ import {
   withOwnedAdmissionLock, type AdmissionAsk, type AdmitLimits,
 } from "./admission.js";
 import {
-  clearDispatchReconcile, discardChatRunDispatch, failChatRunDispatch, openChatRun,
+  discardChatRunDispatch, failChatRunDispatch, openChatRun,
+  releaseDispatchedDoorbellReconcile,
 } from "./chat-run.js";
 import { RUN_CREDENTIALS_FIELD, gpuNodesFromSpec, stripRunSecrets, wantsSandboxFromSpec } from "./run-spec.js";
 import { credentialsFromTask, sealRunCredentials } from "./run-secrets.js";
@@ -309,10 +310,22 @@ async function handOffUncounted(input: HandOffInput): Promise<HandOffResult> {
  *
  * A row opened with no token has nothing to release, which is not a loss of
  * ownership -- so it answers true.
+ *
+ * Not `clearDispatchReconcile`, which is token-only and therefore reads this
+ * turn's own worker retiring the marker as a takeover. The doorbell is durable
+ * before `publishDoorbell` returns and the claim hands over the whole spec, so
+ * a worker can claim, run and report inside the single round trip between that
+ * publish and this call -- and the completion consumer's close retires the
+ * marker on the way through. Answering `publish_unknown` to that is a 503 for a
+ * turn that published, executed and answered, with no marker left for any
+ * reconciler to settle, and the route saves that 503 under the idempotency key
+ * so a retry of the create gets it for ever. See
+ * `releaseDispatchedDoorbellReconcile`, which reads the close's own stamp; a
+ * genuine takeover is still declined.
  */
 async function releaseReconcileClaim(run: { taskId: string; reconcileToken?: string }): Promise<boolean> {
   if (!run.reconcileToken) return true;
-  return await clearDispatchReconcile(run.taskId, run.reconcileToken);
+  return await releaseDispatchedDoorbellReconcile(run.taskId, run.reconcileToken);
 }
 
 export function persistableSpec(task: Record<string, unknown>): Record<string, unknown> {
