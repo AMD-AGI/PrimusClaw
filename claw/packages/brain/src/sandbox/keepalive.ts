@@ -2002,6 +2002,21 @@ async function collectIdleTarget(
   const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
   if (needsProbe(identity, info)) census.probeCandidates.push(candidate);
   if (bgWork === "running" || bgWork === "unknown") {
+    // `unknown` is refreshed on this sweep's own clock rather than on a
+    // measurement, and that is deliberate rather than an oversight to be tidied
+    // away. Returning early already keeps the handle here -- an unreachable
+    // sandbox is never reclaimed on a guess -- but the reuse window this writes
+    // is not read here alone: `eligibleForClusterReclaim` in the reaper derives
+    // it from the same two fields, by the comment on its own formula, and that
+    // sweep consults no background-work verdict at all and runs on a shorter
+    // horizon (MULTI_NODE_IDLE_RECLAIM_MS, five minutes, against fifteen here).
+    // Leaving the window where it was would therefore not merely hold the
+    // handle: it would hand a handle nobody can get an answer about to the one
+    // sweep that deletes a user's GPU cluster, on the evidence this branch
+    // exists to say we do not have. What is left held instead is bounded and
+    // reported -- the probe below resolves all but an unreachable control
+    // plane, and a streak past BG_UNKNOWN_TOLERANCE raises
+    // `keepalive.background_work_unreconciled` for an operator.
     const seenAt = bgWork === "running" ? peeked.at ?? Date.now() : (deps.now ?? Date.now)();
     await refreshIdleSince(deps, key, e.revision, info, seenAt);
     return false;

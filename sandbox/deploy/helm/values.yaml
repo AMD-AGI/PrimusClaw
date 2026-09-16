@@ -57,7 +57,28 @@ controlplane:
 redis:
   deploy: false                   # false=Redis already deployed via deploy-redis.sh
   addr: "redis.agent-sandbox-system:6379"   # In-cluster Redis Service address
-  password: ""                    # Empty = read from Secret/agent-sandbox-redis
+  # An empty password here does NOT mean "inherit the existing Secret". With
+  # secret.create: true (the default, just below) this chart WRITES this
+  # value into Secret/agent-sandbox-redis, so an empty string overwrites the
+  # password deploy-redis.sh generated -- and every consumer downstream reads
+  # blank as "no auth", not as an error: redis-server treats `--requirepass ""`
+  # as authentication disabled, redis-cli with an empty REDISCLI_AUTH sends no
+  # AUTH and so both probes still pass, and go-redis skips AUTH entirely. With
+  # redis.deploy=true the result is a passwordless Redis that reports healthy
+  # while holding the session records EnvD reads per-user OPENAI_API_KEYs from.
+  #
+  # install.sh never reaches that state: it generates or reuses a 32-char
+  # password and passes it in a values file. The exposed path was a hand-run
+  # `helm install`, which is what the header of this file, build-images.sh and
+  # deploy-redis.sh all print.
+  #
+  # There is deliberately NO `password` key here. templates/secret.yaml wraps it
+  # in `required`, the way memory-service's postgres-secret.yaml and the claw
+  # chart's secret.yaml do, so an unset password fails the render with a message
+  # naming this file rather than shipping an open store. Carrying `password: ""`
+  # as a documented default would defeat that: `required` accepts an empty
+  # string, so the guard would pass and the blank would reach redis-server. Set
+  # it with --set redis.password=... or in your own values file.
   db: 1                           # DB 1, isolated from legacy sandbox (DB 0)
   secret:
     create: true                  # false = skip creating Secret, reuse external Secret named agent-sandbox-redis

@@ -20,8 +20,8 @@ import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import {
-  failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq, recordPublishState,
-  SWEEPABLE_RUN_STATUSES,
+  clearDispatchReconcile, failChatRunDispatch, noteRefusedPublish, openChatRun, recordDispatchSeq,
+  recordPublishState, SWEEPABLE_RUN_STATUSES,
 } from "../tasks/chat-run.js";
 import { beginDoorbellDispatch } from "../tasks/doorbell-gate.js";
 import { handOffAssembledRun, publishRunMessage } from "../tasks/run-dispatch.js";
@@ -365,6 +365,19 @@ export async function dispatchTaskToBrain(
           filesWorkspaceId,
           pluginId: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
           sandboxImage: finalSandboxImage,
+          // Forwarded here for the same reason the doorbell branch forwards it,
+          // and it was missing here alone. The action is what arms the row:
+          // `insertTask` writes `dispatch_reconcile_at` only when
+          // `dispatch_reconcile_action` is non-null, so a fat row opened
+          // without one is invisible to `reconcileAmbiguousDispatches` for
+          // ever. The `publish_unknown` this function can return then settles
+          // nothing and asks nobody to: the caller is told not to roll back --
+          // that is the whole point of the kind -- and no sweep can finish the
+          // cleanup it deferred, so the created session, its `UserMessage` and
+          // its `running` gate outlive the 503 with no owner. The fat orphan
+          // reaper closes the row hours later and still never runs the action,
+          // because the action is the part that deletes the session.
+          reconcileAction: input.reconcileAction,
           // Secret-free, and narrower than the doorbell path's spec on purpose:
           // nothing rehydrates a fat row from `input` -- it is published on the
           // wire -- so sealing credentials into it would store a secret no
@@ -421,6 +434,44 @@ export async function dispatchTaskToBrain(
       () => sessionDispatchPorts.publishTask(subject, payload),
     );
     await sessionDispatchPorts.recordDispatchSeq(run.taskId, seq);
+    // And handed back the moment the outcome is settled, which is the other
+    // half of arming it. A marker left on a row that dispatched cleanly is not
+    // inert: `resolveAmbiguousDispatch` reads a fat row as never executed --
+    // nothing on this path increments `claim_count`, that is the doorbell
+    // claim's counter -- so at the horizon it would run the stored action
+    // against a healthy turn and, for a create, delete the session the user is
+    // talking in.
+    //
+    // Which is why a lost fence may not end the attempt here the way it ends
+    // it on the doorbell side. `clearDispatchReconcile` answers false for a
+    // token some other writer now holds, and on a doorbell row that is a safe
+    // answer because the row can still prove what it did: every `takeClaim`
+    // increments `claim_count`, so the reconciler reads an executed row and
+    // retires the marker without touching the session. A fat row has no such
+    // proof and cannot acquire one -- see `releaseDispatchedFatReconcile`.
+    if (run.reconcileToken && !await clearDispatchReconcile(run.taskId, run.reconcileToken)) {
+      if (!await releaseDispatchedFatReconcile(run.taskId)) {
+        logger.error(
+          { sessionId, messageId, subject, runTaskId },
+          "message.dispatch_unknown_awaiting_reconcile",
+        );
+        return {
+          kind: "publish_unknown",
+          messageId,
+          error: new Error("task dispatch outcome unknown"),
+        };
+      }
+      // Reported as dispatched, not as unknown, and the difference is not
+      // cosmetic: `publish_unknown` is a promise that somebody else will settle
+      // this row, and the statement above is what makes that promise false --
+      // there is no marker left for a sweep to select on. The publish itself is
+      // a banked fact by now, so `dispatched` is also the truthful answer, and
+      // it is the one that keeps the caller from rolling back a live turn.
+      logger.warn(
+        { sessionId, messageId, subject, runTaskId },
+        "message.dispatch_reconcile_force_released",
+      );
+    }
     logger.info({ sessionId, messageId, subject, runTaskId, sandboxImage: finalSandboxImage || null }, "message.dispatched");
     return { kind: "dispatched", messageId, sandboxImage: finalSandboxImage, runId: run.taskId };
   } catch (err: any) {
@@ -474,6 +525,76 @@ export async function dispatchTaskToBrain(
     }
     logger.error({ err, sessionId, messageId, subject }, "message.dispatch_failed");
     return { kind: "publish_failed", messageId, error: err };
+  }
+}
+
+/**
+ * Retire a fat row's reconcile marker once its message is on the stream,
+ * whoever holds the token by then.
+ *
+ * The fence `clearDispatchReconcile` applies exists to stop a stale publisher
+ * taking back a marker the reconciler has adopted, and on the doorbell path
+ * losing it costs nothing: a doorbell row that executes says so in
+ * `claim_count`, and `resolveAmbiguousDispatch` decides "never executed" from
+ * exactly that column. A fat row cannot make the same statement. Nothing on
+ * this path increments it, and the only writer that does is `acquireFatLease`
+ * -- which a Brain predating the `accept` flag never reaches: its attempt token
+ * quotes `claim_count = 0`, that matches `renewRunLease`'s fence, and the row is
+ * renewed at zero for the whole turn. During a rolling upgrade -- API first,
+ * Brain second, which is the order `deploy/upgrade.sh` uses -- that Brain is the
+ * one executing these turns.
+ *
+ * So an armed marker outliving a successful fat publish is not a deferral, it
+ * is a scheduled deletion. While the turn runs, `failChatRunDispatch` refuses to
+ * close a row a worker holds and the reconciler merely re-arms; once the turn
+ * *completes*, that non-terminal guard is skipped entirely, the stored
+ * `delete_created_session` runs against a conversation the user was answered in,
+ * and `commitSessionDeletion` tombstones its content and schedules its workspace
+ * objects for collection. RUN_FAT_PREPARING_RECONCILE does not gate that arm, so
+ * turning the rollout flag off only postpones it to the next tick.
+ *
+ * Unfenced against the *token* is correct rather than merely expedient:
+ * `publishRunMessage` returned a sequence and `recordDispatchSeq` banked it, so
+ * the question this marker was armed to answer is already answered and the
+ * cleanup it stores is owed to nobody -- there is no contending writer whose
+ * decision this could overwrite, only a token that moved. Idempotent for the
+ * same reason, so a marker somebody else already retired still reads as
+ * released. That last part matters more than it used to: `closeChatRun` now
+ * retires the marker in the statement that terminalizes a row a worker reported
+ * on, so on a fast turn the marker can legitimately be gone before this runs,
+ * and reading that as a failure would answer 503 for a turn that dispatched and
+ * has already been answered.
+ *
+ * There is exactly one writer it is NOT idempotent against, and it is the one
+ * whose decision this genuinely would overwrite: the reconciler taking the
+ * marker in order to delete the session this create minted. That take stamps
+ * `dispatch_reconcile_deleted` on the row in the same statement that clears the
+ * marker, and this declines on it. The two then contend on one row's lock, so
+ * the ordering is total and observable from both sides -- if this UPDATE gets
+ * there first the reconciler's take matches nothing and it abandons the delete,
+ * and if the take got there first this matches nothing and the caller answers
+ * `publish_unknown` rather than handing back HTTP 200 and a session id that is
+ * about to stop existing. Reporting a turn as dispatched into a session being
+ * deleted is not a smaller lie than reporting a dispatched turn as unknown.
+ *
+ * Swallowing the error and returning false is what leaves the old behaviour in
+ * place for a disarm that never reached Postgres: the caller falls back to
+ * `publish_unknown`, which is the honest answer while a marker is still armed.
+ */
+async function releaseDispatchedFatReconcile(taskId: string): Promise<boolean> {
+  try {
+    const r = await db.query(
+      `UPDATE claw_tasks
+          SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL,
+              metadata = metadata - 'dispatch_reconcile_token'
+        WHERE task_id = $1
+          AND COALESCE((metadata->>'dispatch_reconcile_deleted')::boolean, false) = false`,
+      [taskId],
+    );
+    return (r.rowCount ?? 0) > 0;
+  } catch (err) {
+    logger.warn({ err, taskId }, "message.dispatch_reconcile_release_failed");
+    return false;
   }
 }
 

@@ -257,6 +257,65 @@ function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
 }
 
 /**
+ * Give this delivery's fat pre-gate lease back, ahead of a nak that is asking
+ * for a redelivery.
+ *
+ * A fat chat delivery takes its lease before it queues for an execution slot,
+ * and holds it across everything that follows -- the queue wait, and then every
+ * dispatch check. So a delivery that decides in `tasks/dispatch.ts` to wait and
+ * come back is holding, at the moment it naks, exactly the thing that stops the
+ * redelivery it asked for from getting anywhere: `acquireFatLease` takes a
+ * pristine row, a lapsed-and-fenced one, or one a holder gave back, and a live
+ * lease is none of the three. The redelivery is answered `superseded`, refused
+ * at the pre-gate before it ever probes the lock, and naks in turn -- so the
+ * turn stands still for the rest of the TTL, one wasted delivery at a time.
+ *
+ * The same window swallows a Stop: `stoppedAndUnheld`, the one arm that answers
+ * an acceptance with `stop: "cancelling"` so the delivery can emit the
+ * interrupted completion, requires `lease_owner IS NULL`. While this pod holds
+ * an unreleased lease the row cannot say it was stopped, and the user's Stop is
+ * answered by nothing until the lease lapses.
+ *
+ * Renewal is stopped first and the nak only after the release returns -- the
+ * order `nakAfterAttempt` and the drain branch in `delivery/dispatch.ts` both
+ * use. Both halves matter: a renewal tick landing after the release retakes the
+ * lease the release just gave back (the renewal path acquires an unheld or
+ * lapsed row as readily as an acceptance does), and a nak issued before the
+ * release lands races the redelivery against it.
+ *
+ * Lives here, beside `nakAfterAttempt`, because that is what it mirrors and
+ * because `settleRunAttempt` is the seam a test can answer. It is a no-op on
+ * every other path by construction: only a fat pre-gate delivery runs inside
+ * `fatDeliveryContext`, so a claimed doorbell, a claim-next run and a DAG or
+ * script delivery all find no context and hold no lease to give back.
+ */
+export async function releasePreGateLease(request: ExecuteRequest): Promise<void> {
+  const fat = currentFatDelivery();
+  // Nothing to fence with is nothing to release -- see the pre-gate's own
+  // `release`: `brain_id` is a pod name, the same string for every lease this
+  // pod ever takes on the row, so without the generation the settle cannot say
+  // which lease is being given back. Left to lapse instead.
+  if (!fat || fat.runClaim === undefined) return;
+  const taskId = settlementTaskIdOf(request);
+  if (!taskId) return;
+  fat.handOffRenewal();
+  await fx().settleRunAttempt(taskId, fat.runClaim, undefined, true);
+}
+
+/**
+ * The row a settlement addresses: what the wire says, or what the lease URL
+ * says when the wire says nothing.
+ *
+ * The second half is the rolling-upgrade shape `runIdentity` above documents at
+ * length -- a fat message published before `task_id` was a field -- and the two
+ * readers below are the ones that settle a row rather than describe one, where
+ * missing the id means the settle never happens at all.
+ */
+function settlementTaskIdOf(request: ExecuteRequest): string | null {
+  return request.task_id || taskIdFromLease(request).id;
+}
+
+/**
  * Resolve a task whose JetStream delivery budget is exhausted.
  *
  * DAG tasks must use the same durable callback/outbox handoff as every other
@@ -3602,10 +3661,19 @@ class TaskRunner {
    */
   private async nakAfterAttempt(delayMs: number): Promise<void> {
     if (this.claimed) this.declareCoverage();
-    else if (this.request.task_id) {
-      await fx().settleRunAttempt(
-        this.request.task_id, this.heldGeneration(), this.coverageReport()?.runTime, true,
-      );
+    else {
+      // Through `settlementTaskIdOf`, not `request.task_id` alone. Reading the
+      // wire only meant that a fat message from an API too old to carry the
+      // field -- the whole of a rolling-upgrade window -- skipped this settle
+      // entirely: no coverage banked, and the lease left live under an attempt
+      // that has just asked for a redelivery, which is then refused
+      // `superseded` and naks in turn until the lease lapses on its own.
+      const taskId = settlementTaskIdOf(this.request);
+      if (taskId) {
+        await fx().settleRunAttempt(
+          taskId, this.heldGeneration(), this.coverageReport()?.runTime, true,
+        );
+      }
     }
     this.msg.nak(delayMs);
   }

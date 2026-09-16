@@ -19,6 +19,7 @@ import { StringCodec, type KV } from "nats";
 
 import { handsSessionKey, legacyHandsKey } from "../src/sandbox/hands-key.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
+import { readSessionPlatformKey } from "../src/sandbox/reaper.js";
 import { readHandsProbeEntry } from "../src/sandbox/container-probe.js";
 import {
   markHandsIdle, registerSandbox, runKeepaliveTickForTest, unregisterSandbox,
@@ -118,6 +119,48 @@ test("the container probe still reads the canonical key", async () => {
   bindHandsKv(kv);
 
   assert.equal((await readHandsProbeEntry(SESSION_ID))?.workloadId, "wl-1");
+});
+
+test("a tombstone on the canonical key does not hide the legacy binding", async () => {
+  // The read-through walks the canonical key first and used to return whatever
+  // answered. A delete answers -- the key-value client hands back a readable
+  // entry with an empty value rather than a miss -- so the walk ended on a key
+  // holding nothing and the live binding under the legacy name was never
+  // reached. Every caller turns that empty value into "this session has no
+  // sandbox", which is how a session that already owns a container gets a
+  // second one built for it.
+  const { kv } = kvHolding(LEGACY_KEY);
+  kv.seed(CANONICAL_KEY, "");
+  bindHandsKv(kv);
+
+  const entry = await readHandsProbeEntry(SESSION_ID);
+
+  assert.notEqual(entry, null, "a tombstone on the canonical key read as 'no sandbox'");
+  assert.equal(entry?.workloadId, "wl-1");
+});
+
+test("teardown reads the platform key past a tombstoned canonical key", async () => {
+  // The same short circuit, at the end that cannot be retried: with no platform
+  // key there is no SaFE call teardown can make, so the workload the legacy key
+  // names is left running with nothing pointing at it.
+  const { kv } = kvHolding(LEGACY_KEY);
+  kv.seed(CANONICAL_KEY, "");
+  bindHandsKv(kv);
+
+  assert.equal(await readSessionPlatformKey(SESSION_ID), "pk-1",
+    "teardown was handed no key and the sandbox it should stop stays up");
+});
+
+test("a tombstone under every name is still no binding", async () => {
+  // The other half: skipping tombstones must not turn a torn-down session into
+  // an unreadable one. Both names deleted is the ordinary "no sandbox yet"
+  // answer, and the caller builds one.
+  const { kv } = kvHolding(LEGACY_KEY);
+  kv.seed(LEGACY_KEY, "");
+  kv.seed(CANONICAL_KEY, "");
+  bindHandsKv(kv);
+
+  assert.equal(await readHandsProbeEntry(SESSION_ID), null);
 });
 
 test("a probe finds nothing when the bucket holds nothing", async () => {

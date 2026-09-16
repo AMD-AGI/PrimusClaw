@@ -257,6 +257,7 @@ test("a discard that could not establish anything throws rather than refusing", 
   // runs it, and the caller's rollback then deletes the UserMessage out from
   // under the turn. Nor is it `dispatched`: nothing said a worker has it.
   let attempts = 0;
+  const failed: string[] = [];
   await assert.rejects(
     handOffAssembledRun({
       task: { prompt: "hi" },
@@ -269,10 +270,68 @@ test("a discard that could not establish anything throws rather than refusing", 
       admit: (async () => ({ kind: "dispatch" })) as never,
       hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
       discardRun: (async () => { attempts += 1; return "unknown"; }) as never,
+      failRun: (async (taskId: string) => { failed.push(taskId); return "unknown"; }) as never,
     }),
     /could not discard refused run t1/,
   );
   assert.equal(attempts, 2, "retried once before giving up");
+  // The throw is the caller's dispatch-failure path, and that path can only
+  // read a verdict for a row it knows the id of. `failRun` is where
+  // `dispatchByDoorbell` hangs `rememberTaskId`, so a throw that never went
+  // through it left the caller compensating `null` -- which answers `closed`
+  // for want of a row to look at, and the create path then deletes the session
+  // and its UserMessage while this row stays queued and claimable.
+  assert.deepEqual(failed, ["t1"], "the caller is told the row id before the throw");
+});
+
+test("a row neither discard could erase is terminalized rather than left claimable", async () => {
+  // Two failed DELETEs do not make the row go away; they leave it `queued`,
+  // unheld, and matched by `peekNextQueued`. Closing it is the same thing
+  // `resolveAmbiguousDispatch` would do at the reconciliation horizon, taken
+  // now, because until then claim-next will happily run the turn the fleet
+  // just refused.
+  const failed: Array<[string, string]> = [];
+  const result = await handOffAssembledRun({
+    task: { prompt: "hi" },
+    sessionId: "s1",
+    userId: "u1",
+    messageId: "m1",
+    prompt: "hi",
+    publish: async () => {},
+    openRun: (async () => ({ taskId: "t1" })) as never,
+    admit: (async () => ({ kind: "dispatch" })) as never,
+    hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
+    discardRun: (async () => "unknown") as never,
+    failRun: (async (taskId: string, reason: string) => {
+      failed.push([taskId, reason]);
+      return "closed";
+    }) as never,
+  });
+  assert.deepEqual(result, {
+    kind: "rejected", reason: "fleet at the hard ceiling", taskId: "t1",
+  });
+  assert.deepEqual(failed, [["t1", "fleet at the hard ceiling"]]);
+});
+
+test("a row a worker took between the discards is reported dispatched, not refused", async () => {
+  // The same holder rule the discards use, applied to the answer that arrives
+  // last: claim-next can take the row at any point in this sequence, and
+  // `rejected` over a running turn is the rollback this whole path exists to
+  // avoid.
+  const result = await handOffAssembledRun({
+    task: { prompt: "hi" },
+    sessionId: "s1",
+    userId: "u1",
+    messageId: "m1",
+    prompt: "hi",
+    publish: async () => {},
+    openRun: (async () => ({ taskId: "t1" })) as never,
+    admit: (async () => ({ kind: "dispatch" })) as never,
+    hardAfterInsert: (async () => "fleet at the hard ceiling") as never,
+    discardRun: (async () => "unknown") as never,
+    failRun: (async () => "held") as never,
+  });
+  assert.deepEqual(result, { kind: "dispatched", taskId: "t1", messageId: "m1" });
 });
 
 test("a discard that succeeds on the retry refuses without throwing", async () => {

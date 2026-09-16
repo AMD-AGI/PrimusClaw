@@ -33,7 +33,7 @@ import { markSessionDeleted } from "../infra/deleted-sessions.js";
 import {
   pickLockKey, acquireTaskLock, gateBindingError, lockContentionNakMs, readTaskLock,
 } from "./lock.js";
-import { runHandleTask, resolvePoisonedTask } from "./runner.js";
+import { releasePreGateLease, runHandleTask, resolvePoisonedTask } from "./runner.js";
 import { claimRun, failClaimedRun, type ClaimedRun } from "../clients/run-claim.js";
 import { claimedDoorbellMsg, declareRetryReason } from "../delivery/doorbell-delivery.js";
 import { intakeDoorbell } from "../delivery/doorbell-intake.js";
@@ -58,8 +58,9 @@ function getKv(): KV {
   return _kv;
 }
 
-function deferForLockContention(
+async function deferForLockContention(
   msg: JsMsg,
+  request: ExecuteRequest,
   fields: {
     sessionId: string;
     lockKey: string;
@@ -67,7 +68,7 @@ function deferForLockContention(
     taskId?: string;
     event: "task.in_progress.nak" | "task.lock_not_acquired.nak";
   },
-): void {
+): Promise<void> {
   const nakMs = lockContentionNakMs(msg.info.deliveryCount);
   // Stated here because this is the one site that knows the wait is a lock.
   if (fields.claimedDoorbell && fields.taskId) declareRetryReason(fields.taskId, "lock_contention");
@@ -81,6 +82,12 @@ function deferForLockContention(
     },
     fields.event,
   );
+  // A nak here is a request for a redelivery that probes the lock again, and a
+  // fat delivery that keeps its pre-gate lease guarantees the redelivery never
+  // reaches the probe: the acceptance is refused `superseded` and naks in turn
+  // for the rest of the TTL. See `releasePreGateLease`; a no-op on every path
+  // that holds no such lease.
+  await releasePreGateLease(request);
   msg.nak(nakMs);
 }
 
@@ -450,7 +457,19 @@ async function handleResolvedRequest(
       // same deliberately. Leaving it unsettled costs no extra ack-pending slot
       // (one stream sequence is one pending entry), and if that handler dies
       // the ack_wait lapse ends in the same termination anyway.
-      if (!finalDelivery) msg.nak(nakMs);
+      // Same reason as `deferForLockContention`: the lease this delivery took
+      // before the gate is what would turn its own redelivery away. Nothing
+      // else holds it -- an acceptance only succeeds on a row whose previous
+      // lease had lapsed or been given back -- so handing it back here is what
+      // lets the redelivery reach this guard again instead of bouncing off the
+      // pre-gate until the budget is spent, which ends as a silent termination
+      // rather than as the resolution this guard exists to produce.
+      // Not on the final delivery: nothing is naked there, so there is no
+      // redelivery for the lease to be in the way of.
+      if (!finalDelivery) {
+        await releasePreGateLease(request);
+        msg.nak(nakMs);
+      }
       return;
     }
 
@@ -480,6 +499,7 @@ async function handleResolvedRequest(
         "task.poison_message.unknown_holder_defer",
       );
       metrics.onTaskPoisonDeferred(lock.known ? "unknown_holder" : "probe_failed");
+      await releasePreGateLease(request);
       msg.nak(nakMs);
       return;
     }
@@ -563,7 +583,7 @@ async function handleResolvedRequest(
   // claim-next, which increments claim_count on every take. Fat-path nak waits
   // out the lock; the claimed wrapper's nak does the same delay then unclaim.
   if (activeAbort.has(lockKey)) {
-    deferForLockContention(msg, {
+    await deferForLockContention(msg, request, {
       sessionId, lockKey, claimedDoorbell, taskId: request.task_id,
       event: "task.in_progress.nak",
     });
@@ -574,7 +594,7 @@ async function handleResolvedRequest(
   //    handlers don't race either.
   const locked = await acquireTaskLock(lockKey, msg.seq);
   if (!locked) {
-    deferForLockContention(msg, {
+    await deferForLockContention(msg, request, {
       sessionId, lockKey, claimedDoorbell, taskId: request.task_id,
       event: "task.lock_not_acquired.nak",
     });

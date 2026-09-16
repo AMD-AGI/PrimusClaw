@@ -36,6 +36,11 @@
  * Every function here is best-effort in the same sense as tasks/chat-run.ts: a
  * bookkeeping row that nothing reads must never be the reason a conversation
  * fails. Failures are logged and swallowed, and a caller gets null.
+ *
+ * That holds on the pool, where a failed statement costs exactly itself. On a
+ * transaction a caller passed in it does not, and the functions that take one
+ * raise instead -- see `onCallerTransaction` for why the same failure cannot
+ * have the same answer in both places.
  */
 import pino from "pino";
 import { PG_INT4_MAX } from "@claw/utils";
@@ -46,6 +51,36 @@ import { newWorkspaceId } from "../tasks/ids.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "./prefix.js";
 
 const logger = pino({ name: "workspace-store" });
+
+/**
+ * Whether these statements are riding on a transaction the caller owns.
+ *
+ * The promise in the module header -- a bookkeeping row nothing reads may never
+ * be the reason a conversation fails -- is a statement about the pool, where a
+ * failed statement costs exactly itself. Inside a caller's transaction it is
+ * not available to make: the failure has already aborted that transaction, so
+ * every later statement on it raises 25P02 and Postgres turns the caller's
+ * `COMMIT` into a `ROLLBACK` that reports success.
+ *
+ * `openChatRun` is the caller that makes the difference concrete. It passes the
+ * client its task row was inserted on precisely so the reference and the claim
+ * cannot outlive a row that rolled back -- and then swallowing the failure here
+ * hands it back a task id, a lease and a reconcile token for a row that does
+ * not exist, its `COMMIT` discards the insert without saying so, and the fat
+ * dispatch publishes a full execute payload naming the task. Its own catch
+ * already re-raises for exactly this reason; it never sees the error because
+ * this module absorbed it first.
+ *
+ * So the acquire side reports too, the way `releaseRunUseStrict` already does
+ * on the release side: best-effort on the pool, raised to the transaction's
+ * owner when there is one. Decided by comparing against `db.query` rather than
+ * by a flag the caller sets, because that is exactly the default these
+ * functions take when nobody passed a transaction, and a second way of saying
+ * the same thing is a second thing to get wrong.
+ */
+function onCallerTransaction(q: Querier): boolean {
+  return q !== db.query;
+}
 
 /**
  * How long files survive after nothing references them.
@@ -259,8 +294,15 @@ export async function workspaceForSession(
   return (r.rows[0] as WorkspaceRow | undefined) ?? null;
 }
 
-async function getWorkspace(workspaceId: string): Promise<WorkspaceRow | null> {
-  const r = await db.query(
+// `q` so a claim running on a caller's transaction reads the row as that
+// transaction sees it, and so every statement this module's claim path issues
+// is on one connection -- which is what lets its catch conclude that a failure
+// there has aborted the caller's transaction.
+async function getWorkspace(
+  workspaceId: string,
+  q: Querier = db.query,
+): Promise<WorkspaceRow | null> {
+  const r = await q(
     `SELECT workspace_id, owner_user_id, storage_prefix, version::text AS version,
             writer_run_id, retention_expires_at, deleted_at
        FROM claw_workspaces WHERE workspace_id = $1`,
@@ -308,6 +350,12 @@ export async function acquireRef(
     );
     return true;
   } catch (err) {
+    // Best-effort on the pool, raised on a caller's transaction. A `false`
+    // reads as "this one reference was not taken", which is a thing a caller
+    // may reasonably carry on past; inside a transaction it is a report that
+    // every write in that transaction is already lost. See
+    // {@link onCallerTransaction}.
+    if (onCallerTransaction(q)) throw err;
     logger.warn({ err, workspaceId, kind, refId }, "workspace.ref_acquire_failed");
     return false;
   }
@@ -945,13 +993,19 @@ export async function claimWriter(
     if (r.rowCount) {
       return { held: true, version: String((r.rows[0] as { version: string }).version) };
     }
-    const current = await getWorkspace(workspaceId);
+    const current = await getWorkspace(workspaceId, q);
     return {
       held: false,
       heldBy: current?.writer_run_id ?? undefined,
       version: current?.version ?? "0",
     };
   } catch (err) {
+    // As in `acquireRef`: a `null` here means "could not tell" to a caller on
+    // the pool and "your transaction is aborted" to one that passed its own.
+    // `recordRunUse` only logs contention on this result, so swallowing it is
+    // how the aborted transaction reaches `openChatRun` as a success. See
+    // {@link onCallerTransaction}.
+    if (onCallerTransaction(q)) throw err;
     logger.warn({ err, workspaceId, runId }, "workspace.writer_claim_failed");
     return null;
   }

@@ -244,7 +244,6 @@ if HAS_CLICK:
                         print(f"  │ {stdout}", end="", file=sys.stderr)
                 elif event_type == "end":
                     session_id = data.get("sessionId", "")
-                    sandbox_name = data.get("sandboxName", "")
                     total_duration = data.get("total_duration")
                     dur_str = f" ({total_duration:.1f}s)" if total_duration else ""
                     if session_id:
@@ -1017,6 +1016,9 @@ if HAS_CLICK:
             try:
                 stop_event.wait()
             except KeyboardInterrupt:
+                # Ctrl+C is the documented way to stop the forward ("Press Ctrl+C to stop"
+                # above), so it is a normal exit, not an error. Swallow it here and fall
+                # through to the PortForward context manager's teardown.
                 pass
             print("\nStopped")
 

@@ -14,6 +14,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   KeepaliveConfigRefused, validateKeepaliveCapacity,
@@ -195,4 +197,50 @@ test("the declared span default covers this build's own worst case", async () =>
   assert.ok(SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC > keepaliveSweepCeilingSec(),
     `the shipped span ${SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC}s does not cover a worst-case `
       + `tick of ${keepaliveSweepCeilingSec()}s`);
+});
+
+/**
+ * The refusal has to land before the pod takes any work.
+ *
+ * Everything above proves the function refuses. None of it can prove the pod
+ * asks it before it starts consuming -- and the refusal is worth only as much
+ * as that ordering. `validateKeepaliveCapacity` throws and `main`'s catch calls
+ * `process.exit(1)`; called from `startBackgroundRuntime`, which ran after
+ * `startTaskDelivery`, that exit happened with the durable consumer open and
+ * the claim-next loop running, so the pod died holding deliveries it had begun
+ * and rows it had claimed. Neither comes back on exit: the messages wait out
+ * ack_wait and the rows wait out their leases, minutes of a turn a user is
+ * waiting on, spent on a setting that was knowable before the first connection.
+ *
+ * Read off the source, because `main()` cannot be called from a test -- it
+ * opens NATS, a consumer and an HTTP listener. Comments are stripped first so
+ * that prose about the ordering cannot satisfy it. The enclosing function is
+ * found rather than named, so the assertion survives it being renamed and still
+ * fails the arrangement it was written against.
+ */
+test("the pod proves its capacity before it opens the consumer", () => {
+  const source = readFileSync(
+    fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf-8",
+  )
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/[^\n]*/g, " ");
+
+  const callAt = source.indexOf("validateKeepaliveCapacity({");
+  assert.notEqual(callAt, -1, "nothing in the entrypoint proves the keepalive capacity at all");
+  const enclosing = [...source.slice(0, callAt).matchAll(/function\s+([A-Za-z0-9_]+)\s*\(/g)].pop();
+  assert.ok(enclosing, "the capacity proof is not inside a named function");
+  const gate = enclosing![1];
+  assert.notEqual(gate, "main", "expected the proof to live in a helper main calls");
+
+  const body = source.slice(source.indexOf("async function main("));
+  assert.notEqual(body, "", "could not find main()");
+  const proven = body.indexOf(`${gate}(`);
+  const consuming = body.indexOf("startTaskDelivery(");
+  assert.ok(proven > -1, `main() never calls ${gate}(), so nothing proves the capacity at startup`);
+  assert.ok(consuming > -1, "could not find the delivery loop's start in main()");
+  assert.ok(
+    proven < consuming,
+    `main() calls ${gate}() only after startTaskDelivery(), so a pod with an undeclared `
+    + "ceiling refuses to start having already consumed and claimed",
+  );
 });

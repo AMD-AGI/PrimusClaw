@@ -137,7 +137,21 @@ export async function readHandsEntry(
   // sandbox, and reading it as one is how a live workload gets replaced.
   for (const key of handsEntryKeys(sessionId)) {
     const entry = await kv.get(key);
-    if (entry) return { key, value: sc.decode(entry.value), revision: entry.revision, entry };
+    // A delete leaves a readable entry with an empty value rather than a miss,
+    // so "the first key that answers" is not "the first key that holds a
+    // binding" -- and the whole point of the walk is that during a rolling
+    // upgrade the binding can be under the *other* name. Returning the
+    // tombstone ends the walk on a key that holds nothing, the legacy key is
+    // never looked at, and every caller reads the empty value as the absence of
+    // a sandbox: ensureHands provisions a second one for a session that already
+    // has a live sandbox, readSessionPlatformKey answers "" so teardown has no
+    // key to stop the first with, and the task lock's TTL refresh writes that
+    // empty value back over the key at a fresh revision. A tombstone is the
+    // absence it reads as, so the walk goes on past it rather than stopping on
+    // it; all keys tombstoned is the same "no binding" as all keys absent.
+    if (entry && !isTombstone(entry)) {
+      return { key, value: sc.decode(entry.value), revision: entry.revision, entry };
+    }
   }
   return null;
 }

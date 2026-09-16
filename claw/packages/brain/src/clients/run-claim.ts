@@ -138,7 +138,31 @@ async function postHolderAction(
   as: HolderCall = {},
 ): Promise<void> {
   const url = taskActionUrl(taskId, action);
-  if (!url) return;
+  if (!url) {
+    // Said out loud, because a holder action with nowhere to go is not a
+    // no-op the caller can absorb: every one of them is settling a row, and
+    // returning quietly reports that it was settled. `claimRun` and
+    // `claimNextRun` already throw on the same missing base; these three were
+    // the only callers that treated it as nothing.
+    //
+    // The case that made it matter is a fat-only deployment. Its pre-gate
+    // takes the lease through `run_lease.url`, which the API puts on the wire,
+    // and gives it back through `settleClaimedRun` -- which addresses
+    // INTERNAL_BACKEND_URL, this pod's own configuration, and on such a
+    // deployment there is nothing to set it to. Every release is then a no-op:
+    // the lease stays live for its whole TTL, the redelivery it was released
+    // for is refused `superseded`, and a Stop arriving meanwhile cannot be
+    // answered either, because `stoppedAndUnheld` wants `lease_owner IS NULL`.
+    // Not repaired by POSTing to the URL from the payload instead -- see
+    // `apiBase`: the cluster token goes to the address this replica knows, and
+    // never to one a message named. So the configuration is what has to be
+    // fixed, and this is the line that says so.
+    logger.error(
+      { taskId, action, hasApiBase: apiBase() !== "" },
+      `${warn}.no_api_url`,
+    );
+    return;
+  }
   const attempts = as.attempts ?? 3;
   let lastDetail: unknown = null;
   for (let i = 0; i < attempts; i++) {
