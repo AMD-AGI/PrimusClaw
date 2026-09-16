@@ -305,8 +305,12 @@ export class AgentSandboxProvider implements SandboxProvider {
       }
       if (!resp.ok) return { running: false, healthy: false, state: "unknown" };
       const d = (await resp.json()) as { status?: string; healthy?: boolean; podIp?: string };
-      if (d.status === "running") {
+      const status = String(d.status ?? "").toLowerCase();
+      if (status === "running") {
         return { running: true, healthy: !!d.healthy, podIp: d.podIp, state: "running" };
+      }
+      if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(status)) {
+        return { running: false, healthy: false, podIp: d.podIp, state: "terminal" };
       }
       return { running: false, healthy: false, state: "unknown" };
     } catch {

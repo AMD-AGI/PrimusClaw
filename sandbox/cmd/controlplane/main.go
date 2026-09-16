@@ -89,6 +89,7 @@ func main() {
 	var probeAddr string
 	var enableLeaderElection bool
 	var enableExtensions bool
+	var enableIdleGC bool
 
 	routerPort = 8080
 	wmPort = 8081
@@ -107,6 +108,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
+	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller (default off; PrimusClaw brain owns idle reclaim)")
 	flag.Parse()
 
 	// controller-runtime keeps zap here, deliberately: switching it to the
@@ -123,6 +125,11 @@ func main() {
 	}
 	if v := os.Getenv("ENABLE_AUTH"); v == "true" {
 		routerCfg.EnableAuth = true
+	}
+	if v := os.Getenv("ENABLE_SANDBOX_IDLE_GC"); v == "true" {
+		enableIdleGC = true
+	} else if v == "false" {
+		enableIdleGC = false
 	}
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v
@@ -282,16 +289,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&agentd.SandboxReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		SessionTimeout: sessionTimeout,
-		Store:          st,
-		Audit:          auditStore,
-		Recorder:       mgr.GetEventRecorderFor("sandbox-idle-gc"),
-	}).SetupWithManager(mgr); err != nil {
-		log.Error("unable to setup idle GC controller", "error", err)
-		os.Exit(1)
+	if enableIdleGC {
+		if err := (&agentd.SandboxReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			SessionTimeout: sessionTimeout,
+			Store:          st,
+			Audit:          auditStore,
+			Recorder:       mgr.GetEventRecorderFor("sandbox-idle-gc"),
+		}).SetupWithManager(mgr); err != nil {
+			log.Error("unable to setup idle GC controller", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		log.Info("sandbox idle-GC controller disabled")
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -191,6 +192,32 @@ func TestComputeReadyCondition(t *testing.T) {
 			require.Equal(t, tc.expectedReason, condition.Reason)
 		})
 	}
+}
+
+func TestApplyPodTerminalConditions(t *testing.T) {
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning}})
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodSucceeded}})
+	cond := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodSucceeded, cond.Reason)
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed}})
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, metav1.ConditionTrue, failed.Status)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodFailed, failed.Reason)
+
+	applyPodTerminalConditions(sandbox, nil)
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
 }
 
 func TestReconcile(t *testing.T) {

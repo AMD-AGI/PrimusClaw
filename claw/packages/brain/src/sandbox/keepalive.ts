@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
-import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
+import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -21,7 +21,6 @@ import {
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { listAllDagHandles } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
-import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
 import {
   latchRosterStale, markCensusReconciled, markRosterStale, releaseAdmission,
@@ -36,6 +35,14 @@ import {
   ledgerKeyForRetention, reassertRetentions, releaseRetention,
 } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
+import {
+  inspectSandboxJobs,
+  SandboxJobsUnavailableError,
+  SandboxTerminalProbeError,
+  SandboxTrackingLostError,
+  type JobsProbeResult,
+} from "./job-probe.js";
+import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -53,7 +60,7 @@ export interface SandboxEntry {
 }
 
 interface HandsKvEntry {
-  status?: "pending" | "ready";
+  status?: "pending" | "ready" | "reclaiming" | "closing";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
   sessionId?: string;
@@ -84,6 +91,11 @@ interface HandsKvEntry {
    * starts at the later of this and `idleSince`.
    */
   workSeenAt?: number;
+  /** Epoch ms when EnvD first reported no tracked user jobs. */
+  quiescedAt?: number;
+  /** Identity of the Pod and EnvD process that produced the jobs verdict. */
+  podUid?: string;
+  envdInstanceId?: string;
   /**
    * Identifies the idle period opened by `markHandsIdle`; unlike `idleSince`, it
    * does not move while background work remains active.
@@ -173,6 +185,8 @@ interface HandsKvEntry {
    * while any unexpired reservation remains; each probe releases only its token.
    */
   bgProbes?: Record<string, number>;
+  /** Sandbox terminal reason observed after the workload reached Running. */
+  terminalReason?: string;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
@@ -181,8 +195,13 @@ interface HandsKvEntry {
 
 interface KeepaliveDeps {
   kv: KV;
-  /** Test seam for the background-work probe. */
+  /** Test seam for the EnvD jobs probe. Production never calls Hands here. */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /** Publish a terminal sandbox event to the session event stream. */
+  emitSandboxFailure?: (
+    sessionId: string,
+    event: Record<string, unknown>,
+  ) => Promise<void>;
   /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
   /** Test seam for the ping-phase budget. */
@@ -206,6 +225,25 @@ interface KeepaliveDeps {
    * admitted ones leave -- which starves exactly the target holding live work.
    */
   roster?: { store: RosterStore; config: RosterConfig };
+}
+
+/** Read the authoritative user-job count for idle reclaim. */
+function probeUserProcesses(
+  deps: KeepaliveDeps,
+  info: HandsKvEntry,
+  sessionId: string,
+): Promise<number> {
+  if (deps.countActiveShells) {
+    return deps.countActiveShells(info.handsUrl!, info.token!, sessionId);
+  }
+  return inspectSandboxJobs(info).then(async (result) => {
+    await persistJobsIdentity(deps, sessionId, result);
+    return result.count;
+  });
+}
+
+function isClosingStatus(status: HandsKvEntry["status"]): boolean {
+  return status === "closing" || status === "reclaiming";
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -873,6 +911,7 @@ export function markHandsIdle(
         Date.now(),
         entry.revision,
       );
+      delete info.quiescedAt;
       // Conditional update prevents resurrecting a concurrently deleted handle.
       const witness = nextEntryToken();
       info.idleWriter = witness;
@@ -1211,7 +1250,7 @@ function newTickStats(): TickStats {
 }
 
 /** Where a verdict came from, for the tick counters. */
-type VerdictSource = "mem" | "handle" | "none" | "no-hands";
+type VerdictSource = "mem" | "handle" | "none";
 
 /**
  * Whether a verdict is still about the idle period the handle is in now.
@@ -1273,6 +1312,7 @@ function measuredUnderThisIdlePeriod(
  * sweep that observed work.
  */
 function reuseWindowStart(info: HandsKvEntry): number {
+  if (typeof info.quiescedAt === "number") return info.quiescedAt;
   return Math.max(
     typeof info.idleSince === "number" ? info.idleSince : 0,
     typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
@@ -1323,19 +1363,6 @@ function peekBackgroundWork(
 ): { state: BackgroundWork; source: VerdictSource; at?: number } {
   const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
-  // Missing credentials mean this replica cannot ask again -- not that the
-  // answer is no. Returning `idle` here, before any verdict was read, threw
-  // away a witnessed `running` that another replica (or this one, before the
-  // token went) had already established: a sandbox with live background work
-  // was released because the address to re-check it had gone missing.
-  //
-  // So the evidence is read first, and the legacy `idle` is the fallback for
-  // the case it was written for: no credentials *and* nothing on record.
-  if (!info.handsUrl || !info.token) {
-    if (cached?.state === "running") return { state: "running", source: "mem", at: cached.at };
-    if (shared?.state === "running") return { state: "running", source: "handle", at: shared.at };
-    return { state: "idle", source: "no-hands" };
-  }
   if (cached?.state === "gone" || cached?.state === "unknown") {
     return { state: cached.state, source: "mem", at: cached.at };
   }
@@ -1354,9 +1381,16 @@ function peekBackgroundWork(
   return { state: "unknown", source: "none" };
 }
 
+/** Whether the handle contains enough control-plane identity to query EnvD jobs. */
+function canProbeJobs(info: HandsKvEntry): boolean {
+  return info.provider === "agent-sandbox"
+    ? !!info.sessionId
+    : !!(info.workloadId && info.platformKey);
+}
+
 /** Whether this sandbox identity needs a new background-work probe. */
 function needsProbe(identity: string, info: HandsKvEntry): boolean {
-  if (!info.handsUrl || !info.token) return false;
+  if (!canProbeJobs(info)) return false;
   // A verdict from another idle period cannot suppress a fresh probe.
   const cached = usableCachedVerdict(identity, info);
   if (cached && cached.state !== "unknown" && Date.now() - cached.at < BG_PROBE_REFRESH_MS) return false;
@@ -1436,6 +1470,63 @@ async function releaseProbe(
   } catch { /* best effort: the deadline is the backstop */ }
 }
 
+/** Bind jobs answers to the EnvD process that produced them. */
+async function persistJobsIdentity(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  result: JobsProbeResult,
+): Promise<void> {
+  if (!result.podUid && !result.instanceId) return;
+  try {
+    const key = `hands.${sessionId}`;
+    const entry = await deps.kv.get(key);
+    if (!entry) return;
+    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    const next: HandsKvEntry = {
+      ...info,
+      podUid: info.podUid || result.podUid,
+      envdInstanceId: info.envdInstanceId || result.instanceId,
+    };
+    if (next.podUid === info.podUid && next.envdInstanceId === info.envdInstanceId) return;
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), entry.revision);
+  } catch {
+    // The next successful jobs probe retries the identity binding.
+  }
+}
+
+/** Persist and publish one terminal verdict for a sandbox identity. */
+async function reportTerminalFailure(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  identity: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const key = `hands.${sessionId}`;
+    const entry = await deps.kv.get(key);
+    if (!entry) return;
+    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    if (entryIdentity(info) !== identity || info.terminalReason) return;
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...info, terminalReason: reason })),
+      entry.revision,
+    );
+  } catch {
+    // A later provider check reaches the same terminal result.
+    return;
+  }
+  if (!deps.emitSandboxFailure) return;
+  await deps.emitSandboxFailure(sessionId, {
+    type: "sandboxStatus",
+    status: "failed",
+    reason,
+    message: `Sandbox workload entered terminal phase (${reason})`,
+  }).catch((err) => {
+    logger.warn({ err, sessionId, reason }, "keepalive.terminal_event_failed");
+  });
+}
+
 interface ProbeCandidate {
   key: string;
   identity: string;
@@ -1480,18 +1571,26 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
     const reserved = await reserveProbe(deps, key, identity, token);
     if (!reserved || probeIsStale(probe)) return;
     try {
-      const running = await (deps.countActiveShells ?? countActiveShells)(
-        info.handsUrl!, info.token!, sessionId,
-      );
+      const running = await probeUserProcesses(deps, info, sessionId);
       await recordProbeVerdict(deps, probe, running > 0 ? "running" : "idle", running);
     } catch (err) {
       if (probeIsStale(probe)) return;
       await invalidateProbeVerdict(deps, probe);
       if (probeIsStale(probe)) return;
-      const evidence = await readProbeEvidence(probe);
-      if (probeIsStale(probe)) return;
-      if (evidence.state === "unknown") reportUnknownProbe(probe, err);
-      else await recordProbeVerdict(deps, probe, evidence.state, evidence.running);
+      if (err instanceof SandboxTerminalProbeError) {
+        await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      } else if (err instanceof SandboxRuntimeTerminalError) {
+        await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      } else if (err instanceof SandboxTrackingLostError) {
+        logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+      } else if (err instanceof SandboxJobsUnavailableError) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+          "keepalive.jobs_api_absent",
+        );
+      } else {
+        reportUnknownProbe(probe, err);
+      }
     }
   } catch (err) {
     if (!probeIsStale(probe)) {
@@ -1531,32 +1630,6 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
   }
 }
 
-async function readProbeEvidence(
-  probe: BackgroundProbe,
-): Promise<{ state: BackgroundWork; running?: number }> {
-  const inst = instanceFromEntry(probe.sessionId, probe.info);
-  if (!inst) return { state: "unknown" };
-  const provider = inst.provider === "agent-sandbox"
-    ? getAgentSandboxProvider() : getSafeWorkloadProvider();
-  try {
-    const status = await provider.get(inst);
-    if (probeIsStale(probe)) return { state: "unknown" };
-    if (status.state === "absent" || status.state === "terminal") return { state: "gone" };
-  } catch (err) {
-    logger.warn({ err, sessionId: probe.sessionId }, "keepalive.provider_evidence_failed");
-  }
-  if (probeIsStale(probe)) return { state: "unknown" };
-  const live = await countLiveWork(inst, HANDS_STATE_DIR);
-  if (probeIsStale(probe)) return { state: "unknown" };
-  if (live.verdict === "clear") return { state: "idle", running: 0 };
-  if (live.verdict === "protected") {
-    const running = PROTECTED_CLASSES.reduce((sum, cls) => sum + (live.classes[cls] ?? 0), 0);
-    return { state: "running", running };
-  }
-  logger.warn({ sessionId: probe.sessionId, reason: live.reason }, "keepalive.work_evidence_unknown");
-  return { state: "unknown" };
-}
-
 async function recordProbeVerdict(
   deps: KeepaliveDeps,
   probe: BackgroundProbe,
@@ -1591,10 +1664,6 @@ async function recordProbeVerdict(
 
 function reportUnknownProbe(probe: BackgroundProbe, err: unknown): void {
   const { identity, sessionId, info } = probe;
-  if (err instanceof HandsLivenessIndeterminate) {
-    logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.background_work_indeterminate");
-    return;
-  }
   const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
   bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
   logger.warn(
@@ -1693,6 +1762,10 @@ async function persistVerdict(
       }
       const next = sc.encode(JSON.stringify({
         ...info,
+        ...(running === 0 && usableSharedVerdict(info)?.state !== "idle"
+          ? { quiescedAt: info.quiescedAt ?? measuredAt }
+          : {}),
+        ...(running > 0 ? { quiescedAt: undefined } : {}),
         bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,
@@ -1744,10 +1817,16 @@ async function refreshIdleSince(
       seenAt,
     );
     // The reuse clock reflects when this sweep acted on the running verdict.
-    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: (deps.now ?? Date.now)() }));
+    const next = sc.encode(JSON.stringify({
+      ...info,
+      idleSince,
+      workSeenAt: (deps.now ?? Date.now)(),
+      quiescedAt: undefined,
+    }));
     await deps.kv.update(key, next, revision);
     // Keep the scan copy aligned for probes dispatched later in this tick.
     info.idleSince = idleSince;
+    delete info.quiescedAt;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
@@ -1877,7 +1956,20 @@ async function collectKvTarget(
 ): Promise<boolean> {
   const sessionId = sessionIdFromHandsKey(key);
   const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+  if (isClosingStatus(info.status)) {
+    await destroyHands(sessionId, info).catch((err) => {
+      logger.warn({ err, sessionId }, "keepalive.closing_stop_retry");
+    });
+    return true;
+  }
   if (info.status && info.status !== "ready") return true;
+  if (info.terminalReason) {
+    logger.error(
+      { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
+      "keepalive.sandbox_terminal_recorded",
+    );
+    return true;
+  }
   if (isRetentionEntry(info)) {
     return sweepRetention(deps, census, key, e, info);
   }
@@ -1917,7 +2009,6 @@ async function collectIdleTarget(
   if (peeked.source === "mem") stats.fromMem += 1;
   else if (peeked.source === "handle") stats.fromHandle += 1;
   else if (peeked.source === "none") stats.fromNone += 1;
-  else if (peeked.source === "no-hands") stats.fromNoHands += 1;
   const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
   if (needsProbe(identity, info)) census.probeCandidates.push(candidate);
   if (bgWork === "running" || bgWork === "unknown") {
@@ -1966,19 +2057,51 @@ async function expireIdleTarget(
     await deps.kv.update(key, e.value, e.revision).catch(() => {});
     return;
   }
-  // Release only after the conditional delete wins against any reactivation.
-  const deleted = await deps.kv.delete(key, { previousSeq: e.revision })
-    .then(() => true).catch(() => false);
-  if (deleted) {
+  // Reconfirm Running and an empty EnvD jobs roster at the destructive boundary.
+  // The ready-to-closing CAS lets a concurrent message win instead of being stopped.
+  let claimed = false;
+  try {
+    const running = await probeUserProcesses(deps, info, sessionId);
+    if (running > 0) {
+      await refreshIdleSince(deps, key, e.revision, info, Date.now());
+      return;
+    }
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...info, status: "closing" })),
+      e.revision,
+    );
+    claimed = true;
+    await destroyHands(sessionId, info);
     stats.expired += 1;
-    if (!await releaseAdmission(identity)) {
-      logger.error({ sessionId, identity }, "keepalive.admission_release_unconfirmed");
+    logger.info(
+      { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId },
+      "keepalive.idle_handle_expired",
+    );
+  } catch (err) {
+    if (err instanceof SandboxTerminalProbeError) {
+      await reportTerminalFailure(deps, sessionId, identity, err.reason);
+    } else if (err instanceof SandboxRuntimeTerminalError) {
+      await reportTerminalFailure(deps, sessionId, identity, err.reason);
+    } else if (err instanceof SandboxTrackingLostError) {
+      logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    } else if (err instanceof SandboxJobsUnavailableError) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+        "keepalive.idle_reclaim_jobs_api_absent",
+      );
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    } else if (isRevisionConflict(err)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+    } else {
+      logger.warn(
+        { err, sessionId, workloadId: info.workloadId },
+        "keepalive.idle_reclaim_deferred",
+      );
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     }
   }
-  logger.info(
-    { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, deleted },
-    "keepalive.idle_handle_expired",
-  );
 }
 
 async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -2291,7 +2414,7 @@ async function pingSandbox(
 
   try {
     if (isAgent) {
-      await getAgentSandboxProvider().get({
+      const status = await getAgentSandboxProvider().get({
         provider: "agent-sandbox",
         id: entry.sessionId!,
         sandboxName: entry.sandboxName ?? "",
@@ -2299,6 +2422,18 @@ async function pingSandbox(
         handsBaseUrl: "",
         userId: entry.userId,
       });
+      if (status.state === "terminal") {
+        throw new SandboxRuntimeTerminalError(
+          status.reason ?? "sandbox_workload_terminal",
+          `sandbox workload state=${status.state}`,
+        );
+      }
+      if (status.state === "absent") {
+        throw new SandboxGoneError(`sandbox workload state=${status.state}`);
+      }
+      if (status.state !== "running") {
+        throw new Error(`sandbox workload state=${status.state ?? "unknown"}`);
+      }
     } else {
       await getSafeWorkloadProvider().exec({
         provider: "safe-workload",
@@ -2327,6 +2462,9 @@ async function pingSandbox(
     );
     return null;
   } catch (error: any) {
+    if (error instanceof SandboxRuntimeTerminalError) {
+      await reportTerminalFailure(deps, sessionId, targetKey, error.reason);
+    }
     if (error?.sandboxConfirmedRunning === true) {
       failCounts.delete(targetKey);
       logger.error(

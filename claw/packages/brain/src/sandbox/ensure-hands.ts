@@ -62,6 +62,7 @@ import {
   admitSandbox, assertFleetCensused, type AdmissionHold,
 } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
+import { SandboxProvisionTerminalError } from "./errors.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -299,6 +300,15 @@ export async function assertDagHandleAlive(
   if (health.ok) return;
   if (identity && token) {
     const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+    if (probe.reason === "exec_sandbox_terminal") {
+      await reuseEffects.destroyHands(sessionId, identity, token).catch((err) => {
+        logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+      });
+      throw new SandboxProvisionTerminalError(
+        probe.failureReason ?? "sandbox_workload_terminal",
+        `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
+      );
+    }
     if (probe.verdict === "alive") {
       const restarted = await reuseEffects.restartHandsInSandbox({
         sessionId,
@@ -403,6 +413,19 @@ async function recoverUnhealthyReuse(
   signal?: AbortSignal,
 ): Promise<EnsureHandsResult | null> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+  if (probe.reason === "exec_sandbox_terminal") {
+    await reuseEffects.destroyHands(
+      sessionId,
+      identity,
+      typeof info.token === "string" ? info.token : undefined,
+    ).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    throw new SandboxProvisionTerminalError(
+      probe.failureReason ?? "sandbox_workload_terminal",
+      `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
+    );
+  }
   if (probe.verdict === "dead") return null;
   if (probe.verdict === "unknown") {
     logger.warn(
@@ -581,6 +604,19 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   );
   const identity = reuseIdentity(info);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
+  if (typeof info.terminalReason === "string" && info.terminalReason) {
+    await reuseEffects.destroyHands(
+      sessionId,
+      identity,
+      hasToken ? info.token : undefined,
+    ).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    throw new SandboxProvisionTerminalError(
+      info.terminalReason,
+      `sandbox workload entered terminal phase (${info.terminalReason})`,
+    );
+  }
 
   // Multi-node bakes cluster env at sandbox create; hands never reloads env.
   // Always replace any prior sandbox (single- or multi-node) with a fresh one.
@@ -595,6 +631,14 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       "ensureHands.mn_replace_sandbox",
     );
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    return null;
+  }
+
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info(
+      { sessionId, workloadId: info.workloadId, status: info.status },
+      "ensureHands.closing_not_reusable",
+    );
     return null;
   }
 
@@ -666,7 +710,11 @@ async function clearIdleMarkers(
   identity: SandboxEntry,
   binding: HandsBinding,
 ): Promise<boolean> {
-  if (info.keepalive === undefined && info.idleSince == null) return true;
+  if (
+    info.keepalive === undefined
+    && info.idleSince == null
+    && info.quiescedAt == null
+  ) return true;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
   // handle parked, and eligibleForClusterReclaim refuses any entry whose
   // keepalive is not false, so clearing it here would strip a session delete's
@@ -676,8 +724,13 @@ async function clearIdleMarkers(
     logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
     return true;
   }
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+    return false;
+  }
   delete info.keepalive;
   delete info.idleSince;
+  delete info.quiescedAt;
   const { key } = binding;
   const payload = sc.encode(JSON.stringify(info));
   try {
@@ -702,7 +755,13 @@ async function clearIdleMarkers(
     // The markers are not part of the identity HandsProbeEntry describes, but
     // they live on the same value and this is the writer that removes them.
     const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
-      & { keepalive?: boolean; idleSince?: unknown; sessionDeleted?: boolean };
+      & {
+        keepalive?: boolean;
+        idleSince?: unknown;
+        quiescedAt?: unknown;
+        sessionDeleted?: boolean;
+        status?: string;
+      };
     // Parked by a session delete while we were losing the race. Same sandbox,
     // so the identity check below would pass -- but clearing `keepalive:false`
     // here un-parks it, and eligibleForClusterReclaim refuses any entry whose
@@ -713,6 +772,10 @@ async function clearIdleMarkers(
       logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
       return true;
     }
+    if (current.status === "closing" || current.status === "reclaiming") {
+      logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+      return false;
+    }
     if (!sameHandsSandbox(identity, current)) {
       // Someone else's sandbox now. Reusing ours is still correct -- it passed
       // its own health check under its own identity -- but its markers are not
@@ -720,9 +783,16 @@ async function clearIdleMarkers(
       logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
       return true;
     }
-    if (current.keepalive === undefined && current.idleSince == null) return true;
+    if (
+      current.keepalive === undefined
+      && current.idleSince == null
+      && current.quiescedAt == null
+    ) return true;
     await kv.update(key, sc.encode(JSON.stringify({
-      ...current, keepalive: undefined, idleSince: undefined,
+      ...current,
+      keepalive: undefined,
+      idleSince: undefined,
+      quiescedAt: undefined,
     })), latest.revision);
     return true;
   } catch (err) {

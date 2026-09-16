@@ -102,6 +102,16 @@ type GPUDevice struct {
 	Temperature int    `json:"temperature"`
 }
 
+// JobsResponse is the response from GET /api/jobs.
+type JobsResponse struct {
+	// UserProcesses is true when any tracked execute still has a live user PID.
+	UserProcesses    bool   `json:"user_processes"`
+	UserProcessCount int    `json:"user_process_count"`
+	TrackingLost     bool   `json:"tracking_lost"`
+	PodUID           string `json:"pod_uid,omitempty"`
+	InstanceID       string `json:"instance_id"`
+}
+
 // GPUStatusResponse is the response from GET /api/gpu/status.
 type GPUStatusResponse struct {
 	Available   bool        `json:"available"`

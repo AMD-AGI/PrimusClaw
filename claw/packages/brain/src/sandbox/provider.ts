@@ -61,6 +61,8 @@ export interface SandboxStatus {
   podIp?: string;
   /** Whether the provider could distinguish absence from a control-plane error. */
   state?: "running" | "terminal" | "absent" | "unknown";
+  /** Stable reason when state is terminal. */
+  reason?: string;
 }
 
 export interface SandboxExecResult {

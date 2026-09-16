@@ -254,7 +254,14 @@ test("a Failed phase is terminal, reported as failed", async () => {
 
 // ── classifyWorkloadTerminalReason ───────────────────────────────────────────
 
-test("timeout is read from the terminal condition", () => {
+test("an EnvD exit 0 without an explicit stop is a sandbox environment failure", () => {
+  assert.equal(
+    classifyWorkloadTerminalReason({
+      conditions: [{ type: "AdminFailed", message: "Pod phase is Succeeded; EnvD exited 0 without an explicit Brain stop" }],
+    }),
+    "sandbox_envd_exited",
+  );
+});
   assert.equal(
     classifyWorkloadTerminalReason({ conditions: [{ type: "AdminStopped", message: "the workload has timed out" }] }),
     "sandbox_timed_out",
