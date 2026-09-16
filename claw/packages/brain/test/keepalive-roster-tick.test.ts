@@ -1280,6 +1280,47 @@ test("a census read that outlasts the container timeout still fits the census ce
   }
 });
 
+test("a slow handle release cannot push the phase past its declared ceiling", async () => {
+  // Round 47. The handle cleanup added to this phase is a full-table scan plus a
+  // CAS per handle, and only the enumeration carries a limit of its own -- so
+  // before it was bounded here, a `clear` verdict arriving near the read budget
+  // could be followed by an unbounded cleanup, and the phase could exceed the
+  // very number every span and refresh interval is derived from.
+  //
+  // The existing ceiling test above resolves `releaseDagHandles` immediately, so
+  // it cannot see this: what it measures is the reads.
+  const { keepaliveCensusPhaseCeilingSec } = await import("../src/sandbox/keepalive.js");
+  const ceilingMs = keepaliveCensusPhaseCeilingSec() * 1000;
+
+  const generation = "gen-slow-release";
+  const key = retentionKey(generation);
+  const value = entry(`wl-${generation}`, {
+    sandboxName: generation, protected: true, reason: "protected",
+    detail: "live_work_present", keepalive: false, idleSince: 0,
+  });
+  kv.seed(key, value);
+  kv.seed(ledgerKeyForRetention(key), value);
+
+  const startedAt = Date.now();
+  await runKeepaliveTickForTest({
+    // Never settles. The bound has to come from this side of the call, which is
+    // the whole point: a release that hangs is exactly the case a limit on the
+    // enumeration alone does not cover.
+    releaseDagHandles: () => new Promise<void>(() => {}),
+    kv, countActiveShells: async () => 0, now: () => now,
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.ok(elapsedMs <= ceilingMs,
+    `the tick waited ${elapsedMs}ms on a hanging release against a declared phase `
+      + `ceiling of ${ceilingMs}ms`);
+  // And the retention survives, because the release never happened -- the next
+  // sweep is what retries it.
+  assert.ok(kv.get(key) !== undefined || kv.get(ledgerKeyForRetention(key)) !== undefined,
+    "a release that timed out must leave the retention standing");
+});
+
 test("a restart mid-cycle costs the tail one more cycle and no more", async () => {
   // The queue is process-local, like every other rotation state here, so a
   // restart empties it and the next sweep orders itself by the walk again. That

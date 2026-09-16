@@ -468,7 +468,25 @@ async function runRetentionReadPhase(
       // by one sweep is a container that is simply released a sweep later.
       if (target.inst.id) {
         try {
-          await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id);
+          // Bounded on this side of the call, like every other term in the
+          // phase ceiling: the release scans the whole handle table and then
+          // CASes per handle, and only the enumeration carries a limit of its
+          // own. A deadline here is what keeps the ceiling above a number the
+          // phase can actually exceed.
+          let timer: NodeJS.Timeout;
+          await Promise.race([
+            (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id)
+              .finally(() => clearTimeout(timer)),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(
+                  `dag-handle release exceeded ${HANDLE_RELEASE_CEILING_MS}ms`,
+                )),
+                HANDLE_RELEASE_CEILING_MS,
+              );
+              timer.unref?.();
+            }),
+          ]);
         } catch (err) {
           // Caught here, not by the outer handler: this is the one failure on
           // this path that must leave the retention exactly where it is, and it
@@ -1030,6 +1048,22 @@ const BG_VERDICT_WRITE_ATTEMPTS = 64;
  */
 const CENSUS_READ_BUDGET_MS = 15_000;
 /**
+ * The ceiling on freeing a released container's DAG handle.
+ *
+ * This work happens inside the retention read phase, after the read that
+ * answered `clear`, so it lands on the same wall clock the phase's ceiling is
+ * stated over -- and it is a full-table scan plus a CAS per handle, neither of
+ * which the scan's own 10s enumeration limit bounds end to end. Unbounded, a
+ * phase whose stated worst case is `CENSUS_READ_BUDGET_MS +
+ * LIVE_WORK_READ_CEILING_MS` could exceed it, and every span and refresh
+ * interval derived from that number would be wrong by however long the cleanup
+ * took.
+ *
+ * Exceeding it is not a failure of the sweep: the retention records stay, so the
+ * next sweep tries again -- the same recovery a refused CAS already gets.
+ */
+const HANDLE_RELEASE_CEILING_MS = 10_000;
+/**
  * Every retention the last read phase left unread, in the order it deferred
  * them.
  *
@@ -1143,7 +1177,9 @@ export function keepalivePingPhaseCeilingSec(): number {
  * enforced on this side of the call rather than one hoped for.
  */
 export function keepaliveCensusPhaseCeilingSec(): number {
-  return Math.ceil((CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS) / 1000);
+  return Math.ceil(
+    (CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS + HANDLE_RELEASE_CEILING_MS) / 1000,
+  );
 }
 
 /**
