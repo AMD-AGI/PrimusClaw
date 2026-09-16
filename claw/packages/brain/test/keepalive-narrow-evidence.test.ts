@@ -40,13 +40,21 @@ function bodyOf(name: string): string {
 test("missing probe credentials do not erase a witnessed running verdict", () => {
   // Credentials gone means this replica cannot ask again. It does not mean the
   // answer is no, and a verdict another replica established is still evidence.
+  // No credential is consulted where the verdict is read, so there is nothing
+  // left that can answer "idle" on the strength of an address being absent.
   const body = bodyOf("peekBackgroundWork");
-  const guard = body.indexOf("!info.handsUrl || !info.token");
   const cachedRead = body.indexOf("usableCachedVerdict(");
-  assert.ok(cachedRead >= 0 && cachedRead < guard, "verdicts are read before the fallback");
-  const fallback = body.slice(guard, guard + 400);
-  assert.match(fallback, /cached\?\.state === "running"/, "a cached running survives it");
-  assert.match(fallback, /shared\?\.state === "running"/, "so does a shared one");
+  const sharedRead = body.indexOf("usableSharedVerdict(");
+  const firstReturn = body.indexOf("return {");
+  assert.ok(cachedRead >= 0 && cachedRead < firstReturn, "the cached verdict is read first");
+  assert.ok(sharedRead >= 0 && sharedRead < firstReturn, "so is the shared one");
+  assert.doesNotMatch(body, /handsUrl|token/, "no credential gates the read");
+  // Whether this replica can ask at all is a separate question, asked where the
+  // idle clock is advanced rather than where the verdict is read.
+  assert.match(
+    bodyOf("collectIdleTarget"), /canProbeJobs\(info, sessionId\)/,
+    "the ability to probe gates the clock, not the evidence",
+  );
 });
 
 test("an expired retry separates a failed lock read from an absent lock", () => {

@@ -86,6 +86,9 @@ function stubPingableProvider(): void {
   const provider = {
     kind: "safe-workload",
     async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    // Reclaim confirms Running through the control plane before it reads the
+    // job roster, so a stub that only answers exec leaves it undecided.
+    async get() { return { running: true, healthy: true, state: "running" }; },
     async stop() {},
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
@@ -131,6 +134,9 @@ function fakeKv(opts: { runLease?: boolean } = {}): { kv: KV; deleted: string[];
 
 test("an idle handle past its window is expired when nothing is running on it", async () => {
   const { kv, deleted } = fakeKv();
+  // Reclaim stops the workload before it clears the record, so the provider
+  // has to answer here as well; the key survives a stop it cannot confirm.
+  stubPingableProvider();
   await sweepTwice(kv);
   assert.ok(deleted.includes(`hands.${SESSION}`),
     "the reuse window is over and no run holds it, so the handle goes");

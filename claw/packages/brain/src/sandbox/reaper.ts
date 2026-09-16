@@ -48,7 +48,8 @@ import {
 import { isTombstone } from "../tasks/lock.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { unregisterSandbox } from "./keepalive.js";
+import { pingTargetIdentity, unregisterSandbox } from "./keepalive.js";
+import { releaseAdmission } from "./admission.js";
 import {
   instanceFromEntry,
   parseHandsProbeValue,
@@ -280,7 +281,17 @@ export async function destroyHands(
   // Scoped local cleanup: never revoke a sibling's token or remove a
   // registration that replaced this one while stop was in flight.
   revokeHandsToken(knownToken || (ownsRecorded ? recorded.identity?.token || "" : ""));
-  unregisterSandbox(sessionId, target);
+  // The slot is held past the stop and given back with the record, below. A
+  // binding still in the bucket is a target the next sweep reconciles back in,
+  // so a ceiling passed on before the delete lands admits over itself.
+  unregisterSandbox(sessionId, target, { releaseSlot: false });
+
+  const releaseSlot = async (): Promise<void> => {
+    const identity = pingTargetIdentity(target);
+    if (!await releaseAdmission(identity)) {
+      logger.error({ sessionId, identity }, "sandbox.destroy.admission_release_unconfirmed");
+    }
+  };
 
   if (!ownsRecorded || recorded.revision === undefined) {
     logger.warn(
@@ -296,19 +307,28 @@ export async function destroyHands(
   }
 
   const deleted = await deleteHandsEntryIfRevision(kv, key, recorded.revision);
-  if (deleted) return;
+  if (deleted) {
+    await releaseSlot();
+    return;
+  }
 
   // A keepalive TTL refresh changes the revision without changing ownership.
   // Retry that benign race, but never delete a replacement sibling.
   const latest = await readHandsEntry(sessionId);
-  if (latest.state === "missing") return;
+  if (latest.state === "missing") {
+    await releaseSlot();
+    return;
+  }
   if (
     latest.state === "valid"
     && latest.identity
     && latest.revision !== undefined
     && sameHandsSandbox(target, latest.identity)
   ) {
-    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) return;
+    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) {
+      await releaseSlot();
+      return;
+    }
     // Losing twice means the key is being written faster than we can clear
     // it -- but the workload is already stopped, which is the part callers
     // build a replacement on top of. Throwing here fails a user request over

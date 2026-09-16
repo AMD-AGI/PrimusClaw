@@ -15,7 +15,7 @@ import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../ta
 import { isTombstone } from "../tasks/lock.js";
 import { destroyHands } from "./reaper.js";
 import {
-  handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
+  bindHandsKv, handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
   sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
@@ -36,6 +36,7 @@ import {
 } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
 import {
+  assertSandboxRunning,
   inspectSandboxJobs,
   SandboxJobsUnavailableError,
   SandboxTerminalProbeError,
@@ -228,21 +229,22 @@ interface KeepaliveDeps {
 }
 
 /** Read the authoritative user-job count for idle reclaim. */
-function probeUserProcesses(
+async function probeUserProcesses(
   deps: KeepaliveDeps,
   info: HandsKvEntry,
   sessionId: string,
 ): Promise<number> {
+  const entry = { ...info, sessionId: info.sessionId || sessionId };
   if (deps.countActiveShells) {
-    return deps.countActiveShells(info.handsUrl!, info.token!, sessionId);
+    // The roster read is substituted; the control-plane check is not. A
+    // workload reported absent or terminal is that regardless of who counts
+    // its jobs, and the substitution must not turn it into an unknown.
+    await assertSandboxRunning(entry);
+    return deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId);
   }
-  return inspectSandboxJobs({
-    ...info,
-    sessionId: info.sessionId || sessionId,
-  }).then(async (result) => {
-    await persistJobsIdentity(deps, sessionId, result);
-    return result.count;
-  });
+  const result = await inspectSandboxJobs(entry);
+  await persistJobsIdentity(deps, sessionId, result);
+  return result.count;
 }
 
 function isClosingStatus(status: HandsKvEntry["status"]): boolean {
@@ -1660,6 +1662,8 @@ async function recordProbeVerdict(
     || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope);
   if (probeIsStale(probe)) return;
   if (held && state !== "running") return;
+  // Verdict freshness is compared against `Date.now` by usableSharedVerdict and
+  // usableCachedVerdict, so the reading they age must come off that same clock.
   const measuredAt = Date.now();
   bgProbeCache.set(identity, {
     at: measuredAt, state, epoch: info.idleEpoch,
@@ -1778,10 +1782,14 @@ async function persistVerdict(
         );
         return;
       }
+      // The idle window opens on the sweep clock, which is what
+      // reuseWindowStart is later compared against; verdict freshness above
+      // ages on `Date.now`. Each anchor is read off the clock that measures it.
+      const quiescedAt = (deps.now ?? Date.now)();
       const next = sc.encode(JSON.stringify({
         ...info,
         ...(running === 0 && usableSharedVerdict(info)?.state !== "idle"
-          ? { quiescedAt: info.quiescedAt ?? measuredAt }
+          ? { quiescedAt: info.quiescedAt ?? quiescedAt }
           : {}),
         ...(running > 0 ? { quiescedAt: undefined } : {}),
         bgCheckedAt: measuredAt,
@@ -2201,6 +2209,11 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
  */
 /** One sweep, exported so its decisions can be tested without an interval. */
 export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void> {
+  // Reclaim reaches destroyHands, which reads the process-wide handle KV
+  // instead of the bucket passed in here. Binding the injected one keeps a
+  // sweep driven through this entry point operating on a single bucket; the
+  // production path binds it at boot.
+  bindHandsKv(deps.kv);
   return tick(deps);
 }
 

@@ -135,6 +135,21 @@ export async function countSandboxUserProcesses(
   return (await inspectSandboxJobs(entry, timeoutMs)).count;
 }
 
+/**
+ * Confirm through the control plane that the sandbox is Running.
+ *
+ * Absence and a terminal phase are conclusions about the workload rather than
+ * about its job roster, so this is asked independently of how the roster is
+ * read and stays outside any substitution of that read.
+ */
+export async function assertSandboxRunning(entry: JobProbeEntry): Promise<void> {
+  const inst = instanceFromEntry(entry);
+  const provider = inst.provider === "agent-sandbox"
+    ? getAgentSandboxProvider()
+    : getSafeWorkloadProvider();
+  requireRunning(await provider.get(inst));
+}
+
 /** Inspect EnvD jobs and the process identity those jobs belong to. */
 export async function inspectSandboxJobs(
   entry: JobProbeEntry,
@@ -142,8 +157,7 @@ export async function inspectSandboxJobs(
 ): Promise<JobsProbeResult> {
   const inst = instanceFromEntry(entry);
   const agent = inst.provider === "agent-sandbox";
-  const provider = agent ? getAgentSandboxProvider() : getSafeWorkloadProvider();
-  requireRunning(await provider.get(inst));
+  await assertSandboxRunning(entry);
 
   const base = agent
     ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
