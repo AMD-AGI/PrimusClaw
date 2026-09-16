@@ -54,7 +54,17 @@ function durableBucket() {
       if (current?.revision !== expected) throw conflict();
       map.set(key, { value, revision: expected + 1 });
     },
-    async delete(key: string) { map.delete(key); },
+    // Honours `previousSeq` the way `create` and `update` beside it honour
+    // their conditions, and the way the real bucket does. A stub that dropped
+    // it would leave the lost-delete race unreachable by any test here -- which
+    // is the seam a confirmation mid-flight arrives at.
+    async delete(key: string, opts?: { previousSeq?: number }) {
+      const current = map.get(key);
+      if (opts?.previousSeq !== undefined && current?.revision !== opts.previousSeq) {
+        throw conflict();
+      }
+      map.delete(key);
+    },
     async keys(filter: string) {
       const hits = [...map.keys()].filter((k) => matchesKvFilter(k, filter));
       return (async function* () { yield* hits; })();
@@ -151,6 +161,91 @@ test("a commitment under a replaced sandbox is left exactly as it stands", async
   assert.deepEqual(settled.unresolved, [ORPHAN.shellId],
     "whether it ran is not determinable against a sandbox that can no longer be asked");
   assert.equal((await readRow(bgRowStore()!, ORPHAN))?.state, "dispatched");
+});
+
+/**
+ * Stage the confirmation this reconciliation is racing.
+ *
+ * The dispatch the reconciler is deciding about is still in flight -- a lease
+ * takeover leaves the predecessor executing until its next heartbeat notices --
+ * so its `spawn_confirmed` write lands at some point during the decision. The
+ * read index picks where: 1 is after the scan that produced the row, before the
+ * release reads it again; 2 is after that read, at the delete itself.
+ */
+function confirmDuringReconcile(atRead: 1 | 2): void {
+  const inner = bucket;
+  const key = rowKey(ORPHAN);
+  let reads = 0;
+  const raced = {
+    ...inner,
+    async get(k: string) {
+      const entry = await inner.get(k);
+      if (k === key && entry && ++reads === atRead) {
+        await inner.update(k, new TextEncoder().encode(JSON.stringify({
+          ...ORPHAN, generation: GENERATION, state: "spawn_confirmed",
+          stepIdentity: "toolu_predecessor", sequence: 1, claimedBy: "brain-dead",
+        })), entry.revision);
+      }
+      return entry;
+    },
+  };
+  restoreRows?.();
+  restoreRows = bindBgHandleRowsForTest(raced as never);
+}
+
+test("a confirmation that wins the delete is never reported as a start that never ran", async () => {
+  // The exact interleaving a lease handover produces: the reconciler probes,
+  // sees no record yet, and decides to release -- while the send it is deciding
+  // about is confirming its shell. The release loses the compare-and-set, and
+  // losing it is the interlock doing its job, not a delete that happened.
+  await seedOrphanedDispatch(GENERATION);
+  confirmDuringReconcile(2);
+
+  const settled = await handsClient(URL).reconcileOutstandingStarts();
+
+  assert.deepEqual(settled.released, [],
+    "a delete this call did not perform cannot license \"nothing ran\"");
+  assert.deepEqual(settled.unresolved, [ORPHAN.shellId]);
+  assert.equal((await readRow(bgRowStore()!, ORPHAN))?.state, "spawn_confirmed",
+    "and the row still attests the shell, so the record and what the model is "
+      + "told cannot disagree about whether the command ran");
+});
+
+test("a confirmation that lands before the release's own read is not deleted by it", async () => {
+  // The same race one step earlier. A delete conditioned on a fresh read would
+  // succeed here -- destroying the row of a running shell and reporting it as a
+  // start that never happened -- so the condition is the revision the decision
+  // was taken at, not whatever the address holds now.
+  await seedOrphanedDispatch(GENERATION);
+  confirmDuringReconcile(1);
+
+  const settled = await handsClient(URL).reconcileOutstandingStarts();
+
+  assert.deepEqual(settled.released, []);
+  assert.deepEqual(settled.unresolved, [ORPHAN.shellId]);
+  assert.equal((await readRow(bgRowStore()!, ORPHAN))?.state, "spawn_confirmed");
+});
+
+test("a start whose release lost its race is reported as undecided, not as one that did not run", async () => {
+  // What the model is actually handed. "Never started" is an instruction to
+  // issue the command again, under a new sequence and a new shell id that
+  // Hands' exclusive create can never match to this one -- so a start that may
+  // have landed must reach the transcript as the check it is.
+  await seedOrphanedDispatch(GENERATION);
+  confirmDuringReconcile(2);
+  let restored: Array<{ role: string; content: unknown }> = [];
+
+  await runResumedTask(async (extras) => {
+    restored = (extras!.resumeCheckpoint?.messages ?? []) as typeof restored;
+    return runResult();
+  }, { checkpoint: true });
+
+  const notice = restored.find(
+    (m) => m.role === "user" && String(m.content).startsWith("[system-notice]:"),
+  );
+  assert.match(String(notice?.content), new RegExp(ORPHAN.shellId));
+  assert.match(String(notice?.content), /cannot be determined/);
+  assert.doesNotMatch(String(notice?.content), /never started/);
 });
 
 test("a resumed run that opens no sandbox still settles its predecessor's send", async () => {

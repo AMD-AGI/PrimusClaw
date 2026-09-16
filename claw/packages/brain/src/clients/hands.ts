@@ -15,7 +15,7 @@ import {
 } from "../sandbox/bg-start.js";
 import {
   advanceRow, readRow, readRunRows, releaseRow, rowKey,
-  type BgHandleAddress, type BgHandleRow, type BgRowStore,
+  type BgHandleAddress, type BgHandleRow, type BgRowRead, type BgRowStore,
 } from "../sandbox/bg-handle-rows.js";
 
 /** What a fixed start carries onto its row, so a replay can find it again. */
@@ -434,9 +434,9 @@ export function derivedShellId(
  */
 export async function outstandingStarts(
   store: BgRowStore, owner: string, run: string,
-): Promise<BgHandleRow[]> {
+): Promise<BgRowRead[]> {
   const rows = await readRunRows(store, owner, run);
-  return rows.filter((row) => row.state !== "spawn_confirmed");
+  return rows.filter(({ row }) => row.state !== "spawn_confirmed");
 }
 
 /** What reconciling a resumed run's unconfirmed starts settled, and how. */
@@ -445,7 +445,7 @@ export interface OutstandingReconciliation {
   confirmed: string[];
   /** Starts that demonstrably never landed; their commitment is released. */
   released: string[];
-  /** Starts nothing could decide; their rows stand and still answer `unknown`. */
+  /** Starts nothing could decide; nothing here changed what their rows answer. */
   unresolved: string[];
 }
 
@@ -484,7 +484,9 @@ export async function allocateStartIdentity(
   generation: string, stepIdentity: string | undefined,
 ): Promise<StartIdentity> {
   const commandDigest = commandDigestOf(owner, run, command);
-  const rows = await readRunRows(store, owner, run);
+  // Revisions are not wanted here: every write below is its own exclusive
+  // create, which arbitrates without reference to what the scan saw.
+  const rows = (await readRunRows(store, owner, run)).map((entry) => entry.row);
 
   // The one row this call may take: the one its own call site sealed before a
   // previous dispatch of it, in whatever state that left it. Recognising a
@@ -1005,12 +1007,12 @@ export class HandsClient {
     if (!store || !this.owner || !this.run) return settled;
 
     const sandboxFilesRecords = await this.filesShellRecords();
-    for (const row of await outstandingStarts(store, this.owner, this.run)) {
+    for (const { row, revision } of await outstandingStarts(store, this.owner, this.run)) {
       // `issued` says the request never reached the transport, so nothing ran
       // and the row already reads as the first call it still is.
       if (row.state !== "dispatched") continue;
       try {
-        await this.settleOutstandingStart(store, row, sandboxFilesRecords, settled);
+        await this.settleOutstandingStart(store, row, revision, sandboxFilesRecords, settled);
       } catch (err) {
         settled.unresolved.push(row.shellId);
         logger.warn(
@@ -1027,6 +1029,8 @@ export class HandsClient {
   private async settleOutstandingStart(
     store: BgRowStore,
     row: BgHandleRow,
+    /** The revision `row` was read at, which every decision below is about. */
+    decidedRevision: number,
     sandboxFilesRecords: boolean,
     settled: OutstandingReconciliation,
   ): Promise<void> {
@@ -1044,8 +1048,28 @@ export class HandsClient {
       return;
     }
     if (decision.action === "retransmit") {
-      await releaseRow(store, address);
-      settled.released.push(row.shellId);
+      const outcome = await releaseRow(store, address, decidedRevision);
+      if (outcome === "released") {
+        settled.released.push(row.shellId);
+        return;
+      }
+      // Only a delete this call performed licenses `released`, because
+      // `released` is not a description of the row -- it is the sentence the
+      // resumed model is handed: nothing ran, so issue the command again. The
+      // probe that licensed it read the sandbox at one instant, and the
+      // revision the delete is conditioned on is the only thing carrying that
+      // instant's answer forward to this one. Failing to delete is that
+      // interlock firing, and the one writer it loses to is a dispatch of this
+      // same start confirming a shell; a row that vanished instead took the
+      // evidence with it and did not leave a reason behind. Both are
+      // compatible with the command having run, and re-issuing it then repeats
+      // its side effects under a new call identity -- new sequence, new shell
+      // id -- that Hands' exclusive create can never match to this one. Saying
+      // `unresolved` instead costs the model one check before it re-issues.
+      logger.warn(
+        { shellId: row.shellId, outcome }, "bg_start.release_did_not_happen",
+      );
+      settled.unresolved.push(row.shellId);
       return;
     }
     settled.unresolved.push(row.shellId);

@@ -206,7 +206,8 @@ test("a released row reads as absent, not as a row that could not be read", asyn
   try {
     const store = bgRowStore()!;
     await advanceRow(store, ADDRESS, "gen-1", "issued");
-    assert.equal(await releaseRow(store, ADDRESS), true);
+    const decided = (await store.read(rowKey(ADDRESS)))!.revision;
+    assert.equal(await releaseRow(store, ADDRESS, decided), "released");
 
     // The marker is still the key's last message. Read as a value it is the
     // empty string, and an empty string is where `readRow` throws -- which
@@ -221,6 +222,61 @@ test("a released row reads as absent, not as a row that could not be read", asyn
   } finally {
     restore();
   }
+});
+
+/**
+ * The three ways a release can end, and why only one of them is a release.
+ *
+ * `dispatched` is written before the request leaves and stands for the whole
+ * spawn round trip, so a confirmation can land anywhere between the read that
+ * licensed a release and the delete that performs it. Its caller turns the
+ * answer into a sentence for the model -- "nothing ran, issue it again" -- so a
+ * delete this call did not perform must not read back as one that it did.
+ */
+test("a row that moved on after the decision is not released by it", async () => {
+  const store = memoryStore();
+  await advanceRow(store, ADDRESS, "gen-1", "dispatched");
+  const decided = (await store.read(rowKey(ADDRESS)))!.revision;
+  // The dispatch this decision is about, confirming its shell meanwhile.
+  await advanceRow(store, ADDRESS, "gen-1", "spawn_confirmed");
+
+  assert.equal(await releaseRow(store, ADDRESS, decided), "moved_on");
+  assert.equal((await readRow(store, ADDRESS))?.state, "spawn_confirmed",
+    "and the one durable record that a shell exists survives a decision taken "
+      + "before it was written");
+});
+
+test("a confirmation landing at the delete is a lost race, not a release", async () => {
+  const real = memoryStore();
+  await advanceRow(real, ADDRESS, "gen-1", "dispatched");
+  const decided = (await real.read(rowKey(ADDRESS)))!.revision;
+
+  // Staged at the only seam it is visible from: the confirmation arrives
+  // strictly between the release's own read and the delete conditioned on it,
+  // so the read still answers `dispatched` and the compare-and-set is what
+  // catches it.
+  const store: BgRowStore = {
+    ...real,
+    async read(key) {
+      const entry = await real.read(key);
+      if (entry && key === rowKey(ADDRESS)) {
+        await advanceRow(real, ADDRESS, "gen-1", "spawn_confirmed");
+      }
+      return entry;
+    },
+  };
+
+  assert.equal(await releaseRow(store, ADDRESS, decided), "moved_on");
+  assert.equal((await readRow(real, ADDRESS))?.state, "spawn_confirmed");
+});
+
+test("a row someone else removed is absent, not a release this call made", async () => {
+  // Absence here is evidence of nothing: a peer releasing on the same evidence
+  // and a predecessor's terminal cleanup both produce it, and only the first
+  // means the command never ran.
+  const store = memoryStore();
+
+  assert.equal(await releaseRow(store, ADDRESS, 1), "absent");
 });
 
 test("a row contended at teardown is skipped, and the run's other rows still go", async () => {

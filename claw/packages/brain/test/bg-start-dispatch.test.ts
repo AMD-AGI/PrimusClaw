@@ -472,7 +472,7 @@ test("a resumed run can see every start it committed to and never confirmed", as
 
   const outstanding = await outstandingStarts(bgRowStore()!, OWNER, RUN);
 
-  assert.deepEqual(outstanding.map((r) => r.stepIdentity), ["toolu_left_open"],
+  assert.deepEqual(outstanding.map((r) => r.row.stepIdentity), ["toolu_left_open"],
     "the confirmed one is settled; the unconfirmed one is what must be resolved");
 });
 

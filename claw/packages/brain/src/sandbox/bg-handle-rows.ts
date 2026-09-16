@@ -150,36 +150,72 @@ export async function readRow(
   return entry === null ? null : JSON.parse(entry.value) as BgHandleRow;
 }
 
-/** Every row this run identity holds, whatever state each is in. */
+/** A row, and the revision the read that produced it saw. */
+export interface BgRowRead {
+  row: BgHandleRow;
+  revision: number;
+}
+
+/**
+ * Every row this run identity holds, whatever state each is in.
+ *
+ * The revision travels with the row because a decision taken from a row is a
+ * decision about *that* row. Between the read and the act, the address may hold
+ * a later row written by a dispatch that is still happening, and nothing in the
+ * row's own fields separates the two -- a re-read alone cannot tell a caller
+ * whether what it is looking at is what it decided from.
+ */
 export async function readRunRows(
   store: BgRowStore, ownerScope: string, runIdentity: string,
-): Promise<BgHandleRow[]> {
-  const rows: BgHandleRow[] = [];
+): Promise<BgRowRead[]> {
+  const rows: BgRowRead[] = [];
   for (const key of await store.keys(runRowFilter(ownerScope, runIdentity))) {
     const entry = await store.read(key);
-    if (entry) rows.push(JSON.parse(entry.value) as BgHandleRow);
+    if (entry) {
+      rows.push({ row: JSON.parse(entry.value) as BgHandleRow, revision: entry.revision });
+    }
   }
   return rows;
 }
 
+/** What a release attempt did -- which is not the same question as what it saw. */
+export type RowRelease =
+  /** This call performed the delete: the row the decision rests on is gone. */
+  | "released"
+  /** Nothing at the address. Someone else removed it, on evidence unknown here. */
+  | "absent"
+  /** The address holds a row later than the one the decision was taken from. */
+  | "moved_on";
+
 /**
  * Drop one row whose start positively never reached the sandbox.
  *
- * Conditioned on the revision just read: a row rewritten between the read and
- * this delete belongs to a dispatch that is happening now, and removing it
- * would strand that one in place of the finished send it was meant to release.
+ * Conditioned on `decidedRevision` -- the revision the row was read at when the
+ * release was decided -- and never on a fresh read. The window that has to be
+ * closed opens at that read, not at this one: a release is licensed only by
+ * `dispatched`, which is written before the request goes out and stands for a
+ * whole spawn round trip, so a confirmation landing anywhere across that span
+ * is precisely what is being raced. Deleting at whatever revision a re-read
+ * hands back would happily remove a `spawn_confirmed` row -- the one durable
+ * record that a shell exists -- and report it as a start that never ran.
  *
- * @returns false where no row was there to release, and equally where the row
- * moved on under a dispatch that is still happening -- in both cases this call
- * released nothing, which is the only thing its caller acts on.
+ * @returns `released` only where this call performed the delete. The other two
+ * are different evidence and neither substitutes for it: `absent` says the row
+ * this decision rests on is gone and nothing here removed it, `moved_on` says
+ * it was rewritten by the only writer that rewrites it, a dispatch of this same
+ * start still in flight. Both are compatible with the command having run.
  */
 export async function releaseRow(
-  store: BgRowStore, address: BgHandleAddress,
-): Promise<boolean> {
+  store: BgRowStore, address: BgHandleAddress, decidedRevision: number,
+): Promise<RowRelease> {
   const key = rowKey(address);
   const entry = await store.read(key);
-  if (!entry) return false;
-  return await store.delete(key, entry.revision);
+  if (!entry) return "absent";
+  // Read first only to tell the two non-releases apart for whoever reads the
+  // log; the delete below is what decides, and it is conditioned on the
+  // decision's revision either way.
+  if (entry.revision !== decidedRevision) return "moved_on";
+  return await store.delete(key, decidedRevision) ? "released" : "moved_on";
 }
 
 /**
