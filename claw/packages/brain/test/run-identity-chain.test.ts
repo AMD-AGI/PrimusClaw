@@ -200,7 +200,9 @@ function chainSideEffects(): TaskRunnerSideEffects {
     // flight together must not share one client, or the second one's wait is
     // the only one anything records.
     makeHandsClient: ((_url: string, _token: string, owner: string) => ({
+      classifyShell: async () => ({ shellClass: "running", collectorLive: false }),
       callTool: (name: string) => chains.get(owner)!.callTool(name),
+      async callToolFull(name: string) { return { text: await this.callTool(name), isError: false }; },
       close: async () => {},
     })) as never,
   } as unknown as TaskRunnerSideEffects;
@@ -420,7 +422,7 @@ test("T4.1 a chat turn with only a message id is counted end to end", async () =
   let during: RunPhaseReport | null = null;
   const run = await driveChain({
     waitMs: 40,
-    request: { task_id: undefined, run_lease: undefined },
+    request: { task_id: undefined, dag_root_task_id: undefined, run_lease: undefined },
     messageId: "m-chat-only",
     lease: false,
     duringWait: (key) => { during = phaseOf(key as never); },
@@ -491,7 +493,7 @@ test("T5.5 the runner opens the ledger under the task id, not a proxy", async ()
 test("T5.6 a run with nothing to identify it still gets its own entry, never a proxy", async () => {
   const run = await driveChain({
     waitMs: 20,
-    request: { task_id: undefined, message_id: undefined },
+    request: { task_id: undefined, message_id: undefined, dag_node_id: "node-distinct" },
     messageId: "",
     lease: false,
   });
@@ -509,7 +511,7 @@ test("T4.2 a degraded run reports waiting, not a run that never waited", async (
   let during: RunPhaseReport | null = null;
   const run = await driveChain({
     waitMs: 60,
-    request: { task_id: undefined, message_id: undefined },
+    request: { task_id: undefined, message_id: undefined, dag_node_id: "node-distinct" },
     messageId: "",
     lease: false,
     duringWait: (key) => { during = phaseOf(key as never); },
@@ -543,6 +545,8 @@ test("T3.2 a sub-agent's wait is timed against its parent's entry and parks noth
     onExecute: () => {}, callTool: async () => "ok", onRenewal: () => {}, session: subSession,
   });
   const hands = {
+    classifyShell: async () => ({ shellClass: "running", collectorLive: false }),
+    async callToolFull(name: string) { return { text: await this.callTool(name), isError: false }; },
     async callTool(name: string) {
       if (name !== "wait") return "ok";
       assert.equal(gate.inflight, 1, "the parent's slot stays where it was");

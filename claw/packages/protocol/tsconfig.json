@@ -2,7 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    // Same reason as packages/utils: nothing here imports a third-party package
+    // that pulls @types/node in transitively, and run-doorbell.ts needs
+    // node:crypto for the doorbell dedup id.
+    "types": ["node"]
   },
   "include": ["src"]
 }

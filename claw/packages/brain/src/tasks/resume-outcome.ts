@@ -50,6 +50,46 @@ export function buildResumeHint(text: string): Message {
 }
 
 /**
+ * What to tell the model about the background starts a resume could not
+ * complete, or null where there is nothing to say.
+ *
+ * The two readings lead opposite ways and must not be collapsed: a start whose
+ * claim demonstrably never landed did not run, so re-issuing it is correct,
+ * while one nothing could decide may have run and re-issuing it is the
+ * duplicate execution the whole scheme exists to avoid.
+ *
+ * Said as a notice rather than as a tool result, because the tool use this
+ * answers is not in the transcript -- a step identity that does not appear in
+ * the restored conversation is exactly what identifies these calls -- so there
+ * is no tool-use id a result could be addressed to.
+ */
+export function buildOutstandingStartHint(
+  settled: { released: string[]; unresolved: string[] },
+): Message | null {
+  const parts: string[] = [];
+  if (settled.released.length) {
+    parts.push(
+      `background ${plural(settled.released, "shell")} `
+      + `${list(settled.released)} never started -- the request was interrupted `
+      + "before it reached the sandbox and nothing ran, so the command can be "
+      + "issued again if it is still wanted",
+    );
+  }
+  if (settled.unresolved.length) {
+    parts.push(
+      `whether background ${plural(settled.unresolved, "shell")} `
+      + `${list(settled.unresolved)} started cannot be determined -- check `
+      + "before running the command again, since it may already be running",
+    );
+  }
+  return parts.length ? buildResumeHint(`${parts.join("; and ")}.`) : null;
+}
+
+const list = (ids: string[]): string => ids.join(", ");
+const plural = (ids: string[], word: string): string =>
+  (ids.length === 1 ? word : `${word}s`);
+
+/**
  * Map (resumeMode, ckpt, partial-tail, deliveryCount) to a hint
  * message + toast reason. The classification table follows the §5.6
  * sub-case rules verbatim. Returns nulls for both when the resume

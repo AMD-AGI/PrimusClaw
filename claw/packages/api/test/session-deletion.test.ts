@@ -36,6 +36,7 @@ import {
   TeardownRefused,
   writeSessionTombstones,
 } from "../src/sessions/teardown.js";
+import { registry } from "../src/infra/metrics.js";
 import { stubDb, type DbStub } from "./support/db-stub.js";
 import { resetDeletedSessionCache } from "../src/sessions/deleted-cache.js";
 import { sessionWasDeleted, tombstoneReader } from "../src/events/consumer.js";
@@ -86,6 +87,14 @@ function healthyPorts(): string[] {
   };
   teardownPorts.releaseWorkspaceRefs = async () => { ran.push("workspace_refs"); return "released"; };
   return ran;
+}
+
+async function cancelledQueueExits(): Promise<number> {
+  const text = await registry.metrics();
+  const line = text.split("\n").find((sample) =>
+    sample.startsWith("claw_api_run_queue_exited_total{")
+    && sample.includes('outcome="cancelled"'));
+  return line ? Number(line.slice(line.lastIndexOf(" ") + 1)) : 0;
 }
 
 // ── The mark that outlives a redelivery ──────────────────────────────────────
@@ -161,9 +170,47 @@ test("the deletion is one transaction, on one connection", async () => {
   assert.equal(sql[0], "BEGIN");
   assert.equal(sql.at(-1), "COMMIT");
   assert.ok(dbStub.ran(/DELETE FROM claw_pending_messages/));
-  assert.ok(dbStub.ran(/UPDATE claw_tasks SET status = 'cancelled'/));
+  // Unaliased, because the one status writer builds it without a join -- and
+  // it banks the queue segment it closes, which the hand-written UPDATE this
+  // replaced did not.
+  assert.ok(dbStub.ran(/UPDATE claw_tasks SET status = 'cancelled'[\s\S]*queued_ms_accrued/));
   assert.ok(dbStub.ran(/UPDATE claw_conversation_turns SET deleted_at/));
   assert.ok(dbStub.ran(/UPDATE claw_sessions SET deleted_at = COALESCE/));
+});
+
+test("a committed deletion records every queued doorbell it cancelled", async () => {
+  dbStub = stubDb((sql) => {
+    // The prior state comes off its own locking read now, not off the
+    // UPDATE's RETURNING: RETURNING can only report what a row became.
+    if (/SELECT status AS prior_status/.test(sql)) {
+      return [
+        { prior_status: "queued", origin: "chat", dispatch: "doorbell", queued_since: null },
+        { prior_status: "preparing", origin: "chat", dispatch: "doorbell", queued_since: null },
+        { prior_status: "queued", origin: "task", dispatch: null, queued_since: null },
+      ];
+    }
+  });
+  const before = await cancelledQueueExits();
+
+  await commitSessionDeletion(SID);
+
+  assert.equal(await cancelledQueueExits() - before, 1);
+});
+
+test("a rolled-back deletion records no queue exit", async () => {
+  dbStub = stubDb((sql) => {
+    // Same read as the committed case, so that a delta of 0 here means the
+    // rollback suppressed the metric rather than that nothing was ever counted.
+    if (/SELECT status AS prior_status/.test(sql)) {
+      return [{ prior_status: "queued", origin: "chat", dispatch: "doorbell", queued_since: null }];
+    }
+    if (/UPDATE claw_conversation_turns/.test(sql)) throw new Error("write failed");
+  });
+  const before = await cancelledQueueExits();
+
+  await assert.rejects(() => commitSessionDeletion(SID), TeardownRefused);
+
+  assert.equal(await cancelledQueueExits() - before, 0);
 });
 
 test("a statement that fails takes the whole deletion with it", async () => {

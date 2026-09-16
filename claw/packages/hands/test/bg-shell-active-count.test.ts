@@ -20,6 +20,10 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 
+import { isolatingSandbox } from "./support/sandbox-isolation.js";
+
+isolatingSandbox();
+
 process.env.WORKSPACE_PATH = tmpdir();
 process.env.BG_SHELL_ENABLED = "true";
 // Long enough that an exited shell is still in the registry when it is counted.
@@ -47,12 +51,12 @@ async function until(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 afterEach(async () => { await shutdownAllShells(200); });
 
 test("a shell that has exited is still readable but no longer counts as work", async () => {
-  const quick = spawnBackground(OWNER, RUN, "echo done", "quick");
+  const quick = spawnBackground(OWNER, RUN, "echo done", "quick").shell!;
   assert.ok(await until(() => quick.status !== "running"), "sanity: it ends on its own");
 
   // Still in the registry -- this is the window the production delay keeps open,
   // and the reason counting registry entries rather than running ones is wrong.
-  assert.match(pollOutput(OWNER, "quick"), /done/,
+  assert.match(pollOutput(OWNER, RUN, "quick").text, /done/,
     "sanity: a finished shell is retained so its output survives into the next turn");
 
   assert.equal(runningShellCount(OWNER), 0,
@@ -60,17 +64,49 @@ test("a shell that has exited is still readable but no longer counts as work", a
 });
 
 test("an exited shell does not mask a running one, or inflate the count beside it", async () => {
-  const quick = spawnBackground(OWNER, RUN, "echo done", "quick2");
-  const long = spawnBackground(OWNER, RUN, "sleep 60", "long2");
+  const quick = spawnBackground(OWNER, RUN, "echo done", "quick2").shell!;
+  const long = spawnBackground(OWNER, RUN, "sleep 60", "long2").shell!;
 
   assert.ok(await until(() => quick.status !== "running"));
-  assert.match(pollOutput(OWNER, "quick2"), /done/, "sanity: still retained");
+  assert.match(pollOutput(OWNER, RUN, "quick2").text, /done/, "sanity: still retained");
 
   assert.equal(runningShellCount(OWNER), 1,
     "exactly the running one: the exited neighbour is retained, not counted");
 
-  killShell(OWNER, "long2");
+  killShell(OWNER, RUN, "long2");
   assert.ok(await until(() => long.status !== "running"));
   assert.equal(runningShellCount(OWNER), 0,
     "with the last running shell gone the handle is free, whatever is still retained");
+});
+
+test("a leader that exits while its group runs on is still work", async () => {
+  // `sleep 30 &` inside the command: bash returns immediately, the sleep stays
+  // in the process group. Counting the leader alone reported the shell finished
+  // -- it left the active count, left every reap report, and took its record to
+  // a terminal status -- while the group went on holding the sandbox's CPU and
+  // its pipe handles. `processGroupAlive` is the question that sees it, and is
+  // already what the reaping paths in bg-manager ask.
+  const orphaning = spawnBackground(OWNER, RUN, "sleep 30 & exit 0", "group1").shell!;
+  // The leader's own exit, read from the code it reported rather than from the
+  // status -- the status deliberately does not move while the group lives, and
+  // asserting on it here would be asserting the defect.
+  assert.ok(
+    await until(() => orphaning.exitCode !== null),
+    "sanity: the leader itself ends at once",
+  );
+  assert.equal(
+    orphaning.status, "running",
+    "and the shell is not called finished while its group is not",
+  );
+
+  assert.equal(
+    runningShellCount(OWNER), 1,
+    "the group outlived its leader, so the sandbox is still doing this shell's work",
+  );
+
+  await killShell(OWNER, RUN, "group1");
+  assert.ok(
+    await until(() => runningShellCount(OWNER) === 0),
+    "and killing the shell takes the group with it, so the count comes back down",
+  );
 });

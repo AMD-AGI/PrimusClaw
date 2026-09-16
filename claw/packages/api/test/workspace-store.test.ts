@@ -36,15 +36,18 @@ import {
   ensureSessionWorkspace,
   isWorkspaceBindingError,
   MIN_IDLE_RELEASE_DAYS,
+  recordRunUse,
   releaseRef,
   releaseRefsOfDeletedSessions,
   releaseRefsOfFinishedRuns,
   releaseRefsOfIdleSessions,
   releaseRunUse,
+  releaseRunUseStrict,
   releaseSessionRefs,
   releaseWriter,
   requireWorkspaceBinding,
   RETENTION_DAYS,
+  takeRunRef,
   workspaceState,
 } from "../src/workspace/store.js";
 import { sessionWorkspacePrefix } from "../src/workspace/prefix.js";
@@ -275,6 +278,50 @@ test("the sweep that reclaims a deleted session's reference leases nothing eithe
 
   const lease = seen.find((q) => /retention_expires_at = NOW\(\) \+/.test(q.sql));
   assert.equal(lease?.params[1], 0);
+});
+
+test("a reference that could not be taken is not handed back as one that was", async () => {
+  // The claim is what makes this destructive rather than untidy. A run holding
+  // the write side over a reference nothing recorded is invisible to every
+  // reconciler that looks for it by reference, so the claim outlives the run
+  // and the next turn on those files reads a workspace somebody else owns.
+  db.query = (async (text: string, params: unknown[] = []) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    seen.push({ sql, params });
+    if (/^INSERT INTO claw_workspace_refs/.test(sql)) throw new Error("unique violation");
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+
+  assert.equal(await takeRunRef("s-1", "u-1", "ktsk_9", "kws_1"), undefined,
+    "the insert failed, so no reference is held and there is no workspace to return");
+  assert.equal(await recordRunUse("s-1", "u-1", "ktsk_9", "kws_1"), undefined);
+  assert.ok(!seen.some((q) => /SET writer_run_id\s+= \$2/.test(q.sql)),
+    "and the write side must not be claimed for a reference the run does not hold");
+});
+
+test("the strict release reports the failures the best-effort one swallows", async () => {
+  // A compensation pass owes these resources before it may call its receipt
+  // complete, so a failure it cannot see is a claim nothing ever lets go of.
+  failingDb();
+  await releaseRunUse("ktsk_9");
+  assert.equal(await releaseRunUseStrict("ktsk_9", false), "failed",
+    "the lookup failing is not the same answer as a run that held nothing");
+
+  stubDb();
+  assert.equal(await releaseRunUseStrict("ktsk_9", false), "none_held");
+});
+
+test("the strict release is the same two statements as the best-effort one", async () => {
+  // Sharing the implementation rather than restating it: a second copy of the
+  // writer predicate is how one of them loses the `writer_run_id = $2` term and
+  // starts clearing the claim of the run that took over.
+  stubDb([[/^SELECT workspace_id FROM claw_workspace_refs/, [{ workspace_id: "kws_1" }]]]);
+  await releaseRunUse("ktsk_9", false);
+  const lenient = seen.slice(1).map((q) => q.sql);
+
+  seen = [];
+  assert.equal(await releaseRunUseStrict("ktsk_9", false), "released");
+  assert.deepEqual(seen.slice(1).map((q) => q.sql), lenient);
 });
 
 test("a finished run releases the write side before its reference", async () => {

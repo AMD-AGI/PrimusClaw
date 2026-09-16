@@ -56,7 +56,18 @@ CREATE TABLE claw_sessions (
   session_id     TEXT PRIMARY KEY,
   user_id        TEXT DEFAULT 'default',
   agent_status   TEXT DEFAULT 'idle',
+  agent_gate_message_id TEXT,
   status         TEXT DEFAULT 'active',
+  -- The create route's INSERT names every one of these, so a scenario that
+  -- drives it against a narrower table fails on the column rather than on the
+  -- behaviour under test.
+  name           TEXT DEFAULT '',
+  mode           TEXT DEFAULT 'claw',
+  agent_id       TEXT DEFAULT '',
+  system_prompt  TEXT DEFAULT '',
+  config         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  parent_session_id TEXT,
+  team_role      TEXT DEFAULT '',
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
   deleted_at     TIMESTAMPTZ,
@@ -98,7 +109,11 @@ CREATE TABLE claw_session_events (
 CREATE TABLE claw_pending_messages (
   id          SERIAL PRIMARY KEY,
   session_id  TEXT NOT NULL,
+  user_id     TEXT,
   content     TEXT,
+  -- The durable identity of the run a drain of this row already opened, so a
+  -- retry finishes that handoff instead of creating a sibling.
+  dispatch_task_id TEXT,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -150,7 +165,33 @@ CREATE TABLE claw_workspaces (
   session_id    TEXT,
   user_id       TEXT,
   writer_run_id TEXT,
+  -- Bumped only when a run releases having changed the files, which is the
+  -- difference a scenario reading the release back has to be able to see.
+  version       INT NOT NULL DEFAULT 0,
+  writer_expires_at TIMESTAMPTZ,
+  -- workspaceForSession selects all three, and it is the first statement of
+  -- every dispatch: without them the binding fails and a scenario that meant to
+  -- drive a publish never reaches one.
+  owner_user_id TEXT,
+  storage_prefix TEXT,
+  retention_expires_at TIMESTAMPTZ,
+  deleted_at    TIMESTAMPTZ,
+  updated_at    TIMESTAMPTZ DEFAULT NOW(),
   created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- The default sandbox image and resource shape, read on every dispatch.
+CREATE TABLE resources (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL DEFAULT '',
+  type          TEXT NOT NULL DEFAULT '',
+  image         TEXT NOT NULL DEFAULT '',
+  resource      JSONB NOT NULL DEFAULT '{}'::jsonb,
+  owner_user_id TEXT,
+  author        TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at    TIMESTAMPTZ
 );
 
 -- Read by injectLiveUserEnv on every claim: the vault is re-read at claim
@@ -183,6 +224,7 @@ const TABLES = [
   "claw_session_events",
   "claw_pending_messages",
   "claw_workspaces",
+  "resources",
   "claw_workspace_refs",
   "claw_user_env_vars",
   "claw_conversation_turns",
@@ -268,12 +310,22 @@ export async function startHarness(): Promise<Harness> {
 export async function seedSession(
   h: Harness,
   sessionId: string,
-  opts: { agentStatus?: string; updatedAgoSec?: number; userId?: string } = {},
+  opts: {
+    agentStatus?: string;
+    updatedAgoSec?: number;
+    userId?: string;
+    /** Which turn holds the gate. Absent is a session gated before the column existed. */
+    gateOwner?: string | null;
+  } = {},
 ): Promise<void> {
   await h.sql(
-    `INSERT INTO claw_sessions (session_id, user_id, agent_status, updated_at)
-     VALUES ($1, $2, $3, NOW() - ($4::int * INTERVAL '1 second'))`,
-    [sessionId, opts.userId ?? "u-1", opts.agentStatus ?? "running", opts.updatedAgoSec ?? 0],
+    `INSERT INTO claw_sessions
+       (session_id, user_id, agent_status, agent_gate_message_id, updated_at)
+     VALUES ($1, $2, $3, $5, NOW() - ($4::int * INTERVAL '1 second'))`,
+    [
+      sessionId, opts.userId ?? "u-1", opts.agentStatus ?? "running",
+      opts.updatedAgoSec ?? 0, opts.gateOwner ?? null,
+    ],
   );
 }
 

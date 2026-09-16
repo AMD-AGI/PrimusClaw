@@ -66,6 +66,37 @@ test("but it cannot overrule how this process was launched", () => {
   assert.equal(process.env.MCP_PORT, "9100");
 });
 
+test("a request cannot choose the privilege boundary its own commands run under", () => {
+  // The file is built from user and session environment, and session env has
+  // the highest precedence in that merge. It is also applied before Hands
+  // checks its own posture, so a name that got through would be
+  // indistinguishable from one an operator set -- and a command sharing Hands'
+  // identity reads the sandbox credential out of the parent's environment and
+  // the shell records out of a subtree that identity owns.
+  for (const key of [
+    "HANDS_CHILD_ISOLATION", "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX",
+    "HANDS_STATE_DIR", "BG_SHELL_ENABLED",
+  ]) {
+    delete process.env[key];
+  }
+  const applied = applyEnvFile(handover({
+    HANDS_CHILD_ISOLATION: "unenforced",
+    HANDS_CHILD_UID_MIN: "0",
+    HANDS_CHILD_UID_MAX: "0",
+    HANDS_STATE_DIR: "/workspace/records",
+    BG_SHELL_ENABLED: "true",
+    HF_TOKEN: "still-applied",
+  }));
+
+  assert.deepEqual(applied, ["HF_TOKEN"], "only the request's own environment is applied");
+  for (const key of [
+    "HANDS_CHILD_ISOLATION", "HANDS_CHILD_UID_MIN", "HANDS_CHILD_UID_MAX",
+    "HANDS_STATE_DIR", "BG_SHELL_ENABLED",
+  ]) {
+    assert.equal(process.env[key], undefined, `${key} is the deployment's to set`);
+  }
+});
+
 test("values survive newlines, quotes and shell metacharacters", () => {
   // Why the handover is JSON rather than a KEY=VALUE file the shell sources:
   // a private key is multi-line, and `$(...)` in a password would otherwise

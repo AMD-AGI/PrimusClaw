@@ -1,7 +1,10 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ExecuteRequest, RunTimeReport } from "@claw/protocol";
+import { DOORBELL_SEMANTICS_VERSION } from "@claw/protocol";
+import type {
+  ExecuteRequest, RunFailClaimReason, RunTimeReport, RunUnclaimReason,
+} from "@claw/protocol";
 import pino from "pino";
 
 import { AUTH_INTERNAL_TOKEN, BRAIN_ID } from "../config.js";
@@ -67,7 +70,7 @@ export async function claimNextRun(): Promise<ClaimedRun | null> {
 export async function unclaimRun(
   taskId: string,
   claimCount?: number,
-  reason?: "lock_contention" | "retry" | "drain" | "hydrate_failed",
+  reason?: RunUnclaimReason,
   runTime?: RunTimeReport,
 ): Promise<void> {
   await postHolderAction(taskId, "unclaim", "run.unclaim_failed", {
@@ -78,7 +81,7 @@ export async function unclaimRun(
 
 export async function failClaimedRun(
   taskId: string,
-  reason: "session_deleted" | "claim_abandoned" | "workspace_unbound" = "session_deleted",
+  reason: RunFailClaimReason = "session_deleted",
   claimCount?: number,
   runTime?: RunTimeReport,
 ): Promise<void> {
@@ -86,6 +89,24 @@ export async function failClaimedRun(
     reason, ...claimExtra(claimCount),
     ...(runTime ? { run_time: runTime } : {}),
   });
+}
+
+/**
+ * How a holder action speaks, where the defaults are not what the caller is.
+ *
+ * Both defaults are what every ordinary holder wants: this pod's own id, and
+ * the retry ladder below. The fat pre-gate wants neither. It takes its lease
+ * under an id it was handed rather than the module's, and `settleFinishedClaim`
+ * fences on `lease_owner = $2` and answers a mismatch with the 409 this client
+ * reads as success -- so a release under the wrong name leaks the lease with
+ * nothing logged. And it releases from a path a shutdown can cut off in the
+ * middle, which would take the verdict that follows the release with it.
+ */
+export interface HolderCall {
+  /** The owner the row is fenced to, when it is not this pod's own id. */
+  brainId?: string;
+  /** How many times to try. One, for a caller that cannot outlive its ladder. */
+  attempts?: number;
 }
 
 /**
@@ -97,11 +118,12 @@ export async function settleClaimedRun(
   claimCount?: number,
   runTime?: RunTimeReport,
   releaseLease = false,
+  as: HolderCall = {},
 ): Promise<void> {
   await postHolderAction(taskId, "settle-attempt", "run.settle_attempt_failed", {
     ...claimExtra(claimCount), ...(runTime ? { run_time: runTime } : {}),
     ...(releaseLease ? { release_lease: true } : {}),
-  });
+  }, as);
 }
 
 function claimExtra(claimCount?: number): Record<string, string | number> {
@@ -113,10 +135,11 @@ async function postHolderAction(
   action: HolderAction,
   warn: string,
   extra: Record<string, unknown> = {},
+  as: HolderCall = {},
 ): Promise<void> {
   const url = taskActionUrl(taskId, action);
   if (!url) return;
-  const attempts = 3;
+  const attempts = as.attempts ?? 3;
   let lastDetail: unknown = null;
   for (let i = 0; i < attempts; i++) {
     // Spaced, because the failures worth retrying here are a rolling API
@@ -129,7 +152,7 @@ async function postHolderAction(
       const resp = await fetch(url, {
         method: "POST",
         headers: claimHeaders(),
-        body: JSON.stringify({ brain_id: BRAIN_ID, ...extra }),
+        body: JSON.stringify({ brain_id: as.brainId || BRAIN_ID, ...extra }),
         signal: AbortSignal.timeout(5_000),
       });
       if (resp.ok || resp.status === 409) return;
@@ -175,7 +198,9 @@ async function postClaim(url: string): Promise<ClaimedRun | null> {
   const resp = await fetch(url, {
     method: "POST",
     headers: claimHeaders(),
-    body: JSON.stringify({ brain_id: BRAIN_ID }),
+    // One body serves the by-id and claim-next routes, so the API refuses to
+    // hand either of them a row above what this binary implements.
+    body: JSON.stringify({ brain_id: BRAIN_ID, doorbell_semantics: DOORBELL_SEMANTICS_VERSION }),
     signal: AbortSignal.timeout(10_000),
   });
   // 422 is a settled row (unclaimable / retries exhausted), not a transport

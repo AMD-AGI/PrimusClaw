@@ -35,6 +35,26 @@ export interface ClaimNextLoopDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * Whether this pod may take doorbell work through the claim loop.
+ *
+ * The kill-switch covers both routes into doorbell execution or it is not one:
+ * a pod that declines a doorbell on the wire would otherwise take the same row
+ * through this loop seconds later. And a pod with no API base to claim
+ * against cannot run the loop at all -- every cycle would fail at the POST.
+ *
+ * A function rather than the expression written at the call site, because the
+ * call site is the process entrypoint: `main()` opens NATS before it reaches
+ * that object, so nothing can execute it and the only gate left was a test
+ * that read the source text and checked the spelling.
+ */
+export function claimNextEnabled(
+  backendUrl: string | undefined,
+  doorbellDispatch: boolean,
+): boolean {
+  return Boolean(backendUrl) && doorbellDispatch;
+}
+
 export type ClaimNextOutcome = "idle" | "ran" | "draining";
 
 export async function runClaimNextCycle(deps: ClaimNextLoopDeps): Promise<ClaimNextOutcome> {

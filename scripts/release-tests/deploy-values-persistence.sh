@@ -2,7 +2,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-# Sandbox lifetime knobs must survive the reference upgrade path.
+# The knobs an operator sets once must survive the reference upgrade path.
 #
 # deploy.sh takes them from the shell; upgrade.sh does not -- it re-renders the
 # Deployment from deploy/values.<ns>.env alone, and that file is the only thing
@@ -18,25 +18,33 @@ namespace="claw-values-persist-$$"
 values_file="$repo_root/claw/deploy/values.${namespace}.env"
 default_namespace="claw-values-default-$$"
 default_values_file="$repo_root/claw/deploy/values.${default_namespace}.env"
+rollout_namespace="claw-values-rollout-$$"
+rollout_values_file="$repo_root/claw/deploy/values.${rollout_namespace}.env"
 cleanup() {
   rm -rf "$tmp"
-  rm -f "$values_file" "$default_values_file"
+  rm -f "$values_file" "$default_values_file" "$rollout_values_file"
 }
 trap cleanup EXIT
 
 mkdir -p "$tmp/bin" "$tmp/home"
 
-cat >"$tmp/bin/helm" <<'EOF'
+# The real binary, resolved before the mocked PATH shadows it: a fixed body
+# would be independent of every value render_chart forwards, so no assertion
+# on a value-derived annotation could ever fail.
+real_helm="$(command -v helm || true)"
+[ -n "$real_helm" ] || { echo "error: helm is required for the rollout-key coverage" >&2; exit 1; }
+
+cat >"$tmp/bin/helm" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"${HELM_CAPTURE:-/dev/null}"
-if [[ "${1:-}" == "status" ]]; then exit "${MOCK_HELM_STATUS:-1}"; fi
-if [[ "${1:-}" == "template" ]]; then
-  printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mock\nspec:\n  replicas: 1\n'
+printf '%s\n' "\$*" >>"\${HELM_CAPTURE:-/dev/null}"
+if [[ "\${1:-}" == "status" ]]; then exit "\${MOCK_HELM_STATUS:-1}"; fi
+if [[ "\${1:-}" == "template" ]]; then
+  exec "$real_helm" "\$@"
 fi
-for ((i=1; i<=$#; i++)); do
-  if [[ "${!i}" == "-f" || "${!i}" == "--values" ]]; then
-    j=$((i+1))
-    cp "${!j}" "${HELM_VALUES_CAPTURE:-/dev/null}"
+for ((i=1; i<=\$#; i++)); do
+  if [[ "\${!i}" == "-f" || "\${!i}" == "--values" ]]; then
+    j=\$((i+1))
+    cp "\${!j}" "\${HELM_VALUES_CAPTURE:-/dev/null}"
   fi
 done
 exit 0
@@ -44,12 +52,25 @@ EOF
 
 cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${KUBECTL_CAPTURE:-/dev/null}"
+# $WORK_DIR dies with the subprocess's EXIT trap, so the manifest is copied out
+# now or not at all.
+if [[ "${1:-}" == "apply" && -n "${KUBECTL_APPLY_BODY:-}" ]]; then
+  for ((i=1; i<=$#; i++)); do
+    if [[ "${!i}" == "-f" ]]; then j=$((i+1)); cat "${!j}" >>"$KUBECTL_APPLY_BODY"; fi
+  done
+fi
 case "$*" in
   *"config current-context"*) echo release-test ;;
   *"get sc"*) printf 'fast (default)\n' ;;
   # wait_pods_ready counts lines that carry both the tag and a ready flag.
   *"get pods"*) printf '%s true\n' "${MOCK_TAG:-none}" ;;
-  *"get secret"*|*"get deploy"*|*"get statefulset"*|*"get pod"*) exit 1 ;;
+  *"get secret"*|*"get deploy"*|*"get statefulset"*|*"get pod"*)
+    # Nothing is deployed yet, which is not the same answer as an unreachable
+    # cluster: under --ignore-not-found an absent object is empty and
+    # successful, and the render's fail-closed guard reads the difference.
+    case " $* " in *" --ignore-not-found "*) exit 0 ;; esac
+    exit 1 ;;
 esac
 exit 0
 EOF
@@ -104,6 +125,14 @@ assert_rendered_with() {
           *"--set-string brain.maxSessionDuration=$duration"*) ;;
           *) echo "$phase: brain render lost maxSessionDuration=$duration" >&2; exit 1 ;;
         esac
+        # Rendered only once the operator has set it, and then on every upgrade:
+        # a re-render at the chart default would boot the fleet back to off.
+        if [ -n "${EXPECT_BG_SHELL:-}" ]; then
+          case "$line" in
+            *"--set-string features.backgroundShell=$EXPECT_BG_SHELL"*) ;;
+            *) echo "$phase: brain render lost features.backgroundShell=$EXPECT_BG_SHELL" >&2; exit 1 ;;
+          esac
+        fi
         ;;
     esac
   done <"$capture"
@@ -126,7 +155,8 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy-default.log" 2>&1 || { command cat "$tmp/deploy-default.log" >&2; exit 1; }
 
-for _key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION; do
+for _key in AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION \
+            BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC; do
   grep -q "^${_key}=\"\"$" "$default_values_file" || {
     echo "a no-knob install left $_key out of the generated values file" >&2
     command cat "$default_values_file" >&2
@@ -137,9 +167,14 @@ done
 python3 - "$values_capture" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
-    brain = json.load(f).get("brain", {})
+    values = json.load(f)
+brain = values.get("brain", {})
 assert "sessionTimeout" not in brain, f"unset knob reached the chart: {brain!r}"
 assert "maxSessionDuration" not in brain, f"unset knob reached the chart: {brain!r}"
+assert "bashMaxTimeoutSec" not in brain, f"unset knob reached the chart: {brain!r}"
+# `values["features"]` does not exist unless something creates it, so an
+# enablement wired into the brain loop above would be dropped without a word.
+assert "features" not in values, f"unset flag reached the chart: {values.get('features')!r}"
 PY
 
 # ── First install: the operator names the knobs once, on the command line ──
@@ -150,6 +185,8 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
   TAG="release-test" S3_ACCESS_KEY="ak" S3_SECRET_KEY="sk" \
   AGENT_SANDBOX_SESSION_TIMEOUT="6h" \
   AGENT_SANDBOX_MAX_SESSION_DURATION="48h" \
+  BG_SHELL_ENABLED="true" \
+  BASH_MAX_TIMEOUT_SEC="240" \
   bash "$repo_root/claw/deploy/deploy.sh" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy.log" 2>&1 || { command cat "$tmp/deploy.log" >&2; exit 1; }
@@ -166,6 +203,20 @@ grep -q '^AGENT_SANDBOX_MAX_SESSION_DURATION="48h"$' "$values_file" || {
   command cat "$values_file" >&2
   exit 1
 }
+for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="240"'; do
+  grep -q "^${_pair}\$" "$values_file" || {
+    echo "first install did not persist ${_pair%%=*}" >&2
+    command cat "$values_file" >&2
+    exit 1
+  }
+done
+python3 - "$values_capture" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    values = json.load(f)
+assert values["features"]["backgroundShell"] == "true", values.get("features")
+assert values["brain"]["bashMaxTimeoutSec"] == "240", values["brain"]
+PY
 
 # ── The upgrade an operator actually runs: `env -i`, no knobs re-passed ──
 # The empty environment is the point. If the values file is not carrying the
@@ -214,7 +265,7 @@ env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
   bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --dry-run \
     >"$tmp/upgrade1b.log" 2>&1 || { command cat "$tmp/upgrade1b.log" >&2; exit 1; }
 
-assert_rendered_with "upgrade after filling a blank" "9h" "36h"
+EXPECT_BG_SHELL=true assert_rendered_with "upgrade after filling a blank" "9h" "36h"
 
 # ── A values file written before the knobs existed ──
 # Every install that predates this feature has one. It has no line to source,
@@ -253,5 +304,177 @@ env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
     >"$tmp/upgrade2.log" 2>&1 || { command cat "$tmp/upgrade2.log" >&2; exit 1; }
 
 assert_rendered_with "upgrade after back-fill" "12h" "72h"
+
+# ── The Doorbell switches and the eight admission ceilings ──
+# A ceiling staged through the chart and not written into the values file is
+# reverted by the next ordinary upgrade, mid-canary and with no error. The
+# ceilings additionally reach a pod only through the shared Secret, which
+# render_chart never renders, so forwarding them is not on its own enough.
+kubectl_capture="$tmp/kubectl.args"
+apply_body="$tmp/apply-body.yaml"
+
+rollout_env=(
+  RUN_DOORBELL_DISPATCH="true"
+  BRAIN_DOORBELL_EXECUTION="false"
+  RUN_FAT_PREPARING_RECONCILE="false"
+  ADMIT_SOFT_RUNS="11" ADMIT_HARD_RUNS="12"
+  ADMIT_SOFT_SANDBOXES="13" ADMIT_HARD_SANDBOXES="14"
+  ADMIT_SOFT_GPU_NODES="15" ADMIT_HARD_GPU_NODES="16"
+  ADMIT_TREE_MAX_NODES="17" ADMIT_TREE_MAX_DEPTH="18"
+)
+
+: >"$capture"
+env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  NAMESPACE="$rollout_namespace" DOMAIN="persist.example" \
+  STORAGE_CLASS="release-test-sc" MOCK_TAG="release-test" TAG="release-test" \
+  S3_ACCESS_KEY="ak" S3_SECRET_KEY="sk" "${rollout_env[@]}" \
+  bash "$repo_root/claw/deploy/deploy.sh" \
+    --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
+    >"$tmp/deploy-rollout.log" 2>&1 || { command cat "$tmp/deploy-rollout.log" >&2; exit 1; }
+
+# Each ceiling gets its own number: a mis-mapped admitTreeMaxDepth is invisible
+# to any test that checks two keys.
+python3 - "$values_capture" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    values = json.load(f)
+features, api = values.get("features", {}), values.get("api", {})
+assert features.get("runDoorbellDispatch") is True, features
+assert features.get("brainDoorbellExecution") is False, features
+assert features.get("runFatPreparingReconcile") is False, features
+expected = {
+    "admitSoftRuns": "11", "admitHardRuns": "12",
+    "admitSoftSandboxes": "13", "admitHardSandboxes": "14",
+    "admitSoftGpuNodes": "15", "admitHardGpuNodes": "16",
+    "admitTreeMaxNodes": "17", "admitTreeMaxDepth": "18",
+}
+for key, want in expected.items():
+    assert api.get(key) == want, f"{key}={api.get(key)!r}, expected {want!r}"
+PY
+
+for _pair in "${rollout_env[@]}"; do
+  grep -q "^${_pair%%=*}=\"${_pair#*=}\"$" "$rollout_values_file" || {
+    echo "the install did not persist $_pair" >&2
+    command cat "$rollout_values_file" >&2
+    exit 1
+  }
+done
+
+# The upgrade an operator runs: empty environment, nothing re-passed.
+run_rollout_upgrade() {
+  : >"$capture"; : >"$kubectl_capture"; : >"$apply_body"
+  env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
+    KUBECTL_CAPTURE="$kubectl_capture" KUBECTL_APPLY_BODY="$apply_body" \
+    MOCK_HELM_STATUS=0 TAG="$1" \
+    bash "$repo_root/claw/deploy/upgrade.sh" -n "$rollout_namespace" --dry-run \
+      >"$tmp/upgrade-rollout.log" 2>&1 || { command cat "$tmp/upgrade-rollout.log" >&2; exit 1; }
+}
+
+run_rollout_upgrade "release-test-r1"
+
+api_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" | tail -1)"
+[ -n "$api_render" ] || { echo "no api-deployment render was captured" >&2; exit 1; }
+for _flag in \
+  "--set features.runDoorbellDispatch=true" \
+  "--set features.brainDoorbellExecution=false" \
+  "--set features.runFatPreparingReconcile=false" \
+  "--set-string api.admitSoftRuns=11" "--set-string api.admitHardRuns=12" \
+  "--set-string api.admitSoftSandboxes=13" "--set-string api.admitHardSandboxes=14" \
+  "--set-string api.admitSoftGpuNodes=15" "--set-string api.admitHardGpuNodes=16" \
+  "--set-string api.admitTreeMaxNodes=17" "--set-string api.admitTreeMaxDepth=18"; do
+  case "$api_render" in
+    *"$_flag"*) ;;
+    *) echo "the upgrade render lost $_flag" >&2; exit 1 ;;
+  esac
+done
+
+# One key-scoped patch, carrying the eight ceilings and nothing else, before
+# the apply whose pods must come up on it.
+python3 - "$kubectl_capture" <<'PY'
+import json, re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+patches = [(i, l) for i, l in enumerate(lines) if "patch secret primus-claw-secrets" in l]
+assert len(patches) == 1, f"expected one Secret patch, got {len(patches)}"
+index, line = patches[0]
+assert "--type=merge" in line, line
+assert "--dry-run=client" in line, line
+applies = [i for i, l in enumerate(lines) if l.startswith("apply ")]
+assert applies, "no kubectl apply was captured"
+assert index < applies[0], "the Secret patch ran after the Deployment apply"
+payload = json.loads(re.search(r"-p (\{.*\})", line).group(1))
+assert set(payload) == {"stringData"}, payload
+assert payload["stringData"] == {
+    "ADMIT_HARD_GPU_NODES": "16", "ADMIT_HARD_RUNS": "12",
+    "ADMIT_HARD_SANDBOXES": "14", "ADMIT_SOFT_GPU_NODES": "15",
+    "ADMIT_SOFT_RUNS": "11", "ADMIT_SOFT_SANDBOXES": "13",
+    "ADMIT_TREE_MAX_DEPTH": "18", "ADMIT_TREE_MAX_NODES": "17",
+}, payload["stringData"]
+PY
+
+checksum_staged="$(grep -o 'checksum/rollout-config: [^ ]*' "$apply_body" | head -1 || true)"
+[ -n "$checksum_staged" ] || {
+  echo "the applied API Deployment carries no checksum/rollout-config annotation" >&2
+  exit 1
+}
+
+# ── A recorded key re-passed on the command line ──
+# The file wins, which is the documented contract for this whole class. What
+# the contract needs is a word about it: a kill switch flipped on the command
+# line and dropped in silence looks exactly like one that took effect, the
+# write-back only fills blanks so it writes nothing either, and upgrade.sh
+# prints no effective-value summary. Every run above uses `env -i` because that
+# is the shape of a real upgrade, so the stale value needs an invocation of its
+# own -- and helm is mocked here, so nothing has to be true of a cluster.
+: >"$capture"
+env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
+  MOCK_HELM_STATUS=0 TAG="release-test-r1b" RUN_DOORBELL_DISPATCH="false" \
+  bash "$repo_root/claw/deploy/upgrade.sh" -n "$rollout_namespace" --dry-run \
+    >"$tmp/upgrade-ignored.log" 2>&1 || { command cat "$tmp/upgrade-ignored.log" >&2; exit 1; }
+
+grep -q 'WARN: RUN_DOORBELL_DISPATCH=.*IGNORED' "$tmp/upgrade-ignored.log" || {
+  echo "a shell value the values file pins was discarded without saying so" >&2
+  command cat "$tmp/upgrade-ignored.log" >&2
+  exit 1
+}
+
+ignored_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" | tail -1)"
+case "$ignored_render" in
+  *"--set features.runDoorbellDispatch=true"*) ;;
+  *) echo "the warning was printed but the file did not win: $ignored_render" >&2; exit 1 ;;
+esac
+
+# The shipped defaults: every key blank, so nothing is forwarded and no patch
+# is issued -- and the annotation must still differ from the staged render, or
+# the ceiling would reach the Secret and never reach a pod.
+python3 - "$rollout_values_file" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+text = re.sub(r'(?m)^((?:ADMIT_[A-Z_]+|RUN_DOORBELL_DISPATCH|BRAIN_DOORBELL_EXECUTION|RUN_FAT_PREPARING_RECONCILE))=.*$', r'\1=""', text)
+assert '="11"' not in text, "failed to blank the rollout keys"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+
+run_rollout_upgrade "release-test-r2"
+
+grep -q "patch secret primus-claw-secrets" "$kubectl_capture" && {
+  echo "an upgrade with no ceiling set still patched the Secret" >&2
+  exit 1
+}
+api_render="$(grep -F -- "--show-only templates/api-deployment.yaml" "$capture" | tail -1)"
+case "$api_render" in
+  *"--set-string api.admit"*|*"--set features."*)
+    echo "an upgrade with no rollout key set still forwarded one: $api_render" >&2
+    exit 1 ;;
+esac
+
+checksum_default="$(grep -o 'checksum/rollout-config: [^ ]*' "$apply_body" | head -1 || true)"
+[ "$checksum_staged" != "$checksum_default" ] || {
+  echo "clearing the ceilings did not change checksum/rollout-config, so the pods would not restart" >&2
+  exit 1
+}
 
 echo "deploy values persistence: ok"

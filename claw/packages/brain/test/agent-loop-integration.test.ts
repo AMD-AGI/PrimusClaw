@@ -57,16 +57,29 @@ function scriptedSession(turns: Array<Partial<LlmTurnResult>>): LlmSession & {
   };
 }
 
-/** A router that records every routed call and returns a canned result. */
+/**
+ * A router that records every routed call and returns a canned result.
+ *
+ * `outcome` is filled the way the real router fills it -- from the tool's own
+ * error bit -- so the loop's success accounting is exercised rather than
+ * bypassed. A handler that throws leaves it untouched, which is exactly the
+ * case the loop has to mark itself.
+ */
 function recordingRouter(
   handler: (name: string, input: Record<string, unknown>) => string | Promise<string> = () => "ok",
+  failing = false,
 ): ToolRouter & { calls: Array<{ name: string; input: Record<string, unknown> }> } {
   const calls: Array<{ name: string; input: Record<string, unknown> }> = [];
   return {
     calls,
-    route: async (name: string, input: Record<string, unknown>) => {
+    route: async (
+      name: string, input: Record<string, unknown>,
+      _signal?: AbortSignal, outcome?: { isError: boolean },
+    ) => {
       calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
-      return handler(name, input);
+      const text = await handler(name, input);
+      if (outcome && failing) outcome.isError = true;
+      return text;
     },
     setHands: () => {},
   } as unknown as ToolRouter & { calls: Array<{ name: string; input: Record<string, unknown> }> };
@@ -128,7 +141,12 @@ test("routes a tool call, feeds the result back, and stops on end_turn", async (
   assert.equal(result.finalText, "done reading");
   assert.equal(result.turns, 2);
   assert.equal(result.errorCount, 0);
-  assert.deepEqual(result.toolStats, { total_calls: 1, error_calls: 0, by_tool: { read: 1 } });
+  // `by_tool` counts the attempt; `by_tool_ok` counts the result coming back
+  // without an error, which is the only one of the two that says the work
+  // happened.
+  assert.deepEqual(result.toolStats, {
+    total_calls: 1, error_calls: 0, by_tool: { read: 1 }, by_tool_ok: { read: 1 },
+  });
 
   assert.deepEqual(router.calls, [{ name: "read", input: { path: "/a.txt" } }]);
 
@@ -584,4 +602,44 @@ test("a tool-only turn emits nothing, whatever it routed to", async () => {
     0,
     "no content-less AssistantMessage may reach the wire",
   );
+});
+
+test("a tool call that throws is not counted as work the sandbox did", async () => {
+  // A transport failure, a passed deadline, an abandoned call: the router
+  // raises rather than answering. The loop turns that into text for the model
+  // and carries on, and an outcome left at its optimistic default would fall
+  // through to the success count -- the one place a call that never reached a
+  // sandbox is recorded as one that did.
+  const session = scriptedSession([
+    { content: [toolUse("t1", "read", { path: "/a.txt" })], stopReason: "tool_use" },
+    { content: [textBlock("I could not read it")], stopReason: "end_turn" },
+  ]);
+  const router = recordingRouter(() => {
+    throw Object.assign(new Error("MCP error -32001: Request timed out"), { code: -32001 });
+  });
+  const { opts } = makeOpts({ llmSession: session, router });
+
+  const result = await agentLoop([{ role: "user", content: "read /a.txt" }], TOOLS, opts);
+
+  assert.deepEqual(router.calls.map((c) => c.name), ["read"], "it really was attempted");
+  assert.equal(result.toolStats.by_tool.read, 1, "and counted as an attempt");
+  assert.equal(result.toolStats.by_tool_ok?.read ?? 0, 0,
+    "but never as a call that did the work");
+  assert.equal(result.errorCount, 1);
+});
+
+test("a tool that answers with an error is not counted as a success either", async () => {
+  // The other half, driven through the same accounting: the router fills the
+  // outcome from the tool's error bit, whatever the text says.
+  const session = scriptedSession([
+    { content: [toolUse("t1", "read", { path: "/a.txt" })], stopReason: "tool_use" },
+    { content: [textBlock("done")], stopReason: "end_turn" },
+  ]);
+  const router = recordingRouter(() => "no such file, and nothing about this text says so", true);
+  const { opts } = makeOpts({ llmSession: session, router });
+
+  const result = await agentLoop([{ role: "user", content: "read /a.txt" }], TOOLS, opts);
+
+  assert.equal(result.toolStats.by_tool.read, 1);
+  assert.equal(result.toolStats.by_tool_ok?.read ?? 0, 0);
 });

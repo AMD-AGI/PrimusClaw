@@ -16,12 +16,21 @@ process.env.BG_SHELL_ENABLED = "true";
 const { ToolRouter } = await import("../src/tools/router.js");
 const { handsBaseEnv } = await import("../src/sandbox/bootstrap.js");
 const { callDeadlineMs, explainHandsError } = await import("../src/clients/hands.js");
+const { MCP_DEADLINE_SLACK_MS, toolTimeoutCeilingSec } = await import("../src/tools/hands.js");
+const { assertBackgroundSurface, assertSurfaceMatches } =
+  await import("./fixtures/builtin-tool-surface.js");
 type HandsClient = import("../src/clients/hands.js").HandsClient;
 
 function makeRouter(): { router: InstanceType<typeof ToolRouter>; calls: string[] } {
   const calls: string[] = [];
+  // Both entry points, because the router uses the one that carries the error
+  // bit and a stub with only the other would answer undefined.
   const hands = {
     callTool: async (name: string) => { calls.push(name); return "ran"; },
+    callToolFull: async (name: string) => {
+      calls.push(name);
+      return { text: "ran", isError: false };
+    },
   } as unknown as HandsClient;
   return { router: new ToolRouter(hands), calls };
 }
@@ -31,8 +40,9 @@ test("background calls reach the sandbox when the feature is on", async () => {
   await router.route("bash", { command: "sleep 999", run_in_background: true });
   await router.route("bash_output", { shell_id: "bg-1" });
   await router.route("kill_shell", { shell_id: "bg-1" });
+  await router.route("wait", { shell_id: "bg-1" });
 
-  assert.deepEqual(calls, ["bash", "bash_output", "kill_shell"]);
+  assert.deepEqual(calls, ["bash", "bash_output", "kill_shell", "wait"]);
 });
 
 test("the model is shown the tools and the parameters", () => {
@@ -67,10 +77,11 @@ test("the sandbox is launched with the same answer Brain gave the model", () => 
   // either a tool the model can see and not use, or one it uses unannounced.
   const env = handsBaseEnv("s-1", "9100", "tok");
   assert.match(env, /BG_SHELL_ENABLED=true/);
-  assert.match(env, /BASH_MAX_TIMEOUT_SEC=120/,
-    "the tight ceiling belongs with the background shells that make it livable");
+  assert.match(env, new RegExp(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")}(\\s|$)`),
+    "the tight ceiling belongs with the background shells that make it livable, "
+      + "and is read from the one function every surface reads");
   assert.match(env, /BASH_DEFAULT_TIMEOUT_SEC=120/);
-  assert.match(env, /WAIT_MAX_SEC=1800/,
+  assert.match(env, new RegExp(`WAIT_MAX_SEC=${toolTimeoutCeilingSec("wait")}(\\s|$)`),
     "Brain builds a wait's deadline from this, so the sandbox has to clamp waits "
       + "at the same number");
 });
@@ -111,6 +122,53 @@ test("where the ceiling is 120s, the advice is not to raise the timeout", () => 
 test("with somewhere to put long work, the foreground ceiling is the tight one", async () => {
   const { BASH_FOREGROUND_MAX_SEC } = await import("../src/config.js");
   // F <= S < G: under the 300s graceful shutdown, so a run handed to another
-  // replica has no command from the previous owner still writing.
+  // replica has no command from the previous owner still writing. The literal
+  // is the subject: this is the raw setting, not a surface value.
   assert.equal(BASH_FOREGROUND_MAX_SEC, 120);
+});
+
+test("the whole built-in surface is pinned in the open state too", () => {
+  assertSurfaceMatches(makeRouter().router.getToolSchemas(), true);
+});
+
+test("the background tool set is exactly the four names", () => {
+  assertBackgroundSurface(makeRouter().router.getToolSchemas(), true);
+});
+
+test("the ceiling function's own answers are pinned with the switch on", () => {
+  assert.equal(toolTimeoutCeilingSec("bash"), 120);
+  assert.equal(toolTimeoutCeilingSec("wait"), 1800,
+    "the wait ceiling does not follow the switch; only bash's configured "
+      + "maximum does");
+});
+
+test("schema, deadline and forwarded env agree with the one held ceiling", () => {
+  const held = toolTimeoutCeilingSec("bash");
+  const timeout = (makeRouter().router.getToolSchemas().find((s) => s.name === "bash")!
+    .input_schema as { properties: Record<string, { description?: string }> }).properties.timeout!;
+
+  assert.match(timeout.description!, new RegExp(`\\b${held}\\b`));
+  assert.equal(
+    callDeadlineMs("bash", { command: "x", timeout: held * 10 }),
+    held * 1000 + MCP_DEADLINE_SLACK_MS,
+  );
+  assert.match(handsBaseEnv("s-1", "9100", "tok"),
+    new RegExp(`BASH_MAX_TIMEOUT_SEC=${held}(\\s|$)`));
+});
+
+test("the descriptions send long work at the background tools, not at a bigger timeout", () => {
+  // Targeted phrases rather than a snapshot of the prose: each one is what
+  // decides whether the model reaches for run_in_background or keeps raising
+  // the foreground timeout against a cap it cannot move.
+  const schemas = makeRouter().router.getToolSchemas();
+  const bash = schemas.find((s) => s.name === "bash")!;
+  const timeout = (bash.input_schema as { properties: Record<string, { description?: string }> })
+    .properties.timeout!;
+
+  assert.match(bash.description, /run_in_background=true/);
+  assert.match(bash.description, /call wait/);
+  assert.match(timeout.description!, /instead of raising this/,
+    "the cap is not a budget to be argued up");
+  assert.match(schemas.find((s) => s.name === "wait")!.description, /final output/,
+    "a model that does not know wait returns the output polls for it instead");
 });

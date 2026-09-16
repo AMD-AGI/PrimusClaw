@@ -260,6 +260,14 @@ jobs:
       # finding there has no action behind it either. What this repository
       # declares is covered by the npm audit and pip-audit jobs above; the
       # report step prints the rest.
+      #
+      # --ignorefile: the gate scans the UPSTREAM base image, so a fix Debian
+      # has shipped is invisible here until the image publisher rebuilds, and
+      # until then there is nothing this repository can do about it -- not a
+      # pin bump, not an extra layer. `.trivyignore.yaml` carries those, each
+      # with an `expired_at` that turns the gate red again on its own. The
+      # report step above is deliberately NOT given the file: what is exempted
+      # from blocking a merge still has to be visible in the run.
       - name: Gate on OS packages in the images we ship
         run: |
           set -uo pipefail
@@ -270,11 +278,13 @@ jobs:
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              -v "$PWD/.trivyignore.yaml:/tmp/.trivyignore.yaml:ro" \
               "$TRIVY" image \
                 --scanners vuln \
                 --pkg-types os \
                 --severity HIGH,CRITICAL \
                 --ignore-unfixed \
+                --ignorefile /tmp/.trivyignore.yaml \
                 --exit-code 1 \
                 --no-progress \
                 "$image" || rc=1

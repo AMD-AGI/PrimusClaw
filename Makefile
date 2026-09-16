@@ -82,6 +82,14 @@ verify-claw:
 	@cd claw && npm ci
 	@echo "==> Claw: build"
 	@cd claw && npm run build
+	@# After the build and before the suites: it compiles `test` against the
+	@# emitted .d.ts of the packages those tests import, so it needs both the
+	@# install above and the build above it. That is also why it is not in
+	@# verify-lint -- which runs first, on a tree that may have no node_modules,
+	@# and whose other guards are all plain text scans.
+	@echo "==> Claw: lint: tests must resolve"
+	@bash claw/scripts/lint-tests-must-resolve.sh --self-test
+	@bash claw/scripts/lint-tests-must-resolve.sh --all
 	@echo "==> Claw: test"
 	@cd claw && npm test
 	@# CI runs the example as a smoke test on every change to Hands, so a broken
@@ -144,6 +152,10 @@ verify-lint:
 	@bash claw/scripts/lint-no-direct-hands-calltool-in-workspace.sh --all
 	@echo "==> lint: prom-client metric registration"
 	@bash claw/scripts/lint-metrics-must-register.sh --all
+	@bash claw/scripts/lint-metrics-must-register.sh --self-test
+	@echo "==> lint: startup asserts the rollout config before listening"
+	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --all
+	@bash claw/scripts/lint-startup-calls-rollout-assert.sh --self-test
 	@echo "==> lint: session-event redaction"
 	@bash claw/scripts/lint-session-events-must-redact.sh --all
 	@echo "==> lint: checkpoints are sealed, not redacted"
@@ -162,6 +174,8 @@ verify-lint:
 	else \
 		echo "error: go is required for gofmt verification" >&2; exit 1; \
 	fi
+	@echo "==> lint: PromQL rollout gates"
+	@bash scripts/release-tests/promql-gates.sh
 	@# The last gate before anything reaches a public tree. It needs ripgrep with
 	@# PCRE2 and exits 2 rather than reporting a clean tree it never searched.
 	@echo "==> lint: public tree scan"

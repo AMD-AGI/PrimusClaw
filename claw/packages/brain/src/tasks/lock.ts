@@ -249,6 +249,18 @@ export function pickRunScope(request: ExecuteRequest): string {
 }
 
 /**
+ * Shell-filing key: a DAG node's task or node id, or empty for a conversation.
+ * Throws when a DAG request has neither a task id nor a node id.
+ */
+export function pickShellRun(request: ExecuteRequest): string {
+  const isDagNode = !!(request.dag_root_task_id || request.dag_node_id);
+  if (!isDagNode) return "";
+  const shellRun = request.task_id || request.dag_node_id;
+  if (!shellRun) throw new Error("DAG shell scope requires a non-empty task_id or dag_node_id");
+  return shellRun;
+}
+
+/**
  * Compute the lock key for a request: which runs are allowed to overlap.
  *
  * The question the key is answering is whether two runs write the same files.
