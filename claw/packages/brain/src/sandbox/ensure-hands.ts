@@ -1902,7 +1902,13 @@ export async function rollbackUnregisterableWorkload(args: {
       try {
         owner = (JSON.parse(sc.decode(e.value!)) as { workloadId?: string }).workloadId ?? null;
       } catch { readable = false; }
-      if (!readable || (owner && owner !== workloadId)) {
+      // `owner !== workloadId` outright, empty included. A legitimate
+      // agent-sandbox READY binding carries `workloadId: ""` -- its identity is
+      // the Router session id -- so treating a missing owner as "not somebody
+      // else's" let a SaFE rollback overwrite a live Router binding with its own
+      // PENDING row. The strict comparison this replaced was right about that;
+      // the `owner &&` guard I added to it was the regression.
+      if (!readable || owner !== workloadId) {
         logger.warn(
           { sessionId, workloadId, key: name, owner, readable },
           "dag-handles.pending_register_rollback_session_reused",

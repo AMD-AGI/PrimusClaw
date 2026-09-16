@@ -308,6 +308,14 @@ function isRevisionConflict(e: unknown): boolean {
  * on the teardown path goes through these methods, which is what makes the
  * outcomes below testable without a NATS server.
  */
+/**
+ * Brain's retention ledger prefix, restated rather than imported: it is declared
+ * in `@claw/brain`, which this process does not depend on. A drift here reads as
+ * "nothing is retained", which is why the reader below is asserted against a
+ * real key shape rather than a stub.
+ */
+const RETENTION_LEDGER_PREFIX = "retention.";
+
 export const handleRegistry = {
   destroy(
     dagRootTaskId: string,
@@ -343,13 +351,37 @@ export const handleRegistry = {
   async retained(workloadId: string): Promise<boolean> {
     if (!workloadId) return false;
     const dec = new TextDecoder();
-    for await (const key of await kv.keys(`${HANDS_KEY_PREFIX}${RETAINED_PREFIX}*`)) {
-      const entry = await kv.get(key);
-      if (!entry || !entry.value?.length) continue;
-      let parsed: unknown;
-      try { parsed = JSON.parse(dec.decode(entry.value)); } catch { continue; }
-      if (!isRetentionEntry(parsed)) continue;
-      if ((parsed as { workloadId?: string }).workloadId === workloadId) return true;
+    // Both records, and neither filter is a prefix match.
+    //
+    // `hands.retained-*` is not a wildcard: NATS only treats `*` as one when it
+    // is a whole token, so that filter is a literal nobody writes and the scan
+    // came back empty every time -- a gate that never fired, on a path whose
+    // tests stub this method and so could never have caught it.
+    //
+    // The ledger is the authority, not the projection: `retainContainer` writes
+    // the ledger first and the projection is restored FROM it, so a ledger-only
+    // moment is a container that is retained and a projection-only read that
+    // misses it is the mistake Brain's own `retainedTaker` already avoids.
+    for (const [filter, prefix] of [
+      [`${RETENTION_LEDGER_PREFIX}*`, RETENTION_LEDGER_PREFIX],
+      [`${HANDS_KEY_PREFIX}*`, `${HANDS_KEY_PREFIX}${RETAINED_PREFIX}`],
+    ] as const) {
+      for await (const key of await kv.keys(filter)) {
+        if (!key.startsWith(prefix)) continue;
+        const entry = await kv.get(key);
+        if (!entry || !entry.value?.length) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(dec.decode(entry.value));
+        } catch (e) {
+          // Unreadable is not absent. The caller turns a throw into
+          // `unconfirmed`; swallowing it here would answer "not retained" about
+          // a record that may say the opposite.
+          throw new Error(`retention record ${key} is unreadable: ${errText(e)}`);
+        }
+        if (!isRetentionEntry(parsed)) continue;
+        if ((parsed as { workloadId?: string }).workloadId === workloadId) return true;
+      }
     }
     return false;
   },

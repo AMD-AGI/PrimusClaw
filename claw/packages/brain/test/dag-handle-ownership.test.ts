@@ -909,8 +909,12 @@ test("H25 what round 43 found the halves of", async () => {
   // else's refuses.
   assert.equal(/if \(usable\) \{ found = \{ key: name, entry: e \}; break; \}/.test(body), false,
     "the loop must not stop before it knows whose the row is");
-  assert.match(body, /if \(!readable \|\| \(owner && owner !== workloadId\)\)/,
-    "unreadable is not evidence the slot is free");
+  // Round 45: `owner &&` was a regression on this line. A legitimate
+  // agent-sandbox READY binding carries `workloadId: ""` -- its identity is the
+  // Router session -- so skipping the comparison for an empty owner let a SaFE
+  // rollback overwrite a live Router binding. Strict inequality, empty included.
+  assert.match(body, /if \(!readable \|\| owner !== workloadId\)/,
+    "unreadable is not evidence the slot is free, and neither is an empty owner");
   assert.equal(/readHandsEntry\(/.test(body), false,
     "and not through the canonical-first reader, which stops at the first hit");
 
@@ -1002,11 +1006,17 @@ test("H27 releasing a retention also frees any handle still naming it", async ()
   // cleanup is adjacent to the release and cannot be reordered away from it.
   const ka = readFileSync(
     fileURLToPath(new URL("../src/sandbox/keepalive.ts", import.meta.url)), "utf-8");
-  const at = ka.indexOf("await releaseRetention(");
-  assert.notEqual(at, -1, "expected the retention release");
-  const after = ka.slice(at, ka.indexOf("released += 1;", at));
-  assert.match(after, /releaseHandlesForWorkload\(target\.inst\.id\)/,
-    "the handle has to be freed in the same step that removes its evidence");
+  // Round 45 reversed this: the handle is freed BEFORE the records are deleted.
+  // The records are the evidence a later registration reads to know the
+  // container was handed over, so deleting them first and then failing to free
+  // the handle leaves a handle with nothing behind it and no sweep that will
+  // revisit it. Freeing first, a failure leaves the retention standing and the
+  // next sweep runs this again.
+  const rel = ka.indexOf("await releaseRetention(");
+  assert.notEqual(rel, -1, "expected the retention release");
+  const free = ka.lastIndexOf("releaseHandlesForWorkload(target.inst.id)", rel);
+  assert.notEqual(free, -1, "the handle has to be freed on this path");
+  assert.ok(free < rel, "and freed before the evidence for it is deleted");
   assert.match(ka, /import \{ listAllDagHandles, releaseHandlesForWorkload \}/,
     "and imported, not shadowed by a local of the same name");
 });

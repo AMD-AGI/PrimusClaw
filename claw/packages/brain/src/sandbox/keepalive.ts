@@ -448,27 +448,22 @@ async function runRetentionReadPhase(
       if (live.verdict !== "clear") continue;
       // The only irreversible act on this path, and it still happens only after
       // a read that answered `clear`, on this sweep, about this container.
-      await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
-      // And any DAG handle still naming it.
+      // The handle first, the records second, and that order is the recovery.
       //
-      // The hand-over into retention frees that handle itself, but a release
-      // that did not land leaves it behind -- and until now the retention
-      // record was the only evidence that let a later registration take the
-      // name back. Deleting the record here without this would strip that
-      // evidence at the very moment it stops being reproducible: the session
-      // binding is already gone, so nothing re-enters the hand-over path, and
-      // every replacement is refused for the life of the DAG.
+      // The records are what a later registration reads to know the container
+      // was handed over (`mayTakeFrom`). Deleting them first and then failing to
+      // free the handle leaves a handle with no evidence behind it and nothing
+      // that will try again -- the entry is gone from the retention set, so no
+      // later sweep revisits it, and every replacement is refused for the life
+      // of the DAG. Freeing first, a failure leaves the retention standing and
+      // the next sweep runs this again.
       //
-      // Keyed by workload, and by this point nothing is meant to be holding it
-      // -- the container has just been read `clear` and is leaving protection.
+      // The reverse residue is harmless: a freed handle whose records outlive it
+      // by one sweep is a container that is simply released a sweep later.
       if (target.inst.id) {
-        await releaseHandlesForWorkload(target.inst.id).catch((err) => {
-          logger.warn(
-            { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
-            "keepalive.retention_handle_release_failed",
-          );
-        });
+        await releaseHandlesForWorkload(target.inst.id);
       }
+      await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
       released += 1;
     } catch (err) {
       complete = false;

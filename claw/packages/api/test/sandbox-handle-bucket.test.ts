@@ -140,3 +140,41 @@ test("B4 and no longer grants the bucket it does not use", () => {
     "handles never lived in BRAIN_REGISTRY; a grant saying they do is how this bug reads as intentional",
   );
 });
+
+test("B5 the retention reader uses filters NATS actually matches", async () => {
+  // Round 45. `hands.retained-*` is not a wildcard -- NATS treats `*` as one
+  // only when it is a whole token -- so that filter was a literal nobody
+  // writes, the scan came back empty every time, and the gate never fired in
+  // production. Nothing caught it because every test of that gate stubs the
+  // method, so the filter itself was never executed.
+  //
+  // Checked against the key shapes Brain actually writes, taken from its own
+  // key builders rather than restated here.
+  const src = read("../src/tasks/sandbox-stopper.ts");
+  const fn = src.slice(src.indexOf("async retained(workloadId: string)"));
+  // Code only. The comment in there names the broken filter in order to explain
+  // it, and a check that reads prose cannot tell the explanation from the bug --
+  // this assertion failed on its own comment the first time.
+  const body = fn.slice(0, fn.indexOf("\n  },"))
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+
+  assert.equal(/hands\.retained-\*/.test(body), false,
+    "a `*` mid-token matches nothing; that filter reads as an empty retention set");
+  assert.match(body, /\$\{HANDS_KEY_PREFIX\}\*/,
+    "the projection scan has to use a whole-token wildcard");
+  assert.match(body, /\$\{RETENTION_LEDGER_PREFIX\}\*/,
+    "and the ledger has to be scanned at all -- it is the authority the "
+      + "projection is restored from");
+  assert.match(body, /throw new Error\(`retention record/,
+    "an unreadable record is not an absent one; the caller turns a throw into "
+      + "`unconfirmed`");
+
+  // The prefixes have to be the ones Brain writes. `retentionKey` builds
+  // `hands.retained-<encoded>` and `retentionLedgerKey` builds
+  // `retention.<encoded>`.
+  const brain = read("../../brain/src/sandbox/retain-container.ts");
+  assert.match(brain, /`\$\{HANDS_KEY_PREFIX\}\$\{RETAINED_PREFIX\}\$\{encodeKeyPart\(generation\)\}`/,
+    "if Brain's projection key shape moves, this reader stops matching it");
+  assert.match(brain, /export const RETENTION_LEDGER_PREFIX = "retention\.";/,
+    "and the ledger prefix restated in the API has to be this one");
+});

@@ -56,6 +56,12 @@ afterEach(restoreAll);
 
 let stopped: string[];
 beforeEach(() => {
+  // Nothing is retained unless a test says so. The real `retained` reads the
+  // registry bucket, which no test here binds -- and its failure direction is
+  // refusal, so leaving it unstubbed turns every teardown in this file into
+  // `unconfirmed`. That is how L2, L4 and L8 went red on CI while passing
+  // locally: this file was not the one the gate's own tests live in.
+  handleRegistry.retained = async () => false;
   stopped = [];
   unreleasedRecord.mark = async () => {};
   unreleasedRecord.clear = async () => {};
