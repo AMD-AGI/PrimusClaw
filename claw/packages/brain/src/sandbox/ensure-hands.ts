@@ -1780,8 +1780,20 @@ export function makeOnProvisioned(deps: {
  * A rollback attempt makes at most this many rounds of it. Both remedies are
  * retried because the single thing that must not happen -- a live workload no
  * record points at -- survives one transient failure of either.
+ *
+ * Rounds are spaced by `ROLLBACK_ROUND_GAP_MS` whenever the round ends with
+ * neither remedy landed, so that three rounds are three chances at a transient
+ * failure rather than three reads of the same instant.
  */
 export const ROLLBACK_ATTEMPTS = 3;
+
+/**
+ * Gap between rollback rounds that ended with neither remedy landed. Short,
+ * because the caller is a provisioning path that has already failed and is
+ * about to throw -- long enough to straddle a retryable blip, not long enough
+ * to be worth detaching. The same 200ms the normal pending write uses.
+ */
+export const ROLLBACK_ROUND_GAP_MS = 200;
 
 /**
  * Backoff for the detached recovery that runs when every synchronous round
@@ -1954,8 +1966,17 @@ export async function rollbackUnregisterableWorkload(args: {
           { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },
           "hands.kv.pending_put_after_failed_rollback_failed",
         );
-        if (attempt < rounds) await sleep(200);
       }
+      // The gap belongs to the ROUND, not to the KV catch. `recordPending`
+      // reports a slot that is somebody else's by returning FALSE, not by
+      // throwing -- and that is exactly the case where the stop is the only
+      // remedy left, so it is the case that most needs the rounds spread out.
+      // Spacing only the thrown case meant a session whose slot had moved on
+      // burned all three rounds within a few milliseconds of the same 503,
+      // which is one attempt's worth of a SaFE hiccup wearing three attempts'
+      // clothing. Skipped once the record has landed (the loop is about to end)
+      // and on the last round (nothing follows it to space).
+      if (!recorded && attempt < rounds) await sleep(ROLLBACK_ROUND_GAP_MS);
     }
 
     if (stopped) {

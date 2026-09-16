@@ -46,6 +46,8 @@
  *   H20 a recorded entry does not end the recovery -- only a landed stop does
  *   H21 an empty PUT is replaced, not create-conflicted forever
  *   H22 the reaper's identity check is wired through both call sites
+ *   H28 a declined record still spaces the rounds it shares with the stop
+ *   H29 a registration with no workload id does not take a live workload's name
  */
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -55,7 +57,11 @@ import { handsSessionKey } from "@claw/protocol";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { rollbackUnregisterableWorkload } from "../src/sandbox/ensure-hands.js";
+import {
+  ROLLBACK_ATTEMPTS,
+  ROLLBACK_ROUND_GAP_MS,
+  rollbackUnregisterableWorkload,
+} from "../src/sandbox/ensure-hands.js";
 import {
   bindDagHandleKvForTest,
   initDagHandles,
@@ -429,6 +435,44 @@ test("H12 a legacy bare-string entry still counts as a workload on record", asyn
   } finally {
     restore();
   }
+});
+
+test("H29 a registration with no workload id does not take a live workload's name", async () => {
+  // The refusal used to read `previous && info.workload_id && previous !==
+  // info.workload_id`, so an incoming EMPTY workload id short-circuited it
+  // entirely. An agent-sandbox registration always carries one -- its identity
+  // is the Router session, not a SaFE workload -- so in kubernetes mode, where
+  // both shapes coexist under one handle name, it walked straight over a handle
+  // still naming a live SaFE workload and took its only reference with it.
+  // Backend then reads the DAG as holding a Router sandbox and the workload as
+  // held by nobody: a cancel stops nothing and the GPU stays allocated.
+  //
+  // An absent workload id is not evidence that the handle on record is stale.
+  await replaceDagHandle("dag-29", "main", { workload_id: "W-live" });
+
+  await assert.rejects(
+    () => replaceDagHandle("dag-29", "main", {
+      workload_id: "", provider: "agent-sandbox", session_id: "S-router",
+      sandbox_name: "sb-1", namespace: "ns-1",
+    }),
+    /still names W-live/,
+  );
+  const afterSandbox = await lookupDagHandle("dag-29", "main");
+  assert.equal(afterSandbox?.workload_id, "W-live",
+    "the only reference to the live workload is still the one on record");
+  assert.equal(afterSandbox?.session_id, undefined,
+    "and the Router session did not land on top of it");
+
+  // The same for a registration that names nothing at all: no workload id and
+  // no session either. Nothing could find that sandbox afterwards, so it is
+  // refused rather than handed a name it cannot be looked up by.
+  await assert.rejects(
+    () => replaceDagHandle("dag-29", "main", { workload_id: "", hands_url: "http://h" }),
+    /still names W-live/,
+  );
+  assert.equal(
+    (await lookupDagHandle("dag-29", "main"))?.workload_id, "W-live",
+    "and the handle still names the workload nobody released");
 });
 
 test("H13 releasing does not delete a handle registered while it decided", async () => {
@@ -989,6 +1033,58 @@ test("H26 the rollback's occupancy check reads every name before deciding", asyn
   assert.deepEqual(writes, [],
     "a live row under the other name refuses the write, whichever name holds it");
   assert.equal(outcome, "orphaned", "nothing was recorded and the stop did not land");
+});
+
+test("H28 a declined record still spaces the rounds it shares with the stop", async () => {
+  // G9. `recordPending` reports a session slot that belongs to somebody else by
+  // returning FALSE -- it does not throw -- and the gap between rounds lived
+  // inside the KV catch. So the one shape where the stop is the ONLY remedy
+  // left (H19's: the session has moved on to W2, the record will decline for
+  // good) was also the one shape that got no spacing at all: three stops inside
+  // a few milliseconds, all reading the same instant of the same transient 503.
+  // Three attempts that cannot see three different moments are one attempt.
+  //
+  // Observable as the wall clock between the stop calls, which is the thing the
+  // retry is buying: real time for SaFE to come back in.
+  const stopAt: number[] = [];
+  const t0 = process.hrtime.bigint();
+  const ms = () => Number(process.hrtime.bigint() - t0) / 1e6;
+  // The slot is W2's, under whichever name the rollback reads -- the decline is
+  // the point here, not which key carries it.
+  const row = {
+    value: sc.encode(JSON.stringify({ status: "ready", workloadId: "W2" })),
+    revision: 7,
+    operation: "PUT",
+  };
+  const writes: string[] = [];
+  const outcome = await rollbackUnregisterableWorkload({
+    sessionId: "s-g9", workloadId: "W1", namespace: "ns", platformKey: "pk",
+    pendingPayload: sc.encode(JSON.stringify({ status: "pending", workloadId: "W1" })),
+    kv: {
+      async get() { return row; },
+      async create(key: string) { writes.push(key); return 1; },
+      async update(key: string) { writes.push(key); return 8; },
+    },
+    deps: {
+      stop: async () => { stopAt.push(ms()); throw new Error("503 from SaFE"); },
+      // The detached recovery is a separate mechanism with its own backoff
+      // (H18); what is under test is the three synchronous rounds.
+      detach: () => {},
+      retryDelaysMs: [],
+    },
+  });
+
+  assert.deepEqual(writes, [], "W2's slot is not W1's to take, so nothing is written");
+  assert.equal(outcome, "orphaned", "neither remedy landed");
+  assert.equal(stopAt.length, ROLLBACK_ATTEMPTS, "all three rounds ran");
+  const gaps = stopAt.slice(1).map((t, i) => t - stopAt[i]);
+  for (const [i, gap] of gaps.entries()) {
+    assert.ok(
+      gap >= ROLLBACK_ROUND_GAP_MS * 0.75,
+      `round ${i + 2} must be a separate chance at the outage, not the same `
+        + `instant re-read (waited ${Math.round(gap)}ms of ${ROLLBACK_ROUND_GAP_MS}ms)`,
+    );
+  }
 });
 
 test("H27 releasing a retention also frees any handle still naming it", async () => {

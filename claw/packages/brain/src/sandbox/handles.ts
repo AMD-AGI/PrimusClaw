@@ -283,11 +283,38 @@ export async function replaceDagHandle(
     const previous = typeof prevRaw === "string"
       ? prevRaw
       : (prevRaw as { workload_id?: string } | undefined)?.workload_id;
+    // What the INCOMING registration names, which is not always a workload id:
+    // an agent-sandbox records `workload_id: ""` and carries its Router session
+    // instead. `handleIdentityKey` is the one place that knows both shapes.
+    const incoming = handleIdentityKey(info);
     // Refuse to take the name from a DIFFERENT workload that is still on
     // record. `create` refused this too, and replacing that refusal with an
     // unconditional write is what let a redelivery -- whose `hands.<session>`
     // expired while this handle, in a bucket with no TTL, kept naming a
     // running workload -- overwrite the only reference to it.
+    //
+    // Compared against what this registration NAMES, not against its
+    // `workload_id`. The guard used to read `previous && info.workload_id &&
+    // previous !== info.workload_id`, so an empty `workload_id` short-circuited
+    // the whole refusal -- and an agent-sandbox registration, which always
+    // carries one, walked over a handle still naming a live SaFE workload and
+    // took its only reference with it. An absent workload id is NOT evidence
+    // that the handle on record is stale; it is evidence that the incoming
+    // sandbox is named some other way. A registration that names nothing at all
+    // -- neither id, so `incoming` is null -- is refused for the same reason,
+    // rather than being handed a name nothing could then find it by.
+    //
+    // The comparison stays one-sided on purpose: `previous` is the previous
+    // WORKLOAD id and deliberately not its identity key, so a previous
+    // agent-sandbox entry is still overwritable. Making it symmetric would
+    // protect a name that nothing can free. `releaseHandlesForWorkload` matches
+    // rows on `info.workload_id`, which an agent-sandbox row leaves empty, and
+    // none of its three callers can therefore free one: the reaper's post-stop
+    // release and retention both pass a SaFE workload id, and keepalive's sweep
+    // passes `inst.id`, which for an agent-sandbox is its Router session id and
+    // so matches no row's `workload_id` either. Refusing on that side would
+    // wedge the handle for the life of the DAG. Keying the release by identity
+    // too is what would earn the other half of this guard.
     //
     // A round of review was spent instead carrying the displaced id forward
     // and stopping it at teardown. That mechanism grew five ways to lose the
@@ -301,7 +328,7 @@ export async function replaceDagHandle(
     // the workload, so it stays findable. Whoever legitimately replaces a
     // workload removes its handle when they stop it -- see `runRebuild` --
     // so this refusal is not on the path of an ordinary rebuild.
-    if (previous && info.workload_id && previous !== info.workload_id) {
+    if (previous && previous !== incoming) {
       // Unless the workload it names has been RETAINED -- handed over to the
       // retention store because work was still running in it while this session
       // moved on. That hand-over frees the name, and normally does so itself;
@@ -319,7 +346,8 @@ export async function replaceDagHandle(
         );
       } else throw new Error(
         `dag-handle ${handleName} for ${dagRootTaskId} still names ${previous}; `
-        + `refusing to point it at ${info.workload_id} before that one is released`,
+        + `refusing to point it at ${incoming ?? "a registration naming neither a workload nor a session"} `
+        + `before that one is released`,
       );
     }
     // One write that sets the key, never a delete followed by a create: an

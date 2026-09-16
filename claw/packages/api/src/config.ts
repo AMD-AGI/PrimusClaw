@@ -217,12 +217,35 @@ export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
 export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", NATS_REPLICAS, { min: 1 });
-// Mirrors brain/src/config.ts, which names the same env var for the same
-// bucket. Either side may create DAG_HANDLES, and only this side reconciles
-// it, so a disagreement is not permanent: api corrects the bucket once and a
-// later brain restart attaches without restoring its own value. They still
-// have to agree, or the bucket brain creates on a fresh cluster is wrong until
-// api first reconciles it.
+
+// There is deliberately no DAG_HANDLES_REPLICAS here, and the absence is the
+// point: that bucket is brain's. Brain creates it in `sandbox/handles.ts` with
+// `js.views.kv("DAG_HANDLES", { replicas: DAG_HANDLES_REPLICAS })`, and since
+// `views.kv` attaches to a bucket that already exists and ignores the options
+// it was handed, that one call is the only one in a cluster's lifetime that
+// ever decides the bucket's replica count.
+//
+// Nothing in this package states an opinion about that configuration.
+// `bindDagHandles` and `listDagHandles` attach with `bindOnly: true`, and
+// DAG_HANDLES is kept out of the set that goes through `ensureKvBucket`
+// (nats-stream-config.test.ts pins that it never arrives there). The reason is
+// that `ensureKvBucket` corrects drift as well as creating: a count declared
+// here would be written onto brain's bucket on every boot of this process, and
+// on a cluster that came up api-first it would bring the bucket into existence
+// with a number brain never chose. A bucket with one owner has one answer about
+// its own configuration.
+//
+// The cost of that, spelled out because it is a cost and not a detail: no
+// process corrects this bucket after brain brings it up -- not here, not there.
+// DAG_HANDLES_REPLICAS has to be right in brain's environment the first time
+// brain boots against a fresh cluster, and a count that was wrong then stays
+// wrong until somebody deletes the bucket by hand. The comment that used to
+// stand here claimed the opposite -- a reconcile on this side that no call in
+// this package performs -- and it was cited on a sibling review to justify
+// accepting a defect, which is what a fallback nobody implements is for. The
+// same claim still sits in `infra/nats.ts` over DAG_HANDLES_BUCKET and in
+// brain's `sandbox/handles.ts`, and is no truer in either place.
+
 // The two streams, which had no replica setting at all and so were created at
 // the JetStream default of 1. A single-replica stream lives on exactly one
 // server: when that server's pod went away on 2026-09-01 nothing was hosting

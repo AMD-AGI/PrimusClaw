@@ -33,7 +33,7 @@
  *   R4 a timeout is `unconfirmed`, and does not throw out of the cancel
  *   R5 a DAG where one of several stops fails is not `confirmed`
  *   R6 a task that never recorded a handle is `nothing_held`, distinctly
- *   R7 a handle with no SaFE workload behind it is `unconfirmed`, not `nothing_held`
+ *   R7 a handle with no SaFE workload behind it keeps its mapping, unconfirmed
  *   R8 a failed release does not fail the cancellation or change its fields
  *   R9 the non-root branch omits the field rather than guessing at it
  *   R10 the route answers 200 with the field added and nothing else changed
@@ -300,34 +300,49 @@ test("R6 a task that never recorded a handle is nothing_held, not a failed relea
   assert.deepEqual(stopped, [], "no handle means no call to make");
 });
 
-test("R7 a handle with no SaFE workload behind it is unconfirmed, not nothing_held", async () => {
+test("R7 a handle with no SaFE workload behind it keeps its mapping, unconfirmed", async () => {
   // agent-sandbox handles are registered with `workload_id: ""` (Brain's
   // ensureHands), and this path has no way to stop one: the old code shared a
   // falsy check with "no such handle" and returned early. Something IS held
   // and this code did not release it, so `nothing_held` would assert the
   // opposite of what is true.
   //
+  // What keeps the next caller from answering `nothing_held` is the mapping,
+  // not a record. This branch used to write one and drop the mapping, and that
+  // record could never be discharged: `clear` runs only for a CONFIRMED stop
+  // of the workload it names, and the workload it names is "". So the DAG
+  // answered `unconfirmed` for life, long after the sandbox was gone, naming
+  // an empty workload id nobody could act on.
+  //
   // Asserted on stopSandboxByHandle directly, because the aggregate cannot
   // tell this apart: `nothing_held` for the one handle of a non-empty DAG
   // aggregates to `unconfirmed` too, so a cancel-level assertion would stay
   // green with the branch returning exactly the wrong value.
   stubDb();
+  const destroyed: string[] = [];
   handleRegistry.listForDag = async () => ({ main: { workload_id: "" } });
   handleRegistry.listForDagConsistent = async () => ({ main: { workload_id: "" } });
   handleRegistry.listDagRoots = async () => ["t-root"];
   handleRegistry.lookup = async () => ({ workload_id: "" });
-  handleRegistry.destroy = async () => "";
+  handleRegistry.destroy = async (_dag: string, name: string) => { destroyed.push(name); return ""; };
   handleRegistry.listAll = async () => [];
   const { stopped } = stubSafe(() => new Response("", { status: 200 }));
 
   assert.equal(await stopSandboxByHandle("t-root", "main", "s-1"), "unconfirmed");
   assert.deepEqual(stopped, [], "there is no workload id to issue a stop against");
+  assert.deepEqual(
+    destroyed, [],
+    "and the mapping stays -- it is the only reference to a sandbox this path cannot stop",
+  );
   assert.equal(
-    await unreleasedRecord.any("t-root"), true,
-    "and it is on record, so the next caller does not read the empty map as nothing_held",
+    await unreleasedRecord.any("t-root"), false,
+    "so nothing is latched onto the DAG that no later call could ever clear",
   );
 
-  assert.equal((await cancelTask("t-root")).released, "unconfirmed", "and it aggregates through");
+  assert.equal(
+    (await cancelTask("t-root")).released, "unconfirmed",
+    "and it aggregates through -- off the handle that is still registered, not off a latch",
+  );
 });
 
 test("R8 a failed release changes nothing about the cancellation itself", async () => {

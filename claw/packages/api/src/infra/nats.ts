@@ -67,24 +67,40 @@ export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
 export const DOORBELL_FLOOR_BUCKET = "DOORBELL_FLOOR";
 const DOORBELL_FLOOR_TTL_MS = 0;
 /**
- * Sandbox handle registry, per DAG. Brain is the only writer of handle
- * entries -- see `brain/src/sandbox/handles.ts` -- and this side is the only
- * destroyer. Either process may CREATE it -- whichever starts first on a fresh
- * cluster brings it up -- but only this one reconciles it, because `views.kv`
- * attaches to an existing bucket and ignores its options, so a bucket first
- * opened by brain keeps whatever it was created with until api corrects the
- * drift. Not because brain lacks a JetStreamManager -- its boot makes one --
- * but because only this side implements the reconcile, and `initDagHandles` is
- * handed a JetStreamClient alone. For a long time
- * this side did not read it at all: the API's sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain
- * never writes a handle to, so every teardown it ran found nothing to tear down
- * and every DAG's sandboxes outlived their DAG.
+ * Sandbox handle registry, per DAG. Brain is the only writer of handle entries
+ * -- see `brain/src/sandbox/handles.ts` -- and this side is the only destroyer.
+ *
+ * Brain also OWNS the bucket's configuration, and nothing on this side corrects
+ * it. `bindDagHandles` and `listDagHandles` attach with `bindOnly: true`, and
+ * DAG_HANDLES is deliberately kept out of `ensureKvBuckets` (see the "Bound,
+ * never ensured" note there, and nats-stream-config.test.ts, which pins that it
+ * never arrives). So the replica count and TTL brain creates it with are the
+ * ones it keeps for the life of the cluster; if they are wrong on brain's first
+ * boot against a fresh cluster they stay wrong until somebody deletes the
+ * bucket by hand.
+ *
+ * That cost is deliberate, because `ensureKvBucket` corrects drift as well as
+ * creating: a configuration declared on this side would be written onto brain's
+ * bucket on every boot of this process, and on a cluster that came up api-first
+ * it would bring the bucket into existence with numbers brain never chose. A
+ * bucket with one owner has one answer about its own configuration.
+ *
+ * This comment used to say the opposite -- that only this side reconciles the
+ * bucket, and that a brain-created one keeps its settings "until api corrects
+ * the drift". No call in this package performs that reconcile. The same false
+ * claim stood in api/src/config.ts and was cited on a sibling review to justify
+ * accepting a defect, which is what a fallback nobody implements is good for.
+ *
+ * For a long time this side did not read the bucket at all: the API's
+ * sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain never writes a
+ * handle to, so every teardown it ran found nothing to tear down and every
+ * DAG's sandboxes outlived their DAG.
  *
  * TTL 0 is not a default, it is the requirement: a handle has to live as long
  * as its DAG, which for a long evaluation is hours, and `BRAIN_REGISTRY`'s
  * five-minute TTL -- sized for `lock.<key>` -- is what made the wrong bucket
- * look plausible while quietly discarding the mapping. `widenOnly` so that
- * attaching from this side can never narrow a bucket Brain owns.
+ * look plausible while quietly discarding the mapping. That TTL is brain's to
+ * declare, for the reason above; this side only binds.
  */
 export const DAG_HANDLES_BUCKET = "DAG_HANDLES";
 
