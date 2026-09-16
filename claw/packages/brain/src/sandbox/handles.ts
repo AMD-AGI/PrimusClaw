@@ -423,11 +423,22 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
     // different workload since the scan, which is somebody else's and must
     // not be removed on the strength of a stale read.
     for (const name of names) {
+      // Whether this name was actually let go. Exhausting the retries used to
+      // return as though it had been: the caller then deleted the retention
+      // records that were the container's remaining reference, and the handle
+      // it still had stayed behind with nothing to recover it from. A release
+      // that did not happen has to say so.
+      let freed = false;
       for (let attempt = 0; attempt < REGISTER_CAS_ATTEMPTS; attempt += 1) {
         const key = `${HANDLE_MAP_PREFIX}.${dagRoot}`;
         const entry = await kv.get(key);
-        if (!entry || entry.operation === "DEL" || entry.operation === "PURGE") break;
-        if (entry.value.length === 0) break;
+        // No row, a tombstone, or an empty value: nothing names this workload
+        // here, which is the same outcome as having removed it.
+        if (!entry || entry.operation === "DEL" || entry.operation === "PURGE") { freed = true; break; }
+        if (entry.value.length === 0) { freed = true; break; }
+        // Unreadable is NOT that: it may name this workload and we cannot see
+        // it, so it falls through to the refusal below rather than reporting a
+        // release that was never made.
         const parsed: unknown = JSON.parse(dec.decode(entry.value));
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) break;
         const row = parsed as Record<string, unknown>;
@@ -437,7 +448,7 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
           ? held
           : (held as { workload_id?: string } | undefined)?.workload_id;
         // Already gone, or moved on to something else: not ours to remove.
-        if (heldId !== workloadId) break;
+        if (heldId !== workloadId) { freed = true; break; }
 
         delete row[name];
         try {
@@ -447,11 +458,22 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
             await kv.update(key, enc.encode(JSON.stringify(row)), entry.revision);
           }
           logger.info({ dagRootTaskId: dagRoot, handleName: name, workloadId }, "dag-handles.released");
+          freed = true;
           break;
         } catch (e) {
           if (!isRevisionConflict(e)) throw e;
           logger.info({ dagRootTaskId: dagRoot, handleName: name, attempt }, "dag-handles.release_retry");
         }
+      }
+      if (!freed) {
+        // `break` above also lands here -- that is the case where the row moved
+        // on to another workload or vanished, which IS released as far as this
+        // workload is concerned, so it sets `freed` too. Reaching here means the
+        // retries ran out with the name still ours and still written.
+        throw new Error(
+          `dag-handle ${name} for ${dagRoot} was not released from ${workloadId}: `
+          + `${REGISTER_CAS_ATTEMPTS} attempts exhausted, or its row could not be read`,
+        );
       }
     }
   }

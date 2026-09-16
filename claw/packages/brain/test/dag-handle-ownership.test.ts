@@ -1014,7 +1014,10 @@ test("H27 releasing a retention also frees any handle still naming it", async ()
   // next sweep runs this again.
   const rel = ka.indexOf("await releaseRetention(");
   assert.notEqual(rel, -1, "expected the retention release");
-  const free = ka.lastIndexOf("releaseHandlesForWorkload(target.inst.id)", rel);
+  // Through the seam, like its sibling `listDagHandles`: the real one needs
+  // JetStream, and a sweep whose release always throws never releases anything.
+  const free = ka.lastIndexOf(
+    "(deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id)", rel);
   assert.notEqual(free, -1, "the handle has to be freed on this path");
   assert.ok(free < rel, "and freed before the evidence for it is deleted");
   assert.match(ka, /import \{ listAllDagHandles, releaseHandlesForWorkload \}/,

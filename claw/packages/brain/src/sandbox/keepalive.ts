@@ -185,6 +185,12 @@ interface KeepaliveDeps {
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
   /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
+  /**
+   * Test seam for freeing a released container's DAG handle -- same reason as
+   * `listDagHandles`: it needs JetStream, and a sweep whose release always
+   * throws never releases anything, which is not the behaviour under test.
+   */
+  releaseDagHandles?: (workloadId: string) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
   /**
@@ -461,7 +467,23 @@ async function runRetentionReadPhase(
       // The reverse residue is harmless: a freed handle whose records outlive it
       // by one sweep is a container that is simply released a sweep later.
       if (target.inst.id) {
-        await releaseHandlesForWorkload(target.inst.id);
+        try {
+          await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id);
+        } catch (err) {
+          // Caught here, not by the outer handler: this is the one failure on
+          // this path that must leave the retention exactly where it is, and it
+          // is not a failed retention READ. Letting it reach the outer catch
+          // marked the whole sweep incomplete and disturbed the walk's budget
+          // and queue -- six of the roster-tick tests say so.
+          //
+          // The entry keeps its place: the records still stand, so the next
+          // sweep reaches this line again.
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
+            "keepalive.retention_handle_release_failed",
+          );
+          continue;
+        }
       }
       await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
       released += 1;

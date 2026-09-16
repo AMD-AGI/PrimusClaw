@@ -68,6 +68,14 @@ test("an unset SAFE_API_URL is an unconfirmed release, not a quiet success", asy
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
 
+  // Round 46: this file passed with the retention check throwing -- its log said
+
+  // `retention_check_failed` while the assertion expected `unconfirmed` anyway.
+
+  // Green for the wrong reason is how the gate's absence would have looked too.
+
+  handleRegistry.retained = async () => false;
+
   handleRegistry.listForDag = async (): Promise<Record<string, HandleInfo>> =>
     ({ main: { workload_id: "w-1" } });
   handleRegistry.lookup = async (): Promise<HandleInfo | null> => ({ workload_id: "w-1" });
