@@ -1301,23 +1301,31 @@ test("a slow handle release cannot push the phase past its declared ceiling", as
   kv.seed(key, value);
   kv.seed(ledgerKeyForRetention(key), value);
 
+  let now = 0;
+  let reachedRelease = false;
   const startedAt = Date.now();
   await runKeepaliveTickForTest({
     // Never settles. The bound has to come from this side of the call, which is
     // the whole point: a release that hangs is exactly the case a limit on the
     // enumeration alone does not cover.
-    releaseDagHandles: () => new Promise<void>(() => {}),
+    releaseDagHandles: () => { reachedRelease = true; return new Promise<void>(() => {}); },
     kv, countActiveShells: async () => 0, now: () => now,
     roster: { store: rosterStore(kv), config: CONFIG },
   });
   const elapsedMs = Date.now() - startedAt;
 
+  // First: that the release was reached at all. Without this the timing
+  // assertion passes whenever the sweep never gets that far, which is how a
+  // bound that does not exist would also look.
+  assert.ok(reachedRelease,
+    "the sweep never reached the handle release, so this proves nothing about its bound");
   assert.ok(elapsedMs <= ceilingMs,
     `the tick waited ${elapsedMs}ms on a hanging release against a declared phase `
       + `ceiling of ${ceilingMs}ms`);
   // And the retention survives, because the release never happened -- the next
-  // sweep is what retries it.
-  assert.ok(kv.get(key) !== undefined || kv.get(ledgerKeyForRetention(key)) !== undefined,
+  // sweep is what retries it. Read from the backing map, not `kv.get`: that
+  // returns a promise, so comparing it to undefined asserts nothing at all.
+  assert.ok(values.has(key) || values.has(ledgerKeyForRetention(key)),
     "a release that timed out must leave the retention standing");
 });
 
