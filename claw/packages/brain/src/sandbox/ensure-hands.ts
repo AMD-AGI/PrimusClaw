@@ -14,7 +14,7 @@ import { webcrypto } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import pino from "pino";
 import { composeSandboxEnv } from "@claw/protocol";
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, HandleInfo } from "@claw/protocol";
 import { isRevisionConflict, sleep } from "@claw/utils";
 import { isTombstone, pickLockKey } from "../tasks/lock.js";
 import {
@@ -311,45 +311,118 @@ export async function assertDagHandleAlive(
   token?: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal);
-  if (health.ok) return;
-  if (identity && token) {
-    const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
-    if (probe.verdict === "alive") {
-      const restarted = await reuseEffects.restartHandsInSandbox({
-        sessionId,
-        handsUrl,
-        token,
-        entry: identity,
-        signal,
-      });
-      if (restarted.ok) return;
-      // A node that inherited this sandbox cannot rebuild it (see the throw
-      // below and inheritedSandboxHandle), so a refusal here has no fallback
-      // to offer -- but it must still say which of the two happened, or the
-      // operator reads "could not restart" and goes looking for a crash.
-      throw new Error(
-        restarted.refused
-          ? `sandbox_spec.use='${handle}' in-place Hands restart is unavailable in `
-            + `this deployment (${restarted.detail}), and a node cannot rebuild a `
-            + `sandbox it inherited (dag ${dagRoot}). Re-run the node that created `
-            + `this handle.`
-          : `sandbox_spec.use='${handle}' Hands could not restart in its live sandbox `
-            + `(dag ${dagRoot}): ${restarted.detail}`,
-      );
-    }
-    if (probe.verdict === "unknown") {
-      throw new Error(
-        `sandbox_spec.use='${handle}' could not confirm its sandbox state `
-        + `(dag ${dagRoot}): ${probe.reason}. The sandbox was left intact.`,
-      );
-    }
+  const state = await probeHandleSandbox(sessionId, handsUrl, identity, token, signal);
+  if (state.state === "serving") return;
+  if (state.state === "stuck") {
+    // A node that inherited this sandbox cannot rebuild it (see the throw
+    // below and inheritedSandboxHandle), so a refusal here has no fallback
+    // to offer -- but it must still say which of the two happened, or the
+    // operator reads "could not restart" and goes looking for a crash.
+    throw new Error(
+      state.refused
+        ? `sandbox_spec.use='${handle}' in-place Hands restart is unavailable in `
+          + `this deployment (${state.detail}), and a node cannot rebuild a `
+          + `sandbox it inherited (dag ${dagRoot}). Re-run the node that created `
+          + `this handle.`
+        : `sandbox_spec.use='${handle}' Hands could not restart in its live sandbox `
+          + `(dag ${dagRoot}): ${state.detail}`,
+    );
+  }
+  if (state.state === "unknown") {
+    throw new Error(
+      `sandbox_spec.use='${handle}' could not confirm its sandbox state `
+      + `(dag ${dagRoot}): ${state.detail}. The sandbox was left intact.`,
+    );
   }
   throw new Error(
     `sandbox_spec.use='${handle}' points at a sandbox that is not responding `
-    + `(dag ${dagRoot}, ${handsUrl}): ${health.detail}. The node that created `
+    + `(dag ${dagRoot}, ${handsUrl}): ${state.detail}. The node that created `
     + `this handle has probably lost its sandbox.`,
   );
+}
+
+/**
+ * What a probe of a registered handle's sandbox found, before anybody decides
+ * what to do about it.
+ *
+ * Both readers of a handle row ask the same three questions in the same order
+ * -- is Hands answering, is the container there at all, will Hands come back if
+ * it is restarted in place -- and then want different things from the answers.
+ * A `use` node has no fallback and must fail. A `create` node built this
+ * sandbox itself, so it is allowed to let a dead one go and build another. The
+ * difference belongs in the caller; the probing is one copy here, because two
+ * copies are how the gate that decides a sandbox is reusable and the recovery
+ * that decides it is repairable drift into disagreeing about what "dead" means.
+ */
+type HandleSandboxState =
+  /** Hands answered -- straight away, or after being restarted in place. */
+  | { state: "serving"; detail: string }
+  /** The container is gone. Nothing runs in it, so nothing is lost replacing it. */
+  | { state: "gone"; detail: string }
+  /** The container is there and Hands will not come back inside it. */
+  | { state: "stuck"; detail: string; refused: boolean }
+  /** We could not tell. Never a licence to destroy anything. */
+  | { state: "unknown"; detail: string };
+
+async function probeHandleSandbox(
+  sessionId: string,
+  handsUrl: string,
+  identity?: SandboxEntry,
+  token?: string,
+  signal?: AbortSignal,
+): Promise<HandleSandboxState> {
+  const health = await checkHandsHealth(handsUrl, REUSE_HEALTH_TIMEOUT_MS, signal);
+  if (health.ok) return { state: "serving", detail: health.detail };
+  // Without both of these there is nothing to probe or restart WITH: the
+  // container is reached through the identity, and Hands is relaunched with the
+  // token. What was actually observed is the health failure, so that is what is
+  // quoted -- the caller treats it as gone because it is unusable and
+  // unrepairable, not because anything confirmed the container had left.
+  if (!identity || !token) return { state: "gone", detail: health.detail };
+  const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+  if (probe.verdict === "unknown") return { state: "unknown", detail: probe.reason };
+  if (probe.verdict === "dead") return { state: "gone", detail: health.detail };
+  const restarted = await reuseEffects.restartHandsInSandbox({
+    sessionId,
+    handsUrl,
+    token,
+    entry: identity,
+    signal,
+  });
+  if (restarted.ok) return { state: "serving", detail: restarted.detail };
+  return { state: "stuck", detail: restarted.detail, refused: !!restarted.refused };
+}
+
+/**
+ * The keepalive / teardown identity a handle row describes.
+ *
+ * One mapping for both readers of a handle row -- the `use` branch and the
+ * create path's own-handle gate -- because an identity assembled differently in
+ * two places is a sandbox one of them cannot address. The agent-sandbox shape is
+ * not the SaFE one: it records no workload id at all and carries the Router's
+ * session instead, so a mapping that filled in `workloadId` alone left every
+ * kubernetes handle unreachable.
+ */
+export function identityFromHandleInfo(info: HandleInfo): SandboxEntry {
+  if (info.provider === "agent-sandbox") {
+    return {
+      provider: "agent-sandbox",
+      sessionId: info.session_id,
+      sandboxName: info.sandbox_name,
+      namespace: info.namespace,
+      userId: info.user_id,
+    };
+  }
+  return {
+    workloadId: info.workload_id,
+    platformKey: info.platform_key ?? "",
+    // The namespace the upstream node recorded, not the deployment default:
+    // a workspace-scoped sandbox lives in the namespace its request named,
+    // and keepalive addressed to the default would poll a workload that is
+    // not there and let a live sandbox expire. The default is only the
+    // fallback for entries written before the field existed.
+    namespace: info.namespace || SANDBOX_NAMESPACE,
+  };
 }
 
 export interface ReuseAttempt {
@@ -360,6 +433,18 @@ export interface ReuseAttempt {
   requestedSpec: string;
   onEvent: (evt: Record<string, unknown>) => Promise<void>;
   signal?: AbortSignal;
+  /**
+   * What this request resolved to, so the own-handle gate below knows which
+   * handle name is this DAG's to look up.
+   *
+   * Only a `create` carrying a handle name can have a row of its own to
+   * consult: `use` never reaches here (provisionHands returns above), and an
+   * action with no handle name registers nothing, so there is nothing keyed by
+   * (DAG, handle) for the gate to be authoritative about. Optional because a
+   * caller that has no action to state -- there is none in production -- should
+   * skip the gate rather than be made to invent one.
+   */
+  action?: SandboxAction;
 }
 
 function reuseIdentity(info: any): SandboxEntry {
@@ -735,17 +820,370 @@ async function entryOwnedByAnother(
   }
 }
 
+/**
+ * Is this handle's sandbox built to the image this request is asking for?
+ *
+ * The question the session record answers with `evaluateReuse` over a full spec
+ * fingerprint, asked here over the only build field a handle row actually
+ * carries. `HandleInfo` records `image`, and nothing else about what the
+ * sandbox was made of: no resources, no env, no ttl, no timeout. The
+ * fingerprint belongs on that row -- both of Brain's registration sites already
+ * hold one when they write it -- but `HandleInfo` lives in @claw/protocol, and
+ * adding a field there is outside this change. See the note in the PR body.
+ *
+ * What the gap costs, precisely: a second `create` node of the SAME DAG,
+ * reusing the SAME handle name, with the same image but different resources or
+ * env, is reused where it should have been rebuilt. It costs nothing on the
+ * redelivery this gate exists for, where the request -- and so the spec -- is
+ * identical by construction; and nothing at all in the case where the session
+ * record and the handle agree, which never reaches here and keeps the full
+ * fingerprint comparison it always had. The case it does get wrong is one that
+ * fails outright today, so what the gap risks is a stale reuse in place of a
+ * dead task, not a correct rebuild in place of a stale reuse.
+ *
+ * A row with no image recorded matches, exactly as `evaluateReuse` treats a
+ * missing fingerprint: rows written before the field existed, and rows whose
+ * provider records none, must not be torn down over a comparison nobody wrote.
+ */
+function handleImageMatches(
+  own: HandleInfo,
+  action: Extract<SandboxAction, { kind: "create" }>,
+): boolean {
+  const recorded = (own.image ?? "").trim();
+  if (!recorded) return true;
+  return recorded === String(action.params.image ?? "").trim();
+}
+
+/**
+ * Let go of a sandbox this DAG's own handle names and cannot use.
+ *
+ * Returns null when the name was freed, and otherwise the reason it must not be
+ * -- which is not the same as a failure to free it. `destroyHands` throws for
+ * that, and the throw is deliberately not caught here.
+ */
+async function releaseOwnHandleSandbox(
+  a: ReuseAttempt,
+  dagRoot: string,
+  handleName: string,
+  own: HandleInfo,
+  identity: SandboxEntry,
+  ownKey: string,
+  why: string,
+  /**
+   * Whether anything could be RUNNING in this container.
+   *
+   * False for the two states that reach here with nothing to lose: a row that
+   * never finished provisioning was never handed to a task (and carries no
+   * token for one to have used), and a container the probe found gone is
+   * running nothing by definition. True for a sandbox that is alive and healthy
+   * and simply built to an image this request no longer asks for -- background
+   * shells outlive the turn that started them, and "the spec changed" is not a
+   * reason to kill work that is still going.
+   */
+  mayHoldLiveWork: boolean,
+): Promise<string | null> {
+  // Having REGISTERED this handle is not the same as being the only holder, and
+  // a probe against my own row cannot tell the two apart. A sibling DAG that
+  // adopted this workload out of the session record registered its own handle on
+  // it and is from then on just as much a holder -- so stopping it on the
+  // strength of my row alone pulls a pod out from under a DAG running inside it.
+  // That is the exact mis-stop `workloadHeldByOtherDag` was added to prevent,
+  // and it is asked here, immediately before the one irreversible step, for the
+  // same reason the session-entry branches ask it through `entryOwnedByAnother`.
+  //
+  // A holder scan that cannot complete answers YES. The cost of being wrong that
+  // way is this turn failing; the cost of being wrong the other way is a live
+  // sandbox stopped underneath somebody. That is the right way round.
+  if (await reuseEffects.workloadHeldByOtherDag(dagRoot, ownKey)) {
+    logger.warn(
+      { sessionId: a.sessionId, dagRoot, handle: handleName, workloadId: ownKey, why },
+      "ensureHands.own_handle_held_by_another_dag",
+    );
+    return "another DAG is holding that workload as well -- or the holder scan could not "
+      + "complete -- so it was not stopped";
+  }
+  // And what is running inside it, where that is a question at all. The
+  // session-record branch that rebuilds on a changed spec does not ask, because
+  // the sandbox it is about to replace is the one the session is recorded
+  // against and the retention path can take it over. Here it is not: this
+  // sandbox is named by no session slot, so there is nothing to retain it under
+  // -- `retentionGeneration` and the sweep both resolve a retained container
+  // through the binding it was retained with. Refusing is the only other answer,
+  // and it is the right way round: a turn that fails leaves the work running,
+  // and a turn that succeeds by killing it does not.
+  if (mayHoldLiveWork) {
+    const live = await mayDestroy(a.sessionId, identity, a.signal);
+    if (live.verdict !== "clear") {
+      logger.warn(
+        { sessionId: a.sessionId, dagRoot, handle: handleName, workloadId: ownKey,
+          why, verdict: live.verdict, reason: live.reason },
+        "ensureHands.own_handle_holds_live_work",
+      );
+      return `it still holds work that is running (${live.verdict}: ${live.reason}), `
+        + "so it was left intact";
+    }
+  }
+  logger.warn(
+    { sessionId: a.sessionId, dagRoot, handle: handleName, workloadId: ownKey, why },
+    "ensureHands.releasing_own_handle",
+  );
+  // `destroyHands` is what frees the NAME: it stops the workload and then
+  // releases every handle that names it, and that release is the step which lets
+  // the replacement's registration commit. Nothing here reaches around
+  // `replaceDagHandle`'s refusal to take a name from a workload still on record
+  // -- weakening that refusal is how a redelivery overwrites the only reference
+  // to a live workload, which is the failure it was added for. The name is
+  // freed by releasing it, the way a rebuild does.
+  //
+  // It is addressed by IDENTITY, not by session. The session key may well name
+  // a sibling's live sandbox, and `destroyHands` compares the identity it was
+  // given against the recorded one before it touches that entry -- so this stops
+  // our workload and leaves the sibling's session record where it is.
+  //
+  // A stop it could not confirm throws, and the throw is not caught: building a
+  // replacement over a workload that may still be running is precisely the
+  // orphan this path exists to avoid.
+  await reuseEffects.destroyHands(a.sessionId, identity, own.token || undefined);
+  return null;
+}
+
+/**
+ * The sandbox this DAG's OWN handle names, asked about before the session slot.
+ *
+ * `hands.<sessionId>` is one slot per session, and a session holds more than one
+ * sandbox more often than that shape admits: two DAG roots under a
+ * session-scoped run gate, a replica that died between a create's pending write
+ * and its READY write, a rebuild, a retention. Whichever create wrote the slot
+ * last is the one it names; the other sandbox is still running, still healthy,
+ * and still the only place its DAG's files are. `dag-handles.<dagRoot>` is keyed
+ * by (DAG, handle), which IS the question "which sandbox is this DAG's `main`",
+ * so it is the record that can answer it, and the session slot is the coarser
+ * fallback it has always been. No amount of making that one write atomic fixes
+ * this: a create-only or CAS'd put just picks the winner differently and leaves
+ * the loser's sandbox equally unnamed.
+ *
+ * Read FIRST, not as a tie-break, because the disagreement is only visible once
+ * the handle has been read -- reading it second is reading it too late. Until
+ * now `lookupDagHandle` was consulted only on the `use` path; a redelivered
+ * `create` walked straight past it into the session record, adopted whichever
+ * sandbox that slot happened to name, and had the adoption refused by
+ * `replaceDagHandle` -- because its own handle still named the sandbox it built.
+ * Two healthy sandboxes, the DAG's own one abandoned mid-flight with its
+ * workspace on it, the sibling's idle markers cleared and then re-parked
+ * underneath a DAG still running on it, and a node that failed the same way on
+ * every redelivery until its delivery budget ran out.
+ *
+ * It only ACTS when the two records disagree, and that restraint is the whole
+ * no-regression argument:
+ *
+ *   - They name the same sandbox: the session record is strictly better
+ *     informed -- it carries the full spec fingerprint, which a handle row does
+ *     not -- so the decision is left exactly where it was, untouched.
+ *   - No handle row at all (a first delivery): likewise untouched. The session
+ *     record decides, `registerReusedDagHandle` records the adoption, and the
+ *     name is free so it commits.
+ *   - They disagree: every path below this point ends in a refused registration
+ *     TODAY. Adopting what the slot names is refused because this DAG's handle
+ *     names another workload; building a replacement is refused for the same
+ *     reason. There is no working behaviour here to preserve, only a failure to
+ *     replace with the right answer.
+ *
+ * Returns this DAG's own sandbox when it is still serving; null when the caller
+ * should go on to the session record -- including after RELEASING an own handle
+ * that named something unusable, which is the step that frees the name for the
+ * rebuild; and throws when the DAG's own sandbox is alive but unusable and not
+ * ours to destroy, because there is nothing else this node may be given and
+ * saying so is better than a refused registration three steps later.
+ */
+async function reuseOwnDagHandle(
+  a: ReuseAttempt,
+  sessionInfo: Record<string, unknown> | null,
+): Promise<EnsureHandsResult | null> {
+  const { kv, sessionId, request, action, multiNodeContext, signal } = a;
+  // Multi-node bakes cluster env in at create and Hands never reloads env, so
+  // that path replaces any prior sandbox unconditionally -- there is no reuse
+  // decision here to make. Its own registration can still be refused by a stale
+  // own handle, which is the same defect in a path this change does not touch.
+  if (multiNodeContext) return null;
+  if (!action || action.kind !== "create" || !action.handle) return null;
+  const dagRoot = request.dag_root_task_id ?? request.task_id;
+  if (!dagRoot) return null;
+
+  let own: HandleInfo | null;
+  try {
+    own = await lookupDagHandle(dagRoot, action.handle);
+  } catch (e) {
+    // Unreadable is not "this DAG holds nothing". Reading it as that is how the
+    // only durable reference to a live workload gets overwritten, so the
+    // question is left unanswered and the session record decides as before --
+    // which is exactly what happened before this gate existed.
+    logger.warn(
+      { sessionId, dagRoot, handle: action.handle, err: (e as Error)?.message ?? String(e) },
+      "ensureHands.own_handle_lookup_failed",
+    );
+    return null;
+  }
+  if (!own) return null;
+
+  // Not the workload id alone. An agent-sandbox row records `workload_id: ""`
+  // and names its Router session instead, so comparing on the workload id would
+  // read every kubernetes handle as naming nothing and skip this gate for them.
+  const ownKey = handleIdentityKey(own);
+  if (!ownKey) return null;
+
+  const sessionKey = sessionInfo
+    ? handleIdentityKey({
+      workload_id: typeof sessionInfo.workloadId === "string" ? sessionInfo.workloadId : "",
+      session_id: typeof sessionInfo.sessionId === "string" ? sessionInfo.sessionId : "",
+    })
+    : null;
+  if (sessionKey && sessionKey === ownKey) return null;
+
+  // A RETAINED workload no longer owns the handle naming it: retention hands the
+  // container to the retention store precisely so the session can move on, and
+  // frees the name to say so. When that free did not land, the stale row is one
+  // `replaceDagHandle` is already allowed to take the name from, through
+  // `mayTakeFrom` -- so the ordinary path works and this gate must keep its
+  // hands off. Reusing it would be worse than not helping: the container is
+  // still running somebody else's background work, which is why it was retained.
+  if (await retainedTaker(kv)(own.workload_id ?? "")) {
+    logger.info(
+      { sessionId, dagRoot, handle: action.handle, workloadId: ownKey },
+      "ensureHands.own_handle_names_retained_workload",
+    );
+    return null;
+  }
+
+  const identity = identityFromHandleInfo(own);
+
+  // Half-created, or built for something else. `makeOnProvisioned` registers the
+  // handle the moment SaFE assigns an id -- deliberately, because a cancel
+  // arriving before that reads the DAG as holding nothing -- and the row keeps
+  // `pending: true` until the registration at the end of a successful create
+  // replaces it with the connection fields. A row still marked pending means
+  // this DAG's create never finished. `reapPendingHands` would have cleared it,
+  // but that only ever runs in-process, so the replica that died holding this is
+  // the only one that would have called it, and DAG_HANDLES has no TTL to do it
+  // instead.
+  //
+  // Stopping it is not a judgement call about whether the sandbox came up. The
+  // pending row carries no TOKEN -- the per-sandbox bearer is minted inside the
+  // create that died and written durably nowhere else -- so even a workload that
+  // finished booting and is serving right now cannot be authenticated to by
+  // anybody, ever again. It is unusable by construction, it is this DAG's, and
+  // it holds a GPU until something stops it. The same goes for a row with an
+  // endpoint and no token, or a token and no endpoint: half an address is not
+  // one.
+  const unusable = own.pending
+    ? "never_finished_provisioning"
+    : !own.hands_url
+      ? "no_endpoint_recorded"
+      : !own.token
+        ? "no_token_recorded"
+        : !handleImageMatches(own, action)
+          ? "image_changed"
+          : null;
+  if (unusable) {
+    const refused = await releaseOwnHandleSandbox(
+      a, dagRoot, action.handle, own, identity, ownKey, unusable,
+      // Only a spec change reaches here over a sandbox that is alive.
+      unusable === "image_changed",
+    );
+    if (!refused) return null;
+    throw new Error(
+      `this DAG's sandbox handle '${action.handle}' names ${ownKey}, which cannot serve this `
+      + `request (${unusable}), and ${refused}. The handle cannot be pointed at a replacement `
+      + `until it is released.`,
+    );
+  }
+
+  const state = await probeHandleSandbox(
+    sessionId, own.hands_url as string, identity, own.token, signal,
+  );
+  if (state.state === "serving") {
+    logger.info(
+      { sessionId, dagRoot, handle: action.handle, workloadId: ownKey,
+        handsUrl: own.hands_url, sessionEntryNames: sessionKey, detail: state.detail },
+      "ensureHands.reusing_own_handle",
+    );
+    // No registration, and none is possible to refuse: the handle already names
+    // this sandbox, so `replaceDagHandle` would see `previous === incoming` and
+    // write nothing that matters. That is the point of asking it first.
+    //
+    // No idle markers to clear either. Those live on `hands.<sessionId>`, which
+    // in this branch names a DIFFERENT sandbox -- a sibling's -- and clearing a
+    // sibling's markers is half of the damage this gate exists to stop doing.
+    //
+    // The ceiling is still asked, for the same reason `acceptExistingSandbox`
+    // asks it: provisioning is not the only way a ping target is taken on, and a
+    // reuse admitted against an uncounted fleet is the same unadmitted target by
+    // a path that never claims a slot.
+    assertFleetCensused(sessionId);
+    reuseEffects.registerSandbox(sessionId, identity);
+    return {
+      handsUrl: own.hands_url as string,
+      created: false,
+      token: own.token as string,
+      identity,
+    };
+  }
+
+  if (state.state === "gone") {
+    const refused = await releaseOwnHandleSandbox(
+      a, dagRoot, action.handle, own, identity, ownKey, state.detail, false,
+    );
+    if (!refused) return null;
+    throw new Error(
+      `this DAG's sandbox handle '${action.handle}' names ${ownKey}, whose container is gone `
+      + `(${state.detail}), and ${refused}. The handle cannot be pointed at a replacement `
+      + `until it is released.`,
+    );
+  }
+
+  // Alive, or possibly alive, and not ours to destroy on a guess. Falling
+  // through from here would adopt a sibling's sandbox -- clearing and re-parking
+  // its idle markers on the way out -- or build a replacement, and both end at
+  // the same refused registration, because this handle still names a workload
+  // nobody released. Saying so here costs one failed turn instead of one failed
+  // turn plus a wasted workload plus a sibling's markers.
+  throw new Error(
+    state.state === "stuck"
+      ? (state.refused
+        ? `this DAG's sandbox handle '${action.handle}' names ${ownKey}, which is still running `
+          + `but is not answering, and this deployment cannot restart Hands in place `
+          + `(${state.detail}). It was left intact -- what is running inside it is not this `
+          + `turn's to destroy -- and the DAG cannot be given a different sandbox while its `
+          + `handle names this one.`
+        : `this DAG's sandbox handle '${action.handle}' names ${ownKey}, which is still running `
+          + `but whose Hands could not be restarted (${state.detail}). It was left intact, and `
+          + `the DAG cannot be given a different sandbox while its handle names this one.`)
+      : `could not confirm the state of ${ownKey}, the sandbox this DAG's handle `
+        + `'${action.handle}' names (${state.detail}). It was left intact, and the DAG cannot `
+        + `be given a different sandbox while its handle names this one.`,
+  );
+}
+
 export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHandsResult | null> {
   const { kv, sessionId, request, multiNodeContext, requestedSpec, onEvent, signal } = a;
   logger.info({ sessionId }, "ensureHands.kv_lookup");
   const recorded = await readReusableEntry(kv, sessionId);
+  if (recorded) {
+    logger.info(
+      { sessionId, status: recorded.info.status, workloadId: recorded.info.workloadId,
+        handsUrl: recorded.info.handsUrl },
+      "ensureHands.kv_entry_found",
+    );
+  }
+
+  // Ahead of every branch below, and ahead of the `!recorded` return, because
+  // the case this answers includes the one where the session slot has expired
+  // out from under a DAG whose handle -- in a bucket with no TTL -- still names
+  // its live sandbox. See the note on the function.
+  const ownSandbox = await reuseOwnDagHandle(a, recorded?.info ?? null);
+  if (ownSandbox) return ownSandbox;
+
   if (!recorded) return null;
   const { binding, info } = recorded;
-
-  logger.info(
-    { sessionId, status: info.status, workloadId: info.workloadId, handsUrl: info.handsUrl },
-    "ensureHands.kv_entry_found",
-  );
   const identity = reuseIdentity(info);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
 
@@ -1168,24 +1606,7 @@ async function provisionHands(
         `sandbox_spec.use='${action.handle}' has no registered handle for dag ${dagRoot}`,
       );
     }
-    const identity: SandboxEntry = info.provider === "agent-sandbox"
-      ? {
-        provider: "agent-sandbox",
-        sessionId: info.session_id,
-        sandboxName: info.sandbox_name,
-        namespace: info.namespace,
-        userId: info.user_id,
-      }
-      : {
-        workloadId: info.workload_id,
-        platformKey: info.platform_key ?? "",
-        // The namespace the upstream node recorded, not the deployment default:
-        // a workspace-scoped sandbox lives in the namespace its request named,
-        // and keepalive addressed to the default would poll a workload that is
-        // not there and let a live sandbox expire. The default is only the
-        // fallback for entries written before the field existed.
-        namespace: info.namespace || SANDBOX_NAMESPACE,
-      };
+    const identity = identityFromHandleInfo(info);
     // A registered handle is not necessarily a living Hands endpoint. Probe
     // and restart against this handle's identity, never the shared session key.
     await assertDagHandleAlive(
@@ -1212,7 +1633,10 @@ async function provisionHands(
   if (!options.skipSessionReuse) {
     const reused = await tryReuseSessionSandbox({
       kv, sessionId, request, multiNodeContext, requestedSpec, onEvent,
-      signal: options.signal,
+      // The resolved action, so the reuse decision can start from the record
+      // that is actually keyed by "which sandbox is this DAG's <handle>"
+      // rather than from the session slot every node of every DAG shares.
+      action, signal: options.signal,
     });
     if (reused) {
       // A sandbox taken by reuse is held just as firmly as one that was

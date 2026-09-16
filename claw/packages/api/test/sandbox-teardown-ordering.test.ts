@@ -38,7 +38,9 @@ import type { Harness } from "./scenario-harness.js";
 process.env.SAFE_API_URL = "http://safe.test";
 
 const { startHarness, seedSession, seedRun } = await import("./scenario-harness.js");
-const { handleRegistry, stopAllHandlesForDag } = await import("../src/tasks/sandbox-stopper.js");
+const {
+  handleRegistry, readSessionBackgroundWork, stopAllHandlesForDag,
+} = await import("../src/tasks/sandbox-stopper.js");
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
 
 let h: Harness;
@@ -64,6 +66,15 @@ beforeEach(async () => {
   // would make every outcome below `unconfirmed` for a reason none of them is
   // about.
   handleRegistry.retained = async () => false;
+  // No session binding unless a test writes one. There is no NATS here, so the
+  // orphan sweep's background-work read has no bucket to reach -- and its
+  // failure direction is deferral, which would turn every stop below into a
+  // deferred one for a reason none of these tests is about. The real reader is
+  // still the one running: what is replaced is the bucket, not the answer, and
+  // an empty bucket is exactly the "this session has no sandbox entry" case.
+  // The read itself is covered in orphan-sweep-background-work.test.ts.
+  handleRegistry.backgroundWork = (sessionId, workloadIds) =>
+    readSessionBackgroundWork({ async get() { return null; } }, sessionId, workloadIds);
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input.toString();
     stopped.push(/\/workloads\/([^/]+)\/stop$/.exec(url)?.[1] ?? url);

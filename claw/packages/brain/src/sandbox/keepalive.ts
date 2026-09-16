@@ -5,6 +5,15 @@ import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
 import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
+// The verdict rules are imported, never restated. `usableSharedVerdict` is read
+// here and by the API's orphan-handle sweep, which must not stop a sandbox this
+// file is still holding for background work; one definition is what keeps the
+// two answering the same question. See sandbox/bg-verdict.ts in @claw/protocol.
+import {
+  BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod, reuseWindowStart,
+  sameIdlePeriod, usableSharedVerdict,
+  type BackgroundWork, type SharedVerdictFields,
+} from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -52,7 +61,15 @@ export interface SandboxEntry {
   userId?: string;       // agent-sandbox: BYOK identity forwarded to the Router
 }
 
-interface HandsKvEntry {
+/**
+ * Brain's view of a `hands.<session>` entry.
+ *
+ * The idle-period and verdict halves are inherited rather than restated: they
+ * are read by the API's orphan sweep as well as by this file, and written by
+ * `applyRunEndedIdleFields` in a third place, so the declaration lives with the
+ * rules that interpret it (`@claw/protocol` sandbox/bg-verdict).
+ */
+interface HandsKvEntry extends SharedVerdictFields {
   status?: "pending" | "ready";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
@@ -75,99 +92,10 @@ interface HandsKvEntry {
    *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
   keepalive?: boolean;
   /**
-   * Epoch ms when the handle became idle. All deployed writers stamp this field,
-   * so verdicts use it as the mixed-version idle-period witness.
-   */
-  idleSince?: number;
-  /**
-   * Epoch ms when a sweep last acted on a `running` verdict. The reuse window
-   * starts at the later of this and `idleSince`.
-   */
-  workSeenAt?: number;
-  /**
-   * Identifies the idle period opened by `markHandsIdle`; unlike `idleSince`, it
-   * does not move while background work remains active.
-   */
-  idleEpoch?: number;
-  /**
-   * Revision on which the idle-opening write was conditioned. Together with
-   * `idleSince`, it uniquely witnesses an idle period even when timestamps
-   * collide. Backfilled by `collectTargets` for older entries.
-   */
-  idleRev?: number;
-  /**
    * Per-call token used to confirm an idle write whose acknowledgement was lost.
    * The sweep does not use it.
    */
   idleWriter?: string;
-  /**
-   * The last measured background-work answer, persisted so another replica can
-   * consume it.
-   */
-  bgCheckedAt?: number;
-  /** Shell count from that answer. 0 means the sandbox had nothing running. */
-  bgRunning?: number;
-  /**
-   * The `idleEpoch` under which the verdict was measured. `bgIdleSince` also has
-   * to match because an older binary can preserve both epoch fields across reuse.
-   */
-  bgEpoch?: number;
-  /**
-   * The value `idleSince` had when this verdict was measured.
-   *
-   * Kept as a witness rather than compared as a time, because the two numbers
-   * are written by different replicas off different clocks and a comparison
-   * between them cannot establish which event happened first. A replica whose
-   * clock runs a minute fast files a verdict stamped a minute into the future;
-   * the old binary that later takes the sandbox for a task and idles it again
-   * stamps `idleSince` off its own slower clock, and the verdict from BEFORE the
-   * task carries the LARGER number. Every ordering test between them then says
-   * the stale answer is the current one, and the handle is reclaimed with a
-   * background shell in it -- the same reclaim `bgEpoch` and the stamp were
-   * added to prevent, arriving through ordinary NTP-grade skew rather than
-   * through anything going wrong.
-   *
-   * Equality asks a question skew cannot answer wrongly. `idleSince` is opaque
-   * here: whether the value a re-idle wrote is larger or smaller than the one
-   * the verdict was measured under does not matter, only that it is a different
-   * value -- and it is, because every writer that opens an idle period stamps
-   * its own clock's reading of the moment it did so. Absent on verdicts written
-   * before this field existed, which are read as not witnessed at all.
-   */
-  bgIdleSince?: number;
-  /**
-   * The `idleRev` the entry carried when this verdict was measured.
-   *
-   * The half of the witness that cannot collide. `bgIdleSince` catches an idle
-   * period an OLD binary opened -- it rewrites `idleSince` and can write neither
-   * of these -- but two distinct periods can share an `idleSince` value, and
-   * when they do they share `idleEpoch` with it, so nothing else on the entry
-   * tells them apart. This one does: no two idle-opening writes to a key are
-   * conditioned on the same revision.
-   *
-   * Both must match for an `idle` verdict to be believed, because neither
-   * subsumes the other: an old binary carries this field across a task
-   * untouched, and a millisecond collision carries the other one across.
-   * Absent on verdicts written before this field existed, which are read as not
-   * witnessed at all.
-   */
-  bgIdleRev?: number;
-  /**
-   * The revision the write that published this verdict was conditioned on.
-   *
-   * Names the verdict itself, the way `idleRev` names an idle period and for the
-   * same reason: the bucket accepts one write per revision of a key and hands
-   * out a strictly greater one each time, so no two verdict-publishing writes
-   * can ever carry the same value. `bgCheckedAt` cannot do this on its own --
-   * it is a clock reading taken on whichever replica probed, and two replicas
-   * can read the same millisecond.
-   *
-   * Read by persistVerdict, to tell the verdict a probe went out under from one
-   * a different replica published while that probe was still in the air. Absent
-   * on verdicts written before this field existed, where the stamp beside it is
-   * the only half of the comparison available.
-   */
-  bgRev?: number;
   /**
    * Fleet-visible probe reservations, keyed by per-probe token. Reclaim waits
    * while any unexpired reservation remains; each probe releases only its token.
@@ -961,12 +889,6 @@ export function markHandsIdle(
     });
 }
 
-/**
- * What a probe of Hands' background-shell registry can tell us.
- * Only positive idle or gone evidence may permit reclaim.
- */
-type BackgroundWork = "running" | "idle" | "gone" | "unknown";
-
 /** Local measured-verdict reuse interval. */
 const BG_PROBE_TTL_MS = 5 * 60_000;
 const BG_PROBE_REFRESH_MS = 4 * 60_000;
@@ -975,12 +897,6 @@ const BG_PROBE_REFRESH_MS = 4 * 60_000;
  * Consecutive unanswered probes before reporting an unreconciled handle.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
-/**
- * Shared verdict lifetime. It must outlive the interval between fleet sweeps of
- * the same handle, while local probing still refreshes every BG_PROBE_TTL_MS.
- */
-const BG_VERDICT_TTL_MS = 30 * 60_000;
-
 /**
  * Failed-probe streak lifetime. It must cover the interval until the same replica
  * revisits an identity, which can span several fleet rotations.
@@ -1294,72 +1210,6 @@ function newTickStats(): TickStats {
 /** Where a verdict came from, for the tick counters. */
 type VerdictSource = "mem" | "handle" | "none" | "no-hands";
 
-/**
- * Whether a verdict is still about the idle period the handle is in now.
- * Missing epochs are not a match; they remain `unknown` until backfilled and
- * measured.
- */
-function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): boolean {
-  return typeof verdictEpoch === "number" && verdictEpoch === info.idleEpoch;
-}
-
-/**
- * Whether a verdict measured at `at`, under the stamp `witness`, can be about
- * the idle period the handle is in now.
- *
- * During a rolling deployment, an older binary rewrites `idleSince` but carries
- * the epoch fields unchanged. The timestamp witness therefore detects its idle
- * periods even when the epochs still match.
- *
- * Idle verdicts require equality with both witnesses: timestamp equality avoids
- * ordering clocks from different replicas, and revision equality prevents a
- * same-millisecond ABA. Together they leave exactly one gap: an old binary re-idling
- * onto the identical millisecond, which leaves an entry byte-identical to the
- * one it found, and which therefore no rule reading the entry can detect. It
- * closes when the old binary is gone, and nothing on the entry can close it
- * sooner.
- *
- * `running` also accepts the older rule, `at` at or after the stamp. It is a
- * weaker test and it is allowed to be, because the two ways it can be wrong are
- * both safe: believing a stale `running` costs a ping the sandbox did not need,
- * and disbelieving a current one costs a probe. Keeping it means the sweep that
- * slides the stamp forward under a working sandbox does not have to re-witness
- * the verdict it just acted on -- which would amount to relabelling an answer as
- * being about a period it was not measured in -- and means a verdict written by
- * the build before this field existed still keeps a busy sandbox pinged while it
- * ages out. The `idle` branch, the only one that can delete anything, gets no
- * such latitude.
- *
- * A rejected or incomplete witness reads as `unknown`, so the handle is kept and
- * probed again.
- */
-function measuredUnderThisIdlePeriod(
-  at: number | undefined,
-  witness: number | undefined,
-  witnessRev: number | undefined,
-  info: HandsKvEntry,
-  state: BackgroundWork,
-): boolean {
-  if (typeof info.idleSince !== "number") return false;
-  if (
-    typeof witness === "number" && witness === info.idleSince
-    && typeof witnessRev === "number" && witnessRev === info.idleRev
-  ) return true;
-  if (state !== "running") return false;
-  return typeof at === "number" && at >= info.idleSince;
-}
-
-/**
- * The reuse window starts at the later of the idle-period opening and the last
- * sweep that observed work.
- */
-function reuseWindowStart(info: HandsKvEntry): number {
-  return Math.max(
-    typeof info.idleSince === "number" ? info.idleSince : 0,
-    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
-  );
-}
-
 /** This replica's own last answer, if it is fresh enough to reuse and still
  *  about the idle period the handle is in. */
 function usableCachedVerdict(
@@ -1377,19 +1227,6 @@ function usableCachedVerdict(
   if ((cached.state === "gone" || cached.state === "unknown")
     && (!cached.verdictAtStart || !sameVerdict(cached.verdictAtStart, info))) return null;
   return cached;
-}
-
-/** The handle's own copy, which any replica can read, under the same two rules
- *  and its own longer TTL. */
-function usableSharedVerdict(info: HandsKvEntry): { at: number; state: BackgroundWork } | null {
-  if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
-  if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
-  if (!sameIdlePeriod(info.bgEpoch, info)) return null;
-  const state: BackgroundWork = info.bgRunning > 0 ? "running" : "idle";
-  if (!measuredUnderThisIdlePeriod(
-    info.bgCheckedAt, info.bgIdleSince, info.bgIdleRev, info, state,
-  )) return null;
-  return { at: info.bgCheckedAt, state };
 }
 
 /**
@@ -1601,9 +1438,8 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
       bgProbeCache.delete(identity);
       return;
     }
-    for (const field of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"] as const) {
-      delete current[field];
-    }
+    // The reader's own field list, not a copy of it: see SHARED_VERDICT_FIELDS.
+    for (const field of SHARED_VERDICT_FIELDS) delete current[field];
     await deps.kv.update(key, sc.encode(JSON.stringify(current)), e.revision);
     if (!probeIsStale(probe)) bgProbeCache.delete(identity);
     probe.verdictAtStart = verdictWitness(current);

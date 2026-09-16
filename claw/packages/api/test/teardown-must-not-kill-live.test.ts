@@ -35,7 +35,9 @@ import assert from "node:assert/strict";
 process.env.SAFE_API_URL = "http://safe.test";
 
 const { db } = await import("../src/infra/db.js");
-const { handleRegistry, unreleasedRecord } = await import("../src/tasks/sandbox-stopper.js");
+const {
+  handleRegistry, readSessionBackgroundWork, unreleasedRecord,
+} = await import("../src/tasks/sandbox-stopper.js");
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
 const { stopAllHandlesForDag } = await import("../src/tasks/sandbox-stopper.js");
 const { cancelTask } = await import("../src/tasks/lifecycle.js");
@@ -62,6 +64,15 @@ beforeEach(() => {
   // `unconfirmed`. That is how L2, L4 and L8 went red on CI while passing
   // locally: this file was not the one the gate's own tests live in.
   handleRegistry.retained = async () => false;
+  // No session binding unless a test writes one. There is no NATS here, so the
+  // orphan sweep's background-work read has no bucket to reach -- and its
+  // failure direction is deferral, which would turn every stop below into a
+  // deferred one for a reason none of these tests is about. The real reader is
+  // still the one running: what is replaced is the bucket, not the answer, and
+  // an empty bucket is exactly the "this session has no sandbox entry" case.
+  // The read itself is covered in orphan-sweep-background-work.test.ts.
+  handleRegistry.backgroundWork = (sessionId, workloadIds) =>
+    readSessionBackgroundWork({ async get() { return null; } }, sessionId, workloadIds);
   stopped = [];
   unreleasedRecord.mark = async () => {};
   unreleasedRecord.clear = async () => {};
@@ -311,6 +322,26 @@ test("L7 a workload another DAG still holds is not stopped by this one's teardow
     // D2 adopted the same workload and registered its own reference.
     ["dag-2", { main: { workload_id: "w-shared" } }],
   ];
+  // And the leader says so too, which is `handleFor`'s own rule -- "what the
+  // snapshot says, the leader says" -- and was the half this test used to omit.
+  // It passed anyway because the direct scan short-circuits, so a co-holder
+  // that existed only on a replica was never contradicted by anything.
+  //
+  // That distinction is now load-bearing. A declining teardown re-asks once
+  // after its OWN row is gone (`"after-own-row-gone"` in the stopper), and
+  // that re-check takes no answer from a direct read: a row a replica still
+  // shows after the leader has seen it deleted is exactly the co-holder that
+  // let go a moment ago, and believing it is how both sides of a concurrent
+  // release decline and the workload is lost. So a co-holder modelled on the
+  // replica alone is not a co-holder to the re-check -- it is a removed row --
+  // and D1 would stop the workload, correctly, for a D2 that is not there.
+  // A REAL D2 is on the leader, and this is what asserts the guard against one.
+  // (`sandbox-shared-release-race` S4 is the other side of the same coin, and
+  // L9 below is the enumeration half: a co-holder the direct scan dropped
+  // entirely is still found, because the leader has it.)
+  handleRegistry.listDagRoots = async () => ["dag-1", "dag-2"];
+  handleRegistry.listForDagConsistent = async (dag: string) =>
+    (dag === "dag-2" ? { main: { workload_id: "w-shared" } } : {});
 
   const released = await stopAllHandlesForDag("dag-1", "s-1");
 

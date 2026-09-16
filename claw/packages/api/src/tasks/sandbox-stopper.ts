@@ -25,6 +25,11 @@ import {
   HANDS_KEY_PREFIX,
   RETAINED_PREFIX,
   isRetentionEntry,
+  handsSessionKey,
+  legacyHandsKey,
+  reuseWindowStart,
+  usableSharedVerdict,
+  type SharedVerdictFields,
 } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
@@ -197,10 +202,17 @@ export function makeKvStore(kv: KvLike): KVStore {
     },
     async scanPrefix(prefix) {
       const filter = prefix.endsWith(".") ? `${prefix}>` : `${prefix}.>`;
-      const iter = await kv.keys(filter);
+      // Drained before the first `get`. `kv.keys()` is an ordered-consumer
+      // subscription and awaiting another JetStream request inside `for await`
+      // stalls its pump, ending the consumer early with no error -- measured at
+      // 1 key returned out of 21 live ones on the real bucket. See the same
+      // note in @claw/utils' kv store, which had the identical shape.
+      const keys: string[] = [];
+      for await (const key of await kv.keys(filter)) {
+        if (key.startsWith(prefix)) keys.push(key);
+      }
       const out: Array<[string, Record<string, unknown>]> = [];
-      for await (const key of iter) {
-        if (!key.startsWith(prefix)) continue;
+      for (const key of keys) {
         // Same three answers as `get`, and for the same reasons: a tombstone or
         // an empty value is a key that is gone, while an entry that will not
         // parse is an unknown. A scan that silently skipped the last of those
@@ -341,6 +353,164 @@ function isRevisionConflict(e: unknown): boolean {
  */
 const RETENTION_LEDGER_PREFIX = "retention.";
 
+/** The part of the NATS KV surface reading a session binding needs. */
+export interface HandsReadKv {
+  get(key: string): Promise<{ operation?: string; value: Uint8Array; revision: number } | null>;
+}
+
+/**
+ * What a session's `hands.<session>` binding establishes about background work
+ * still running inside a particular workload.
+ *
+ * Four answers, not two, because the caller's action differs for each and
+ * collapsing any pair of them loses something:
+ *
+ *   - `running`  a verdict measured in THIS idle period found live shells.
+ *   - `clear`    nothing on record says there is background work in this
+ *                workload, for a reason that will not change by waiting.
+ *   - `awaiting` no usable verdict yet, but the sandbox is still addressable
+ *                and Brain's keepalive sweep is the thing that will publish
+ *                one. A measurement that has not happened is not a measurement
+ *                of zero.
+ *   - `unreadable` the store or the entry could not be read. Not absence:
+ *                classifying it as absence is how an unavailable bucket turns
+ *                into a confident "nothing is running in there".
+ */
+export type SessionBackgroundWork =
+  | { state: "running"; workloadId: string; running: number; at: number }
+  | {
+    state: "clear";
+    reason: "no_workload" | "no_binding" | "other_sandbox" | "verdict_idle"
+      | "no_idle_period" | "no_credentials";
+    workloadId?: string;
+    running?: number;
+  }
+  | { state: "awaiting"; workloadId: string; sinceMs: number }
+  | { state: "unreadable"; reason: string };
+
+/**
+ * Read a session's binding through both names it can live under.
+ *
+ * Read-through for the same reason `readReusableEntry` in Brain does it: an
+ * older replica in a rolling upgrade writes and reads only the legacy key, so
+ * looking at the canonical one alone reads a live session as having no sandbox.
+ * For an ordinary session id the two names are identical and this is one read.
+ *
+ * A deleted key is not an absent one to `kv.get` -- it answers with the
+ * tombstone, whose value is empty -- so the walk goes past it rather than
+ * stopping on it. A payload that will not parse throws: an unreadable entry is
+ * an unknown, and the one answer it must never become is "no sandbox here".
+ */
+async function readHandsBinding(
+  kv: HandsReadKv, sessionId: string,
+): Promise<Record<string, unknown> | null> {
+  const canonical = handsSessionKey(sessionId);
+  const legacy = legacyHandsKey(sessionId);
+  const dec = new TextDecoder();
+  for (const key of canonical === legacy ? [canonical] : [canonical, legacy]) {
+    const entry = await kv.get(key);
+    if (!entry) continue;
+    if (entry.operation === "DEL" || entry.operation === "PURGE") continue;
+    if (entry.value.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(dec.decode(entry.value));
+    } catch (e) {
+      throw new Error(`hands entry ${key} is not readable JSON: ${errText(e)}`);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`hands entry ${key} is not a JSON object`);
+    }
+    return parsed as Record<string, unknown>;
+  }
+  return null;
+}
+
+/**
+ * Whether a session is still carrying background work inside one of these
+ * workloads.
+ *
+ * Background shells outlive the run that started them: ending a chat parks the
+ * sandbox and keeps them alive deliberately. When Brain finishes with such a
+ * container it writes a retention record, and `retained` above is what stops a
+ * teardown from touching it -- but the ordinary end of a chat writes no such
+ * record. It leaves the sandbox in the plain `hands.<session>` binding with
+ * `keepalive: false`, and from that moment the only thing on record saying
+ * "there is still work in here" is the background-work verdict Brain's
+ * keepalive sweep publishes onto that same entry.
+ *
+ * So this reads it. The rules for believing it are `usableSharedVerdict`'s, in
+ * `@claw/protocol`, shared with the sweep that writes it rather than restated
+ * here -- `bgRunning > 0` on its own is a measurement from SOME idle period,
+ * and a verdict about the period before this one is not evidence about this
+ * one in either direction.
+ *
+ * The workload match is a precondition on the whole answer, not a detail of it:
+ * one session key names one sandbox at a time, and a binding naming a
+ * replacement sandbox says nothing whatsoever about the workload a stale handle
+ * still points at. Without the match, a session that had rebuilt its sandbox
+ * would hold its own dead workload's handle open forever.
+ *
+ * `workloadIds` is every workload the caller is about to stop together, and any
+ * match defers all of them: they go down in one call, so the answer has to be
+ * about the set. An empty or workload-less set is `no_workload` -- the
+ * agent-sandbox path, which records no workload id and which this read cannot
+ * speak about at all.
+ */
+export async function readSessionBackgroundWork(
+  kv: HandsReadKv,
+  sessionId: string,
+  workloadIds: readonly string[],
+  now: number = Date.now(),
+): Promise<SessionBackgroundWork> {
+  const wanted = new Set(workloadIds.filter((w) => !!w));
+  if (!sessionId || wanted.size === 0) return { state: "clear", reason: "no_workload" };
+  let info: Record<string, unknown> | null;
+  try {
+    info = await readHandsBinding(kv, sessionId);
+  } catch (e) {
+    return { state: "unreadable", reason: errText(e) };
+  }
+  if (!info) return { state: "clear", reason: "no_binding" };
+  const workloadId = typeof info.workloadId === "string" ? info.workloadId : "";
+  if (!workloadId || !wanted.has(workloadId)) {
+    return { state: "clear", reason: "other_sandbox", workloadId };
+  }
+  const fields = info as SharedVerdictFields;
+  const verdict = usableSharedVerdict(fields, now);
+  if (verdict?.state === "running") {
+    return { state: "running", workloadId, running: verdict.running, at: verdict.at };
+  }
+  if (verdict) {
+    return { state: "clear", reason: "verdict_idle", workloadId, running: verdict.running };
+  }
+  // No verdict is usable. Whether that is worth waiting for is decided by
+  // whether one could ever arrive, and there are two ways it could not.
+  //
+  // With no `idleSince` the entry has no idle period open on it, and
+  // `measuredUnderThisIdlePeriod` rejects every verdict against such an entry
+  // by its first line -- so waiting here is waiting for something the rule
+  // itself will never accept. Every deployed writer stamps the field when it
+  // parks a handle; an entry without it has not been parked.
+  //
+  // Without `handsUrl` and `token` nobody can probe the sandbox again, which is
+  // not the same as the answer being no -- it is the same "no credentials and
+  // nothing on record" that Brain's own `peekBackgroundWork` resolves to the
+  // legacy idle behaviour, and it resolves it the same way here, AFTER the
+  // verdict above has been read rather than before it.
+  if (typeof fields.idleSince !== "number") {
+    return { state: "clear", reason: "no_idle_period", workloadId };
+  }
+  if (!info.handsUrl || !info.token) {
+    return { state: "clear", reason: "no_credentials", workloadId };
+  }
+  return {
+    state: "awaiting",
+    workloadId,
+    sinceMs: Math.max(0, now - reuseWindowStart(fields)),
+  };
+}
+
 export const handleRegistry = {
   destroy(
     dagRootTaskId: string,
@@ -427,6 +597,27 @@ export const handleRegistry = {
       scan([`${HANDS_KEY_PREFIX}*`, `${HANDS_KEY_PREFIX}${RETAINED_PREFIX}`]),
     ]);
     return found.some((retained) => retained);
+  },
+  /**
+   * Is this session still carrying background work in one of these workloads?
+   *
+   * On the seam with `retained` and for the identical reason: it closes over a
+   * module-scoped live binding that cannot be substituted, so every outcome
+   * has to be reachable without a NATS server. The rules themselves live in
+   * `readSessionBackgroundWork` above, which takes the bucket, so a test
+   * exercises the real reader against a fake store rather than a stub of the
+   * answer.
+   *
+   * Nothing on the cancel path calls this, and nothing on it may. The only
+   * action this answer licenses is "not this time", which is a coherent thing
+   * for a sweep that runs again in a minute to say and an incoherent thing for
+   * a cancel to say: a cancel that defers never comes back, so deferring there
+   * would mean never stopping at all.
+   */
+  backgroundWork(
+    sessionId: string, workloadIds: readonly string[],
+  ): Promise<SessionBackgroundWork> {
+    return readSessionBackgroundWork(kv as unknown as HandsReadKv, sessionId, workloadIds);
   },
   /**
    * Every DAG the registry has a key for, readable or not.
@@ -978,6 +1169,10 @@ export async function stopSandboxByHandle(
       "sandbox.stop_skipped_shared",
     );
   }
+  // Set when the decline branch below has already removed this DAG's row, so
+  // the code after it must neither destroy again nor behave as though the
+  // mapping were still there to fall back on.
+  let ownRowGone = false;
   if (retained || heldElsewhere) {
     // The mapping still goes, as it did when these checks ran after it: this
     // DAG is done with the workload either way. Dropping it with nothing
@@ -985,13 +1180,102 @@ export async function stopSandboxByHandle(
     // first, the mapping is the last reference -- is about a workload nobody
     // else is holding. Here somebody else is, by the very read that got us to
     // this branch: the retention ledger, or the other DAG's own handle.
-    await handleRegistry.destroy(dagRootTaskId, handleName, known.workload_id).catch((e) => {
+    try {
+      // `null` is not "removed": the entry was already gone, or it now names a
+      // DIFFERENT workload and the identity check refused to remove it. In
+      // neither case did THIS call drop a reference to the workload it looked
+      // up, so it has not earned the right to re-ask -- whoever did remove the
+      // row owns that question, and answering it from here would promote a
+      // caller that took nothing away.
+      ownRowGone = await handleRegistry.destroy(
+        dagRootTaskId, handleName, known.workload_id,
+      ) !== null;
+    } catch (e) {
       logger.warn(
         { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
         "sandbox.handle_destroy_failed",
       );
-    });
-    return "unconfirmed";
+    }
+    // A retention is an older claim than this handle, not a race: nothing this
+    // call does can discharge it, so there is nothing to re-ask. And a destroy
+    // that did not commit leaves the mapping as the reference it always was,
+    // which is the state every other declining exit relies on.
+    if (retained || !ownRowGone) return "unconfirmed";
+
+    // Otherwise the co-holder that sent us here may be releasing the SAME
+    // workload at the same moment, and that is not a rare interleaving -- it
+    // is what session reuse plus two entry points produces. Every read on this
+    // path precedes every write:
+    //
+    //   t1  A reads the registry, sees dag-b naming w   -> heldElsewhere
+    //   t2  B reads the registry, sees dag-a naming w   -> heldElsewhere
+    //   t3  A drops dag-a's row, records nothing, declines
+    //   t4  B drops dag-b's row, records nothing, declines
+    //
+    // The read that means "do not destroy" is about a DIFFERENT KEY than the
+    // write that removes the last reference -- the registry is keyed by DAG,
+    // the question is keyed by workload -- so no per-row CAS can order t1
+    // against t4, and `destroyHandleCas` conditions on `dag-handles.<dagRoot>`,
+    // a key the other side never touches. The branch's own justification
+    // ("somebody else is holding it") is true at t1 and false at t4, and
+    // before this re-check nothing re-established it in between. What came out
+    // was a live SaFE workload with every reference to it deleted: both rows
+    // gone, no record on either DAG, `stopAllHandlesForDag` answering
+    // `nothing_held`, and `reapOrphanHandles` -- which starts from
+    // `listAll()`, the mappings -- with no entry point left to find it from.
+    //
+    // This is what the ordering before this branch got for free and gave up.
+    // With the checks AFTER the destroy, "both decline" required
+    // A.destroy < A.read(B) < B.destroy < B.read(A) < A.destroy: a cycle, and
+    // impossible. Moving them ahead of the destroy bought something real --
+    // a legitimately shared or retained decline no longer leaves a permanent
+    // `unreleased` marker on a container that never leaked -- and turned that
+    // impossible interleaving into the ordinary one. So the decision follows
+    // the act again here rather than the checks moving back: re-asked now that
+    // THIS row is gone, whichever side removes its row last sees an empty
+    // answer and is the last holder, and both sides seeing a holder is the
+    // cycle again. The mutual-decline signature in the logs is two
+    // `sandbox.stop_skipped_shared` lines naming each other.
+    //
+    // A raced release therefore issues the stop from BOTH sides. That is
+    // deliberate: the module's own contract is that the KV destroy and the
+    // SaFE stop are idempotent (a 404 counts as confirmed), and two idempotent
+    // stops are strictly better than none.
+    //
+    // Leader-only -- see `OwnershipQuestion` for why a direct read must not
+    // answer this one, and for what that costs.
+    let stillHeld: string | null;
+    try {
+      stillHeld = await withDeadline(
+        otherDagHolding(dagRootTaskId, known.workload_id, "after-own-row-gone"),
+        SHARED_CHECK_TIMEOUT_MS,
+        `last-holder re-check for ${known.workload_id}`,
+      );
+    } catch (e) {
+      // The one declining exit with no mapping left to be its own evidence.
+      // Everywhere else a check that fails keeps the handle registered and the
+      // sweeper comes back to it; here the row is already gone, so `unreleased`
+      // is the only place this workload can still be named. Not a false alarm
+      // either: this call really did drop a reference without establishing
+      // that anything else still holds one, which is precisely what the record
+      // means. (`rememberOutcome` contains its own failures, and answers
+      // `NoRecordHome` -- no DAG row, so no reader -- by reporting success.)
+      logger.warn(
+        { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
+        "sandbox.last_holder_recheck_failed",
+      );
+      await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
+      return "unconfirmed";
+    }
+    if (stillHeld !== null) {
+      // The ordinary shared release, and the property the ordering move bought:
+      // it declines, and it leaves nothing behind to report.
+      return "unconfirmed";
+    }
+    logger.info(
+      { dagRootTaskId, handleName, workloadId: known.workload_id, wasHeldBy: heldElsewhere },
+      "sandbox.last_holder_after_recheck",
+    );
   }
 
   // On record first, so the window below is one this can be recovered from
@@ -1006,17 +1290,39 @@ export async function stopSandboxByHandle(
   // retries, which the sweeper does; the alternative costs the only reference
   // to it. (The cancellation's own verdict is already written and unaffected --
   // this returns, it does not throw.)
-  if (!await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed")) {
+  const recorded = await rememberOutcome(
+    dagRootTaskId, handleName, known.workload_id, "unconfirmed",
+  );
+  if (!recorded && !ownRowGone) {
     logger.warn(
       { dagRootTaskId, handleName, workloadId: known.workload_id },
       "sandbox.teardown_skipped_unrecorded",
     );
     return "unconfirmed";
   }
+  if (!recorded) {
+    // Promoted to last holder by the re-check above, so the mapping this gate
+    // exists to preserve is ALREADY gone. Withholding the stop now buys
+    // nothing and costs everything -- the same reasoning `NoRecordHome` gives
+    // one level down: with no reference left to protect, refusing to act just
+    // leaves the workload running with nothing naming it at all. So the stop
+    // goes ahead unrecorded, and this line is its only trace.
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: known.workload_id },
+      "sandbox.teardown_unrecorded_row_already_gone",
+    );
+  }
 
   let wid: string | null;
   try {
-    wid = await handleRegistry.destroy(dagRootTaskId, handleName, known.workload_id);
+    // Already destroyed by the decline branch when the re-check promoted this
+    // call to last holder: the row is gone and its workload is the one the
+    // lookup named, so asking again would answer `null` -- "the handle went
+    // between the lookup and the destroy" -- and abandon the stop this call
+    // was just established to owe.
+    wid = ownRowGone
+      ? known.workload_id
+      : await handleRegistry.destroy(dagRootTaskId, handleName, known.workload_id);
   } catch (e) {
     // The delete may or may not have committed, and the stop was not attempted
     // either way. Both possibilities are already on record above, which is the
@@ -1054,7 +1360,10 @@ export async function stopSandboxByHandle(
   // A workload two DAGs hold, or one retention is protecting, was settled
   // above: both are claims that forbid a stop, and both are read before the
   // mapping is dropped so that declining leaves nothing behind. What remains
-  // here is a workload this DAG held alone.
+  // here is a workload this DAG held alone -- either it never had a co-holder,
+  // or the re-check above found the co-holder had let go first and promoted
+  // this call to last holder, in which case `ownRowGone` is already true and
+  // the destroy below has happened.
   let released: ReleaseOutcome;
   try {
     const platformKey = await loadPlatformKeyForSession(sessionId);
@@ -1196,6 +1505,37 @@ function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T>
 }
 
 /**
+ * Which question this scan is being asked, because the two take opposite
+ * answers from the same stale read.
+ *
+ * `"before-release"` is the check that PERMITS a stop: this DAG still holds
+ * the workload, and a direct read showing somebody else holding it too is
+ * conservative -- it declines.
+ *
+ * `"after-own-row-gone"` is the re-check that promotes a declining caller to
+ * last holder once its own row is already destroyed. On that question a stale
+ * direct read is the opposite of conservative: the row it shows may be the
+ * co-holder's own row, deleted microseconds ago by the release that is racing
+ * this one, and believing it is exactly how both sides decline and the
+ * workload is lost. So that mode takes no answer from a direct read -- it
+ * harvests CANDIDATES from the direct scan and settles every one of them
+ * against the leader.
+ *
+ * What that costs, stated rather than glossed: the shipped "nobody holds it"
+ * is an intersection -- the direct scan found nobody AND the leader scan found
+ * nobody -- and this mode drops the first half. Its "nobody" therefore rests
+ * on leader reads alone, which is strictly less conservative. What it does NOT
+ * drop is the enumeration: the direct scan's keys are unioned into the set of
+ * DAGs to leader-read, so a root that `listDagRoots`'s own `kv.keys()` call
+ * silently truncated away (see its comment -- "this does NOT make the
+ * enumeration verifiably complete") is still leader-read if either
+ * enumeration saw it. The weakening is confined to the one thing that has to
+ * weaken: a row's CONTENT read from a possibly-stale replica no longer gets to
+ * answer on its own.
+ */
+type OwnershipQuestion = "before-release" | "after-own-row-gone";
+
+/**
  * The first other DAG whose handles still name `workloadId`, or null.
  *
  * Only DAGs other than this one: this DAG's own entry is removed before the
@@ -1205,17 +1545,21 @@ function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T>
 async function otherDagHolding(
   dagRootTaskId: string,
   workloadId: string,
+  question: OwnershipQuestion = "before-release",
 ): Promise<string | null> {
   if (!workloadId) return null;
   const rows = await handleRegistry.listAll();
 
   // A holder found on a direct read is enough: a stale read that SHOWS one
   // only makes this more conservative, and conservative here means declining
-  // to stop.
-  for (const [dagRoot, handles] of rows) {
-    if (dagRoot === dagRootTaskId) continue;
-    for (const info of Object.values(handles)) {
-      if (info.workload_id === workloadId) return dagRoot;
+  // to stop. Not on the re-check -- see `OwnershipQuestion`, where the same
+  // stale read is the lost stop rather than a careful one.
+  if (question === "before-release") {
+    for (const [dagRoot, handles] of rows) {
+      if (dagRoot === dagRootTaskId) continue;
+      for (const info of Object.values(handles)) {
+        if (info.workload_id === workloadId) return dagRoot;
+      }
     }
   }
 
@@ -1239,6 +1583,15 @@ async function otherDagHolding(
   // keyed by DAG, so the answer is assembled from an enumeration plus a read
   // per entry, and every layer of that can be incomplete in a way that reads
   // as "nobody". Two rounds of review have each found another such layer.
+  //
+  // A third is not incompleteness at all, and is the reason for the
+  // `"after-own-row-gone"` mode: the scan's answer is not atomic with the
+  // write it authorises. Two callers releasing the same workload each read a
+  // holder and each then remove the row the other one read, so a correct
+  // answer to a question asked about one key licences a write to another. No
+  // amount of hardening the read fixes that, because the flaw is that the read
+  // and the write are about different keys. The re-check closes the
+  // reproduced interleaving; it does not close the class.
   //
   // The shape that answers it directly is ownership keyed BY WORKLOAD, with
   // holders and state in one transactional record -- the existing Postgres row
@@ -1264,8 +1617,17 @@ async function otherDagHolding(
   // leader-read before a stop is permitted, and a read that fails still
   // rejects rather than counting as "nobody". Raising the ceiling instead was
   // considered and rejected where the ceiling is defined.
-  const others = (await handleRegistry.listDagRoots())
-    .filter((dagRoot) => dagRoot !== dagRootTaskId);
+  // Two enumerations of the same bucket, unioned rather than chosen between.
+  // `listDagRoots` is the authoritative one and stays the reason this is
+  // correct; `rows` is already in hand, and both go through a separate
+  // `kv.keys()` call whose truncation mode is silent, so a key missing from
+  // one is still leader-read if the other saw it. On the `"before-release"`
+  // question this adds nothing the loop above did not already cover; on the
+  // re-check it is the half that keeps the enumeration no weaker than the
+  // shipped check's.
+  const candidates = new Set(await handleRegistry.listDagRoots());
+  for (const [dagRoot] of rows) candidates.add(dagRoot);
+  const others = [...candidates].filter((dagRoot) => dagRoot !== dagRootTaskId);
   return await firstAnswer(others, async (dagRoot) => {
     const authoritative = await handleRegistry.listForDagConsistent(dagRoot);
     for (const info of Object.values(authoritative)) {

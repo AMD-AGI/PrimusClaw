@@ -29,6 +29,7 @@ import pino from "pino";
 import {
   appendAttemptRecord, bankQueuedMs, endAttemptRecord, interruptSubject,
   noteAttemptRenewal, openAttemptRecord,
+  BG_VERDICT_TTL_MS,
   type AttemptRecord,
 } from "@claw/protocol";
 import {
@@ -74,6 +75,34 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
   BRAIN_TASK_TIMEOUT_SEC,
   { min: 1 },
 );
+/**
+ * How long the orphan sweep will wait for a background-work verdict that has
+ * not been published yet, before it stops waiting for one.
+ *
+ * The wait exists because a verdict that has not been measured is not a
+ * measurement of zero: a chat that has just ended leaves its sandbox parked
+ * with the verdict fields deliberately cleared, and Brain's keepalive sweep
+ * publishes the first answer about the new idle period one interval later
+ * (SANDBOX_KEEPALIVE_INTERVAL_SEC, 60s by default). Reaping inside that window
+ * is reaping on the absence of evidence, which is the defect this guard is for.
+ *
+ * The bound exists because "wait for a verdict" is only safe while something is
+ * producing verdicts. A fleet with the keepalive sweep switched off entirely
+ * (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0, which is permitted whenever
+ * BG_SHELL_ENABLED is false) publishes none, ever, and an unbounded wait would
+ * make this sweep permanently dead for its own primary case -- the leak it
+ * exists to stop. That failure has already shipped on this branch once and must
+ * not be reintroduced through the back door.
+ *
+ * One verdict lifetime is the value because it is the same span the reader uses
+ * to decide a published verdict is too old to believe: past it, an entry that
+ * still has nothing to say is not mid-measurement, it is unmeasured. In a fleet
+ * that is measuring, the wait is never reached -- the answer arrives in about a
+ * minute, well inside it -- so this bound bites only where the alternative is
+ * waiting forever.
+ */
+const ORPHAN_BG_VERDICT_WAIT_MS = BG_VERDICT_TTL_MS;
+
 /**
  * Whether the deadline backstop is allowed to act on chat runs.
  *
@@ -2065,6 +2094,7 @@ export async function reapOrphanHandles(): Promise<number> {
   const all = await handleRegistry.listAll();
   let dropped = 0;
   let unreleased = 0;
+  let deferred = 0;
   for (const [dagRoot, handles] of all) {
     // Keyed by `task_id` alone, which is the primary key. The old predicate
     // also demanded `dag_node_id = '__dag_root__'`, and that was not a
@@ -2117,6 +2147,88 @@ export async function reapOrphanHandles(): Promise<number> {
           continue;
         }
       }
+      // A session with no live task can still be carrying live work.
+      //
+      // Background shells outlive the run that started them -- that is the
+      // whole point of them. Ending a chat parks the sandbox and keeps them
+      // running, and from that moment this sweep sees exactly the shape it was
+      // written to reap: a terminal (or absent) DAG row, no live task in the
+      // session, and a handle pointing at a workload. Stopping it kills the
+      // user's background work, and the reproduction is not subtle -- at the
+      // moment `/stop` was issued the running process count inside the sandbox
+      // was still 1.
+      //
+      // Brain has a mechanism that means "do not stop this": it writes a
+      // retention record, and `handleRegistry.retained` inside the teardown
+      // refuses on one. But it writes that record when it RELEASES a container
+      // whose DAG is finished with it -- not when a chat simply ends. This path
+      // produces no retention record at all, so the gate that was supposed to
+      // protect it never sees anything, and the liveness check above passes
+      // because no *task* is running. Nothing else in the chain is looking at
+      // the sandbox itself.
+      //
+      // So the sandbox's own entry is read. Brain's keepalive sweep probes idle
+      // handles and publishes what it found onto `hands.<session>`, and that
+      // verdict -- read under the freshness rules it was written with, which
+      // live in `@claw/protocol` beside the writer rather than being restated
+      // here -- is the evidence this sweep was missing.
+      //
+      // The cost is one point read per DAG this sweep was about to act on, and
+      // only for DAGs that got past every cheaper check above -- next to the
+      // `retained` scan the stop itself already runs over the whole bucket per
+      // handle, it is not a term worth trading a user's background work for.
+      //
+      // "Defer" is a coherent answer only because this is a periodic sweep: it
+      // runs again in TASK_SWEEPER_TICK_MS and will reap the moment the sandbox
+      // reports idle. It would not be coherent on the cancel path, where there
+      // is no next time and deferring means never stopping, which is why the
+      // guard is here and not inside `stopAllHandlesForDag`.
+      const bg = sessionId
+        ? await handleRegistry.backgroundWork(
+          sessionId, Object.values(handles).map((h) => h.workload_id ?? ""),
+        )
+        : { state: "clear" as const, reason: "no_workload" as const };
+      if (bg.state === "running") {
+        logger.info(
+          { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
+          "sweeper.orphan_handles_background_work",
+        );
+        deferred++;
+        continue;
+      }
+      if (bg.state === "unreadable") {
+        // An unreadable store is not a sandbox with nothing in it. Same
+        // direction as every other unknown on this path: decline to act, and
+        // say so where an operator can see it.
+        logger.warn(
+          { dagRoot, sessionId, reason: bg.reason },
+          "sweeper.orphan_handles_background_unreadable",
+        );
+        deferred++;
+        continue;
+      }
+      if (bg.state === "awaiting") {
+        if (bg.sinceMs < ORPHAN_BG_VERDICT_WAIT_MS) {
+          // Distinct from the `running` line on purpose. This one repeats every
+          // tick for the same handle while nothing resolves it, and an operator
+          // watching a workload that is never reclaimed needs to be able to
+          // tell "held because work was measured" from "held because nothing
+          // has measured it yet".
+          logger.info(
+            { dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs },
+            "sweeper.orphan_handles_background_unknown",
+          );
+          deferred++;
+          continue;
+        }
+        logger.warn(
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs,
+            waitMs: ORPHAN_BG_VERDICT_WAIT_MS,
+          },
+          "sweeper.orphan_handles_background_unresolved",
+        );
+      }
       // The owner's session id when known; falling back to "" is safe because
       // safeStopWorkload reads the platform key from the session and skips
       // when absent.
@@ -2126,6 +2238,13 @@ export async function reapOrphanHandles(): Promise<number> {
   }
   if (unreleased > 0) {
     logger.warn({ dropped, unreleased }, "sweeper.orphan_handles_unreleased");
+  }
+  // Reported separately from `dropped`, which counts DAGs this sweep acted on.
+  // A tick that acted on nothing because everything was deferred and a tick
+  // that found nothing to do both return 0, and those are very different
+  // states of the fleet.
+  if (deferred > 0) {
+    logger.info({ dropped, deferred }, "sweeper.orphan_handles_deferred");
   }
   return dropped;
 }
