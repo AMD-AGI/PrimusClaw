@@ -40,9 +40,6 @@ func countUserDescendants(shimPID int) (int, error) {
 			}
 			seen[child.pid] = true
 			queue = append(queue, child.pid)
-			if child.pid == shimPID {
-				continue
-			}
 			if child.state == 'Z' || child.state == 'X' {
 				continue
 			}

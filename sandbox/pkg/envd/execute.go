@@ -82,6 +82,13 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			// HTTP cancellation does not stop the tracked tree.
 			return
 		}
+		awaitOutputQuiet(func() time.Time {
+			out, errOut := stdout.lastWrite(), stderr.lastWrite()
+			if errOut.After(out) {
+				return errOut
+			}
+			return out
+		})
 	}
 	endTime := time.Now()
 
@@ -171,7 +178,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send start event
-	sseWrite(w, flusher, "start", map[string]interface{}{"pid": pid})
+	stream.event("start", map[string]interface{}{"pid": pid})
 
 	exitCode := 0
 	timer := time.NewTimer(timeout)
@@ -184,13 +191,16 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		stream.deactivate()
 		return
 	}
-	stream.deactivate()
+	// Let the output the exit status overtook reach the stream before it stops
+	// accepting bytes, or the tail of the command is dropped silently.
+	awaitOutputQuiet(stream.lastWrite)
 
-	sseWrite(w, flusher, "end", map[string]interface{}{
+	stream.event("end", map[string]interface{}{
 		"exit_code": exitCode,
 		"exited":    true,
 		"status":    exitStatusString(exitCode),
 	})
+	stream.deactivate()
 }
 
 // buildChildEnv constructs the environment for a child process.
@@ -217,6 +227,31 @@ func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 // GNU timeout's documented execute timeout status.
 const executeTimeoutExitCode = 124
 
+// How long the output path must stay silent before a response is built from it.
+//
+// The exit status travels on its own descriptor while output travels through a
+// pipe and a copy goroutine, so the status routinely overtakes the last bytes
+// the command wrote. The first wait is unconditional for that reason: a buffer
+// that has received nothing yet looks exactly like one that has received
+// everything.
+const outputQuietPeriod = 100 * time.Millisecond
+
+// Ceiling on that wait. Descendants the command detached hold the same pipe and
+// may keep writing, so silence is not guaranteed to arrive.
+const outputQuietCeiling = 2 * time.Second
+
+// awaitOutputQuiet resynchronises the exit status with the output it overtook.
+func awaitOutputQuiet(lastWrite func() time.Time) {
+	deadline := time.Now().Add(outputQuietCeiling)
+	time.Sleep(outputQuietPeriod)
+	for time.Now().Before(deadline) {
+		if time.Since(lastWrite()) >= outputQuietPeriod {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // finalizeTimedOutCommand stops the tracked tree and always reports 124,
 // including when the shim surfaces SIGKILL as -1.
 func finalizeTimedOutCommand(exitCh <-chan int, stop func()) int {
@@ -242,15 +277,24 @@ func exitStatusString(code int) string {
 }
 
 type synchronizedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu   sync.Mutex
+	b    bytes.Buffer
+	last time.Time
 }
 
 // Write appends command output while permitting detached descendants to drain.
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.last = time.Now()
 	return b.b.Write(p)
+}
+
+// lastWrite reports when output last arrived, zero where none has.
+func (b *synchronizedBuffer) lastWrite() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.last
 }
 
 // appendString appends an EnvD-generated error message.
@@ -272,11 +316,30 @@ type sseCommandStream struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
 	active  bool
+	last    time.Time
+}
+
+// lastWrite reports when output last arrived, zero where none has.
+func (s *sseCommandStream) lastWrite() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
 }
 
 // writer creates one stdout or stderr field writer.
 func (s *sseCommandStream) writer(key string) *sseFieldWriter {
 	return &sseFieldWriter{stream: s, key: key}
+}
+
+// event emits one SSE event while the response is active. Output arrives from
+// the command's copy goroutines, so every write to the ResponseWriter goes
+// through here.
+func (s *sseCommandStream) event(name string, data interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		sseWrite(s.w, s.flusher, name, data)
+	}
 }
 
 // deactivate stops writes after the HTTP response has ended.
@@ -295,6 +358,7 @@ type sseFieldWriter struct {
 func (w *sseFieldWriter) Write(p []byte) (int, error) {
 	w.stream.mu.Lock()
 	defer w.stream.mu.Unlock()
+	w.stream.last = time.Now()
 	if w.stream.active {
 		sseWrite(w.stream.w, w.stream.flusher, "data", map[string]string{w.key: string(p)})
 	}

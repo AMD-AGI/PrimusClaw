@@ -207,6 +207,8 @@ interface KeepaliveDeps {
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
+  /** Test seam for the idle-expiry budget. */
+  idleExpiryBudgetMs?: number;
   /**
    * Test seam for the clock the ping deadline is measured against.
    *
@@ -974,6 +976,12 @@ const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
  */
 const BG_PROBE_MAX_IN_FLIGHT = 8;
 const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
+/**
+ * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
+ * The ping phase behind it needs what is left to renew every live record before
+ * the bucket drops it.
+ */
+const IDLE_EXPIRY_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 4));
 
 /**
  * Reservation deadline for a probe and its verdict write. It is shorter than
@@ -1921,9 +1929,26 @@ async function collectTargets(
     census.targets.set(key, registered);
   }
   const kvComplete = await collectKvTargets(deps, census);
-  await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, (item) =>
-    expireIdleTarget(deps, item.candidate, item.record, census.stats),
-  );
+  // Bounded, because every expiry confirms Running, reads the roster and stops a
+  // workload: against a slow control plane this phase can spend the whole sweep,
+  // and the phase behind it is the one that renews every live record ahead of
+  // its bucket TTL. A deferred candidate is still expired -- the next sweep
+  // reaches it through the same scan, on a clock that has not been reset.
+  const expiryDeadline = clock() + (deps.idleExpiryBudgetMs ?? IDLE_EXPIRY_BUDGET_MS);
+  let deferredExpiries = 0;
+  await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
+    if (clock() >= expiryDeadline) {
+      deferredExpiries += 1;
+      return;
+    }
+    await expireIdleTarget(deps, item.candidate, item.record, census.stats);
+  });
+  if (deferredExpiries > 0) {
+    logger.warn(
+      { deferred: deferredExpiries, total: census.idleExpiries.length },
+      "keepalive.idle_expiry_budget_exhausted",
+    );
+  }
   const dagComplete = await collectDagTargets(deps, census);
   stats.probes += dispatchProbes(deps, census.probeCandidates);
   // Accounted apart from the reads, and only accounted: the reads happen after

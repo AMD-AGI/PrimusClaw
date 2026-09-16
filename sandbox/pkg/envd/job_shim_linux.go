@@ -33,6 +33,12 @@ func runJobShim() {
 	); errno != 0 {
 		os.Exit(1)
 	}
+	// Close-on-exec before the command starts. This descriptor carries the
+	// primary PID and the exit status, and a program that writes to fd 3 by
+	// convention would otherwise feed four of its own bytes back as an exit
+	// code. Inherited, it also keeps the read end from seeing EOF when the shim
+	// is killed, so a request would wait out its timeout instead.
+	syscall.CloseOnExec(exitStatusFD)
 	control := os.NewFile(uintptr(exitStatusFD), "job-control")
 	if control == nil {
 		os.Exit(1)
