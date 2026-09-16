@@ -38,13 +38,13 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { lookupDagHandle, registerDagHandle } from "./handles.js";
+import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
 import { countLiveWork, type LiveWorkAnswer } from "./live-work-gate.js";
 import { retainContainer } from "./retain-container.js";
 import { restartHandsInSandbox } from "./hands-restart.js";
-import { registerSandbox } from "./keepalive.js";
+import { markHandsIdle, registerSandbox, unregisterSandbox } from "./keepalive.js";
 import type { SandboxEntry } from "./keepalive.js";
 import {
   instanceFromEntry,
@@ -58,6 +58,7 @@ import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
+import { RETENTION_LEDGER_FILTER } from "./retain-container.js";
 import {
   admitSandbox, assertFleetCensused, type AdmissionHold,
 } from "./admission.js";
@@ -221,7 +222,8 @@ function sandboxNamespaceFor(request: ExecuteRequest): string {
  *
  * Bound rather than called through the imports directly, so the gates below can
  * be exercised without a cluster: `destroyHands` reaches for the KV bucket and
- * the workload API, and `registerSandbox` starts a keepalive ticker. Neither is
+ * the workload API, and `registerSandbox` adds to the registry the keepalive
+ * ticker walks. Neither is
  * what the decision is about, and both are what a test of it would otherwise
  * have to stand up.
  */
@@ -238,6 +240,16 @@ export interface SandboxReuseEffects {
     signal?: AbortSignal,
   ) => Promise<ContainerProbeOutcome>;
   restartHandsInSandbox: typeof restartHandsInSandbox;
+  // The two halves of undoing an adoption. Through the seam for the same
+  // reason the rest of it is: the undo runs only when a registration failed,
+  // which no test can reach through a real KV, and it is the piece that has
+  // already been wrong once -- it addressed the Router's session id rather
+  // than Claw's, so it unwound nothing and reported success.
+  unregisterSandbox: typeof unregisterSandbox;
+  markHandsIdle: typeof markHandsIdle;
+  dagHoldsWorkload: typeof dagHoldsWorkload;
+  workloadHeldByOtherDag: typeof workloadHeldByOtherDag;
+  releaseHandlesForWorkload: typeof releaseHandlesForWorkload;
   countLiveWork: typeof countLiveWork;
   retainContainer: typeof retainContainer;
 }
@@ -264,7 +276,11 @@ export interface EnsureHandsOptions {
 }
 
 const realReuseEffects: SandboxReuseEffects = {
+  dagHoldsWorkload,
+  workloadHeldByOtherDag,
+  releaseHandlesForWorkload,
   destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
+  unregisterSandbox, markHandsIdle,
   countLiveWork, retainContainer,
 };
 let reuseEffects: SandboxReuseEffects = realReuseEffects;
@@ -385,6 +401,19 @@ async function recoverOrRetainUnusableSandbox(
     if (recovered) return recovered;
   }
 
+  // Two separate questions, and destroying needs both answered. `mayDestroy`
+  // asks whether the container has live work in it; this asks whether the
+  // sandbox is even this DAG's to recreate. Unhealthy to US, over an entry a
+  // session shares between concurrent DAGs, is not a licence over somebody
+  // else's workload -- and a sibling's sandbox can be perfectly healthy while
+  // our probe of it fails.
+  if (await entryOwnedByAnother(info, attempt.request)) {
+    logger.warn(
+      { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+      "hands.kv.unhealthy_rebuild_skipped_other_owner",
+    );
+    return null;
+  }
   const live = await mayDestroy(sessionId, identity, signal);
   if (live.verdict === "clear") {
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
@@ -457,6 +486,38 @@ async function recoverUnhealthyReuse(
  * found here -- the count decides which container it gets, never what it is
  * told -- so the finding reaches operator telemetry alone.
  */
+/**
+ * A workload that has been retained no longer owns the handle naming it.
+ *
+ * Read from the retention ledger, which is what `retainContainer` writes first
+ * and what a lost projection is restored from -- so it is the durable answer to
+ * "was this container handed over", and the one thing a failed handle release
+ * cannot invalidate.
+ */
+function retainedTaker(kv: ReuseAttempt["kv"]): (previousWorkloadId: string) => Promise<boolean> {
+  return async (previousWorkloadId: string): Promise<boolean> => {
+    if (!previousWorkloadId) return false;
+    try {
+      const store = retentionStore(kv);
+      for (const ledgerKey of await store.keys(RETENTION_LEDGER_FILTER)) {
+        const held = await store.read(ledgerKey);
+        if (!held) continue;
+        const record = JSON.parse(held.value) as { workloadId?: string };
+        if (record?.workloadId === previousWorkloadId) return true;
+      }
+      return false;
+    } catch (e) {
+      // Unreadable is not "retained": refusing the registration keeps the
+      // handle naming something that may still be nobody's to take.
+      logger.warn(
+        { previousWorkloadId, err: (e as Error)?.message ?? String(e) },
+        "dag-handles.retention_check_failed",
+      );
+      return false;
+    }
+  };
+}
+
 async function retainInsteadOfDestroying(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -464,6 +525,22 @@ async function retainInsteadOfDestroying(
   answer: LiveWorkAnswer,
   binding: HandsBinding,
 ): Promise<void> {
+  // Retention BEFORE the handle release, and this order has been both ways now.
+  //
+  // Releasing first was an attempt to keep a failed release retryable, on the
+  // premise that a throw means the delete did not happen. It does not: a delete
+  // whose ACK is lost has committed, and the caller then provisions a
+  // replacement that registers cleanly and overwrites the session entry --
+  // leaving the retained container with no handle, no retention record and no
+  // binding. The same window opens on a crash between the two, and for a DAG
+  // that REUSED this container the handle was also its own way back into this
+  // path, so losing it first makes the next attempt skip retention entirely.
+  //
+  // Retaining first means the reference that replaces the handle exists before
+  // the handle can go. What that costs is a failed release leaving a stale
+  // handle -- which `registerReusedDagHandle` and the create-path registration
+  // recover from, by noticing the name belongs to a retained workload and
+  // freeing it there.
   await reuseEffects.retainContainer({
     store: retentionStore(kv),
     // The key this binding was read under, not one re-derived from the session
@@ -480,6 +557,24 @@ async function retainInsteadOfDestroying(
     verdict: answer.verdict,
     detail: answer.reason,
   });
+
+  // The DAG's handle goes with the DAG, not with the container it gives up.
+  // Leaving it naming the retained workload makes the replacement
+  // unregisterable -- `replaceDagHandle` refuses to take a name from a workload
+  // still on record, which is right -- so it is freed here, and if that does
+  // not land the registration path frees it instead.
+  //
+  // Safe to release by workload: this is only reached when
+  // `entryOwnedByAnother` said no other DAG holds it.
+  const retainedWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
+  if (retainedWorkload) {
+    await reuseEffects.releaseHandlesForWorkload(retainedWorkload).catch((e) => {
+      logger.warn(
+        { sessionId, workloadId: retainedWorkload, err: (e as Error)?.message ?? String(e) },
+        "hands.retain_handle_release_failed",
+      );
+    });
+  }
 }
 
 /**
@@ -568,6 +663,78 @@ async function readReusableEntry(
  * image or the resources and sent another message silently got the old sandbox
  * back with no indication anything had been ignored.
  */
+/**
+ * Is this session entry somebody else's to destroy?
+ *
+ * `hands.<sessionId>` is a single entry, and every replace branch below reads
+ * it, takes the workload it names, and stops it. That is right when a session
+ * runs one task at a time. Under a session-scoped run gate it is not: two DAG
+ * roots take different lock keys and run at once over this one entry, so the
+ * workload it names may be one a sibling is still creating -- or already
+ * promoted and using. Stopping it is a mis-stop, and no amount of passing the
+ * read identity along prevents it: pinning WHICH workload gets stopped is not
+ * evidence that it is the caller's to stop.
+ *
+ * The DAG root is the unit of ownership here, not the task: nodes of the same
+ * DAG are meant to share the session's sandbox, and reuse across them is the
+ * point. An entry written before these fields existed names nobody, and is
+ * treated as the caller's -- the pre-rollout behaviour, and the alternative is
+ * refusing to rebuild a session that has no owner recorded.
+ */
+async function entryOwnedByAnother(
+  info: Record<string, unknown>,
+  request: ExecuteRequest,
+): Promise<boolean> {
+  const mineRoot = request.dag_root_task_id ?? request.task_id ?? null;
+  const entryRoot = typeof info.dagRootTaskId === "string" ? info.dagRootTaskId : null;
+  if (!entryRoot || !mineRoot) return false;
+
+  // Who WROTE the entry is not the same question as who holds the workload now.
+  // A task that reused another's sandbox registers its own handle on it and is
+  // from then on just as much a holder -- but the entry still names whoever
+  // created it. Refusing on that alone left such a task unable to rebuild a
+  // sandbox that had broken under it: the replace was skipped as somebody
+  // else's, and its own handle, still naming the dead workload, then refused
+  // the registration of the replacement. Two attempts, two rolled-back
+  // workloads, no way forward.
+  //
+  // So the handle registry decides. A read failure answers "not mine", which
+  // keeps the mis-stop this guard exists to prevent.
+  // Not the workload id alone: an agent-sandbox entry records `workloadId: ""`
+  // and names its Router session instead, so keying on the workload id meant
+  // every ownership question about one was answered "nobody else holds it"
+  // without a single query being made -- and a Router sandbox another DAG was
+  // using got deleted on the strength of it.
+  const workloadId = handleIdentityKey({
+    workload_id: typeof info.workloadId === "string" ? info.workloadId : "",
+    session_id: typeof info.sessionId === "string" ? info.sessionId : "",
+  });
+  if (!workloadId) return entryRoot !== mineRoot;
+  try {
+    // Two questions, and destroying needs both answered. The first is "am I
+    // entitled to this sandbox at all" -- true if I created it, and equally
+    // true if I merely reused it, because a reusing DAG registers its own
+    // handle and is from then on just as much a holder.
+    //
+    // The second is the one being entitled does not answer: is anyone ELSE
+    // holding it? Reuse is the point of the registry, so the answer is often
+    // yes -- and creating the workload does not exempt you from asking. A
+    // creator whose sandbox has since been reused by another DAG was skipping
+    // straight past both queries and stopping it underneath them.
+    const entitled = entryRoot === mineRoot
+      || await reuseEffects.dagHoldsWorkload(mineRoot, workloadId);
+    if (!entitled) return true;
+    return await reuseEffects.workloadHeldByOtherDag(mineRoot, workloadId);
+  } catch (e) {
+    logger.warn(
+      { sessionId: request.session_id, workloadId, dagRoot: mineRoot,
+        err: (e as Error)?.message ?? String(e) },
+      "hands.kv.owner_check_failed",
+    );
+    return true;
+  }
+}
+
 export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHandsResult | null> {
   const { kv, sessionId, request, multiNodeContext, requestedSpec, onEvent, signal } = a;
   logger.info({ sessionId }, "ensureHands.kv_lookup");
@@ -594,16 +761,38 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       },
       "ensureHands.mn_replace_sandbox",
     );
+    if (await entryOwnedByAnother(info, request)) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+        "hands.kv.mn_replace_skipped_other_owner",
+      );
+      return null;
+    }
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
     return null;
   }
 
   if (info.status !== "ready") {
+    // "Stale" is an assumption, and under a session-scoped run gate it is
+    // sometimes wrong: two DAG roots take different lock keys and run at once
+    // over this one entry, so a pending entry can be a sibling's create still
+    // in flight rather than this task's own leftover. Destroying it stopped a
+    // workload the sibling went on to promote and use.
+    //
+    // Whoever wrote it says so on the entry. Somebody else's is left where it
+    // is -- this task cannot reuse it either, so it falls through to creating
+    // its own, which is what it would have done anyway.
+    const entryTask = typeof info.taskId === "string" ? info.taskId : null;
+    const mine = (!entryTask || !request.task_id || entryTask === request.task_id)
+      && !(await entryOwnedByAnother(info, request));
     logger.warn(
-      { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)" },
-      "hands.kv.stale_pending_found",
+      { sessionId, workloadId: info.workloadId, status: info.status ?? "(none)",
+        entryTaskId: entryTask, taskId: request.task_id ?? null, mine },
+      mine ? "hands.kv.stale_pending_found" : "hands.kv.pending_belongs_to_other_task",
     );
-    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    if (mine) {
+      await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    }
     return null;
   }
 
@@ -622,6 +811,13 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       reason: "spec_changed",
       detail: "the sandbox image, resources or environment differ from the running sandbox",
     }).catch(() => {});
+    if (await entryOwnedByAnother(info, request)) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
+        "hands.kv.spec_rebuild_skipped_other_owner",
+      );
+      return null;
+    }
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
     return null;
   }
@@ -733,6 +929,131 @@ async function clearIdleMarkers(
       "ensureHands.idle_markers_not_cleared",
     );
     return true;
+  }
+}
+
+
+/**
+ * Record that this DAG now holds the sandbox it just took over.
+ *
+ * A failure throws, and attempts to undo the adoption first -- attempts,
+ * because the undo can itself report failure and is logged when it does. An
+ * unregistered reuse is a sandbox nothing owns on paper, which is how a live
+ * pod gets reaped and how a cancel reports that it released everything it
+ * could see.
+ *
+ * `replace` rather than `create`, because the whole point is that a handle of
+ * this name may already exist naming the workload this session used before.
+ *
+ * Exported for the same reason `destroyHandleCas` is on the Backend side: the
+ * undo below runs only when a registration failed, which no test reaches
+ * through a real KV, and it is the part that has already been wrong twice.
+ */
+export async function registerReusedDagHandle(
+  kv: ReuseAttempt["kv"],
+  request: ExecuteRequest,
+  action: { kind: string; handle?: string },
+  reused: EnsureHandsResult,
+): Promise<void> {
+  const dagRoot = request.dag_root_task_id ?? request.task_id;
+  if (!dagRoot || !action.handle) return;
+  const identity = reused.identity;
+  if (!identity) return;
+  try {
+    await replaceDagHandle(dagRoot, action.handle, {
+      workload_id: identity.workloadId ?? "",
+      hands_url: reused.handsUrl,
+      token: reused.token,
+      platform_key: identity.platformKey ?? "",
+      provider: identity.provider,
+      sandbox_name: identity.sandboxName,
+      namespace: identity.namespace,
+      session_id: identity.sessionId,
+      user_id: identity.userId,
+    }, { mayTakeFrom: retainedTaker(kv) });
+  } catch (e) {
+    // Not swallowed. Adopting a sandbox whose ownership could not be recorded
+    // hands this DAG a workload that Backend's teardown cannot find: a cancel
+    // reports the DAG holds nothing and stops nothing, while the pod keeps its
+    // GPU. Failing the turn is loud and retryable; succeeding quietly is how
+    // the leak becomes invisible, which is the whole thing this work is about.
+    // Throwing alone leaves the adoption half-done. `acceptExistingSandbox`
+    // has already cleared the idle markers and registered keepalive, and the
+    // runner has not been handed the identity yet -- so nothing downstream can
+    // unwind either, `reapPendingHands` skips the READY entry, and the turn's
+    // own teardown answers `no_sandbox`. The sandbox stays active, owned by a
+    // session whose turn just failed, and unclaimed by any DAG.
+    //
+    // The adoption is therefore undone rather than abandoned: the sandbox goes
+    // back to idle, which is the state it was in a moment ago and the state
+    // the next turn expects to find it in. It is deliberately NOT stopped --
+    // this path did not create it, and another session's warm pod is not this
+    // turn's to destroy on the way out.
+    logger.error(
+      { dagRoot, handle: action.handle, sessionId: request.session_id,
+        err: (e as Error).message },
+      "ensureHands.reused_handle_register_failed",
+    );
+    // The CLAW session, not `identity.sessionId`. For agent-sandbox that field
+    // is the Router's session id, while keepalive registrations and the
+    // `hands.<session>` key are both keyed by Claw's -- so preferring it sent
+    // the unregister and the idle write to a session that does not exist, and
+    // the adoption stayed exactly as un-undone as before, with the undo
+    // reporting success.
+    const adoptedSession = request.session_id;
+    try {
+      // The two halves of what `acceptExistingSandbox` just did, undone in the
+      // reverse order it did them. `unregisterSandbox` drops THIS session's
+      // entry from the LOCAL registry. It stops no ticker and recalls no ping
+      // already collected into the current tick. It does not make the sandbox
+      // unreachable either: keepalive also scans `hands.*` directly, so an
+      // entry still marked active is picked up again from KV regardless of the
+      // local registry -- which is why the park below is the half that
+      // matters, and why its outcome is checked.
+      //
+      // The order is still the right way round: reversed, the entry reads idle
+      // while a live local registration still names it. It is not an atomic
+      // handover and nothing here should be read as claiming one.
+      //
+      // `releaseSlot: false`, which #35 made default true: this is the undo of
+      // an ADOPTION, so the sandbox it stops pinging is one somebody else built
+      // and is still running. Handing its ceiling slot back lets a new
+      // provision take a place the fleet has not actually vacated.
+      reuseEffects.unregisterSandbox(adoptedSession, identity, { releaseSlot: false });
+      // `markHandsIdle` REPORTS its result rather than throwing -- `parked`,
+      // `gone`, `skipped`, `superseded` or `failed` -- so a catch around it
+      // establishes nothing, and which of those means "not undone" has to be
+      // decided rather than assumed. A conflict is the ordinary case here:
+      // the entry is live and its TTL is being refreshed underneath. Left
+      // unchecked, the local registration is gone while the KV entry still
+      // says active, and the next keepalive tick finds the workload again from
+      // KV and goes on pinging a sandbox no turn owns.
+      const parked = await reuseEffects.markHandsIdle(kv, adoptedSession, identity);
+      // What counts as "the undo did not happen" is narrower than "not
+      // parked". `gone` means there is no entry left to park. `skipped` covers
+      // three cases, and two of them -- the entry is not READY, or it now
+      // names a different sandbox -- mean this adoption's marks are no longer
+      // what is there, so there is nothing of ours left to undo. Reporting
+      // those would page somebody for an ordinary handover. `unreadable` is
+      // the one that does mean the undo was not performed.
+      const incomplete = parked.outcome === "superseded"
+        || parked.outcome === "failed"
+        || (parked.outcome === "skipped" && parked.reason === "unreadable");
+      if (incomplete) {
+        logger.error(
+          { dagRoot, handle: action.handle, sessionId: adoptedSession,
+            outcome: parked.outcome, reason: parked.reason },
+          "ensureHands.reused_handle_undo_incomplete",
+        );
+      }
+    } catch (undoErr) {
+      logger.error(
+        { dagRoot, handle: action.handle, sessionId: adoptedSession,
+          err: (undoErr as Error).message },
+        "ensureHands.reused_handle_undo_failed",
+      );
+    }
+    throw e;
   }
 }
 
@@ -893,7 +1214,21 @@ async function provisionHands(
       kv, sessionId, request, multiNodeContext, requestedSpec, onEvent,
       signal: options.signal,
     });
-    if (reused) return reused;
+    if (reused) {
+      // A sandbox taken by reuse is held just as firmly as one that was
+      // created, and until now only the created case was ever registered: this
+      // path returned early, so the DAG that reused a warm pod owned it while
+      // the handle map still named whichever task created it.
+      //
+      // Two consequences, both reachable without any race. Backend's teardown
+      // for this DAG finds an empty map and reports it holds nothing, so a
+      // cancel stops nothing and says so confidently. And the sweeper, reading
+      // only the creating task, sees that task terminal and tears the sandbox
+      // down under the DAG now running on it. Ownership has to move with the
+      // sandbox, and this is the moment it moves.
+      await registerReusedDagHandle(kv, request, action, reused);
+      return reused;
+    }
   }
 
   // kubernetes/BYOK: the selected LLM key is injected into the sandbox; safe
@@ -1026,6 +1361,11 @@ async function provisionHands(
   const hold = await admitSandbox(sessionId);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
+    // The handle this DAG is claiming, and who is claiming it. Needed inside
+    // because the registration has to happen in this hook -- see the note there.
+    taskId: request.task_id ?? null,
+    dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
+    handleName: action.kind === "create" ? (action.handle ?? null) : null,
   });
 
   logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
@@ -1117,6 +1457,9 @@ async function provisionHands(
   const kvKey = handsSessionKey(sessionId);
   const readyPayload = sc.encode(JSON.stringify({
     status: "ready",
+    // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
+    taskId: request.task_id ?? null,
+    dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
     // The key the run lease is actually under. Not the session: the gate is
     // workspace-scoped by default, so a run holding files takes
     // `lock.ws.<workspaceId>`, and only an unbound run falls back to the DAG
@@ -1178,12 +1521,20 @@ async function provisionHands(
   // task-design.md §9.4: when the calling task belongs to a DAG and declared
   // a sandbox.handle name, publish a HandleInfo to the DagHandleMap so any
   // downstream node with `sandbox.use=<handle>` can short-circuit ensureHands
-  // and connect directly to this workload. Failures are non-fatal -- the DAG
-  // can still complete with sandbox-per-node semantics, just without reuse.
+  // and connect directly to this workload. A failure here is fatal and rolls
+  // the workload back: the handle is also the only record Backend has of what
+  // this DAG holds.
   const dagRoot = request.dag_root_task_id ?? request.task_id;
+  // `replace`, not `create`. A create refuses a name that already maps
+  // elsewhere -- correct against a double-create, wrong here, because this IS
+  // the moment a handle legitimately changes hands: a rebuild has just stopped
+  // the previous workload and this is its replacement. Rejected and swallowed,
+  // as it was, the map goes on naming a workload that is gone while the new
+  // one runs unreferenced, so a later cancel stops the corpse, hears 404 or
+  // 200, and reports the sandbox released.
   if (dagRoot && action.kind === "create" && action.handle) {
     try {
-      await registerDagHandle(dagRoot, action.handle, {
+      await replaceDagHandle(dagRoot, action.handle, {
         workload_id: workloadId,
         hands_url: handsUrl,
         token: handsToken,
@@ -1193,12 +1544,36 @@ async function provisionHands(
         // deployment default when the field is missing, so a workspace-scoped
         // sandbox would be polled where it is not and expire while still live.
         namespace: nsForSandbox,
-      });
+      }, { mayTakeFrom: retainedTaker(kv) });
     } catch (e) {
-      logger.warn(
-        { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
-        "ensureHands.handle_register_failed",
+      // Was non-fatal, on the reasoning that a DAG can still complete without
+      // reuse. It can -- but the handle is also the only record Backend has of
+      // what this DAG holds, so a swallowed failure leaves a live workload
+      // that a cancel reports as `nothing_held` and never stops. Losing reuse
+      // is a cost; losing the ability to account for a GPU is not one to take
+      // silently.
+      //
+      // Throwing is not enough on its own: the workload is already created and
+      // its `hands.<session>` entry is already READY, and the failure cleanup
+      // above this only reaps PENDING entries. So the turn would fail with the
+      // GPU still allocated. The early registration usually still names it --
+      // this write was enriching that entry, not creating it -- so it is not
+      // necessarily unreferenced; it is simply not released, which is what the
+      // teardown here is for, in the same shape as the pending write's own
+      // rollback.
+      logger.error(
+        { sessionId, dagRoot, handle: action.handle, workloadId, err: (e as Error).message },
+        "ensureHands.handle_register_failed_rollback",
       );
+      await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+        // Logged with the id: if the early registration is also gone, this
+        // line is what is left to find the workload by.
+        logger.error(
+          { sessionId, workloadId, err: (cleanupErr as Error).message },
+          "ensureHands.handle_register_rollback_failed",
+        );
+      });
+      throw e;
     }
   }
 
@@ -1229,6 +1604,10 @@ export function makeOnProvisioned(deps: {
   kv: KV;
   hold: AdmissionHold;
   stop?: (workloadId: string) => Promise<void>;
+  /** Who this workload belongs to, and the handle it is claiming. */
+  taskId?: string | null;
+  dagRootTaskId?: string | null;
+  handleName?: string | null;
 }): (workloadId: string) => Promise<void> {
   const stopWorkload = deps.stop ?? (async (workloadId: string) => {
     await getSafeWorkloadProvider().stop({
@@ -1275,9 +1654,64 @@ export function makeOnProvisioned(deps: {
 
     const pendingPayload = sc.encode(JSON.stringify({
       status: "pending", workloadId, sandboxImage: deps.sandboxImage,
+      // Who this entry belongs to. `hands.<sessionId>` is one slot and a
+      // session can hold more than one DAG at a time under a session-scoped run
+      // gate, so a failing task must be able to tell its own half-created
+      // workload from a sibling's live one before reaping it.
+      taskId: deps.taskId ?? null,
+      dagRootTaskId: deps.dagRootTaskId ?? null,
       platformKey: deps.apiKey, token: deps.handsToken, namespace: deps.namespace,
       createdAt: new Date().toISOString(),
     }));
+
+    // Phase (A) for the DAG handle, written BEFORE the session entry below.
+    //
+    // Both records are made in this hook for the same reason: the workload
+    // exists from this moment, and everything between here and the registration
+    // at the end of ensureHands -- poll, bootstrap, health -- is time in which a
+    // cancel can arrive. It found no handle, concluded the DAG held nothing, and
+    // reported exactly that while the workload it missed kept its GPU.
+    //
+    // Their ORDER matters because only one of them is what a cancel reads.
+    // Backend decides whether a DAG holds a sandbox from the handle map, so
+    // every instant in which the session entry exists and the handle does not is
+    // an instant a cancel answers `nothing_held` over a live workload. This way
+    // round, the worst it sees is a handle whose session entry has not landed
+    // yet -- which errs towards reporting a workload that is there, the
+    // direction this whole change exists to err in.
+    //
+    // A registration that cannot be written rolls the workload back, exactly as
+    // the pending write below does: an unregisterable workload is one nothing
+    // can account for, and it must not outlive this call.
+    if (deps.dagRootTaskId && deps.handleName) {
+      try {
+        await replaceDagHandle(deps.dagRootTaskId, deps.handleName, {
+          workload_id: workloadId,
+          // Not serving yet: SaFE has an id for it, but it can still be queued
+          // for a GPU. Readers that ping what a handle names have to be able to
+          // tell this row from one that finished provisioning.
+          pending: true,
+          platform_key: deps.apiKey || "",
+          image: deps.sandboxImage ?? undefined,
+          namespace: deps.namespace,
+        }, { mayTakeFrom: retainedTaker(deps.kv) });
+      } catch (err) {
+        logger.error(
+          { sessionId: deps.sessionId, workloadId, dagRoot: deps.dagRootTaskId,
+            handle: deps.handleName, err: (err as Error).message },
+          "dag-handles.pending_register_failed_rollback",
+        );
+        await rollbackUnregisterableWorkload({
+          sessionId: deps.sessionId, workloadId, namespace: deps.namespace,
+          platformKey: deps.apiKey, pendingPayload, kv: deps.kv,
+          deps: { stop: async (id) => { await stopWorkload(id); } },
+        });
+        throw new Error(
+          `DAG handle registration failed for workload ${workloadId}, rolled back`,
+        );
+      }
+    }
+
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await deps.kv.put(handsSessionKey(deps.sessionId), pendingPayload);
@@ -1292,7 +1726,26 @@ export function makeOnProvisioned(deps: {
       }
     }
     logger.error({ sessionId: deps.sessionId, workloadId }, "hands.kv.pending_put_failed_rollback");
-    await rollback(workloadId, new Error(`KV pending write failed for workload ${workloadId}`));
+    // Same two remedies as the registration rollback above, so the same helper:
+    // whichever of stop / session-entry lands first is enough, and the pending
+    // write it retries is a fourth attempt at the one that just failed three
+    // times -- by now KV may have come back. It also keeps trying in the
+    // background when neither lands, which `rollback` alone cannot.
+    const outcome = await rollbackUnregisterableWorkload({
+      sessionId: deps.sessionId, workloadId, namespace: deps.namespace,
+      platformKey: deps.apiKey, pendingPayload, kv: deps.kv,
+      deps: { stop: async (id) => { await stopWorkload(id); } },
+    });
+    if (outcome === "orphaned") {
+      // main's wording, and still the right one: nothing durable could be
+      // written and the stop would not land, so it is running, unadmitted and
+      // untracked -- with a bounded background retry still trying.
+      throw new Error(
+        `workload ${workloadId} could not be stopped after KV pending write failed. `
+        + "It is running, unadmitted and untracked.",
+      );
+    }
+    throw new Error(`KV pending write failed for workload ${workloadId}, rolled back`);
   };
 }
 
@@ -1322,6 +1775,265 @@ export function makeOnProvisioned(deps: {
  * and redeliveries are densest, and the panel would report a provisioning
  * outage caused by the deploy that was in fact the deploy working.
  */
+
+/**
+ * A rollback attempt makes at most this many rounds of it. Both remedies are
+ * retried because the single thing that must not happen -- a live workload no
+ * record points at -- survives one transient failure of either.
+ */
+export const ROLLBACK_ATTEMPTS = 3;
+
+/**
+ * Backoff for the detached recovery that runs when every synchronous round
+ * failed. Spread over ~8 minutes, because what it is waiting for is a SaFE or
+ * KV outage ending, and one attempt after that is enough.
+ */
+export const ORPHAN_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+
+/**
+ * Undo a workload whose DAG handle could not be registered.
+ *
+ * The registration failing does not say WHY it failed, and the two reasons want
+ * opposite things:
+ *
+ *   - **Refused**, because the name still belongs to an older workload. This
+ *     workload has no handle and never will get one, so nothing in the handle
+ *     map will ever lead back to it.
+ *   - **Committed, ACK lost.** The handle already names THIS workload, so
+ *     leaving it in place means every later attempt is refused against a corpse.
+ *
+ * Two remedies, and EITHER one is enough. Stopping the workload is the better
+ * of them -- a workload that no longer exists needs no record -- so it is tried
+ * first each round. Failing that, the pending session entry makes it findable,
+ * which matters because this path returns before the caller writes that entry,
+ * so without it the only trace of a running workload is a log line and
+ * `reapPendingHands` has nothing to retry.
+ *
+ * Each round tries the stop, then the record; the loop ends the moment one of
+ * them lands. One-shotting either of them was the defect this replaces: the
+ * normal pending write retries three times, and the rollback's did not, so a
+ * single transient KV error on a workload whose stop had also failed left it
+ * running and unreferenced.
+ *
+ * Releasing the handle happens only after a stop that SUCCEEDED, and is keyed
+ * by workload, so it removes nothing if the registration really was refused.
+ * It is retried too: a stop that landed and a release that did not leaves the
+ * name pointing at something that is gone.
+ */
+export async function rollbackUnregisterableWorkload(args: {
+  sessionId: string;
+  workloadId: string;
+  namespace: string;
+  platformKey: string;
+  pendingPayload: Uint8Array;
+  kv: {
+    get: (key: string) => Promise<{ value?: Uint8Array; revision: number; operation?: string } | null>;
+    create: (key: string, value: Uint8Array) => Promise<unknown>;
+    update: (key: string, value: Uint8Array, revision: number) => Promise<unknown>;
+  };
+  deps?: {
+    stop?: (workloadId: string, namespace: string, platformKey: string) => Promise<unknown>;
+    release?: (workloadId: string) => Promise<unknown>;
+    /** Test seam: run the detached recovery inline instead of in the background. */
+    detach?: (fn: () => Promise<void>) => void;
+    /** Test seam: the backoff between recovery attempts. */
+    retryDelaysMs?: number[];
+  };
+}): Promise<"stopped" | "recorded" | "orphaned"> {
+  const { sessionId, workloadId, namespace, platformKey, pendingPayload, kv } = args;
+  const stop = args.deps?.stop ?? ((id: string, ns: string, key: string) =>
+    getSafeWorkloadProvider().stop({
+      provider: "safe-workload", id, sandboxName: id,
+      namespace: ns, handsBaseUrl: "", platformKey: key,
+    }));
+  const release = args.deps?.release ?? releaseHandlesForWorkload;
+
+  // Writing the session entry is only a remedy while the entry is still THIS
+  // workload's to write. The background recovery below can wake long after the
+  // task that owned it failed and the session moved on to a new workload, and
+  // `hands.<sessionId>` holds one entry: writing the old pending payload over a
+  // live one takes the new workload's only reference to give the old one a
+  // reference that the new workload's own `ready` write then overwrites. Both
+  // end up unreferenced, and the loop -- having counted the write as success --
+  // has already exited.
+  //
+  // So it reads first, and declines when the entry names someone else. That is
+  // not a failure to retry: the entry is spoken for and will stay spoken for,
+  // and stopping the workload is the remedy that remains. Absent, tombstoned or
+  // still ours, the write is revision-conditional, so a session entry that
+  // appears between the read and the write is not overwritten either.
+  const recordPending = async (): Promise<boolean> => {
+    // Read through BOTH names, write the canonical one -- the same rule
+    // `readReusableEntry` follows, and for the same reason. #35 introduced the
+    // canonical key and a migration that resolves the two by `createdAt`, so a
+    // check that looks at one name can miss a live binding held under the
+    // other: during a rolling upgrade the live one can be the legacy name,
+    // this writes a newer pending on the canonical name, and the migration then
+    // deletes the live binding as the older of the pair. Before the merge the
+    // two names were the same string and one read saw everything.
+    // BOTH keys, read explicitly -- not `readHandsEntry`, which is
+    // canonical-first and returns the first non-null it finds. That is right for
+    // "which binding is in force" and wrong for "is this slot free": when the
+    // canonical key holds a tombstone, an empty PUT, or this workload's own
+    // row, the read-through stops there and never sees another workload holding
+    // the legacy name. The migration then merges the two by `createdAt` and
+    // deletes that live binding as the older of the pair.
+    const key = handsSessionKey(sessionId);
+    const names = [key, `hands.${sessionId}`].filter((n, i, a) => a.indexOf(n) === i);
+    // EVERY name, all the way through -- no early exit. Breaking on the first
+    // usable row decided the answer before knowing whose it was, so a canonical
+    // row belonging to this very workload (or holding unparseable bytes) hid a
+    // live row under the legacy name, and the migration then deleted that live
+    // binding as the older of the pair.
+    //
+    // Unparseable is treated as "somebody else's" for the same reason: it is
+    // not evidence that the slot is free, and the alternative is overwriting a
+    // row whose owner simply could not be read.
+    let mine: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
+    let replaceable: { key: string; entry: NonNullable<Awaited<ReturnType<typeof kv.get>>> } | null = null;
+    for (const name of names) {
+      const e = await kv.get(name);
+      if (!e) continue;
+      const live = e.operation !== "DEL" && e.operation !== "PURGE"
+        && (e.value?.length ?? 0) > 0;
+      if (!live) { replaceable ??= { key: name, entry: e }; continue; }
+      let owner: string | null = null;
+      let readable = true;
+      try {
+        owner = (JSON.parse(sc.decode(e.value!)) as { workloadId?: string }).workloadId ?? null;
+      } catch { readable = false; }
+      // `owner !== workloadId` outright, empty included. A legitimate
+      // agent-sandbox READY binding carries `workloadId: ""` -- its identity is
+      // the Router session id -- so treating a missing owner as "not somebody
+      // else's" let a SaFE rollback overwrite a live Router binding with its own
+      // PENDING row. The strict comparison this replaced was right about that;
+      // the `owner &&` guard I added to it was the regression.
+      if (!readable || owner !== workloadId) {
+        logger.warn(
+          { sessionId, workloadId, key: name, owner, readable },
+          "dag-handles.pending_register_rollback_session_reused",
+        );
+        return false;
+      }
+      mine ??= { key: name, entry: e };
+    }
+
+    // Our own row first, then a tombstone to revive, then create the canonical
+    // name. Always the key it was read under: updating the canonical name on
+    // the strength of a legacy read is the lost update this check exists for.
+    const target = mine ?? replaceable;
+    if (target) {
+      await kv.update(target.key, pendingPayload, target.entry.revision);
+      return true;
+    }
+    await kv.create(key, pendingPayload);
+    return true;
+  };
+
+  const attemptRemedies = async (rounds: number): Promise<"stopped" | "recorded" | null> => {
+    let stopped = false;
+    let recorded = false;
+    // `!recorded` only: a landed stop `break`s out two lines below, so testing
+    // `!stopped` here could never be false. Flagged by CodeQL, and correctly --
+    // the break is what ends that case, and the condition was decoration.
+    for (let attempt = 1; attempt <= rounds && !recorded; attempt++) {
+      try {
+        await stop(workloadId, namespace, platformKey);
+        stopped = true;
+        break;
+      } catch (stopErr) {
+        logger.error(
+          { sessionId, workloadId, attempt, err: (stopErr as Error)?.message ?? String(stopErr) },
+          "dag-handles.pending_register_rollback_stop_failed",
+        );
+      }
+      try {
+        recorded = await recordPending();
+      } catch (kvErr) {
+        logger.error(
+          { sessionId, workloadId, attempt, err: (kvErr as Error)?.message ?? String(kvErr) },
+          "hands.kv.pending_put_after_failed_rollback_failed",
+        );
+        if (attempt < rounds) await sleep(200);
+      }
+    }
+
+    if (stopped) {
+      for (let attempt = 1; attempt <= ROLLBACK_ATTEMPTS; attempt++) {
+        try {
+          await release(workloadId);
+          break;
+        } catch (e) {
+          logger.error(
+            { sessionId, workloadId, attempt, err: (e as Error)?.message ?? String(e) },
+            "dag-handles.pending_register_rollback_release_failed",
+          );
+          if (attempt < ROLLBACK_ATTEMPTS) await sleep(200);
+        }
+      }
+      return "stopped";
+    }
+    return recorded ? "recorded" : null;
+  };
+
+  const outcome = await attemptRemedies(ROLLBACK_ATTEMPTS);
+  if (outcome === "stopped") return outcome;
+
+  // Neither remedy landed in any round: SaFE would not stop it and KV would not
+  // take the record. Nothing durable can be written, because those two ARE the
+  // only durable stores this process has -- so there is no record to leave for
+  // a sweep to find, and the caller is about to throw.
+  //
+  // What the exhausted case has that the caller does not is the workload id, so
+  // it keeps trying in the background. Both of these failures are transient by
+  // hypothesis -- a 503 and an unreachable KV -- and the moment either
+  // dependency comes back, one attempt is enough to either stop the workload or
+  // make it findable. Detached deliberately: the task this belonged to has
+  // already failed and must not wait on a recovery that may never come.
+  //
+  // What this does NOT survive is the process dying inside the retry window, and
+  // it cannot: recording the workload somewhere that outlives the process is
+  // exactly the workload-keyed durable ownership this PR defers.
+  //
+  // A session entry that WAS written does not end it either. `hands.<sessionId>`
+  // is one slot, owned by whichever workload the session is currently creating,
+  // and the next normal pending write takes it back unconditionally -- so a
+  // recovery that recorded W1 and exited left W1 unreferenced again the moment
+  // W2 finished provisioning, with nothing still trying. Only a landed stop
+  // means there is no longer a workload to keep track of.
+  if (!outcome) {
+    logger.error(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_orphaned",
+    );
+  } else {
+    logger.warn(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_recorded_pending_stop",
+    );
+  }
+  const detach = args.deps?.detach ?? ((fn: () => Promise<void>) => { void fn().catch(() => {}); });
+  const delays = args.deps?.retryDelaysMs ?? ORPHAN_RETRY_DELAYS_MS;
+  detach(async () => {
+    for (const delay of delays) {
+      await sleep(delay);
+      const recovered = await attemptRemedies(1);
+      if (recovered === "stopped") {
+        logger.warn(
+          { sessionId, workloadId, outcome: recovered },
+          "dag-handles.pending_register_rollback_orphan_recovered",
+        );
+        return;
+      }
+    }
+    logger.error(
+      { sessionId, workloadId, namespace },
+      "dag-handles.pending_register_rollback_orphan_retry_exhausted",
+    );
+  });
+  return outcome ?? "orphaned";
+}
+
 export async function ensureHands(
   sessionId: string,
   request: ExecuteRequest,
@@ -1482,6 +2194,9 @@ async function ensureHandsAgentSandbox(
     // the agent-sandbox session later.
     await kv.put(handsSessionKey(sessionId), sc.encode(JSON.stringify({
       status: "ready",
+      // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
+      taskId: request.task_id ?? null,
+      dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
       // The key the run lease is actually under -- see the note on the other
       // create path: workspace-gated by default, session only as a fallback.
       runScope: pickLockKey(request),
@@ -1511,12 +2226,16 @@ async function ensureHandsAgentSandbox(
 
     // task-design.md §9.4: publish the handle so downstream DAG nodes with
     // `sandbox.use=<handle>` can re-attach. agent-sandbox has no workload_id,
-    // so carry the provider + agent-sandbox identity for the use path. Failures
-    // are non-fatal -- the DAG falls back to sandbox-per-node semantics.
+    // so carry the provider + agent-sandbox identity for the use path. A
+    // failure here is fatal and tears the sandbox down, as on the SaFE path.
     const dagRoot = request.dag_root_task_id ?? request.task_id;
+    // `replace` for the same reason as the SaFE path above: a rebuilt
+    // agent-sandbox is a new instance under the same handle name, and a create
+    // that refuses it leaves the map naming the instance that was just torn
+    // down.
     if (dagRoot && action.handle) {
       try {
-        await registerDagHandle(dagRoot, action.handle, {
+        await replaceDagHandle(dagRoot, action.handle, {
           workload_id: "",
           provider: "agent-sandbox",
           session_id: inst.id,
@@ -1526,12 +2245,24 @@ async function ensureHandsAgentSandbox(
           hands_url: handsUrl,
           token: handsToken,
           image: workloadImage,
-        });
+        }, { mayTakeFrom: retainedTaker(kv) });
       } catch (e) {
-        logger.warn(
-          { sessionId, dagRoot, handle: action.handle, err: (e as Error).message },
-          "ensureHands.agent.handle_register_failed",
+        // Same reasoning as the SaFE path, rollback included: the sandbox is
+        // created and registered for keepalive by now, so failing the turn
+        // without tearing it down leaves an allocated sandbox nothing refers
+        // to.
+        logger.error(
+          { sessionId, dagRoot, handle: action.handle, sandboxName: inst.sandboxName,
+            err: (e as Error).message },
+          "ensureHands.agent.handle_register_failed_rollback",
         );
+        await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+          logger.error(
+            { sessionId, sandboxName: inst.sandboxName, err: (cleanupErr as Error).message },
+            "ensureHands.agent.handle_register_rollback_failed",
+          );
+        });
+        throw e;
       }
     }
 

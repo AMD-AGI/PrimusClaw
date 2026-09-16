@@ -19,7 +19,7 @@ import {
   sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { listAllDagHandles } from "./handles.js";
+import { listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -185,6 +185,12 @@ interface KeepaliveDeps {
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
   /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
+  /**
+   * Test seam for freeing a released container's DAG handle -- same reason as
+   * `listDagHandles`: it needs JetStream, and a sweep whose release always
+   * throws never releases anything, which is not the behaviour under test.
+   */
+  releaseDagHandles?: (workloadId: string) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
   /**
@@ -448,6 +454,55 @@ async function runRetentionReadPhase(
       if (live.verdict !== "clear") continue;
       // The only irreversible act on this path, and it still happens only after
       // a read that answered `clear`, on this sweep, about this container.
+      // The handle first, the records second, and that order is the recovery.
+      //
+      // The records are what a later registration reads to know the container
+      // was handed over (`mayTakeFrom`). Deleting them first and then failing to
+      // free the handle leaves a handle with no evidence behind it and nothing
+      // that will try again -- the entry is gone from the retention set, so no
+      // later sweep revisits it, and every replacement is refused for the life
+      // of the DAG. Freeing first, a failure leaves the retention standing and
+      // the next sweep runs this again.
+      //
+      // The reverse residue is harmless: a freed handle whose records outlive it
+      // by one sweep is a container that is simply released a sweep later.
+      if (target.inst.id) {
+        try {
+          // Bounded on this side of the call, like every other term in the
+          // phase ceiling: the release scans the whole handle table and then
+          // CASes per handle, and only the enumeration carries a limit of its
+          // own. A deadline here is what keeps the ceiling above a number the
+          // phase can actually exceed.
+          let timer: NodeJS.Timeout;
+          await Promise.race([
+            (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id)
+              .finally(() => clearTimeout(timer)),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(
+                  `dag-handle release exceeded ${HANDLE_RELEASE_CEILING_MS}ms`,
+                )),
+                HANDLE_RELEASE_CEILING_MS,
+              );
+              timer.unref?.();
+            }),
+          ]);
+        } catch (err) {
+          // Caught here, not by the outer handler: this is the one failure on
+          // this path that must leave the retention exactly where it is, and it
+          // is not a failed retention READ. Letting it reach the outer catch
+          // marked the whole sweep incomplete and disturbed the walk's budget
+          // and queue -- six of the roster-tick tests say so.
+          //
+          // The entry keeps its place: the records still stand, so the next
+          // sweep reaches this line again.
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
+            "keepalive.retention_handle_release_failed",
+          );
+          continue;
+        }
+      }
       await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
       released += 1;
     } catch (err) {
@@ -839,7 +894,15 @@ export function markHandsIdle(
   return readHandsEntry(kv, sessionId)
     .then(async (entry): Promise<RunEndedParkResult> => {
       if (!entry) return { outcome: "gone" };
-      const kvKey = entry.key;
+      // A deleted key is not an absent one to `kv.get`: it answers with the
+      // tombstone, whose value is empty. Parsed, that reads as an unreadable
+      // entry -- which the adoption undo reports as an undo that did not
+      // happen, when in fact there is nothing left to park.
+      if (entry.entry.operation === "DEL" || entry.entry.operation === "PURGE") {
+        return { outcome: "gone" };
+      }
+      if (entry.entry.value.length === 0) return { outcome: "gone" };
+      const kvKey = entry.entry.key;
       let info: HandsKvEntry;
       try {
         info = JSON.parse(entry.value) as HandsKvEntry;
@@ -985,6 +1048,22 @@ const BG_VERDICT_WRITE_ATTEMPTS = 64;
  */
 const CENSUS_READ_BUDGET_MS = 15_000;
 /**
+ * The ceiling on freeing a released container's DAG handle.
+ *
+ * This work happens inside the retention read phase, after the read that
+ * answered `clear`, so it lands on the same wall clock the phase's ceiling is
+ * stated over -- and it is a full-table scan plus a CAS per handle, neither of
+ * which the scan's own 10s enumeration limit bounds end to end. Unbounded, a
+ * phase whose stated worst case is `CENSUS_READ_BUDGET_MS +
+ * LIVE_WORK_READ_CEILING_MS` could exceed it, and every span and refresh
+ * interval derived from that number would be wrong by however long the cleanup
+ * took.
+ *
+ * Exceeding it is not a failure of the sweep: the retention records stay, so the
+ * next sweep tries again -- the same recovery a refused CAS already gets.
+ */
+const HANDLE_RELEASE_CEILING_MS = 10_000;
+/**
  * Every retention the last read phase left unread, in the order it deferred
  * them.
  *
@@ -1098,7 +1177,9 @@ export function keepalivePingPhaseCeilingSec(): number {
  * enforced on this side of the call rather than one hoped for.
  */
 export function keepaliveCensusPhaseCeilingSec(): number {
-  return Math.ceil((CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS) / 1000);
+  return Math.ceil(
+    (CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS + HANDLE_RELEASE_CEILING_MS) / 1000,
+  );
 }
 
 /**
@@ -1994,6 +2075,14 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
           namespace: info.namespace,
           userId: info.user_id,
         };
+        // A handle written before its workload can serve anything is not a
+        // ping target. The registration happens as soon as SaFE assigns an id,
+        // so this row can name a workload still queued for a GPU: exec against
+        // it returns a perfectly ordinary 404, which counts as a failure, and
+        // enough sweeps of ordinary queueing then evict a workload that was
+        // never unhealthy. The session-row scan already skips PENDING for the
+        // same reason.
+        if (info.pending) continue;
         const usable = entry.provider === "agent-sandbox"
           ? !!entry.sessionId : !!(entry.workloadId && entry.platformKey);
         if (!usable) continue;

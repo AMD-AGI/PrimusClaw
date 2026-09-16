@@ -37,8 +37,11 @@ import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
-import { stopAllHandlesForDag } from "./sandbox-stopper.js";
-import { handleMap } from "./sandbox-stopper.js";
+// `handleRegistry` is this branch's replacement for the bare `handleMap()`
+// accessor main imported here: same KV bucket, but every read goes through the
+// registry so a lookup can be re-read consistently before a destroy. The only
+// caller in this file is reapOrphanHandles, so the rename is the whole change.
+import { handleRegistry, stopAllHandlesForDag } from "./sandbox-stopper.js";
 import {
   DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
   RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
@@ -1685,25 +1688,81 @@ export async function reapStuckSessions(): Promise<number> {
   return r.rowCount;
 }
 
-/** Reconcile DagHandleMap: drop entries for terminal DAG roots. */
+/**
+ * Reconcile DagHandleMap: drop entries for terminal DAG roots.
+ *
+ * `dropped` counts DAGs reached, which is not a count of sandboxes released --
+ * `stopAllHandlesForDag` reports that separately, and this is the one teardown
+ * path with no caller to report it to. So the sweeps it could not establish a
+ * release for are counted and logged here, because an operator watching for a
+ * leak has nowhere else to look: the per-handle warnings say which stop failed,
+ * but only this says how much of a tick's reconciliation did not land.
+ */
 export async function reapOrphanHandles(): Promise<number> {
-  const all = await handleMap().listAll();
+  const all = await handleRegistry.listAll();
   let dropped = 0;
-  for (const [dagRoot] of all) {
+  let unreleased = 0;
+  for (const [dagRoot, handles] of all) {
+    // Keyed by `task_id` alone, which is the primary key. The old predicate
+    // also demanded `dag_node_id = '__dag_root__'`, and that was not a
+    // narrowing of the same row -- it was a different row for half the
+    // handles here. Brain registers under `dag_root_task_id ?? task_id`
+    // (ensure-hands.ts), so a standalone task owns a handle under its own
+    // task id, and a standalone task's `dag_node_id` is NULL. Every one of
+    // them therefore matched nothing, read as `missing`, and was reaped as an
+    // orphan -- **while it was still running**, tearing the sandbox out from
+    // under a live task. Nothing had ever executed that path, because the
+    // handle map this walks was the wrong bucket until this branch fixed it.
     const r = await db.query(
-      `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      `SELECT status, session_id FROM claw_tasks WHERE task_id = $1`,
       [dagRoot],
     );
-    const status = r.rows[0]?.status ?? "missing";
+    const owner = r.rows[0] as { status?: string; session_id?: string } | undefined;
+    // A row that is absent is an orphan; a row that is present and not
+    // terminal owns its sandbox, whatever shape of task it is.
+    const status = owner?.status ?? "missing";
     if (status === "completed" || status === "failed" || status === "cancelled" || status === "missing") {
-      // We pass the dag root's session id when known; falling back to ""
-      // is safe because safeStopWorkload reads the platform key from the
-      // session and skips when absent.
-      const sess = await db.query(`SELECT session_id FROM claw_tasks WHERE task_id = $1`, [dagRoot]);
-      const sessionId = sess.rows[0]?.session_id ?? "";
-      await stopAllHandlesForDag(dagRoot, sessionId);
+      // The registering task being terminal does not mean the sandbox is idle.
+      // Brain keeps a finished task's pod warm as `hands.<session>` and the
+      // next message in the same session reuses it (`tryReuseSessionSandbox`)
+      // WITHOUT moving the DAG handle's ownership. So T1 completes, T2 picks up
+      // the same workload, and this sweep -- reading only T1 -- stops the
+      // sandbox T2 is running on. No race is needed: the two are sequential,
+      // which is the normal shape of a session.
+      //
+      // Reuse now DOES register the adopting DAG -- but it adds that reference
+      // without removing the creating task's, so this sweep can still reach a
+      // workload through a terminal owner while a live DAG holds it too. The
+      // session is the wider thing the workload actually belongs to, so a
+      // session with live work keeps its sandboxes, and this guard stays
+      // necessary rather than being made redundant by the registration. The cost is a
+      // deferred reap on a busy session; the cost of the alternative is a pod
+      // pulled out from under a running task.
+      const sessionId = owner?.session_id
+        ?? Object.values(handles).find((h) => h.session_id)?.session_id
+        ?? "";
+      if (sessionId) {
+        const live = await db.query(
+          `SELECT 1 FROM claw_tasks
+            WHERE session_id = $1
+              AND status NOT IN ('completed','failed','cancelled')
+            LIMIT 1`,
+          [sessionId],
+        );
+        if ((live.rowCount ?? 0) > 0) {
+          logger.info({ dagRoot, sessionId }, "sweeper.orphan_handles_session_live");
+          continue;
+        }
+      }
+      // The owner's session id when known; falling back to "" is safe because
+      // safeStopWorkload reads the platform key from the session and skips
+      // when absent.
+      if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
       dropped++;
     }
+  }
+  if (unreleased > 0) {
+    logger.warn({ dropped, unreleased }, "sweeper.orphan_handles_unreleased");
   }
   return dropped;
 }

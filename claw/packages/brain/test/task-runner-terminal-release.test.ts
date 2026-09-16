@@ -85,10 +85,14 @@ safe.unref();
 // root has no default, so without it a multi-node run is refused before it can
 // reach the release this file is about.
 process.env.SAFE_API_URL = `http://127.0.0.1:${(safe.address() as AddressInfo).port}`;
+// The lock-renewal tick is what brings the news that the lease is gone, and R10
+// is about what that tick records -- so it has to really run. 1s is the floor
+// the config enforces (MIN_RENEWAL_INTERVAL_MS).
+process.env.LOCK_REFRESH_INTERVAL_MS = "1000";
 
 const { bindTaskRunnerDeps, runHandleTask } = await import("../src/tasks/runner.js");
 const { AgentDoneDeliveryError } = await import("../src/tasks/callback.js");
-const { activeAbort, RUN_ROW_TERMINAL_ABORT_REASON } =
+const { activeAbort, RUN_ROW_TERMINAL_ABORT_REASON, LEASE_LOST_ABORT_REASON } =
   await import("../src/tasks/abort-registry.js");
 
 /**
@@ -195,10 +199,22 @@ function stubSideEffects(
   };
 }
 
+let abortDuringHandlerCtrl: AbortController | null = null;
+
 interface Scenario {
   request: ExecuteRequest;
   /** Set before the run, the way a refused lease renewal sets it mid-run. */
   abortReason?: unknown;
+  /**
+   * Set from inside the retryable-failure handler, which is where the heartbeat
+   * actually aborts: after the dispatch that routes an already-aborted run
+   * elsewhere, and before the reap.
+   */
+  abortDuringHandler?: unknown;
+  /** Run inside the retryable-failure handler, before the reap. */
+  onHandlerEntered?: () => Promise<void>;
+  /** Run inside the terminal handler, before the cluster is released. */
+  onTerminal?: () => Promise<void>;
   nakThrows?: boolean;
   ackThrows?: boolean;
   sideEffects?: Partial<TaskRunnerSideEffects>;
@@ -212,7 +228,26 @@ async function run(scenario: Scenario) {
     ackThrows: scenario.ackThrows,
   });
   const kv = fakeKv();
-  const sideEffects = stubSideEffects(scenario.sideEffects);
+  const sideEffects = stubSideEffects({
+    ...("abortDuringHandler" in scenario || scenario.onHandlerEntered
+      ? {
+        markRetryPending: (async () => {
+          safeCalls.push("markRetryPending");
+          abortDuringHandlerCtrl?.abort(scenario.abortDuringHandler);
+          if (scenario.onHandlerEntered) await scenario.onHandlerEntered();
+        }) as never,
+      }
+      : {}),
+    ...(scenario.onTerminal
+      ? {
+        postAgentDone: (async () => {
+          safeCalls.push("postAgentDone");
+          await scenario.onTerminal!();
+        }) as never,
+      }
+      : {}),
+    ...scenario.sideEffects,
+  });
   const engine: Engine = {
     async execute() {
       safeCalls.push("engine.execute");
@@ -226,6 +261,7 @@ async function run(scenario: Scenario) {
   });
 
   const abortCtrl = new AbortController();
+  abortDuringHandlerCtrl = abortCtrl;
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
   if ("abortReason" in scenario) abortCtrl.abort(scenario.abortReason);
@@ -357,4 +393,203 @@ test("R6 a batch node hands the cluster back before it reaps its shells", async 
   assert.ok(released >= 0, "a multi-node message owes its cluster back");
   assert.ok(reaped >= 0, "and a finished batch node owes its background shells");
   assert.ok(released < reaped, `the cluster goes first, in: ${calls.join(" -> ")}`);
+});
+
+test("R9 an attempt that lost its lease does not reap the new attempt's workload", async () => {
+  // Round 33. The pending entry records the task that wrote it, which keeps a
+  // failing task off a SIBLING DAG's workload -- but it cannot separate two
+  // ATTEMPTS of the same task. A delivery whose lease expires is redelivered
+  // under the same task_id, so the new attempt's entry carries exactly the
+  // identity the old attempt compares against, and the old one stops a workload
+  // the new one is using. Reproduced with both holders acquiring, the real
+  // heartbeat aborting the first, and `stopSawReady=true`.
+  //
+  // The lease goes at the moment the heartbeat notices, which is INSIDE the
+  // failure handler -- past the dispatch that would have routed an
+  // already-aborted run to the interrupt branch. So this aborts from
+  // `markRetryPending`, which is where that handler sits when the heartbeat
+  // fires, rather than before the run: setting it up front tests the interrupt
+  // path, which never reaches the reaper at all and passes with the guard
+  // deleted.
+  const lost = await run({
+    request: { session_id: SESSION, task_id: "t-redelivered", prompt: "go" } as ExecuteRequest,
+    engineBehavior: async () => { throw new Error("503 from upstream"); },
+    abortDuringHandler: LEASE_LOST_ABORT_REASON,
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("markRetryPending"), "the handler really did run");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "the workload it would reap belongs to whoever took the lock");
+
+  // Any other failure still reaps -- that is what the function is for.
+  const kept = await run({
+    request: { session_id: SESSION, task_id: "t-plain", prompt: "go" } as ExecuteRequest,
+    engineBehavior: async () => { throw new Error("503 from upstream"); },
+  });
+  await kept.settled;
+  assert.ok(safeCalls.includes("reapPendingHands"),
+    "a task that still holds its lock cleans up after itself");
+});
+
+test("R10 a lease lost after an ordinary abort is still not forgotten", async () => {
+  // Round 35. The only trace of a lost lease was the abort REASON -- and that
+  // slot is taken by whoever aborts first. A run interrupted normally and THEN
+  // superseded recorded nothing: the heartbeat saw `renewal=lost`, found the
+  // signal already aborted, and returned. Teardown read the successor's entry,
+  // asked whether it still held the lock, and was told yes -- reproduced as
+  // `renewal=lost` with `callbackValue=true`, ending in `stop(successor-W2)`.
+  //
+  // The renewal that brings the news is IN FLIGHT when the heartbeat timer is
+  // cleared: it was issued during the run and resolves while the failure
+  // handler is already going. That is what this models -- a renewal held open
+  // until the handler is running, then answering "lost".
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const lost = await run({
+    request: {
+      session_id: SESSION, task_id: "t-superseded", prompt: "go",
+      // Without a lease there is no heartbeat, and no heartbeat is the one
+      // thing this test cannot stub away.
+      run_lease: { url: "http://api.test/v1/internal/tasks/t-superseded/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));  // long enough for one tick
+      throw new Error("503 from upstream");
+    },
+    // The interrupt lands first and takes the abort reason; the lock has
+    // already moved, and the renewal is about to say so.
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      postRunLease: (async () => ({ status: "ok" })) as never,
+      refreshTaskLock: (async () => {
+        safeCalls.push("refreshTaskLock");
+        await answered;
+        return "lost";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();                                     // the renewal answers "lost"
+      await new Promise((r) => setTimeout(r, 50));   // let its .then run
+    },
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("refreshTaskLock"), "the heartbeat has to have ticked");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "an abort for another reason must not hide the lock having moved");
+});
+
+test("R11 a run superseded after an ordinary abort is not forgotten either", async () => {
+  // Round 36. The same news arrives by two roads -- the lock renewal saying
+  // `lost`, and the run-row lease saying `superseded` -- and fixing only the
+  // first left the second swallowed by any earlier abort, exactly as before:
+  // `leaseAnswer=superseded, callbackValue=true, stoppedWhileReady=true`.
+  //
+  // `gone` is deliberately not the same: the row went terminal and nobody took
+  // over, so this worker is still the one holding the sandbox.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const lost = await run({
+    request: {
+      session_id: SESSION, task_id: "t-superseded-row", prompt: "go",
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));
+      throw new Error("503 from upstream");
+    },
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "superseded";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await lost.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.equal(safeCalls.includes("reapPendingHands"), false,
+    "another worker holds this run, so its workload is not ours to reap");
+});
+
+test("R12 a row that went terminal is still this worker's to clean up", async () => {
+  // The other half of R11, and the reason `refused` is not the condition.
+  // `gone` means the row went terminal with nobody taking over -- this worker
+  // is still the one holding the sandbox and the delivery, so it must still
+  // reap what it left behind. Treating it like `superseded` would leak the
+  // workload instead of mis-stopping one, which is a different bug, not a
+  // safer one.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const terminal = await run({
+    request: {
+      session_id: SESSION, task_id: "t-row-gone", prompt: "go",
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    } as ExecuteRequest,
+    engineBehavior: async () => {
+      await new Promise((r) => setTimeout(r, 1300));
+      throw new Error("503 from upstream");
+    },
+    abortDuringHandler: new Error("cancelled by user"),
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "gone";
+      }) as never,
+    },
+    onHandlerEntered: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await terminal.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.ok(safeCalls.includes("reapPendingHands"),
+    "nobody took this run over, so its half-created workload is still ours");
+});
+
+test("R13 a superseded attempt does not delete the cluster its successor adopted", async () => {
+  // Round 37. The sandbox teardown correctly refused -- and then the terminal
+  // handler went on to release the cluster anyway. The cluster is addressed by
+  // messageId, and a successor that takes the run over ADOPTS it under that
+  // same id, so the observed sequence was `hands.destroy_skipped_not_owned`
+  // followed by `DELETE /api/v1/workloads/M` against a Running, adopted
+  // cluster.
+  //
+  // One rule, asked everywhere something irreversible happens -- including a
+  // layer above the one the last two rounds were about.
+  let release: () => void = () => {};
+  const answered = new Promise<void>((r) => { release = r; });
+  const superseded = await run({
+    request: {
+      ...multiNodeRequest("t-cluster-superseded"),
+      run_lease: { url: "http://api.test/v1/internal/tasks/t/lease", token: "tok" },
+    },
+
+    sideEffects: {
+      refreshTaskLock: (async () => "ok") as never,
+      postRunLease: (async () => {
+        safeCalls.push("postRunLease");
+        await answered;
+        return "superseded";
+      }) as never,
+    },
+    // The lease answers while the terminal handler is already running, which is
+    // after the dispatch that would otherwise route an aborted run elsewhere.
+    onTerminal: async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+    },
+  });
+  await superseded.settled;
+  assert.ok(safeCalls.includes("postRunLease"), "the run-row heartbeat has to have ticked");
+  assert.equal(safeCalls.includes(RELEASE_CALL), false,
+    "the successor is running on that cluster");
 });

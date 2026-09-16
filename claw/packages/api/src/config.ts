@@ -217,6 +217,12 @@ export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
 export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const BRAIN_CHECKPOINTS_REPLICAS = envInt("BRAIN_CHECKPOINTS_REPLICAS", NATS_REPLICAS, { min: 1 });
 export const SYSTEM_ENV_REPLICAS = envInt("SYSTEM_ENV_REPLICAS", NATS_REPLICAS, { min: 1 });
+// Mirrors brain/src/config.ts, which names the same env var for the same
+// bucket. Either side may create DAG_HANDLES, and only this side reconciles
+// it, so a disagreement is not permanent: api corrects the bucket once and a
+// later brain restart attaches without restoring its own value. They still
+// have to agree, or the bucket brain creates on a fresh cluster is wrong until
+// api first reconciles it.
 // The two streams, which had no replica setting at all and so were created at
 // the JetStream default of 1. A single-replica stream lives on exactly one
 // server: when that server's pod went away on 2026-09-01 nothing was hosting
