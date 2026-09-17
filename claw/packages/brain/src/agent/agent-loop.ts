@@ -1929,7 +1929,7 @@ class AgentLoopRunner {
         // and the delivery is acked, which is how a classified-retryable race
         // became a permanent task failure on the default path while the eager
         // path naked correctly. See brain/src/agent/attach-error.ts.
-        if (err?.name === "SandboxAttachError" && isRetryable(err.cause)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err)) throw err.cause;
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be
@@ -1984,6 +1984,50 @@ class AgentLoopRunner {
         description: resultText.slice(0, 2000),
       });
       resultByToolId.set(toolId, resultText);
+  }
+
+  /**
+   * Whether a failed sandbox open may be rethrown to end this delivery.
+   *
+   * Two conditions, and the second is the one that cost a P1.
+   *
+   * It has to be an open that failed for a reason already judged worth another
+   * delivery -- `SandboxAttachError` around a cause `isRetryable` accepts. A
+   * tool that RAN and failed is a tool result, however transient its error.
+   *
+   * And nothing in this run may have executed yet. A rethrow leaves this
+   * function before the turn's results are appended to `workingMessages`, so
+   * the redelivery re-runs the turn from its start -- including any tool that
+   * already completed. For a `read` that is waste; for an MCP call that wrote
+   * to something outside this process it is a second write, and measured as
+   * one: an external append ran once on the eager path and twice through a nak
+   * here. The eager path is safe for precisely this reason and not by luck --
+   * it opens the sandbox before any tool has run, so there is nothing to
+   * repeat.
+   *
+   * `totalToolCalls` is incremented before the call it counts, so 1 is "this
+   * one, and nothing before it". It also carries across a redelivery from the
+   * checkpoint, which keeps a resumed run on the conservative side: the work
+   * behind that count is in the recovered history and must not be re-run.
+   *
+   * The cost of being wrong either way decides where the line sits. Refusing a
+   * rethrow loses a redelivery, and the model is told the sandbox could not be
+   * opened -- the behaviour that shipped before any of this. Allowing one
+   * wrongly repeats a side effect that has already left the process, which
+   * nothing downstream can undo.
+   */
+  private mayRethrowOpenFailure(err: unknown): boolean {
+    const e = err as { name?: string; cause?: unknown } | null;
+    if (e?.name !== "SandboxAttachError") return false;
+    if (!isRetryable(e.cause)) return false;
+    if (this.totalToolCalls > 1) {
+      logger.warn(
+        { sessionId: this.sessionId, totalToolCalls: this.totalToolCalls },
+        "sandbox.open_retryable_but_turn_has_run_tools",
+      );
+      return false;
+    }
+    return true;
   }
 
   private async runTaskTool(
@@ -2071,6 +2115,11 @@ class AgentLoopRunner {
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";
       } catch (err: any) {
+        // Same question as the ordinary tool path, and the same answer: a
+        // `task` whose sandbox never opened did not run a sub-agent, and the
+        // open is reached from here too (`attachHands` above) for a turn whose
+        // first tool is a `task`.
+        if (this.mayRethrowOpenFailure(err)) throw err.cause;
         resultText = `Error: ${err?.message || String(err)}`;
       this.errorCount++;
       logger.warn({ err, subagentId, depth: this.depth, sessionId: this.sessionId }, "sub-agent.failed");

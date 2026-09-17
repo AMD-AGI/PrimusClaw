@@ -212,6 +212,15 @@ export function isRetryable(err: unknown): boolean {
   // ACKED it, and an acked delivery does not come back. Pinned in
   // brain/test/gone-handle-release-contention.test.ts, which runs the real
   // runner over the real release and asserts on the ack/nak alone.
+  // Unwrapped first, because the same failure arrives here wearing two shapes.
+  // `SandboxAttachError` (brain/src/agent/attach-error.ts) tags a sandbox open
+  // that failed, and the tag replaces the class name this function matches on.
+  // The open happens at several points -- marketplace tool installs, plugin
+  // resolution and pre-run hooks all call `sandbox()` before the agent loop
+  // starts, and those propagate straight here with no loop to unwrap them. A
+  // wrapper that made a previously-retryable contention terminal would be a
+  // regression introduced by the tagging itself.
+  if (e?.name === "SandboxAttachError" && e?.cause) return isRetryable(e.cause);
   if (e?.name === "DagHandleContendedError") return true;
   // The same redelivery for a release that never reached the table:
   // `DagHandleScanTimeoutError` (brain/src/sandbox/errors.ts), the enumeration
