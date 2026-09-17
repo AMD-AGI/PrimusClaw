@@ -121,6 +121,8 @@ function stubEffects(
   retained: string[];
   /** The session keys a retention released, which is the binding it unbound. */
   retainedKeys: string[];
+  /** One entry per `releaseHandlesForWorkload` call the path made. */
+  released: string[];
 } {
   const destroyed: string[] = [];
   const released: string[] = [];
@@ -158,7 +160,7 @@ function stubEffects(
       return "retained";
     },
   });
-  return { destroyed, registered, restartCalls, retained, retainedKeys };
+  return { destroyed, registered, restartCalls, retained, retainedKeys, released };
 }
 
 /** The session ids passed to `registerSandbox`, for the cases that only count. */
@@ -1097,4 +1099,65 @@ test("a retention whose handle release fails still retains the container", async
 
   assert.equal(await tryReuseSessionSandbox(a), null, "a failed release must not fail the turn");
   assert.deepEqual(order, ["retain"], "the container keeps the reference that replaced its handle");
+});
+
+test("a gone container is released rather than retained when the live gate cannot answer", async () => {
+  // The pair that cannot both be honoured: the provider has confirmed the
+  // workload is absent, and the record-derived gate answers anything but
+  // `clear`. It is not a rare pair -- it is the ONLY one a gone container can
+  // produce, because `countLiveWork` has to reach the container to answer and
+  // gets `unknown` from one that is not there.
+  //
+  // Retaining on `unknown` is right for a container that is merely unreachable
+  // and wrong for one that is absent: there is no work to protect and no stop
+  // to protect it from, and `runRetentionReadPhase` re-runs that same
+  // unanswerable read every sweep and reads `unknown` too, for ever. With
+  // SANDBOX_SWEEPER_EVICT_AFTER_FAILURES and SANDBOX_KEEPALIVE_FAIL_LIMIT both
+  // defaulting to 0 nothing else removes it, so the record outlives everything
+  // that could release it while counting against the keepalive ceiling live
+  // sandboxes need room in.
+  //
+  // The `entryOwnedByAnother` branch has asked this question since it was
+  // written. This asserts it for the path that reaches the retention without
+  // going through that branch -- which a release of this function's own can
+  // produce: `releaseHandlesForWorkload` walks one DAG row at a time with no
+  // transaction over the set, so a release that frees a sibling's name and then
+  // exhausts its CAS attempts on its own row throws with the first deletion
+  // already durable, and the redelivery re-runs this path against a table where
+  // the sibling reference is gone.
+  const { destroyed, retained, released } = stubEffects("dead", true, undefined, "unknown");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(retained, [], "a container that is not there gets no retention record");
+  assert.equal(released.length > 0, true, "its handles are freed instead");
+  assert.deepEqual(destroyed, [], "and nothing is stopped: there is nothing to stop");
+});
+
+test("an unreachable container is still retained", async () => {
+  // The other side of the same line, and the reason the check sits where it
+  // does rather than earlier. `unknown` from the probe is not `dead`: the
+  // container may be running with work in it that nothing can currently see,
+  // which is exactly what a retention is for. A fix that read "unknown live
+  // work means release" would destroy the protection it was meant to keep.
+  const { retained } = stubEffects("unknown", true, undefined, "unknown");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  await assert.rejects(() => tryReuseSessionSandbox(a), /container state is unknown/);
+  assert.deepEqual(retained, [], "this path refuses before it decides anything");
+});
+
+test("a gone container with a clear gate is still destroyed", async () => {
+  // The teardown a gone container needs as much as a live one: the entry has to
+  // be cleaned up. The release check is placed AFTER this branch for that
+  // reason -- it is not "skip the teardown for gone containers".
+  const { destroyed, retained } = stubEffects("dead", true, undefined, "clear");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "the entry cleanup still happens");
+  assert.deepEqual(retained, []);
 });

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { ToolRouter } from "../tools/router.js";
+import { isRetryable } from "../infra/retry.js";
 import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
   SUB_AGENT_MAX_TURNS, SUB_AGENT_MAX_CONCURRENT, SUB_AGENT_MAX_DEPTH,
@@ -1920,6 +1921,15 @@ class AgentLoopRunner {
           "tool.result",
         );
       } catch (err: any) {
+        // Before anything else, because this one is not a tool result at all.
+        // The lazy sandbox open happens inside this `try`, and an open that
+        // failed for a reason already judged worth a redelivery has to reach
+        // the task runner as a thrown error -- the runner is the only place
+        // that can nak. Rendered as text instead, it ends the turn normally
+        // and the delivery is acked, which is how a classified-retryable race
+        // became a permanent task failure on the default path while the eager
+        // path naked correctly. See brain/src/agent/attach-error.ts.
+        if (err?.name === "SandboxAttachError" && isRetryable(err.cause)) throw err.cause;
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be

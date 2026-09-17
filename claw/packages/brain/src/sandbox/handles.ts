@@ -24,7 +24,7 @@ import {
 } from "@claw/protocol";
 import { natsKvStore, type NatsLikeKv } from "@claw/utils";
 import { DAG_HANDLES_REPLICAS } from "../config.js";
-import { DagHandleContendedError } from "./errors.js";
+import { DagHandleContendedError, DagHandleScanTimeoutError } from "./errors.js";
 import pino from "pino";
 
 const logger = pino({ name: "dag-handles" });
@@ -325,7 +325,14 @@ export async function workloadHeldByOtherDag(
     getMap().listAll().finally(() => clearTimeout(timer)),
     new Promise<never>((_, reject) => {
       timer = setTimeout(
-        () => reject(new Error(`dag-handles holder scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
+        // Same class as the release scan below, because it is the same
+        // statement -- the store did not answer in time -- and nothing about
+        // which question was being asked changes what the next read can
+        // return. Only the release path's caller consults `isRetryable`; this
+        // one is reached from the keepalive sweep, which has its own handling.
+        // The class is shared so the two cannot drift into disagreeing about
+        // what a timeout means.
+        () => reject(new DagHandleScanTimeoutError(`dag-handles holder scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
         RELEASE_SCAN_TIMEOUT_MS,
       );
       timer.unref?.();
@@ -588,7 +595,7 @@ export async function releaseHandlesForWorkload(
     getMap().listAll().finally(() => clearTimeout(timer)),
     new Promise<never>((_, reject) => {
       timer = setTimeout(
-        () => reject(new Error(`dag-handles release scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
+        () => reject(new DagHandleScanTimeoutError(`dag-handles release scan exceeded ${RELEASE_SCAN_TIMEOUT_MS}ms`)),
         RELEASE_SCAN_TIMEOUT_MS,
       );
       timer.unref?.();

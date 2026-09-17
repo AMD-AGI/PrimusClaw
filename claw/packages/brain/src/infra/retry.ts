@@ -202,17 +202,28 @@ export function isRetryable(err: unknown): boolean {
   // someone reworks a sentence.
   //
   // Narrow on purpose. This is not "the handle layer is retryable": the same
-  // function still raises an ordinary Error for an unbound bucket, a scan that
-  // overran its ceiling, and a row that does not parse, and every one of those
-  // still fails the task. The one case that earns a redelivery is the one where
-  // a second read can return something different -- the row moved because
-  // another task wrote it -- rather than the same bytes again.
+  // function still raises an ordinary Error for an unbound bucket and for a row
+  // that does not parse, and both of those still fail the task. The cases that
+  // earn a redelivery are the ones where a second read can return something
+  // different -- the row moved because another task wrote it, or no read
+  // happened at all -- rather than the same bytes again.
   //
   // Before this line, five lost conditional writes reported the task failed and
   // ACKED it, and an acked delivery does not come back. Pinned in
   // brain/test/gone-handle-release-contention.test.ts, which runs the real
   // runner over the real release and asserts on the ack/nak alone.
   if (e?.name === "DagHandleContendedError") return true;
+  // The same redelivery for a release that never reached the table:
+  // `DagHandleScanTimeoutError` (brain/src/sandbox/errors.ts), the enumeration
+  // overran its ceiling. Grouped here rather than with the permanent failures
+  // because of what the next read can return, which is the same test the line
+  // above applies: a timeout produced no answer and forecloses nothing, and it
+  // was measured to clear -- a release that failed at ~10s under an injected
+  // enumeration delay completed in 2.89ms once the delay lifted. The earlier
+  // round left this terminal on the grounds that the store had failed; the
+  // busy bucket that overruns a scan is the same one that loses a CAS race, so
+  // that grouping denied a second delivery to the case most likely to need it.
+  if (e?.name === "DagHandleScanTimeoutError") return true;
   // Legacy / undici / NATS string matches.
   if (msg.includes("503") || msg.includes("502") || msg.includes("429")) return true;
   if (msg.includes("econnrefused") || msg.includes("econnreset") || msg.includes("etimedout")) return true;

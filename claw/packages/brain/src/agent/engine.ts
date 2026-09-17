@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import fs from "node:fs";
+import { attachOrWrap } from "./attach-error.js";
 import os from "node:os";
 import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
@@ -96,7 +97,10 @@ export class AgentEngine {
     const sandbox = async (): Promise<HandsClient> => {
       if (attached) return attached;
       if (!attach) throw new Error("HandsClient is required for the agent engine");
-      attached = await attach();
+      // Wrapped, not caught: the open still fails the tool call. The wrapper
+      // only preserves WHICH failure it was across the `catch` in `agent-loop`
+      // that would otherwise flatten it to a string -- see SandboxAttachError.
+      attached = await attachOrWrap(attach);
       return attached;
     };
     if (!attached && !attach) {

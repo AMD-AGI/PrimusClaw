@@ -524,14 +524,13 @@ async function recoverOrRetainUnusableSandbox(
     // named identity is `exec_sandbox_gone`, which for a safe-workload sandbox
     // the provider only reports after independently confirming the workload is
     // absent. Retaining anyway is not the safe direction here, it is a record
-    // nothing can ever release -- `countLiveWork` has to reach the container to
-    // answer, so the hand-over reads `unknown` and retains, and
-    // `runRetentionReadPhase` re-runs that same read every sweep and reads
-    // `unknown` too, for ever. With SANDBOX_SWEEPER_EVICT_AFTER_FAILURES and
-    // SANDBOX_KEEPALIVE_FAIL_LIMIT both defaulting to 0, nothing else in the
-    // fleet removes it either: the entry stays in the census, is pinged and
-    // queried every sweep, and counts against the keepalive target ceiling that
-    // live sandboxes need room in.
+    // nothing can ever release -- `countLiveWork` has to reach the container to answer, so the
+    // hand-over reads `unknown` and retains, and `runRetentionReadPhase`
+    // re-runs that same read every sweep and reads `unknown` too, for ever.
+    // With SANDBOX_SWEEPER_EVICT_AFTER_FAILURES and SANDBOX_KEEPALIVE_FAIL_LIMIT
+    // both defaulting to 0, nothing else in the fleet removes it either: the
+    // entry stays in the census, is pinged and queried every sweep, and counts
+    // against the keepalive target ceiling that live sandboxes need room in.
     if (containerGone) {
       await releaseHandlesForGoneWorkload(sessionId, info);
       return null;
@@ -542,6 +541,42 @@ async function recoverOrRetainUnusableSandbox(
   const live = await mayDestroy(sessionId, identity, signal);
   if (live.verdict === "clear") {
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    return null;
+  }
+  // Between `clear` and the retention, and only here: a verdict that is not
+  // `clear` over a container the provider has already reported absent.
+  //
+  // The other two outcomes keep their handling. `clear` still destroys, which
+  // is the entry cleanup a gone container needs as much as a live one -- this
+  // branch is not "skip the teardown for gone containers", it is placed after
+  // the teardown for exactly that reason. And a container that is merely
+  // unreachable still retains, because unreachable is not absent.
+  //
+  // What this catches is the pair that cannot both be honoured: gone, and a
+  // verdict that is not `clear`. It is not a rare pair, it is the ONLY one a
+  // gone container can produce, since `countLiveWork` has to reach the
+  // container to answer and gets `unknown` from one that is not there. The
+  // retention it would otherwise write is a record nothing can ever release:
+  // `runRetentionReadPhase` re-runs that same unanswerable read every sweep and
+  // reads `unknown` too, for ever, while SANDBOX_SWEEPER_EVICT_AFTER_FAILURES
+  // and SANDBOX_KEEPALIVE_FAIL_LIMIT both default to 0 so nothing else in the
+  // fleet removes it. The identical argument is made at the `entryOwnedByAnother`
+  // branch above, which has had this check since it was written; this is the
+  // same conclusion for the path that reaches the retention without going
+  // through that branch.
+  //
+  // Reachable from this function's own releases, not only from an unrelated
+  // race. `releaseHandlesForWorkload` walks one DAG row at a time, each row its
+  // own conditional write, with no transaction over the set: a release that
+  // frees a sibling's name and then exhausts its CAS attempts on this DAG's row
+  // throws with the first deletion already durable. The redelivery that
+  // `DagHandleContendedError` now earns re-runs this path against a table where
+  // the sibling reference is gone, so `entryOwnedByAnother` answers false on the
+  // retry where it answered true on the attempt -- and the branch that knew
+  // about `containerGone` is the one no longer taken. The retry added in this
+  // same change is what made the gap reachable by an ordinary sequence.
+  if (containerGone) {
+    await releaseHandlesForGoneWorkload(sessionId, info);
     return null;
   }
   await retainInsteadOfDestroying(kv, sessionId, info, live, binding);
@@ -1002,9 +1037,10 @@ async function retainInsteadOfDestroying(
  * into the same row -- satisfied none of its conditions. So the turn was
  * reported failed and the delivery ACKED, which ends the task for good.
  * `releaseHandlesForWorkload` now raises that one case as
- * `DagHandleContendedError` and `isRetryable` naks it; a row that cannot be
- * read, a bucket that is not bound and a scan that overran still end the task,
- * which is what they should do. Pinned in
+ * `DagHandleContendedError` and `isRetryable` naks it, and a scan that overran
+ * its ceiling as `DagHandleScanTimeoutError`, which is naked for the same
+ * reason -- it produced no read at all. A row that cannot be read and a bucket
+ * that is not bound still end the task, which is what they should do. Pinned in
  * brain/test/gone-handle-release-contention.test.ts.
  *
  * The decision, the irreversible act, and the gap between them, since every

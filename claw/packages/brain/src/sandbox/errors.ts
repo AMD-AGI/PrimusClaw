@@ -140,9 +140,11 @@ export class SandboxExecRouteUnavailableError extends Error {
  * attempts-exhausted throw.
  *
  * What it is NOT: a blanket "the handle layer failed, try again". An unbound
- * bucket, a scan that overran its ceiling, a row that does not parse and a
- * transport error out of the store all still leave this module as ordinary
- * errors and are still judged on their own terms. The line between them is not
+ * bucket, a row that does not parse and a transport error out of the store all
+ * still leave this module as ordinary errors and are still judged on their own
+ * terms. (A scan that overran its ceiling was on that list until it was
+ * measured; it now raises `DagHandleScanTimeoutError` and is retried. See
+ * below.) The line between them is not
  * a guess about how long anything takes -- no claim is made here about how
  * quickly contention clears, and none has been measured. It is about what the
  * next read can possibly return. A row that is not a JSON object returns the
@@ -161,5 +163,35 @@ export class DagHandleContendedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DagHandleContendedError";
+  }
+}
+
+/**
+ * A release that never got to look at the table: enumerating `DAG_HANDLES`
+ * overran `RELEASE_SCAN_TIMEOUT_MS`.
+ *
+ * Separate from `DagHandleContendedError` because it is a different statement
+ * -- that one is "the row moved", this one is "the store did not answer in
+ * time" -- but it earns the same redelivery, and for the reason that class's
+ * docstring gives for drawing the line where it does: what can the next read
+ * possibly return. A scan that timed out returns nothing at all, and says
+ * nothing about whether the next one will; the store was slow for ten seconds,
+ * which is a statement about a moment rather than about the data. Measured on
+ * the real bucket: with a 10.5s enumeration delay injected the release failed
+ * at ~10,005ms and the task was acked; with the delay lifted the SAME release
+ * completed in 2.89ms.
+ *
+ * That measurement is also why this is not left to the ordinary `Error` it used
+ * to be. The previous round reasoned that a timeout was "the store failing" and
+ * grouped it with an unparseable row -- but an unparseable row hands every
+ * reader the same bytes until something rewrites it, and a slow store does not.
+ * The busy bucket that makes a scan overrun is the same busy bucket that makes
+ * a CAS race likely, so the one condition that most needs a second delivery was
+ * the one being denied it.
+ */
+export class DagHandleScanTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DagHandleScanTimeoutError";
   }
 }
