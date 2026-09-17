@@ -474,8 +474,16 @@ async function recoverOrRetainUnusableSandbox(
   );
 
   // MCP liveness does not determine whether the container and its work may be destroyed.
+  //
+  // `containerGone` is the one thing carried out of the recovery, and it is
+  // carried because the two ways it can fail are opposites. A refused restart
+  // leaves a container that is still there with the user's shells in it; a
+  // `dead` probe is the provider's own answer that the workload no longer
+  // exists. Collapsing both into "recovery did not happen" is what had the
+  // hand-over below take a retention over a container nothing can reach.
+  let containerGone = false;
   if (!health.ok && hasToken) {
-    const recovered = await recoverUnhealthyReuse(
+    const recovery = await recoverUnhealthyReuse(
       kv,
       sessionId,
       info,
@@ -483,7 +491,8 @@ async function recoverOrRetainUnusableSandbox(
       binding,
       signal,
     );
-    if (recovered) return recovered;
+    if (recovery.outcome === "reused" && recovery.result) return recovery.result;
+    containerGone = recovery.outcome === "gone";
   }
 
   // Two separate questions, and destroying needs both answered. `mayDestroy`
@@ -509,6 +518,27 @@ async function recoverOrRetainUnusableSandbox(
     // one whose shells nothing else can report. The read that decides is
     // `countLiveWork` over the exec channel rather than over Hands, precisely
     // so that it can answer while Hands is what is down.
+    //
+    // Unless the probe above already established that there is no container. A
+    // retention protects work from a stop, and there is neither: `dead` over a
+    // named identity is `exec_sandbox_gone`, which for a safe-workload sandbox
+    // the provider only reports after independently confirming the workload is
+    // absent. Retaining anyway is not the safe direction here, it is a record
+    // nothing can ever release -- `countLiveWork` has to reach the container to
+    // answer, so the hand-over reads `unknown` and retains, and
+    // `runRetentionReadPhase` re-runs that same read every sweep and reads
+    // `unknown` too, for ever. With SANDBOX_SWEEPER_EVICT_AFTER_FAILURES and
+    // SANDBOX_KEEPALIVE_FAIL_LIMIT both defaulting to 0, nothing else in the
+    // fleet removes it either: the entry stays in the census, is pinged and
+    // queried every sweep, and counts against the keepalive target ceiling that
+    // live sandboxes need room in.
+    if (containerGone) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId ?? null },
+        "ensureHands.displaced_sandbox_already_gone",
+      );
+      return null;
+    }
     await retainDisplacedSandbox(attempt, info, identity, binding, "unhealthy_rebuild");
     return null;
   }
@@ -521,6 +551,24 @@ async function recoverOrRetainUnusableSandbox(
   return null;
 }
 
+/**
+ * What the unhealthy-reuse recovery leaves the caller to do.
+ *
+ * Three answers rather than the two a nullable result could carry, and the
+ * third is the point: `gone` and `rebuild` both end with the caller building a
+ * replacement, but they are opposite statements about the container it is
+ * replacing. `rebuild` is a container that is still there -- the probe reached
+ * it -- whose Hands this deployment will not restart in place. `gone` is the
+ * provider saying the workload does not exist. Every question a later step asks
+ * about what is running inside it can be answered in the first case and in the
+ * second cannot be answered by anything, ever, which is why the two must not
+ * arrive here as the same `null`.
+ */
+type UnhealthyRecovery =
+  | { outcome: "reused"; result: EnsureHandsResult | null }
+  | { outcome: "gone" }
+  | { outcome: "rebuild" };
+
 async function recoverUnhealthyReuse(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -528,9 +576,9 @@ async function recoverUnhealthyReuse(
   identity: SandboxEntry,
   binding: HandsBinding,
   signal?: AbortSignal,
-): Promise<EnsureHandsResult | null> {
+): Promise<UnhealthyRecovery> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
-  if (probe.verdict === "dead") return null;
+  if (probe.verdict === "dead") return { outcome: "gone" };
   if (probe.verdict === "unknown") {
     logger.warn(
       { sessionId, handsUrl: info.handsUrl, verdict: probe.verdict, reason: probe.reason },
@@ -562,7 +610,7 @@ async function recoverUnhealthyReuse(
         { sessionId, handsUrl: info.handsUrl, detail: restarted.detail },
         "ensureHands.restart_refused",
       );
-      return null;
+      return { outcome: "rebuild" };
     }
     throw new Error(
       `Hands is unavailable (${restarted.detail}); the live sandbox was left intact`,
@@ -572,7 +620,10 @@ async function recoverUnhealthyReuse(
     { sessionId, handsUrl: info.handsUrl, detail: restarted.detail },
     "ensureHands.mcp_restarted_in_place",
   );
-  return acceptExistingSandbox(kv, sessionId, info, identity, binding);
+  return {
+    outcome: "reused",
+    result: await acceptExistingSandbox(kv, sessionId, info, identity, binding),
+  };
 }
 
 /**
@@ -616,6 +667,114 @@ function retainedTaker(kv: ReuseAttempt["kv"]): (previousWorkloadId: string) => 
   };
 }
 
+/** How many times the slot delete may re-read before it gives up on deleting. */
+const SLOT_DELETE_ATTEMPTS = 3;
+
+/**
+ * The retention store, with the one delete that can take a binding this call
+ * never looked at made conditional on the revision it WAS looked at.
+ *
+ * `retainContainer` finishes by deleting the session key, because a container
+ * that has been handed over has to stop being the session's. The decision to
+ * hand it over was taken on a binding read at `binding.revision`, and between
+ * that read and this delete sit a health check, a live-work read over the exec
+ * channel, and the two store round trips the retention itself makes. A
+ * concurrent DAG C on the same session does one thing in that window that
+ * matters: it provisions a sandbox of its own and puts ITS binding on the slot
+ * -- an unconditional put, because one session has one slot and that writer is
+ * not racing anybody it knows about.
+ *
+ * An unconditional delete then takes C's binding, and a delete is the
+ * irreversible act on this path. What it costs is not bookkeeping: the API's
+ * background-work guard reads that slot before an orphan sweep stops a
+ * workload, no binding at all is `no_binding`, and `bindingNamesOneOf` reads
+ * `no_binding` as "nothing on record holds this" and lets the stop through. So
+ * a call that decided to PROTECT one container ends by getting a DIFFERENT one
+ * stopped -- one it never looked at, with C's background shell inside it.
+ *
+ * Hence the CAS on the act rather than after it. A delete that loses is a
+ * delete that must not happen at all: the retention has already landed, which
+ * is the protection this path exists for, and whatever is on the slot now is
+ * somebody else's to remove.
+ *
+ * A lost CAS is not by itself a changed owner, which is why this re-reads
+ * rather than giving up. Three writers bump this key without changing which
+ * sandbox it names -- the run-lease heartbeat and the keepalive ticker both
+ * re-put it to refresh its TTL, and a sibling may be clearing the same idle
+ * markers -- so the same sandbox at a newer revision is still the binding the
+ * decision was about, and it is deleted at the revision it was just re-read at.
+ * The same shape as `clearIdleMarkers`, for the same reason: ownership is the
+ * thing worth protecting, the revision is not.
+ */
+function retentionStoreForBinding(
+  kv: ReuseAttempt["kv"],
+  sessionId: string,
+  info: any,
+  binding: HandsBinding,
+): ReturnType<typeof retentionStore> {
+  const base = retentionStore(kv);
+  const identity = reuseIdentity(info);
+  return {
+    ...base,
+    delete: async (key: string): Promise<unknown> => {
+      // Every other key a retention writes is its own: the ledger entry and the
+      // projection are named by the container's generation and nothing else
+      // writes them. Only the session key is shared.
+      if (key !== binding.key) return base.delete(key);
+      let revision = binding.revision;
+      for (let attempt = 0; attempt < SLOT_DELETE_ATTEMPTS; attempt++) {
+        // A revision of zero is not a condition: the client sets the
+        // expected-sequence header only when `previousSeq` is truthy, so a
+        // falsy one would issue exactly the unconditional delete this exists to
+        // prevent. Re-read for a real one instead.
+        if (revision > 0) {
+          try {
+            return await kv.delete(key, { previousSeq: revision });
+          } catch (err) {
+            // A bucket that is unavailable is not a lost race, and retrying it
+            // here would only fail again. The retention stands either way.
+            if (!isRevisionConflict(err)) throw err;
+          }
+        }
+        const latest = await kv.get(key);
+        if (!latest || isTombstone(latest)) {
+          logger.info(
+            { sessionId, key, workloadId: info.workloadId ?? null },
+            "ensureHands.retain_slot_already_released",
+          );
+          return undefined;
+        }
+        let current: HandsProbeEntry | null = null;
+        try {
+          current = parseHandsProbeValue(sc.decode(latest.value));
+        } catch {
+          // Unreadable is not "still ours". Standing aside leaves a binding
+          // nothing here can identify for the sweep that can, which is the
+          // direction that cannot stop a live container by mistake.
+          current = null;
+        }
+        if (!sameHandsSandbox(identity, current)) {
+          logger.warn(
+            { sessionId, key, workloadId: info.workloadId ?? null,
+              nowNames: current?.workloadId ?? null },
+            "ensureHands.retain_slot_moved_on",
+          );
+          return undefined;
+        }
+        revision = latest.revision;
+      }
+      // Contended by writers that keep leaving the same sandbox on the slot.
+      // The binding stays; the caller's own registration puts its replacement
+      // over it, and the retention is what protects the container meanwhile.
+      logger.warn(
+        { sessionId, key, workloadId: info.workloadId ?? null, attempts: SLOT_DELETE_ATTEMPTS },
+        "ensureHands.retain_slot_delete_contended",
+      );
+      return undefined;
+    },
+  };
+}
+
 async function retainInsteadOfDestroying(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -651,7 +810,11 @@ async function retainInsteadOfDestroying(
   // recover from, by noticing the name belongs to a retained workload and
   // freeing it there.
   await reuseEffects.retainContainer({
-    store: retentionStore(kv),
+    // Conditioned on the revision the binding was read at -- see the note on
+    // `retentionStoreForBinding`. The key alone is not enough: the same key
+    // holds a different generation of the same session a moment later, and the
+    // delete below is what would take it.
+    store: retentionStoreForBinding(kv, sessionId, info, binding),
     // The key this binding was read under, not one re-derived from the session
     // id. `readReusableEntry` reads through both names, so during a rolling
     // upgrade the binding it acted on can be the legacy one while the canonical
@@ -722,6 +885,15 @@ async function retainInsteadOfDestroying(
  * queued behind -- so a `clear` count leaves this path byte for byte as it was:
  * no record, no protection, reaped. `unknown` retains, like every other caller
  * of `mayDestroy`: a container that could not be asked never answered zero.
+ *
+ * With one exception, which the CALLER establishes before it gets here because
+ * only the caller holds the evidence: a container the provider has already
+ * confirmed gone is not retained at all. `unknown` is the right answer to "is
+ * work running in there" and still the wrong reason to keep a record, because
+ * the same read is what has to say `clear` before anything lets the record go
+ * -- and a workload that does not exist cannot answer either question on this
+ * sweep or on any sweep after it. See the `containerGone` branch in
+ * `recoverOrRetainUnusableSandbox`.
  *
  * The handles are deliberately NOT released here, and that is the one way this
  * differs from a retention taken over a container the caller owns. This path is

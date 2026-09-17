@@ -72,6 +72,10 @@
  *      stop
  *   S8 a retention that lands DURING this release protects the container too
  *   S9 and a retention re-check that cannot be answered leaves it on record
+ *   S10 a retention landing BETWEEN the re-check's two reads protects it too --
+ *      asking both questions beside each other does not make the pair atomic
+ *   S11 credentials that cannot be read once the row is already gone still
+ *      leave the workload on record
  */
 import test, { after, afterEach, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -86,6 +90,7 @@ import type { Harness } from "./scenario-harness.js";
 process.env.SAFE_API_URL = "http://safe.test";
 
 const { startHarness, seedSession, seedRun } = await import("./scenario-harness.js");
+const { db } = await import("../src/infra/db.js");
 const {
   handleRegistry, stopSandboxByHandle, stopAllHandlesForDag,
   destroyHandleCas, makeKvStore,
@@ -529,5 +534,131 @@ test("S9 a retention re-check that cannot be answered leaves the workload on rec
     Object.values(record).map((e) => (e as { workload_id?: string }).workload_id),
     ["w-shared"],
     "so the record is the only thing left naming the workload, and it does",
+  );
+});
+
+/**
+ * A leader read is a network round trip, and the retention ledger read beside
+ * it is a different one.
+ *
+ * Nothing here decides which of the re-check's two questions is asked first --
+ * that is the code under test's business. What it fixes is the one property
+ * that makes the gap between them observable: settling a candidate DAG against
+ * the leader takes longer than reading the ledger. Both orderings are legal in
+ * the cluster and this is the one that costs a container, so it is the one the
+ * scenario pins.
+ */
+function slowLeaderReads(ms = 10): void {
+  const consistent = handleRegistry.listForDagConsistent;
+  handleRegistry.listForDagConsistent = async (dag) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return consistent(dag);
+  };
+}
+
+test("S10 a retention landing between the re-check's two reads still protects it", async () => {
+  // S8's hand-over lands before the re-check runs at all, so asking both
+  // questions catches it. This one lands INSIDE the re-check: the ledger is
+  // read, answers "not retained" about the world as it was, and only then does
+  // B park the container -- retention record first, then its handle freed, the
+  // order `retainInsteadOfDestroying` writes them in. Asking both questions
+  // beside each other does not make the pair atomic: the ledger answer is
+  // already stale when the holder half lands, and what comes out is a stop
+  // against a container whose background work is the entire reason it was kept.
+  await twoDagsSharing("w-shared");
+  let handedOver = false;
+  const flag = { retained: false };
+  const handOver = async (): Promise<void> => {
+    handedOver = true;
+    // Retention BEFORE the handle release -- the reference that replaces the
+    // handle exists before the handle can go. Production writes it this way on
+    // purpose, and the removal is the real `destroyHandleCas` against the
+    // leader, which is what `releaseHandlesForWorkload` issues.
+    flag.retained = true;
+    await destroyHandleCas(kvb.leader as never, "dag-b", "main", "w-shared");
+  };
+  handleRegistry.retained = async (workloadId: string) => {
+    // The answer is about the ledger as it is when the ledger is read. B's
+    // hand-over lands immediately after that read has been answered, which is
+    // the whole window -- and `kvb.rowOf("dag-a") === null` is what makes this
+    // the RE-check rather than the first check, by construction rather than by
+    // a call count.
+    const answer = flag.retained && workloadId === "w-shared";
+    if (!handedOver && kvb.rowOf("dag-a") === null) await handOver();
+    return answer;
+  };
+  slowLeaderReads();
+
+  const released = await stopSandboxByHandle("dag-a", "main", "s-1");
+
+  assert.deepEqual(
+    stopped, [],
+    "a container that was retained while this release was deciding is not this one's to stop",
+  );
+  assert.equal(released, "unconfirmed", "and nothing here established a release");
+  assert.equal(kvb.rowOf("dag-a"), null, "A still let go -- it is done with the workload");
+  assert.deepEqual(
+    await leakRecord("dag-a"), {},
+    "and a container something still holds is not a workload that escaped",
+  );
+});
+
+/**
+ * B finishes its own release inside the same window, with no retention: the
+ * ordinary promotion to last holder, which is what leaves A's row gone and A
+ * owing the stop.
+ */
+function releaseOnceAHasLetGo(workloadId: string): void {
+  const real = handleRegistry.destroy;
+  handleRegistry.destroy = async (dag, name, wid) => {
+    const removed = await real(dag, name, wid);
+    if (dag === "dag-a" && removed !== null) {
+      await destroyHandleCas(kvb.leader as never, "dag-b", "main", workloadId);
+    }
+    return removed;
+  };
+}
+
+test("S11 credentials that cannot be read after the row is gone leave the workload on record", async () => {
+  // The credentials moved ahead of the destroy so that a session row which will
+  // not load fails while the mapping is still there to fall back on. On the
+  // shared-release path there is no such mapping: the decline branch destroyed
+  // this DAG's row before the re-check, the re-check promoted this call to last
+  // holder, and B has already let go. Returning with nothing written then loses
+  // the last name the workload had -- both rows gone, no stop issued, and every
+  // later teardown answering `nothing_held` over a live GPU.
+  await twoDagsSharing("w-shared");
+  releaseOnceAHasLetGo("w-shared");
+  const realQuery = db.query;
+  db.query = (async (text: string, params?: unknown[]) => {
+    // Only the credentials read: the record write below must still be able to
+    // land, or this scenario would be asserting on a database that is down
+    // rather than on one statement that timed out.
+    if (/FROM claw_sessions/.test(text)) {
+      throw new Error("canceling statement due to lock timeout");
+    }
+    return realQuery(text, params);
+  }) as typeof db.query;
+
+  try {
+    const released = await stopSandboxByHandle("dag-a", "main", "s-1");
+
+    assert.equal(released, "unconfirmed", "the stop could not even be issued");
+    assert.deepEqual(stopped, [], "and none was attempted");
+    assert.equal(kvb.rowOf("dag-a"), null, "A's row went before the re-check");
+    assert.equal(kvb.rowOf("dag-b"), null, "and B let go inside the same window");
+    const record = await leakRecord("dag-a");
+    assert.deepEqual(
+      Object.values(record).map((e) => (e as { workload_id?: string }).workload_id),
+      ["w-shared"],
+      "so the record is the only thing left naming the workload, and it must",
+    );
+  } finally {
+    db.query = realQuery;
+  }
+
+  assert.equal(
+    await stopAllHandlesForDag("dag-a", "s-1"), "unconfirmed",
+    "and the DAG must not go on to claim it held nothing",
   );
 });

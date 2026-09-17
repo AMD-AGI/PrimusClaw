@@ -1376,45 +1376,95 @@ export async function stopSandboxByHandle(
     // registered. Dropping that row at t2 is what opens the window, and this
     // branch is the only one that drops it before deciding.
     //
-    // Together, because both are bounded by the same ceiling and a cancel that
-    // paid it twice in series would spend twice the budget the ceiling exists
-    // to cap. `allSettled` rather than `all` so that a rejection from one is
-    // settled rather than left unhandled while its sibling is still in flight.
-    const [heldAnswer, retainedAnswer] = await Promise.allSettled([
-      withDeadline(
+    // IN THIS ORDER, and the order is the whole of it. Asking both questions
+    // at once was the previous shape of this, and side by side is not atomic:
+    // it changed which interleavings are possible without removing the one
+    // t1-t4 above describes. What it leaves is the same hand-over, split
+    // across the pair:
+    //
+    //   r1  A's LEDGER read answers "not retained"
+    //   r2  B writes the retention record
+    //   r3  B frees dag-b's handle
+    //   r4  A's HOLDER read -- an enumeration plus a leader read per candidate
+    //       DAG, the slower half by construction -- answers "nobody holds it"
+    //
+    // Each half answered correctly about the instant it was read, both
+    // answered "no claim", and a claim existed throughout: a handle when the
+    // ledger was read, a retention by the time the registry was. The stop goes
+    // out against the container the retention was written to protect.
+    //
+    // What closes it is reading the two claims in the REVERSE of the order the
+    // hand-over writes them. `retainInsteadOfDestroying` writes the retention
+    // FIRST and frees the handle after -- deliberately, so the reference that
+    // replaces the handle exists before the handle can go -- which makes the
+    // handle the claim that disappears LAST. Reading it first leaves two
+    // cases and no others:
+    //
+    //   - the holder read lands before the free: the handle is still there,
+    //     this declines, and where the hand-over got to is irrelevant;
+    //   - the holder read lands after the free: the retention write committed
+    //     before that free, so the ledger read that FOLLOWS is guaranteed to
+    //     see it, and this declines.
+    //
+    // That is not atomicity and does not pretend to be. Nothing available here
+    // can make the pair atomic -- `otherDagHolding` says what would, ownership
+    // keyed by workload in one transactional record -- but the window this
+    // branch opens contains one writer doing one ordered pair of writes, and
+    // reading them in the opposite order is enough for that.
+    //
+    // One budget across both rather than one each: a cancel paying the ceiling
+    // twice in series would spend twice what the ceiling exists to cap, and
+    // not paying it twice is what the concurrent version was buying. So the
+    // clock starts once and the second read gets what is left of it.
+    const recheckStartedAt = Date.now();
+    const recheckBudget = (): number =>
+      Math.max(1, SHARED_CHECK_TIMEOUT_MS - (Date.now() - recheckStartedAt));
+    let heldNow: string | null = null;
+    let recheckFailure: unknown = null;
+    try {
+      heldNow = await withDeadline(
         otherDagHolding(dagRootTaskId, known.workload_id, "after-own-row-gone"),
-        SHARED_CHECK_TIMEOUT_MS,
+        recheckBudget(),
         `last-holder re-check for ${known.workload_id}`,
-      ),
-      withDeadline(
+      );
+    } catch (e) {
+      recheckFailure = e;
+    }
+    if (heldNow !== null) {
+      // The ordinary shared release, and the property the ordering move bought:
+      // it declines, and it leaves nothing behind to report.
+      return "unconfirmed";
+    }
+    // Asked even when the holder read FAILED, which is the one thing the
+    // sequence gives up and it is bought back here: a failed read established
+    // no claim, while a positive ledger answer still forbids the stop and
+    // still leaves nothing behind. One extra read on the failure path is worth
+    // not filing a leak report against a container a retention is
+    // demonstrably protecting.
+    let retainedNow = false;
+    try {
+      retainedNow = await withDeadline(
         handleRegistry.retained(known.workload_id),
-        SHARED_CHECK_TIMEOUT_MS,
+        recheckBudget(),
         `retention re-check for ${known.workload_id}`,
-      ),
-    ]);
-    // A positive answer from either half is decisive and is read first: it
-    // says the workload is demonstrably still claimed, which forbids the stop
-    // whatever the other half did. Declining on it leaves nothing behind for
-    // the same reason the branch above does -- somebody else is holding it, by
-    // the very read that answered -- so there is no leak to report.
-    if (retainedAnswer.status === "fulfilled" && retainedAnswer.value) {
+      );
+    } catch (e) {
+      recheckFailure ??= e;
+    }
+    if (retainedNow) {
+      // Decisive, and declining on it leaves nothing behind for the same
+      // reason the branch above does -- somebody else is holding it, by the
+      // very read that answered -- so there is no leak to report.
       logger.info(
         { dagRootTaskId, handleName, workloadId: known.workload_id },
         "sandbox.stop_skipped_retained_after_recheck",
       );
       return "unconfirmed";
     }
-    if (heldAnswer.status === "fulfilled" && heldAnswer.value !== null) {
-      // The ordinary shared release, and the property the ordering move bought:
-      // it declines, and it leaves nothing behind to report.
-      return "unconfirmed";
-    }
-    // Only now do failures matter: neither half established a claim, so an
-    // unanswered half is the difference between "nobody holds it" and "nobody
+    // Only now do failures matter: neither read established a claim, so an
+    // unanswered one is the difference between "nobody holds it" and "nobody
     // could say". The second is not a licence to stop anything.
-    const failure = [heldAnswer, retainedAnswer]
-      .find((answer): answer is PromiseRejectedResult => answer.status === "rejected");
-    if (failure) {
+    if (recheckFailure) {
       // The one declining exit with no mapping left to be its own evidence.
       // Everywhere else a check that fails keeps the handle registered and the
       // sweeper comes back to it; here the row is already gone, so `unreleased`
@@ -1425,7 +1475,7 @@ export async function stopSandboxByHandle(
       // `NoRecordHome` -- no DAG row, so no reader -- with `no_record_home`,
       // which is a teardown that may proceed, not a record that was made.)
       logger.warn(
-        { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(failure.reason) },
+        { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(recheckFailure) },
         "sandbox.last_holder_recheck_failed",
       );
       await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
@@ -1449,13 +1499,37 @@ export async function stopSandboxByHandle(
     platformKey = await loadPlatformKeyForSession(sessionId);
   } catch (e) {
     // Reaching the credentials is part of issuing the stop; failing to is a
-    // stop that did not happen, not an error for the cancel to raise. Nothing
-    // is written or destroyed yet, so the mapping is still the reference it
-    // always was and the sweeper comes back to it.
+    // stop that did not happen, not an error for the cancel to raise. On the
+    // ordinary path nothing is written or destroyed yet, so the mapping is
+    // still the reference it always was and the sweeper comes back to it.
     logger.warn(
       { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
       "sandbox.stop_precondition_failed",
     );
+    // Except on the one path where it is NOT still there. The decline branch
+    // above destroys this DAG's row before the re-check, and the re-check then
+    // promoted this call to last holder -- so by here both the co-holder and
+    // this DAG have let go, no stop has been issued, and returning with
+    // nothing written leaves the workload with no name anywhere: no mapping
+    // for `reapOrphanHandles` to start from (it enumerates mappings), no
+    // record, and `stopAllHandlesForDag` answering `nothing_held` for a
+    // workload that is still running.
+    //
+    // Same reasoning, and the same record, as the re-check failure one branch
+    // up -- and it is the same shape of failure, a read that could not be
+    // answered after the row was already gone. Not a false alarm either: this
+    // call really did drop a reference and really did not establish a release.
+    //
+    // Nothing will clear it, and that is correct rather than a latch. `clear`
+    // runs only for a CONFIRMED stop of the same (handle, workload) pair, and
+    // the mapping that would take a later teardown back to this handle is
+    // gone -- so the entry stands until somebody acts on it. That is the
+    // difference from the entry the empty-workload-id branch refuses to write:
+    // this one names a real workload id an operator can go and stop, which is
+    // the whole content of the report.
+    if (ownRowGone) {
+      await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
+    }
     return "unconfirmed";
   }
   const blocked = stopBlocker(known.workload_id, platformKey);

@@ -308,6 +308,58 @@ function orderedRetentionReads(reads: Map<string, RetentionRead>): RetentionRead
 }
 
 /**
+ * Every DAG whose handle map still names this container, read from the table
+ * itself rather than inferred from anything this sweep already believes.
+ *
+ * "Who holds this workload" has exactly one durable answer and it is this
+ * table: a DAG node reaches its sandbox by resolving a handle
+ * (`lookupDagHandle` on the `sandbox.use` path), so a row naming the container
+ * IS a live reference to it and removing the row is removing the reference.
+ * Nothing else in this process can stand in for that. The run lease cannot:
+ * `runScope` is `pickLockKey(request)`, which under the default
+ * `RUN_GATE_KEY=workspace` is `ws.<workspaceId>`, and a handle row records
+ * neither the lock key nor the workspace -- so a lease read keyed off a handle
+ * would answer "no lease" for a perfectly live sibling and delete its handle,
+ * which is the defect rather than the fix.
+ *
+ * Rows are matched the way the release matches them and then one way more.
+ * `releaseHandlesForWorkload` frees rows whose `workload_id` equals the id, so
+ * every row this could take is covered by the first test; an agent-sandbox row
+ * carries `workload_id: ""` and its Router session instead, and `inst.id` for
+ * an agent-sandbox target IS that session id, so the second test covers a
+ * reference the release cannot currently free at all. Declining on one of those
+ * is the point: a handle this sweep cannot free is still a handle naming the
+ * container, and letting the retention go while it stands would leave the row
+ * with no ledger behind it.
+ *
+ * `pending` rows count. A handle is registered the moment SaFE assigns an id,
+ * before the workload can serve anything -- `collectDagTargets` skips those for
+ * PINGING because an exec against a queued workload 404s, which is a different
+ * question from whether the DAG holds it. It does; that row is the DAG's only
+ * reference while it waits for a GPU.
+ *
+ * A table that cannot be read throws rather than answering "nobody", and the
+ * caller treats that as a reason not to release. `listAllDagHandles` answering
+ * `[]` for an UNBOUND map is the one case that is not an exception, and it is
+ * covered from the other side: the release it would then let through is
+ * `releaseHandlesForWorkload`, which throws `not_initialized` on the same
+ * unbound map, so the retention still stands.
+ */
+async function dagsHoldingWorkload(deps: KeepaliveDeps, workloadId: string): Promise<string[]> {
+  const rows = await (deps.listDagHandles ?? listAllDagHandles)();
+  const held: string[] = [];
+  for (const [dagRoot, handles] of rows) {
+    for (const info of Object.values(handles)) {
+      if (info.workload_id === workloadId || info.session_id === workloadId) {
+        held.push(dagRoot);
+        break;
+      }
+    }
+  }
+  return held;
+}
+
+/**
  * Read live-work evidence out of as many retained containers as the budget
  * allows, and release the ones whose work has finished.
  *
@@ -394,17 +446,63 @@ async function runRetentionReadPhase(
       //
       // The reverse residue is harmless: a freed handle whose records outlive it
       // by one sweep is a container that is simply released a sweep later.
+      //
+      // And it is not unconditional, which is the other half of the same rule.
+      // `releaseHandlesForWorkload` frees EVERY DAG's handle on the workload,
+      // so it may only be issued by somebody who has established that the
+      // workload is nobody else's -- exactly the precondition
+      // `retainInsteadOfDestroying` carries in its `releaseHandles` parameter,
+      // and exactly the precondition the displaced-sandbox path cannot meet.
+      // That path retains a container PRECISELY because a sibling DAG may still
+      // hold it, and it therefore hands the container over with the sibling's
+      // handle deliberately left in place. This sweep is what finally lets that
+      // retention go, and it used to free the handle here regardless: the
+      // sibling's run lease was still valid, its only reference to the sandbox
+      // was deleted, and its next `sandbox.use` node failed outright. The
+      // parameter protected the call that took the retention and nothing after
+      // it; this is the same precondition, asked again by the caller that acts
+      // on it.
       if (target.inst.id) {
+        let heldBy: string[] = [];
         try {
           // Bounded on this side of the call, like every other term in the
           // phase ceiling: the release scans the whole handle table and then
           // CASes per handle, and only the enumeration carries a limit of its
           // own. A deadline here is what keeps the ceiling above a number the
-          // phase can actually exceed.
+          // phase can actually exceed. The holder read is inside the SAME
+          // deadline rather than beside it, because it is the same scan of the
+          // same table -- a second term would have to be added to
+          // `keepaliveCensusPhaseCeilingSec()` and the declared sweep span with
+          // it, for work that happens in place of the release and never
+          // alongside it.
           let timer: NodeJS.Timeout;
           await Promise.race([
-            (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id)
-              .finally(() => clearTimeout(timer)),
+            (async () => {
+              // Read HERE, immediately before the delete, and never carried
+              // from anywhere earlier. The verdict this branch acts on is a
+              // process count taken INSIDE the container, and a count of
+              // processes is not an answer about who holds the container: a DAG
+              // sitting between two nodes runs nothing in it and still owns the
+              // handle that its next node resolves. So the two reads answer
+              // different questions and the second one cannot be folded into
+              // the first. Nor can it come from `collectDagTargets`, which
+              // walked this same table earlier in the sweep -- between that walk
+              // and this line sit the whole ping phase and every read this phase
+              // has already taken, and a handle registered in that window would
+              // be deleted on the strength of a snapshot that predates it.
+              heldBy = await dagsHoldingWorkload(deps, target.inst.id);
+              // Somebody still names this container, so its handle is not this
+              // sweep's to take and the records that back it are not this
+              // sweep's to delete either. Both stay, together: the retention
+              // ledger is what `mayTakeFrom`/`retainedTaker` reads to let a
+              // later registration take the name back from a handed-over
+              // workload, so releasing the records while a handle still names
+              // the workload would strand that handle with nothing behind it --
+              // the same ordering failure the paragraph above refuses in the
+              // other direction.
+              if (heldBy.length > 0) return;
+              await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id);
+            })().finally(() => clearTimeout(timer)),
             new Promise<never>((_, reject) => {
               timer = setTimeout(
                 () => reject(new Error(
@@ -423,10 +521,38 @@ async function runRetentionReadPhase(
           // and queue -- six of the roster-tick tests say so.
           //
           // The entry keeps its place: the records still stand, so the next
-          // sweep reaches this line again.
+          // sweep reaches this line again. A holder read that threw lands here
+          // too, and lands in the right place: an unreadable handle table is
+          // not a table with nothing in it, and the release must not proceed on
+          // a question it could not ask.
           logger.warn(
             { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
             "keepalive.retention_handle_release_failed",
+          );
+          continue;
+        }
+        if (heldBy.length > 0) {
+          // Reported, never silent: a retention that outlives the work it was
+          // taken for is the state this phase exists to end, so an operator
+          // reading "released" counts has to be able to see the ones that were
+          // deliberately kept, and whose handle kept them.
+          //
+          // It is a deferral and not a refusal. The retention is released by
+          // the first sweep that finds the last handle gone, and a handle
+          // outliving its DAG does not wait on this sweep to notice: api's
+          // `reapOrphanHandles` walks the same table every TASK_SWEEPER_TICK_MS,
+          // and for a DAG root whose task row is terminal or missing with no
+          // live work holding the workload it calls `stopSandboxByHandle`,
+          // which on a RETAINED workload skips the stop and destroys the
+          // mapping anyway (`sandbox.stop_skipped_retained`). So the holder set
+          // shrinks without anything here having to guess at liveness -- which
+          // is just as well, because it could not: the run lease is keyed by
+          // `pickLockKey`, which under the default `RUN_GATE_KEY=workspace` is
+          // `ws.<workspaceId>`, and a handle row carries neither that nor
+          // anything to derive it from. Presence of the handle IS the holding.
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, heldBy },
+            "keepalive.retention_kept_handle_still_held",
           );
           continue;
         }
