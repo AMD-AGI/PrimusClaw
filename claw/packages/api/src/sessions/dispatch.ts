@@ -173,10 +173,47 @@ export async function dispatchTaskToBrain(
       (await ensureSessionWorkspace(sessionId, userId))?.workspace_id,
       { sessionId },
     );
+    // Best-effort, and it has to stay best-effort, because the turn does not
+    // depend on it. The stamp is for a reader that arrives after the request is
+    // gone -- `platformKeyForSession` in tasks/platform-backfill.ts, which
+    // authenticates the terminal-facts read on a run that has already ended.
+    // What actually runs this turn is the `platform_key` put on `task` below:
+    // the doorbell path seals `credentialsFromTask(task)` onto the row and the
+    // fat path publishes it on the wire, so the SaFE workload is created with,
+    // and owned by, its submitter whether or not this UPDATE landed. Nothing
+    // between here and the publish reads the session row's copy.
+    //
+    // It used to throw. The throw reached this function's catch, the catch ran
+    // `onPublishFailure`, and a dropped connection under one UPDATE therefore
+    // refused the user's chat turn: 503 with no UserMessage written and the
+    // gate handed back, and on `POST /v1/sessions` the just-created session
+    // deleted underneath it. Refusing a conversation turn to protect a
+    // diagnostic is the wrong trade in both directions.
+    //
+    // Not silent either, which is the other half of the trade. This line is
+    // what says the row is now stale, and it is not the only trace. A run whose
+    // session was never stamped falls back to the `platformKey` Brain writes
+    // into its own KV entry for that sandbox -- `ensure-hands.ts` puts the
+    // caller's key on both the pending and the ready SaFE payload and calls the
+    // field mandatory, and `platformKeyForSandbox` accepts it only when the
+    // entry names the same handle, so the fallback cannot pair a newer
+    // sandbox's credential with this run. The entry is on a KV TTL, so it does
+    // not cover a late sweep; when it is gone the backfill records
+    // `missing_platform_key` and leaves `platform_facts_resolved_at` NULL until
+    // `drainPendingPlatformFacts` stops selecting the row an hour after it
+    // completed. An unstamped run is therefore still queryable afterwards --
+    // unresolved facts on a terminal row -- rather than merely lost.
+    //
+    // The error object is deliberately not logged: a constraint or type failure
+    // on `claw_sessions` carries the failing row in `detail`, and that row is
+    // the config we are writing credentials into. The driver's code names the
+    // class of failure without quoting the row.
     if (user?.platformKey) {
-      await stampSessionCredentials(sessionId, user).catch(() => {
-        // Database errors can include the credential-bearing config row.
-        throw new Error("session.credentials_stamp_failed");
+      await stampSessionCredentials(sessionId, user).catch((stampErr: any) => {
+        logger.error(
+          { sessionId, userId, code: stampErr?.code ?? "", constraint: stampErr?.constraint ?? "" },
+          "session.credentials_stamp_failed",
+        );
       });
     }
 

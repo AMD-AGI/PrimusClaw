@@ -90,6 +90,7 @@ interface SeedOptions {
   attempts?: number;
   resolved?: boolean;
   config?: Record<string, unknown>;
+  origin?: string;
 }
 
 async function seed(id: string, reason: string, opts: SeedOptions = {}): Promise<void> {
@@ -101,13 +102,14 @@ async function seed(id: string, reason: string, opts: SeedOptions = {}): Promise
     `INSERT INTO claw_tasks (
        task_id, session_id, status, failure_reason, sandbox_workload_id, metadata, completed_at,
        platform_facts_next_retry_at, platform_facts_attempts, platform_facts_resolved_at, origin, created_at
-     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, 'chat', $10)`,
+     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $11, $10)`,
     [id, opts.status ?? "failed", reason,
       opts.handle === undefined ? `wl-${id}` : opts.handle,
       JSON.stringify(opts.metadata ?? {}),
       new Date(now - (opts.completedAgoMs ?? 60_000)),
       opts.retryDelayMs === undefined ? null : new Date(now + opts.retryDelayMs),
-      opts.attempts ?? 0, opts.resolved ? new Date(now) : null, new Date(now - 300_000)],
+      opts.attempts ?? 0, opts.resolved ? new Date(now) : null, new Date(now - 300_000),
+      opts.origin ?? "chat"],
   );
 }
 
@@ -237,4 +239,69 @@ test("the drain's cap makes progress on both new rows and old eligible retries",
   assert.deepEqual(counts.rows, [{ lane: "new", resolved: 25 }, { lane: "retry", resolved: 25 }]);
   assert.equal(await drainPendingPlatformFacts(), 10);
   assert.equal(fetched.length, 60);
+});
+
+test("rows that can never name a sandbox neither take the drain's cap nor cost a claim", async () => {
+  // reapStaleTasks closes a whole batch of DAG nodes no worker ever claimed as
+  // failed/brain_timeout. They hold no workload id and never will -- the row is
+  // terminal, and resolveSandbox refuses a non-chat row without one anyway,
+  // because a session's latest sandbox cannot establish one node's ownership.
+  // Selected, each one spends a claim UPDATE, a diagnostic and one of the fifty
+  // slots per tick until it falls out of the hour -- which is how sixty rows
+  // that did name a SaFE workload got read zero times across an hour of ticks
+  // and then aged out for good.
+  for (let i = 0; i < 60; i++) {
+    await seed(`node-${i}`, "brain_timeout", {
+      handle: null, origin: "dag_node", completedAgoMs: 120_000,
+    });
+  }
+  for (let i = 0; i < 5; i++) await seed(`held-${i}`, "worker_lost", { completedAgoMs: 60_000 });
+
+  assert.equal(await drainPendingPlatformFacts(), 5);
+  assert.deepEqual(
+    fetched.map((url) => url.slice(url.lastIndexOf("/") + 1)).sort(),
+    ["wl-held-0", "wl-held-1", "wl-held-2", "wl-held-3", "wl-held-4"],
+    "the rows that name a workload are the ones asked about",
+  );
+  for (let i = 0; i < 5; i++) {
+    assert.ok((await row(`held-${i}`)).platform_facts_resolved_at, `held-${i}`);
+  }
+  const untouched = await pg.query<{ attempts: number; retries: number }>(
+    `SELECT sum(platform_facts_attempts)::int AS attempts,
+            count(platform_facts_next_retry_at)::int AS retries
+       FROM claw_tasks WHERE task_id LIKE 'node-%'`,
+  );
+  assert.deepEqual(untouched.rows[0], { attempts: 0, retries: 0 },
+    "and the unattributable rows were never claimed or backed off");
+  assert.deepEqual(diagnostics.filter((d) => d.reason === "kv_handle_run_unattributed"), []);
+});
+
+test("the eligibility clause keeps every row a read could still answer for", async () => {
+  // The filter this replaces was `sandbox_workload_id IS NOT NULL`, which also
+  // dropped the chat rows the KV fallback exists to recover. Each arm of the
+  // replacement is asserted here so a future tightening cannot quietly lose one.
+  await seed("dag-with-handle", "worker_lost", { origin: "dag_node" });
+  await seed("agent-metadata-only", "sandbox_gone", {
+    handle: null, origin: "dag_node",
+    metadata: { sandbox: { provider: "agent-sandbox", handle: "agent-session" } },
+  });
+  await seed("chat-kv-only", "sandbox_workload_terminal", { handle: null, config: {} });
+  hands.set(handsSessionKey("chat-kv-only"), {
+    workloadId: "wl-from-kv", platformKey: "brain-key",
+    createdAt: new Date(Date.now() - 120_000).toISOString(),
+  });
+
+  assert.equal(await drainPendingPlatformFacts(), 2);
+  assert.deepEqual(
+    fetched.map((url) => url.slice(url.lastIndexOf("/") + 1)).sort(),
+    ["wl-dag-with-handle", "wl-from-kv"],
+  );
+  assert.ok((await row("dag-with-handle")).platform_facts_resolved_at);
+  assert.equal((await row("chat-kv-only")).sandbox_workload_id, "wl-from-kv");
+  // Still selected, still refused by the reader rather than by the SELECT: the
+  // router has no termination facts, and that refusal is the one being asserted.
+  assert.equal((await row("agent-metadata-only")).platform_facts_attempts, 1);
+  assert.equal((await row("agent-metadata-only")).platform_facts_resolved_at, null);
+  assert.ok(diagnostics.some((d) =>
+    d.taskId === "agent-metadata-only" && d.reason === "termination_facts_unavailable"));
 });

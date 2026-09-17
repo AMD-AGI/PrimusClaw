@@ -169,19 +169,54 @@ export interface TaskTerminalInput {
 /**
  * Claw's own reasons for ending a run, and the kill they amount to.
  *
- * These need no platform read: the deadline is ours to enforce and a cancellation
- * is a person pressing a button here.
+ * These need no platform read: every one of them is a budget on a run Claw had
+ * already admitted and was itself holding -- the run's wall clock, the dispatch
+ * queue, an external wait -- so when one expires Claw is what ended the run, and
+ * a pod describing itself as terminated afterwards is describing us doing it.
+ *
+ * The line is not "these rows never carry a pod account". `reapStaleTasks` hands
+ * its whole batch to `backfillPlatformFacts`, the rows it closed as
+ * `run_budget_exhausted` included, so one of these can arrive here with a
+ * `Preempted` on it -- and it is still outranked, because that pod was
+ * terminated after our own budget had already ended the run.
+ *
+ * The line is what the deadline was measured against. A provisioning timeout is
+ * measured against a sandbox that never became usable, which is the opposite
+ * case: see WEAK_REASONS below.
  */
 const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["run_budget_exhausted", "deadline"],
   ["queue_timeout", "deadline"],
-  ["sandbox_pending_timeout", "deadline"],
   ["external_timeout", "deadline"],
 ]);
 
-// The workload's timeout message is weaker than an explicit pod/container reason.
-// Liveness failures (`brain_timeout`, `worker_lost`) establish no deadline.
+/**
+ * Deadlines that are real, and that yield anyway to what the pod said.
+ *
+ * Both are timeouts on *provisioning* -- Claw's queue ceiling
+ * (`sandbox_pending_timeout`, SANDBOX_PENDING_TIMEOUT_SECONDS) and SaFE's own
+ * workload timeout (`sandbox_timed_out`) -- and a provisioning timeout is the
+ * one kind of deadline whose expiry does not establish its own cause. Both fire
+ * because a sandbox never became usable, and "the cluster took the machine" is
+ * one of the reasons a sandbox never becomes usable, not a competing account of
+ * some other ending. So they stand only once the platform has been asked and had
+ * nothing to say.
+ *
+ * `sandbox_pending_timeout` was ranked with the owned deadlines above, and that
+ * cancelled out the reason the rest of this work exists. This deployment goes and
+ * fetches the pod's account for exactly these rows on purpose:
+ * `drainPendingPlatformFacts` names the reason, `idx_tasks_platform_facts_pending_v2`
+ * is indexed for it, and Brain's `capturePlatformFacts` reads the workload before
+ * `reapPendingHands` stops it, precisely because a run that dies before its first
+ * heartbeat is the family the platform is the only witness to. Ranked above the
+ * pod read, every one of those reads was spent recording an `OOMKilled` or a
+ * `Preempted` that the answer then threw away and reported as `deadline`.
+ *
+ * Liveness failures (`brain_timeout`, `worker_lost`) are in neither map: they say
+ * a run stopped reporting, which establishes no deadline at all.
+ */
 const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
+  ["sandbox_pending_timeout", "deadline"],
   ["sandbox_timed_out", "deadline"],
 ]);
 
@@ -196,7 +231,8 @@ const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
  * 2. Claw's own deadline next, for the same reason: we enforced it, so the pod's
  *    account of being terminated is a description of us doing it.
  * 3. Then the platform's own reason, which is the only source for a preemption.
- * 4. Then a workload timeout reported without a pod/container reason.
+ * 4. Then a provisioning timeout -- ours or SaFE's -- which stands only when the
+ *    platform was asked about the sandbox and had nothing to say.
  * 5. A failure nobody explained stays `failed`, not a kill with a guessed cause.
  */
 export function terminalFacts(input: TaskTerminalInput): TerminalFacts | null {

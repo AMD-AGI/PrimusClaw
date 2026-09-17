@@ -17,6 +17,9 @@
  *   R2 an OOM likewise, from the container's own reason
  *   R3 liveness failures without platform facts remain unexplained
  *   R4 our own budget still outranks whatever the pod said on the way down
+ *   R5 the Pending queue ceiling still stands when the platform said nothing
+ *   R6 and yields to the pod/container facts this PR backfills for exactly it
+ *   R7 the budgets on an already-admitted run keep outranking the pod
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -71,14 +74,58 @@ test("R4 our own budget still outranks the pod's account", () => {
   );
 });
 
-test("a Pending sandbox queue ceiling is an enforced deadline", () => {
+test("R5 the Pending queue ceiling stands on its own when the platform said nothing", () => {
+  // The ceiling is still reported: a sandbox that never left the queue and has no
+  // pod account to read is a deadline, and the only one anybody can name.
+  assert.deepEqual(
+    terminalFacts({ status: "failed", failure_reason: "sandbox_pending_timeout" }),
+    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
+  );
+});
+
+test("R6 the Pending queue ceiling yields to the pod and container facts backfilled for it", () => {
+  // The rows this covers are rows `drainPendingPlatformFacts` selects by name and
+  // spends a SaFE read on. Ranked above the read, the reason it recorded was
+  // discarded and a reclaimed node came back as `deadline` -- charged to the model
+  // that happened to be queued, which is the confusion this whole surface exists to
+  // end.
   assert.deepEqual(
     terminalFacts({
       status: "failed", failure_reason: "sandbox_pending_timeout",
-      pod_failed_message: "Evicted, stopped after the queue deadline",
+      pod_failed_message: "Preempted, the node was reclaimed while the pod was Pending",
+      exit_code: 137,
     }),
-    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
+    { class: "killed", kill_reason: "preempted", exit_code: 137, signal: "SIGKILL" },
   );
+  assert.deepEqual(
+    terminalFacts({
+      status: "failed", failure_reason: "sandbox_pending_timeout",
+      pod_failed_message: "", container_reason: "OOMKilled", exit_code: 137,
+    }),
+    { class: "killed", kill_reason: "oom", exit_code: 137, signal: "SIGKILL" },
+  );
+  assert.equal(
+    terminalFacts({
+      status: "failed", failure_reason: "sandbox_pending_timeout",
+      pod_failed_message: "TerminationByKubelet, node is shutting down",
+    })?.kill_reason,
+    "preempted",
+  );
+});
+
+test("R7 our own admitted-run budgets still outrank the pod, unlike the queue ceiling", () => {
+  // The other half of the split, asserted together so the two cannot drift: these
+  // three are budgets on a run Claw had already taken, so a pod terminated after
+  // one expires is a description of Claw doing it.
+  for (const failure_reason of ["run_budget_exhausted", "queue_timeout", "external_timeout"]) {
+    assert.equal(
+      terminalFacts({
+        status: "failed", failure_reason,
+        pod_failed_message: "Preempted, reclaimed", container_reason: "OOMKilled",
+      })?.kill_reason,
+      "deadline",
+    );
+  }
 });
 
 test("a workload timeout message yields to explicit pod termination facts", () => {

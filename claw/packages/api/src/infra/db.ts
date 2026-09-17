@@ -742,6 +742,67 @@ export async function ensureConcurrentIndexOrWarn(
   });
 }
 
+/**
+ * Drop an index a later one has replaced, but only once the replacement is
+ * actually there and usable. Exported for tests.
+ *
+ * Renaming an index to `_v2` and editing its predicate leaves the old object
+ * behind for ever: `CREATE INDEX IF NOT EXISTS` will not alter an existing
+ * predicate, so the new name is the only way to widen one -- and nothing in
+ * this migration has ever removed the name it superseded. A database that has
+ * booted the older code carries both from then on, and `claw_tasks` is never
+ * pruned, so both are maintained on every insert and update of a table that
+ * only grows.
+ *
+ * The check is the entire safety of this, and it is not ceremony. Concurrent
+ * builds here are issued through {@link ensureConcurrentIndexOrWarn}, which
+ * swallows a raised build on purpose so one failed index cannot abort the
+ * remaining DDL -- which means "the CREATE above returned" says nothing about
+ * whether the replacement exists. An unconditional drop after a swallowed
+ * failure is precisely how a table ends up with neither index, so the
+ * replacement's validity is read back from `pg_index` first and a build that
+ * did not land leaves the old index exactly where it is.
+ *
+ * Interruption cannot lose both, in either order. The only state this can stop
+ * halfway into is "replacement valid, superseded still present", which is the
+ * state every deployment running today is already in; the next boot re-reads
+ * and finishes the drop. A `DROP INDEX CONCURRENTLY` killed mid-flight leaves
+ * the superseded index invalid and unusable by the planner -- harmless, since
+ * the replacement it was cleared for is valid by then -- and `IF EXISTS` lets
+ * the next boot complete it. On a fresh database the superseded name was never
+ * created and the statement is a no-op.
+ *
+ * Failure is warned rather than thrown for the same reason every other index
+ * statement in this migration is: leaving a redundant index behind costs write
+ * throughput, and aborting the migration on the way to `assertSchema` costs
+ * correctness. A drop that times out against a long-running reader is retried
+ * by the next boot.
+ */
+export async function dropSupersededIndexWhenReplaced(
+  client: pg.PoolClient,
+  superseded: string,
+  replacement: string,
+): Promise<void> {
+  // Same guard, and fatal for the same reason as in ensureConcurrentIndex: the
+  // name is interpolated into DDL, so an unvalidated identifier reaching here
+  // is a caller bug and must not be logged and booted past.
+  if (!/^[a-z_][a-z0-9_]*$/.test(superseded)) {
+    throw new Error(`unsafe index name: ${superseded}`);
+  }
+  const live = await readIndexValidity(client, replacement).catch(() => null);
+  if (!live?.rowCount || !live.rows[0].indisvalid) {
+    logger.warn(
+      { superseded, replacement },
+      "db.superseded_index_kept (its replacement is absent or invalid, so dropping this "
+      + "would leave the query with no index at all)",
+    );
+    return;
+  }
+  await client.query(`DROP INDEX CONCURRENTLY IF EXISTS "${superseded}"`).catch((err) => {
+    logger.warn({ superseded, err: (err as Error)?.message }, "db.superseded_index_drop_failed");
+  });
+}
+
 const TURN_DEBRIS_MESSAGE =
   "a retried dispatch opened this row a second time for the same message; the turn "
   + "belongs to the row that holds it, and this one is closed so it can never be claimed";
@@ -1685,6 +1746,21 @@ export async function initDb(): Promise<void> {
          )
          AND platform_facts_resolved_at IS NULL`,
     );
+    // The name this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because v2 strictly widens v1: identical key
+    // columns in identical order, eight more failure reasons in the `IN` list,
+    // and `sandbox_workload_id IS NOT NULL` dropped from the predicate. Every
+    // row v1 indexed is a row v2 indexes, and v1's predicate implies v2's, so a
+    // pod still running the older code has its narrower scan served by v2
+    // throughout a rolling upgrade rather than falling back to a sequential one.
+    //
+    // The retention rule below still holds for the indexes it names; what it
+    // refuses is an *unguarded* drop, and the guard is what this call adds.
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v2",
+    );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
     ).catch(() => {});
@@ -1724,9 +1800,18 @@ export async function initDb(): Promise<void> {
        WHERE status IN ('completed','failed','cancelled')`,
     );
     // Older variants are intentionally retained during this rolling upgrade.
-    // Dropping them after a swallowed concurrent-create failure could leave the
-    // route with no ordered index; a later maintenance migration can remove
-    // them after every deployment reports the replacement present.
+    // The hazard is specifically an *unguarded* drop: the create above is
+    // issued through a wrapper that swallows a raised build, so a drop that
+    // merely follows it in program order can run after nothing was built and
+    // leave the route with no ordered index.
+    //
+    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
+    // retained -- it reads the replacement back from `pg_index` and drops only
+    // against a valid one -- and the platform-facts pair above has been moved
+    // onto it. This index and `idx_tasks_occupying` have not: each needs its
+    // own check that the newer predicate really does subsume the older, since
+    // the guard protects the ordering and not the claim that the replacement
+    // covers every row the old index did.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});

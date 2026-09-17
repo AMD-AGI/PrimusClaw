@@ -64,7 +64,7 @@ import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
 import { runScript } from "./script-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
-  type RunAttemptToken,
+  type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import type { RunTimeReport } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
@@ -1421,7 +1421,7 @@ class TaskRunner {
    */
   private async capturePlatformFacts(): Promise<void> {
     if (this.platformFacts) return;
-    const identity = this.handsIdentity ?? await this.pendingHandsIdentity();
+    const identity = await this.reportableIdentity();
     const facts = await fx().fetchPlatformFacts(
       identity?.workloadId,
       identity?.platformKey ?? this.platformKey,
@@ -1430,7 +1430,7 @@ class TaskRunner {
   }
 
   /**
-   * The workload of a provision that never came back, out of its own KV record.
+   * The workload of a provision that has not come back, out of its own KV record.
    *
    * `handsIdentity` is assigned from what `ensureHands` returns, so it is still
    * null for every failure that happens before the sandbox is ready -- which is
@@ -1444,16 +1444,23 @@ class TaskRunner {
    * provision writes a PENDING entry naming it before it starts waiting for the
    * pod (ensure-hands' onProvisioned), because a workload nobody has recorded
    * is a workload nobody can reap. That entry is the only copy of the id this
-   * worker holds, and the caller is one line away from destroying it.
+   * worker holds while the provision is still in flight.
+   *
+   * Two callers live in that window, and neither can name the workload any
+   * other way: `capturePlatformFacts`, which is one line away from destroying
+   * it, and the lease heartbeat, which reports it upward so the row keeps a
+   * handle for whoever asks about the ending afterwards. Only the first
+   * destroys anything; what they share is that `handsIdentity` is null.
    *
    * PENDING only, deliberately, and it is the same test `reapPendingHands`
-   * applies a moment later -- so what this reads is exactly the workload that
-   * is about to be stopped. A READY entry is the opposite case twice over: it
-   * cannot be this attempt's (a READY entry means `ensureHands` returned, and
-   * then `handsIdentity` is set and this is never reached), so it belongs to a
-   * live sandbox some earlier message built and this run never attached to, and
-   * SaFE answers for a live workload with the node it is happily running on --
-   * which would record a placement, and an ending, for a run that had neither.
+   * applies a moment later -- so what this reads is the workload that is about
+   * to be stopped, or the one this run is still waiting on. A READY entry is
+   * the opposite case twice over: it cannot be this attempt's (a READY entry
+   * means `ensureHands` returned, and then `handsIdentity` is set and neither
+   * caller reaches this), so it belongs to a live sandbox some earlier message
+   * built and this run never attached to, and SaFE answers for a live workload
+   * with the node it is happily running on -- which would record a placement,
+   * an ending, or a sandbox handle for a run that has none of them.
    *
    * Null on anything unreadable. An absent entry, an unreachable bucket and a
    * corrupt payload all mean the same thing here: we cannot name the workload,
@@ -1469,6 +1476,40 @@ class TaskRunner {
       logger.warn({ err: e, sessionId: this.sessionId }, "platform_facts.pending_identity_unreadable");
       return null;
     }
+  }
+
+  /**
+   * Which sandbox to name when this run tells anything outside itself which
+   * sandbox it is on -- as opposed to which one to act on, which is always
+   * `handsIdentity` and nothing else.
+   *
+   * The two are the same once `ensureHands` has returned and differ before it
+   * does, and the difference is the whole of the pre-ready family: a run killed
+   * as sandbox_pending_timeout, sandbox_exited_before_ready or sandbox_gone
+   * never reaches the assignment, so every report it makes named no sandbox at
+   * all. Both reporters wanted the same thing from the same window and only one
+   * of them had been given it, which is why the rule is stated here rather than
+   * at either call site:
+   *
+   *   - `capturePlatformFacts` asks SaFE what happened to the workload.
+   *   - the lease heartbeat puts the handle on the row, where the API lifts it
+   *     off (`recordLeaseSandbox`) for platform-backfill to ask SaFE with later.
+   *     Backfill's own KV fallback deliberately refuses a reused sandbox, so
+   *     from the second turn of a session the renewal is the only source the
+   *     handle has -- and a row with no handle is a kill nobody can attribute.
+   *
+   * The fallback costs a KV read, and the heartbeat caller runs every
+   * RUN_LEASE_HEARTBEAT_MS for every run on the fleet, so it is reached for
+   * only when `handsIdentity` is genuinely null. That is the pre-ready window,
+   * plus -- under BRAIN_LAZY_SANDBOX -- a turn answered from context that never
+   * provisions and has no entry to find. Both are already paying for this exact
+   * read on a shorter timer: `startDeliveryHeartbeat` reads the same key
+   * unconditionally for the whole run, every LOCK_REFRESH_INTERVAL_MS (10s,
+   * against 15s here). So this adds strictly less KV traffic than the run
+   * already makes, and none at all once the sandbox is attached.
+   */
+  private async reportableIdentity(): Promise<HandsProbeEntry | null> {
+    return this.handsIdentity ?? await this.pendingHandsIdentity();
   }
 
   /**
@@ -3684,7 +3725,7 @@ class TaskRunner {
     // by a path that does not issue leases waits exactly as long as any other.
     beginRun(this.runIdentity.key);
     if (!this.request.run_lease?.url) return null;
-    const tick = () => {
+    const tick = (sandbox: LeaseRenewal["sandbox"]) => {
       const phase = phaseOf(this.runIdentity.key);
       const runClaim = currentFatDelivery()?.runClaim;
       const coverage = this.coverageReport();
@@ -3693,7 +3734,7 @@ class TaskRunner {
       this.coverageOpened = true;
       void fx().postRunLease(this.request, {
         brainId: BRAIN_ID,
-        sandbox: sandboxForLease(this.handsIdentity),
+        sandbox,
         leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
         phase: phase.phase,
         waitReason: phase.waitReason,
@@ -3754,8 +3795,27 @@ class TaskRunner {
         );
       }).catch(() => { /* renewal already logs; a failure is not a verdict */ });
     };
-    tick();
-    const timer = setInterval(tick, RUN_LEASE_HEARTBEAT_MS);
+    // The opening renewal is sent without resolving anything, unlike the ones
+    // on the interval below. `handOffRenewal` releases the delivery layer's
+    // pre-gate heartbeat the moment this method returns, so a first renewal
+    // parked behind an await -- even a KV read -- is a stretch with nobody
+    // renewing the row, which is a live run another pod's reaper finds expired.
+    // Nothing is given up for it: this runs before `executeRun` has asked for a
+    // sandbox, so there is no PENDING entry of this attempt's to find, and
+    // `handsIdentity` is null for the same reason. The interval below resolves
+    // it properly one tick later, still deep inside the pre-ready window.
+    tick(sandboxForLease(this.handsIdentity));
+    // Never at the cost of the renewal itself: a handle that cannot be resolved
+    // is a missing diagnostic, while a renewal that never goes out is a run
+    // taken away from a user, so the tick is sent either way.
+    const timer = setInterval(
+      () => {
+        void this.reportableIdentity()
+          .catch(() => null)
+          .then((identity) => tick(sandboxForLease(identity)));
+      },
+      RUN_LEASE_HEARTBEAT_MS,
+    );
     timer.unref();
     return timer;
   }

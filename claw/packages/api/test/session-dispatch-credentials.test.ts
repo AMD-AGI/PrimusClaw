@@ -135,22 +135,25 @@ for (const doorbell of [false, true]) {
     });
   });
 
-  test(`${path} chat rolls back a credential write failure before opening or publishing`, async () => {
+  test(`${path} chat dispatches the turn when the credential write fails`, async () => {
     await h.sql(`ALTER TABLE claw_sessions ADD CONSTRAINT reject_credentials
       CHECK (config->>'platform_key' IS DISTINCT FROM 'platform-first')`);
-    const steps = dispatchPorts(doorbell, user.platformKey);
-    let rolledBack = false;
+    // The stamp is the only thing that fails, and the turn is published anyway:
+    // `task.platform_key` is what the run is created with, so the workload is
+    // still owned by its submitter. The expected key is therefore the empty one
+    // -- `openChatRun` and `publishTask` assert on what the *session row* holds,
+    // and this case is exactly the one where it holds nothing.
+    const steps = dispatchPorts(doorbell, "");
 
-    const result = await dispatchTaskToBrain(input(user), async () => { rolledBack = true; });
+    const result = await dispatchTaskToBrain(input(user), async () => assert.fail("unexpected rollback"));
 
-    assert.equal(result.kind, "publish_failed");
-    assert.equal(result.kind === "publish_failed" ? result.error.message : "", "session.credentials_stamp_failed");
-    assert.equal(rolledBack, true);
-    assert.deepEqual(steps, []);
+    assert.equal(result.kind, "dispatched");
+    assert.deepEqual(steps, ["event", "open", "publish"]);
     // The row's untouched value, not NULL: `claw_sessions.config` defaults to
     // an empty object, so "nothing was stamped" is an empty config rather than
-    // an absent one. What the rollback has to guarantee is that no credential
-    // reached it.
+    // an absent one. What matters is that no half-written credential reached
+    // it, so a later reader sees "never stamped" and falls back rather than
+    // authenticating with something this call invented.
     assert.deepEqual(await config(), {});
   });
 

@@ -148,3 +148,50 @@ test("a retained pending KV handle reaches the run view without a callback or st
   assert.equal((await listedRun()).terminal.kill_reason, "preempted");
   assert.equal(kvReads, 1);
 });
+
+/**
+ * The run that dies before its first heartbeat, end to end.
+ *
+ * `sandbox_pending_timeout` is Claw's own queue ceiling, and it used to be ranked
+ * with the budgets that outrank the pod -- so this exact row, whose handle the
+ * lease above exists to record and whose pod account `drainPendingPlatformFacts`
+ * names the reason to go and fetch, came back `deadline` with the `OOMKilled` it
+ * had just paid a SaFE read for sitting unused on the row. Asserted through the
+ * HTTP answer rather than against the resolver, because the wasted read and the
+ * discarded reason are only visible together.
+ */
+for (const [message, containerReason, expected] of [
+  ["Preempted, the node was reclaimed while the pod was Pending", "Error", "preempted"],
+  ["", "OOMKilled", "oom"],
+]) {
+  test(`a run reaped at the Pending queue ceiling reports ${expected} on GET /v1/runs`, async () => {
+    const leased = await app.inject({
+      method: "POST", url: "/v1/internal/tasks/run-1/lease",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: {
+        brain_id: "worker-1", lease_seconds: 45,
+        attempt_id: "attempt-1", claim_count: 0, delivery_seq: 0, delivery_count: 0,
+        sandbox: { provider: "safe-workload", handle: "workload-1" },
+      },
+    });
+    assert.equal(leased.statusCode, 200);
+    await finishRun("sandbox_pending_timeout");
+    // The ceiling alone is still a deadline: nothing has been read yet.
+    assert.equal((await listedRun()).terminal.kill_reason, "deadline");
+    const reads = platformAnswers(message!, containerReason!);
+
+    assert.equal(await drainPendingPlatformFacts(), 1);
+
+    const [stored] = await h.sql("SELECT platform_message, platform_container_reason FROM claw_tasks");
+    assert.deepEqual(stored, {
+      platform_message: message,
+      platform_container_reason: containerReason || null,
+    });
+    const run = await listedRun();
+    assert.equal(run.terminal.class, "killed");
+    assert.equal(run.terminal.kill_reason, expected);
+    assert.equal(run.terminal.exit_code, 137);
+    assert.equal(run.placement.node, "node-1");
+    assert.equal(reads(), 1);
+  });
+}

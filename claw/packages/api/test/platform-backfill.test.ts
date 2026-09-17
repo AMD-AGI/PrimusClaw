@@ -254,7 +254,17 @@ test("R6 the drain offers liveness and sandbox failures without requiring a row 
   for (const reason of ["agent_error", "dispatch_failed", "session_deleted"]) {
     assert.ok(!sel!.includes(`'${reason}'`), `unrelated ${reason} must stay out`);
   }
-  assert.doesNotMatch(sel!, /sandbox_workload_id IS NOT NULL|sandbox_workload_id <> ''/);
+  // Against the statement, not against its prose: the eligibility clause added
+  // to this SELECT explains in a comment which filter it replaces, and naming
+  // that filter was enough to trip the assertion below. The invariant it is
+  // here for is unchanged -- a handle on the row is not a precondition, because
+  // the KV fallback recovers chat handles that were never written to it -- and
+  // the column may now be mentioned as one arm of an OR that keeps rows which
+  // can never name a sandbox out. So the arm that lets a handle-less chat row
+  // through is asserted too.
+  const predicate = sel!.replace(/^\s*--.*$/gm, "");
+  assert.doesNotMatch(predicate, /sandbox_workload_id IS NOT NULL|sandbox_workload_id <> ''/);
+  assert.match(predicate, /OR origin = 'chat'/, "a chat row without a handle is still offered");
   assert.match(sel!, /platform_facts_resolved_at IS NULL/, "not already resolved");
   assert.match(sel!, /platform_facts_next_retry_at/, "failed reads have a retry gate");
   assert.match(sel!, /LIMIT/, "and bounded, since this runs inside a sweeper tick");

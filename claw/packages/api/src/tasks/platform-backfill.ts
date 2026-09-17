@@ -19,10 +19,10 @@ const FETCH_TIMEOUT_MS = 10_000;
  *
  * What falls past the cap is deferred, not uniformly recoverable:
  * drainPendingPlatformFacts revisits only rows left `failed` with one of its
- * sandbox/liveness reasons inside the hour, and reapStaleTasks also closes rows
- * as `cancelled` and with `run_budget_exhausted`, which it never selects. So the
- * cap has to be spent on the rows most likely to answer -- see the ordering in
- * backfillPlatformFacts.
+ * sandbox/liveness reasons, inside the hour, and able to name a sandbox at all
+ * -- and reapStaleTasks also closes rows as `cancelled` and with
+ * `run_budget_exhausted`, which it never selects. So the cap has to be spent on
+ * the rows most likely to answer -- see the ordering in backfillPlatformFacts.
  */
 const MAX_PER_SWEEP = 50;
 /** Concurrent reads. Small: SaFE is shared, and nothing here is urgent. */
@@ -62,6 +62,14 @@ function cannotRead(row: SweptRow, reason: string, fields: Partial<SandboxHandle
 }
 
 async function claimRow(row: SweptRow): Promise<SweptRow | null> {
+  // A deployment with no SaFE has nothing to ask, and this module is meant to
+  // be inert there. Without this line it is not inert, it is merely useless:
+  // every offered row still takes the claim below -- one UPDATE that raises the
+  // attempt count and defers the next retry -- and the read then declines it
+  // with `missing_safe_api_url`, so the write buys nothing but a row that looks
+  // like it was tried. In front of the claim rather than in either caller so
+  // that the sweeper's offer and the drain are both covered by one statement.
+  if (!SAFE_API_URL) return null;
   const r = await db.query(
     `UPDATE claw_tasks
         SET platform_facts_attempts = platform_facts_attempts + 1,
@@ -373,6 +381,10 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
  * Retry liveness losses and sandbox failures, including consumer-closed chat
  * rows. Cleanup may already have removed their KV handle or platform detail;
  * this bounded fallback cannot reconstruct evidence that no longer exists.
+ *
+ * Rows that could never name a sandbox are not retried at all -- see the
+ * eligibility clause below, which is what keeps the per-tick LIMIT for the rows
+ * a read can actually answer for.
  */
 export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
@@ -393,6 +405,32 @@ export async function drainPendingPlatformFacts(): Promise<number> {
             'sandbox_health_failed', 'sandbox_bootstrap_failed'
           )
           AND platform_facts_resolved_at IS NULL
+          -- A row that names no sandbox and did not come from chat can never
+          -- be attributed: resolveSandbox refuses it outright, because a
+          -- session's latest sandbox cannot establish a particular DAG node's
+          -- ownership -- and the row is terminal, so no writer can give it a
+          -- handle later either. Selected anyway it is not merely a wasted
+          -- read: it costs a claim UPDATE and a diagnostic line every time its
+          -- backoff expires, and it holds one of the LIMIT slots below while
+          -- doing so. One batch of DAG nodes that timed out before any worker
+          -- claimed them is enough to take all of them. Measured over an hour
+          -- of sweeper ticks, 2000 such rows spent all 3000 slots and the 60
+          -- rows that did carry a SaFE handle got zero reads before they aged
+          -- out of the window below -- where nothing revisits them.
+          --
+          -- Chat rows stay in whether or not they name a handle: theirs is the
+          -- one the KV fallback can still recover, and dropping them is what
+          -- the old sandbox_workload_id IS NOT NULL filter this replaces got
+          -- wrong. It has to be asked here, in SQL, and not of the offered row:
+          -- the rows the sweeper hands to backfillPlatformFacts do not all
+          -- carry origin, so a JavaScript test would read a missing field as
+          -- "not chat" and drop exactly the rows the drain exists for. (No
+          -- backticks anywhere above: this statement is a template literal.)
+          AND (
+            NULLIF(sandbox_workload_id, '') IS NOT NULL
+            OR (metadata->'sandbox' IS NOT NULL AND metadata->'sandbox' <> 'null'::jsonb)
+            OR origin = 'chat'
+          )
           AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
           AND completed_at > NOW() - INTERVAL '1 hour'
      )

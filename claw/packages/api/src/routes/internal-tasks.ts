@@ -261,6 +261,24 @@ async function recordLeaseSandbox(
           FOR UPDATE
        ),
        written AS (
+         -- Assigned rather than COALESCEd, unlike writeRunOwnership's $3 above.
+         -- There a NULL means the event carried no workload field at all and
+         -- the row's own value must survive -- which is why its metadata write
+         -- is skipped in the same breath, by the CASE beside it. Here a NULL is
+         -- not an absent field: the sandbox parsed, so the holder did name the
+         -- sandbox it is on, and NULL is what an agent-sandbox handle reduces
+         -- to in a column that only ever held SaFE workload ids.
+         --
+         -- The column is derived from the handle it is written with, never
+         -- accumulated across reports, and every writer of the pair moves both
+         -- together -- platform-backfill's rememberFallback derives its own
+         -- workload bind from the provider exactly like this one. COALESCE
+         -- would make this the only writer that splits them, leaving the column
+         -- naming a SaFE workload while the metadata names an agent-sandbox
+         -- pod; resolveSandbox reads the metadata first, so the runs API would
+         -- then publish a placement workload id the backfill has already
+         -- concluded is not this run's sandbox. (No backticks: this statement
+         -- is a template literal.)
          UPDATE claw_tasks t
             SET sandbox_workload_id = $3,
                 metadata = jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
@@ -576,6 +594,17 @@ async function renewLegacyRunLease(
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner = $2,
+              -- Bare $2, like the lease_owner above it and unlike renewRunLease's
+              -- COALESCE, because a NULL cannot reach this statement: a body with
+              -- no attempt token is routed here only when isLegacyRunLease holds,
+              -- and that demands a brain_id that is a string with non-blank
+              -- content. Every other shape -- omitted, null, blank, non-string --
+              -- fails the token check, misses the legacy test, and is answered
+              -- 400 by the route before either renewal runs. Writing COALESCE
+              -- here would read as though a legacy renewal may arrive without
+              -- naming its worker, which is the one thing this bridge does not
+              -- allow -- and it would still leave lease_owner bare above. (No
+              -- backticks: this statement is a template literal.)
               brain_id = $2,
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at = NOW(),
@@ -1322,13 +1351,28 @@ function registerLeaseRoute(app: FastifyInstance): void {
         return reply.status(503).send({ ok: false, status: "unknown" });
       }
       if (grant) {
-        // The same write the accepted arm above makes, because an acquisition
-        // is a lease too and a body that names a sandbox names it here on the
-        // one POST that matters most: a fat chat row's first lease. Skipping
-        // it drops the handle for the whole window before the first heartbeat
-        // -- which is precisely when a run dies of `sandbox_pending_timeout`
-        // or an OOM, and precisely the failure whose platform reason this
-        // handle is what makes reachable.
+        // A guard, not a live path. No acquisition this fleet makes carries a
+        // sandbox: `createFatPreGate`'s body() (brain, delivery/dispatch.ts)
+        // sets no `sandbox` field on any POST it sends, acceptance included,
+        // and nothing is provisioned before the execution gate, so there is no
+        // handle in existence to name. The comment that stood here said the
+        // reverse -- that this covered "a fat chat row's first lease" -- and
+        // that lease IS the pre-gate's acceptance, which is exactly the POST
+        // with no sandbox on it. On every acquisition a Brain actually makes,
+        // the condition below is false and this costs one short-circuit.
+        //
+        // Kept rather than deleted, because the gap is the caller's and not the
+        // protocol's: `sandbox` is an optional field of the lease body that
+        // `askRunLease` serialises on every POST, acceptances among them, so an
+        // acceptance starts carrying one the moment a Brain fills it in. The
+        // redelivery arm of `acquireFatLease` is where that would be legitimate
+        // rather than hypothetical -- a retry re-accepts a released lease on a
+        // session whose registry still holds the sandbox the previous attempt
+        // ran in, so `sandboxForLease` has an answer there on the very first
+        // POST. Deleting this would send that handle unrecorded until the first
+        // in-run heartbeat, and the window before that heartbeat is the one
+        // `sandbox_pending_timeout` and a pre-first-token OOM land in -- the
+        // failures whose platform reason this whole path exists to reach.
         //
         // Fenced token-less whatever the body carried: `acquireFatLease` has
         // just set `attempt_id` to NULL, so an attempt-shaped fence would

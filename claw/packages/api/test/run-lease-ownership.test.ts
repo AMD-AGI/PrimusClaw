@@ -548,3 +548,60 @@ test("an acceptance taking over a settled attempt records its sandbox", async ()
   assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
   assert.deepEqual((run.metadata as Record<string, unknown>).sandbox, SAFE_SANDBOX);
 });
+
+// A pre-gate acceptance is the fat chat row's first lease, and it names no
+// sandbox: `createFatPreGate`'s body() sets no such field, and nothing is
+// provisioned before the execution gate. This pins the shape the acquisition's
+// sandbox write is commented against, so a Brain that starts sending one -- or
+// a change that deletes the write on the grounds that nobody does -- is visible
+// here rather than as a handle that quietly stops being recorded.
+test("a pre-gate acceptance records no sandbox, because it names none", async () => {
+  const res = await postTaskRoute("lease", {
+    brain_id: "worker-a", lease_seconds: 45, phase: "waiting", waited_ms: 0, waits: 0,
+    accept: true,
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { ok: true, status: "running", claim_count: 1 });
+  const run = await storedRun();
+  assert.equal(run.lease_owner, "worker-a");
+  assert.equal(run.sandbox_workload_id, null);
+  assert.equal((run.metadata as Record<string, unknown>).sandbox, undefined);
+});
+
+// `renewLegacyRunLease` writes `brain_id = $2` and `lease_owner = $2` bare,
+// with no COALESCE, so a renewal that reached it without naming a worker would
+// NULL both. Nothing can: a body with no attempt token is routed there only by
+// `isLegacyRunLease`, which demands a non-blank string. These are the shapes
+// that would otherwise arrive, refused at the route before either statement --
+// which is the guarantee the bare bind rests on, and the reason it is not a
+// COALESCE.
+for (const [label, brainId] of [
+  ["omits brain_id", undefined],
+  ["sends a null brain_id", null],
+  ["sends an empty brain_id", ""],
+  ["sends a blank brain_id", " \t "],
+  ["sends a non-string brain_id", 7],
+] as const) {
+  test(`a legacy renewal that ${label} cannot clear the recorded worker`, async () => {
+    // Lapsed, which is the shape the legacy bridge's takeover arm accepts: if
+    // one of these bodies ever reached the statement, it would match there and
+    // write both identity columns NULL.
+    await setLeaseOwner("worker-a", -60);
+    await setSandbox(SAFE_SANDBOX);
+    const original = await storedRun();
+
+    const res = await postTaskRoute("lease", {
+      lease_seconds: 45,
+      ...(brainId === undefined ? {} : { brain_id: brainId }),
+    });
+
+    assert.equal(res.statusCode, 400);
+    assert.deepEqual(res.json(), {
+      ok: false, error: "attempt token incomplete: attempt_id is required",
+    });
+    // Nothing was written at all: not the identity, not the lease it would
+    // have extended on its way to clearing one.
+    assert.deepEqual(await storedRun(), original);
+  });
+}
