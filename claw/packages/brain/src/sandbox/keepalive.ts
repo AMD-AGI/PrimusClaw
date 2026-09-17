@@ -1002,6 +1002,17 @@ const BG_PROBE_RESERVE_ATTEMPTS = 8;
 const BG_VERDICT_WRITE_ATTEMPTS = 64;
 
 /**
+ * Retry ceiling for an `idle` verdict. Lower than a running one, which still
+ * outlasts it under contention, but not one: every sweep writes this key -- the
+ * window on a working handle, the record renewal behind it, a probe reservation
+ * -- and a fleet has more than one replica sweeping. A single attempt made an
+ * empty roster contingent on landing in a gap between those writes, and a
+ * verdict that never lands leaves the sandbox held. Yielding to a newer running
+ * verdict is the guard below, not this ceiling.
+ */
+const BG_IDLE_VERDICT_WRITE_ATTEMPTS = 8;
+
+/**
  * How long the retention read phase may go on starting live-work reads.
  *
  * A budget rather than a count, and for the same reason the failure phase has
@@ -1746,9 +1757,11 @@ async function persistVerdict(
   stale: () => boolean,
 ): Promise<void> {
   try {
-    // Re-read all guards after contention; `idle` yields after one attempt.
+    // Re-read all guards after contention, on either verdict: each attempt
+    // re-applies them, so a retry cannot carry a stale decision past a
+    // reactivation, a replacement, or a newer running answer.
     let workloadId: string | undefined;
-    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1;
+    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : BG_IDLE_VERDICT_WRITE_ATTEMPTS;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const e = await deps.kv.get(key);
       if (!e || stale()) return;
@@ -1810,21 +1823,20 @@ async function persistVerdict(
         await deps.kv.update(key, next, e.revision);
         return;
       } catch {
-        // A running retry re-reads the entry and all guards on the next attempt.
+        // The next attempt re-reads the entry and all guards.
         logger.info(
           { sessionId, workloadId, attempt },
           "keepalive.background_work_answer_write_contended",
         );
       }
     }
-    // Exhausted running retries are reported; an unconditional write could
-    // overwrite a newer reactivation or replacement.
-    if (running > 0) {
-      logger.warn(
-        { sessionId, workloadId, attempts },
-        "keepalive.background_work_answer_write_abandoned",
-      );
-    }
+    // Exhausted retries are reported; an unconditional write could overwrite a
+    // newer reactivation or replacement. An abandoned idle verdict reads back as
+    // `unknown`, which keeps the sandbox until a later sweep measures it again.
+    logger.warn(
+      { sessionId, workloadId, attempts, running },
+      "keepalive.background_work_answer_write_abandoned",
+    );
   } catch {
     // Missing verdicts read back as `unknown`, which keeps the sandbox.
   }
@@ -1846,25 +1858,23 @@ async function refreshIdleSince(
   key: string,
   revision: number,
   info: HandsKvEntry,
-  seenAt: number,
   workObserved = true,
 ): Promise<void> {
   try {
-    // Keep the verdict anchor monotonic and no later than its measurement.
-    const idleSince = Math.max(
-      typeof info.idleSince === "number" ? info.idleSince : 0,
-      seenAt,
-    );
-    // The reuse clock reflects when this sweep acted on the running verdict.
+    // `workSeenAt` carries the window, and `idleSince` is left where the idle
+    // period opened it. Moving it would be moving the period's own identity:
+    // persistVerdict matches it to decide a verdict belongs to the period it
+    // was measured under, and measuredUnderThisIdlePeriod matches it again to
+    // decide the stored verdict is still usable. A sweep that advanced it on
+    // every running answer therefore refused the idle answer that followed --
+    // and because a running verdict is what brings the sweep back here, the
+    // refusal renewed the state that caused it and the window never closed.
     const next = sc.encode(JSON.stringify({
       ...info,
-      idleSince,
       workSeenAt: (deps.now ?? Date.now)(),
       ...(workObserved ? { quiescedAt: undefined } : {}),
     }));
     await deps.kv.update(key, next, revision);
-    // Keep the scan copy aligned for probes dispatched later in this tick.
-    info.idleSince = idleSince;
     if (workObserved) delete info.quiescedAt;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
@@ -2077,12 +2087,11 @@ async function collectIdleTarget(
   const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
   if (needsProbe(identity, info, sessionId)) census.probeCandidates.push(candidate);
   if (bgWork === "running") {
-    const seenAt = peeked.at ?? Date.now();
-    await refreshIdleSince(deps, key, e.revision, info, seenAt);
+    await refreshIdleSince(deps, key, e.revision, info);
     return false;
   }
   if (bgWork === "unknown" && canProbeJobs(info, sessionId)) {
-    await refreshIdleSince(deps, key, e.revision, info, (deps.now ?? Date.now)(), false);
+    await refreshIdleSince(deps, key, e.revision, info, false);
     return false;
   }
   const expired = bgWork === "gone"
@@ -2140,7 +2149,7 @@ async function expireIdleTarget(
   try {
     const running = await probeUserProcesses(deps, info, sessionId);
     if (running > 0) {
-      await refreshIdleSince(deps, key, e.revision, info, Date.now());
+      await refreshIdleSince(deps, key, e.revision, info);
       return;
     }
     await deps.kv.update(

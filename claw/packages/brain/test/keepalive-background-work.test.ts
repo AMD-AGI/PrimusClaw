@@ -294,21 +294,27 @@ test("a probe that never answers holds the handle at every streak length", async
 });
 
 test("work that outlasts the reuse window still leaves a window behind it", async () => {
-  // The bug this pins: idleSince is stamped when the task ends, so a job that
+  // The bug this pins: the window was stamped when the task ended, so a job that
   // runs longer than the window means the handle is already expired the moment
   // the job finishes -- deleted by the very next sweep, before the session can
   // reuse the pod or read what the job wrote.
+  //
+  // `workSeenAt` is what carries the window, reuseWindowStart taking the later
+  // of it and `idleSince`. `idleSince` stays where the idle period opened it,
+  // because that is the period's identity: a verdict is matched against it to
+  // decide which period it was measured under.
   const { kv, current } = fakeKv();
   stubPingableProvider();
 
   await sweepUntilProbed({ kv, countActiveShells: async () => 1 });
 
-  const idleSince = current().idleSince;
-  assert.equal(typeof idleSince, "number", "the idle clock was never moved while work ran");
+  const workSeenAt = current().workSeenAt;
+  assert.equal(typeof workSeenAt, "number", "the window was never moved while work ran");
   assert.ok(
-    Date.now() - (idleSince as number) < 60_000,
-    `the stamp has to track the work, not the turn that started it; got ${idleSince}`,
+    Date.now() - (workSeenAt as number) < 60_000,
+    `the stamp has to track the work, not the turn that started it; got ${workSeenAt}`,
   );
+  assert.equal(current().idleSince, 0, "the period's identity stays put");
 });
 
 test("the probe is not repeated on every tick", async () => {
