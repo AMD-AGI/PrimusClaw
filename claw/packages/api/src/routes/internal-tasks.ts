@@ -28,6 +28,7 @@ import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/ind
 import type { BackendMcpCtx } from "../backend-mcp/index.js";
 import { applyAgentDone, type AgentDonePayload } from "../tasks/lifecycle.js";
 import { getTask, transitionStatus } from "../tasks/db.js";
+import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -151,6 +152,9 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
+              metadata = CASE WHEN $9::jsonb IS NULL THEN metadata
+                         ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
+                         END,
               attempt_id          = COALESCE($5, attempt_id),
               attempt_generation  = CASE
                                       WHEN $5::text IS NOT NULL
@@ -170,6 +174,7 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
         taskId, brainId || null, workloadId || null, RENEWABLE_STATUSES,
         attemptId ?? null, body.delivery_seq ?? 0, body.delivery_count ?? 0,
         body.claim_count ?? 0,
+        workloadId ? JSON.stringify({ provider: "safe-workload", handle: workloadId }) : null,
       ],
     );
     return (r.rowCount ?? 0) > 0;
@@ -182,8 +187,140 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
   }
 }
 
+/**
+ * Name the sandbox this run is holding on the row that granted its lease.
+ *
+ * The generation this binds is the one the renewal just matched on -- what
+ * `quotedGeneration` answers -- and not the attempt token's own count. On
+ * the fat path the Brain mints its attempt at zero and quotes the generation
+ * the acceptance issued in `run_claim` beside it, while `acquireFatLease` has
+ * already pushed the row's `claim_count` to one or more -- so a fence bound to
+ * the token names a generation the row stopped carrying at acceptance, and
+ * every heartbeat of every fat chat turn writes nothing. That is not a lost
+ * diagnostic: `platform-backfill` reads this handle to ask SaFE why a run
+ * died, and its KV fallback refuses a reused sandbox (the entry's `createdAt`
+ * must fall inside the run), so from the second turn of a session onward the
+ * lease report is the only thing that can establish the handle at all.
+ *
+ * `token` null is the acquisition's shape rather than a missing value: a fat
+ * row's first lease clears `attempt_id` (see acquireFatLease), so there is no
+ * attempt for the write to fence against even when the body carried one, and
+ * the legacy arm below -- owner, live lease, the row's own bearer, no attempt
+ * open -- is the whole of the evidence there is.
+ */
+async function recordLeaseSandbox(
+  taskId: string,
+  brainId: string,
+  sandbox: SandboxHandle,
+  body: RunLeaseBody,
+  token: AttemptToken | null,
+  authorization: string | undefined,
+): Promise<void> {
+  const bearer = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  const fence = token?.ok ? token : null;
+  const generation = fence ? quotedGeneration(body, fence) : null;
+  try {
+    // Renewal and sandbox storage can straddle a takeover, including one by the same brain.
+    //
+    // Three statements' worth of question in one, because the answers differ
+    // and only one of them is a fault: `fenced` is whether this caller still
+    // holds the row it just renewed, `written` is whether the handle was not
+    // already there. Without the split, the no-op guard below would make a
+    // dropped handle and a handle recorded seconds ago both arrive as zero
+    // rows -- and a silently dropped handle is the whole of this function's
+    // failure mode. The guard itself is worth having: a renewal arrives every
+    // few seconds for every run in the fleet and the value it carries changes
+    // at most once per turn, so every heartbeat after the first would rewrite
+    // the row for nothing. `FOR UPDATE` rather than a bare SELECT so the fence
+    // is evaluated against the live row and holds while the UPDATE runs;
+    // otherwise a takeover committing mid-statement would be re-checked
+    // against snapshot values that can no longer be true.
+    const r = await db.query(
+      `WITH fenced AS (
+         SELECT task_id,
+                sandbox_workload_id AS workload,
+                metadata->'sandbox' AS recorded
+           FROM claw_tasks
+          WHERE task_id = $1
+            AND lease_owner = $2
+            AND lease_expires_at > NOW()
+            AND status = ANY($5::text[])
+            AND (
+              ($6::text IS NOT NULL AND attempt_id = $6 AND claim_count = $7
+                AND (delivery_seq, delivery_count) = ($8::bigint, $9::bigint))
+              -- No attempt is open, so there is none to fence against: what
+              -- is left is the row's own bearer. Neither the generation nor
+              -- the settled attempt belongs here -- acquireFatLease clears
+              -- attempt_id and nothing else, so after a redelivery or a
+              -- takeover the row carries a non-zero generation and still
+              -- remembers a spent attempt, and a fence demanding either would
+              -- refuse the new holder the one write it is here to make. (No
+              -- backticks: this statement is a template literal.)
+              OR ($6::text IS NULL AND internal_token_hash = $10 AND attempt_id IS NULL)
+            )
+          FOR UPDATE
+       ),
+       written AS (
+         -- Assigned rather than COALESCEd, unlike writeRunOwnership's $3 above.
+         -- There a NULL means the event carried no workload field at all and
+         -- the row's own value must survive -- which is why its metadata write
+         -- is skipped in the same breath, by the CASE beside it. Here a NULL is
+         -- not an absent field: the sandbox parsed, so the holder did name the
+         -- sandbox it is on, and NULL is what an agent-sandbox handle reduces
+         -- to in a column that only ever held SaFE workload ids.
+         --
+         -- The column is derived from the handle it is written with, never
+         -- accumulated across reports, and every writer of the pair moves both
+         -- together -- platform-backfill's rememberFallback derives its own
+         -- workload bind from the provider exactly like this one. COALESCE
+         -- would make this the only writer that splits them, leaving the column
+         -- naming a SaFE workload while the metadata names an agent-sandbox
+         -- pod; resolveSandbox reads the metadata first, so the runs API would
+         -- then publish a placement workload id the backfill has already
+         -- concluded is not this run's sandbox. (No backticks: this statement
+         -- is a template literal.)
+         UPDATE claw_tasks t
+            SET sandbox_workload_id = $3,
+                metadata = jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+           FROM fenced f
+          WHERE t.task_id = f.task_id
+            AND (f.workload IS DISTINCT FROM $3 OR f.recorded IS DISTINCT FROM $4::jsonb)
+         RETURNING 1
+       )
+       SELECT EXISTS (SELECT 1 FROM fenced)  AS fenced,
+              EXISTS (SELECT 1 FROM written) AS written`,
+      [
+        taskId, brainId,
+        sandbox.provider === "safe-workload" ? sandbox.handle : null,
+        JSON.stringify(sandbox), RENEWABLE_STATUSES,
+        fence ? fence.attemptId : null,
+        generation,
+        fence ? fence.deliverySeq : null,
+        fence ? fence.deliveryCount : null,
+        fence ? null : createHash("sha256").update(bearer).digest("hex"),
+      ],
+    );
+    // Said out loud rather than swallowed, because the two explanations are a
+    // takeover this fence is here to lose to -- benign, and the renewal's own
+    // next tick answers 409 -- and this fence disagreeing with the renewal's,
+    // which is a defect and was invisible for exactly as long as this write
+    // returned nothing. Either way the run is executing with no handle
+    // recorded, which is the fact `platform-backfill` will be missing. One
+    // line per tick it happens: zero lines in a healthy fleet.
+    if ((r.rows[0] as { fenced?: boolean } | undefined)?.fenced !== true) {
+      logger.warn(
+        { taskId, brainId, attemptId: fence?.attemptId ?? null, generation },
+        "run_lease.sandbox_handle_unrecorded",
+      );
+    }
+  } catch (err) {
+    logger.warn({ taskId, err: (err as Error)?.message }, "task.ownership_write_failed");
+  }
+}
+
 interface RunLeaseBody {
   brain_id?: string;
+  sandbox?: unknown;
   /** How long the row should treat this renewal as valid. Bounded below. */
   lease_seconds?: number;
   /** "executing" or "waiting"; anything else is read as executing. */
@@ -380,6 +517,7 @@ async function renewRunLease(
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner      = COALESCE($2, lease_owner),
+              brain_id         = COALESCE($2, brain_id),
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at     = NOW(),
               metadata         = jsonb_set(
@@ -456,6 +594,18 @@ async function renewLegacyRunLease(
     const r = await db.query(
       `UPDATE claw_tasks
           SET lease_owner = $2,
+              -- Bare $2, like the lease_owner above it and unlike renewRunLease's
+              -- COALESCE, because a NULL cannot reach this statement: a body with
+              -- no attempt token is routed here only when isLegacyRunLease holds,
+              -- and that demands a brain_id that is a string with non-blank
+              -- content. Every other shape -- omitted, null, blank, non-string --
+              -- fails the token check, misses the legacy test, and is answered
+              -- 400 by the route before either renewal runs. Writing COALESCE
+              -- here would read as though a legacy renewal may arrive without
+              -- naming its worker, which is the one thing this bridge does not
+              -- allow -- and it would still leave lease_owner bare above. (No
+              -- backticks: this statement is a template literal.)
+              brain_id = $2,
               lease_expires_at = NOW() + ($3::int * INTERVAL '1 second'),
               heartbeat_at = NOW(),
               metadata = jsonb_set(
@@ -1030,11 +1180,6 @@ async function buildBackendMcpCtxStub(
   };
 }
 
-/**
- * Register the three Brain → Backend lifecycle endpoints.
- *
- * Mount path: `/v1/internal/tasks/:taskId/{agent_done,event,backend-mcp}`.
- */
 export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<void> {
   registerAgentDoneRoute(app);
   registerEventRoute(app);
@@ -1092,6 +1237,25 @@ function registerEventRoute(app: FastifyInstance): void {
 }
 
 /**
+ * What a rejected `sandbox` field looked like, in terms that are safe to log.
+ *
+ * The handle is deliberately not among them: it is free text of up to a
+ * kilobyte from a body this endpoint has just found malformed, and the line is
+ * written once per renewal for as long as the Brain keeps sending it. The
+ * provider and the JSON shape are what name the sending bug.
+ */
+function describeRejectedSandbox(value: unknown): { shape: string; provider: string | null } {
+  const object = typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+  const provider = object?.provider;
+  return {
+    shape: value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
+    provider: provider === undefined ? null : String(provider).slice(0, 64),
+  };
+}
+
+/**
  * Brain → Backend: this run is still alive, and here is what it is doing.
  *
  * Kept apart from the two endpoints above because it says something much
@@ -1119,6 +1283,27 @@ function registerLeaseRoute(app: FastifyInstance): void {
           });
         }
       }
+      const sandbox = parseSandboxHandle(body.sandbox);
+      if (body.sandbox !== undefined && !sandbox) {
+        // Reported and dropped, never answered 400. This field names the
+        // sandbox; it is not the request. A 400 refuses the lease itself, and
+        // `askRunLease` reads every non-409 failure as `unresolved` -- so a
+        // worker whose handle went bad keeps heartbeating into a refusal,
+        // never renews, and a run that is executing perfectly well is reaped
+        // as `worker_lost`. A diagnostic field must not be able to do that.
+        //
+        // Dropping it is not the same as accepting it: nothing unparsed
+        // reaches the row, and this line says a handle arrived that could not
+        // be stored, which is how the bad value stays visible instead of
+        // becoming a column nobody can explain. (`run_claim` and `claim_count`
+        // above keep their 400s, and the difference is not squeamishness:
+        // those are bound into the fence, where a value the column cannot
+        // hold makes the whole statement a server fault.)
+        logger.warn(
+          { taskId, ...describeRejectedSandbox(body.sandbox) },
+          "run_lease.sandbox_rejected",
+        );
+      }
       const token = attemptTokenOf(body);
       if (!token.ok && !isLegacyRunLease(body)) {
         // A partial modern token must never fall back to the legacy bridge.
@@ -1139,6 +1324,11 @@ function registerLeaseRoute(app: FastifyInstance): void {
           ? await renewRunLease(taskId, body, token)
           : await renewLegacyRunLease(taskId, body, req.headers.authorization, runClaim);
       if (outcome.kind === "accepted") {
+        if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
+          await recordLeaseSandbox(
+            taskId, body.brain_id, sandbox, body, token, req.headers.authorization,
+          );
+        }
         if (token.ok) await mergeRenewalCoverage(taskId, body, token);
         return { ok: true, status: outcome.status };
       }
@@ -1161,6 +1351,37 @@ function registerLeaseRoute(app: FastifyInstance): void {
         return reply.status(503).send({ ok: false, status: "unknown" });
       }
       if (grant) {
+        // A guard, not a live path. No acquisition this fleet makes carries a
+        // sandbox: `createFatPreGate`'s body() (brain, delivery/dispatch.ts)
+        // sets no `sandbox` field on any POST it sends, acceptance included,
+        // and nothing is provisioned before the execution gate, so there is no
+        // handle in existence to name. The comment that stood here said the
+        // reverse -- that this covered "a fat chat row's first lease" -- and
+        // that lease IS the pre-gate's acceptance, which is exactly the POST
+        // with no sandbox on it. On every acquisition a Brain actually makes,
+        // the condition below is false and this costs one short-circuit.
+        //
+        // Kept rather than deleted, because the gap is the caller's and not the
+        // protocol's: `sandbox` is an optional field of the lease body that
+        // `askRunLease` serialises on every POST, acceptances among them, so an
+        // acceptance starts carrying one the moment a Brain fills it in. The
+        // redelivery arm of `acquireFatLease` is where that would be legitimate
+        // rather than hypothetical -- a retry re-accepts a released lease on a
+        // session whose registry still holds the sandbox the previous attempt
+        // ran in, so `sandboxForLease` has an answer there on the very first
+        // POST. Deleting this would send that handle unrecorded until the first
+        // in-run heartbeat, and the window before that heartbeat is the one
+        // `sandbox_pending_timeout` and a pre-first-token OOM land in -- the
+        // failures whose platform reason this whole path exists to reach.
+        //
+        // Fenced token-less whatever the body carried: `acquireFatLease` has
+        // just set `attempt_id` to NULL, so an attempt-shaped fence would
+        // match nothing.
+        if (sandbox && typeof body.brain_id === "string" && body.brain_id.trim()) {
+          await recordLeaseSandbox(
+            taskId, body.brain_id, sandbox, body, null, req.headers.authorization,
+          );
+        }
         return grant.claimCount === undefined
           ? { ok: true, status: grant.status }
           : { ok: true, status: grant.status, claim_count: grant.claimCount };

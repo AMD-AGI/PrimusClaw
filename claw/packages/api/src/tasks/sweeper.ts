@@ -35,7 +35,7 @@ import {
   envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
 import { nc, taskDeliverySettlement } from "../infra/nats.js";
-import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
+import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 import { stopAllHandlesForDag } from "./sandbox-stopper.js";
@@ -90,11 +90,22 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
  */
 const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 
-/** Injection seam for the terminal events a reap has to announce. */
+/**
+ * Injection seam for the terminal events a reap has to announce.
+ *
+ * `handleMap` is here for a different reason from the other three. It is not an
+ * announcement; it is the census `reapOrphanHandles` traverses, and it is bound
+ * through a module-level memo over a NATS KV bucket that no caller can reach
+ * without a broker. That left the one sweep with an irreversible action -- it
+ * destroys sandboxes -- as the one sweep whose loop no test could enter, so
+ * what the traversal does when it stops part way was held by reading the
+ * source. Naming the census here lets that be driven instead.
+ */
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
   drainPendingMessage: drainOldestPendingMessage,
   deliverySettlement: taskDeliverySettlement,
+  handleMap,
 };
 
 let stopped = false;
@@ -2048,11 +2059,59 @@ export async function reapStuckSessions(): Promise<number> {
   return r.rowCount;
 }
 
-/** Reconcile DagHandleMap: drop entries for terminal DAG roots. */
-export async function reapOrphanHandles(): Promise<number> {
-  const all = await handleMap().listAll();
+/**
+ * Reconcile DagHandleMap: drop entries for terminal DAG roots.
+ *
+ * `lease` is the leadership this scan is running under, and the loop below
+ * checks it because this is the one sweep whose action is irreversible: it
+ * decides the DAG behind a handle is over and destroys the sandbox. The lock
+ * that makes that decision safe is a session-scoped advisory lock on a
+ * connection this function never touches -- every statement here goes through
+ * `db.query` on the main pool -- so when that connection drops, Postgres
+ * releases the lock immediately and nothing in this traversal notices. Measured:
+ * a second replica took the same lock 200ms later while this loop ran on for
+ * twenty-one more queries, which is two replicas both concluding "the DAG behind
+ * this handle is over" about the same handle, and the second one deciding it
+ * against a world the first has already changed.
+ *
+ * At the top of the iteration and not anywhere finer, because that is the only
+ * boundary where stopping is coherent: mid-`stopAllHandlesForDag` there is a
+ * teardown in flight that this function cannot take back.
+ *
+ * Stopping bounds the exposure and does not repair it. The handles torn down
+ * before the drop stay torn down, and the count returned is of those. The
+ * caller is told the pass was not exclusive by `withLeaderLock`, which throws
+ * `LeadershipLostError` rather than letting this return read as a clean sweep.
+ *
+ * Optional because this is also called directly, by tests and by anything that
+ * wants one pass without leadership; with no lease there is no boundary to
+ * check and the loop runs to the end as it always did.
+ */
+export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
+  const all = await sweeperPorts.handleMap().listAll();
   let dropped = 0;
+  // How much of the traversal happened, which is not how much of it did
+  // anything. `dropped` counts teardowns and most handles are torn down by
+  // nobody, so `all.length - dropped` answers "how many handles are alive"
+  // rather than "how much of this pass was abandoned" -- a hundred handles
+  // walked down to the last ten reported a hundred still to go. The number the
+  // line exists to carry is how much work was handed to the next leader, so it
+  // has to come off a counter the loop advances every iteration.
+  let examined = 0;
   for (const [dagRoot] of all) {
+    const lost = lease?.lost();
+    if (lost) {
+      // The handle this iteration had not yet judged is one of the remaining
+      // ones: the gate is read before anything looks at it, so it is left whole
+      // for the next leader along with everything behind it.
+      logger.error(
+        { dagRoot, examined, dropped, remaining: all.length - examined, err: lost.message },
+        "sweeper.orphan_handles_stopped (the lock connection dropped, so this traversal "
+        + "was no longer exclusive and the rest of it is left to the next leader)",
+      );
+      break;
+    }
+    examined++;
     const r = await db.query(
       `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
       [dagRoot],

@@ -219,7 +219,7 @@ async function processCompletionEvent(
 ): Promise<boolean> {
   const messageId = typeof event.message_id === "string" && event.message_id
     ? event.message_id : null;
-  const outcome = await withCompletionLock(sessionId, async () => {
+  const outcome = await withCompletionLock(sessionId, async (lease) => {
     // Another delivery may have finished while this one was acquiring the lock.
     const current = (await db.query(
       "SELECT processed_at FROM claw_session_events WHERE id = $1 AND session_id = $2",
@@ -257,6 +257,59 @@ async function processCompletionEvent(
     } else {
       await handleComplete(sessionId, event, rowId, provenance);
     }
+    // The durable done-marker, and the one statement in this body that a hold
+    // which has already lost its lock must not write.
+    //
+    // `withLeaderLock` throws `LeadershipLostError` after this function returns,
+    // the caller below turns that into `nak(10_000)`, and the redelivery is the
+    // only repair that exists for a completion two holders may both have run --
+    // see the header of completion-lock.ts. That repair is reachable through
+    // exactly one thing: the redelivery reading `processed_at` as NULL. Stamped
+    // unconditionally, the pass that lost the lock wrote the marker on its way
+    // out, its own redelivery returned at the gate at the top of this body, and
+    // the duplicate terminalization and the second `recordCompletionTurns` at
+    // the same turn index stood. The throw was still thrown and the nak still
+    // went out; the remedy they were justified by had already been deleted by
+    // the line that ran before them. Measured, against a real backend killed by
+    // `pg_terminate_backend` mid-body: the row came back stamped and the
+    // redelivery acked without running `handleComplete` at all.
+    //
+    // The check sits here rather than at the top because nothing above it can
+    // be taken back -- `handleComplete` closes a row, releases a gate and
+    // writes turns -- so a loss discovered at the top and one discovered here
+    // leave the same work behind. What differs is only whether the delivery
+    // that carried it can be redone, and that is decided by this statement
+    // alone.
+    //
+    // Skipping it costs the ordinary crash window and nothing else: a process
+    // that dies between `handleComplete` and here leaves `processed_at` NULL
+    // and the redelivery redoes the completion, which is the contract the
+    // column has always had ("on failure -> leave processed_at = NULL").
+    //
+    // Two alternatives were rejected. Moving the stamp out of the body, to
+    // after `withCompletionLock` returns, puts the read of `processed_at` and
+    // the write of it in different critical sections -- which is the race the
+    // lock exists to prevent, since a second delivery could then take the lock,
+    // read NULL and run `handleComplete` a second time on a completion that had
+    // in fact just finished. Having the caller clear the stamp when it naks on
+    // a `LeadershipLostError` repairs it after the fact instead of not writing
+    // it, and it clears from a replica that demonstrably no longer holds the
+    // lock: by then another holder may have taken it, read NULL, run
+    // `handleComplete` and stamped its own marker, which an unconditional clear
+    // would erase -- turning a duplicate into a triplicate. Made safe it needs
+    // the stamp to return its own timestamp and the clear to be a
+    // compare-and-swap against it, two extra statements on an error path, to
+    // buy only the window this check cannot close: a drop recorded between this
+    // read and the UPDATE's return, one round trip wide, where the stamp lands
+    // and `withLeaderLock`'s own post-`fn` read then throws. That window is
+    // unrepaired here and is no worse than it was; it is bounded by the same
+    // limit the throw itself has, which is that a loss can only be acted on
+    // once db.ts has recorded it. Closing it completely would mean sending this
+    // statement on the lock's own connection, so that a released lock makes the
+    // stamp fail rather than succeed -- which needs `LeaderLease` to expose its
+    // client (infra/leader-lock.ts), and would put a completion's write on the
+    // lock pool the bulkhead in db.ts keeps it off.
+    if (lease.lost()) return;
     await db.query("UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1", [rowId]);
   });
   return outcome.ran;
@@ -369,8 +422,18 @@ export async function consumeEventDelivery(msg: {
           return;
         }
       } catch (e) {
+        // Retry complete handling later, with `processed_at` still NULL so the
+        // redelivery redoes it rather than reading a done-marker and acking.
+        //
+        // Two shapes arrive here and both depend on that. A step of
+        // `handleComplete` that threw never reached the stamp at all; a
+        // `LeadershipLostError` reached it and declined to write it, because
+        // this delivery ran without the exclusion it assumed and the redelivery
+        // is the only repair a possibly-duplicated completion has. See the
+        // stamp in `processCompletionEvent`, which is the statement that makes
+        // this comment true.
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
-        msg.nak(10_000); // Retry complete handling later — processed_at stays NULL
+        msg.nak(10_000);
         return;
       }
     } else if (event.type === "taskInterrupted" || event.type === "taskResumed") {

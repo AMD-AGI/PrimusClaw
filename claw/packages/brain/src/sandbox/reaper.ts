@@ -15,6 +15,7 @@ import {
   BRAIN_REGISTRY_TTL_MS,
   MULTI_NODE_IDLE_RECLAIM_MS,
   MULTI_NODE_SWEEPER_INTERVAL_MS,
+  SANDBOX_PENDING_ABANDONED_AFTER_MS,
   SANDBOX_SWEEPER_EVICT_AFTER_FAILURES,
 } from "../config.js";
 import { reclaimIdleSessionClusters as realReclaimIdleSessionClusters }
@@ -337,8 +338,35 @@ export async function destroyHands(
  * the failure happened later in the agent loop (LLM error, tool crash,
  * etc.) — in that case the sandbox is healthy and should be kept so the
  * user's next message can reuse it; this function is a no-op for READY.
+ *
+ * `ownedSinceMs` is what makes this the CALLER's reap rather than the
+ * session's. `hands.<sid>` is keyed per session and its PENDING form carries
+ * no task id, so `status === "pending"` alone says only that some run of this
+ * session left a workload mid-creation -- not that this run did. The two come
+ * apart on the ordinary chat turn: under BRAIN_LAZY_SANDBOX a turn answered
+ * from context calls `ensureHands` zero times, and when its model provider
+ * refuses it, this failure path ran and destroyed the workload a PREVIOUS
+ * message of the same session was still provisioning. The predecessor then
+ * reported its own sandbox as preempted, on a task that had never asked for
+ * one.
+ *
+ * The test that separates them already exists and is the runner's, not ours:
+ * `sandboxAskedAt` is stamped immediately before each `ensureHands` call, and
+ * `onProvisioned` writes `createdAt` from inside that same call in the same
+ * process, so an entry stamped before the ask belongs to something else. The
+ * runner passes that threshold down rather than this function re-deriving it,
+ * because it is the only thing that knows it -- see `pendingHandsIdentity`,
+ * which makes exactly this comparison for the reporting side.
+ *
+ * `null` means this run never asked for a sandbox at all. A run that never
+ * asked owns no entry and therefore reaps nothing: there is no window in which
+ * it could have minted the workload the entry names.
  */
-export async function reapPendingHands(sessionId: string): Promise<void> {
+export async function reapPendingHands(
+  sessionId: string,
+  ownedSinceMs: number | null,
+): Promise<void> {
+  if (ownedSinceMs === null) return;
   try {
     const kv = getHandsKv();
     // Read-through: a pending binding an old replica wrote sits under the
@@ -346,7 +374,32 @@ export async function reapPendingHands(sessionId: string): Promise<void> {
     const entry = await readSessionBinding(kv, sessionId);
     if (!entry) return;
     const info = JSON.parse(entry.value);
+    // Belt and braces with the key walk above: `readSessionBinding` looks under
+    // the session's own names and a retention is keyed by a sandbox generation,
+    // so it should not be reachable from here. Should not is not the standard
+    // this guard is held to anywhere else it appears -- a retention projection
+    // is a byte copy of the binding it was made from, so it would pass the
+    // status test below and be stopped with the live work it exists to protect
+    // still running inside it.
+    if (isRetentionEntry(info)) return;
     if (info.status !== "pending") return;
+    const createdAt = Date.parse(typeof info.createdAt === "string" ? info.createdAt : "");
+    // Unparseable or absent `createdAt` is not evidence of ownership. Entries
+    // written before that field existed read as somebody else's, which is the
+    // direction that costs a leak rather than a stranger's workload; the
+    // sweeper's collector below is the net under exactly those.
+    if (!Number.isFinite(createdAt) || createdAt < ownedSinceMs) {
+      logger.info(
+        {
+          sessionId,
+          workloadId: info.workloadId,
+          createdAt: info.createdAt,
+          askedAt: new Date(ownedSinceMs).toISOString(),
+        },
+        "hands.reap_pending_not_ours",
+      );
+      return;
+    }
     logger.warn({ sessionId, workloadId: info.workloadId }, "hands.reap_pending");
     await destroyHands(
       sessionId,
@@ -365,6 +418,164 @@ const SWEEPER_HEALTH_TIMEOUT_MS = 3_000;
 // <=0 disables sweeper-driven eviction entirely.
 
 /**
+ * Whether anyone still holds the run lease at `scope` -- and, separately,
+ * whether we could find out.
+ *
+ * `sessionHasActiveRunLease` is the same read and the same tombstone rule; what
+ * it does not have is the third answer. It returns `false` when the bucket
+ * cannot be read, because its callers turn a `false` into a skipped reclaim
+ * that the next pass retries. The pending collector turns a `false` into a stop
+ * against a user's sandbox, and there is nothing after that to retry, so "the
+ * store did not answer" has to stay distinguishable from "nobody is running".
+ */
+async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free" | "unknown"> {
+  let lock;
+  try {
+    lock = await kv.get(`lock.${scope}`);
+  } catch (err) {
+    logger.warn({ err, scope }, "sweeper.lease_read_failed");
+    return "unknown";
+  }
+  // A released lease is deleted, and a delete leaves a readable entry with an
+  // empty value -- so presence alone reads every finished run as a running one.
+  return lock && !isTombstone(lock) ? "held" : "free";
+}
+
+/**
+ * Is the walked entry still, byte for byte, the one the decision was taken on?
+ *
+ * The revision answers it on its own -- in a NATS KV bucket a revision is the
+ * sequence of the write that produced the value, so an unchanged revision means
+ * nobody has written this key since the walk read it. The payload is re-checked
+ * anyway because it costs nothing and because it names the failure in the log
+ * an operator will read: an entry that is READY here is a creator that finished
+ * while this pass was reading the lease, which is a different story from an
+ * entry that has simply been refreshed.
+ *
+ * Every unreadable or changed answer is `false`. This gates a stop that nothing
+ * undoes, and the cost of a wrong `false` is one skipped pass against an entry
+ * that is still sitting there for the next one.
+ */
+async function pendingEntryUnmoved(
+  kv: KV,
+  key: string,
+  revision: number,
+  workloadId: string,
+): Promise<boolean> {
+  let entry;
+  try {
+    entry = await kv.get(key);
+  } catch (err) {
+    logger.warn({ err, key, revision }, "sweeper.pending_recheck_failed");
+    return false;
+  }
+  // A deleted key reads back as an entry with an empty value; something else
+  // collected this one first, and it names no workload we may act on.
+  if (!entry || isTombstone(entry)) return false;
+  if (entry.revision !== revision) return false;
+  try {
+    const info = JSON.parse(sc.decode(entry.value)) as Record<string, unknown>;
+    return info.status === "pending" && String(info.workloadId ?? "") === workloadId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop the workload a long-abandoned PENDING entry names, and delete that
+ * entry -- the one that was walked, at the revision it was walked at.
+ *
+ * Not `destroyHands`. That one is written for a caller holding a session: it
+ * re-reads `hands.<sessionId>` and CASes on the key that read returns. A walker
+ * has something better and something more dangerous than a session id. Better,
+ * because it has the exact key and revision its decision was taken on. More
+ * dangerous, because `sessionIdFromHandsKey` does not always yield a session:
+ * a retention is keyed by a sandbox generation, so the id it hands back names
+ * no session, and re-deriving a key from it addresses whatever that fabricated
+ * id happens to hit. The caller's `isRetentionEntry` guard is what keeps a
+ * retention out of here in the first place; deleting only the walked key is
+ * what keeps a mistake from spreading to a key nobody looked at.
+ *
+ * The revision is checked BEFORE the stop, not only after it. The decision this
+ * call carries was taken on two separate reads -- the entry, then the lease --
+ * and the creator that entry belongs to finishes inside exactly that gap: it
+ * promotes PENDING -> READY with a plain `kv.put` (ensure-hands) and releases
+ * `lock.<scope>` at the end of its run, in that order. So a lease that reads
+ * free has any promotion already durable behind it, and re-reading the entry
+ * after the lease read is what turns "nobody was running this a moment ago"
+ * into "and the record I am about to act on has not moved since". A conditional
+ * delete cannot do that job: it runs after a stop that nothing undoes, so all it
+ * can do is report the race, leaving a READY binding that names a workload this
+ * pass has already killed.
+ *
+ * The delete stays conditional on the same revision for the other half of it --
+ * a heartbeat re-put between the recheck and here must not have its entry
+ * deleted out from under it -- and a lost CAS there is said out loud rather than
+ * retried: the workload is already stopped, which is the half that mattered.
+ *
+ * Returns whether the workload was actually collected, so the pass counts an
+ * eviction only where one happened.
+ */
+async function collectAbandonedPending(
+  kv: KV,
+  key: string,
+  revision: number,
+  sessionId: string,
+  info: Record<string, unknown>,
+  ageMs: number,
+): Promise<boolean> {
+  const workloadId = String(info.workloadId ?? "");
+  const token = typeof info.token === "string" ? info.token : "";
+  // The last thing before the irreversible act, and after the lease read for
+  // the reason above. Anything at all having been written to this key since the
+  // walk -- a promotion, a rebuild's replacement, an idle marker, a heartbeat
+  // refresh -- invalidates the evidence this stop rests on, and "leave it" is
+  // free: the entry is still there, and the next pass reads it fresh.
+  if (!await pendingEntryUnmoved(kv, key, revision, workloadId)) {
+    logger.info(
+      { sessionId, key, revision, workloadId, ageMs },
+      "sweeper.pending_moved_not_collected",
+    );
+    return false;
+  }
+  // ERROR, not warn, and deliberately. Nothing reaches this line in a healthy
+  // fleet: a run that ends, retries or crashes with its pod alive reaps its own
+  // pending entry on the way out. An entry that is two hours old with no lease
+  // behind it means a brain died between minting a workload and recording it,
+  // or a reap failed silently -- and the GPUs that entry was holding were being
+  // billed the whole time. An operator should see every one of these.
+  logger.error(
+    {
+      sessionId,
+      key,
+      workloadId,
+      runScope: info.runScope,
+      createdAt: info.createdAt,
+      ageMs,
+      horizonMs: SANDBOX_PENDING_ABANDONED_AFTER_MS,
+    },
+    "sweeper.pending_abandoned_collected",
+  );
+  try {
+    await stopNamedSandbox(sessionId, info as HandsProbeEntry);
+    metrics.onSandboxStop("ok");
+  } catch (err) {
+    metrics.onSandboxStop("error");
+    // The entry stays: it is the only record of workloadId + platformKey, and
+    // deleting it after a stop that was not confirmed leaves a workload nothing
+    // can name. The next pass asks again.
+    logger.warn({ err, sessionId, key, workloadId }, "sweeper.pending_stop_failed");
+    return false;
+  }
+  revokeHandsToken(token);
+  unregisterSandbox(sessionId, info as HandsProbeEntry);
+  if (!await deleteHandsEntryIfRevision(kv, key, revision)) {
+    logger.warn({ sessionId, key, revision, workloadId }, "sweeper.pending_entry_left_after_stop");
+  }
+  return true;
+}
+
+/**
  * Periodic sweeper: scan all `hands.*` KV entries, health-check each Hands
  * endpoint, delete KV + Workload when unhealthy for too long. Complements
  * the in-task lazy revalidation for long-idle sessions.
@@ -380,10 +591,16 @@ async function sweepStaleHands(): Promise<void> {
       scanned += 1;
       const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
+      // The revision of the entry THIS pass read, kept for the collector below:
+      // it is what the collector re-checks before it stops anything -- the
+      // decision is taken here and acted on several reads later -- and what any
+      // delete is conditioned on, under the key the decision was read from.
+      let revision = 0;
       try {
         const entry = await kv.get(key);
         if (!entry) continue;
         info = JSON.parse(sc.decode(entry.value));
+        revision = entry.revision;
       } catch { continue; }
 
       // A retained container's projection lives in this keyspace too, and it
@@ -402,14 +619,103 @@ async function sweepStaleHands(): Promise<void> {
       // as a session's.
       if (isRetentionEntry(info)) continue;
 
-      // PENDING entries are owned by an in-flight ensureHands (legitimately
-      // polling a slow GPU queue, or bootstrapping hands). Policy: wait
-      // indefinitely — never reap. If the creator dies, the handleTask KV
-      // refresh stops and the entry naturally expires via the bucket TTL;
-      // at that point the SaFE-side workload becomes SaFE's idle-killer
-      // problem, not ours. Keeping the wait unbounded avoids killing long
-      // legitimate waits.
+      // A PENDING entry is USUALLY owned by an in-flight ensureHands -- polling
+      // a slow GPU queue, or bootstrapping hands -- and a sweeper must not
+      // stop a sandbox a run is still waiting for. That is what the two guards
+      // below establish, and only what is left after them is collected.
+      //
+      // What used to be here instead was an unconditional `continue`, on the
+      // reasoning that an abandoned pending entry expires on the bucket TTL and
+      // the workload behind it "becomes SaFE's idle-killer problem, not ours".
+      // Both halves of that are false, which is why there is a collector here
+      // now rather than a comment:
+      //
+      //  - Nothing expires while the session keeps receiving messages.
+      //    `startDeliveryHeartbeat` re-puts `hands.<sid>` every 10s to refresh
+      //    its TTL, and it is SESSION-keyed and ownership-blind: it runs for
+      //    every task on the session, including the ones that provision nothing.
+      //    Measured on a live bucket, an orphan's revision advanced 2 -> 9 under
+      //    a non-owner's heartbeat across twice the 5-minute TTL and expired
+      //    only once that heartbeat stopped. So the entry is pinned alive by
+      //    precisely the tasks that do not own it.
+      //  - SaFE's Workload has no idle timeout. This repo states that twice
+      //    already -- config.ts, where AGENT_SANDBOX_SESSION_TIMEOUT is refused
+      //    outside kubernetes mode, and safe-workload-provider.ts, where
+      //    `workloadTimeoutSeconds` says the same thing. `timeout` runs whether
+      //    or not anyone is using the sandbox and
+      //    `ttlSecondsAfterFinished` is cleanup after it ends. The only thing
+      //    actually behind an abandoned workload is that absolute timeout,
+      //    SANDBOX_DEFAULT_TIMEOUT_SECONDS: 24 hours of GPUs.
+      //
+      // And expiry would be the wrong end of it anyway. Every path that can
+      // stop the workload -- this sweep, reapPendingHands, the stale_pending
+      // destroy in the reuse path, teardown, rollback -- needs the entry to
+      // still exist, because the entry is the only record of workloadId +
+      // platformKey. Letting it expire deletes the evidence and keeps the leak.
       if (info.status === "pending") {
+        if (SANDBOX_PENDING_ABANDONED_AFTER_MS <= 0) continue;
+        const createdAt = Date.parse(typeof info.createdAt === "string" ? info.createdAt : "");
+        // Age is measured from creation, and the heartbeat above cannot move
+        // it: that refresh writes the entry's bytes back unchanged
+        // (`kv.update(e.key, sc.encode(e.value), e.revision)`) purely to reset
+        // the TTL, so it advances the revision and leaves `createdAt` exactly
+        // as `onProvisioned` stamped it. The horizon would be defeated if it
+        // were measured from the last write; it is not.
+        //
+        // An entry with no readable `createdAt` has no age, so it has not been
+        // shown to be past anything and is left alone.
+        if (!Number.isFinite(createdAt)) continue;
+        const ageMs = Date.now() - createdAt;
+        if (ageMs < SANDBOX_PENDING_ABANDONED_AFTER_MS) continue;
+        // Age says nobody finished; the run lease says whether anybody is still
+        // trying. It has to be this and not the age alone, because the two
+        // legitimately co-exist: SANDBOX_PENDING_TIMEOUT_SECONDS lets a run
+        // queue for three hours, longer than this two-hour horizon, and that
+        // run is not abandoned -- it is holding its lease and will fail its own
+        // message at its own ceiling.
+        //
+        // `sessionHasActiveRunLease` is the right read for "is anyone running
+        // this", and it is the same one the multi-node sweep below already
+        // takes. Two properties matter here. It reads `lock.<scope>`, which a
+        // live run re-proves every LOCK_REFRESH_INTERVAL_MS for the whole run
+        // and releases only at the end -- so a task merely between statements,
+        // between turns of its agent loop, or parked in a long tool call still
+        // holds it and reads as active. And it takes the scope from the entry
+        // rather than assuming the session id, because under the default
+        // RUN_GATE_KEY=workspace a run's lease is at `lock.ws.<workspaceId>`
+        // and under a DAG it is at the root task id; looking under the session
+        // would find nothing and report "no lease" for a run that has one.
+        //
+        // Which is why an entry that does not name its scope is skipped rather
+        // than guessed at. A PENDING entry written before `runScope` was added
+        // to that payload cannot be checked, and "cannot tell" has to mean
+        // "leave it": a wrong "no lease" here stops a live user's sandbox.
+        if (typeof info.runScope !== "string" || !info.runScope) {
+          logger.warn(
+            { sessionId, key, workloadId: info.workloadId, ageMs },
+            "sweeper.pending_unscoped_not_collected",
+          );
+          continue;
+        }
+        //
+        // And an unreadable bucket is not an absent lease either, which is the
+        // one place this cannot simply call `sessionHasActiveRunLease`: that
+        // one folds a failed read into `false`, which is harmless where it is
+        // used today (a skipped cluster reclaim, retried next pass) and is a
+        // licence to stop a live sandbox here.
+        const lease = await readRunLeaseState(kv, info.runScope);
+        if (lease !== "free") {
+          if (lease === "unknown") {
+            logger.warn(
+              { sessionId, key, runScope: info.runScope, workloadId: info.workloadId },
+              "sweeper.pending_lease_unreadable",
+            );
+          }
+          continue;
+        }
+        if (await collectAbandonedPending(kv, key, revision, sessionId, info, ageMs)) {
+          evicted += 1;
+        }
         continue;
       }
 

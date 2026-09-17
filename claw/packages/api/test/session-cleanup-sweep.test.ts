@@ -263,3 +263,35 @@ test("the report is taken after the work, over rows the pass never touched", asy
 
   assert.deepEqual(order, ["scan", "report"]);
 });
+
+test("a pass whose lock connection drops stops before the next session, and leaves it pending", async () => {
+  // The defect this pins is not slowness, it is loss of exclusivity: a dropped
+  // lock connection releases the advisory lock server-side, so another replica
+  // is free to take the same `cleanup_state = 'pending'` rows while this loop
+  // sits between statements. Two holders then run runSessionCleanup for one
+  // session against each other's half-finished state.
+  //
+  // Asserted on what the pass DID -- which sessions it cleaned -- rather than
+  // on a log line, and the lease reports the loss only after the first session,
+  // so a pass that ignored it would be visible by having cleaned the second.
+  const cleaned = healthyPorts();
+  const due = [
+    { session_id: "s-1", user_id: "u-1" },
+    { session_id: "s-2", user_id: "u-1" },
+  ];
+  dbStub = stubDb(((sql: string) => {
+    if (sql.startsWith("SELECT session_id, user_id")) return due;
+    return [];
+  }) as Answer);
+
+  let dropped = false;
+  const lease = {
+    lost: () => (dropped ? new Error("Connection terminated unexpectedly") : undefined),
+  };
+  teardownPorts.writeTombstones = async () => { dropped = true; return "written"; };
+
+  const finished = await sweepSessionCleanups(lease);
+
+  assert.deepEqual(cleaned, ["s-1"], "the session after the drop is left for the next leader");
+  assert.equal(finished, 1);
+});

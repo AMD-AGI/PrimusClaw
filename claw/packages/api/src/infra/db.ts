@@ -87,6 +87,144 @@ const lockPool = new pg.Pool({
 pool.on("error", (err) => logger.error({ err }, "db.pool.idle_client_error"));
 lockPool.on("error", (err) => logger.error({ err }, "db.lockPool.idle_client_error"));
 
+// The same protection for a client while a caller HOLDS it, which the two above
+// do not give: a pool's 'error' handler covers its clients only while they are
+// idle in it. A connection that drops while checked out emits on the client
+// itself, and a client with no listener for 'error' is the one case where
+// node's EventEmitter rethrows -- taking the process down rather than failing
+// the query.
+//
+// Not hypothetical, and not rare enough to leave: four API replicas were
+// restarting every few hours with
+//
+//   Error: Connection terminated unexpectedly
+//       at Client._handleErrorEvent (pg/lib/client.js:422)
+//   throw er; // Unhandled 'error' event
+//
+// Every long hold is exposed to it -- `withLeaderLock` keeps a client across a
+// whole scan, `inTransaction` across a transaction, `acquireIdempotencyLock`
+// across a whole session create -- and the blast radius is the replica, not the
+// query: in-flight requests on that pod die with it, and whatever the scan was
+// holding is left to the next leader.
+//
+// Attached on 'connect' rather than at each of the dozen call sites, because
+// the ones that matter are exactly the ones a future call site will forget.
+// This is additive: the pool still removes and replaces the broken client.
+//
+// Logging it is not the whole job, though. Surviving the drop leaves the caller
+// running, and for a hold whose correctness IS the connection that is the more
+// dangerous half: `withLeaderLock` takes a session-scoped advisory lock on the
+// client it keeps, and the server releases that lock the instant the backend
+// goes -- so from the drop onwards the scan is still walking its read-decide-act
+// traversal while another replica is free to take the same lock and walk it too.
+// The scan cannot notice on its own: its own work goes through `db.query` on the
+// main pool, which is unaffected, and the release at the end cannot undo a
+// teardown that already happened. `pg_advisory_unlock` on the dropped client
+// does not even answer false -- it throws -- so the alarm written for exactly
+// this condition is on the branch that a drop does not take.
+//
+// So the fact has to leave this listener. What it cannot do here is act on it:
+// this file has no idea what the holder is doing or where it could stop, and
+// ending the query for it would be the same guess at a different level. It
+// publishes instead, at the one place that learns of the loss, in the two shapes
+// a holder needs -- `connectionLost` for a scan that can check at a loop
+// boundary, `onConnectionLost` for one parked in an await with nothing to check.
+// A holder that reads neither is exactly as it was: logged, alive, uninformed.
+//
+// What a holder does with the fact is its own, and the two consumers so far do
+// different things with it, because the work behind the lock differs. A scan
+// that has lost `withLeaderLock` is told it was not the leader and its caller
+// treats the pass as failed. A session create that has lost the per-key
+// idempotency lock can only be refused while nothing is created: once the row
+// is in and its first turn is running in a sandbox, the create is not
+// retractable, so the loss is spent on saving that create's idempotency record
+// somewhere still connected rather than on failing it.
+//
+// Watchers are called inside a try/catch, and the published shape is a callback
+// rather than an `AbortSignal`, because a watcher that throws on this path must
+// not become the unhandled exception the listener exists to prevent -- and a
+// signal cannot offer that: `AbortController.abort()` dispatches to listeners
+// itself and rethrows a listener's error from a `process.nextTick`, where no
+// caller's try/catch can reach it. A holder that wants a signal can build one
+// from the callback in a line, and owns what its own listeners throw.
+type ClientLoss = {
+  /** The error that dropped the connection; set once, by the first one. */
+  err?: Error;
+  /** Holders waiting to be told, dropped as soon as they have been. */
+  watchers: Set<(err: Error) => void>;
+};
+
+// Keyed weakly, and per connection rather than per checkout: a client whose
+// connection dropped is never handed out again (pg-pool's `_release` removes a
+// client whose `_queryable` went false), so the record dies with it.
+const clientLosses = new WeakMap<pg.ClientBase, ClientLoss>();
+
+const lossOf = (client: pg.ClientBase): ClientLoss => {
+  const existing = clientLosses.get(client);
+  if (existing) return existing;
+  const loss: ClientLoss = { watchers: new Set() };
+  clientLosses.set(client, loss);
+  return loss;
+};
+
+const tellWatcher = (watcher: (err: Error) => void, err: Error): void => {
+  try {
+    watcher(err);
+  } catch (watcherErr) {
+    logger.error({ err: watcherErr }, "db.client.lost_watcher_failed");
+  }
+};
+
+/**
+ * The error that dropped this client's connection, or undefined while it holds.
+ *
+ * For a holder that has somewhere to check -- the top of a scan's per-item loop
+ * -- since a connection that is gone stays gone, so one read at the boundary is
+ * as good as a subscription and cannot be missed by arriving late.
+ */
+export function connectionLost(client: pg.ClientBase): Error | undefined {
+  return clientLosses.get(client)?.err;
+}
+
+/**
+ * Be told when this client's connection drops. Returns an unsubscribe.
+ *
+ * Called immediately when the connection is already gone, so a holder that
+ * subscribes after the drop is told rather than waiting for a second one that
+ * will never come -- registering and checking are the same act, with no window
+ * between them for the loss to land in.
+ */
+export function onConnectionLost(
+  client: pg.ClientBase,
+  watcher: (err: Error) => void,
+): () => void {
+  const loss = lossOf(client);
+  if (loss.err) {
+    tellWatcher(watcher, loss.err);
+    return () => {};
+  }
+  loss.watchers.add(watcher);
+  return () => loss.watchers.delete(watcher);
+}
+
+const surfaceClientError = (client: pg.PoolClient): void => {
+  client.on("error", (err) => {
+    const loss = lossOf(client);
+    // Recorded before anything that can fail, and only for the first error: a
+    // dropped socket usually emits twice (the backend's reason, then the close),
+    // and the first one is the one that says when leadership ended.
+    const firstLoss = loss.err === undefined;
+    if (firstLoss) loss.err = err as Error;
+    logger.error({ err }, "db.client.error");
+    if (!firstLoss) return;
+    const waiting = [...loss.watchers];
+    loss.watchers.clear();
+    for (const watcher of waiting) tellWatcher(watcher, loss.err as Error);
+  });
+};
+pool.on("connect", surfaceClientError);
+lockPool.on("connect", surfaceClientError);
+
 if (DB_SCHEMA) {
   const setSearchPath = (client: pg.PoolClient): void => {
     client.query(`SET search_path TO "${DB_SCHEMA}"`);
@@ -611,6 +749,67 @@ export async function ensureConcurrentIndexOrWarn(
   await ensureConcurrentIndex(client, name, createSql).catch((err: unknown) => {
     if (typeof (err as { code?: unknown })?.code !== "string") throw err;
     logger.warn({ index: name, err }, "db.concurrent_index_build_failed");
+  });
+}
+
+/**
+ * Drop an index a later one has replaced, but only once the replacement is
+ * actually there and usable. Exported for tests.
+ *
+ * Renaming an index to `_v2` and editing its predicate leaves the old object
+ * behind for ever: `CREATE INDEX IF NOT EXISTS` will not alter an existing
+ * predicate, so the new name is the only way to widen one -- and nothing in
+ * this migration has ever removed the name it superseded. A database that has
+ * booted the older code carries both from then on, and `claw_tasks` is never
+ * pruned, so both are maintained on every insert and update of a table that
+ * only grows.
+ *
+ * The check is the entire safety of this, and it is not ceremony. Concurrent
+ * builds here are issued through {@link ensureConcurrentIndexOrWarn}, which
+ * swallows a raised build on purpose so one failed index cannot abort the
+ * remaining DDL -- which means "the CREATE above returned" says nothing about
+ * whether the replacement exists. An unconditional drop after a swallowed
+ * failure is precisely how a table ends up with neither index, so the
+ * replacement's validity is read back from `pg_index` first and a build that
+ * did not land leaves the old index exactly where it is.
+ *
+ * Interruption cannot lose both, in either order. The only state this can stop
+ * halfway into is "replacement valid, superseded still present", which is the
+ * state every deployment running today is already in; the next boot re-reads
+ * and finishes the drop. A `DROP INDEX CONCURRENTLY` killed mid-flight leaves
+ * the superseded index invalid and unusable by the planner -- harmless, since
+ * the replacement it was cleared for is valid by then -- and `IF EXISTS` lets
+ * the next boot complete it. On a fresh database the superseded name was never
+ * created and the statement is a no-op.
+ *
+ * Failure is warned rather than thrown for the same reason every other index
+ * statement in this migration is: leaving a redundant index behind costs write
+ * throughput, and aborting the migration on the way to `assertSchema` costs
+ * correctness. A drop that times out against a long-running reader is retried
+ * by the next boot.
+ */
+export async function dropSupersededIndexWhenReplaced(
+  client: pg.PoolClient,
+  superseded: string,
+  replacement: string,
+): Promise<void> {
+  // Same guard, and fatal for the same reason as in ensureConcurrentIndex: the
+  // name is interpolated into DDL, so an unvalidated identifier reaching here
+  // is a caller bug and must not be logged and booted past.
+  if (!/^[a-z_][a-z0-9_]*$/.test(superseded)) {
+    throw new Error(`unsafe index name: ${superseded}`);
+  }
+  const live = await readIndexValidity(client, replacement).catch(() => null);
+  if (!live?.rowCount || !live.rows[0].indisvalid) {
+    logger.warn(
+      { superseded, replacement },
+      "db.superseded_index_kept (its replacement is absent or invalid, so dropping this "
+      + "would leave the query with no index at all)",
+    );
+    return;
+  }
+  await client.query(`DROP INDEX CONCURRENTLY IF EXISTS "${superseded}"`).catch((err) => {
+    logger.warn({ superseded, err: (err as Error)?.message }, "db.superseded_index_drop_failed");
   });
 }
 
@@ -1542,17 +1741,35 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await ensureConcurrentIndexOrWarn(
       client,
-      "idx_tasks_platform_facts_pending",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending
+      "idx_tasks_platform_facts_pending_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v2
          ON claw_tasks(
            platform_facts_next_retry_at ASC NULLS FIRST,
            completed_at ASC,
            task_id ASC
          )
        WHERE status = 'failed'
-         AND failure_reason IN ('brain_timeout','worker_lost')
-         AND sandbox_workload_id IS NOT NULL
+         AND failure_reason IN (
+           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
+           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed'
+         )
          AND platform_facts_resolved_at IS NULL`,
+    );
+    // The name this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because v2 strictly widens v1: identical key
+    // columns in identical order, eight more failure reasons in the `IN` list,
+    // and `sandbox_workload_id IS NOT NULL` dropped from the predicate. Every
+    // row v1 indexed is a row v2 indexes, and v1's predicate implies v2's, so a
+    // pod still running the older code has its narrower scan served by v2
+    // throughout a rolling upgrade rather than falling back to a sequential one.
+    //
+    // The retention rule below still holds for the indexes it names; what it
+    // refuses is an *unguarded* drop, and the guard is what this call adds.
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v2",
     );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
@@ -1593,9 +1810,18 @@ export async function initDb(): Promise<void> {
        WHERE status IN ('completed','failed','cancelled')`,
     );
     // Older variants are intentionally retained during this rolling upgrade.
-    // Dropping them after a swallowed concurrent-create failure could leave the
-    // route with no ordered index; a later maintenance migration can remove
-    // them after every deployment reports the replacement present.
+    // The hazard is specifically an *unguarded* drop: the create above is
+    // issued through a wrapper that swallows a raised build, so a drop that
+    // merely follows it in program order can run after nothing was built and
+    // leave the route with no ordered index.
+    //
+    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
+    // retained -- it reads the replacement back from `pg_index` and drops only
+    // against a valid one -- and the platform-facts pair above has been moved
+    // onto it. This index and `idx_tasks_occupying` have not: each needs its
+    // own check that the newer predicate really does subsume the older, since
+    // the guard protects the ordering and not the claim that the replacement
+    // covers every row the old index did.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
