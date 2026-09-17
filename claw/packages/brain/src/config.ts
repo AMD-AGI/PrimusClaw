@@ -1111,7 +1111,13 @@ export const SANDBOX_KEEPALIVE_TARGET_CEILING = env("SANDBOX_KEEPALIVE_TARGET_CE
 export const SANDBOX_KEEPALIVE_RECONCILE_RESERVE = env("SANDBOX_KEEPALIVE_RECONCILE_RESERVE");
 // Deployment-declared because not every provider exposes its idle deadline.
 export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC");
-export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 300, { min: 1 });
+// Has to stay above `keepaliveSweepCeilingSec()`, which sums every phase that
+// awaits per-target work: the retention read, the idle expiry that probes and
+// then stops each handle, the ping phase, and the failure handling. The gap
+// between two refreshes of one handle and the admission reclaim horizon are
+// both derived from this number, so one declared below the sweep's own worst
+// case makes both of them short in the unsafe direction.
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 420, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can

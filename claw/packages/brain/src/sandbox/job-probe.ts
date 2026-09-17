@@ -150,14 +150,55 @@ export async function assertSandboxRunning(entry: JobProbeEntry): Promise<void> 
   requireRunning(await provider.get(inst));
 }
 
+/**
+ * The probe's whole deadline, spanning both of its round trips.
+ *
+ * The probe reads the workload's status and then reads the roster. A deadline
+ * on only the second leaves the first bounded by the provider's own transport
+ * timeout -- a number this side did not choose, and one the sweep phase that
+ * awaits this probe cannot state as its cost. Sized to cover both, so the
+ * caller's argument is the bound rather than one term of it.
+ */
+export const JOBS_PROBE_BUDGET_MS = 20_000;
+
+/**
+ * Fail once the budget is spent, whatever the awaited call is still doing.
+ *
+ * The call is not cancelled: a provider read holds its own deadline and this
+ * side cannot reach into it. What this bounds is the waiting, which is the cost
+ * the phase actually pays.
+ */
+async function withinBudget<T>(work: Promise<T>, deadline: number, what: string): Promise<T> {
+  const left = deadline - Date.now();
+  if (left <= 0) throw new Error(`sandbox jobs probe budget expired before the ${what}`);
+  // Claimed so the losing side of the race cannot surface as an unhandled
+  // rejection after this function has already returned its verdict.
+  work.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`sandbox jobs probe budget expired during the ${what}`)),
+          left,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Inspect EnvD jobs and the process identity those jobs belong to. */
 export async function inspectSandboxJobs(
   entry: JobProbeEntry,
-  timeoutMs = 5_000,
+  timeoutMs = JOBS_PROBE_BUDGET_MS,
 ): Promise<JobsProbeResult> {
   const inst = instanceFromEntry(entry);
   const agent = inst.provider === "agent-sandbox";
-  await assertSandboxRunning(entry);
+  const deadline = Date.now() + timeoutMs;
+  await withinBudget(assertSandboxRunning(entry), deadline, "workload status read");
 
   const base = agent
     ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
@@ -176,10 +217,14 @@ export async function inspectSandboxJobs(
     if (AUTH_INTERNAL_TOKEN.trim()) headers["X-Internal-Token"] = AUTH_INTERNAL_TOKEN.trim();
   }
 
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new Error("sandbox jobs probe budget expired before the roster read");
+  }
   const response = await fetch(url, {
     method: "GET",
     headers,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(remaining),
   });
   if (!response.ok) {
     if (response.status === 404 || response.status === 405 || response.status === 501) {

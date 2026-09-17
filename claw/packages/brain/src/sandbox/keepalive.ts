@@ -38,6 +38,7 @@ import { HANDS_STATE_DIR } from "./bootstrap.js";
 import {
   assertSandboxRunning,
   inspectSandboxJobs,
+  JOBS_PROBE_BUDGET_MS,
   SandboxJobsUnavailableError,
   SandboxTerminalProbeError,
   SandboxTrackingLostError,
@@ -976,6 +977,35 @@ const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
  */
 const BG_PROBE_MAX_IN_FLIGHT = 8;
 const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
+
+/**
+ * How long a teardown that failed waits before the walk offers it again.
+ *
+ * A stop that cannot succeed leaves its record `closing`, and the walk reaches
+ * a `closing` record every sweep. Attempted unconditionally, one unreachable
+ * control plane makes every sweep re-pay the stop's full cost for a set that
+ * never shrinks, and the phase that renews every live record is the one behind
+ * it. Deferring converges the cost without abandoning the teardown: the record
+ * stays, and the next sweep past the backoff tries again.
+ *
+ * Kept in memory rather than on the record. The cost being bounded is this
+ * replica's sweep, a replica that restarted has no teardown of its own left to
+ * defer, and writing it would put a conditional update in the path of a stop
+ * that is already failing.
+ */
+const TEARDOWN_RETRY_BACKOFF_MS = 60_000;
+const teardownRetryAt = new Map<string, number>();
+
+/** Whether a teardown that failed is still inside its backoff. */
+function teardownDeferred(sessionId: string, now: number): boolean {
+  const until = teardownRetryAt.get(sessionId);
+  if (until === undefined) return false;
+  if (now >= until) {
+    teardownRetryAt.delete(sessionId);
+    return false;
+  }
+  return true;
+}
 /**
  * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
  * The ping phase behind it needs what is left to renew every live record before
@@ -1190,8 +1220,26 @@ export function keepaliveCensusPhaseCeilingSec(): number {
  */
 export function keepaliveSweepCeilingSec(): number {
   return keepaliveCensusPhaseCeilingSec()
+    + keepaliveIdleExpiryPhaseCeilingSec()
     + keepalivePingPhaseCeilingSec()
     + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
+}
+
+/**
+ * The longest the idle-expiry phase can run: its budget bars the *starting* of
+ * a teardown, so the ones already in flight when it expires run on for their
+ * own ceiling. They run concurrently, so one ceiling is the term rather than
+ * one per slot.
+ *
+ * Two ceilings, because the work this phase starts is two calls: it reconfirms
+ * the roster at the destructive boundary, then stops the sandbox. The probe
+ * term is the budget the probe is given and not the provider's own timeout,
+ * which is what `JOBS_PROBE_BUDGET_MS` exists to make true.
+ */
+export function keepaliveIdleExpiryPhaseCeilingSec(): number {
+  return Math.ceil(
+    (IDLE_EXPIRY_BUDGET_MS + JOBS_PROBE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000,
+  );
 }
 
 /** Longest one started eviction may take, stop and retries together. */
@@ -1232,6 +1280,7 @@ export function resetBackgroundWorkStateForTest(): void {
   bgProbeInFlight.clear();
   bgGeneration.clear();
   bgProbeCursor = 0;
+  teardownRetryAt.clear();
   // Rotation state like the cursor above it: a queue left by one test names keys
   // the next one never walks, and its first read phase would order itself around
   // retentions that do not exist.
@@ -1956,9 +2005,16 @@ async function collectTargets(
       deferredExpiries += 1;
       return;
     }
-    await destroyHands(item.sessionId, item.info).catch((err) => {
-      logger.warn({ err, sessionId: item.sessionId }, `keepalive.${item.site}`);
-    });
+    await destroyHands(item.sessionId, item.info)
+      .then(() => teardownRetryAt.delete(item.sessionId))
+      .catch((err) => {
+        // Held off rather than retried on the next sweep. The record stays
+        // `closing`, so the walk keeps offering this handle, and a stop that
+        // cannot succeed would otherwise re-pay its whole cost every sweep for
+        // a set that never shrinks.
+        teardownRetryAt.set(item.sessionId, clock() + TEARDOWN_RETRY_BACKOFF_MS);
+        logger.warn({ err, sessionId: item.sessionId }, `keepalive.${item.site}`);
+      });
   });
   await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
     if (clock() >= expiryDeadline) {
@@ -2047,16 +2103,20 @@ async function collectKvTarget(
   // unresponsive control plane spends the sweep on teardowns and the ping phase
   // behind it never renews a single live record.
   if (isClosingStatus(info.status)) {
-    census.teardowns.push({ sessionId, info, site: "closing_stop_retry" });
+    if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
+      census.teardowns.push({ sessionId, info, site: "closing_stop_retry" });
+    }
     return true;
   }
   if (info.status && info.status !== "ready") return true;
   if (info.terminalReason) {
-    logger.error(
-      { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
-      "keepalive.sandbox_terminal_recorded",
-    );
-    census.teardowns.push({ sessionId, info, site: "terminal_stop_retry" });
+    if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
+      logger.error(
+        { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
+        "keepalive.sandbox_terminal_recorded",
+      );
+      census.teardowns.push({ sessionId, info, site: "terminal_stop_retry" });
+    }
     return true;
   }
   if (isRetentionEntry(info)) {
