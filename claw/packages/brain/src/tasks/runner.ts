@@ -2262,7 +2262,30 @@ class TaskRunner {
     logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "task.sandbox_ensuring");
     // Before the call, not after it: the PENDING entry this marker qualifies is
     // written from inside it.
-    this.sandboxAskedAt = Date.now();
+    //
+    // And only on the FIRST ask of this run, which is why it is `??=` and not an
+    // assignment. `attachHands` deliberately does not cache a failure, so a lazy
+    // run can arrive here more than once -- the tool that hit the failure
+    // reports it and a later tool call gets a fresh attempt. The first attempt
+    // can have got as far as `onProvisioned`, which mints a workload and records
+    // it as PENDING before waiting for the pod; a second attempt that fails
+    // earlier than that (a KV read, an admission refusal) writes nothing of its
+    // own. Re-stamping the marker then moves the ownership floor past the entry
+    // this very run created, and the failure path's reap reads its own workload
+    // as a stranger's and leaves it running. Nothing collects it afterwards
+    // either: BRAIN_REGISTRY is a 5-minute-TTL bucket
+    // (DEFAULT_BRAIN_REGISTRY_TTL_MS) and the delivery heartbeat that was
+    // refreshing the entry stops with the run, so the entry -- the only record of
+    // workloadId + platformKey -- is gone hours before the sweeper's
+    // SANDBOX_PENDING_ABANDONED_AFTER_MS horizon could look at it.
+    //
+    // Keeping the earliest ask does not widen ownership onto a predecessor's
+    // entry: that entry was written before this run asked at all, which is the
+    // case `reapPendingHands` exists to refuse, and it stays refused. The
+    // rebuild path re-stamps on purpose and still does -- `runRebuild` destroys
+    // the previous sandbox and its entry first, so from there on the only entry
+    // this run can own is the one its rebuild is about to write.
+    this.sandboxAskedAt ??= Date.now();
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { signal: this.abortCtrl.signal },

@@ -29,6 +29,11 @@
  *     request has to finish and answer 200 (a create cannot be un-created, and
  *     a late 503 would send the client to start a second one), and the record
  *     the retry replays has to survive on the main pool.
+ *   C the drop lands after the session exists, another pod takes the freed lock
+ *     and caches its own successful create under the same key, and only then
+ *     does THIS request's dispatch fail -- the fallback write may record its
+ *     failure only if the key is still unclaimed, because the record it would
+ *     otherwise overwrite is the only handle on a run that is executing.
  *
  * The lock connection is a real Postgres backend on `DATABASE_URL` and the drop
  * is a real `pg_terminate_backend`, with a rival connection asserting the
@@ -357,6 +362,160 @@ test("a create whose lock connection drops after the dispatch keeps its live run
     // rather than on the connection the drop took with it.
     const saved = await store.query("SELECT status_code FROM claw_idempotency_keys");
     assert.equal(saved.rowCount, 1, "the create's result never reached the cache");
+  } finally {
+    await server.close();
+  }
+});
+
+/**
+ * The create another pod runs while this one is mid-flight, and the record it
+ * leaves behind.
+ *
+ * It is not written by a second `inject` because the route collapses same-key
+ * creates in-process (`inflightCreates`): a second request on THIS pod joins
+ * the first one's flight and never reaches the lock at all. The concurrency the
+ * advisory lock exists for is between pods, so the rival is modelled where that
+ * concurrency actually lives -- another connection, taking the lock this
+ * request lost, reading the cache under it (the miss is the premise: its create
+ * is nobody's replay) and writing the create's result with the same statement
+ * `saveIdempotency` writes.
+ */
+const ROUTE = "POST /v1/sessions";
+const RIVAL_SESSION = "9f1c1c2e-0000-4000-8000-0000000000aa";
+const RIVAL_RUN = "ktsk_rival";
+const rivalCachedCreate = {
+  ok: true,
+  data: {
+    session_id: RIVAL_SESSION, name: "s", user_id: CALLER.userId, mode: "claw",
+    agent_status: "running", parent_session_id: null, team_role: "",
+    message: { message_id: "claw-1700000000001", dispatched: true, run_id: RIVAL_RUN },
+  },
+};
+
+async function rivalCreatesUnderTheFreedLock(scope: string, key: string): Promise<void> {
+  const took = await rival.query(
+    "SELECT pg_try_advisory_lock(hashtext($1), hashtext($2)) AS ok",
+    [scope, key],
+  );
+  rivalTookIt = took.rows[0].ok === true;
+  const miss = await rival.query(
+    "SELECT status_code FROM claw_idempotency_keys WHERE user_id = $1 AND route = $2 "
+    + "AND idem_key = $3 AND expires_at > NOW()",
+    [CALLER.userId, ROUTE, key],
+  );
+  assert.equal(miss.rowCount, 0,
+    "the premise: the rival create found no cached result, so what it writes next is the "
+    + "first and only record this key has ever had");
+  await rival.query(
+    `INSERT INTO claw_idempotency_keys (idem_key, user_id, route, status_code, response, expires_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + INTERVAL '24 hours')`,
+    [key, CALLER.userId, ROUTE, 200, JSON.stringify(rivalCachedCreate)],
+  );
+  await rival.query("SELECT pg_advisory_unlock(hashtext($1), hashtext($2))", [scope, key]);
+}
+
+/** A dispatch that opens its run and then cannot publish it. */
+function dispatchFailsToPublish(): void {
+  sessionDispatchPorts.publishTask = async () => {
+    throw new Error("no stream leader");
+  };
+  // 'closed' = the compensation settled the row, which is what earns the
+  // caller's rollback and the `publish_failed` the route turns into its 503.
+  sessionDispatchPorts.failChatRunDispatch = (async () => "closed") as
+    typeof sessionDispatchPorts.failChatRunDispatch;
+}
+
+test("a create that lost its lock records its own dispatch failure only while the key is "
+  + "still unclaimed", { skip }, async () => {
+  // C. The order is the whole point: this request read the cache (empty) at the
+  // top, lost the lock at the insert, and only decides what to cache at the
+  // end. In between, the pod that took the freed lock created a session, opened
+  // a run and cached the 200 that names it. Writing this request's 503 over
+  // that record replaces a live handle with a failure -- and every later retry
+  // on the key is then answered with the failure while the rival's run goes on
+  // executing with nobody able to name it.
+  let interrupted = false;
+  realLockPool({ dropAfterRead: false });
+  stubMainPool(async () => {
+    if (interrupted) return;
+    interrupted = true;
+    await dropBackend(handouts[handouts.length - 1]);
+    await rivalCreatesUnderTheFreedLock(`${CALLER.userId}:${ROUTE}`, KEY);
+  });
+  dispatchFailsToPublish();
+  const server = await app();
+  try {
+    const first = await create(server);
+
+    assert.ok(rivalTookIt,
+      "the premise: the server released this key's lock when the connection dropped, so the "
+      + "rival pod really could take it and create alongside this request");
+    assert.equal(first.statusCode, 503, "this request's own dispatch really did fail");
+    assert.equal(first.body.error, "task dispatch failed");
+
+    // What the client's next retry on this key is told.
+    const retry = await create(server);
+
+    assert.equal(retry.statusCode, 200,
+      "the retry was answered with this request's dispatch failure, which this request had no "
+      + "lock to record: it overwrote the concurrent create's cached success");
+    assert.equal(retry.body.data?.session_id, RIVAL_SESSION,
+      "the retry no longer names the session that concurrent create left running");
+    assert.equal(retry.body.data?.message?.run_id, RIVAL_RUN,
+      "and the id of its live run is not recoverable by replay any more");
+
+    const saved = await store.query(
+      "SELECT status_code, response FROM claw_idempotency_keys WHERE idem_key = $1", [KEY],
+    );
+    assert.equal(saved.rows[0]?.status_code, 200,
+      "the stored record for this key is a failure, not the create that succeeded");
+    assert.equal(saved.rows[0]?.response?.data?.session_id, RIVAL_SESSION);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a key whose cached result has expired is claimed again, so the create after it still "
+  + "de-duplicates its retry", { skip }, async () => {
+  // The other half of the claim rule, and the one the fallback leans on for
+  // every ordinary reuse of a key: `readIdempotency` refuses an expired row, so
+  // nobody is holding it as a handle and the next create must be able to take
+  // the key over. If the takeover did not land, that create would answer 200,
+  // store nothing, and its retry would build a second session alongside the run
+  // the first one started -- the exact loss the record exists to prevent, moved
+  // from the drop path to the TTL.
+  await store.query(
+    `INSERT INTO claw_idempotency_keys (idem_key, user_id, route, status_code, response, expires_at)
+     VALUES ($1, $2, $3, 200, $4::jsonb, NOW() - INTERVAL '1 hour')`,
+    [KEY, CALLER.userId, ROUTE, JSON.stringify(rivalCachedCreate)],
+  );
+  realLockPool({ dropAfterRead: false });
+  stubMainPool();
+  const server = await app();
+  try {
+    const fresh = await create(server);
+
+    assert.equal(fresh.statusCode, 200);
+    assert.notEqual(fresh.body.data?.session_id, RIVAL_SESSION,
+      "the expired entry was replayed as if it were still a handle");
+    assert.equal(sessionInserts(), 1);
+
+    const retry = await create(server);
+
+    assert.equal(retry.body.data?.session_id, fresh.body.data?.session_id,
+      "the retry got a different session: the create could not claim a key whose record was "
+      + "already dead, so nothing was there for it to replay");
+    assert.equal(retry.body.data?.message?.run_id, fresh.body.data?.message?.run_id);
+    assert.equal(sessionInserts(), 1, "and it created a second session alongside the live run");
+    assert.deepEqual(opened, ["ktsk_1"], "and opened a second run");
+
+    const saved = await store.query(
+      "SELECT status_code, response, expires_at > NOW() AS live FROM claw_idempotency_keys "
+      + "WHERE idem_key = $1", [KEY],
+    );
+    assert.equal(saved.rowCount, 1);
+    assert.equal(saved.rows[0].live, true, "the claimed row kept the dead entry's expiry");
+    assert.equal(saved.rows[0].response?.data?.session_id, fresh.body.data?.session_id);
   } finally {
     await server.close();
   }

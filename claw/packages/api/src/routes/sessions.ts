@@ -740,6 +740,40 @@ async function backfillCachedRunId(
   };
 }
 
+/**
+ * Record this request's result under the key, unless the key is already taken.
+ *
+ * The write is a claim rather than an assignment, and the conflict clause is
+ * where that is decided -- before the row is replaced, not after. What every
+ * caller here is acting on is the cache read it took at the top of `execute()`,
+ * which said this key had no result yet; what it does with that read is
+ * everything a create does, and only then does it come back to write. On the
+ * fallback path (see saveIdempotencyBestEffort) the exclusion that made the
+ * read durable is gone by then: the server released this key's advisory lock
+ * with the connection, so between the read and this statement another pod can
+ * have taken the freed lock, created its own session, opened its run and cached
+ * the 200 that names it. An unconditional UPSERT would put this request's
+ * outcome -- for a failed dispatch, a 503 -- where that 200 was, and since this
+ * row IS the only handle anyone keeps on a create, every later retry on the key
+ * would be answered with the failure while the other pod's run went on
+ * executing with nobody able to name it.
+ *
+ * So a row that is still live is left exactly as it was, whoever wrote it: the
+ * caller is told the claim did not land (rowCount 0) instead of the row being
+ * overwritten. Only an absent row, or one whose TTL has passed -- which
+ * `readIdempotency` already refuses to replay, so no client can be holding it
+ * as a handle -- is claimed.
+ *
+ * Nothing here has to identify the writer, and there is no column that could:
+ * a request writes this key at most once, on the single path that ends its
+ * create, so "not the row I wrote" and "a row was already there" are the same
+ * condition. The locked path is held to the same rule, because the lock is not
+ * the only writer -- a fallback write from a request whose lock dropped lands
+ * without holding anything, and the mirror image of the clobber above is a
+ * lock holder overwriting that request's record.
+ *
+ * Returns whether this request's result is the one now stored.
+ */
 async function saveIdempotency(
   client: QueryRunner,
   userId: string,
@@ -747,17 +781,19 @@ async function saveIdempotency(
   key: string,
   statusCode: number,
   response: unknown,
-): Promise<void> {
-  await client.query(
+): Promise<boolean> {
+  const claimed = await client.query(
     `INSERT INTO claw_idempotency_keys (idem_key, user_id, route, status_code, response, expires_at)
      VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + ($6 || ' milliseconds')::interval)
      ON CONFLICT (user_id, route, idem_key) DO UPDATE SET
        status_code = EXCLUDED.status_code,
        response = EXCLUDED.response,
        created_at = NOW(),
-       expires_at = EXCLUDED.expires_at`,
+       expires_at = EXCLUDED.expires_at
+     WHERE claw_idempotency_keys.expires_at <= NOW()`,
     [key, userId, route, statusCode, JSON.stringify(response), String(IDEMPOTENCY_TTL_MS)],
   );
+  return (claimed.rowCount ?? 0) > 0;
 }
 
 /**
@@ -774,9 +810,20 @@ async function saveIdempotency(
  * that work: the retry misses the cache, takes the lock and creates a SECOND
  * session, while the first one's run goes on executing in its sandbox with no
  * caller left holding its id. The lock is already gone by the time this runs
- * (the server released it with the backend), so the fallback is not writing
- * under an exclusion it has lost -- the create it is recording is what did
- * that, and what the write recovers is the record of it.
+ * (the server released it with the backend), so what the fallback recovers is
+ * the record of a create that the lock no longer covers.
+ *
+ * Which is also the limit of what it may do. Writing without the exclusion is
+ * only safe while the key is still nobody's: the same drop that sent this write
+ * to the main pool freed the lock for another pod, and that pod's create can
+ * have finished and cached its own result in the meantime. So the row is
+ * claimed rather than assigned -- `saveIdempotency` leaves a live record alone
+ * and says so -- and a request that finds the key already answered keeps its
+ * own outcome to its own caller instead of making every future retry inherit
+ * it. Logged, not raised: the key holding somebody else's live create is a
+ * better state than the one this write was recovering from, but it means this
+ * request's session (when it made one) is now reachable only by the id already
+ * in its own 200.
  *
  * Best-effort either way: a create the client already completed is not failed
  * because the note about it did not land.
@@ -801,7 +848,14 @@ async function saveIdempotencyBestEffort(
     );
   }
   try {
-    await saveIdempotency(writer, userId, route, key, statusCode, response);
+    if (!await saveIdempotency(writer, userId, route, key, statusCode, response)) {
+      logger.error(
+        { userId, route, statusCode, lockLost: !!lost },
+        "idempotency.key_already_claimed (another request cached a live result for this key "
+        + "while this one was running, so its result was NOT stored; retries replay that "
+        + "record and this request's own answer is the only handle on what it created)",
+      );
+    }
   } catch (err) {
     logger.error({ err, userId, route }, "idempotency.save_failed");
   }

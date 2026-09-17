@@ -442,6 +442,46 @@ async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free"
 }
 
 /**
+ * Is the walked entry still, byte for byte, the one the decision was taken on?
+ *
+ * The revision answers it on its own -- in a NATS KV bucket a revision is the
+ * sequence of the write that produced the value, so an unchanged revision means
+ * nobody has written this key since the walk read it. The payload is re-checked
+ * anyway because it costs nothing and because it names the failure in the log
+ * an operator will read: an entry that is READY here is a creator that finished
+ * while this pass was reading the lease, which is a different story from an
+ * entry that has simply been refreshed.
+ *
+ * Every unreadable or changed answer is `false`. This gates a stop that nothing
+ * undoes, and the cost of a wrong `false` is one skipped pass against an entry
+ * that is still sitting there for the next one.
+ */
+async function pendingEntryUnmoved(
+  kv: KV,
+  key: string,
+  revision: number,
+  workloadId: string,
+): Promise<boolean> {
+  let entry;
+  try {
+    entry = await kv.get(key);
+  } catch (err) {
+    logger.warn({ err, key, revision }, "sweeper.pending_recheck_failed");
+    return false;
+  }
+  // A deleted key reads back as an entry with an empty value; something else
+  // collected this one first, and it names no workload we may act on.
+  if (!entry || isTombstone(entry)) return false;
+  if (entry.revision !== revision) return false;
+  try {
+    const info = JSON.parse(sc.decode(entry.value)) as Record<string, unknown>;
+    return info.status === "pending" && String(info.workloadId ?? "") === workloadId;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Stop the workload a long-abandoned PENDING entry names, and delete that
  * entry -- the one that was walked, at the revision it was walked at.
  *
@@ -456,12 +496,25 @@ async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free"
  * retention out of here in the first place; deleting only the walked key is
  * what keeps a mistake from spreading to a key nobody looked at.
  *
- * The CAS is the same reason the heartbeat exists to defeat: an entry re-put
- * between the read and this call is one somebody is still touching, and losing
- * the CAS means the stop was issued against a record that has since moved. The
- * stop is not undoable, so it is the delete that is conditional, and a lost CAS
- * is said out loud rather than retried -- the workload is already stopped,
- * which is the half that mattered.
+ * The revision is checked BEFORE the stop, not only after it. The decision this
+ * call carries was taken on two separate reads -- the entry, then the lease --
+ * and the creator that entry belongs to finishes inside exactly that gap: it
+ * promotes PENDING -> READY with a plain `kv.put` (ensure-hands) and releases
+ * `lock.<scope>` at the end of its run, in that order. So a lease that reads
+ * free has any promotion already durable behind it, and re-reading the entry
+ * after the lease read is what turns "nobody was running this a moment ago"
+ * into "and the record I am about to act on has not moved since". A conditional
+ * delete cannot do that job: it runs after a stop that nothing undoes, so all it
+ * can do is report the race, leaving a READY binding that names a workload this
+ * pass has already killed.
+ *
+ * The delete stays conditional on the same revision for the other half of it --
+ * a heartbeat re-put between the recheck and here must not have its entry
+ * deleted out from under it -- and a lost CAS there is said out loud rather than
+ * retried: the workload is already stopped, which is the half that mattered.
+ *
+ * Returns whether the workload was actually collected, so the pass counts an
+ * eviction only where one happened.
  */
 async function collectAbandonedPending(
   kv: KV,
@@ -470,9 +523,21 @@ async function collectAbandonedPending(
   sessionId: string,
   info: Record<string, unknown>,
   ageMs: number,
-): Promise<void> {
+): Promise<boolean> {
   const workloadId = String(info.workloadId ?? "");
   const token = typeof info.token === "string" ? info.token : "";
+  // The last thing before the irreversible act, and after the lease read for
+  // the reason above. Anything at all having been written to this key since the
+  // walk -- a promotion, a rebuild's replacement, an idle marker, a heartbeat
+  // refresh -- invalidates the evidence this stop rests on, and "leave it" is
+  // free: the entry is still there, and the next pass reads it fresh.
+  if (!await pendingEntryUnmoved(kv, key, revision, workloadId)) {
+    logger.info(
+      { sessionId, key, revision, workloadId, ageMs },
+      "sweeper.pending_moved_not_collected",
+    );
+    return false;
+  }
   // ERROR, not warn, and deliberately. Nothing reaches this line in a healthy
   // fleet: a run that ends, retries or crashes with its pod alive reaps its own
   // pending entry on the way out. An entry that is two hours old with no lease
@@ -500,13 +565,14 @@ async function collectAbandonedPending(
     // deleting it after a stop that was not confirmed leaves a workload nothing
     // can name. The next pass asks again.
     logger.warn({ err, sessionId, key, workloadId }, "sweeper.pending_stop_failed");
-    return;
+    return false;
   }
   revokeHandsToken(token);
   unregisterSandbox(sessionId, info as HandsProbeEntry);
   if (!await deleteHandsEntryIfRevision(kv, key, revision)) {
     logger.warn({ sessionId, key, revision, workloadId }, "sweeper.pending_entry_left_after_stop");
   }
+  return true;
 }
 
 /**
@@ -526,8 +592,9 @@ async function sweepStaleHands(): Promise<void> {
       const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       // The revision of the entry THIS pass read, kept for the collector below:
-      // whatever it deletes has to be deleted at the revision the decision was
-      // taken on, under the key the decision was read from.
+      // it is what the collector re-checks before it stops anything -- the
+      // decision is taken here and acted on several reads later -- and what any
+      // delete is conditioned on, under the key the decision was read from.
       let revision = 0;
       try {
         const entry = await kv.get(key);
@@ -646,8 +713,9 @@ async function sweepStaleHands(): Promise<void> {
           }
           continue;
         }
-        await collectAbandonedPending(kv, key, revision, sessionId, info, ageMs);
-        evicted += 1;
+        if (await collectAbandonedPending(kv, key, revision, sessionId, info, ageMs)) {
+          evicted += 1;
+        }
         continue;
       }
 
