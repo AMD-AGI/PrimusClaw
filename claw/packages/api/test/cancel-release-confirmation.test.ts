@@ -622,7 +622,15 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
   // database hiccup threw straight through the aggregate and out of
   // cancelTask -- producing a 500 for a cancellation already written to the
   // database, and abandoning every handle after the first.
+  //
+  // The credentials read has since moved AHEAD of the destroy, with the other
+  // two reads that can forbid a stop, so what a failing one costs changed:
+  // both handles are still reached, and neither mapping is dropped. That is
+  // the stronger outcome and the assertions below say so -- "the second handle
+  // still ran" is now read from the lookups rather than from the destroys,
+  // because a call that declines before destroying anything is the point.
   const live = new Map([["a", "w-a"], ["b", "w-b"]]);
+  const lookedUp: string[] = [];
   db.query = (async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (sql.startsWith("SELECT * FROM claw_tasks WHERE task_id")) {
@@ -642,8 +650,10 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
   handleRegistry.listForDagConsistent = async () =>
     Object.fromEntries([...live].map(([n, w]) => [n, { workload_id: w }]));
   handleRegistry.listDagRoots = async () => ["t-root"];
-  handleRegistry.lookup = async (_dag: string, name: string) =>
-    live.has(name) ? { workload_id: live.get(name)! } : null;
+  handleRegistry.lookup = async (_dag: string, name: string) => {
+    lookedUp.push(name);
+    return live.has(name) ? { workload_id: live.get(name)! } : null;
+  };
   handleRegistry.listAll = async () => [];
   const destroyed: string[] = [];
   handleRegistry.destroy = async (_dag: string, name: string) => {
@@ -659,8 +669,17 @@ test("R16 cleanup that throws is contained: 200, and the other handles still run
   assert.equal(res.status, 200, "the verdict is written; a cleanup that threw is not the caller's 500");
   assert.deepEqual(res.body, { ok: true, cancelled: 1, released: "unconfirmed" });
   assert.deepEqual(
-    destroyed, ["a", "b"],
+    lookedUp, ["a", "b"],
     "the second handle is still attempted -- one broken teardown must not abandon the rest",
+  );
+  assert.deepEqual(
+    destroyed, [],
+    "and neither mapping is dropped: the read that failed is one of the reads that "
+    + "forbid a stop, so it now fails while the handle is still the reference",
+  );
+  assert.deepEqual(
+    [...live.keys()], ["a", "b"],
+    "which leaves both workloads named, for the sweeper to come back to",
   );
 });
 

@@ -842,8 +842,16 @@ async function entryOwnedByAnother(
  * dead task, not a correct rebuild in place of a stale reuse.
  *
  * A row with no image recorded matches, exactly as `evaluateReuse` treats a
- * missing fingerprint: rows written before the field existed, and rows whose
- * provider records none, must not be torn down over a comparison nobody wrote.
+ * missing fingerprint: a comparison nobody wrote is not evidence of a change,
+ * and the sandbox it would tear down is alive. Both registration paths record
+ * the field -- SaFE and agent-sandbox creates, the pending pre-registration,
+ * and -- since the fix in `registerReusedDagHandle` -- the reuse, so what
+ * still reaches here silent is a legacy bare-string row, which is just a
+ * workload id, and a row an older reuse blanked, which DAG_HANDLES has no TTL
+ * to expire. Failing closed instead
+ * would take those two populations to be image changes and stop a live
+ * container each, which is why this stays permissive and the fix went where
+ * the field was being dropped.
  */
 function handleImageMatches(
   own: HandleInfo,
@@ -948,6 +956,114 @@ async function releaseOwnHandleSandbox(
 }
 
 /**
+ * Put the sandbox this DAG recovered onto back into `hands.<sessionId>`.
+ *
+ * The recovery above recovers the SANDBOX. This is the bookkeeping that keeps
+ * it alive afterwards, and it is not a cache of anything: the session binding
+ * is the ONLY place the evidence "there is still background work in here" can
+ * live for a sandbox no retention record protects. Without it the chain runs
+ * four steps, with no race anywhere in it -- the turn ends and `markHandsIdle`
+ * finds nothing to park, so no idle period is ever opened; the keepalive sweep
+ * publishes background-work verdicts onto the entry that idle period belongs
+ * to, so the measurement that a shell is running lands nowhere; and the API's
+ * orphan-handle sweep, which reads that entry before it stops a workload whose
+ * DAG is over (`readSessionBackgroundWork`), sees no binding, classifies
+ * `no_binding` as reclaimable, and stops the container with the user's shell
+ * still running in it. The recovery would have saved the task and lost the work.
+ *
+ * A BINDING and not a retention record, which is the other thing that means
+ * "do not stop this". Retention is for a container the session has GIVEN UP:
+ * `retainContainer` deletes the session key on purpose, and `retainedTaker`
+ * makes this very gate stand aside for a workload that holds one -- so writing
+ * a retention over a sandbox this turn is about to run in would hand the DAG's
+ * own sandbox away, have the next node provision a second one beside it, and
+ * leave the first protected by a record released on no clock at all ("the work
+ * this protects has no bounded age"). What the binding costs if this recovery
+ * later turns out to have been wrong is bounded by comparison, and by the same
+ * machinery every other entry is: the sweep probes it, and a sandbox that
+ * answers "nothing running" has its binding expired and deleted once the reuse
+ * window passes, which is the point at which the orphan sweep is right to stop
+ * the workload.
+ *
+ * `create`, never `put`. One session has one slot, and this path is reached
+ * precisely when that slot does not name this DAG's sandbox -- so the other
+ * thing it can name is a SIBLING's live binding, and overwriting that strands
+ * the sibling's sandbox in exactly the way this gate exists to stop doing.
+ * Returns false where the slot is taken: the read that found it free is a
+ * moment old, and a sibling that landed in between wins it. The sandbox is
+ * still handed back either way; a binding is what this can add, not a
+ * precondition for reusing a container that is healthy and this DAG's.
+ *
+ * `specFingerprint` is the requester's own claim, recorded for the reason
+ * `registerReusedDagHandle` records `image`: the alternative is silence, and
+ * `evaluateReuse` reads silence as `no_recorded_spec` and reuses anyway -- so
+ * writing it rebuilds for the next request that asks for something else, where
+ * omitting it would hand that request this container blind.
+ *
+ * @throws where the write failed for any reason other than a taken slot. The
+ * turn is retryable and leaves the sandbox alive with its handle intact; going
+ * on would return a sandbox this replica has just established it cannot record,
+ * which is the defect above by a quieter route.
+ */
+async function restoreSessionBinding(
+  a: ReuseAttempt,
+  dagRoot: string,
+  handleName: string,
+  own: HandleInfo,
+  identity: SandboxEntry,
+): Promise<boolean> {
+  const key = handsSessionKey(a.sessionId);
+  const payload = sc.encode(JSON.stringify({
+    status: "ready",
+    // Who holds it -- see the note on `entryOwnedByAnother`. This DAG does: it
+    // is the DAG the handle row is keyed by.
+    taskId: a.request.task_id ?? null,
+    dagRootTaskId: dagRoot,
+    runScope: pickLockKey(a.request),
+    provider: own.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+    workloadId: own.workload_id ?? "",
+    handsUrl: own.hands_url,
+    sandboxImage: own.image ?? null,
+    specFingerprint: a.requestedSpec,
+    // From the identity rather than from the row, so the agent-sandbox shape --
+    // no workload id, a Router session and a pod name instead -- reaches the
+    // sweep addressable, the same mapping `identityFromHandleInfo` states once
+    // for every reader of a handle row.
+    platformKey: identity.platformKey ?? "",
+    token: own.token,
+    namespace: identity.namespace ?? "",
+    sessionId: identity.sessionId,
+    sandboxName: identity.sandboxName,
+    userId: identity.userId,
+    createdAt: new Date().toISOString(),
+  }));
+  try {
+    await a.kv.create(key, payload);
+    logger.info(
+      { sessionId: a.sessionId, dagRoot, workloadId: own.workload_id ?? "", key },
+      "ensureHands.own_handle_binding_restored",
+    );
+    return true;
+  } catch (e) {
+    if (isRevisionConflict(e)) {
+      logger.warn(
+        { sessionId: a.sessionId, dagRoot, workloadId: own.workload_id ?? "", key },
+        "ensureHands.own_handle_binding_slot_taken",
+      );
+      return false;
+    }
+    throw new Error(
+      `this DAG recovered onto the sandbox its handle '${handleName}' names, but the `
+      + `session binding that keeps it could not be written `
+      + `(${(e as Error)?.message ?? String(e)}). Without it nothing records that the `
+      + "container is in use, and the orphan sweep stops it; the sandbox was left alone "
+      + "so the delivery can be retried.",
+      { cause: e },
+    );
+  }
+}
+
+/**
  * The sandbox this DAG's OWN handle names, asked about before the session slot.
  *
  * `hands.<sessionId>` is one slot per session, and a session holds more than one
@@ -987,6 +1103,11 @@ async function releaseOwnHandleSandbox(
  *     names another workload; building a replacement is refused for the same
  *     reason. There is no working behaviour here to preserve, only a failure to
  *     replace with the right answer.
+ *
+ * Recovering the sandbox is not the whole of what it owes: where the session
+ * slot is empty rather than a sibling's, the sandbox comes back bound to
+ * nothing the teardown sweeps read, and `restoreSessionBinding` is what puts
+ * that record back. See the note on it.
  *
  * Returns this DAG's own sandbox when it is still serving; null when the caller
  * should go on to the session record -- including after RELEASING an own handle
@@ -1106,19 +1227,46 @@ async function reuseOwnDagHandle(
         handsUrl: own.hands_url, sessionEntryNames: sessionKey, detail: state.detail },
       "ensureHands.reusing_own_handle",
     );
-    // No registration, and none is possible to refuse: the handle already names
-    // this sandbox, so `replaceDagHandle` would see `previous === incoming` and
-    // write nothing that matters. That is the point of asking it first.
+    // No registration HERE, and none this branch could have refused: the handle
+    // already names this sandbox, so `replaceDagHandle` sees `previous ===
+    // incoming` and never reaches its refusal. That is the point of asking it
+    // first. What it does NOT mean is that nothing is written -- the caller
+    // still runs `registerReusedDagHandle` over this result, and that write
+    // replaces the handle's whole entry rather than merging into it. This
+    // comment used to say the write did not matter, which is how `image` came
+    // to be dropped from it and go unnoticed.
     //
-    // No idle markers to clear either. Those live on `hands.<sessionId>`, which
-    // in this branch names a DIFFERENT sandbox -- a sibling's -- and clearing a
-    // sibling's markers is half of the damage this gate exists to stop doing.
+    // No idle markers to clear either, and here the two cases this branch is
+    // reached by part company. Those markers live on `hands.<sessionId>`, and
+    // that slot either names a DIFFERENT sandbox -- a sibling's, whose markers
+    // are not ours to clear, which is half of the damage this gate exists to
+    // stop doing -- or names nothing at all, because the hands bucket's TTL
+    // expired it while DAG_HANDLES, which has no TTL, went on naming this
+    // sandbox. There are no markers to clear in either case; what differs is
+    // that the second leaves this container named by nothing the sweeps read,
+    // and `restoreSessionBinding` is what puts it back. Only the empty slot is
+    // written, never a sibling's -- and what that leaves unfixed is stated
+    // rather than hidden: a session whose slot a sibling holds has one sandbox
+    // on record and two alive, so the orphan sweep reads `other_sandbox` about
+    // ours and may stop it with work inside. That is the shape of
+    // `hands.<sessionId>` itself and predates this gate -- two concurrent
+    // creates in one session already leave the earlier sandbox unnamed, the
+    // create path's own write being an unconditional put -- and closing it
+    // needs the liveness record keyed by sandbox rather than by session, which
+    // is a change to the key scheme and to the API's sweep, not to this branch.
+    //
+    // Ahead of the local registration and behind the ceiling on purpose. The
+    // ceiling throws for a fleet this replica has not counted, and it must
+    // throw before anything is written; the binding write throws for a store
+    // that would not take it, and it must throw before this replica starts
+    // pinging a sandbox it has just failed to record.
     //
     // The ceiling is still asked, for the same reason `acceptExistingSandbox`
     // asks it: provisioning is not the only way a ping target is taken on, and a
     // reuse admitted against an uncounted fleet is the same unadmitted target by
     // a path that never claims a slot.
     assertFleetCensused(sessionId);
+    if (!sessionInfo) await restoreSessionBinding(a, dagRoot, action.handle, own, identity);
     reuseEffects.registerSandbox(sessionId, identity);
     return {
       handsUrl: own.hands_url as string,
@@ -1383,6 +1531,29 @@ async function clearIdleMarkers(
  * `replace` rather than `create`, because the whole point is that a handle of
  * this name may already exist naming the workload this session used before.
  *
+ * The write is WHOLESALE: `replaceDagHandle` sets the handle's entry, it does
+ * not merge into it, so every field this call omits is a field the reuse
+ * erases. Two are omitted on purpose -- `pending`, because a sandbox that just
+ * passed a health check is serving and a row still marked pending is one the
+ * own-handle gate stops as never-provisioned; and `created_at`, which
+ * `replaceDagHandle` re-stamps and nothing reads. `image` was omitted by
+ * accident, and that one is load-bearing: `handleImageMatches` reads an absent
+ * image as a match, so the first reuse blanked the field and the next create
+ * asking for a DIFFERENT image was handed this sandbox instead of a rebuild.
+ * Pinned by dag-handle-first-recovery's D8.
+ *
+ * What it records is the image the REQUEST asked for, which is the same thing
+ * the create path records (`assertImageDigest` validates and returns its
+ * argument unchanged, so `workloadImage` there IS `action.params.image`). It is
+ * not a guess: every route into this function has just compared that image
+ * against the sandbox and found it acceptable -- the own-handle gate through
+ * `handleImageMatches`, the session-record gate through the full
+ * `evaluateReuse` fingerprint. Where one of those gates was permissive because
+ * NOTHING was recorded, this turns a silence into the requester's own claim,
+ * which is no weaker than the silence it replaces: the next request for the
+ * same image is reused exactly as it is today, and one for a different image
+ * rebuilds instead of being handed this container blind.
+ *
  * Exported for the same reason `destroyHandleCas` is on the Backend side: the
  * undo below runs only when a registration failed, which no test reaches
  * through a real KV, and it is the part that has already been wrong twice.
@@ -1390,7 +1561,7 @@ async function clearIdleMarkers(
 export async function registerReusedDagHandle(
   kv: ReuseAttempt["kv"],
   request: ExecuteRequest,
-  action: { kind: string; handle?: string },
+  action: { kind: string; handle?: string; params?: { image?: string } },
   reused: EnsureHandsResult,
 ): Promise<void> {
   const dagRoot = request.dag_root_task_id ?? request.task_id;
@@ -1403,6 +1574,10 @@ export async function registerReusedDagHandle(
       hands_url: reused.handsUrl,
       token: reused.token,
       platform_key: identity.platformKey ?? "",
+      // Empty is stored as absent rather than as "": `handleImageMatches`
+      // trims before it compares, so the two already mean the same thing to
+      // the only reader, and a row that says nothing should look like one.
+      image: action.params?.image || undefined,
       provider: identity.provider,
       sandbox_name: identity.sandboxName,
       namespace: identity.namespace,

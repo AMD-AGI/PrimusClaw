@@ -31,11 +31,13 @@
  *   C2 a retention check over a large ledger still issues the stop
  *   C3 and a co-holder at the far end of that registry is still found
  *   C4 and a leader read that fails is still an unknown, not a "nobody"
+ *   C5 the enumeration that runs BEFORE the fan-out is bounded too
+ *   C6 and a row that cannot be read is still an unknown, not a "nobody"
  */
 import { registerHooks } from "node:module";
 import test, { after, afterEach, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import type { HandleInfo } from "@claw/protocol";
+import { DagHandleMap, HANDLE_MAP_PREFIX, type HandleInfo } from "@claw/protocol";
 
 const STOPPER_MODULE = new URL("../src/tasks/sandbox-stopper.ts", import.meta.url).href;
 
@@ -246,6 +248,94 @@ test("C4 and a leader read that fails is still an unknown, not a nobody", async 
   assert.deepEqual(
     stopped, [],
     "one unreadable DAG means sole ownership was not established, whoever else answered",
+  );
+  assert.equal(released, "unconfirmed");
+});
+
+/**
+ * A dag-handles bucket holding `roots`, charging `readLatency` per row read.
+ *
+ * `keys` is answered from memory: the enumeration is not what is being
+ * measured here, the read-per-key underneath it is. Every read is recorded, so
+ * a scan that got faster by reading less fails the assertion rather than the
+ * clock.
+ */
+function handleBucket(roots: readonly string[], readLatency: number, fails?: string) {
+  const reads: string[] = [];
+  const kvb = {
+    async keys(): Promise<AsyncIterable<string>> {
+      const keys = roots.map((dag) => `${HANDLE_MAP_PREFIX}.${dag}`);
+      return (async function* stream() { for (const key of keys) yield key; })();
+    },
+    async get(key: string) {
+      reads.push(key);
+      await delay(readLatency);
+      if (fails !== undefined && key === `${HANDLE_MAP_PREFIX}.${fails}`) {
+        throw new Error("nats: no responders");
+      }
+      return {
+        value: encoder.encode(JSON.stringify({ main: { workload_id: `w-${key}` } })),
+        revision: 1,
+        operation: "PUT" as const,
+      };
+    },
+  };
+  return { kvb, reads };
+}
+
+test("C5 the enumeration that runs before the fan-out is bounded too", { timeout: 120_000 }, async () => {
+  // The fan-out below it reads one key per other DAG from the leader, in
+  // parallel. Above it, `otherDagHolding` opens with `listAll()` -- the direct
+  // scan that both names a co-holder and supplies half the candidate set --
+  // and that is one `kv.get` per row issued one after another. 1400 rows at
+  // 8ms is 11.2s against a ten-second ceiling, so the budget is gone before
+  // the bounded half is reached: the whole check expires, `stopSandboxByHandle`
+  // answers `unconfirmed` having issued nothing, and the SaFE workload keeps
+  // its GPU. Bounding the second half of a scan does not bound the scan.
+  oneHandle();
+  const roots = Array.from({ length: 1400 }, (_, i) => `dag-other-${i}`);
+  const { kvb, reads } = handleBucket(roots, 8);
+  const map = new DagHandleMap(stopper.makeKvStore(kvb as never));
+  stopper.handleRegistry.listAll = () => map.listAll();
+  stopper.handleRegistry.listDagRoots = async () => ["dag-1", ...roots];
+  stopper.handleRegistry.listForDagConsistent = async () => ({});
+
+  const started = process.hrtime.bigint();
+  const released = await stopper.stopSandboxByHandle("dag-1", "main", "s-1");
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.deepEqual(
+    stopped, ["w-1"],
+    `nobody else holds this workload, so the stop has to be issued `
+      + `(the whole check took ${Math.round(elapsedMs)}ms)`,
+  );
+  assert.equal(released, "confirmed");
+  assert.deepEqual(
+    [...new Set(reads)].sort(),
+    roots.map((dag) => `${HANDLE_MAP_PREFIX}.${dag}`).sort(),
+    "and every row is still read -- a scan that answers by reading less is not the same scan",
+  );
+});
+
+test("C6 and a row that cannot be read is still an unknown, not a nobody", async () => {
+  // The half that must not change when the reads run together. `scanPrefix`
+  // raises on a row it cannot read, deliberately: a dropped row is a
+  // co-holder turned into "nobody", which is the one answer this path may
+  // never invent. A sibling read that came back empty and finished first must
+  // not be allowed to answer over the top of it.
+  oneHandle();
+  const roots = Array.from({ length: 40 }, (_, i) => `dag-other-${i}`);
+  const { kvb } = handleBucket(roots, 1, roots[20]);
+  const map = new DagHandleMap(stopper.makeKvStore(kvb as never));
+  stopper.handleRegistry.listAll = () => map.listAll();
+  stopper.handleRegistry.listDagRoots = async () => ["dag-1", ...roots];
+  stopper.handleRegistry.listForDagConsistent = async () => ({});
+
+  const released = await stopper.stopSandboxByHandle("dag-1", "main", "s-1");
+
+  assert.deepEqual(
+    stopped, [],
+    "one unreadable row means sole ownership was not established, whoever else answered",
   );
   assert.equal(released, "unconfirmed");
 });

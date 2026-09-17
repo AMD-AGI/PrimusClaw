@@ -132,8 +132,22 @@ test("T1 an orphan handle -- the DAG row is gone -- is stopped, not skipped", as
   //
   // Driven through the sweeper rather than through `stopAllHandlesForDag`,
   // because the missing row is what the sweeper's own query has to see.
+  //
+  // The session row IS seeded, and carrying the key the stop authenticates
+  // with, because that is the orphan this sweep actually meets: task rows are
+  // what go, and `loadPlatformKeyForSession` reads the session row, which is
+  // soft-deleted rather than removed. The fixture used to name a session that
+  // was never inserted, so the stop it asserts went out with no
+  // `Authorization` header at all -- green only because the fake SaFE here
+  // answers 200 to anything. What the real one answers to that, and what the
+  // teardown must do about it, is orphan-sweep-unstoppable.test.ts.
+  await seedSession(h, "s-1");
+  await h.sql(
+    `UPDATE claw_sessions SET config = config || $2::jsonb WHERE session_id = $1`,
+    ["s-1", JSON.stringify({ _server_managed_credentials: true, platform_key: "pk-1" })],
+  );
   const live = registryHolding("t-orphan", {
-    main: { workload_id: "w-orphan", session_id: "s-gone" },
+    main: { workload_id: "w-orphan", session_id: "s-1" },
   });
 
   const dropped = await reapOrphanHandles();

@@ -519,8 +519,16 @@ export async function listAllDagHandles(): Promise<Array<[string, Record<string,
 export async function isValidDagHandleToken(token: string): Promise<boolean> {
   if (!token || !_kvBucket) return false;
   try {
-    const keys = await _kvBucket.keys();
-    for await (const key of keys) {
+    // Drained before the first `get`: `keys()` is an ordered-consumer
+    // subscription and awaiting another JetStream request inside `for await`
+    // stalls its pump, ending the consumer early with no error (measured at 1
+    // key out of 21 live ones on the real bucket -- see @claw/utils' kv store).
+    // A truncated scan here does not fail loudly: a token that IS valid is not
+    // found, `registry.ts` caches that in `deniedTokens`, and the sandbox.use
+    // node it belongs to is answered 401 from then on.
+    const keys: string[] = [];
+    for await (const key of await _kvBucket.keys()) keys.push(key);
+    for (const key of keys) {
       const entry = await _kvBucket.get(key);
       if (!entry) continue;
       try {

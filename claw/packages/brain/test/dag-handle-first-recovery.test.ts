@@ -37,6 +37,7 @@
  *   D5 a DAG with no handle of its own still adopts a warm sibling sandbox
  *   D6 a sandbox whose spec changed is not stopped while work is running in it
  *   D7 -- and is stopped, and the name freed, when nothing is
+ *   D8 a reuse does not erase the image the handle was recorded with
  */
 import test, { afterEach, before } from "node:test";
 import assert from "node:assert/strict";
@@ -144,16 +145,33 @@ async function sandbox() {
   return s;
 }
 
-/** The `hands.<sessionId>` slot, in the shape the reuse path reads it back. */
-function fakeHandsKv(sessionId: string, entry: Record<string, unknown> | null): KV {
+/**
+ * The `hands.<sessionId>` slot, in the shape the reuse path reads it back.
+ *
+ * `create` refuses an occupied key the way NATS does, and a create that wins is
+ * visible to the next `get`: the own-handle recovery writes the session binding
+ * back through it when the slot is empty, so a stub that swallowed that write --
+ * or did not offer the method at all -- would hide whether the recovered
+ * sandbox ends the turn on record or on nothing.
+ */
+function fakeHandsKv(sessionId: string, seed: Record<string, unknown> | null): KV {
   const key = handsSessionKey(sessionId);
+  let entry = seed;
   let revision = 7;
   const kv = {
     async get(k: string) {
       if (!entry || k !== key) return null;
       return { key: k, value: sc.encode(JSON.stringify(entry)), revision, operation: "PUT" };
     },
-    async put() { return ++revision; },
+    async create(k: string, value: Uint8Array) {
+      if (k === key && entry) throw new Error("wrong last sequence: key exists");
+      entry = JSON.parse(sc.decode(value)) as Record<string, unknown>;
+      return ++revision;
+    },
+    async put(_k: string, value: Uint8Array) {
+      entry = JSON.parse(sc.decode(value)) as Record<string, unknown>;
+      return ++revision;
+    },
     async update() { return ++revision; },
     async delete() {},
     // No retentions in the bucket, which is what `retainedTaker` scans for.
@@ -462,5 +480,50 @@ test("D7 -- and is stopped, and the name freed, when nothing is running in it", 
   assert.equal(
     (await lookupDagHandle("dag-a7", "main"))?.workload_id, "wl-other",
     "the handle names what the DAG is now on, and the registration was not refused",
+  );
+});
+
+test("D8 a reuse does not erase what the handle says its sandbox is built from", async () => {
+  // The image gate is only as good as the row it reads, and a reuse used to
+  // blank that row. `registerReusedDagHandle` rewrites the handle WHOLESALE --
+  // `replaceDagHandle` sets the entry, it does not merge into it -- and the
+  // fields it did not pass were dropped. `image` was one of them, so the first
+  // reuse turned "built from A" into "nothing recorded", and
+  // `handleImageMatches` reads nothing recorded as a match.
+  //
+  // Two turns, and the second is the one that matters: after a reuse at image
+  // A, a create asking for image B was handed the sandbox running A, silently,
+  // with neither a rebuild nor an error. Asserted on the sandbox the turn ends
+  // up on rather than on the row, because the row is the mechanism and this is
+  // about which container the next node's work lands in.
+  const w = await sandbox();
+  await replaceDagHandle("dag-a8", "main", {
+    workload_id: "wl-8", hands_url: w.mcpUrl, token: "tok-8", image: IMAGE, namespace: "ns",
+  });
+
+  // Turn one: the same DAG, the same image, redelivered with its session slot
+  // expired out from under it. The own-handle path hands back its own sandbox
+  // and re-registers the adoption -- the write that used to lose the image.
+  const { stopped } = stubEffects();
+  const first = await recoverTurn(attemptFor(requestFor("dag-a8", "task-a8"), null));
+  assert.equal(first?.identity?.workloadId, "wl-8", "the DAG keeps the sandbox it already had");
+  assert.deepEqual(stopped, [], "and nothing was stopped to do it");
+
+  // Turn two: a later node of the same DAG, same handle name, DIFFERENT image.
+  // There is no session slot naming anything, so the only sandbox that can be
+  // handed back is the one the handle names -- which is built from A.
+  const second = await recoverTurn(
+    attemptFor(requestFor("dag-a8", "task-a8c", "example.io/torch@sha256:cccc"), null),
+  );
+
+  assert.equal(
+    second, null,
+    "a create asking for another image is not handed the sandbox running the old one; "
+    + "it goes on to build its own",
+  );
+  assert.deepEqual(stopped, ["wl-8"], "the sandbox built from the old image is released");
+  assert.equal(
+    await lookupDagHandle("dag-a8", "main"), null,
+    "and its name is free, so the replacement's registration will not be refused",
   );
 });

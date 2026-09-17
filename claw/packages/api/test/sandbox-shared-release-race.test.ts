@@ -70,6 +70,8 @@
  *      decline leaves no permanent `unreleased` marker
  *   S7 a retention is an older claim, not a race: no re-check, no record, no
  *      stop
+ *   S8 a retention that lands DURING this release protects the container too
+ *   S9 and a retention re-check that cannot be answered leaves it on record
  */
 import test, { after, afterEach, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -447,4 +449,85 @@ test("S7 a retention is an older claim, not a race: no re-check, no record", asy
     "and a container retention is protecting is not a workload that escaped",
   );
   assert.equal(leaderReads, 0, "nothing re-asked the registry about a claim it cannot discharge");
+});
+
+/**
+ * B's hand-over, landing in the one window the last-holder re-check looks at:
+ * after A's own row is gone, and before A re-asks who holds the workload.
+ *
+ * In the same order production writes it (`retainInsteadOfDestroying`): the
+ * retention record replaces the handle, so it is written FIRST and the handle
+ * is released after -- "retaining first means the reference that replaces the
+ * handle exists before the handle can go". The removal is the production
+ * `destroyHandleCas` against the leader, which is what
+ * `releaseHandlesForWorkload` issues.
+ *
+ * Hooked on `handleRegistry.destroy` rather than on a timer: A's own removal
+ * is by construction after every read A made and before the re-check, so this
+ * is that window, reached on every run.
+ */
+function retainOnceAHasLetGo(workloadId: string, flag: { retained: boolean }): void {
+  const real = handleRegistry.destroy;
+  handleRegistry.destroy = async (dag, name, wid) => {
+    const removed = await real(dag, name, wid);
+    if (dag === "dag-a" && removed !== null) {
+      flag.retained = true;
+      await destroyHandleCas(kvb.leader as never, "dag-b", "main", workloadId);
+    }
+    return removed;
+  };
+}
+
+test("S8 a retention that lands during this release protects the container too", async () => {
+  // The re-check asks the registry whether any DAG still holds the workload.
+  // That is not the only claim that forbids a stop, and between A's first read
+  // and this one the claim can change KIND: B parks the container with
+  // background shells still running in it, which writes a retention record and
+  // then frees the last handle. So the re-check sees no holder, promotes A to
+  // last holder -- and stops a sandbox somebody's work is running in. The
+  // `retained` value A reads at the top is from before any of that happened.
+  await twoDagsSharing("w-shared");
+  const flag = { retained: false };
+  handleRegistry.retained = async (workloadId: string) =>
+    flag.retained && workloadId === "w-shared";
+  retainOnceAHasLetGo("w-shared", flag);
+
+  const released = await stopSandboxByHandle("dag-a", "main", "s-1");
+
+  assert.deepEqual(
+    stopped, [],
+    "a container retention took over while this release was in flight is not this one's to stop",
+  );
+  assert.equal(released, "unconfirmed", "and nothing here established a release");
+  assert.equal(kvb.rowOf("dag-a"), null, "A still let go -- it is done with the workload");
+  assert.deepEqual(
+    await leakRecord("dag-a"), {},
+    "and a container retention is protecting is not a workload that escaped",
+  );
+});
+
+test("S9 a retention re-check that cannot be answered leaves the workload on record", async () => {
+  // The same shape S5 has for the holder half. A retention read that fails is
+  // no evidence the container is unprotected, so it cannot license a stop --
+  // and A's row is already gone, so `unreleased` is the only place the
+  // workload can still be named.
+  await twoDagsSharing("w-shared");
+  const flag = { retained: false };
+  handleRegistry.retained = async () => {
+    if (kvb.rowOf("dag-a") === null) throw new Error("nats: no responders");
+    return false;
+  };
+  retainOnceAHasLetGo("w-shared", flag);
+
+  const released = await stopSandboxByHandle("dag-a", "main", "s-1");
+
+  assert.equal(released, "unconfirmed");
+  assert.deepEqual(stopped, [], "an unreadable retention ledger is not a licence to stop");
+  assert.equal(kvb.rowOf("dag-a"), null);
+  const record = await leakRecord("dag-a");
+  assert.deepEqual(
+    Object.values(record).map((e) => (e as { workload_id?: string }).workload_id),
+    ["w-shared"],
+    "so the record is the only thing left naming the workload, and it does",
+  );
 });

@@ -2378,11 +2378,39 @@ export async function reapOrphanHandles(): Promise<number> {
       // because no *task* is running. Nothing else in the chain is looking at
       // the sandbox itself.
       //
-      // So the sandbox's own entry is read. Brain's keepalive sweep probes idle
+      // So the session's entry is read. Brain's keepalive sweep probes idle
       // handles and publishes what it found onto `hands.<session>`, and that
       // verdict -- read under the freshness rules it was written with, which
       // live in `@claw/protocol` beside the writer rather than being restated
       // here -- is the evidence this sweep was missing.
+      //
+      // The session's entry, NOT the sandbox's, and the two stop being the same
+      // thing the moment the session moves off the sandbox. `hands.<session>`
+      // is one slot: a turn that changes the image cannot reuse W1, creates W2,
+      // and W2's binding is written over W1's at that one key -- taking the
+      // verdict that said "there are shells running in W1" with it. The reader
+      // then answers `other_sandbox` about W1, which is true about the binding
+      // it found and is not an answer about W1 at all, and this guard reads a
+      // non-answer as nothing to defer for. Reproduced: T1 completes on W1 with
+      // a shell still running, T2 binds W2, and this sweep stops W1 with the
+      // shell alive inside it.
+      //
+      // That is not fixable from here, and the reason is worth writing down so
+      // the next reader does not go looking for a read that would fix it. Once
+      // the slot has moved there is no record left in this process's reach that
+      // is ABOUT W1 -- and a sweep cannot manufacture one, because the
+      // overwrite can happen in any gap between two ticks, so a verdict it
+      // cached would be evidence only for the sessions it happened to be
+      // watching at the right moment. Per-workload evidence has exactly one
+      // durable home: a retention record, keyed by the container's own
+      // generation rather than by session, which `handleRegistry.retained`
+      // matches by workload id and which `stopSandboxByHandle` already refuses
+      // on -- that whole chain is exercised over this very shape in
+      // `orphan-sweep-displaced-sandbox.test.ts`. The missing half is the
+      // write, and it belongs to the party that destroys the evidence at the
+      // moment it destroys it: Brain retains a container it RELEASES
+      // (`retainInsteadOfDestroying` in brain/src/sandbox/ensure-hands.ts) and
+      // writes nothing on the path that merely abandons one for a replacement.
       //
       // The cost is one point read per DAG this sweep was about to act on, and
       // only for DAGs that got past every cheaper check above -- next to the
@@ -2463,9 +2491,42 @@ export async function reapOrphanHandles(): Promise<number> {
           "sweeper.orphan_handles_background_unresolved",
         );
       }
-      // The owner's session id when known; falling back to "" is safe because
-      // safeStopWorkload reads the platform key from the session and skips
-      // when absent.
+      // The population this sweep cannot answer for, named so it can be counted.
+      //
+      // `other_sandbox` is the reader saying the binding it found names a
+      // DIFFERENT workload, so about the one in hand it says nothing -- and
+      // "nothing on record" is what the stop below then acts on. Every other
+      // unknown on this path defers; this one must not, because a displaced
+      // sandbox whose work really is finished is the orphan this sweep exists
+      // to reap and deferring on it is both the leak and the deadlock that put
+      // the narrowed guard above here in the first place. So the risk is
+      // carried, and until a retention record is written wherever a session's
+      // slot moves off a container that may still be running work, this line is
+      // the only place in the fleet where it is visible.
+      if (bg.state === "clear" && bg.reason === "other_sandbox") {
+        logger.warn(
+          { dagRoot, sessionId, stopping: [...workloads], bindingNames: bg.workloadId },
+          "sweeper.orphan_handles_displaced_sandbox",
+        );
+      }
+      // The owner's session id when known, the handles' own when the DAG row
+      // is gone, and "" when neither names one.
+      //
+      // That fallback is not a stop that is skipped. `safeStopWorkload` does
+      // NOT decline on a missing platform key -- it POSTs the stop with no
+      // `Authorization` header, and SaFE answers 401 -- so "" means a request
+      // that reaches the provider and cannot succeed. This comment used to
+      // claim the opposite, and on the orphan path the difference was the
+      // whole bug: the stop failed, the DAG row was gone so the failure had
+      // nowhere to be recorded, and the mapping was destroyed anyway, leaving
+      // a running workload that nothing in the system named.
+      //
+      // What makes passing "" acceptable is one level down, in
+      // `stopSandboxByHandle`: a teardown that can neither issue the stop nor
+      // record that it did not now KEEPS the handle mapping. So this sweep
+      // finds the same workload again next tick instead of losing it, and
+      // counts it in `unreleased` every one of those ticks -- which is where
+      // an operator sees a session whose key never came back.
       if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
       dropped++;
     }

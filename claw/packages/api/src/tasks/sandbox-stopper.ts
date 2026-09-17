@@ -35,7 +35,7 @@ import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
-import { SAFE_API_URL } from "../config.js";
+import { isKubernetesMode, SAFE_API_URL } from "../config.js";
 import { DAG_HANDLES_BUCKET, jsm, kv, kvDagHandles, nc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
@@ -81,6 +81,12 @@ const SHARED_CHECK_TIMEOUT_MS = 10_000;
  * on holding their GPUs. The cancel that waited also holds its caller open,
  * and the interrupt with it, since `routes/tasks.ts` publishes that only after
  * `cancelTask` returns.
+ *
+ * It bounds every phase of those answers, not the last one. The ownership
+ * question is two scans in series -- the direct enumeration in `scanPrefix`
+ * and then the leader fan-out in `otherDagHolding` -- and a serial first phase
+ * spends the ceiling just as completely as a serial second one did. Bounding
+ * half of a two-phase scan buys nothing at the size where it matters.
  *
  * The reads are independent and idempotent, so they are issued in parallel.
  * This does not reduce the total work and is not a substitute for the
@@ -211,19 +217,42 @@ export function makeKvStore(kv: KvLike): KVStore {
       for await (const key of await kv.keys(filter)) {
         if (key.startsWith(prefix)) keys.push(key);
       }
-      const out: Array<[string, Record<string, unknown>]> = [];
-      for (const key of keys) {
-        // Same three answers as `get`, and for the same reasons: a tombstone or
-        // an empty value is a key that is gone, while an entry that will not
-        // parse is an unknown. A scan that silently skipped the last of those
-        // would hand the sweeper a short list of DAGs and call it complete.
+      // And read `REGISTRY_READ_CONCURRENCY` at a time rather than one after
+      // another. This scan is the FIRST half of `otherDagHolding`: it names a
+      // co-holder on the direct read and supplies half the candidate set the
+      // leader fan-out below it walks. Bounding only that second half bounded
+      // only half the cost -- one `kv.get` per registered DAG, issued serially,
+      // spends the same `SHARED_CHECK_TIMEOUT_MS` budget before the concurrent
+      // phase begins, and a budget spent here expires the whole check. What
+      // that looks like from outside is the failure the fan-out was bounded to
+      // remove, unchanged: `sandbox.shared_check_failed`, `unconfirmed`, no
+      // stop issued, and a SaFE workload nobody held still holding its GPU.
+      // Measured at 1400 rows and 8ms a read: 11.2s of reads against a
+      // ten-second ceiling.
+      //
+      // The answer is unchanged in both directions, which is the part that
+      // matters here. Every key the serial loop would have read is still read,
+      // in the same order in the output, under the same three rules -- a
+      // tombstone or an empty value is a key that is gone, and an entry that
+      // will not parse is an unknown that REJECTS. That last one is why this
+      // is a bounded map and not a race: a row dropped instead of raised is a
+      // live co-holder turned into "nobody", which is the one answer this path
+      // may never invent, and a sibling read that came back empty must not get
+      // to answer over the top of a read that failed. As in `firstAnswer`,
+      // each worker stops at its own first rejection and `Promise.all` settles
+      // every one of them, so a failing registry costs one read per worker and
+      // surfaces no unhandled rejection.
+      const rows = await boundedMap(keys, async (key) => {
         const entry = await kv.get(key);
-        if (!entry) continue;
-        if (entry.operation === "DEL" || entry.operation === "PURGE") continue;
-        if (entry.value.length === 0) continue;
-        out.push([key, JSON.parse(dec.decode(entry.value)) as Record<string, unknown>]);
-      }
-      return out;
+        if (!entry) return null;
+        if (entry.operation === "DEL" || entry.operation === "PURGE") return null;
+        if (entry.value.length === 0) return null;
+        const row: [string, Record<string, unknown>] = [
+          key, JSON.parse(dec.decode(entry.value)) as Record<string, unknown>,
+        ];
+        return row;
+      });
+      return rows.filter((row): row is [string, Record<string, unknown>] => row !== null);
     },
   };
 }
@@ -876,9 +905,10 @@ export const unreleasedRecord = {
  *                   is asynchronous, so accepted is the strongest thing its API
  *                   can be asked, and it is weaker than "the GPU is free".
  *   - `unconfirmed` at least one handle's release was not established: a
- *                   non-2xx, a timeout, an unset `SAFE_API_URL`, a registry
- *                   that could not be read, or a handle this path cannot stop
- *                   at all.
+ *                   non-2xx, a timeout, an unset `SAFE_API_URL`, credentials
+ *                   the stop cannot be authenticated with, a registry that
+ *                   could not be read, or a handle this path cannot stop at
+ *                   all.
  *   - `nothing_held` this DAG holds no handle and none is on record as having
  *                   escaped release. Nothing was leaked.
  *
@@ -892,6 +922,61 @@ export const unreleasedRecord = {
  * running" -- only that this side did not establish the release.
  */
 export type ReleaseOutcome = "confirmed" | "unconfirmed" | "nothing_held";
+
+/**
+ * Why a stop cannot succeed yet, or `null` when it is a request worth making.
+ *
+ * Asked SEPARATELY from `safeStopWorkload`, and that is the whole point: the
+ * answer is needed BEFORE the mapping is dropped, and `safeStopWorkload` can
+ * only answer after the request has been made, by which time the destroy has
+ * already happened. Both halves are read from the same two places the request
+ * itself reads them from, so this cannot drift from what the fetch does.
+ *
+ *   - `no_workload_id`   nothing to address the request to. Every caller that
+ *                        can tell an unstoppable handle from an absent one
+ *                        answers this earlier; kept so the set is complete.
+ *   - `no_safe_url`      no SaFE to send it to. The request is never made.
+ *   - `no_platform_key`  the request IS made -- with no `Authorization` header,
+ *                        because that is what `safeStopWorkload` does with an
+ *                        empty key -- and SaFE answers 401.
+ *
+ * `no_platform_key` is the one worth justifying, and it is not a guess about
+ * the provider. Three places in this repo already treat a missing platform key
+ * as "the SaFE call cannot be made", and `safeStopWorkload`'s conditional
+ * header is the only place that does not:
+ *
+ *   - `assertSessionCredentialsForDispatch` refuses to dispatch a run at all
+ *     outside kubernetes mode, and the reason it gives is that the cluster's
+ *     shared identity would leave "its own submitter unable to stop it";
+ *   - brain's own `SafeWorkloadProvider.stop` -- the normal stopper of these
+ *     very workloads -- checks `inst.platformKey` up front, logs
+ *     `safe-workload.stop_skipped_no_key`, and raises `SandboxStopUnavailable`
+ *     rather than sending anything;
+ *   - `platform-backfill` reads the same key the same way and returns without
+ *     issuing its request when it comes back empty.
+ *
+ * And there is no fallback identity to fill in for it: the cancel route says
+ * so in as many words ("requires the calling user's platformKey -- there is no
+ * admin fallback"). A workload that exists was started under somebody's key,
+ * and that key is what can stop it.
+ *
+ * In kubernetes mode there is no SaFE identity to carry and this is not a
+ * blocker -- those handles name no workload either, and the caller answers
+ * them one branch earlier.
+ *
+ * A blocker means "the stop cannot be attempted", which is a different state
+ * from "it was attempted and failed". `stopSandboxByHandle` is where the
+ * difference earns its keep: it decides whether the last reference to a
+ * running workload may be destroyed.
+ */
+type StopBlocker = "no_workload_id" | "no_safe_url" | "no_platform_key";
+
+function stopBlocker(workloadId: string, platformKey: string): StopBlocker | null {
+  if (!workloadId) return "no_workload_id";
+  if (!SAFE_API_URL) return "no_safe_url";
+  if (!platformKey && !isKubernetesMode()) return "no_platform_key";
+  return null;
+}
 
 /**
  * Stop one SaFE workload and say whether SaFE accepted the stop.
@@ -943,6 +1028,13 @@ async function safeStopWorkload(
   // that can tell an unstoppable handle from an absent one. Kept so a future
   // caller cannot turn "no id to call with" into a silent success.
   if (!workloadId) return "unconfirmed";
+  // Deliberately NOT a third guard on `platformKey`, which is what `stopBlocker`
+  // would say about this request. The header goes out empty, SaFE refuses it,
+  // and `safe.stop_failed` names the workload and the 401 -- which is worth
+  // more to whoever is looking for it than a silent decline, now that the
+  // caller no longer destroys the last reference on the strength of it. Every
+  // other SaFE caller in the repo declines instead; this one is the outlier on
+  // purpose, and the outcome it reports (`unconfirmed`) is the same either way.
   if (!SAFE_API_URL) {
     logger.warn({ workloadId }, "safe.stop_skipped_no_url");
     return "unconfirmed";
@@ -986,8 +1078,15 @@ async function loadPlatformKeyForSession(sessionId: string): Promise<string> {
  * Which makes the order of the whole function one rule: read everything that
  * could forbid a stop before writing anything down, because a branch that
  * declines after the record is written leaves a leak report nothing will ever
- * clear. So the claims come first (retention, another DAG), then the record,
- * then the destroy, then the stop.
+ * clear. So the claims come first (retention, another DAG, and the credentials
+ * the stop would be issued with), then the record, then the destroy, then the
+ * stop.
+ *
+ * The destroy has one precondition beyond "the record was written", and it is
+ * the one an orphan runs into: a call that can neither file the outcome
+ * anywhere (`no_record_home`) nor issue the stop at all (`stopBlocker`) leaves
+ * the mapping alone, because in that combination the mapping is not
+ * bookkeeping -- it is the only thing that still knows the workload exists.
  *
  * `destroy` distinguishes two falsy results and so does this:
  *   - `null`  -- from the LOOKUP, this DAG holds no handle of that name:
@@ -1196,8 +1295,11 @@ export async function stopSandboxByHandle(
         "sandbox.handle_destroy_failed",
       );
     }
-    // A retention is an older claim than this handle, not a race: nothing this
-    // call does can discharge it, so there is nothing to re-ask. And a destroy
+    // A retention SEEN ABOVE is an older claim than this handle, not a race:
+    // nothing this call does can discharge it, so there is nothing for it to
+    // re-ask and it returns here. The converse does not follow and is the
+    // subject of the re-check below -- `retained === false` is a fact about
+    // the moment it was read, not a property of the workload. And a destroy
     // that did not commit leaves the mapping as the reference it always was,
     // which is the state every other declining exit relies on.
     if (retained || !ownRowGone) return "unconfirmed";
@@ -1244,14 +1346,75 @@ export async function stopSandboxByHandle(
     //
     // Leader-only -- see `OwnershipQuestion` for why a direct read must not
     // answer this one, and for what that costs.
-    let stillHeld: string | null;
-    try {
-      stillHeld = await withDeadline(
+    //
+    // BOTH claims are re-asked, not just the handle one. The re-check used to
+    // ask the registry "does any other DAG still hold this" and reuse the
+    // `retained` boolean read at the top of this function, and those are not
+    // the same window: the claim protecting a workload can change KIND in
+    // between. The co-holder that sent us here is the one that changes it --
+    // `retainInsteadOfDestroying` writes the retention record FIRST, exactly
+    // so the reference that replaces the handle exists before the handle can
+    // go, and then frees the handle. Both writes land inside this window:
+    //
+    //   t1  A reads: dag-b holds w, w is not retained
+    //   t2  A drops dag-a's row
+    //   t3  B parks the container with background shells still in it:
+    //       retention record written, then dag-b's handle freed
+    //   t4  A re-asks the DAG registry only -- nobody holds it -- and stops w
+    //
+    // What comes out at t4 is a stop issued against a container whose
+    // background work is the whole reason it was kept alive, and the retention
+    // record protecting it is still valid while the stop goes out. So the
+    // question the re-check asks has to be the same question the first check
+    // asked -- is there ANY claim on this workload -- and a stale `false` from
+    // before the window is not an answer to it.
+    //
+    // Here and not on the path that never declined, which is why this is one
+    // more read on the re-check rather than a third read before every stop:
+    // Brain retains a container only when `entryOwnedByAnother` says no other
+    // DAG holds it, so t3 is not reachable while this DAG's own row is still
+    // registered. Dropping that row at t2 is what opens the window, and this
+    // branch is the only one that drops it before deciding.
+    //
+    // Together, because both are bounded by the same ceiling and a cancel that
+    // paid it twice in series would spend twice the budget the ceiling exists
+    // to cap. `allSettled` rather than `all` so that a rejection from one is
+    // settled rather than left unhandled while its sibling is still in flight.
+    const [heldAnswer, retainedAnswer] = await Promise.allSettled([
+      withDeadline(
         otherDagHolding(dagRootTaskId, known.workload_id, "after-own-row-gone"),
         SHARED_CHECK_TIMEOUT_MS,
         `last-holder re-check for ${known.workload_id}`,
+      ),
+      withDeadline(
+        handleRegistry.retained(known.workload_id),
+        SHARED_CHECK_TIMEOUT_MS,
+        `retention re-check for ${known.workload_id}`,
+      ),
+    ]);
+    // A positive answer from either half is decisive and is read first: it
+    // says the workload is demonstrably still claimed, which forbids the stop
+    // whatever the other half did. Declining on it leaves nothing behind for
+    // the same reason the branch above does -- somebody else is holding it, by
+    // the very read that answered -- so there is no leak to report.
+    if (retainedAnswer.status === "fulfilled" && retainedAnswer.value) {
+      logger.info(
+        { dagRootTaskId, handleName, workloadId: known.workload_id },
+        "sandbox.stop_skipped_retained_after_recheck",
       );
-    } catch (e) {
+      return "unconfirmed";
+    }
+    if (heldAnswer.status === "fulfilled" && heldAnswer.value !== null) {
+      // The ordinary shared release, and the property the ordering move bought:
+      // it declines, and it leaves nothing behind to report.
+      return "unconfirmed";
+    }
+    // Only now do failures matter: neither half established a claim, so an
+    // unanswered half is the difference between "nobody holds it" and "nobody
+    // could say". The second is not a licence to stop anything.
+    const failure = [heldAnswer, retainedAnswer]
+      .find((answer): answer is PromiseRejectedResult => answer.status === "rejected");
+    if (failure) {
       // The one declining exit with no mapping left to be its own evidence.
       // Everywhere else a check that fails keeps the handle registered and the
       // sweeper comes back to it; here the row is already gone, so `unreleased`
@@ -1259,17 +1422,13 @@ export async function stopSandboxByHandle(
       // either: this call really did drop a reference without establishing
       // that anything else still holds one, which is precisely what the record
       // means. (`rememberOutcome` contains its own failures, and answers
-      // `NoRecordHome` -- no DAG row, so no reader -- by reporting success.)
+      // `NoRecordHome` -- no DAG row, so no reader -- with `no_record_home`,
+      // which is a teardown that may proceed, not a record that was made.)
       logger.warn(
-        { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
+        { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(failure.reason) },
         "sandbox.last_holder_recheck_failed",
       );
       await rememberOutcome(dagRootTaskId, handleName, known.workload_id, "unconfirmed");
-      return "unconfirmed";
-    }
-    if (stillHeld !== null) {
-      // The ordinary shared release, and the property the ordering move bought:
-      // it declines, and it leaves nothing behind to report.
       return "unconfirmed";
     }
     logger.info(
@@ -1277,6 +1436,29 @@ export async function stopSandboxByHandle(
       "sandbox.last_holder_after_recheck",
     );
   }
+
+  // The credentials come first now, with the other two reads that can forbid a
+  // stop, rather than after the destroy where they used to sit. Same rule as
+  // the retention and co-holder checks above: read everything that could
+  // forbid dropping the mapping before anything is dropped. The cost of the
+  // old position was not hypothetical -- a session row that would not load
+  // threw AFTER the mapping was gone, which is the one ordering this function
+  // exists to avoid.
+  let platformKey: string;
+  try {
+    platformKey = await loadPlatformKeyForSession(sessionId);
+  } catch (e) {
+    // Reaching the credentials is part of issuing the stop; failing to is a
+    // stop that did not happen, not an error for the cancel to raise. Nothing
+    // is written or destroyed yet, so the mapping is still the reference it
+    // always was and the sweeper comes back to it.
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: known.workload_id, err: errText(e) },
+      "sandbox.stop_precondition_failed",
+    );
+    return "unconfirmed";
+  }
+  const blocked = stopBlocker(known.workload_id, platformKey);
 
   // On record first, so the window below is one this can be recovered from
   // rather than one that loses the handle. Cleared by a release that lands.
@@ -1290,17 +1472,17 @@ export async function stopSandboxByHandle(
   // retries, which the sweeper does; the alternative costs the only reference
   // to it. (The cancellation's own verdict is already written and unaffected --
   // this returns, it does not throw.)
-  const recorded = await rememberOutcome(
+  const fate = await rememberOutcome(
     dagRootTaskId, handleName, known.workload_id, "unconfirmed",
   );
-  if (!recorded && !ownRowGone) {
+  if (fate === "not_written" && !ownRowGone) {
     logger.warn(
       { dagRootTaskId, handleName, workloadId: known.workload_id },
       "sandbox.teardown_skipped_unrecorded",
     );
     return "unconfirmed";
   }
-  if (!recorded) {
+  if (fate === "not_written") {
     // Promoted to last holder by the re-check above, so the mapping this gate
     // exists to preserve is ALREADY gone. Withholding the stop now buys
     // nothing and costs everything -- the same reasoning `NoRecordHome` gives
@@ -1311,6 +1493,53 @@ export async function stopSandboxByHandle(
       { dagRootTaskId, handleName, workloadId: known.workload_id },
       "sandbox.teardown_unrecorded_row_already_gone",
     );
+  }
+  // Nothing could be filed, and nothing can be sent. The one combination where
+  // dropping the mapping is not a bookkeeping loss but the loss of the
+  // workload itself.
+  //
+  // Three states are collapsed here if this gate is missing, and they are not
+  // the same. A stop that SUCCEEDED owes nothing and the mapping should go. A
+  // stop that FAILED against a DAG row that exists is a leak somebody can act
+  // on: `sandbox_release.unreleased` names the workload, `GET /v1/tasks/:id`
+  // serves it, and the mapping is free to go because the record replaced it.
+  // A stop that could not be ISSUED against a DAG row that is gone has
+  // neither. Destroying the mapping there is not "reporting a leak", it is
+  // deleting the last thing in the system that knows the workload's id -- the
+  // sweep that would have come back for it starts from `listAll()`, which is
+  // these mappings, so after the destroy there is no entry point left.
+  //
+  // `NoRecordHome` is right and is not what changes here. A missing DAG root
+  // row is the definition of the orphan this sweep exists to reap, and letting
+  // it withhold the stop made every orphan permanent. What it assumed is that
+  // the stop would at least be ATTEMPTED, so "nothing recorded" was paid for
+  // with "something released". When the stop cannot be issued that trade is
+  // not on offer, and the gate is the attempt, not the record.
+  //
+  // So the mapping stays and the sweeper reaches this handle again next tick.
+  // That is a loop on something this process may never be able to stop, and it
+  // is the trade this branch has already made once, one branch up, for a
+  // handle naming no workload at all: a row that outlives its DAG, counted in
+  // `sweeper.orphan_handles_unreleased` every tick, is a cost an operator can
+  // see and act on. A silent abandonment is not. And unlike that branch this
+  // loop can actually end: `no_safe_url` ends when the deployment is
+  // configured, and `no_platform_key` ends the moment the session is submitted
+  // to again -- `stampSessionCredentials` rewrites `platform_key` onto the
+  // session row on EVERY submission, precisely so a session that predates a
+  // key is not stuck without one. The next tick then issues a stop that can
+  // work.
+  //
+  // Not gated on `ownRowGone`: when the decline branch above already destroyed
+  // this DAG's row, there is no mapping left to preserve and returning here
+  // would abandon the stop as well as the reference. That path keeps the
+  // behaviour it has -- attempt it anyway, and let the warning above be the
+  // trace.
+  if (fate === "no_record_home" && blocked && !ownRowGone) {
+    logger.warn(
+      { dagRootTaskId, handleName, workloadId: known.workload_id, blocked },
+      "sandbox.teardown_kept_last_reference",
+    );
+    return "unconfirmed";
   }
 
   let wid: string | null;
@@ -1364,19 +1593,19 @@ export async function stopSandboxByHandle(
   // or the re-check above found the co-holder had let go first and promoted
   // this call to last holder, in which case `ownRowGone` is already true and
   // the destroy below has happened.
-  let released: ReleaseOutcome;
-  try {
-    const platformKey = await loadPlatformKeyForSession(sessionId);
-    released = await safeStopWorkload(wid, platformKey);
-  } catch (e) {
-    // Reaching the credentials is part of issuing the stop; failing to is a
-    // stop that did not happen, not an error for the cancel to raise.
-    logger.warn(
-      { dagRootTaskId, handleName, workloadId: wid, err: errText(e) },
-      "sandbox.stop_precondition_failed",
-    );
-    released = "unconfirmed";
-  }
+  // No try around this one any more: the only part of issuing a stop that could
+  // throw was reaching the credentials, and that moved above the destroy where
+  // a failure still has a mapping to fall back on. `safeStopWorkload` answers
+  // `unconfirmed` for every failure it meets and throws none of them, which is
+  // the contract cleanup depends on -- it must not fail the cancellation that
+  // triggered it.
+  //
+  // Still issued when `blocked` is set and this call got past the gate above:
+  // either the DAG row is there to record the failure on, or the mapping was
+  // already gone. An unauthenticated stop that SaFE refuses costs one 401 and
+  // tells the operator, through `safe.stop_failed`, which workload is stranded
+  // and why -- better than declining silently once the reference is safe.
+  const released = await safeStopWorkload(wid, platformKey);
 
   logger.info({ dagRootTaskId, handleName, workloadId: wid, released }, "sandbox.destroyed");
   await rememberOutcome(dagRootTaskId, handleName, wid, released);
@@ -1384,27 +1613,40 @@ export async function stopSandboxByHandle(
 }
 
 /**
- * Keep or drop this handle's entry in the record, without letting the
- * bookkeeping decide the answer.
+ * Where this call's outcome ended up: on the DAG root's row, nowhere because
+ * there is no row, or nowhere because the write did not land.
  *
- * A failed write is reported, not thrown, and it is not inconsequential: the
- * pre-stop write returning `false` stops THIS call from destroying the
- * mapping, which is the point of writing first -- the mapping is the last
- * reference once the record is gone. Reporting rather than throwing keeps the
- * outcome this call did establish from being discarded along with it.
+ * Three values rather than the boolean this used to return, and the third is
+ * the one that was missing. `true` meant "the teardown may proceed", which
+ * covered both "it is written down" and "there is nothing to write it on" --
+ * and those differ on the only question that matters after the mapping goes:
+ * whether ANYTHING still names the workload. A caller handed one bit cannot
+ * ask it, which is how an orphan whose stop also could not be issued ended up
+ * with its mapping destroyed, no record, and a running workload nothing could
+ * reach.
  *
- * `true` therefore means "the teardown may proceed", which is a different
- * claim from "a record was written", and the two part company in exactly one
- * place: `NoRecordHome`, where the DAG root row is gone. See the class -- with
- * no row there is no reader, so there is nothing for a record to protect and
- * nothing for withholding the stop to buy.
+ *   - `recorded`        the mark (or clear) reached the DAG root row. The
+ *                       record is a reference: `GET /v1/tasks/:taskId` serves
+ *                       it and `unreleasedRecord.any` reads it.
+ *   - `no_record_home`  there is no row, so no reader -- see `NoRecordHome`.
+ *                       The teardown still proceeds; withholding it protects
+ *                       nobody. But nothing was filed, so the handle mapping
+ *                       is the only reference there is.
+ *   - `not_written`     the row is there and the write did not land. The
+ *                       evidence is missing while the thing it is evidence
+ *                       about is still reachable, so the mapping must stay.
+ *
+ * A failed write is reported, not thrown: reporting rather than throwing keeps
+ * the outcome this call did establish from being discarded along with it.
  */
+type RecordFate = "recorded" | "no_record_home" | "not_written";
+
 async function rememberOutcome(
   dagRootTaskId: string,
   handleName: string,
   workloadId: string,
   released: ReleaseOutcome,
-): Promise<boolean> {
+): Promise<RecordFate> {
   try {
     // Cleared by identity: this release confirms THIS workload, and says
     // nothing about another one a rebuild registered under the same name.
@@ -1413,7 +1655,7 @@ async function rememberOutcome(
     } else {
       await unreleasedRecord.mark(dagRootTaskId, handleName, workloadId);
     }
-    return true;
+    return "recorded";
   } catch (e) {
     if (e instanceof NoRecordHome) {
       // Nowhere to file it, and so nobody to file it for. This is the orphan
@@ -1421,17 +1663,20 @@ async function rememberOutcome(
       // it an orphan, and refusing to act on that would leave the workload
       // running with its only reference in a bucket that never expires.
       //
-      // Not folded into the `false` below and not made silent: the teardown
-      // goes ahead, and this line is the only trace that it went ahead on a
-      // DAG that can no longer report anything about itself.
+      // Not folded into the `not_written` below and not made silent: the
+      // teardown goes ahead, and this line is the only trace that it went
+      // ahead on a DAG that can no longer report anything about itself. What
+      // the caller does with the distinction is in `stopSandboxByHandle`: a
+      // teardown with nowhere to file evidence may not also destroy the only
+      // reference left, unless it can at least issue the stop.
       logger.warn(
         { dagRootTaskId, handleName, workloadId, released },
         "sandbox.unreleased_record_no_row",
       );
-      return true;
+      return "no_record_home";
     }
-    // Contained here so the caller can decide: `false` is how it learns not to
-    // drop the mapping.
+    // Contained here so the caller can decide: `not_written` is how it learns
+    // not to drop the mapping.
     //
     // `workloadId` deliberately: this warning is the only trace of a handle
     // whose record was not written, and without the id an operator has to
@@ -1441,7 +1686,7 @@ async function rememberOutcome(
       { dagRootTaskId, handleName, workloadId, released, err: errText(e) },
       "sandbox.unreleased_record_write_failed",
     );
-    return false;
+    return "not_written";
   }
 }
 
@@ -1482,6 +1727,42 @@ async function firstAnswer<T, R>(
     Array.from({ length: Math.min(REGISTRY_READ_CONCURRENCY, items.length) }, worker),
   );
   return found;
+}
+
+/**
+ * `probe` applied to every one of `items`, with at most
+ * `REGISTRY_READ_CONCURRENCY` probes in flight, in `items` order.
+ *
+ * The sibling of `firstAnswer` for the reads whose answer is the whole list
+ * rather than the first hit, and it keeps that function's two properties for
+ * the same reasons. A probe that rejects rejects the whole call: a registry
+ * read that failed is an unknown, and a list assembled by skipping it is a
+ * list that reads as "these are all the rows there are". And each worker stops
+ * at its own first rejection, so a registry failing outright costs at most one
+ * read per worker; every rejection is settled by the `Promise.all`, so a
+ * sibling failing after the first cannot surface as an unhandled rejection.
+ *
+ * Order is preserved by writing each answer at its own index rather than
+ * pushing, so nothing downstream has to care that the reads were reordered.
+ */
+async function boundedMap<T, R>(
+  items: readonly T[],
+  probe: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      out[index] = await probe(items[index] as T);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(REGISTRY_READ_CONCURRENCY, items.length) }, worker),
+  );
+  return out;
 }
 
 /**
