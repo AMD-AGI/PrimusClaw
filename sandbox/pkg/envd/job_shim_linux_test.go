@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -142,31 +144,35 @@ func TestSetsidDescendantKeepsTheJobTracked(t *testing.T) {
 	t.Fatal("the job stayed on the roster after its descendant exited")
 }
 
-func TestHandsJobCountsDescendantsAndNotHandsItself(t *testing.T) {
-	requireJobShim(t)
-	// The Hands job is infrastructure: its own process never counts, and the
-	// roster reports the descendants it spawned. This is the branch that decides
-	// every reclaim in production, and it walks procfs.
-	s := newTestServer()
+func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {
+	// The Hands job is infrastructure: the roster reports the descendants it
+	// spawned rather than the supervisor, which is the branch that decides every
+	// reclaim. A user job is accounted for by its own live shim instead.
 	command := []string{"sh", "-c", "exec -a /tmp/.hands-binary sleep 2"}
 	if !isHandsCommand(command) {
 		t.Fatal("the relaunch command has to be recognised as Hands")
 	}
-	var out synchronizedBuffer
-	_, _, stop, err := s.startTrackedCommand(command, "", os.Environ(), &out, &out, true)
-	if err != nil {
-		t.Fatalf("startTrackedCommand: %v", err)
-	}
-	defer stop()
-	// Read once, while Hands is up: the walk crosses every process the caller
-	// can see, so its cost tracks the size of that table rather than the tree.
-	time.Sleep(200 * time.Millisecond)
-	snap, err := s.jobs.snapshot()
+	root := procTable(t,
+		procEntry{pid: 400, ppid: 1, state: 'S', argv: []string{"envd", "--job-shim", "sh"}},
+		procEntry{pid: 401, ppid: 400, state: 'S', argv: []string{"/tmp/.hands-binary"}},
+	)
+	r := newJobRegistry()
+	r.count = func(shimPID int) (int, error) { return countUserDescendantsIn(root, shimPID) }
+	r.add(400, command)
+	snap, err := r.snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snap.count != 0 {
 		t.Fatalf("Hands counted itself as user work, which holds every sandbox open: %+v", snap)
+	}
+	r.add(500, []string{"sh", "-c", "sleep 30"})
+	snap, err = r.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.count != 1 {
+		t.Fatalf("a live user shim is work regardless of its tree: %+v", snap)
 	}
 }
 
@@ -218,6 +224,94 @@ func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("an untracked shim's death latched tracking_lost")
+}
+
+// procEntry is one row of a process table the walk can be pointed at.
+type procEntry struct {
+	pid   int
+	ppid  int
+	state byte
+	argv  []string
+}
+
+// procTable writes a process table the walk reads like procfs. Pointing the
+// walk at one of these keeps a case about the tree from being a measurement of
+// whatever else the host is running.
+func procTable(t *testing.T, entries ...procEntry) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, e := range entries {
+		dir := filepath.Join(root, strconv.Itoa(e.pid))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		comm := filepath.Base(e.argv[0])
+		stat := fmt.Sprintf("%d (%s) %c %d 0 0 0\n", e.pid, comm, e.state, e.ppid)
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmdline := strings.Join(e.argv, "\x00") + "\x00"
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(cmdline), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func TestWorkDetachedAlongsideHandsIsCounted(t *testing.T) {
+	// The shape production produces. The tracked job starts Hands; Hands spawns
+	// a detached shell for the user's command, and prompts routinely detach
+	// again with `setsid nohup`. Neither hop leaves the shim -- a subreaper
+	// adopts orphans from its whole descendant tree, and setsid changes the
+	// session rather than the parent chain -- so both land back under it.
+	// Hands stays out of the count while the work beside it is counted.
+	root := procTable(t,
+		procEntry{pid: 100, ppid: 1, state: 'S', argv: []string{"envd", "--job-shim", "sh"}},
+		procEntry{pid: 101, ppid: 100, state: 'S', argv: []string{"/tmp/.hands-binary"}},
+		procEntry{pid: 102, ppid: 100, state: 'S', argv: []string{"sleep", "120"}},
+	)
+	n, err := countUserDescendantsIn(root, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("detached work beside Hands has to be the one thing counted, got %d", n)
+	}
+}
+
+func TestHandsDescendantsAreCountedAndZombiesAreNot(t *testing.T) {
+	// Work the user started through Hands is a descendant of Hands, so the walk
+	// has to continue through the process it excludes. A zombie has nothing
+	// left running and is not work.
+	root := procTable(t,
+		procEntry{pid: 200, ppid: 1, state: 'S', argv: []string{"envd", "--job-shim", "sh"}},
+		procEntry{pid: 201, ppid: 200, state: 'S', argv: []string{"/app/hands-binary"}},
+		procEntry{pid: 202, ppid: 201, state: 'S', argv: []string{"python", "train.py"}},
+		procEntry{pid: 203, ppid: 202, state: 'S', argv: []string{"sh", "-c", "nvidia-smi"}},
+		procEntry{pid: 204, ppid: 201, state: 'Z', argv: []string{"sh"}},
+	)
+	n, err := countUserDescendantsIn(root, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("Hands is excluded but its descendants are not, and a zombie is not work; got %d", n)
+	}
+}
+
+func TestAnIdleHandsSandboxCountsNothing(t *testing.T) {
+	// The state a reclaim turns on: Hands resident, nothing else running.
+	root := procTable(t,
+		procEntry{pid: 300, ppid: 1, state: 'S', argv: []string{"envd", "--job-shim", "sh"}},
+		procEntry{pid: 301, ppid: 300, state: 'S', argv: []string{"/tmp/.hands-binary"}},
+	)
+	n, err := countUserDescendantsIn(root, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("a sandbox holding only Hands is idle, got %d", n)
+	}
 }
 
 func TestOnlyHandsItselfIsExcludedFromTheCount(t *testing.T) {

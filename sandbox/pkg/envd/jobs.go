@@ -31,11 +31,15 @@ type jobRegistry struct {
 	mu   sync.Mutex
 	jobs map[int]trackedJob
 	lost bool
+	// count resolves a Hands shim to its live user descendants. It is a field
+	// so accounting can be exercised against a known tree; the walk it defaults
+	// to reads the whole process table of whatever host it runs on.
+	count func(shimPID int) (int, error)
 }
 
 // newJobRegistry creates an empty per-EnvD job registry.
 func newJobRegistry() *jobRegistry {
-	return &jobRegistry{jobs: make(map[int]trackedJob)}
+	return &jobRegistry{jobs: make(map[int]trackedJob), count: countUserDescendants}
 }
 
 // markLost records that a supervisor died before its tree could be accounted for.
@@ -109,7 +113,7 @@ func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 	count := 0
 	for _, j := range r.jobs {
 		if j.hands {
-			n, err := countUserDescendants(j.shimPID)
+			n, err := r.count(j.shimPID)
 			if err != nil {
 				return jobSnapshot{}, err
 			}

@@ -17,10 +17,21 @@ type procInfo struct {
 	cmd   string
 }
 
+// The process table this walk reads.
+const procRoot = "/proc"
+
 // countUserDescendants counts live descendants while excluding the Hands
 // daemon itself. Descendants of Hands remain in the walk and are counted.
 func countUserDescendants(shimPID int) (int, error) {
-	procs, err := listProcs()
+	return countUserDescendantsIn(procRoot, shimPID)
+}
+
+// countUserDescendantsIn is the walk itself, over a given process table. The
+// table is a parameter because its size decides the cost: a sandbox holds a few
+// dozen processes, while a build host can hold hundreds of thousands, and a
+// test that walked the latter would measure the host rather than the tree.
+func countUserDescendantsIn(root string, shimPID int) (int, error) {
+	procs, err := listProcs(root)
 	if err != nil {
 		return 0, err
 	}
@@ -71,8 +82,8 @@ func isHandsProcess(cmd string) bool {
 }
 
 // listProcs snapshots process identity and parent links from procfs.
-func listProcs() ([]procInfo, error) {
-	ents, err := os.ReadDir("/proc")
+func listProcs(root string) ([]procInfo, error) {
+	ents, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +96,7 @@ func listProcs() ([]procInfo, error) {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		p, ok := readProc(pid)
+		p, ok := readProc(root, pid)
 		if ok {
 			out = append(out, p)
 		}
@@ -94,8 +105,8 @@ func listProcs() ([]procInfo, error) {
 }
 
 // readProc reads one process, tolerating normal exit races.
-func readProc(pid int) (procInfo, bool) {
-	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+func readProc(root string, pid int) (procInfo, bool) {
+	raw, err := os.ReadFile(root + "/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return procInfo{}, false
 	}
@@ -114,7 +125,7 @@ func readProc(pid int) (procInfo, bool) {
 		return procInfo{}, false
 	}
 	cmd := string(raw[lparen+1 : rparen])
-	if c, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err == nil && len(c) > 0 {
+	if c, err := os.ReadFile(root + "/" + strconv.Itoa(pid) + "/cmdline"); err == nil && len(c) > 0 {
 		cmd = string(bytes.ReplaceAll(c, []byte{0}, []byte{' '}))
 	}
 	return procInfo{pid: pid, ppid: ppid, state: fields[0][0], cmd: cmd}, true
