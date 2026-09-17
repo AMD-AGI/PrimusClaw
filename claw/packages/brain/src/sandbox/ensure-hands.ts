@@ -1026,6 +1026,14 @@ async function provisionHands(
   const hold = await admitSandbox(sessionId);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
+    // Same field the READY payload below carries, and for the same reason, but
+    // it is the PENDING form that cannot do without it: the sweeper's collector
+    // has to ask whether anyone still holds this session's run lease before it
+    // stops a queued workload, and `lock.<sessionId>` is not where that lease
+    // is. Without this the collector cannot tell "nobody is waiting for this"
+    // from "I looked under the wrong key", and it is written to skip rather
+    // than guess -- so an entry with no runScope is an entry nothing collects.
+    runScope: pickLockKey(request),
   });
 
   logger.info({ sessionId, sandboxImage, namespace: nsForSandbox }, "ensureHands.creating_workload");
@@ -1228,6 +1236,13 @@ export function makeOnProvisioned(deps: {
   sandboxImage: string | null;
   kv: KV;
   hold: AdmissionHold;
+  /**
+   * The key this run's lease is under (`pickLockKey`), recorded on the PENDING
+   * entry so a sweeper can ask whether the run that minted this workload is
+   * still alive. Omitted only where there is no request to take it from; the
+   * collector treats an entry without it as one it may not judge.
+   */
+  runScope?: string;
   stop?: (workloadId: string) => Promise<void>;
 }): (workloadId: string) => Promise<void> {
   const stopWorkload = deps.stop ?? (async (workloadId: string) => {
@@ -1276,6 +1291,12 @@ export function makeOnProvisioned(deps: {
     const pendingPayload = sc.encode(JSON.stringify({
       status: "pending", workloadId, sandboxImage: deps.sandboxImage,
       platformKey: deps.apiKey, token: deps.handsToken, namespace: deps.namespace,
+      runScope: deps.runScope,
+      // Stamped once, here, and never rewritten. The delivery heartbeat re-puts
+      // this entry's bytes back unchanged every 10s to refresh its TTL, so this
+      // is an age from creation and not from the last touch -- which is what
+      // lets both the runner's ownership test and the sweeper's abandonment
+      // horizon read it.
       createdAt: new Date().toISOString(),
     }));
     for (let attempt = 1; attempt <= 3; attempt++) {

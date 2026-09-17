@@ -3382,7 +3382,13 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands left a PENDING entry
     // (no-op when the entry is READY — a healthy sandbox is kept for the
     // retry to reuse). Done BEFORE nak so the retry starts clean.
-    await fx().reapPendingHands(this.sessionId);
+    //
+    // `sandboxAskedAt` and not a bare session id: the entry is per session, so
+    // a run that asked for no sandbox, or asked and was refused before
+    // `onProvisioned` ran, would otherwise destroy whichever workload an
+    // earlier message of this session is still provisioning. Same threshold
+    // `pendingHandsIdentity` reports on -- see reapPendingHands.
+    await fx().reapPendingHands(this.sessionId, this.sandboxAskedAt);
     // Flush a per-attempt transcript before NAK so the JSONL captures
     // events of THIS attempt even if the next delivery / pod loses state.
     this.transcriptLog.push({
@@ -3454,7 +3460,14 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
-    await fx().reapPendingHands(this.sessionId);
+    //
+    // Ownership-gated on `sandboxAskedAt`, which is what makes this the reap of
+    // THIS run's provision. It is the path the defect ran down: a chat turn
+    // under BRAIN_LAZY_SANDBOX that never called `ensureHands` fails on an LLM
+    // error, arrives here, and with a blind reap destroys the predecessor's
+    // pending workload -- the same misreading `reportableIdentity` above
+    // refuses, now refused on the destructive side too.
+    await fx().reapPendingHands(this.sessionId, this.sandboxAskedAt);
     // Classify sandbox-originated failures so the frontend can render a
     // dedicated banner (and so the user sees a readable reason rather than
     // a raw stack-trace tail). Non-sandbox errors fall through with the
