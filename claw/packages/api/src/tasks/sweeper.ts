@@ -43,7 +43,9 @@ import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 // accessor main imported here: same KV bucket, but every read goes through the
 // registry so a lookup can be re-read consistently before a destroy. The only
 // caller in this file is reapOrphanHandles, so the rename is the whole change.
-import { handleRegistry, stopAllHandlesForDag } from "./sandbox-stopper.js";
+import {
+  handleRegistry, stopAllHandlesForDag, type SessionBackgroundWork,
+} from "./sandbox-stopper.js";
 import {
   DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
   RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
@@ -102,6 +104,165 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
  * waiting forever.
  */
 const ORPHAN_BG_VERDICT_WAIT_MS = BG_VERDICT_TTL_MS;
+
+/**
+ * How many of a session's live tasks the orphan sweep will enumerate before it
+ * stops claiming to have seen all of them.
+ *
+ * The guard below is an assertion about EVERY live task in the session, so a
+ * truncated list is not a smaller answer to the same question -- it is a
+ * different question, and the row it did not read is exactly the one that may
+ * be holding the workload about to be stopped. Past this many rows the answer
+ * is `unknown`, which defers, the same as a read that failed outright.
+ *
+ * A session with two hundred simultaneously non-terminal tasks is not a shape
+ * this system produces. If one ever appears, an operator gets a named log line
+ * saying the sweep declined rather than a sweep that quietly reaped under it.
+ */
+const LIVE_TASK_SCAN_LIMIT = 200;
+
+/** One non-terminal task of a session, and where its workload can be named. */
+interface LiveTaskRow {
+  task_id: string;
+  dag_root_task_id: string | null;
+  sandbox_workload_id: string | null;
+}
+
+/**
+ * What a session's live work is holding, as far as this sweep can establish.
+ *
+ * `unknown` is not a quieter `idle`, and the whole safety of the narrowed
+ * guard rests on keeping them apart. `idle` means the database was read and
+ * there is no non-terminal task in this session. `unknown` means there IS live
+ * work and this sweep could not find out what it holds -- a failed query, a
+ * registry read that threw, or a live task that has not yet been given a
+ * workload by anybody. Only `idle` and a `holding` set that misses the
+ * candidate may license a stop.
+ */
+type SessionHoldings =
+  | { state: "idle" }
+  | { state: "unknown"; reason: string }
+  | { state: "holding"; workloads: Set<string>; tasks: number };
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Every workload the session's live tasks hold, or why that cannot be said.
+ *
+ * Three stores can name the workload a live task is on, and none of them is
+ * sufficient alone, so all three are unioned and the union is only believed
+ * when it is non-empty:
+ *
+ *   - **The DAG handle registry.** Brain registers a handle under
+ *     `dag_root_task_id ?? task_id` the moment SaFE assigns a workload id
+ *     (`makeOnProvisioned`), i.e. while the task is still `preparing` and the
+ *     pod may still be queued for a GPU, and reuse registers the ADOPTING DAG
+ *     the same way. So this is the earliest and the most complete of the three.
+ *     It is read from the stream leader, not from the local replica: the
+ *     load-bearing answer here is the negative one -- "this live task does not
+ *     hold that workload" -- and a direct read that is merely behind an
+ *     acknowledged registration would answer it wrongly in the one direction
+ *     that costs a running pod. A read that throws is `unknown`, never "holds
+ *     nothing".
+ *   - **`claw_tasks.sandbox_workload_id`.** Written best-effort when the run
+ *     reports itself running, which is AFTER `ensureHands` returns -- so it is
+ *     NULL for the whole of `preparing` and can lag a rebuild. It can only add
+ *     a workload to the set, never remove one, so its staleness defers rather
+ *     than reaps.
+ *   - **`hands.<session>`**, read by the caller through the background-work
+ *     reader it already runs. Not part of this union because it is a property
+ *     of the session rather than of a task; the caller applies it separately.
+ *
+ * A live task that names no workload in any of them is the case the guard
+ * exists to get right: a task sitting `preparing` before anything has been
+ * created for it holds nothing YET, and it is about to either create a sandbox
+ * or adopt the session's existing one -- possibly the very one being
+ * considered. Reading it as "holds nothing, so reap everything" is how a pod
+ * gets pulled out from under the task that was one moment away from using it.
+ * It answers `unknown`, and `unknown` defers.
+ */
+async function liveWorkHoldings(
+  sessionId: string,
+  memo: Map<string, SessionHoldings>,
+): Promise<SessionHoldings> {
+  const cached = memo.get(sessionId);
+  if (cached) return cached;
+  const answer = await resolveLiveWorkHoldings(sessionId);
+  memo.set(sessionId, answer);
+  return answer;
+}
+
+async function resolveLiveWorkHoldings(sessionId: string): Promise<SessionHoldings> {
+  let rows: LiveTaskRow[];
+  try {
+    const live = await db.query(
+      `SELECT task_id, dag_root_task_id, sandbox_workload_id
+         FROM claw_tasks
+        WHERE session_id = $1
+          AND status NOT IN ('completed','failed','cancelled')
+        LIMIT $2`,
+      [sessionId, LIVE_TASK_SCAN_LIMIT + 1],
+    );
+    rows = (live.rows ?? []) as LiveTaskRow[];
+  } catch (e) {
+    return { state: "unknown", reason: `live_task_query_failed: ${errMsg(e)}` };
+  }
+  if (rows.length === 0) return { state: "idle" };
+  if (rows.length > LIVE_TASK_SCAN_LIMIT) {
+    return { state: "unknown", reason: "live_tasks_past_scan_limit" };
+  }
+  // The key Brain registers a handle under, which for a standalone task -- a
+  // chat turn -- is its own task id, because `dag_root_task_id` is NULL for
+  // one. Collected before any read so each root is leader-read ONCE: every node
+  // of a fan-out shares a root, and a session's live work is much more often
+  // many nodes of one DAG than many DAGs.
+  const byRoot = new Map<string, Set<string>>();
+  for (const row of rows) {
+    const dagRoot = row.dag_root_task_id || row.task_id;
+    if (dagRoot) byRoot.set(dagRoot, new Set());
+  }
+  for (const [dagRoot, into] of byRoot) {
+    try {
+      for (const info of Object.values(await handleRegistry.listForDagConsistent(dagRoot))) {
+        if (info.workload_id) into.add(info.workload_id);
+      }
+    } catch (e) {
+      return { state: "unknown", reason: `handle_read_failed(${dagRoot}): ${errMsg(e)}` };
+    }
+  }
+  const workloads = new Set<string>();
+  for (const row of rows) {
+    const dagRoot = row.dag_root_task_id || row.task_id;
+    const held = new Set(byRoot.get(dagRoot) ?? []);
+    if (row.sandbox_workload_id) held.add(row.sandbox_workload_id);
+    if (held.size === 0) {
+      return { state: "unknown", reason: `live_task_holds_nothing_yet(${row.task_id})` };
+    }
+    for (const workloadId of held) workloads.add(workloadId);
+  }
+  return { state: "holding", workloads, tasks: rows.length };
+}
+
+/**
+ * Does the session's `hands.<session>` slot currently name one of the
+ * workloads this sweep is about to stop?
+ *
+ * Derived from the background-work answer the sweep already reads rather than
+ * from a second point read, because that reader's workload match IS this
+ * question: every state except the three below is reached only after the
+ * binding was found to name one of the workloads asked about.
+ *
+ * `"unknown"` for an unreadable store, which is where every other unknown on
+ * this path lands too.
+ */
+function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
+  if (bg.state === "unreadable") return "unknown";
+  if (bg.state === "running" || bg.state === "awaiting") return true;
+  return bg.reason !== "no_binding" && bg.reason !== "other_sandbox"
+    && bg.reason !== "no_workload";
+}
 
 /**
  * Whether the deadline backstop is allowed to act on chat runs.
@@ -2095,6 +2256,12 @@ export async function reapOrphanHandles(): Promise<number> {
   let dropped = 0;
   let unreleased = 0;
   let deferred = 0;
+  // One answer per session per tick. Several DAG roots of one session reach
+  // this loop -- that is the shape the guard below is about -- and the question
+  // "what is this session's live work holding" has the same answer for all of
+  // them. Not held across ticks: the next tick asks again, which is what makes
+  // "defer" a coherent answer here at all.
+  const holdingsBySession = new Map<string, SessionHoldings>();
   for (const [dagRoot, handles] of all) {
     // Keyed by `task_id` alone, which is the primary key. The old predicate
     // also demanded `dag_node_id = '__dag_root__'`, and that was not a
@@ -2121,29 +2288,73 @@ export async function reapOrphanHandles(): Promise<number> {
       // WITHOUT moving the DAG handle's ownership. So T1 completes, T2 picks up
       // the same workload, and this sweep -- reading only T1 -- stops the
       // sandbox T2 is running on. No race is needed: the two are sequential,
-      // which is the normal shape of a session.
+      // which is the normal shape of a session. Reuse now DOES register the
+      // adopting DAG, but it adds that reference without removing the creating
+      // task's, so this sweep still reaches a workload through a terminal owner
+      // while a live DAG holds it too.
       //
-      // Reuse now DOES register the adopting DAG -- but it adds that reference
-      // without removing the creating task's, so this sweep can still reach a
-      // workload through a terminal owner while a live DAG holds it too. The
-      // session is the wider thing the workload actually belongs to, so a
-      // session with live work keeps its sandboxes, and this guard stays
-      // necessary rather than being made redundant by the registration. The cost is a
-      // deferred reap on a busy session; the cost of the alternative is a pod
-      // pulled out from under a running task.
+      // **The question is which workload the live work holds, not whether the
+      // session has any.** The session-wide form of it deferred a reap for a
+      // task that could not possibly be using the sandbox in hand, and that is
+      // not a harmless delay: T1 finishes on W1; T2 in the same session changes
+      // the image, cannot reuse W1, and creates W2; T2 then sits `preparing`
+      // waiting for the GPU W1 is still holding. Consecutive sweeps each saw a
+      // live task and each skipped W1, Brain's keepalive kept it alive, and W1
+      // was released only when T2 eventually timed out. A guard whose deferral
+      // is what prevents the work that would end the deferral is not a
+      // conservative guard, it is a deadlock.
+      //
+      // Asking per workload was not possible until this branch: every
+      // registry-wide scan went through `scanPrefix`, which awaited `kv.get`
+      // inside the `for await` over `kv.keys()`, stalling the ordered consumer
+      // so it ended early and silently -- 21 live keys in the DAG_HANDLES
+      // bucket, one row returned. A per-workload answer built on that would
+      // have been a confident "nobody holds it" assembled from a list that was
+      // mostly missing. With the drain fixed the same bucket returns all of it,
+      // so who holds what can be asked and believed.
+      //
+      // `liveWorkHoldings` says which workloads the session's live tasks hold,
+      // and the three ways it can fail to say -- a failed query, a registry
+      // read that threw, a live task not yet given any workload -- all answer
+      // `unknown`, which defers exactly as the old guard did. The trade this
+      // guard was written to make is unchanged: it still never permits a stop
+      // it cannot establish is safe, and a deferred reap is still preferred to
+      // a pod pulled out from under a running task. What changed is that
+      // "cannot establish" now means the answer was unavailable, rather than
+      // meaning some unrelated task in the session was running.
       const sessionId = owner?.session_id
         ?? Object.values(handles).find((h) => h.session_id)?.session_id
         ?? "";
-      if (sessionId) {
-        const live = await db.query(
-          `SELECT 1 FROM claw_tasks
-            WHERE session_id = $1
-              AND status NOT IN ('completed','failed','cancelled')
-            LIMIT 1`,
-          [sessionId],
+      // What this sweep would be stopping. Handles with no workload id are the
+      // agent-sandbox (kubernetes) shape, which names a Router session instead
+      // -- there is no workload to ask about, so a candidate made only of those
+      // falls back to the session-wide question below rather than being reaped
+      // on an answer about a set that is empty.
+      const workloads = new Set(
+        Object.values(handles).map((h) => h.workload_id ?? "").filter((w) => !!w),
+      );
+      const holdings = sessionId
+        ? await liveWorkHoldings(sessionId, holdingsBySession)
+        : { state: "idle" as const };
+      if (holdings.state === "unknown") {
+        logger.info(
+          { dagRoot, sessionId, reason: holdings.reason },
+          "sweeper.orphan_handles_live_work_unknown",
         );
-        if ((live.rowCount ?? 0) > 0) {
-          logger.info({ dagRoot, sessionId }, "sweeper.orphan_handles_session_live");
+        deferred++;
+        continue;
+      }
+      if (holdings.state === "holding") {
+        const held = [...workloads].filter((w) => holdings.workloads.has(w));
+        if (workloads.size === 0 || held.length > 0) {
+          logger.info(
+            {
+              dagRoot, sessionId, liveTasks: holdings.tasks,
+              held: workloads.size === 0 ? "unnamed_workload" : held,
+            },
+            "sweeper.orphan_handles_session_live",
+          );
+          deferred++;
           continue;
         }
       }
@@ -2184,10 +2395,33 @@ export async function reapOrphanHandles(): Promise<number> {
       // is no next time and deferring means never stopping, which is why the
       // guard is here and not inside `stopAllHandlesForDag`.
       const bg = sessionId
-        ? await handleRegistry.backgroundWork(
-          sessionId, Object.values(handles).map((h) => h.workload_id ?? ""),
-        )
+        ? await handleRegistry.backgroundWork(sessionId, [...workloads])
         : { state: "clear" as const, reason: "no_workload" as const };
+      // The second half of "does live work hold THIS workload", and the half
+      // the handle registry cannot answer on its own.
+      //
+      // `hands.<session>` is the one slot a session reuses from: a live task
+      // that has never touched this workload can still be a moment away from
+      // adopting whatever that slot names, and adoption registers its handle
+      // only afterwards. So while the session has live work, a binding pointing
+      // at one of these workloads keeps them, and that is also the backstop for
+      // a registration this sweep read late or not at all. It costs nothing
+      // extra: the workload match is already the first thing the background-work
+      // reader does, so this is the read above classified rather than a second
+      // one, and it is skipped entirely for a session with no live work -- which
+      // is where the genuine orphan lives, and where the background-work guard
+      // below, not this one, is what decides.
+      if (holdings.state === "holding") {
+        const names = bindingNamesOneOf(bg);
+        if (names !== false) {
+          logger.info(
+            { dagRoot, sessionId, liveTasks: holdings.tasks, certain: names !== "unknown" },
+            "sweeper.orphan_handles_session_binding_holds",
+          );
+          deferred++;
+          continue;
+        }
+      }
       if (bg.state === "running") {
         logger.info(
           { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },

@@ -254,8 +254,17 @@ test("L5 a sandbox the next task in the session is reusing is not reaped", async
     if (sql.startsWith("SELECT status, session_id FROM claw_tasks")) {
       return { rows: [{ status: "completed", session_id: "s-1" }], rowCount: 1 };
     }
-    // T2, still running in the same session on the reused sandbox.
-    if (sql.startsWith("SELECT 1 FROM claw_tasks")) return { rows: [{ "?column?": 1 }], rowCount: 1 };
+    // T2, still running in the same session ON THE REUSED SANDBOX. The row
+    // names the workload, which is what makes this T2-holds-w-live rather than
+    // merely T2-exists: the sweep no longer defers for a live task that has
+    // nothing to do with the sandbox in hand, and a stub that only said "the
+    // session is busy" would no longer be describing this scenario.
+    if (sql.startsWith("SELECT task_id, dag_root_task_id, sandbox_workload_id")) {
+      return {
+        rows: [{ task_id: "t-2", dag_root_task_id: null, sandbox_workload_id: "w-live" }],
+        rowCount: 1,
+      };
+    }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
 
@@ -263,7 +272,7 @@ test("L5 a sandbox the next task in the session is reusing is not reaped", async
 
   assert.deepEqual(
     stopped, [],
-    "the workload belongs to the session while the session still has live work",
+    "the workload the next task reused is held by it, terminal owner or not",
   );
 });
 
