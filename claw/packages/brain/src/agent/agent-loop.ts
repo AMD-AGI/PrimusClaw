@@ -630,6 +630,29 @@ class AgentLoopRunner {
    */
   private toolOkByName: Record<string, number>;
   private totalToolCalls: number;
+  /**
+   * Tools this process has BEGUN, counted before anything can await.
+   *
+   * Separate from `totalToolCalls`, which is a reporting figure: it is
+   * incremented after the start event is published, and it is restored from a
+   * checkpoint. Neither is a defect there -- but both make it useless as an
+   * answer to "is anything running right now", which is the question
+   * `mayRethrowOpenFailure` actually asks.
+   *
+   * The gap it closes: `runTaskTool` is dispatched with `Promise.all` over a
+   * batch, and a sibling still suspended on its own start event had not reached
+   * its increment yet. The first task's open could then fail, read the count as
+   * 1, decide nothing else was running and nak -- while `Promise.all` went on
+   * to start the sibling, which executed and wrote. The redelivery then wrote
+   * again. Reproduced against a real ledger: two rows, against one on the
+   * baseline.
+   *
+   * So this is incremented synchronously, in the first statement of each path,
+   * before any `await` can yield. An async function runs to its first await
+   * when called, so by the time `batch.map` has finished building its promises
+   * every task in the batch is already counted.
+   */
+  private toolsStarted = 0;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
   private readonly initialTurn: number;
@@ -1711,6 +1734,7 @@ class AgentLoopRunner {
       // had no matching entry to update). Total bytes still drop ~60% vs
       // the pre-optimisation baseline because the terminal event no longer
       // re-sends argumentsDetail (only `description` carrying the result).
+    this.toolsStarted++;
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "start",
         argumentsDetail: { [toolName]: toolInput },
@@ -2020,9 +2044,18 @@ class AgentLoopRunner {
     const e = err as { name?: string; cause?: unknown } | null;
     if (e?.name !== "SandboxAttachError") return false;
     if (!isRetryable(e.cause)) return false;
-    if (this.totalToolCalls > 1) {
+    // Both counters, because they answer different halves of the question and
+    // neither answers it alone. `toolsStarted` covers what this process has
+    // begun, including a sibling that has not reached its own increment;
+    // `totalToolCalls` arrives from the checkpoint and covers work done under
+    // an earlier delivery, which `toolsStarted` has no memory of.
+    if (this.toolsStarted > 1 || this.totalToolCalls > 1) {
       logger.warn(
-        { sessionId: this.sessionId, totalToolCalls: this.totalToolCalls },
+        {
+          sessionId: this.sessionId,
+          toolsStarted: this.toolsStarted,
+          totalToolCalls: this.totalToolCalls,
+        },
         "sandbox.open_retryable_but_turn_has_run_tools",
       );
       return false;
@@ -2035,6 +2068,10 @@ class AgentLoopRunner {
     turn: number,
     resultByToolId: Map<string, string>,
   ): Promise<void> {
+    // FIRST, before any await. A sibling in the same `Promise.all` batch must
+    // be visible to a check made while this one is still suspended -- see
+    // `toolsStarted`.
+    this.toolsStarted++;
       const toolId = tc.id as string;
       const toolInput = (tc.input || {}) as Record<string, unknown>;
       const subagentId = `sub-${randomUUID().slice(0, 8)}`;

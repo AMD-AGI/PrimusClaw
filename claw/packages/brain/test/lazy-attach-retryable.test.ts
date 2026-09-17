@@ -257,3 +257,60 @@ test("isRetryable sees through the wrapper", async () => {
     "and it does not make every wrapped failure retryable",
   );
 });
+
+test("a sibling task still in flight blocks the rethrow", async () => {
+  // The counter this guard first used was incremented AFTER the start event was
+  // published, and `runTaskTool` is dispatched with `Promise.all` over a batch.
+  // A sibling suspended on its own start event had therefore not reached its
+  // increment, so the first task's failing open read the count as 1, concluded
+  // nothing else was running, and naked -- while `Promise.all` went on to start
+  // the sibling, which executed and wrote. The redelivery wrote again.
+  //
+  // The fixture reproduces exactly that interleaving: t2 is held inside its
+  // start event, and only then is t1's open allowed to fail. What makes it safe
+  // now is that the registration happens before any await, so t2 is visible to
+  // t1's check while still suspended.
+  let siblingEntered: () => void;
+  const siblingIsInside = new Promise<void>((r) => { siblingEntered = r; });
+
+  const prompts: Message[][] = [];
+  let threw: unknown = null;
+  try {
+    await agentLoop([{ role: "user", content: "delegate twice" }], TOOLS, {
+      model: "test-model", apiUrl: "http://localhost:0", apiKey: "test-key",
+      maxTurns: 2,
+      router: { route: async () => "ok", setHands: () => {} } as unknown as ToolRouter,
+      onEvent: async (evt: Record<string, unknown>) => {
+        // t2 reports itself in and then never returns from its start event, so
+        // it cannot reach any increment of its own.
+        if (evt.tool === "task" && evt.actionId === "t2" && evt.status === "start") {
+          siblingEntered();
+          // Held long enough for t1's open to fail and be judged, then released
+          // so Promise.all can settle and the turn can end.
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      },
+      sessionId: "sess-sibling", userId: "user-1",
+      llmSession: scriptedSession([
+        { content: [
+            { type: "tool_use", id: "t1", name: "task", input: { description: "a", prompt: "a" } } as LlmContentBlock,
+            { type: "tool_use", id: "t2", name: "task", input: { description: "b", prompt: "b" } } as LlmContentBlock,
+          ], stopReason: "tool_use" },
+        { content: [{ type: "text", text: "done" } as LlmContentBlock], stopReason: "end_turn" },
+      ], prompts) as never,
+      recreateHands: async () => ({ hands: {} as never, action: "rebuilt" as const }),
+      attachHands: async () => {
+        // Fail only once the sibling is demonstrably inside the batch.
+        await siblingIsInside;
+        throw new SandboxAttachError(new DagHandleContendedError("5 attempts exhausted"));
+      },
+    } as never);
+  } catch (e) {
+    threw = e;
+  }
+
+  assert.equal(
+    threw, null,
+    "a nak here would abandon a sibling that Promise.all does not cancel, and the redelivery would run it twice",
+  );
+});
