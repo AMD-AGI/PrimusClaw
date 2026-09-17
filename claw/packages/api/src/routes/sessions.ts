@@ -741,36 +741,89 @@ async function backfillCachedRunId(
 }
 
 /**
- * Record this request's result under the key, unless the key is already taken.
+ * Record this request's result under the key, unless the key already holds a
+ * result worth more to the client than this one.
  *
- * The write is a claim rather than an assignment, and the conflict clause is
- * where that is decided -- before the row is replaced, not after. What every
- * caller here is acting on is the cache read it took at the top of `execute()`,
- * which said this key had no result yet; what it does with that read is
- * everything a create does, and only then does it come back to write. On the
- * fallback path (see saveIdempotencyBestEffort) the exclusion that made the
- * read durable is gone by then: the server released this key's advisory lock
- * with the connection, so between the read and this statement another pod can
- * have taken the freed lock, created its own session, opened its run and cached
- * the 200 that names it. An unconditional UPSERT would put this request's
- * outcome -- for a failed dispatch, a 503 -- where that 200 was, and since this
- * row IS the only handle anyone keeps on a create, every later retry on the key
- * would be answered with the failure while the other pod's run went on
- * executing with nobody able to name it.
+ * WHAT DECIDES, AND WHY IT IS NOT "WHO GOT THERE FIRST"
  *
- * So a row that is still live is left exactly as it was, whoever wrote it: the
- * caller is told the claim did not land (rowCount 0) instead of the row being
- * overwritten. Only an absent row, or one whose TTL has passed -- which
- * `readIdempotency` already refuses to replay, so no client can be holding it
- * as a handle -- is claimed.
+ * Two requests can be live on one key at once, and the drop that makes that
+ * possible is the same drop the fallback exists for: the advisory lock is
+ * session-scoped, so the server hands it away the instant a lock connection
+ * goes, and from then on the request that lost it is still running -- it will
+ * still create, still dispatch, still come here to write -- while another pod
+ * takes the freed lock and does the same. Both read this key when it was empty.
+ * Both arrive here. Neither can see the other, and the order the two statements
+ * land in is decided by the network.
  *
- * Nothing here has to identify the writer, and there is no column that could:
- * a request writes this key at most once, on the single path that ends its
- * create, so "not the row I wrote" and "a row was already there" are the same
- * condition. The locked path is held to the same rule, because the lock is not
- * the only writer -- a fallback write from a request whose lock dropped lands
- * without holding anything, and the mirror image of the clobber above is a
- * lock holder overwriting that request's record.
+ * So the conflict clause cannot be asked "did I get here first", because the
+ * answer is noise. What it is asked instead is which of the two results is
+ * still worth handing back, and for this endpoint that has a single durable
+ * answer sitting in the row itself: a 2xx create response carries `session_id`
+ * and `message.run_id`, and every failure this route caches carries neither.
+ * That is a contract, not an observation -- `DispatchResult` gives no failing
+ * kind a run id on purpose, `rejected` and `publish_failed` have already rolled
+ * their session row back, and `publish_unknown`'s body names nothing a caller
+ * could come back for. A cached 2xx is therefore the only handle anyone has on
+ * work that exists; a cached failure is a record that nothing exists.
+ *
+ * Hence the rule, in one line: a success may take the key from a failure, and
+ * nothing else may take the key from anything.
+ *
+ *   - failure landing on a success: refused. This is the round-N clobber -- a
+ *     503 written over the 200 that names a live run would answer every later
+ *     retry on the key with a failure while that run went on executing in its
+ *     sandbox with nobody able to name it.
+ *   - success landing on a failure: claimed. This is the same defect in the
+ *     other order, and it is the same victim -- the request that actually
+ *     created something. Refusing it leaves the key answering retries with a
+ *     failure for a create that did not happen, in front of a run that did.
+ *   - like on like: the incumbent keeps it. Two failures are worth the same to
+ *     the client (neither names anything), and of two successes only one can be
+ *     the key's answer; overwriting the first would orphan the run it names to
+ *     no one's benefit, so the churn buys nothing. `lock_lost_before_create`
+ *     already refuses any request whose lock dropped BEFORE it created, so two
+ *     live successes on one key need two drops landing after two creates.
+ *   - an expired row: claimed by anyone. `readIdempotency` refuses to replay
+ *     it, so no client is holding it as a handle and the key is free again.
+ *
+ * WHY NOT LOCK OWNERSHIP
+ *
+ * The obvious rival rule -- the holder's write wins, a lockless write only
+ * fills an empty slot -- is rejected twice over.
+ *
+ * It is wrong on the merits: the holder is not reliably the request that
+ * created anything. Let the holder's dispatch fail and a lockless request's
+ * succeed, and ownership hands the key to the 503 and orphans the live run. It
+ * arbitrates the wrong thing, because what the client loses is never "the wrong
+ * writer won", it is "the key stopped naming work that exists".
+ *
+ * And it cannot be evaluated here even where it would agree. There is no column
+ * recording it and there could not be an honest one: a writer's belief that it
+ * holds the lock is a `connectionLost` read taken before the statement, and the
+ * server can release the lock in the gap between that read and this INSERT.
+ * Storing it would put the read-then-act shape that produced every defect on
+ * this path INTO the row, where it would outlive the request that was wrong.
+ * Worse, it has no answer at all in the case the fallback was added for -- both
+ * requests lockless, nobody to appeal to -- where it collapses to "whoever
+ * wrote first", which is the rule being replaced.
+ *
+ * WHAT THIS STATEMENT READS, AND WHEN
+ *
+ * The decision reads nothing outside itself. `existing` and `EXCLUDED` are both
+ * evaluated inside this one INSERT, under the row lock ON CONFLICT takes, and
+ * against the latest committed version of the row -- so a same-key writer that
+ * commits while we are in flight is seen by our comparison rather than missed
+ * by it. There is no window between the read and the act, because they are the
+ * same statement. `connectionLost` still runs in the caller, but only to pick
+ * WHICH connection carries this write; a stale answer there costs a failed
+ * statement on a dead backend, which the caller already catches, never a wrong
+ * winner.
+ *
+ * That makes the outcome independent of arrival order, which is the property
+ * the old rule lacked: "success beats failure" is a one-way upgrade and every
+ * other pair is refused, so whichever order the two statements land in, the key
+ * converges on the same row -- the first success if either request produced
+ * one, otherwise the first failure.
  *
  * Returns whether this request's result is the one now stored.
  */
@@ -790,7 +843,8 @@ async function saveIdempotency(
        response = EXCLUDED.response,
        created_at = NOW(),
        expires_at = EXCLUDED.expires_at
-     WHERE claw_idempotency_keys.expires_at <= NOW()`,
+     WHERE claw_idempotency_keys.expires_at <= NOW()
+        OR (claw_idempotency_keys.status_code >= 400 AND EXCLUDED.status_code < 400)`,
     [key, userId, route, statusCode, JSON.stringify(response), String(IDEMPOTENCY_TTL_MS)],
   );
   return (claimed.rowCount ?? 0) > 0;
@@ -813,17 +867,25 @@ async function saveIdempotency(
  * (the server released it with the backend), so what the fallback recovers is
  * the record of a create that the lock no longer covers.
  *
- * Which is also the limit of what it may do. Writing without the exclusion is
- * only safe while the key is still nobody's: the same drop that sent this write
- * to the main pool freed the lock for another pod, and that pod's create can
- * have finished and cached its own result in the meantime. So the row is
- * claimed rather than assigned -- `saveIdempotency` leaves a live record alone
- * and says so -- and a request that finds the key already answered keeps its
- * own outcome to its own caller instead of making every future retry inherit
- * it. Logged, not raised: the key holding somebody else's live create is a
- * better state than the one this write was recovering from, but it means this
- * request's session (when it made one) is now reachable only by the id already
- * in its own 200.
+ * Which does not make it a licence to assign. The same drop that sent this
+ * write to the main pool freed the lock for another pod, whose create can have
+ * finished and cached its own result in the meantime -- and, in the other
+ * order, can still be mid-flight and about to. So what lands here is a claim:
+ * `saveIdempotency` decides between this result and whatever the key holds at
+ * the instant of the statement, and it decides on which of the two names work
+ * that exists, not on which of them arrived first. A failure from this path
+ * therefore takes the key only while nothing better is on it; a success takes
+ * it even from a failure another request has already left there, which is the
+ * case this fallback runs into most, because a create whose lock dropped is by
+ * construction the one writing alongside somebody else.
+ *
+ * Refused either way, this request's own answer is the only handle on what it
+ * created, so both refusals are logged -- but only one of them is a loss. A
+ * failure refused by a live success is the rule working: the key names a run
+ * that is executing and the client's retries will reach it. A success refused
+ * by another success is a real orphan: two creates landed on one key, and the
+ * session this one made is now reachable only through the 200 it is about to
+ * return to its own caller.
  *
  * Best-effort either way: a create the client already completed is not failed
  * because the note about it did not land.
@@ -849,12 +911,23 @@ async function saveIdempotencyBestEffort(
   }
   try {
     if (!await saveIdempotency(writer, userId, route, key, statusCode, response)) {
-      logger.error(
-        { userId, route, statusCode, lockLost: !!lost },
-        "idempotency.key_already_claimed (another request cached a live result for this key "
-        + "while this one was running, so its result was NOT stored; retries replay that "
-        + "record and this request's own answer is the only handle on what it created)",
-      );
+      const fields = { userId, route, statusCode, lockLost: !!lost };
+      if (statusCode < 400) {
+        logger.error(
+          fields,
+          "idempotency.success_not_stored (a concurrent request on this key had already "
+          + "cached a create of its own, so this one's result was NOT stored; retries replay "
+          + "that record and the session this request created is reachable only through the "
+          + "answer it is returning now)",
+        );
+      } else {
+        logger.warn(
+          fields,
+          "idempotency.failure_not_stored (this key already names a create that succeeded, "
+          + "so this request's failure was NOT stored over it; retries replay that create "
+          + "and this request's own answer stays with its own caller)",
+        );
+      }
     }
   } catch (err) {
     logger.error({ err, userId, route }, "idempotency.save_failed");
