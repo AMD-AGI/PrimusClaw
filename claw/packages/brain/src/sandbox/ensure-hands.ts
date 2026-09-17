@@ -944,7 +944,6 @@ async function provisionHands(
     ...(action.params.env ?? {}),
     AUTH_CLAW_TOKEN: handsToken,
     CLAW_SESSION_ID: sessionId,
-    HYPERLOOM_SESSION_ID: sessionId,
     INFERENCE_OPTIMIZER_SESSION_LAYOUT: "per_model_ts",
     MCP_PORT: mcpPort,
     WORKSPACE_PATH: "/workspace",

@@ -100,6 +100,23 @@ test("the child environment carries no Brain-facing credential, over the whole e
   assert.equal(env.PATH, process.env.PATH);
 });
 
+test("the child environment carries the session id", () => {
+  // Regression guard. This value used to reach a command only under a second,
+  // application-specific name, while the name every consumer actually reads was
+  // filtered out -- so a run could not say which session it belonged to, and the
+  // one document that told agents to branch on it was branching on a variable
+  // that is never set. It is an identifier and the same value is already on the
+  // sandbox, so naming it here costs no secrecy.
+  const previous = process.env.CLAW_SESSION_ID;
+  process.env.CLAW_SESSION_ID = "sess-visible-to-the-child";
+  try {
+    assert.equal(privilege.childEnvironment().CLAW_SESSION_ID, "sess-visible-to-the-child");
+  } finally {
+    if (previous === undefined) delete process.env.CLAW_SESSION_ID;
+    else process.env.CLAW_SESSION_ID = previous;
+  }
+});
+
 test("a spawned command cannot read the token out of its own environment", async () => {
   bg.spawnBackground("sess-env", "run-env", "env; cat /proc/self/environ | tr '\\0' '\\n'", "envdump");
   await settle(300);
