@@ -108,7 +108,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
-	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller (default off; PrimusClaw brain owns idle reclaim)")
+	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller, which deletes a Sandbox idle past --session-timeout")
 	flag.Parse()
 
 	// controller-runtime keeps zap here, deliberately: switching it to the
