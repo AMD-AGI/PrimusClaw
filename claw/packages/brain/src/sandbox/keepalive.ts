@@ -988,12 +988,18 @@ const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
  * it. Deferring converges the cost without abandoning the teardown: the record
  * stays, and the next sweep past the backoff tries again.
  *
+ * Derived from the sweep cadence rather than fixed, because a backoff at or
+ * below one interval expires before the next sweep reaches the record and defers
+ * nothing at all. A fixed number would read as a backoff while being none on
+ * any deployment whose interval caught up with it.
+ *
  * Kept in memory rather than on the record. The cost being bounded is this
  * replica's sweep, a replica that restarted has no teardown of its own left to
  * defer, and writing it would put a conditional update in the path of a stop
  * that is already failing.
  */
-const TEARDOWN_RETRY_BACKOFF_MS = 60_000;
+export const TEARDOWN_RETRY_BACKOFF_MS =
+  Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 5 * 1000;
 const teardownRetryAt = new Map<string, number>();
 
 /** Whether a teardown that failed is still inside its backoff. */

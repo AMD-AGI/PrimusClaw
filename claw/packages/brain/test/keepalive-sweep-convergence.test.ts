@@ -118,6 +118,20 @@ test("a stop that cannot succeed is not retried on every sweep", async () => {
   }
 });
 
+test("the teardown backoff outlasts the sweep interval", async () => {
+  // A backoff at or below one interval has expired by the time the next sweep
+  // reaches the record, so it defers nothing and the cost it exists to bound is
+  // paid every sweep anyway. Pinned because the first version of this backoff
+  // was exactly one interval and read as working while doing nothing.
+  const { SANDBOX_KEEPALIVE_INTERVAL_SEC } = await import("../src/config.js");
+  const { TEARDOWN_RETRY_BACKOFF_MS } = await import("../src/sandbox/keepalive.js");
+  assert.ok(
+    TEARDOWN_RETRY_BACKOFF_MS > SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000,
+    `a ${TEARDOWN_RETRY_BACKOFF_MS}ms backoff does not outlast a `
+      + `${SANDBOX_KEEPALIVE_INTERVAL_SEC}s sweep interval`,
+  );
+});
+
 test("a stop retried after its backoff still gets its next attempt", async () => {
   // The backoff defers the retry, it does not abandon it. A handle that stops
   // being retried at all is a sandbox nothing is left to tear down.
@@ -142,7 +156,8 @@ test("a stop retried after its backoff still gets its next attempt", async () =>
     await new Promise((r) => setImmediate(r));
     assert.equal(stops, 1, "the first sweep attempts the stop");
 
-    now += 60_000;
+    const { TEARDOWN_RETRY_BACKOFF_MS } = await import("../src/sandbox/keepalive.js");
+    now += TEARDOWN_RETRY_BACKOFF_MS + 1_000;
     await runKeepaliveTickForTest(deps);
     await new Promise((r) => setImmediate(r));
     assert.equal(stops, 2, "past the backoff the stop is attempted again");
