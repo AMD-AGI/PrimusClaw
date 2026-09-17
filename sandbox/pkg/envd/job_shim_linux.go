@@ -122,7 +122,7 @@ func (s *Server) startTrackedCommand(
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
-	track bool,
+	tracking jobTracking,
 ) (primaryPID int, exitCh <-chan int, cancel func(), err error) {
 	self, err := os.Executable()
 	if err != nil {
@@ -159,8 +159,8 @@ func (s *Server) startTrackedCommand(
 		_ = shim.Wait()
 		return 0, nil, nil, fmt.Errorf("job shim failed to start primary command")
 	}
-	if track {
-		s.jobs.add(shim.Process.Pid, command)
+	if tracking.track {
+		s.jobs.add(shim.Process.Pid, tracking.hands)
 	}
 
 	ch := make(chan int, 1)
@@ -189,7 +189,7 @@ func (s *Server) startTrackedCommand(
 		waitErr := shim.Wait()
 		// Only a tracked tree contributes to the jobs roster, so only its
 		// supervisor dying leaves descendants unaccounted for.
-		if track && supervisorDiedUnexpectedly(waitErr) {
+		if tracking.track && supervisorDiedUnexpectedly(waitErr) {
 			s.jobs.markLost()
 		}
 		s.jobs.remove(shim.Process.Pid)

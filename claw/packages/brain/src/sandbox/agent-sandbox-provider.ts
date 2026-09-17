@@ -334,6 +334,7 @@ export class AgentSandboxProvider implements SandboxProvider {
         command: ["sh", "-c", command],
         timeout,
         ...(opts?.untracked ? { untracked: true } : {}),
+        ...(opts?.hands ? { hands: true } : {}),
       }),
       timeoutMs: parseExecTimeoutMs(timeout) + EXEC_TRANSPORT_SLACK_MS,
       userId: inst.userId,

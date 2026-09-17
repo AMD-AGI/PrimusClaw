@@ -47,7 +47,7 @@ func requireJobShim(t *testing.T) {
 		var out synchronizedBuffer
 		s := newTestServer()
 		_, exitCh, _, err := s.startTrackedCommand(
-			[]string{"true"}, "", os.Environ(), &out, &out, false,
+			[]string{"true"}, "", os.Environ(), &out, &out, jobTracking{},
 		)
 		if err != nil {
 			shimProbe.err = err
@@ -68,7 +68,7 @@ func requireJobShim(t *testing.T) {
 func run(t *testing.T, s *Server, track bool, args ...string) (int, *synchronizedBuffer) {
 	t.Helper()
 	var out synchronizedBuffer
-	_, exitCh, _, err := s.startTrackedCommand(args, "", os.Environ(), &out, &out, track)
+	_, exitCh, _, err := s.startTrackedCommand(args, "", os.Environ(), &out, &out, jobTracking{track: track})
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
 	}
@@ -148,17 +148,13 @@ func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {
 	// The Hands job is infrastructure: the roster reports the descendants it
 	// spawned rather than the supervisor, which is the branch that decides every
 	// reclaim. A user job is accounted for by its own live shim instead.
-	command := []string{"sh", "-c", "exec -a /tmp/.hands-binary sleep 2"}
-	if !isHandsCommand(command) {
-		t.Fatal("the relaunch command has to be recognised as Hands")
-	}
 	root := procTable(t,
 		procEntry{pid: 400, ppid: 1, state: 'S', argv: []string{"envd", "--job-shim", "sh"}},
 		procEntry{pid: 401, ppid: 400, state: 'S', argv: []string{"/tmp/.hands-binary"}},
 	)
 	r := newJobRegistry()
 	r.count = func(shimPID int) (int, error) { return countUserDescendantsIn(root, shimPID) }
-	r.add(400, command)
+	r.add(400, true)
 	snap, err := r.snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +162,7 @@ func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {
 	if snap.count != 0 {
 		t.Fatalf("Hands counted itself as user work, which holds every sandbox open: %+v", snap)
 	}
-	r.add(500, []string{"sh", "-c", "sleep 30"})
+	r.add(500, false)
 	snap, err = r.snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +197,7 @@ func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
 	s := newTestServer()
 	var out synchronizedBuffer
 	_, exitCh, stop, err := s.startTrackedCommand(
-		[]string{"sh", "-c", "sleep 30"}, "", os.Environ(), &out, &out, false,
+		[]string{"sh", "-c", "sleep 30"}, "", os.Environ(), &out, &out, jobTracking{},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)

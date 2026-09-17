@@ -208,6 +208,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
         command: ["sh", "-c", command],
         timeout,
         ...(opts?.untracked ? { untracked: true } : {}),
+        ...(opts?.hands ? { hands: true } : {}),
       }),
       // `timeout` is only the command's deadline inside the container; it says
       // nothing about a Router that accepts the connection and then goes quiet.

@@ -14,6 +14,11 @@ type ExecuteRequest struct {
 	Timeout    string            `json:"timeout,omitempty"` // e.g. "60s"
 	WorkingDir string            `json:"working_dir,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	// Hands marks the execute that starts the resident Hands supervisor, whose
+	// own process is infrastructure rather than user work. Set by the caller,
+	// which knows what it is starting; EnvD otherwise has to infer it from the
+	// shell script it is handed.
+	Hands bool `json:"hands,omitempty"`
 	// Untracked omits this execute from GET /api/jobs user-process accounting.
 	Untracked bool `json:"untracked,omitempty"`
 }

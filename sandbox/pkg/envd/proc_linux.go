@@ -75,10 +75,7 @@ func isHandsProcess(cmd string) bool {
 	if i := strings.IndexByte(argv0, ' '); i >= 0 {
 		argv0 = argv0[:i]
 	}
-	if i := strings.LastIndexByte(argv0, '/'); i >= 0 {
-		argv0 = argv0[i+1:]
-	}
-	return argv0 == handsBinaryMark || argv0 == "."+handsBinaryMark
+	return handsBasename(argv0)
 }
 
 // listProcs snapshots process identity and parent links from procfs.

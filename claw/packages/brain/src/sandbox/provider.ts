@@ -75,6 +75,13 @@ export interface SandboxExecResult {
 export interface SandboxExecOptions {
   /** When true, EnvD does not register this execute as a user job. */
   untracked?: boolean;
+  /**
+   * When true, this execute starts the resident Hands supervisor, so EnvD
+   * accounts for the descendants it spawns rather than counting the supervisor
+   * itself as user work. Stated here because the caller knows what it is
+   * starting; EnvD can otherwise only guess from the shell script it receives.
+   */
+  hands?: boolean;
 }
 
 /**

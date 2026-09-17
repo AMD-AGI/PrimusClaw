@@ -1135,7 +1135,7 @@ async function provisionHands(
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
-    (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t),
+    (cmd, t, opts) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, opts),
     sessionId, mcpPort, handsToken, env,
   );
   logger.info({ sessionId, workloadId }, "ensureHands.bootstrap_done");
@@ -1524,7 +1524,7 @@ async function ensureHandsAgentSandbox(
       "ensureHands.agent.bootstrap_start",
     );
     await bootstrapHandsInSandbox(
-      (cmd, t) => provider.exec(inst, cmd, t),
+      (cmd, t, opts) => provider.exec(inst, cmd, t, undefined, opts),
       sessionId, mcpPort, handsToken, env,
     );
 

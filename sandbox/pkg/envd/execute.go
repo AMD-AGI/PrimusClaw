@@ -67,7 +67,8 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 	_, exitCh, stop, err := s.startTrackedCommand(
-		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr, !req.Untracked,
+		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	exitCode := 0
 	if err == nil {
@@ -170,7 +171,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		s.buildChildEnv(req.Env),
 		stream.writer("stdout"),
 		stream.writer("stderr"),
-		!req.Untracked,
+		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	if err != nil {
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)

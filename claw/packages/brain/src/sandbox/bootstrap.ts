@@ -25,10 +25,15 @@ import {
   WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC, HANDS_CHILD_ISOLATION_ENV,
 } from "../config.js";
 import { toolTimeoutCeilingSec } from "../tools/hands.js";
+import type { SandboxExecOptions } from "./provider.js";
 
 const logger = pino({ name: "sandbox-bootstrap" });
 
-export type SandboxExecFn = (cmd: string, timeout: string) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+export type SandboxExecFn = (
+  cmd: string,
+  timeout: string,
+  opts?: SandboxExecOptions,
+) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
 /** One place the Hands binary might come from, and the command that tries it. */
 export interface HandsBinarySource {
@@ -365,7 +370,10 @@ export async function bootstrapHandsInSandbox(
           );
         }
       }
-      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT);
+      // Marked as the Hands start so EnvD accounts for the supervisor as
+      // infrastructure. Left to be inferred from the script, it would be
+      // counted as user work and hold the sandbox open past every idle window.
+      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT, { hands: true });
       if (r.exitCode === 0) {
         logger.info(
           { sessionId, source: source.name, stdout: r.stdout.slice(0, 200) },
