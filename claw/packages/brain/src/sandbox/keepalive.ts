@@ -5,6 +5,15 @@ import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
 import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
+// The verdict rules are imported, never restated. `usableSharedVerdict` is read
+// here and by the API's orphan-handle sweep, which must not stop a sandbox this
+// file is still holding for background work; one definition is what keeps the
+// two answering the same question. See sandbox/bg-verdict.ts in @claw/protocol.
+import {
+  BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod, reuseWindowStart,
+  sameIdlePeriod, usableSharedVerdict,
+  type BackgroundWork, type SharedVerdictFields,
+} from "@claw/protocol";
 import {
   SANDBOX_KEEPALIVE_INTERVAL_SEC,
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
@@ -19,7 +28,7 @@ import {
   sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { listAllDagHandles } from "./handles.js";
+import { dagsNamingWorkload, listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -52,7 +61,15 @@ export interface SandboxEntry {
   userId?: string;       // agent-sandbox: BYOK identity forwarded to the Router
 }
 
-interface HandsKvEntry {
+/**
+ * Brain's view of a `hands.<session>` entry.
+ *
+ * The idle-period and verdict halves are inherited rather than restated: they
+ * are read by the API's orphan sweep as well as by this file, and written by
+ * `applyRunEndedIdleFields` in a third place, so the declaration lives with the
+ * rules that interpret it (`@claw/protocol` sandbox/bg-verdict).
+ */
+interface HandsKvEntry extends SharedVerdictFields {
   status?: "pending" | "ready";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
@@ -75,99 +92,10 @@ interface HandsKvEntry {
    *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
   keepalive?: boolean;
   /**
-   * Epoch ms when the handle became idle. All deployed writers stamp this field,
-   * so verdicts use it as the mixed-version idle-period witness.
-   */
-  idleSince?: number;
-  /**
-   * Epoch ms when a sweep last acted on a `running` verdict. The reuse window
-   * starts at the later of this and `idleSince`.
-   */
-  workSeenAt?: number;
-  /**
-   * Identifies the idle period opened by `markHandsIdle`; unlike `idleSince`, it
-   * does not move while background work remains active.
-   */
-  idleEpoch?: number;
-  /**
-   * Revision on which the idle-opening write was conditioned. Together with
-   * `idleSince`, it uniquely witnesses an idle period even when timestamps
-   * collide. Backfilled by `collectTargets` for older entries.
-   */
-  idleRev?: number;
-  /**
    * Per-call token used to confirm an idle write whose acknowledgement was lost.
    * The sweep does not use it.
    */
   idleWriter?: string;
-  /**
-   * The last measured background-work answer, persisted so another replica can
-   * consume it.
-   */
-  bgCheckedAt?: number;
-  /** Shell count from that answer. 0 means the sandbox had nothing running. */
-  bgRunning?: number;
-  /**
-   * The `idleEpoch` under which the verdict was measured. `bgIdleSince` also has
-   * to match because an older binary can preserve both epoch fields across reuse.
-   */
-  bgEpoch?: number;
-  /**
-   * The value `idleSince` had when this verdict was measured.
-   *
-   * Kept as a witness rather than compared as a time, because the two numbers
-   * are written by different replicas off different clocks and a comparison
-   * between them cannot establish which event happened first. A replica whose
-   * clock runs a minute fast files a verdict stamped a minute into the future;
-   * the old binary that later takes the sandbox for a task and idles it again
-   * stamps `idleSince` off its own slower clock, and the verdict from BEFORE the
-   * task carries the LARGER number. Every ordering test between them then says
-   * the stale answer is the current one, and the handle is reclaimed with a
-   * background shell in it -- the same reclaim `bgEpoch` and the stamp were
-   * added to prevent, arriving through ordinary NTP-grade skew rather than
-   * through anything going wrong.
-   *
-   * Equality asks a question skew cannot answer wrongly. `idleSince` is opaque
-   * here: whether the value a re-idle wrote is larger or smaller than the one
-   * the verdict was measured under does not matter, only that it is a different
-   * value -- and it is, because every writer that opens an idle period stamps
-   * its own clock's reading of the moment it did so. Absent on verdicts written
-   * before this field existed, which are read as not witnessed at all.
-   */
-  bgIdleSince?: number;
-  /**
-   * The `idleRev` the entry carried when this verdict was measured.
-   *
-   * The half of the witness that cannot collide. `bgIdleSince` catches an idle
-   * period an OLD binary opened -- it rewrites `idleSince` and can write neither
-   * of these -- but two distinct periods can share an `idleSince` value, and
-   * when they do they share `idleEpoch` with it, so nothing else on the entry
-   * tells them apart. This one does: no two idle-opening writes to a key are
-   * conditioned on the same revision.
-   *
-   * Both must match for an `idle` verdict to be believed, because neither
-   * subsumes the other: an old binary carries this field across a task
-   * untouched, and a millisecond collision carries the other one across.
-   * Absent on verdicts written before this field existed, which are read as not
-   * witnessed at all.
-   */
-  bgIdleRev?: number;
-  /**
-   * The revision the write that published this verdict was conditioned on.
-   *
-   * Names the verdict itself, the way `idleRev` names an idle period and for the
-   * same reason: the bucket accepts one write per revision of a key and hands
-   * out a strictly greater one each time, so no two verdict-publishing writes
-   * can ever carry the same value. `bgCheckedAt` cannot do this on its own --
-   * it is a clock reading taken on whichever replica probed, and two replicas
-   * can read the same millisecond.
-   *
-   * Read by persistVerdict, to tell the verdict a probe went out under from one
-   * a different replica published while that probe was still in the air. Absent
-   * on verdicts written before this field existed, where the stamp beside it is
-   * the only half of the comparison available.
-   */
-  bgRev?: number;
   /**
    * Fleet-visible probe reservations, keyed by per-probe token. Reclaim waits
    * while any unexpired reservation remains; each probe releases only its token.
@@ -185,6 +113,15 @@ interface KeepaliveDeps {
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
   /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
+  /**
+   * Test seam for freeing a released container's DAG handle -- same reason as
+   * `listDagHandles`: it needs JetStream, and a sweep whose release always
+   * throws never releases anything, which is not the behaviour under test.
+   */
+  releaseDagHandles?: (
+    workloadId: string,
+    opts?: { rows?: Array<[string, Record<string, HandleInfo>]> },
+  ) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
   /**
@@ -448,6 +385,160 @@ async function runRetentionReadPhase(
       if (live.verdict !== "clear") continue;
       // The only irreversible act on this path, and it still happens only after
       // a read that answered `clear`, on this sweep, about this container.
+      // The handle first, the records second, and that order is the recovery.
+      //
+      // The records are what a later registration reads to know the container
+      // was handed over (`mayTakeFrom`). Deleting them first and then failing to
+      // free the handle leaves a handle with no evidence behind it and nothing
+      // that will try again -- the entry is gone from the retention set, so no
+      // later sweep revisits it, and every replacement is refused for the life
+      // of the DAG. Freeing first, a failure leaves the retention standing and
+      // the next sweep runs this again.
+      //
+      // The reverse residue is harmless: a freed handle whose records outlive it
+      // by one sweep is a container that is simply released a sweep later.
+      //
+      // And it is not unconditional, which is the other half of the same rule.
+      // `releaseHandlesForWorkload` frees EVERY DAG's handle on the workload,
+      // so it may only be issued by somebody who has established that the
+      // workload is nobody else's -- exactly the precondition
+      // `retainInsteadOfDestroying` carries in its `releaseHandles` parameter,
+      // and exactly the precondition the displaced-sandbox path cannot meet.
+      // That path retains a container PRECISELY because a sibling DAG may still
+      // hold it, and it therefore hands the container over with the sibling's
+      // handle deliberately left in place. This sweep is what finally lets that
+      // retention go, and it used to free the handle here regardless: the
+      // sibling's run lease was still valid, its only reference to the sandbox
+      // was deleted, and its next `sandbox.use` node failed outright. The
+      // parameter protected the call that took the retention and nothing after
+      // it; this is the same precondition, asked again by the caller that acts
+      // on it.
+      if (target.inst.id) {
+        let heldBy: string[] = [];
+        try {
+          // Bounded on this side of the call, like every other term in the
+          // phase ceiling: the release scans the whole handle table and then
+          // CASes per handle, and only the enumeration carries a limit of its
+          // own. A deadline here is what keeps the ceiling above a number the
+          // phase can actually exceed.
+          //
+          // ONE enumeration under that deadline, and the previous round of this
+          // code is why it has to be said out loud. The holder question was put
+          // inside the same deadline on the stated grounds that it "is the same
+          // scan of the same table and happens in place of the release, never
+          // alongside it" -- a claim about cost, made about a path being written
+          // at that moment, and never checked against
+          // `releaseHandlesForWorkload`, which enumerates the table AGAIN
+          // internally. So the budget that comfortably fits one scan was being
+          // asked to fit two: measured against a real bucket with read latency
+          // added, a scan is ~5.5s and the pair is ~11.1s against a 10s ceiling,
+          // and the sweep timed out on every attempt. The timeout is not a
+          // partial failure either -- it aborts before `releaseRetention`, so
+          // the records are refreshed and the container is pinged again next
+          // sweep, for ever.
+          //
+          // The rows are therefore read once, here, and both answers are taken
+          // from that one read: the holder set by `dagsNamingWorkload`, and the
+          // release by handing the same snapshot on. Raising the ceiling would
+          // have hidden the doubling instead of removing it, and the ceiling is
+          // the term `keepaliveCensusPhaseCeilingSec()` -- and every refresh gap
+          // and reclaim horizon derived from it -- is stated over.
+          let timer: NodeJS.Timeout;
+          await Promise.race([
+            (async () => {
+              // Read HERE, immediately before the delete, and never carried
+              // from anywhere earlier. The verdict this branch acts on is a
+              // process count taken INSIDE the container, and a count of
+              // processes is not an answer about who holds the container: a DAG
+              // sitting between two nodes runs nothing in it and still owns the
+              // handle that its next node resolves. So the two reads answer
+              // different questions -- one is a container, one is a table -- and
+              // the container read cannot stand in for the table read. Nor can
+              // the table read come from `collectDagTargets`, which walked this
+              // same table earlier in the sweep: between that walk and this line
+              // sit the whole ping phase and every read this phase has already
+              // taken, and a handle registered in that window would be deleted
+              // on the strength of a snapshot that predates it.
+              //
+              // What the two answers may share is THIS read, and sharing it is
+              // stricter than two reads rather than merely cheaper: with two, a
+              // handle registered between them is invisible to the holder check
+              // and visible to the release, so a reference nothing had ruled on
+              // could be freed. With one, the set cleared and the set acted on
+              // are the same set. A row that changes after the snapshot is still
+              // handled at the write, where `releaseHandlesForWorkload` re-reads
+              // each row and removes the name only while it still names this
+              // workload, under the revision it was just read at.
+              const rows = await (deps.listDagHandles ?? listAllDagHandles)();
+              heldBy = dagsNamingWorkload(rows, target.inst.id);
+              // Somebody still names this container, so its handle is not this
+              // sweep's to take and the records that back it are not this
+              // sweep's to delete either. Both stay, together: the retention
+              // ledger is what `mayTakeFrom`/`retainedTaker` reads to let a
+              // later registration take the name back from a handed-over
+              // workload, so releasing the records while a handle still names
+              // the workload would strand that handle with nothing behind it --
+              // the same ordering failure the paragraph above refuses in the
+              // other direction.
+              if (heldBy.length > 0) return;
+              await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(
+                target.inst.id, { rows },
+              );
+            })().finally(() => clearTimeout(timer)),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(
+                  `dag-handle release exceeded ${HANDLE_RELEASE_CEILING_MS}ms`,
+                )),
+                HANDLE_RELEASE_CEILING_MS,
+              );
+              timer.unref?.();
+            }),
+          ]);
+        } catch (err) {
+          // Caught here, not by the outer handler: this is the one failure on
+          // this path that must leave the retention exactly where it is, and it
+          // is not a failed retention READ. Letting it reach the outer catch
+          // marked the whole sweep incomplete and disturbed the walk's budget
+          // and queue -- six of the roster-tick tests say so.
+          //
+          // The entry keeps its place: the records still stand, so the next
+          // sweep reaches this line again. A holder read that threw lands here
+          // too, and lands in the right place: an unreadable handle table is
+          // not a table with nothing in it, and the release must not proceed on
+          // a question it could not ask.
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, err: (err as Error)?.message },
+            "keepalive.retention_handle_release_failed",
+          );
+          continue;
+        }
+        if (heldBy.length > 0) {
+          // Reported, never silent: a retention that outlives the work it was
+          // taken for is the state this phase exists to end, so an operator
+          // reading "released" counts has to be able to see the ones that were
+          // deliberately kept, and whose handle kept them.
+          //
+          // It is a deferral and not a refusal. The retention is released by
+          // the first sweep that finds the last handle gone, and a handle
+          // outliving its DAG does not wait on this sweep to notice: api's
+          // `reapOrphanHandles` walks the same table every TASK_SWEEPER_TICK_MS,
+          // and for a DAG root whose task row is terminal or missing with no
+          // live work holding the workload it calls `stopSandboxByHandle`,
+          // which on a RETAINED workload skips the stop and destroys the
+          // mapping anyway (`sandbox.stop_skipped_retained`). So the holder set
+          // shrinks without anything here having to guess at liveness -- which
+          // is just as well, because it could not: the run lease is keyed by
+          // `pickLockKey`, which under the default `RUN_GATE_KEY=workspace` is
+          // `ws.<workspaceId>`, and a handle row carries neither that nor
+          // anything to derive it from. Presence of the handle IS the holding.
+          logger.warn(
+            { key: target.key, workloadId: target.inst.id, heldBy },
+            "keepalive.retention_kept_handle_still_held",
+          );
+          continue;
+        }
+      }
       await releaseRetention(retentionStore(deps.kv), target.key, target.ledgerKey);
       released += 1;
     } catch (err) {
@@ -839,7 +930,15 @@ export function markHandsIdle(
   return readHandsEntry(kv, sessionId)
     .then(async (entry): Promise<RunEndedParkResult> => {
       if (!entry) return { outcome: "gone" };
-      const kvKey = entry.key;
+      // A deleted key is not an absent one to `kv.get`: it answers with the
+      // tombstone, whose value is empty. Parsed, that reads as an unreadable
+      // entry -- which the adoption undo reports as an undo that did not
+      // happen, when in fact there is nothing left to park.
+      if (entry.entry.operation === "DEL" || entry.entry.operation === "PURGE") {
+        return { outcome: "gone" };
+      }
+      if (entry.entry.value.length === 0) return { outcome: "gone" };
+      const kvKey = entry.entry.key;
       let info: HandsKvEntry;
       try {
         info = JSON.parse(entry.value) as HandsKvEntry;
@@ -898,12 +997,6 @@ export function markHandsIdle(
     });
 }
 
-/**
- * What a probe of Hands' background-shell registry can tell us.
- * Only positive idle or gone evidence may permit reclaim.
- */
-type BackgroundWork = "running" | "idle" | "gone" | "unknown";
-
 /** Local measured-verdict reuse interval. */
 const BG_PROBE_TTL_MS = 5 * 60_000;
 const BG_PROBE_REFRESH_MS = 4 * 60_000;
@@ -912,12 +1005,6 @@ const BG_PROBE_REFRESH_MS = 4 * 60_000;
  * Consecutive unanswered probes before reporting an unreconciled handle.
  */
 const BG_UNKNOWN_TOLERANCE = 5;
-/**
- * Shared verdict lifetime. It must outlive the interval between fleet sweeps of
- * the same handle, while local probing still refreshes every BG_PROBE_TTL_MS.
- */
-const BG_VERDICT_TTL_MS = 30 * 60_000;
-
 /**
  * Failed-probe streak lifetime. It must cover the interval until the same replica
  * revisits an identity, which can span several fleet rotations.
@@ -984,6 +1071,36 @@ const BG_VERDICT_WRITE_ATTEMPTS = 64;
  * walk was also spending it on store round trips.
  */
 const CENSUS_READ_BUDGET_MS = 15_000;
+/**
+ * The ceiling on freeing a released container's DAG handle.
+ *
+ * This work happens inside the retention read phase, after the read that
+ * answered `clear`, so it lands on the same wall clock the phase's ceiling is
+ * stated over -- and it is a full-table scan plus a CAS per handle, neither of
+ * which the scan's own 10s enumeration limit bounds end to end. Unbounded, a
+ * phase whose stated worst case is `CENSUS_READ_BUDGET_MS +
+ * LIVE_WORK_READ_CEILING_MS` could exceed it, and every span and refresh
+ * interval derived from that number would be wrong by however long the cleanup
+ * took.
+ *
+ * ONE scan is what this number is sized for, and the census phase is why it is
+ * not simply raised when the work under it grows. This term is the difference
+ * between `keepaliveCensusPhaseCeilingSec()` and the budget the census reads
+ * actually get: `CENSUS_READ_BUDGET_MS` was sized by subtracting the other two
+ * terms from a 50s span the operator's config envelope is already checked
+ * against, so every second added here is a second taken off the reads, or a
+ * second added to a span that has been deliberately held still twice. When a
+ * caller needs a second question answered over the same table, the answer is to
+ * make it share the one enumeration -- `releaseHandlesForWorkload` takes the
+ * rows -- not to buy it a second one out of this.
+ *
+ * Exceeding it is not a failure of the sweep: the retention records stay, so the
+ * next sweep tries again -- the same recovery a refused CAS already gets. It IS
+ * a failure of the release, though, and of the retention delete sequenced behind
+ * it, so a ceiling that the ordinary case cannot fit inside is a container
+ * retained for ever rather than a container retained one sweep longer.
+ */
+const HANDLE_RELEASE_CEILING_MS = 10_000;
 /**
  * Every retention the last read phase left unread, in the order it deferred
  * them.
@@ -1098,7 +1215,9 @@ export function keepalivePingPhaseCeilingSec(): number {
  * enforced on this side of the call rather than one hoped for.
  */
 export function keepaliveCensusPhaseCeilingSec(): number {
-  return Math.ceil((CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS) / 1000);
+  return Math.ceil(
+    (CENSUS_READ_BUDGET_MS + LIVE_WORK_READ_CEILING_MS + HANDLE_RELEASE_CEILING_MS) / 1000,
+  );
 }
 
 /**
@@ -1213,72 +1332,6 @@ function newTickStats(): TickStats {
 /** Where a verdict came from, for the tick counters. */
 type VerdictSource = "mem" | "handle" | "none" | "no-hands";
 
-/**
- * Whether a verdict is still about the idle period the handle is in now.
- * Missing epochs are not a match; they remain `unknown` until backfilled and
- * measured.
- */
-function sameIdlePeriod(verdictEpoch: number | undefined, info: HandsKvEntry): boolean {
-  return typeof verdictEpoch === "number" && verdictEpoch === info.idleEpoch;
-}
-
-/**
- * Whether a verdict measured at `at`, under the stamp `witness`, can be about
- * the idle period the handle is in now.
- *
- * During a rolling deployment, an older binary rewrites `idleSince` but carries
- * the epoch fields unchanged. The timestamp witness therefore detects its idle
- * periods even when the epochs still match.
- *
- * Idle verdicts require equality with both witnesses: timestamp equality avoids
- * ordering clocks from different replicas, and revision equality prevents a
- * same-millisecond ABA. Together they leave exactly one gap: an old binary re-idling
- * onto the identical millisecond, which leaves an entry byte-identical to the
- * one it found, and which therefore no rule reading the entry can detect. It
- * closes when the old binary is gone, and nothing on the entry can close it
- * sooner.
- *
- * `running` also accepts the older rule, `at` at or after the stamp. It is a
- * weaker test and it is allowed to be, because the two ways it can be wrong are
- * both safe: believing a stale `running` costs a ping the sandbox did not need,
- * and disbelieving a current one costs a probe. Keeping it means the sweep that
- * slides the stamp forward under a working sandbox does not have to re-witness
- * the verdict it just acted on -- which would amount to relabelling an answer as
- * being about a period it was not measured in -- and means a verdict written by
- * the build before this field existed still keeps a busy sandbox pinged while it
- * ages out. The `idle` branch, the only one that can delete anything, gets no
- * such latitude.
- *
- * A rejected or incomplete witness reads as `unknown`, so the handle is kept and
- * probed again.
- */
-function measuredUnderThisIdlePeriod(
-  at: number | undefined,
-  witness: number | undefined,
-  witnessRev: number | undefined,
-  info: HandsKvEntry,
-  state: BackgroundWork,
-): boolean {
-  if (typeof info.idleSince !== "number") return false;
-  if (
-    typeof witness === "number" && witness === info.idleSince
-    && typeof witnessRev === "number" && witnessRev === info.idleRev
-  ) return true;
-  if (state !== "running") return false;
-  return typeof at === "number" && at >= info.idleSince;
-}
-
-/**
- * The reuse window starts at the later of the idle-period opening and the last
- * sweep that observed work.
- */
-function reuseWindowStart(info: HandsKvEntry): number {
-  return Math.max(
-    typeof info.idleSince === "number" ? info.idleSince : 0,
-    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
-  );
-}
-
 /** This replica's own last answer, if it is fresh enough to reuse and still
  *  about the idle period the handle is in. */
 function usableCachedVerdict(
@@ -1296,19 +1349,6 @@ function usableCachedVerdict(
   if ((cached.state === "gone" || cached.state === "unknown")
     && (!cached.verdictAtStart || !sameVerdict(cached.verdictAtStart, info))) return null;
   return cached;
-}
-
-/** The handle's own copy, which any replica can read, under the same two rules
- *  and its own longer TTL. */
-function usableSharedVerdict(info: HandsKvEntry): { at: number; state: BackgroundWork } | null {
-  if (typeof info.bgCheckedAt !== "number" || typeof info.bgRunning !== "number") return null;
-  if (Date.now() - info.bgCheckedAt >= BG_VERDICT_TTL_MS) return null;
-  if (!sameIdlePeriod(info.bgEpoch, info)) return null;
-  const state: BackgroundWork = info.bgRunning > 0 ? "running" : "idle";
-  if (!measuredUnderThisIdlePeriod(
-    info.bgCheckedAt, info.bgIdleSince, info.bgIdleRev, info, state,
-  )) return null;
-  return { at: info.bgCheckedAt, state };
 }
 
 /**
@@ -1520,9 +1560,8 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
       bgProbeCache.delete(identity);
       return;
     }
-    for (const field of ["bgCheckedAt", "bgRunning", "bgEpoch", "bgIdleSince", "bgIdleRev", "bgRev"] as const) {
-      delete current[field];
-    }
+    // The reader's own field list, not a copy of it: see SHARED_VERDICT_FIELDS.
+    for (const field of SHARED_VERDICT_FIELDS) delete current[field];
     await deps.kv.update(key, sc.encode(JSON.stringify(current)), e.revision);
     if (!probeIsStale(probe)) bgProbeCache.delete(identity);
     probe.verdictAtStart = verdictWitness(current);
@@ -2009,6 +2048,14 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
           namespace: info.namespace,
           userId: info.user_id,
         };
+        // A handle written before its workload can serve anything is not a
+        // ping target. The registration happens as soon as SaFE assigns an id,
+        // so this row can name a workload still queued for a GPU: exec against
+        // it returns a perfectly ordinary 404, which counts as a failure, and
+        // enough sweeps of ordinary queueing then evict a workload that was
+        // never unhealthy. The session-row scan already skips PENDING for the
+        // same reason.
+        if (info.pending) continue;
         const usable = entry.provider === "agent-sandbox"
           ? !!entry.sessionId : !!(entry.workloadId && entry.platformKey);
         if (!usable) continue;

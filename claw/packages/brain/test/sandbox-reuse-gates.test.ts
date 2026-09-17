@@ -110,6 +110,10 @@ function stubEffects(
   refusal?: string,
   /** What the record-derived gate answers. Default: nothing left running. */
   liveWork: "clear" | "protected" | "unknown" = "clear",
+  /** Whether the caller's DAG holds a handle on the entry's workload. */
+  holds?: boolean | (() => Promise<boolean>),
+  /** Whether some OTHER DAG also holds a handle on it. */
+  heldByOther?: boolean | (() => Promise<boolean>),
 ): {
   destroyed: string[];
   registered: Registration[];
@@ -117,8 +121,11 @@ function stubEffects(
   retained: string[];
   /** The session keys a retention released, which is the binding it unbound. */
   retainedKeys: string[];
+  /** One entry per `releaseHandlesForWorkload` call the path made. */
+  released: string[];
 } {
   const destroyed: string[] = [];
+  const released: string[] = [];
   const registered: Registration[] = [];
   const restartCalls: number[] = [];
   const retained: string[] = [];
@@ -129,6 +136,18 @@ function stubEffects(
       registered.push({ sessionId, target });
     }) as never,
     probeSandboxContainer: async () => ({ verdict: probe, reason: "exec_ok" as const }),
+    // Succeeds by default: the retention path releases the handed-over
+    // container's handle before it retains it, so a fixture that threw here
+    // would stop every retention test short of its assertion.
+    releaseHandlesForWorkload: (async () => { released.push("release"); }) as never,
+    dagHoldsWorkload: (async () => {
+      if (typeof holds === "function") return holds();
+      return holds ?? false;
+    }) as never,
+    workloadHeldByOtherDag: (async () => {
+      if (typeof heldByOther === "function") return heldByOther();
+      return heldByOther ?? false;
+    }) as never,
     restartHandsInSandbox: async () => {
       restartCalls.push(1);
       if (refusal) return { ok: false, detail: refusal, refused: true };
@@ -141,7 +160,7 @@ function stubEffects(
       return "retained";
     },
   });
-  return { destroyed, registered, restartCalls, retained, retainedKeys };
+  return { destroyed, registered, restartCalls, retained, retainedKeys, released };
 }
 
 /** The session ids passed to `registerSandbox`, for the cases that only count. */
@@ -561,11 +580,19 @@ test("the SaFE handle records the namespace keepalive will poll", () => {
     fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
     "utf-8",
   );
-  const from = src.indexOf("await registerDagHandle(dagRoot, action.handle, {");
-  const call = src.slice(from, src.indexOf("});", from) + 3);
-  assert.doesNotMatch(call, /provider:\s*"agent-sandbox"/,
-    "the first register is the SaFE path, not the kubernetes one");
-  assert.match(call, /namespace:\s*nsForSandbox/,
+  // Selected by what the call IS, not by where it sits. Several registrations
+  // match this shape -- the early provisioning write, SaFE create,
+  // agent-sandbox create, the reuse adoption -- and this test wants the SaFE
+  // create; picking "the first
+  // occurrence" silently retargeted it at the reuse call when that was added.
+  const calls = [...src.matchAll(/await replaceDagHandle\(dagRoot, action\.handle, \{/g)]
+    .map((m) => src.slice(m.index!, src.indexOf("});", m.index!) + 3));
+  const call = calls.find((c) => /workload_id:\s*workloadId\b/.test(c));
+
+  assert.ok(call, "no SaFE registration found -- has it been renamed or reshaped?");
+  assert.doesNotMatch(call!, /provider:\s*"agent-sandbox"/,
+    "this is the SaFE path, not the kubernetes one");
+  assert.match(call!, /namespace:\s*nsForSandbox/,
     "keepalive has to poll the namespace the request named");
 });
 
@@ -783,4 +810,354 @@ test("reuse is refused while the fleet is uncounted, and registers nothing", asy
     // A ceiling of zero binds no roster, which is this module's off state.
     await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
   }
+});
+
+// A pending entry is not automatically this task's leftover.
+//
+// Under a session-scoped run gate two DAG roots take different lock keys and
+// run at the same time over one `hands.<sessionId>` entry. So the pending entry
+// a lazily-attaching task finds may be a sibling's create still in flight --
+// and destroying it stopped a workload the sibling went on to promote and use.
+// Round 33 reproduced exactly that: `stopped=[{id:"W2", inUse:true,
+// currentStatus:"ready"}], deleted=true`.
+const PENDING_OF = (taskId?: string) => ({
+  status: "pending" as const,
+  handsUrl: "http://hands.test:9100/mcp",
+  token: "tok-existing",
+  workloadId: "wl-sibling",
+  ...(taskId === undefined ? {} : { taskId }),
+});
+
+test("a pending entry another task wrote is left where it is", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF("t-sibling") as never, {
+    request: { ...REQUEST, task_id: "t-mine" },
+  });
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.equal(result, null, "this task still goes on to create its own");
+  assert.deepEqual(destroyed, [], "but not over the top of a sibling's workload");
+});
+
+test("a pending entry this task wrote is still cleaned up", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF("t-mine") as never, {
+    request: { ...REQUEST, task_id: "t-mine" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own leftover is exactly what this branch is for");
+});
+
+test("a pending entry with no task on it is cleaned up as before", async () => {
+  // It predates the field, so it can only have come from a process running
+  // before this rollout. Leaving those would leak them.
+  const { destroyed } = stubEffects();
+  const { a } = attempt(PENDING_OF() as never, { request: { ...REQUEST, task_id: "t-mine" } });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"]);
+});
+
+// Every replace branch reads the one shared session entry, takes the workload
+// it names, and stops it. Right when a session runs one task at a time; under a
+// session-scoped run gate two DAG roots run at once over that entry, so the
+// workload it names can be a sibling's -- already promoted and in use. Round 34
+// reproduced both remaining branches as
+// `stopped=[{"id":"W2","inUse":true,"currentStatus":"ready"}]`, the spec one
+// with no race at all: B builds image:1 and keeps using it, A asks for image:2
+// and the fingerprint comparison alone routes it into the rebuild.
+const OWNED_BY = (dagRootTaskId: string, over: Record<string, unknown> = {}) => ({
+  ...LIVE, specFingerprint: specOf(), dagRootTaskId, ...over,
+});
+/** A recorded fingerprint that parses but does not match -- the shape
+ *  evaluateReuse actually refuses on. A non-fingerprint string is treated as
+ *  unknown and reuses, which routes past this branch into the health check. */
+const STALE_SPEC = () => specOf().replace(/:[0-9a-f]+$/, ":ffffffffffffffff");
+const MINE = { ...REQUEST, task_id: "t-a", dag_root_task_id: "dag-a" };
+
+test("a spec rebuild does not stop a sandbox another DAG owns", async () => {
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-b", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null, "this task goes on to build its own");
+  assert.deepEqual(destroyed, [], "but not by stopping one a sibling DAG is using");
+});
+
+test("a multi-node replace does not stop a sandbox another DAG owns", async () => {
+  const { destroyed } = stubEffects();
+  const { a } = attempt(OWNED_BY("dag-b") as never, {
+    request: MINE,
+    multiNodeContext: { serviceUrl: "http://mn.test" } as never,
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "multi-node replaces its own prior sandbox, not a sibling's");
+});
+
+test("an unhealthy sandbox another DAG owns is not recreated over", async () => {
+  // The probe that failed was of somebody else's sandbox.
+  const { destroyed } = stubEffects("dead", false);
+  stubHealth("fail");
+  const { a } = attempt(OWNED_BY("dag-b") as never, { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, []);
+});
+
+test("a task rebuilding its OWN DAG's sandbox still replaces it", async () => {
+  // Nodes of one DAG share the session's sandbox on purpose: this is the
+  // behaviour the guard must not break.
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own DAG's sandbox is its to rebuild");
+});
+
+test("an entry with no owner recorded is replaced as before", async () => {
+  const { destroyed } = stubEffects();
+  stubHealth("ok");
+  const { a } = attempt({ ...LIVE, specFingerprint: STALE_SPEC() } as never, { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "refusing to rebuild an unowned session would be worse");
+});
+
+// Who WROTE the session entry is not who holds the workload now.
+//
+// A task that reused another's sandbox registers its own handle on it, and is
+// from then on just as much a holder -- but the entry still names whoever
+// created it. Round 35: refusing on that alone left such a task unable to
+// rebuild a sandbox that had broken under it. The replace was skipped as
+// somebody else's, and its own handle, still naming the dead workload, then
+// refused the registration of the replacement -- two attempts, two rolled-back
+// workloads, no way forward, while a brand new task succeeded.
+test("a task that reused a sandbox may still rebuild it when it breaks", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "holding a handle on it makes it yours to replace");
+});
+
+test("a task holding no handle on it still may not", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", false);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "this is still a sibling's live workload");
+});
+
+test("a registry that cannot be read answers 'not mine'", async () => {
+  // The conservative direction: the cost of being wrong here is the rebuild
+  // regression above, and the cost of being wrong the other way is stopping a
+  // workload somebody is using.
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", true,
+    async () => { throw new Error("kv down"); });
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, []);
+});
+
+test("holding a handle is not the same as being the only holder", async () => {
+  // Round 36, and a regression I introduced answering round 35. Reuse is the
+  // point of the handle registry, so a DAG holding a handle on a workload says
+  // it is A holder -- which is what makes rebuilding it that DAG's right. It
+  // does not say it is the ONLY one: the creator can still be running on the
+  // same workload. Permission read off the first question alone stopped a
+  // sandbox somebody was using -- `stopped=[{id:"W1", inUse:true}]`.
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", true, true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "the creator is still using it");
+});
+
+test("a scan that cannot answer who else holds it refuses the destroy", async () => {
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", true,
+    async () => { throw new Error("scan timed out"); });
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-creator", { specFingerprint: STALE_SPEC() }) as never,
+    { request: MINE });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "a refused rebuild beats stopping a live workload");
+});
+
+test("the creator is not exempt from asking who else holds it", async () => {
+  // Round 37. My own predicate short-circuited on `entryRoot === mineRoot` and
+  // returned "mine" without asking either question -- so a creator whose
+  // sandbox had since been reused by another DAG stopped it underneath them:
+  // `stopped=[{id:"W1", bUsing:true}], holdsQueries=0, otherQueries=0`.
+  //
+  // Creating it answers the first question (am I entitled at all). It says
+  // nothing about the second.
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", false, true);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never, {
+    request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, [], "another DAG reused it and is running on it");
+});
+
+test("the creator may still rebuild when nobody else holds it", async () => {
+  // The ordinary case, and the one the extra question must not break.
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", false, false);
+  stubHealth("ok");
+  const { a } = attempt(OWNED_BY("dag-a", { specFingerprint: STALE_SPEC() }) as never, {
+    request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "its own sandbox, held by nobody else");
+});
+
+test("an agent-sandbox entry is identified by its Router session, not a blank workload id", async () => {
+  // Round 38. An agent-sandbox entry records `workloadId: ""` and names its
+  // Router session instead. Keying ownership on the workload id meant the
+  // question short-circuited before either query ran -- `holderQueries=0` --
+  // so a Router sandbox another DAG was using was deleted on the strength of
+  // an answer nobody had asked for.
+  const queries: string[] = [];
+  const { destroyed } = stubEffects("dead", true, undefined, "clear", false,
+    async () => { queries.push("other"); return true; });
+  stubHealth("ok");
+  const { a } = attempt({
+    ...LIVE, specFingerprint: STALE_SPEC(), dagRootTaskId: "dag-a",
+    provider: "agent-sandbox", workloadId: "", sessionId: "router-R",
+  } as never, { request: { ...MINE, task_id: "a2", dag_root_task_id: "dag-a" } });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(queries, ["other"], "the holder question has to actually be asked");
+  assert.deepEqual(destroyed, [], "another DAG is using that Router sandbox");
+});
+
+test("a retention lands its reference before it gives up the handle", async () => {
+  // This assertion has been both ways round, and round 43 settled it.
+  //
+  // It first said "release first, so a failed release leaves everything as it
+  // was and the next attempt retries". That premise is false: a delete whose
+  // ACK is lost has committed. The container then ends with no handle, no
+  // retention record and no session binding, because the caller goes on to
+  // provision a replacement whose own pending write takes the binding. The same
+  // window opens on a crash between the two, and for a DAG that REUSED the
+  // container its handle was also its way back into this path.
+  //
+  // So the reference that replaces the handle has to exist before the handle
+  // can go. A release that then fails leaves a stale handle -- recoverable,
+  // because a registration refused by a RETAINED workload may take the name
+  // (see H25 and `mayTakeFrom`).
+  const order: string[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    retainContainer: (async () => { order.push("retain"); }) as never,
+    releaseHandlesForWorkload: (async () => { order.push("release"); }) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" }),
+    restartHandsInSandbox: async () => ({ ok: false, detail: "refused", refused: true }),
+    countLiveWork: (async () => ({ verdict: "protected", classes: {}, reason: "shells" })) as never,
+    destroyHands: (async () => { order.push("destroy"); }) as never,
+  });
+  stubHealth("fail");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf(), workloadId: "W-old" } as never);
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(order, ["retain", "release"],
+    "the retention record has to exist before the handle naming it is freed");
+});
+
+test("a retention whose handle release fails still retains the container", async () => {
+  // The failure this ordering is FOR: the release throwing must not cost the
+  // container its retention record, because that record is now its only
+  // reference. The stale handle it leaves behind is the recoverable half.
+  const order: string[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    retainContainer: (async () => { order.push("retain"); }) as never,
+    releaseHandlesForWorkload: (async () => { throw new Error("kv down"); }) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" }),
+    restartHandsInSandbox: async () => ({ ok: false, detail: "refused", refused: true }),
+    countLiveWork: (async () => ({ verdict: "protected", classes: {}, reason: "shells" })) as never,
+    destroyHands: (async () => { order.push("destroy"); }) as never,
+  });
+  stubHealth("fail");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf(), workloadId: "W-old" } as never);
+
+  assert.equal(await tryReuseSessionSandbox(a), null, "a failed release must not fail the turn");
+  assert.deepEqual(order, ["retain"], "the container keeps the reference that replaced its handle");
+});
+
+test("a gone container is released rather than retained when the live gate cannot answer", async () => {
+  // The pair that cannot both be honoured: the provider has confirmed the
+  // workload is absent, and the record-derived gate answers anything but
+  // `clear`. It is not a rare pair -- it is the ONLY one a gone container can
+  // produce, because `countLiveWork` has to reach the container to answer and
+  // gets `unknown` from one that is not there.
+  //
+  // Retaining on `unknown` is right for a container that is merely unreachable
+  // and wrong for one that is absent: there is no work to protect and no stop
+  // to protect it from, and `runRetentionReadPhase` re-runs that same
+  // unanswerable read every sweep and reads `unknown` too, for ever. With
+  // SANDBOX_SWEEPER_EVICT_AFTER_FAILURES and SANDBOX_KEEPALIVE_FAIL_LIMIT both
+  // defaulting to 0 nothing else removes it, so the record outlives everything
+  // that could release it while counting against the keepalive ceiling live
+  // sandboxes need room in.
+  //
+  // The `entryOwnedByAnother` branch has asked this question since it was
+  // written. This asserts it for the path that reaches the retention without
+  // going through that branch -- which a release of this function's own can
+  // produce: `releaseHandlesForWorkload` walks one DAG row at a time with no
+  // transaction over the set, so a release that frees a sibling's name and then
+  // exhausts its CAS attempts on its own row throws with the first deletion
+  // already durable, and the redelivery re-runs this path against a table where
+  // the sibling reference is gone.
+  const { destroyed, retained, released } = stubEffects("dead", true, undefined, "unknown");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(retained, [], "a container that is not there gets no retention record");
+  assert.equal(released.length > 0, true, "its handles are freed instead");
+  assert.deepEqual(destroyed, [], "and nothing is stopped: there is nothing to stop");
+});
+
+test("an unreachable container is still retained", async () => {
+  // The other side of the same line, and the reason the check sits where it
+  // does rather than earlier. `unknown` from the probe is not `dead`: the
+  // container may be running with work in it that nothing can currently see,
+  // which is exactly what a retention is for. A fix that read "unknown live
+  // work means release" would destroy the protection it was meant to keep.
+  const { retained } = stubEffects("unknown", true, undefined, "unknown");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  await assert.rejects(() => tryReuseSessionSandbox(a), /container state is unknown/);
+  assert.deepEqual(retained, [], "this path refuses before it decides anything");
+});
+
+test("a gone container with a clear gate is still destroyed", async () => {
+  // The teardown a gone container needs as much as a live one: the entry has to
+  // be cleaned up. The release check is placed AFTER this branch for that
+  // reason -- it is not "skip the teardown for gone containers".
+  const { destroyed, retained } = stubEffects("dead", true, undefined, "clear");
+  stubHealth("throw");
+  const { a } = attempt({ ...LIVE, specFingerprint: specOf() });
+
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"], "the entry cleanup still happens");
+  assert.deepEqual(retained, []);
 });

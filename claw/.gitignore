@@ -13,6 +13,9 @@ dist/
 
 # Per-env deploy values (contain secrets — keep example template tracked)
 deploy/values.*.env
+# Anything derived from it too. A backup copy named values.<ns>.env.bak
+# escaped the line above and put two live cluster credentials in a commit.
+deploy/values.*.env.*
 !deploy/values.example.env
 
 # Runtime files

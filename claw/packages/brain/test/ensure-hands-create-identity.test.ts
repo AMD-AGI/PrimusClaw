@@ -13,7 +13,7 @@
  * about whichever sibling wrote last and its rebuild stops that sibling's
  * live workload. That is the failure the identity-scoping work exists to end.
  */
-import test, { afterEach } from "node:test";
+import test, { afterEach, before } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";
 import type { KV } from "nats";
@@ -23,10 +23,45 @@ import {
   type SandboxEntry,
 } from "../src/sandbox/ensure-hands.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
+import { bindDagHandleKvForTest } from "../src/sandbox/handles.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
 import type { ExecuteRequest } from "@claw/protocol";
 
+
+/**
+ * A DAG_HANDLES bucket for the registration these paths now perform.
+ *
+ * Before it existed these tests passed while the registration inside
+ * `ensureHands` threw `dag-handles.not_initialized` and the call site swallowed
+ * it -- so a file named for "the identity it registered" was green without
+ * anything being registered. The swallow is gone, which is what surfaced this.
+ */
+function bindDagHandles(): void {
+  const rows: Record<string, unknown> = {};
+  const revs: Record<string, number> = {};
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  bindDagHandleKvForTest({
+    async get(key: string) {
+      return rows[key] === undefined
+        ? null
+        : { key, value: enc.encode(JSON.stringify(rows[key])), revision: revs[key]!, operation: "PUT" };
+    },
+    async create(key: string, value: Uint8Array) {
+      if (rows[key] !== undefined) throw new Error("wrong last sequence: key exists");
+      rows[key] = JSON.parse(dec.decode(value)); revs[key] = 1; return 1;
+    },
+    async update(key: string, value: Uint8Array, rev: number) {
+      if (revs[key] !== rev) throw new Error("wrong last sequence");
+      rows[key] = JSON.parse(dec.decode(value)); revs[key] = rev + 1; return revs[key];
+    },
+    async delete(key: string) { delete rows[key]; delete revs[key]; },
+    async keys() { return (async function* () { for (const k of Object.keys(rows)) yield k; })(); },
+  } as never);
+}
+
+before(bindDagHandles);
 const sc = StringCodec();
 const SESSION = "sess-create";
 

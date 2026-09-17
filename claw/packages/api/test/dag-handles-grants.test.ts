@@ -67,13 +67,29 @@ test("the api user can read the DAG handle bucket its census depends on", () => 
     "the sandbox census attaches to DAG_HANDLES; these subjects are denied");
 });
 
-test("the api user cannot write the DAG handle bucket", () => {
+test("the api user cannot create or reconfigure the DAG handle bucket", () => {
+  // Narrowed from "cannot write" when the cancel teardown landed. The row
+  // writes are now required: whoever stops a workload frees its handle, and
+  // this side stops them on cancel -- a handle left naming a stopped workload
+  // blocks the replacement's registration rather than leaking it.
+  //
+  // The part that still holds, and is the reason the original assertion
+  // existed, is the STREAM: `ensureKvBucket` corrects drift as well as
+  // creating, so an attach from here carrying its own replica setting would
+  // rewrite Brain's bucket config on every boot, and on an api-first cluster
+  // would create it with a count Brain never chose. Hence `bindOnly`.
   const forbidden = publishAllowList("api").filter((s) =>
-    s.startsWith("$KV.DAG_HANDLES.")
-    || s.startsWith("$JS.API.STREAM.CREATE.KV_DAG_HANDLES")
+    s.startsWith("$JS.API.STREAM.CREATE.KV_DAG_HANDLES")
     || s.startsWith("$JS.API.STREAM.UPDATE.KV_DAG_HANDLES"));
 
-  assert.deepEqual(forbidden, [], "the census is read-only; api must not create or write this bucket");
+  assert.deepEqual(forbidden, [], "Brain owns this bucket; api must not create or reconfigure it");
+});
+
+test("the api user can destroy the handle rows its teardown frees", () => {
+  const allowed = new Set(publishAllowList("api"));
+
+  assert.ok(allowed.has("$KV.DAG_HANDLES.dag-handles.*"),
+    "the cancel teardown frees the handles of the workloads it stops");
 });
 
 test("brain keeps the write access api is denied", () => {
