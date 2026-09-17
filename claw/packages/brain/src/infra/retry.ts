@@ -192,6 +192,27 @@ export function isRetryable(err: unknown): boolean {
   // transient gateway hiccups burn the task instead of getting redelivered.
   if (e?.name === "APIConnectionError" || e?.name === "APIConnectionTimeoutError") return true;
   if (typeof e?.status === "number" && [408, 409, 429, 500, 502, 503, 504].includes(e.status)) return true;
+  // A DAG handle row that kept moving under a conditional write
+  // (`DagHandleContendedError`, brain/src/sandbox/errors.ts). Matched by name
+  // for the same reason the two Anthropic classes above are: the class is
+  // raised in sandbox/handles.ts, and importing it here would point the retry
+  // POLICY at the module that owns the DAG_HANDLES bucket -- infra must not
+  // depend on a sandbox for that. The name is a class identifier rather than
+  // prose, so unlike the message matches further down it does not move when
+  // someone reworks a sentence.
+  //
+  // Narrow on purpose. This is not "the handle layer is retryable": the same
+  // function still raises an ordinary Error for an unbound bucket, a scan that
+  // overran its ceiling, and a row that does not parse, and every one of those
+  // still fails the task. The one case that earns a redelivery is the one where
+  // a second read can return something different -- the row moved because
+  // another task wrote it -- rather than the same bytes again.
+  //
+  // Before this line, five lost conditional writes reported the task failed and
+  // ACKED it, and an acked delivery does not come back. Pinned in
+  // brain/test/gone-handle-release-contention.test.ts, which runs the real
+  // runner over the real release and asserts on the ack/nak alone.
+  if (e?.name === "DagHandleContendedError") return true;
   // Legacy / undici / NATS string matches.
   if (msg.includes("503") || msg.includes("502") || msg.includes("429")) return true;
   if (msg.includes("econnrefused") || msg.includes("econnreset") || msg.includes("etimedout")) return true;

@@ -115,3 +115,51 @@ export class SandboxExecRouteUnavailableError extends Error {
     this.name = "SandboxExecRouteUnavailableError";
   }
 }
+
+/**
+ * A DAG handle row kept moving under a conditional write, so the write never
+ * landed and the row still says what it said before.
+ *
+ * Raised only where the writer LOST A RACE and would have won it given another
+ * read: `releaseHandlesForWorkload` re-reads the row, checks that the handle
+ * still names the workload it is freeing, and writes back conditional on the
+ * revision it just read. A concurrent registration into the same DAG's row --
+ * a sibling node of the same DAG taking a second handle -- bumps that revision
+ * and the conditional write is refused. Five of those in a row exhausts
+ * `REGISTER_CAS_ATTEMPTS` and nothing was released.
+ *
+ * It exists as a class, and not as one more phrase for `isRetryable` to match
+ * on, because the ONLY reader that can tell this apart from a permanent failure
+ * is the code that raised it. By the time the error reaches the task runner, a
+ * lost race and an unreadable row are the same shape -- a string out of the same
+ * function saying a name was not freed -- and the previous version of the throw
+ * genuinely conflated them: one message covered both "attempts exhausted" and
+ * "its row could not be read". A caller cannot recover a distinction the raiser
+ * threw away. So the raiser keeps it, the way `replaceDagHandle` already does
+ * by raising `dag-handles row ... is not a JSON object` separately from its own
+ * attempts-exhausted throw.
+ *
+ * What it is NOT: a blanket "the handle layer failed, try again". An unbound
+ * bucket, a scan that overran its ceiling, a row that does not parse and a
+ * transport error out of the store all still leave this module as ordinary
+ * errors and are still judged on their own terms. The line between them is not
+ * a guess about how long anything takes -- no claim is made here about how
+ * quickly contention clears, and none has been measured. It is about what the
+ * next read can possibly return. A row that is not a JSON object returns the
+ * same bytes to every reader until something rewrites it, so re-reading it is
+ * asking a question whose answer is already fixed. A row that MOVED returns
+ * whatever the writer that moved it left, and that writer is another task
+ * finishing its own registration -- so the next read is a genuinely different
+ * question, and the only way to ask it is to be delivered again.
+ *
+ * The policy that acts on it -- nak the delivery rather than fail the task --
+ * lives in `isRetryable` (brain/src/infra/retry.ts), next to every other
+ * condition that earns a redelivery. This class carries the nature; that
+ * function carries the decision.
+ */
+export class DagHandleContendedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DagHandleContendedError";
+  }
+}

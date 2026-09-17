@@ -24,6 +24,7 @@ import {
 } from "@claw/protocol";
 import { natsKvStore, type NatsLikeKv } from "@claw/utils";
 import { DAG_HANDLES_REPLICAS } from "../config.js";
+import { DagHandleContendedError } from "./errors.js";
 import pino from "pino";
 
 const logger = pino({ name: "dag-handles" });
@@ -614,6 +615,10 @@ export async function releaseHandlesForWorkload(
       // it still had stayed behind with nothing to recover it from. A release
       // that did not happen has to say so.
       let freed = false;
+      // Kept apart from `freed` because the two ways this loop can end without
+      // freeing anything want OPPOSITE handling from the task that called it,
+      // and only this loop can still tell them apart. See the throws below.
+      let rowUnreadable = false;
       for (let attempt = 0; attempt < REGISTER_CAS_ATTEMPTS; attempt += 1) {
         const key = `${HANDLE_MAP_PREFIX}.${dagRoot}`;
         const entry = await kv.get(key);
@@ -625,7 +630,10 @@ export async function releaseHandlesForWorkload(
         // it, so it falls through to the refusal below rather than reporting a
         // release that was never made.
         const parsed: unknown = JSON.parse(dec.decode(entry.value));
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) break;
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          rowUnreadable = true;
+          break;
+        }
         const row = parsed as Record<string, unknown>;
 
         const held = getHandleEntry(row, name);
@@ -651,13 +659,44 @@ export async function releaseHandlesForWorkload(
         }
       }
       if (!freed) {
-        // `break` above also lands here -- that is the case where the row moved
-        // on to another workload or vanished, which IS released as far as this
-        // workload is concerned, so it sets `freed` too. Reaching here means the
-        // retries ran out with the name still ours and still written.
-        throw new Error(
+        // Two failures, and they used to share one throw and one sentence:
+        // "N attempts exhausted, OR its row could not be read". That message
+        // was honest about not knowing, and the not-knowing was the defect --
+        // the task runner reads an error and decides whether to nak or to fail
+        // the task, and those two want opposite answers. Split here rather than
+        // guessed at there, because here is the last place the difference still
+        // exists. `replaceDagHandle` already splits its own two the same way.
+        //
+        // A row that does not parse as an object will not parse next time
+        // either: whatever wrote it is still what is in the bucket, and the
+        // release is not retried against it -- for the same reason
+        // `replaceDagHandle` raises on this rather than looping. It stays an
+        // ordinary Error, which the runner fails the task on. That is the
+        // direction that gets an operator to look.
+        if (rowUnreadable) {
+          throw new Error(
+            `dag-handle ${name} for ${dagRoot} was not released from ${workloadId}: `
+            + `dag-handles row ${HANDLE_MAP_PREFIX}.${dagRoot} is not a JSON object`,
+          );
+        }
+        // Everything else that reaches here is the loop having re-read the row
+        // REGISTER_CAS_ATTEMPTS times, found the handle still naming this
+        // workload every time, and lost the conditional write every time. The
+        // `break`s above do not: each of them means the name is no longer on
+        // this workload, which IS released as far as this call is concerned, so
+        // each sets `freed`.
+        //
+        // Losing that race says something about another writer, not about
+        // anything being broken: the row moved because a sibling node of this
+        // same DAG registered a handle of its own into it. How long such a
+        // burst lasts is not claimed here and has not been measured -- what is
+        // claimed is only that the next read of this row can return something
+        // different, which is not true of any other failure this function has.
+        // So it is raised as the thing it is, and `isRetryable` naks the
+        // delivery rather than ending the task -- see the class.
+        throw new DagHandleContendedError(
           `dag-handle ${name} for ${dagRoot} was not released from ${workloadId}: `
-          + `${REGISTER_CAS_ATTEMPTS} attempts exhausted, or its row could not be read`,
+          + `${REGISTER_CAS_ATTEMPTS} attempts exhausted, the row changing under each`,
         );
       }
     }

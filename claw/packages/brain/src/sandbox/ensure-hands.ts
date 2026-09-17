@@ -991,8 +991,81 @@ async function retainInsteadOfDestroying(
  * the registration that follows is refused and the replacement workload is
  * created, rolled back and stopped for nothing -- so failing here is the same
  * outcome one GPU create cheaper, and with an error that names the actual
- * cause. It is also retryable: the next attempt re-probes, gets `dead` again,
- * and tries the release again.
+ * cause.
+ *
+ * WHICH failure decides what that costs, and this comment used to claim the
+ * easy half of it: "it is also retryable: the next attempt re-probes, gets
+ * `dead` again, and tries the release again". That was a guarantee nobody had
+ * read. The task runner does not retry on the shape of a call stack, it retries
+ * on `isRetryable(err)`, and the error this throws for a lost CAS race -- the
+ * release losing five conditional writes in a row to another DAG registering
+ * into the same row -- satisfied none of its conditions. So the turn was
+ * reported failed and the delivery ACKED, which ends the task for good.
+ * `releaseHandlesForWorkload` now raises that one case as
+ * `DagHandleContendedError` and `isRetryable` naks it; a row that cannot be
+ * read, a bucket that is not bound and a scan that overran still end the task,
+ * which is what they should do. Pinned in
+ * brain/test/gone-handle-release-contention.test.ts.
+ *
+ * The decision, the irreversible act, and the gap between them, since every
+ * other branch on this path states them:
+ *
+ *   - the DECISION reads one thing: the error object, at `failureOutcome` and
+ *     `handleRunFailure` in tasks/runner.ts. Not the row, not the bucket, not
+ *     the provider -- whatever the release knew has already been compressed
+ *     into an exception by the time anyone asks.
+ *   - the IRREVERSIBLE ACT is `msg.ack()`, through `settleTerminal`. A nak
+ *     spends one of TASK_MAX_DELIVER and the message comes back; an ack ends
+ *     it, and no later reader can tell that the task ever existed. That is why
+ *     the classification has to be right in the direction of "retry a failure
+ *     that was permanent" rather than "ack a failure that was transient": the
+ *     first costs deliveries out of a budget that is bounded anyway (see
+ *     below), the second cannot be undone.
+ *   - what can INVALIDATE the read between them: nothing, and that is the
+ *     shape of this one rather than a reprieve from it. The error is in hand
+ *     and the ack is microseconds later in the same catch. The read that goes
+ *     stale is the one INSIDE the release -- the row revision taken at `kv.get`
+ *     and spent at `kv.update` -- and its going stale is the entire content of
+ *     the error. So by the time the decision is made the evidence is already
+ *     known to be out of date, and the only act that can take a fresh read is
+ *     a redelivery. A nak is not optimism here; it is the only way to ask
+ *     again.
+ *
+ * What bounds the asking, since "retryable" must not mean "for ever": the
+ * consumer's own budget, which is not set here and was read rather than
+ * assumed. `TASK_MAX_DELIVER` resolves through `resolveTaskDeliveryBudget`
+ * (@claw/protocol task-consumer.ts) from `DEFAULT_TASK_MAX_DELIVER = 23`, and
+ * that function returns `poisonDeliveryCount = maxDeliver - 1` with it. So
+ * brain's own poison guard in tasks/dispatch.ts fires at delivery 22, one
+ * inside the ceiling, and `resolvePoisonedTask` ends the task with a
+ * user-visible exec_complete. A contention that never clears therefore still
+ * terminates, and terminates with the user told, rather than with the message
+ * silently exceeding max_deliver and the session left at `running`.
+ *
+ * What the redelivery finds when it re-enters here, which is the other half of
+ * "converges":
+ *
+ *   - the workload is still gone. A SaFE workload id is minted per create and
+ *     never reissued, so the probe answers `dead` again -- the premise the
+ *     branch above rests on is the one premise on this path that cannot expire.
+ *   - a PARTIAL release is not redone. The scan re-reads the table and only
+ *     rows whose entries still carry `workload_id === goneWorkload` are
+ *     attempted at all (`names.length === 0` skips the rest), so every name the
+ *     first attempt did free is simply not seen. Each attempt has strictly less
+ *     to do than the last.
+ *   - the winning DAG's registration is welcome. If the contender's write moved
+ *     that handle to its own workload, `heldId !== workloadId` and the name is
+ *     left alone as somebody else's -- counted as released, because it no
+ *     longer names the dead workload, which is all this call was ever asking
+ *     for.
+ *   - the name may already be free. The reaper and the keepalive retention
+ *     phase release by workload too; if either got there first the scan finds
+ *     nothing naming it and the call returns having done nothing.
+ *
+ * In every one of those the release ends, this function returns, and the turn
+ * goes on to provision a replacement and register it against a name no longer
+ * held by a workload that does not exist -- which is what this whole branch is
+ * for.
  *
  * An agent-sandbox entry records `workloadId: ""` and there is nothing to pass:
  * `releaseHandlesForWorkload` matches rows on `workload_id`, which such a row
