@@ -497,6 +497,19 @@ async function recoverOrRetainUnusableSandbox(
       { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
       "hands.kv.unhealthy_rebuild_skipped_other_owner",
     );
+    // The same hand-over as the spec-change branch, which is worth saying
+    // because an unhealthy container looks like the case that deserves the
+    // opposite treatment. It is not. "Unhealthy" here is a statement about
+    // Hands' HTTP endpoint answering US; background shells are processes in the
+    // container, a dead Hands does not end them, and the branch immediately
+    // below already retains rather than destroys for exactly that reason when
+    // the container is ours. Being somebody else's changes only that we may not
+    // stop it -- it does not make the evidence any less perishable, and in fact
+    // makes it more so, since a container nobody can reach through Hands is the
+    // one whose shells nothing else can report. The read that decides is
+    // `countLiveWork` over the exec channel rather than over Hands, precisely
+    // so that it can answer while Hands is what is down.
+    await retainDisplacedSandbox(attempt, info, identity, binding, "unhealthy_rebuild");
     return null;
   }
   const live = await mayDestroy(sessionId, identity, signal);
@@ -609,6 +622,17 @@ async function retainInsteadOfDestroying(
   info: any,
   answer: LiveWorkAnswer,
   binding: HandsBinding,
+  /**
+   * Whether this caller may free the handles naming the workload.
+   *
+   * True for every caller that reached here past `entryOwnedByAnother` saying
+   * the container is nobody else's -- which is what makes releasing by workload
+   * safe, and what the note on the release itself rests on. False for
+   * `retainDisplacedSandbox`, which is reached precisely when that check said
+   * the opposite: see the note there for why a retained container with a handle
+   * still naming it is a supported state and not a leak.
+   */
+  releaseHandles = true,
 ): Promise<void> {
   // Retention BEFORE the handle release, and this order has been both ways now.
   //
@@ -649,10 +673,15 @@ async function retainInsteadOfDestroying(
   // still on record, which is right -- so it is freed here, and if that does
   // not land the registration path frees it instead.
   //
-  // Safe to release by workload: this is only reached when
-  // `entryOwnedByAnother` said no other DAG holds it.
+  // Safe to release by workload ONLY because `entryOwnedByAnother` said no
+  // other DAG holds it, which is a precondition of this caller and not of the
+  // retention itself. `releaseHandles` is what carries that distinction:
+  // release by workload takes every DAG's handle on it, so a caller that could
+  // not establish sole ownership must not do it, and does not -- the retention
+  // record is a reference in its own right, and the keepalive sweep that
+  // releases one frees the handle before it does.
   const retainedWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
-  if (retainedWorkload) {
+  if (releaseHandles && retainedWorkload) {
     await reuseEffects.releaseHandlesForWorkload(retainedWorkload).catch((e) => {
       logger.warn(
         { sessionId, workloadId: retainedWorkload, err: (e as Error)?.message ?? String(e) },
@@ -660,6 +689,89 @@ async function retainInsteadOfDestroying(
       );
     });
   }
+}
+
+/**
+ * Hand over a container this session is about to stop naming.
+ *
+ * Reached from the two branches that decide a recorded sandbox cannot serve
+ * this request AND that it is not this DAG's to stop. Both of them used to
+ * answer that with a bare `return null`, and that is the whole defect: it reads
+ * as "leave it alone", and what actually follows is the caller provisioning a
+ * replacement and writing ITS binding over `hands.<sessionId>` with an
+ * unconditional put. That slot is one slot per session, so the moment it moves
+ * it can no longer answer for the container it used to name. The verdict "there
+ * are shells running in W1" lived nowhere else: the API's background-work guard
+ * asks that slot, is handed a binding about W2, and answers `other_sandbox` --
+ * which is true, and is not an answer about W1 at all -- so the orphan sweep
+ * stops W1 with the user's background shell still running inside it. Leaving
+ * the container ALIVE is not the same as leaving the EVIDENCE that it is busy,
+ * and only the second one protects anything: every later reader asks a record,
+ * not a container.
+ *
+ * So the binding is MOVED rather than dropped, into the one record keyed by the
+ * container instead of by the session. That is exactly what a retention is,
+ * which is why this reuses `retainInsteadOfDestroying` rather than inventing a
+ * second protection with rules of its own: from here on `handleRegistry.retained`
+ * finds this workload by its own id however often the session slot moves after
+ * it, and `stopSandboxByHandle` refuses on what it finds.
+ *
+ * Only when something is actually running in it, and that is what keeps this
+ * from being "retain everything". A displaced sandbox whose work has finished
+ * is the orphan the sweep exists to reap -- and the GPU the next task is
+ * queued behind -- so a `clear` count leaves this path byte for byte as it was:
+ * no record, no protection, reaped. `unknown` retains, like every other caller
+ * of `mayDestroy`: a container that could not be asked never answered zero.
+ *
+ * The handles are deliberately NOT released here, and that is the one way this
+ * differs from a retention taken over a container the caller owns. This path is
+ * reached precisely because the ownership check said somebody else may hold
+ * this workload, and `releaseHandlesForWorkload` releases every DAG's handle on
+ * it -- so releasing here could take a live sibling's only reference to the
+ * sandbox it is running in, which is the mis-stop that check exists to prevent,
+ * by a quieter route. A retained container with a handle still naming it is an
+ * already-supported state rather than a leak: `replaceDagHandle` may take that
+ * name from it (`mayTakeFrom` / `retainedTaker`), the reuse gate stands aside
+ * for it, the API's sweep drops the stale mapping WITHOUT stopping the
+ * container, and the keepalive sweep that finally releases the retention frees
+ * the handle first and lets go second.
+ *
+ * What collects the container afterwards is that same sweep and nothing new:
+ * a retention projection is a census target, so the container keeps being
+ * pinged, and `runRetentionReadPhase` re-reads `countLiveWork` in it every
+ * sweep and releases the retention -- handle first, records second -- the first
+ * time the answer is `clear`. Nothing here is released on a clock, because the
+ * work it protects has no bounded age.
+ *
+ * @throws where the hand-over could not be recorded -- a binding naming no
+ * endpoint to key it by, or a store that refused the write. The turn fails with
+ * the session slot STILL naming this container, which is the one state in which
+ * the guard can go on answering for it; going on instead would move the slot
+ * and take the evidence with it, which is the defect this exists to close. The
+ * same direction, for the same reason, as `restoreSessionBinding`.
+ */
+async function retainDisplacedSandbox(
+  a: ReuseAttempt,
+  info: any,
+  identity: SandboxEntry,
+  binding: HandsBinding,
+  why: string,
+): Promise<void> {
+  const live = await mayDestroy(a.sessionId, identity, a.signal);
+  if (live.verdict === "clear") {
+    logger.info(
+      { sessionId: a.sessionId, workloadId: info.workloadId ?? null, why,
+        reason: live.reason },
+      "ensureHands.displaced_sandbox_holds_nothing",
+    );
+    return;
+  }
+  logger.warn(
+    { sessionId: a.sessionId, workloadId: info.workloadId ?? null, why,
+      verdict: live.verdict, reason: live.reason },
+    "ensureHands.displaced_sandbox_retained",
+  );
+  await retainInsteadOfDestroying(a.kv, a.sessionId, info, live, binding, false);
 }
 
 /**
@@ -1402,6 +1514,12 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
         { sessionId, workloadId: info.workloadId, entryDagRoot: info.dagRootTaskId ?? null },
         "hands.kv.spec_rebuild_skipped_other_owner",
       );
+      // Still not a stop -- and no longer a bare `return null` either. The
+      // caller's very next act is to build a replacement and put its binding
+      // over this session's one slot, so this is the last moment at which
+      // anything can still record what is running in the sandbox that slot is
+      // about to stop naming. See `retainDisplacedSandbox`.
+      await retainDisplacedSandbox(a, info, identity, binding, "spec_changed");
       return null;
     }
     await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
