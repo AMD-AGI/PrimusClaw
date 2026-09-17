@@ -533,10 +533,7 @@ async function recoverOrRetainUnusableSandbox(
     // queried every sweep, and counts against the keepalive target ceiling that
     // live sandboxes need room in.
     if (containerGone) {
-      logger.warn(
-        { sessionId, workloadId: info.workloadId ?? null },
-        "ensureHands.displaced_sandbox_already_gone",
-      );
+      await releaseHandlesForGoneWorkload(sessionId, info);
       return null;
     }
     await retainDisplacedSandbox(attempt, info, identity, binding, "unhealthy_rebuild");
@@ -892,11 +889,16 @@ async function retainInsteadOfDestroying(
  * work running in there" and still the wrong reason to keep a record, because
  * the same read is what has to say `clear` before anything lets the record go
  * -- and a workload that does not exist cannot answer either question on this
- * sweep or on any sweep after it. See the `containerGone` branch in
+ * sweep or on any sweep after it. That case does not merely skip the retention:
+ * it FREES the handles instead, absolutely, because nothing else would ever
+ * free them and the name is what the replacement needs. See
+ * `releaseHandlesForGoneWorkload` and the `containerGone` branch in
  * `recoverOrRetainUnusableSandbox`.
  *
- * The handles are deliberately NOT released here, and that is the one way this
- * differs from a retention taken over a container the caller owns. This path is
+ * The handles are deliberately NOT released here -- while there is a container
+ * to argue about, which is the qualification the gone-workload branch turns on
+ * -- and that is the one way this differs from a retention taken over a
+ * container the caller owns. This path is
  * reached precisely because the ownership check said somebody else may hold
  * this workload, and `releaseHandlesForWorkload` releases every DAG's handle on
  * it -- so releasing here could take a live sibling's only reference to the
@@ -922,6 +924,96 @@ async function retainInsteadOfDestroying(
  * and take the evidence with it, which is the defect this exists to close. The
  * same direction, for the same reason, as `restoreSessionBinding`.
  */
+/**
+ * Free every handle naming a workload the provider has confirmed is GONE, so
+ * its replacement can take the name.
+ *
+ * The other half of not retaining a dead container, and the half the previous
+ * round left out. Declining to retain was right -- there is no work in a
+ * workload that does not exist, and a retention over one is a record nothing
+ * can ever release. But a bare `return null` leaves the handle rows naming it
+ * exactly where they were, and the very next thing this turn does is provision
+ * a replacement and register it: `replaceDagHandle` finds the name still on
+ * record against a different workload, asks `mayTakeFrom`, and `retainedTaker`
+ * reads the retention ledger -- where, precisely because nothing was retained,
+ * there is nothing. The registration is refused, the replacement is rolled back
+ * and stopped, and the next attempt does the same thing again. Measured: at
+ * 05e09d7 a replacement registered on the first try; with the bare return, two
+ * consecutive retries both failed.
+ *
+ * Writing a retention to make `mayTakeFrom` answer yes would undo the fix it
+ * belongs to, so the release is the remedy: the name has to stop being on
+ * record, not be excused from being on record.
+ *
+ * THE RELEASE IS ABSOLUTE, and that is the part worth arguing, because the
+ * sibling path a few lines above refuses to do exactly this. `entryOwnedByAnother`
+ * has just said another DAG may hold this workload, and
+ * `releaseHandlesForWorkload` frees EVERY DAG's handle on it -- which on the
+ * displaced-sandbox path would take a live sibling's only reference to a
+ * container it is running in. That refusal is a statement about a container
+ * that EXISTS. Here the provider has confirmed it does not, and every premise
+ * the refusal rests on goes with it:
+ *
+ *   - the sibling's handle is not a reference to anything. `sandbox.use`
+ *     resolves the row and then `assertDagHandleAlive` probes what it names;
+ *     the probe answers `dead`, `probeHandleSandbox` maps that to `gone`, and
+ *     the node throws. That happens whether or not this release runs, so
+ *     freeing the row costs the sibling nothing it had not already lost.
+ *   - keeping the row costs the sibling something real. A DAG whose sandbox has
+ *     died rebuilds by registering a replacement on the same name -- and its
+ *     own registration is refused by its own stale row, for the life of that
+ *     DAG. That is the two-attempts-two-rolled-back-workloads failure
+ *     `entryOwnedByAnother`'s handle-registry check was written to end,
+ *     reintroduced one branch over.
+ *   - nothing can invalidate the read between the probe and this release. A
+ *     SaFE workload id is minted per create and never reissued, so "this
+ *     workload does not exist" is a fact that cannot become false; there is no
+ *     write any concurrent actor can make that puts live work back inside
+ *     `info.workloadId`. This is the one decision on these paths whose premise
+ *     is not perishable, which is why an absolute act is defensible here and
+ *     nowhere near it. Nor can a row appear naming it again: a handle is
+ *     written against the id SaFE has just minted for a workload it has just
+ *     created (`makeOnProvisioned`), never against a retired one -- and in any
+ *     case `releaseHandlesForWorkload` removes a row only while that row still
+ *     names this workload, under the revision it was just read at, so a row
+ *     that moved on is left alone.
+ *
+ * What `dead` rests on, since this turns on it: `probeSandboxContainer` was
+ * called with an explicit identity, so the `no_kv_entry` path that also answers
+ * `dead` is unreachable -- `classify` uses the identity it was handed and never
+ * reads KV. That leaves `exec_sandbox_gone`, and for a safe-workload sandbox
+ * `execFailureMeansGone` requires the provider's own `SandboxGoneError` tag,
+ * which `safe-workload-provider` raises only after independently confirming a
+ * Router 404/410 against the control plane. A merely unreachable backend is a
+ * 502 -> `exec_unreachable` -> `unknown`, which never reaches this branch.
+ *
+ * Failure propagates rather than being swallowed. If the release cannot commit,
+ * the registration that follows is refused and the replacement workload is
+ * created, rolled back and stopped for nothing -- so failing here is the same
+ * outcome one GPU create cheaper, and with an error that names the actual
+ * cause. It is also retryable: the next attempt re-probes, gets `dead` again,
+ * and tries the release again.
+ *
+ * An agent-sandbox entry records `workloadId: ""` and there is nothing to pass:
+ * `releaseHandlesForWorkload` matches rows on `workload_id`, which such a row
+ * leaves empty, so it could free nothing even if called. That gap is the one
+ * `handles.ts` documents on the `replaceDagHandle` guard, and closing it means
+ * keying the release by identity; it is not closed here.
+ */
+async function releaseHandlesForGoneWorkload(sessionId: string, info: any): Promise<void> {
+  const goneWorkload = typeof info.workloadId === "string" ? info.workloadId : "";
+  logger.warn(
+    { sessionId, workloadId: goneWorkload || null },
+    "ensureHands.displaced_sandbox_already_gone",
+  );
+  if (!goneWorkload) return;
+  await reuseEffects.releaseHandlesForWorkload(goneWorkload);
+  logger.info(
+    { sessionId, workloadId: goneWorkload },
+    "ensureHands.gone_sandbox_handles_released",
+  );
+}
+
 async function retainDisplacedSandbox(
   a: ReuseAttempt,
   info: any,

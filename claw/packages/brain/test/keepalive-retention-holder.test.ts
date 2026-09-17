@@ -134,20 +134,47 @@ function fakeKv(): { kv: KV; deleted: string[] } {
  * behaviour under test, so the stub must not be gentler than the thing it
  * stands for.
  */
-function handleTable(): {
+type Rows = Array<[string, Record<string, import("@claw/protocol").HandleInfo>]>;
+
+function handleTable(scanMs = 0): {
   map: DagHandleMap;
-  listDagHandles: () => Promise<Array<[string, Record<string, import("@claw/protocol").HandleInfo>]>>;
-  releaseDagHandles: (workloadId: string) => Promise<void>;
+  listDagHandles: () => Promise<Rows>;
+  releaseDagHandles: (workloadId: string, opts?: { rows?: Rows }) => Promise<void>;
   releases: string[];
+  /** Every enumeration of the table, labelled by who asked for it. */
+  scans: string[];
 } {
   const map = new DagHandleMap(new InMemoryKVStore());
   const releases: string[] = [];
+  const scans: string[] = [];
+  /**
+   * One enumeration of the whole table, at whatever a row costs to read.
+   *
+   * `scanMs` is the term that makes the budget test mean anything. A real scan
+   * is `keys()` plus one `get` per row (`scanPrefix`, packages/utils), so its
+   * cost is the row count times the store's read latency -- measured at ~5.46s
+   * for 200 rows against a real JetStream KV bucket with 27ms added per get.
+   * An in-memory map answers in microseconds, and against that stub a doubled
+   * scan is free and the defect is invisible.
+   */
+  const scan = async (by: string): Promise<Rows> => {
+    scans.push(by);
+    if (scanMs) await new Promise((r) => setTimeout(r, scanMs));
+    return map.listAll();
+  };
   return {
     map,
-    listDagHandles: () => map.listAll(),
-    releaseDagHandles: async (workloadId: string) => {
+    scans,
+    listDagHandles: () => scan("holder"),
+    releaseDagHandles: async (workloadId: string, opts?: { rows?: Rows }) => {
       releases.push(workloadId);
-      for (const [dagRoot, handles] of await map.listAll()) {
+      // `releaseHandlesForWorkload` enumerates the table ITSELF unless it is
+      // handed rows, and that internal enumeration is the whole of the defect
+      // this stands for: the caller paid for one scan, the release paid for
+      // another, and both came out of one ceiling. A stub that skipped it would
+      // be gentler than the thing it stands for, and would pass at HEAD.
+      const rows = opts?.rows ?? await scan("release");
+      for (const [dagRoot, handles] of rows) {
         for (const [name, info] of Object.entries(handles)) {
           if (info.workload_id === workloadId) await map.destroy(dagRoot, name);
         }
@@ -277,4 +304,65 @@ test("a handle table that cannot be read is not a table with nothing in it", asy
 
   assert.deepEqual(table.releases, [], "no release is issued on a question that was not answered");
   assert.deepEqual(deleted, [], `the retention was released anyway; deleted=${JSON.stringify(deleted)}`);
+});
+
+/**
+ * A scan cost the ceiling can afford once and not twice.
+ *
+ * Measured, not chosen: against a real JetStream KV bucket holding 200 handle
+ * rows with 27ms of added latency per `get` -- the shape a replicated bucket
+ * has and a loopback broker does not -- one `listAllDagHandles()` took 5455ms
+ * and 200 gets, the holder-scan-then-release pair took 10922ms and 401 gets,
+ * and handing the rows on took 5448ms and 200 gets. `HANDLE_RELEASE_CEILING_MS`
+ * is 10s, so one scan clears it by 4.5s and the pair misses it by 0.9s.
+ *
+ * 5500 is that scan, rounded up. The test is about the outcome at that cost --
+ * whether the retention was released -- and not about the elapsed time, which
+ * is why nothing here asserts on a duration.
+ */
+const MEASURED_SCAN_MS = 5_500;
+
+test("the holder answer and the release share one pass, so the release still fits its ceiling", async () => {
+  // Round 47. The holder check was added inside `HANDLE_RELEASE_CEILING_MS` on
+  // the stated grounds that it "is the same scan of the same table and happens
+  // IN PLACE of the release, never alongside it" -- a claim about cost that was
+  // never checked against `releaseHandlesForWorkload`, which enumerates the
+  // table again internally. Two scans, one 10s ceiling: the race rejected,
+  // `releaseRetention` never ran, and because the records survive, the next
+  // sweep refreshed them, pinged the container, and timed out again. An idle
+  // container retained and pinged for ever, which is the exact leak this phase
+  // exists to close.
+  //
+  // Nobody holds this workload, so the fully correct outcome is a release --
+  // the same control as "a retained container nobody holds is still released",
+  // run at a cost the budget can actually feel.
+  const { kv, deleted } = fakeKv();
+  const table = handleTable(MEASURED_SCAN_MS);
+  stubContainer();
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => 0,
+    listDagHandles: table.listDagHandles,
+    releaseDagHandles: table.releaseDagHandles,
+  });
+
+  assert.deepEqual(
+    deleted, [LEDGER, KEY],
+    "the retention was not released within the ceiling, so the ledger and the "
+    + "projection are still there to be refreshed and pinged next sweep; "
+    + `deleted=${JSON.stringify(deleted)}`,
+  );
+  assert.deepEqual(table.releases, [WORKLOAD], "and the release did run");
+  // Two enumerations in the whole sweep, and neither of them is the one that
+  // broke the budget. The first is the census walk's (`collectDagTargets`,
+  // which is how a DAG sandbox gets pinged at all): it happens before the read
+  // phase and outside this ceiling. The second is the holder answer. What must
+  // NOT appear is a "release" scan -- the second enumeration INSIDE the
+  // ceiling, which `releaseHandlesForWorkload` runs internally whenever it is
+  // not handed rows, and which is what HEAD was paying for.
+  assert.deepEqual(
+    table.scans, ["holder", "holder"],
+    `the release enumerated the table for itself; scans=${JSON.stringify(table.scans)}`,
+  );
 });

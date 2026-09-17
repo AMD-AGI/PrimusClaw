@@ -45,9 +45,11 @@ import { isRetentionEntry, usableSharedVerdict } from "@claw/protocol";
 
 import {
   bindSandboxReuseEffects,
+  makeOnProvisioned,
   requestSpecFingerprint,
   tryReuseSessionSandbox,
 } from "../src/sandbox/ensure-hands.js";
+import { bindDagHandlesForTest, lookupDagHandle, replaceDagHandle } from "../src/sandbox/handles.js";
 import { resolveSandboxAction } from "../src/sandbox/params.js";
 import { handsSessionKey } from "../src/sandbox/hands-key.js";
 import { retentionStore } from "../src/sandbox/registry.js";
@@ -58,10 +60,13 @@ import { matchesKvFilter } from "./fixtures/kv-filter.js";
 
 const realFetch = globalThis.fetch;
 let restoreEffects: (() => void) | null = null;
+let restoreHandles: (() => void) | null = null;
 afterEach(() => {
   globalThis.fetch = realFetch;
   restoreEffects?.();
   restoreEffects = null;
+  restoreHandles?.();
+  restoreHandles = null;
 });
 
 /* ------------------------------------------------------------------ store */
@@ -328,6 +333,16 @@ interface Effects { released: string[] }
 function stubEffects(fleet: Fleet, over: {
   probe?: "alive" | "dead" | "unknown";
   restartRefused?: boolean;
+  /**
+   * Leave the three handle-table effects REAL, over whatever bucket
+   * `bindDagHandlesForTest` has bound.
+   *
+   * X5/X6 are about what the handle table ends up holding, and a stubbed
+   * release or a stubbed ownership answer would make them assertions about the
+   * stub. The ownership questions are answered by the rows the test seeds, and
+   * the release is the production one, CAS and all.
+   */
+  realHandleTable?: boolean;
 } = {}): Effects {
   const effects: Effects = { released: [] };
   restoreEffects = bindSandboxReuseEffects({
@@ -342,11 +357,13 @@ function stubEffects(fleet: Fleet, over: {
     restartHandsInSandbox: async () => (over.restartRefused
       ? { ok: false, detail: "kill switch off", refused: true }
       : { ok: true, detail: "healthy" }),
-    releaseHandlesForWorkload: (async (id: string) => { effects.released.push(id); }) as never,
-    // T2's DAG holds no handle on W1; T1's DAG still does, which is what makes
-    // W1 "not this turn's to stop".
-    dagHoldsWorkload: (async () => false) as never,
-    workloadHeldByOtherDag: (async () => true) as never,
+    ...(over.realHandleTable ? {} : {
+      releaseHandlesForWorkload: (async (id: string) => { effects.released.push(id); }) as never,
+      // T2's DAG holds no handle on W1; T1's DAG still does, which is what makes
+      // W1 "not this turn's to stop".
+      dagHoldsWorkload: (async () => false) as never,
+      workloadHeldByOtherDag: (async () => true) as never,
+    }),
     countLiveWork: (async (inst: { id?: string }) => countInFleet(fleet, inst?.id ?? "")) as never,
   });
   return effects;
@@ -494,4 +511,163 @@ test("X4 CONTROL: a container that is merely unreachable is retained, and releas
     await retained(store.kv, "w-1"), false,
     "the retention is released once the work it was taken for is over",
   );
+});
+
+/* ------------------------------------------- the handle table and its users */
+
+/**
+ * The DAG handle bucket, and the two DAGs that share W1.
+ *
+ * Rows are seeded through the production `replaceDagHandle` rather than written
+ * as JSON, so the shape they end up in is the shape the refusal below actually
+ * reads -- including `created_at`, which is stamped by the writer and not by
+ * any fixture.
+ *
+ * A and B both name W1 because that is the state the displaced-sandbox path
+ * exists for: B (`dag-t2`) reused the sandbox A (`dag-t1`) created, so both
+ * hold a handle on it, and `entryOwnedByAnother` answers "somebody else's"
+ * over exactly these rows.
+ */
+async function seedSharedHandles(): Promise<Store> {
+  const handleStore = memoryKv();
+  restoreHandles = bindDagHandlesForTest(handleStore.kv);
+  for (const dagRoot of ["dag-t1", "dag-t2"]) {
+    await replaceDagHandle(dagRoot, "sbx", {
+      workload_id: "w-1",
+      platform_key: "pk-1",
+      namespace: "ns-1",
+      hands_url: W1_URL,
+      token: "tok-1",
+    });
+  }
+  return handleStore;
+}
+
+/**
+ * The registration the replacement makes, run through the production hook.
+ *
+ * `makeOnProvisioned` is what SaFE's create calls the moment a workload id
+ * exists, and it is where the refusal lands: it registers the handle with the
+ * real `retainedTaker` as `mayTakeFrom`, and on a refusal it stops the workload
+ * it has just been handed and throws. So "did the replacement register" is
+ * observable as a workload that was NOT stopped and a row that now names it,
+ * and neither of those is a flag the code under test sets.
+ */
+async function registerReplacement(
+  kv: KV, fleet: Fleet, workloadId: string,
+): Promise<string | null> {
+  const onProvisioned = makeOnProvisioned({
+    sessionId: SESSION,
+    namespace: "ns-1",
+    apiKey: "pk-1",
+    handsToken: "tok-new",
+    sandboxImage: "example.io/torch:2.5",
+    kv,
+    hold: { async bind() {}, async release() {} },
+    stop: async (id: string) => { stop(fleet, id); },
+    taskId: "t-2",
+    dagRootTaskId: "dag-t2",
+    handleName: "sbx",
+  });
+  try {
+    await onProvisioned(workloadId);
+    return null;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
+test("X5 a dead sandbox's stale handle does not outlive it and block the replacement", async () => {
+  // Round 47. The round before this one stopped RETAINING a container the
+  // provider had confirmed dead -- correctly: a retention over a workload that
+  // does not exist is a record nothing can ever release. But it returned
+  // without freeing the handles naming it and without writing anything that
+  // would let the name be taken, so the very next act of the same turn --
+  // registering the replacement -- was refused by W1's own row, the workload
+  // was rolled back and stopped, and the retry hit the identical wall.
+  //
+  // Asserted on the two things a later reader acts on: whether W2 survived its
+  // registration, and what the handle table names afterwards.
+  const fleet = newFleet({ "w-1": 0 }, ["w-1"]);
+  const handles = await seedSharedHandles();
+  stubEffects(fleet, { probe: "dead", realHandleTable: true });
+  globalThis.fetch = (async () => { throw new Error("ECONNREFUSED"); }) as typeof fetch;
+  const store = memoryKv({
+    [handsSessionKey(SESSION)]: { ...w1Binding(), specFingerprint: specOf(T2) },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(attempt(store.kv)), null);
+
+  // What the turn does next, and the outcome that settles this: the workload it
+  // provisions either survives its registration or is stopped and rolled back.
+  const refusal = await registerReplacement(store.kv, fleet, "w-2");
+  assert.equal(
+    refusal, null,
+    "the replacement registered on the first attempt instead of being refused "
+    + "by a row still naming a workload the provider has confirmed absent",
+  );
+  assert.deepEqual(
+    fleet.stops, [],
+    "so nothing was created, refused and stopped. Without the release this is "
+    + "`['w-2']` and the turn fails, and a redelivery repeats it exactly: the "
+    + "rollback leaves the table as it found it, so the second attempt is "
+    + "refused by the same row and costs a second GPU create",
+  );
+  assert.equal(
+    (await lookupDagHandle("dag-t2", "sbx"))?.workload_id, "w-2",
+    "and the handle names the replacement",
+  );
+
+  // A's row went with it, which is the part the argument in
+  // `releaseHandlesForGoneWorkload` has to carry: A's row is a reference to
+  // nothing, its next `sandbox.use` throws either way, and leaving it would
+  // refuse A's OWN rebuild for the life of that DAG.
+  assert.equal(
+    await lookupDagHandle("dag-t1", "sbx"), null,
+    "the sibling's handle on the dead workload is gone too",
+  );
+  assert.equal(
+    handles.map.has("dag-handles.dag-t1"), false,
+    "and gone from the bucket, not merely unreadable",
+  );
+});
+
+test("X6 CONTROL: a LIVE displaced sandbox keeps its sibling's handle, and the replacement still registers", async () => {
+  // The half X5 must not break, and the half a release added to the wrong
+  // branch would break silently. Here the container answered the probe: Hands
+  // is down and will not restart, but the shells in it are real processes and
+  // A may be between two nodes with its next one about to resolve the handle.
+  // So the hand-over retains and frees NOTHING -- and the replacement registers
+  // anyway, because the retention ledger is what `mayTakeFrom` reads.
+  //
+  // That is the whole design in one pass: the handle is taken from a retained
+  // workload on the evidence of the retention, and from a dead one on the
+  // evidence of the provider. It is never simply taken.
+  const fleet = newFleet({ "w-1": 2 });
+  await seedSharedHandles();
+  stubEffects(fleet, { probe: "alive", restartRefused: true, realHandleTable: true });
+  globalThis.fetch = (async () => { throw new Error("ECONNREFUSED"); }) as typeof fetch;
+  const store = memoryKv({
+    [handsSessionKey(SESSION)]: { ...w1Binding(), specFingerprint: specOf(T2) },
+  });
+
+  assert.equal(await tryReuseSessionSandbox(attempt(store.kv)), null);
+  assert.equal(await retained(store.kv, "w-1"), true, "the live container is kept");
+  assert.equal(
+    (await lookupDagHandle("dag-t1", "sbx"))?.workload_id, "w-1",
+    "and A's only reference to the container it is running in is still there",
+  );
+
+  const refusal = await registerReplacement(store.kv, fleet, "w-2");
+  assert.equal(refusal, null, "B's replacement registers through the retention evidence");
+  assert.deepEqual(fleet.stops, [], "nothing was rolled back");
+  assert.equal(
+    (await lookupDagHandle("dag-t2", "sbx"))?.workload_id, "w-2",
+    "B names its new sandbox",
+  );
+  assert.equal(
+    (await lookupDagHandle("dag-t1", "sbx"))?.workload_id, "w-1",
+    "and A still names the old one, which is still running A's shells",
+  );
+  assert.equal(fleet.shells.get("w-1"), 2, "untouched");
 });

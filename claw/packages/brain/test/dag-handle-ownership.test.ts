@@ -1113,9 +1113,19 @@ test("H27 releasing a retention also frees any handle still naming it", async ()
   // Through the seam, like its sibling `listDagHandles`: the real one needs
   // JetStream, and a sweep whose release always throws never releases anything.
   const free = ka.lastIndexOf(
-    "(deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id)", rel);
+    "(deps.releaseDagHandles ?? releaseHandlesForWorkload)(", rel);
   assert.notEqual(free, -1, "the handle has to be freed on this path");
   assert.ok(free < rel, "and freed before the evidence for it is deleted");
-  assert.match(ka, /import \{ listAllDagHandles, releaseHandlesForWorkload \}/,
+  // Round 47: the release takes the rows the holder check has already read,
+  // rather than enumerating the table a second time under the same ceiling.
+  // Asserted on the call text because the doubling was invisible at the call
+  // site -- the second scan was inside `releaseHandlesForWorkload` -- which is
+  // how it survived a round of review.
+  assert.match(
+    ka.slice(free, rel),
+    /\(deps\.releaseDagHandles \?\? releaseHandlesForWorkload\)\(\s*target\.inst\.id,\s*\{ rows \},\s*\)/,
+    "and handed the one table read this path already took",
+  );
+  assert.match(ka, /import \{ dagsNamingWorkload, listAllDagHandles, releaseHandlesForWorkload \}/,
     "and imported, not shadowed by a local of the same name");
 });

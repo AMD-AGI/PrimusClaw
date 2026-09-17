@@ -28,7 +28,7 @@ import {
   sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
+import { dagsNamingWorkload, listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
 import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
@@ -118,7 +118,10 @@ interface KeepaliveDeps {
    * `listDagHandles`: it needs JetStream, and a sweep whose release always
    * throws never releases anything, which is not the behaviour under test.
    */
-  releaseDagHandles?: (workloadId: string) => Promise<void>;
+  releaseDagHandles?: (
+    workloadId: string,
+    opts?: { rows?: Array<[string, Record<string, HandleInfo>]> },
+  ) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
   /**
@@ -308,58 +311,6 @@ function orderedRetentionReads(reads: Map<string, RetentionRead>): RetentionRead
 }
 
 /**
- * Every DAG whose handle map still names this container, read from the table
- * itself rather than inferred from anything this sweep already believes.
- *
- * "Who holds this workload" has exactly one durable answer and it is this
- * table: a DAG node reaches its sandbox by resolving a handle
- * (`lookupDagHandle` on the `sandbox.use` path), so a row naming the container
- * IS a live reference to it and removing the row is removing the reference.
- * Nothing else in this process can stand in for that. The run lease cannot:
- * `runScope` is `pickLockKey(request)`, which under the default
- * `RUN_GATE_KEY=workspace` is `ws.<workspaceId>`, and a handle row records
- * neither the lock key nor the workspace -- so a lease read keyed off a handle
- * would answer "no lease" for a perfectly live sibling and delete its handle,
- * which is the defect rather than the fix.
- *
- * Rows are matched the way the release matches them and then one way more.
- * `releaseHandlesForWorkload` frees rows whose `workload_id` equals the id, so
- * every row this could take is covered by the first test; an agent-sandbox row
- * carries `workload_id: ""` and its Router session instead, and `inst.id` for
- * an agent-sandbox target IS that session id, so the second test covers a
- * reference the release cannot currently free at all. Declining on one of those
- * is the point: a handle this sweep cannot free is still a handle naming the
- * container, and letting the retention go while it stands would leave the row
- * with no ledger behind it.
- *
- * `pending` rows count. A handle is registered the moment SaFE assigns an id,
- * before the workload can serve anything -- `collectDagTargets` skips those for
- * PINGING because an exec against a queued workload 404s, which is a different
- * question from whether the DAG holds it. It does; that row is the DAG's only
- * reference while it waits for a GPU.
- *
- * A table that cannot be read throws rather than answering "nobody", and the
- * caller treats that as a reason not to release. `listAllDagHandles` answering
- * `[]` for an UNBOUND map is the one case that is not an exception, and it is
- * covered from the other side: the release it would then let through is
- * `releaseHandlesForWorkload`, which throws `not_initialized` on the same
- * unbound map, so the retention still stands.
- */
-async function dagsHoldingWorkload(deps: KeepaliveDeps, workloadId: string): Promise<string[]> {
-  const rows = await (deps.listDagHandles ?? listAllDagHandles)();
-  const held: string[] = [];
-  for (const [dagRoot, handles] of rows) {
-    for (const info of Object.values(handles)) {
-      if (info.workload_id === workloadId || info.session_id === workloadId) {
-        held.push(dagRoot);
-        break;
-      }
-    }
-  }
-  return held;
-}
-
-/**
  * Read live-work evidence out of as many retained containers as the budget
  * allows, and release the ones whose work has finished.
  *
@@ -469,12 +420,29 @@ async function runRetentionReadPhase(
           // phase ceiling: the release scans the whole handle table and then
           // CASes per handle, and only the enumeration carries a limit of its
           // own. A deadline here is what keeps the ceiling above a number the
-          // phase can actually exceed. The holder read is inside the SAME
-          // deadline rather than beside it, because it is the same scan of the
-          // same table -- a second term would have to be added to
-          // `keepaliveCensusPhaseCeilingSec()` and the declared sweep span with
-          // it, for work that happens in place of the release and never
-          // alongside it.
+          // phase can actually exceed.
+          //
+          // ONE enumeration under that deadline, and the previous round of this
+          // code is why it has to be said out loud. The holder question was put
+          // inside the same deadline on the stated grounds that it "is the same
+          // scan of the same table and happens in place of the release, never
+          // alongside it" -- a claim about cost, made about a path being written
+          // at that moment, and never checked against
+          // `releaseHandlesForWorkload`, which enumerates the table AGAIN
+          // internally. So the budget that comfortably fits one scan was being
+          // asked to fit two: measured against a real bucket with read latency
+          // added, a scan is ~5.5s and the pair is ~11.1s against a 10s ceiling,
+          // and the sweep timed out on every attempt. The timeout is not a
+          // partial failure either -- it aborts before `releaseRetention`, so
+          // the records are refreshed and the container is pinged again next
+          // sweep, for ever.
+          //
+          // The rows are therefore read once, here, and both answers are taken
+          // from that one read: the holder set by `dagsNamingWorkload`, and the
+          // release by handing the same snapshot on. Raising the ceiling would
+          // have hidden the doubling instead of removing it, and the ceiling is
+          // the term `keepaliveCensusPhaseCeilingSec()` -- and every refresh gap
+          // and reclaim horizon derived from it -- is stated over.
           let timer: NodeJS.Timeout;
           await Promise.race([
             (async () => {
@@ -484,13 +452,25 @@ async function runRetentionReadPhase(
               // processes is not an answer about who holds the container: a DAG
               // sitting between two nodes runs nothing in it and still owns the
               // handle that its next node resolves. So the two reads answer
-              // different questions and the second one cannot be folded into
-              // the first. Nor can it come from `collectDagTargets`, which
-              // walked this same table earlier in the sweep -- between that walk
-              // and this line sit the whole ping phase and every read this phase
-              // has already taken, and a handle registered in that window would
-              // be deleted on the strength of a snapshot that predates it.
-              heldBy = await dagsHoldingWorkload(deps, target.inst.id);
+              // different questions -- one is a container, one is a table -- and
+              // the container read cannot stand in for the table read. Nor can
+              // the table read come from `collectDagTargets`, which walked this
+              // same table earlier in the sweep: between that walk and this line
+              // sit the whole ping phase and every read this phase has already
+              // taken, and a handle registered in that window would be deleted
+              // on the strength of a snapshot that predates it.
+              //
+              // What the two answers may share is THIS read, and sharing it is
+              // stricter than two reads rather than merely cheaper: with two, a
+              // handle registered between them is invisible to the holder check
+              // and visible to the release, so a reference nothing had ruled on
+              // could be freed. With one, the set cleared and the set acted on
+              // are the same set. A row that changes after the snapshot is still
+              // handled at the write, where `releaseHandlesForWorkload` re-reads
+              // each row and removes the name only while it still names this
+              // workload, under the revision it was just read at.
+              const rows = await (deps.listDagHandles ?? listAllDagHandles)();
+              heldBy = dagsNamingWorkload(rows, target.inst.id);
               // Somebody still names this container, so its handle is not this
               // sweep's to take and the records that back it are not this
               // sweep's to delete either. Both stay, together: the retention
@@ -501,7 +481,9 @@ async function runRetentionReadPhase(
               // the same ordering failure the paragraph above refuses in the
               // other direction.
               if (heldBy.length > 0) return;
-              await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(target.inst.id);
+              await (deps.releaseDagHandles ?? releaseHandlesForWorkload)(
+                target.inst.id, { rows },
+              );
             })().finally(() => clearTimeout(timer)),
             new Promise<never>((_, reject) => {
               timer = setTimeout(
@@ -1101,8 +1083,22 @@ const CENSUS_READ_BUDGET_MS = 15_000;
  * interval derived from that number would be wrong by however long the cleanup
  * took.
  *
+ * ONE scan is what this number is sized for, and the census phase is why it is
+ * not simply raised when the work under it grows. This term is the difference
+ * between `keepaliveCensusPhaseCeilingSec()` and the budget the census reads
+ * actually get: `CENSUS_READ_BUDGET_MS` was sized by subtracting the other two
+ * terms from a 50s span the operator's config envelope is already checked
+ * against, so every second added here is a second taken off the reads, or a
+ * second added to a span that has been deliberately held still twice. When a
+ * caller needs a second question answered over the same table, the answer is to
+ * make it share the one enumeration -- `releaseHandlesForWorkload` takes the
+ * rows -- not to buy it a second one out of this.
+ *
  * Exceeding it is not a failure of the sweep: the retention records stay, so the
- * next sweep tries again -- the same recovery a refused CAS already gets.
+ * next sweep tries again -- the same recovery a refused CAS already gets. It IS
+ * a failure of the release, though, and of the retention delete sequenced behind
+ * it, so a ceiling that the ordinary case cannot fit inside is a container
+ * retained for ever rather than a container retained one sweep longer.
  */
 const HANDLE_RELEASE_CEILING_MS = 10_000;
 /**

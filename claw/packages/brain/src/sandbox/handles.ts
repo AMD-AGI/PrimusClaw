@@ -50,7 +50,20 @@ export async function initDagHandles(js: JetStreamClient): Promise<DagHandleMap>
   // which is why it used to say "for the life of the cluster". See
   // `ensureKvBucket`.
   _kvBucket = await js.views.kv(BUCKET, { replicas: DAG_HANDLES_REPLICAS });
-  const adapter: NatsLikeKv = {
+  _map = new DagHandleMap(natsKvStore(boundBucketAdapter()));
+  logger.info({ bucket: BUCKET }, "dag-handles.bound");
+  return _map;
+}
+
+/**
+ * The `DagHandleMap` view of whatever bucket is currently bound.
+ *
+ * Reads `_kvBucket` on every call rather than closing over the bucket it was
+ * built with, which is what lets the map and the direct writes stay the same
+ * bucket when one of them is rebound.
+ */
+function boundBucketAdapter(): NatsLikeKv {
+  return {
     async get(key) {
       const entry = await _kvBucket!.get(key);
       if (!entry) return null;
@@ -66,9 +79,6 @@ export async function initDagHandles(js: JetStreamClient): Promise<DagHandleMap>
       return _kvBucket!.keys(filter);
     },
   };
-  _map = new DagHandleMap(natsKvStore(adapter));
-  logger.info({ bucket: BUCKET }, "dag-handles.bound");
-  return _map;
 }
 
 /**
@@ -84,6 +94,32 @@ export function bindDagHandleKvForTest(
   const prev = _kvBucket;
   _kvBucket = stub as KV;
   return () => { _kvBucket = prev; };
+}
+
+/**
+ * Bind a stand-in bucket for the WHOLE module -- the direct CAS writes and the
+ * `DagHandleMap` view together -- and return the call that puts the real one
+ * back.
+ *
+ * Wider than `bindDagHandleKvForTest` on purpose, and the width is the point.
+ * The behaviour worth testing here is the interaction between the three
+ * operations, not any one of them: a registration is refused because a row
+ * still names something (`replaceDagHandle`, direct writes), the release that
+ * should have cleared that row enumerates through the map (`listAll`), and the
+ * question of whether the refusal or the release wins can only be asked with
+ * both over the SAME bucket. A test that stubbed one of them would be asserting
+ * about its own stub.
+ *
+ * Standing up real JetStream would be the alternative, and is what the
+ * measurement harness does; it is the wrong dependency for a unit suite that
+ * every other sandbox test runs without a broker.
+ */
+export function bindDagHandlesForTest(stub: KV): () => void {
+  const prevKv = _kvBucket;
+  const prevMap = _map;
+  _kvBucket = stub;
+  _map = new DagHandleMap(natsKvStore(boundBucketAdapter()));
+  return () => { _kvBucket = prevKv; _map = prevMap; };
 }
 
 function getMap(): DagHandleMap {
@@ -180,6 +216,87 @@ export function handleIdentityKey(
   if (typeof info === "string") return info;
   if (info.workload_id) return info.workload_id;
   return info.session_id ? `sandbox-session:${info.session_id}` : null;
+}
+
+/**
+ * One read of the handle table, in the shape both questions about it take.
+ *
+ * Named because it is now something callers hold and pass on rather than
+ * something each of them fetches for itself: see `dagsNamingWorkload` and the
+ * `rows` option on `releaseHandlesForWorkload`.
+ */
+export type DagHandleRows = Array<[string, Record<string, HandleInfo>]>;
+
+/**
+ * Which DAGs, in an ALREADY-READ table, still name this container.
+ *
+ * Pure on purpose, and that is the whole point of it existing separately from
+ * the scan. "Who holds this workload" and "free every handle naming this
+ * workload" are two questions over one table, and the caller that asks both --
+ * the keepalive retention phase -- used to answer them with two enumerations:
+ * its own, and then the one `releaseHandlesForWorkload` runs internally. Both
+ * were charged to a single `HANDLE_RELEASE_CEILING_MS`, so the pair could not
+ * finish inside a budget one of them fits in comfortably, and when it expired
+ * the release never ran AND the retention delete behind it never ran either --
+ * an idle container retained, refreshed and pinged for ever.
+ *
+ * Sharing one snapshot is also the stricter answer, not merely the cheaper one.
+ * With two scans, a handle registered between them is invisible to the holder
+ * check and visible to the release -- so the release could free a reference
+ * that nothing had been allowed to rule on. With one, the set the holder check
+ * cleared and the set the release acts on are the same set by construction.
+ * That a row can still change AFTER the snapshot is handled where it has to be,
+ * at the write: every removal re-reads its row and removes the name only while
+ * it still names this workload, under the revision it was just read at. A row
+ * that appears after the snapshot is simply not freed, which is the direction
+ * that keeps a reference rather than takes one.
+ *
+ * The table is the only durable answer to "who holds this workload", which is
+ * why the question is asked of it and not inferred: a DAG node reaches its
+ * sandbox by resolving a handle (`lookupDagHandle` on the `sandbox.use` path),
+ * so a row naming the container IS a live reference to it and removing the row
+ * is removing the reference. The run lease cannot stand in for it: `runScope`
+ * is `pickLockKey(request)`, which under the default `RUN_GATE_KEY=workspace`
+ * is `ws.<workspaceId>`, and a handle row records neither the lock key nor the
+ * workspace -- so a lease read keyed off a handle would answer "no lease" for a
+ * perfectly live sibling and delete its handle, which is the defect rather than
+ * the fix.
+ *
+ * Rows are matched the way the release matches them and then one way more.
+ * `releaseHandlesForWorkload` frees rows whose `workload_id` equals the id, so
+ * every row it could take is covered by the first test; an agent-sandbox row
+ * carries `workload_id: ""` and its Router session instead, and the keepalive
+ * target's `inst.id` for an agent-sandbox IS that session id, so the second
+ * test covers a reference the release cannot currently free at all. Reporting a
+ * holder the release could not have freed is the point: a handle nothing here
+ * can free is still a handle naming the container, and letting the retention go
+ * while it stands would leave the row with no ledger behind it.
+ *
+ * `pending` rows count. A handle is registered the moment SaFE assigns an id,
+ * before the workload can serve anything -- `collectDagTargets` skips those for
+ * PINGING because an exec against a queued workload 404s, which is a different
+ * question from whether the DAG holds it. It does; that row is the DAG's only
+ * reference while it waits for a GPU.
+ *
+ * Nothing here decides what to do about an unreadable table, because nothing
+ * here reads one: the caller's scan throws and never reaches this. The one case
+ * that is not an exception is an UNBOUND map, where `listAllDagHandles` answers
+ * `[]` and this answers "nobody" -- covered from the other side, since the
+ * release such an answer lets through throws `not_initialized` on the same
+ * unbound map before it frees anything.
+ */
+export function dagsNamingWorkload(rows: DagHandleRows, workloadId: string): string[] {
+  if (!workloadId) return [];
+  const held: string[] = [];
+  for (const [dagRoot, handles] of rows) {
+    for (const info of Object.values(handles)) {
+      if (info.workload_id === workloadId || info.session_id === workloadId) {
+        held.push(dagRoot);
+        break;
+      }
+    }
+  }
+  return held;
 }
 
 /**
@@ -414,10 +531,50 @@ function isRevisionConflict(e: unknown): boolean {
  * Scans, for the same reason the Backend's shared-holder check does: the
  * question is "who names this workload", and the registry is keyed the other
  * way round. Teardown is not a hot path.
+ *
+ * Except where it shares one, which is what `opts.rows` is for. The scan is by
+ * far the expensive half of this call -- the CASes that follow touch only the
+ * rows that actually name the workload, usually one -- so a caller that has
+ * already enumerated the table for a question of its own must be able to hand
+ * that enumeration over rather than pay for a second one out of the same
+ * budget. It is the caller's own deadline the second scan was overrunning, and
+ * measured rather than assumed: see the note on `dagsNamingWorkload`.
  */
-export async function releaseHandlesForWorkload(workloadId: string): Promise<void> {
+export async function releaseHandlesForWorkload(
+  workloadId: string,
+  /**
+   * A table read the caller has ALREADY taken, used instead of scanning again.
+   *
+   * For the one caller that has to ask a second question over the same table
+   * before it may issue this release at all -- the keepalive retention phase,
+   * which must establish that no other DAG still names the container. Without
+   * this it enumerated the table, and then this function enumerated it again,
+   * under one shared deadline; the doubling is what pushed the pair past
+   * `HANDLE_RELEASE_CEILING_MS` and stopped anything from ever being released.
+   *
+   * It narrows what gets freed and never widens it: the rows only decide which
+   * (DAG, handle) pairs are ATTEMPTED, and each attempt below still re-reads
+   * its row and removes the name only while that row still names this workload,
+   * conditional on the revision it was just read at. So a snapshot that has
+   * gone stale can cause a name to be left alone -- the direction that keeps a
+   * reference -- and can never cause somebody else's to be taken.
+   *
+   * Omitted by the three callers that release after a confirmed stop
+   * (`reapPendingHands`, `retainInsteadOfDestroying`, and the gone-workload
+   * branch in `recoverOrRetainUnusableSandbox`): each of those has no second
+   * question to ask and their release stays absolute, scanning for itself.
+   */
+  opts?: { rows?: DagHandleRows },
+): Promise<void> {
   if (!workloadId) return;
   const kv = _kvBucket;
+  // Checked BEFORE the rows are consulted, and it has to stay that way. An
+  // unbound map makes `listAllDagHandles` answer `[]` rather than throw, so a
+  // caller that hands over such a snapshot would otherwise get a release that
+  // silently found nothing to free -- and the keepalive caller reads a
+  // successful release as licence to delete the retention records behind it.
+  // The throw here is what makes "the table could not be read" reach that
+  // caller as a failure instead of as an empty table.
   if (!kv) throw new Error("dag-handles.not_initialized -- call initDagHandles(js) at boot");
   const dec = new TextDecoder();
   const enc = new TextEncoder();
@@ -426,7 +583,7 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
   // await. What the enumeration goes on doing afterwards is not cancellable
   // here; what matters is that the caller stops waiting on it.
   let timer: NodeJS.Timeout;
-  const rows = await Promise.race([
+  const rows = opts?.rows ?? await Promise.race([
     getMap().listAll().finally(() => clearTimeout(timer)),
     new Promise<never>((_, reject) => {
       timer = setTimeout(
@@ -507,7 +664,7 @@ export async function releaseHandlesForWorkload(workloadId: string): Promise<voi
   }
 }
 
-export async function listAllDagHandles(): Promise<Array<[string, Record<string, HandleInfo>]>> {
+export async function listAllDagHandles(): Promise<DagHandleRows> {
   // Not bound is not unreadable: the sweep can start before the bucket is
   // attached, and treating that as a failed read would mark every census
   // incomplete until it is. A bucket that is bound and cannot be read still
