@@ -3,7 +3,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
-import { db, type StatementRunner } from "../infra/db.js";
+import { connectionLost, db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
@@ -601,6 +601,12 @@ function isClientGone(req: FastifyRequest): boolean {
  * (another in-flight request held it past the budget) so the caller can replay
  * the cache or fail transiently WITHOUT pinning a connection. Held until
  * releaseIdempotencyLock returns the pooled client.
+ *
+ * Taking it is not the same as keeping it: it is session-scoped, so the server
+ * releases it the moment this connection's backend goes, and nothing the caller
+ * does afterwards would notice. The caller checks `connectionLost` on this
+ * client before it creates anything -- see execute() -- and again before it
+ * writes the key's cache entry.
  */
 async function acquireIdempotencyLock(
   userId: string,
@@ -754,17 +760,48 @@ async function saveIdempotency(
   );
 }
 
-/** Cache idempotency response without changing the primary request outcome. */
+/**
+ * Cache the idempotency response without changing the primary request outcome.
+ *
+ * Written on the connection holding the key's lock, which is where every save
+ * has gone -- unless that connection has dropped, in which case it goes out on
+ * the main pool instead. Two different pools of different connections: the drop
+ * is one backend's, and `db.query` is untouched by it.
+ *
+ * The fallback is not a nicety. This row IS what makes the client's retry a
+ * replay, and a request that reaches here has already created the session and
+ * dispatched its first turn. Losing the row loses the only handle anyone has on
+ * that work: the retry misses the cache, takes the lock and creates a SECOND
+ * session, while the first one's run goes on executing in its sandbox with no
+ * caller left holding its id. The lock is already gone by the time this runs
+ * (the server released it with the backend), so the fallback is not writing
+ * under an exclusion it has lost -- the create it is recording is what did
+ * that, and what the write recovers is the record of it.
+ *
+ * Best-effort either way: a create the client already completed is not failed
+ * because the note about it did not land.
+ */
 async function saveIdempotencyBestEffort(
-  client: QueryRunner,
+  lock: IdempotencyLock,
   userId: string,
   route: string,
   key: string,
   statusCode: number,
   response: unknown,
 ): Promise<void> {
+  let writer: QueryRunner = lock.client;
+  const lost = connectionLost(lock.client);
+  if (lost) {
+    writer = db;
+    logger.error(
+      { userId, route, err: lost.message },
+      "idempotency.lock_connection_lost_before_save (the server released this key's lock when "
+      + "the connection dropped; saving the create's result on the main pool so the client's "
+      + "retry replays it instead of creating a second session)",
+    );
+  }
   try {
-    await saveIdempotency(client, userId, route, key, statusCode, response);
+    await saveIdempotency(writer, userId, route, key, statusCode, response);
   } catch (err) {
     logger.error({ err, userId, route }, "idempotency.save_failed");
   }
@@ -968,6 +1005,49 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           }
         }
 
+        // The last boundary at which this request can still change its mind.
+        //
+        // The lock above is a session-scoped advisory lock on `idemLock.client`,
+        // and the server releases it the instant that backend goes -- so from a
+        // drop onwards this request holds nothing, and a concurrent same-key
+        // retry is free to take the lock and create a second session alongside
+        // it. The request cannot notice on its own: everything below runs on the
+        // main pool, which the drop does not touch. db.ts publishes the loss for
+        // exactly this reason; honouring it is the caller's job, and honouring
+        // it HERE is the whole of the choice. Nothing durable has been written
+        // yet, so the request can end with no session, no run and no sandbox
+        // behind it, and the client's retry does the create once, under a lock
+        // that is really held.
+        //
+        // Deliberately not repeated after the dispatch, which is where the
+        // shape stops matching `withLeaderLock`. A lease holder can be told it
+        // is no longer the leader; a create cannot be un-created. Past this
+        // point the session row exists and its first turn is a run in a live
+        // sandbox, so a late 503 would report failure for work that is still
+        // executing AND send the client to start a second one -- the opposite
+        // of what this lock is for. What a late drop actually costs is the
+        // idempotency record, and that is recovered rather than refused; see
+        // saveIdempotencyBestEffort.
+        if (idemLock) {
+          const lost = connectionLost(idemLock.client);
+          if (lost) {
+            logger.error(
+              { userId, route, err: lost.message },
+              "idempotency.lock_lost_before_create (the server released this key's lock when "
+              + "the connection dropped, so this create is no longer de-duplicated against a "
+              + "concurrent retry; refusing while nothing has been created)",
+            );
+            return {
+              statusCode: 503,
+              response: {
+                ok: false,
+                error: "lock_connection_lost",
+                message: "creation lost its de-duplication lock; please retry",
+              },
+            };
+          }
+        }
+
         // Snapshot user env BEFORE inserting the session so a snapshot failure
         // can short-circuit without leaving a row behind.
         let userEnvSnapshot: Record<string, string> = {};
@@ -1016,7 +1096,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
             },
           };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, response);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
           metrics.onSessionCreated("ok");
           return { statusCode: 200, response };
         }
@@ -1086,12 +1166,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           // A settled failure deleted its row; counting it would name no session.
           if (dispatch.kind === "publish_unknown") metrics.onSessionCreated("ok");
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 503, errResp);
           return { statusCode: 503, response: errResp };
         }
         if (dispatch.kind === "rejected") {
           const errResp = { ok: false, error: "admission_rejected", reason: dispatch.reason };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 429, errResp);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 429, errResp);
           return { statusCode: 429, response: errResp };
         }
 
@@ -1115,7 +1195,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             },
           },
         };
-        if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, okResp);
+        if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, okResp);
         metrics.onSessionCreated("ok");
         return { statusCode: 200, response: okResp };
       } catch (err) {

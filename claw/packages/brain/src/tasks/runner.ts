@@ -1122,6 +1122,17 @@ class TaskRunner {
    */
   private handsIdentity: HandsProbeEntry | null = null;
   /**
+   * When this run asked for a sandbox of its own, or null while it never has.
+   *
+   * The one thing that separates the PENDING KV entry this run's provision
+   * wrote from one an earlier run of the same session left behind: the entry is
+   * written by `onProvisioned`, in this process, after `ensureHands` has been
+   * called from here, so an entry stamped before this instant cannot be the one
+   * this attempt is waiting on. See `pendingHandsIdentity`, which is the only
+   * reader.
+   */
+  private sandboxAskedAt: number | null = null;
+  /**
    * What the platform said about this run's sandbox dying, read at the moment we
    * found out and kept until the callback carries it.
    *
@@ -1462,16 +1473,39 @@ class TaskRunner {
    * with the node it is happily running on -- which would record a placement,
    * an ending, or a sandbox handle for a run that has none of them.
    *
-   * Null on anything unreadable. An absent entry, an unreachable bucket and a
-   * corrupt payload all mean the same thing here: we cannot name the workload,
-   * so we ask about nothing and record nothing, exactly as before.
+   * PENDING does not say *whose*, though, and that is a separate question the
+   * entry itself cannot answer: nothing in it names a run. A provision that
+   * died between minting its workload and reaping it leaves an entry of exactly
+   * this shape behind, and the next turn of the same session -- which under
+   * BRAIN_LAZY_SANDBOX can fail on an LLM error without ever calling
+   * `ensureHands` -- then reads that workload as the sandbox it was on, asks
+   * SaFE about it, and delivers the previous run's preemption as its own
+   * ending. So ownership is asked of this runner rather than of the entry:
+   * `sandboxAskedAt` is set immediately before `ensureHands` is called from
+   * here, `onProvisioned` stamps `createdAt` on the entry from inside that same
+   * call and in this same process, and an entry older than the ask therefore
+   * belongs to something else. Both halves matter -- a run that never asked can
+   * own no entry at all, and a run whose provision was refused before
+   * `onProvisioned` ran has only a predecessor's entry left to find.
+   *
+   * Null on anything unreadable. An absent entry, an unreachable bucket, a
+   * corrupt payload and a missing or unparseable `createdAt` all mean the same
+   * thing here: we cannot show the workload is ours, so we ask about nothing
+   * and record nothing, exactly as a run with no entry does.
    */
   private async pendingHandsIdentity(): Promise<HandsProbeEntry | null> {
+    // Read once: a rebuild moves it, and the comparison below has to be made
+    // against the ask this read is answering.
+    const askedAt = this.sandboxAskedAt;
+    if (askedAt === null) return null;
     try {
       const entry = await readHandsEntry(this.kv, this.sessionId);
       if (!entry) return null;
-      const info = JSON.parse(entry.value) as HandsProbeEntry & { status?: string };
-      return info.status === "pending" && info.workloadId ? info : null;
+      const info = JSON.parse(entry.value) as HandsProbeEntry
+        & { status?: string; createdAt?: string };
+      if (info.status !== "pending" || !info.workloadId) return null;
+      const createdAt = Date.parse(info.createdAt ?? "");
+      return Number.isFinite(createdAt) && createdAt >= askedAt ? info : null;
     } catch (e) {
       logger.warn({ err: e, sessionId: this.sessionId }, "platform_facts.pending_identity_unreadable");
       return null;
@@ -1500,13 +1534,16 @@ class TaskRunner {
    *
    * The fallback costs a KV read, and the heartbeat caller runs every
    * RUN_LEASE_HEARTBEAT_MS for every run on the fleet, so it is reached for
-   * only when `handsIdentity` is genuinely null. That is the pre-ready window,
-   * plus -- under BRAIN_LAZY_SANDBOX -- a turn answered from context that never
-   * provisions and has no entry to find. Both are already paying for this exact
-   * read on a shorter timer: `startDeliveryHeartbeat` reads the same key
-   * unconditionally for the whole run, every LOCK_REFRESH_INTERVAL_MS (10s,
-   * against 15s here). So this adds strictly less KV traffic than the run
-   * already makes, and none at all once the sandbox is attached.
+   * only when `handsIdentity` is genuinely null -- the pre-ready window, which
+   * is already paying for this exact read on a shorter timer:
+   * `startDeliveryHeartbeat` reads the same key unconditionally for the whole
+   * run, every LOCK_REFRESH_INTERVAL_MS (10s, against 15s here). A turn
+   * answered from context under BRAIN_LAZY_SANDBOX has `handsIdentity` null
+   * too, and costs nothing at all: `pendingHandsIdentity` answers it from
+   * `sandboxAskedAt` without opening the bucket, because a run that never asked
+   * for a sandbox cannot own the entry it would find. So this adds strictly
+   * less KV traffic than the run already makes, and none once the sandbox is
+   * attached or while none was ever wanted.
    */
   private async reportableIdentity(): Promise<HandsProbeEntry | null> {
     return this.handsIdentity ?? await this.pendingHandsIdentity();
@@ -1594,6 +1631,10 @@ class TaskRunner {
     oldHands?.close().catch(() => {});
     // Pass multiNodeContext so the rebuilt sandbox keeps the dispatcher external-mode
     // env and the Infera SSH key for the cluster already provisioned above.
+    // Marked like the first provision: a rebuild mints its own workload and
+    // writes its own PENDING entry, and the destroy above has just removed the
+    // one the old sandbox left.
+    this.sandboxAskedAt = Date.now();
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal },
@@ -2219,6 +2260,9 @@ class TaskRunner {
 
     // Ensure Hands sandbox (GPU custom image when sandbox_image is specified).
     logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "task.sandbox_ensuring");
+    // Before the call, not after it: the PENDING entry this marker qualifies is
+    // written from inside it.
+    this.sandboxAskedAt = Date.now();
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { signal: this.abortCtrl.signal },
@@ -3402,6 +3446,11 @@ class TaskRunner {
     // ahead of the reap is not new either, `recoverInflightCheckpoint` above
     // already takes one.
     await this.capturePlatformFacts();
+    // And, in the same window and for the same reason, leave the handle on the
+    // row: the facts above reach a chat run's row through nothing else, and the
+    // reap on the next line is about to delete the only record of which
+    // workload this was. See `recordSandboxBeforeReap`.
+    await this.recordSandboxBeforeReap();
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
@@ -3719,6 +3768,78 @@ class TaskRunner {
     await ackAndClearCallback(this.msg, this.kvCkpt, this.request);
   }
 
+  /**
+   * One renewal of the row's lease, naming the sandbox it is told to name.
+   *
+   * Its own method rather than a closure inside the heartbeat because the
+   * terminal path sends one too (`recordSandboxBeforeReap`), and the body is
+   * the part that must not drift between them: the row fences a renewal on the
+   * attempt token and the generation, so a second sender assembling its own
+   * body is a second chance to assemble it wrong. The heartbeat keeps the
+   * verdict handling, which is the half that belongs to a run still going.
+   */
+  private renewLease(sandbox: LeaseRenewal["sandbox"]): Promise<string | null> {
+    const phase = phaseOf(this.runIdentity.key);
+    const runClaim = currentFatDelivery()?.runClaim;
+    const coverage = this.coverageReport();
+    // Only from the second renewal onward, by construction rather than because
+    // the clock happened not to advance since `beginRun`.
+    this.coverageOpened = true;
+    return fx().postRunLease(this.request, {
+      brainId: BRAIN_ID,
+      sandbox,
+      leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
+      phase: phase.phase,
+      waitReason: phase.waitReason,
+      waitedMs: phase.waitedMs,
+      waits: phase.waits,
+      attempt: this.attempt,
+      ...(runClaim === undefined ? {} : { runClaim }),
+      ...(coverage ?? {}),
+    });
+  }
+
+  /**
+   * Put this run's sandbox handle on the row before the reap takes the last
+   * copy of it away.
+   *
+   * The heartbeat resolves the handle every RUN_LEASE_HEARTBEAT_MS (15s) and
+   * the opening renewal carries none, so a run that dies inside its first
+   * fifteen seconds sends exactly one renewal and it names nothing. That is not
+   * a rare corner: the pre-ready family -- sandbox_exited_before_ready,
+   * sandbox_gone, sandbox_pending_timeout -- is a pod dying during its own
+   * provisioning, and a pod that never starts is over well inside one tick.
+   *
+   * What the row loses by it depends on the run. A task with a `callback_url`
+   * carries the platform account itself, in `agent_done`'s platform fields. A
+   * chat run has no callback at all -- `postAgentDone` and `postTaskRunning`
+   * both return on the first line without one -- so `platformFacts` is read,
+   * held, attached to a result nobody posts, and dropped; `exec_complete` has
+   * no field for it. The row's own handle is what is left, and it is enough,
+   * because platform-backfill asks SaFE with it later. Its KV fallback cannot
+   * stand in here: `reapPendingHands` deletes the entry on the next line, which
+   * is the whole reason this runs first.
+   *
+   * Only a handle this run is entitled to name, and only when there is a lease
+   * to name it on. `reportableIdentity` refuses a READY entry some earlier
+   * message left and a PENDING one this run did not provision, so the row is
+   * never given a workload that is still somebody's live sandbox.
+   *
+   * A bounded wait ahead of the reap, like the platform read above it: one POST
+   * capped at 5s by `askRunLease`, which answers `unresolved` rather than
+   * throwing on anything it cannot complete.
+   */
+  private async recordSandboxBeforeReap(): Promise<void> {
+    if (!this.request.run_lease?.url) return;
+    const identity = await this.reportableIdentity().catch(() => null);
+    const sandbox = sandboxForLease(identity);
+    if (!sandbox) return;
+    // The verdict is deliberately not read. `startLeaseHeartbeat` acts on a
+    // refusal by aborting the run; this run has already ended, and aborting it
+    // here would change how the failure in hand is filed on the way out.
+    await this.renewLease(sandbox);
+  }
+
   private startLeaseHeartbeat(): ReturnType<typeof setInterval> | null {
     // Tracked whether or not there is anywhere to report it to. The ledger is
     // what hands the execution slot back during a wait, and a run dispatched
@@ -3726,24 +3847,7 @@ class TaskRunner {
     beginRun(this.runIdentity.key);
     if (!this.request.run_lease?.url) return null;
     const tick = (sandbox: LeaseRenewal["sandbox"]) => {
-      const phase = phaseOf(this.runIdentity.key);
-      const runClaim = currentFatDelivery()?.runClaim;
-      const coverage = this.coverageReport();
-      // Only from the second tick onward, by construction rather than because
-      // the clock happened not to advance since `beginRun`.
-      this.coverageOpened = true;
-      void fx().postRunLease(this.request, {
-        brainId: BRAIN_ID,
-        sandbox,
-        leaseSeconds: Math.ceil(RUN_LEASE_TTL_MS / 1000),
-        phase: phase.phase,
-        waitReason: phase.waitReason,
-        waitedMs: phase.waitedMs,
-        waits: phase.waits,
-        attempt: this.attempt,
-        ...(runClaim === undefined ? {} : { runClaim }),
-        ...(coverage ?? {}),
-      }).then((status) => {
+      void this.renewLease(sandbox).then((status) => {
         // The row no longer recognises this worker, and carrying on would mean
         // two workers driving one sandbox, or a run writing a workspace a
         // cancelled run is no longer entitled to -- the same reason a lost lock
@@ -3802,8 +3906,13 @@ class TaskRunner {
     // renewing the row, which is a live run another pod's reaper finds expired.
     // Nothing is given up for it: this runs before `executeRun` has asked for a
     // sandbox, so there is no PENDING entry of this attempt's to find, and
-    // `handsIdentity` is null for the same reason. The interval below resolves
-    // it properly one tick later, still deep inside the pre-ready window.
+    // `handsIdentity` is null for the same reason.
+    //
+    // What resolves it is the interval below -- one tick later, and only if the
+    // run lasts that long. A pod killed during its own provisioning usually
+    // does not, which is why the terminal path sends its own renewal rather
+    // than relying on this timer to have come round: see
+    // `recordSandboxBeforeReap`.
     tick(sandboxForLease(this.handsIdentity));
     // Never at the cost of the renewal itself: a handle that cannot be resolved
     // is a missing diagnostic, while a renewal that never goes out is a run

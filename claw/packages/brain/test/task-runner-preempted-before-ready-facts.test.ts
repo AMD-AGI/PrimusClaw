@@ -83,24 +83,29 @@ test("preempted before ready: the platform is asked about the minted workload, b
 
   const noop = <T>(name: string, v: T) => (() => { order.push(name); return Promise.resolve(v); }) as never;
 
-  // The durable record `onProvisioned` writes the moment SaFE answers with an
-  // id: status pending, no handsUrl yet, and the platform key the workload was
-  // created with. This is the state of the bucket when the pod is reclaimed.
-  const { kv } = fakeKv({
-    [handsSessionKey(SESSION)]: JSON.stringify({
-      status: "pending",
-      provider: "safe-workload",
-      workloadId: WORKLOAD,
-      platformKey: PLATFORM_KEY,
-      token: "hands-token",
-      namespace: "claw",
-      createdAt: new Date().toISOString(),
-    }),
-  });
+  // The bucket starts empty, because in production it is this run's own
+  // provision that fills it: `onProvisioned` writes the PENDING record from
+  // inside `ensureHands`, in this process, the moment SaFE answers with an id.
+  // Seeding it before the run would describe a different session -- one holding
+  // an entry some earlier message left behind -- which is precisely the entry
+  // this run is not allowed to claim.
+  const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
 
   const sideEffects = {
     ensureHands: (async () => {
+      // What `onProvisioned` writes: status pending, no handsUrl yet, and the
+      // platform key the workload was created with. This is the state of the
+      // bucket when the pod is reclaimed a moment later.
+      await kv.put(handsSessionKey(SESSION), JSON.stringify({
+        status: "pending",
+        provider: "safe-workload",
+        workloadId: WORKLOAD,
+        platformKey: PLATFORM_KEY,
+        token: "hands-token",
+        namespace: "claw",
+        createdAt: new Date().toISOString(),
+      }));
       order.push("ensureHands.threw");
       throw new SandboxProvisionTerminalError(
         "sandbox_exited_before_ready",

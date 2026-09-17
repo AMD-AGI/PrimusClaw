@@ -102,9 +102,10 @@ lockPool.on("error", (err) => logger.error({ err }, "db.lockPool.idle_client_err
 //   throw er; // Unhandled 'error' event
 //
 // Every long hold is exposed to it -- `withLeaderLock` keeps a client across a
-// whole scan, `withTransaction` across a transaction -- and the blast radius is
-// the replica, not the query: in-flight requests on that pod die with it, and
-// whatever the scan was holding is left to the next leader.
+// whole scan, `inTransaction` across a transaction, `acquireIdempotencyLock`
+// across a whole session create -- and the blast radius is the replica, not the
+// query: in-flight requests on that pod die with it, and whatever the scan was
+// holding is left to the next leader.
 //
 // Attached on 'connect' rather than at each of the dozen call sites, because
 // the ones that matter are exactly the ones a future call site will forget.
@@ -129,6 +130,15 @@ lockPool.on("error", (err) => logger.error({ err }, "db.lockPool.idle_client_err
 // a holder needs -- `connectionLost` for a scan that can check at a loop
 // boundary, `onConnectionLost` for one parked in an await with nothing to check.
 // A holder that reads neither is exactly as it was: logged, alive, uninformed.
+//
+// What a holder does with the fact is its own, and the two consumers so far do
+// different things with it, because the work behind the lock differs. A scan
+// that has lost `withLeaderLock` is told it was not the leader and its caller
+// treats the pass as failed. A session create that has lost the per-key
+// idempotency lock can only be refused while nothing is created: once the row
+// is in and its first turn is running in a sandbox, the create is not
+// retractable, so the loss is spent on saving that create's idempotency record
+// somewhere still connected rather than on failing it.
 //
 // Watchers are called inside a try/catch, and the published shape is a callback
 // rather than an `AbortSignal`, because a watcher that throws on this path must
