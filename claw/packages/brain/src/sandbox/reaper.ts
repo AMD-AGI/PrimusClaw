@@ -281,9 +281,12 @@ export async function destroyHands(
   // Scoped local cleanup: never revoke a sibling's token or remove a
   // registration that replaced this one while stop was in flight.
   revokeHandsToken(knownToken || (ownsRecorded ? recorded.identity?.token || "" : ""));
-  // The slot is held past the stop and given back with the record, below. A
-  // binding still in the bucket is a target the next sweep reconciles back in,
-  // so a ceiling passed on before the delete lands admits over itself.
+  // The slot is held past the stop and given back below, with the record that
+  // names it. A binding still in the bucket under this identity is a target the
+  // next sweep reconciles back in, so a ceiling passed on before the delete
+  // lands admits over itself. Where the record names some other sandbox there
+  // is no such reconcile, and the slot has to be given back explicitly or it is
+  // counted against the ceiling for a workload that is already stopped.
   unregisterSandbox(sessionId, target, { releaseSlot: false });
 
   const releaseSlot = async (): Promise<void> => {
@@ -303,6 +306,9 @@ export async function destroyHands(
       },
       "sandbox.destroy.left_session_entry",
     );
+    // The record names another sandbox, so no sweep will reconcile this
+    // identity back onto the roster.
+    await releaseSlot();
     return;
   }
 
@@ -342,6 +348,9 @@ export async function destroyHands(
   }
   if (latest.state === "valid") {
     logger.warn({ sessionId, revision: recorded.revision }, "sandbox.destroy.kv_owner_changed");
+    // Same as above: the key belongs to a different sandbox now, so this
+    // identity is not coming back through a reconcile.
+    await releaseSlot();
     return;
   }
   // Unreadable is different from contended: the stop is confirmed, but we

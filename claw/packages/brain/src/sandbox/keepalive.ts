@@ -1920,6 +1920,8 @@ interface TargetCensus {
    */
   retentionReads: Map<string, RetentionRead>;
   idleExpiries: Array<{ candidate: ProbeCandidate; record: HandsRecord }>;
+  /** Stops owed by handles the walk found already closing or already terminal. */
+  teardowns: Array<{ sessionId: string; info: HandsKvEntry; site: string }>;
 }
 
 async function collectTargets(
@@ -1933,6 +1935,7 @@ async function collectTargets(
     targets: new Map(), seenIdentities, probeCandidates: [], stats,
     retentionReads: new Map(),
     idleExpiries: [],
+    teardowns: [],
   };
   for (const [key, registered] of localRegistry) {
     if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
@@ -1946,6 +1949,17 @@ async function collectTargets(
   // reaches it through the same scan, on a clock that has not been reset.
   const expiryDeadline = clock() + (deps.idleExpiryBudgetMs ?? IDLE_EXPIRY_BUDGET_MS);
   let deferredExpiries = 0;
+  // Teardowns owed by the walk share the budget with the expiries: both end in
+  // destroyHands, and what the budget protects is the phase behind them.
+  await forEachWithLimit(census.teardowns, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
+    if (clock() >= expiryDeadline) {
+      deferredExpiries += 1;
+      return;
+    }
+    await destroyHands(item.sessionId, item.info).catch((err) => {
+      logger.warn({ err, sessionId: item.sessionId }, `keepalive.${item.site}`);
+    });
+  });
   await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
     if (clock() >= expiryDeadline) {
       deferredExpiries += 1;
@@ -1955,7 +1969,8 @@ async function collectTargets(
   });
   if (deferredExpiries > 0) {
     logger.warn(
-      { deferred: deferredExpiries, total: census.idleExpiries.length },
+      { deferred: deferredExpiries, expiries: census.idleExpiries.length,
+        teardowns: census.teardowns.length },
       "keepalive.idle_expiry_budget_exhausted",
     );
   }
@@ -2027,10 +2042,12 @@ async function collectKvTarget(
 ): Promise<boolean> {
   const sessionId = sessionIdFromHandsKey(key);
   const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+  // Queued rather than awaited here: a stop carries its own retries and sleeps,
+  // and this runs inside the serial walk of the bucket. Left inline, one
+  // unresponsive control plane spends the sweep on teardowns and the ping phase
+  // behind it never renews a single live record.
   if (isClosingStatus(info.status)) {
-    await destroyHands(sessionId, info).catch((err) => {
-      logger.warn({ err, sessionId }, "keepalive.closing_stop_retry");
-    });
+    census.teardowns.push({ sessionId, info, site: "closing_stop_retry" });
     return true;
   }
   if (info.status && info.status !== "ready") return true;
@@ -2039,9 +2056,7 @@ async function collectKvTarget(
       { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
       "keepalive.sandbox_terminal_recorded",
     );
-    await destroyHands(sessionId, info).catch((err) => {
-      logger.warn({ err, sessionId }, "keepalive.terminal_stop_retry");
-    });
+    census.teardowns.push({ sessionId, info, site: "terminal_stop_retry" });
     return true;
   }
   if (isRetentionEntry(info)) {
