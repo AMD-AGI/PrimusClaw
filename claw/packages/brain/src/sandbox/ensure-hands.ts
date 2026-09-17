@@ -944,6 +944,15 @@ async function provisionHands(
     ...(action.params.env ?? {}),
     AUTH_CLAW_TOKEN: handsToken,
     CLAW_SESSION_ID: sessionId,
+    // The same id under a second name, kept because something still reads it:
+    // the Hyperloom TUI resolves the session it is running inside from
+    // HYPERLOOM_SESSION_ID and from no other name (Hyperloom-Web
+    // packages/hyperloom-tui/src/cli.ts). That is worth reading as a symptom
+    // rather than a design: every other field there falls back to a CLAW_* name
+    // and this one does not, which is what you would expect from a consumer
+    // that found CLAW_SESSION_ID empty -- as, until the line above reached the
+    // child, it always was. This line has no reason to outlive that consumer
+    // reading the platform's own name for the session.
     HYPERLOOM_SESSION_ID: sessionId,
     INFERENCE_OPTIMIZER_SESSION_LAYOUT: "per_model_ts",
     MCP_PORT: mcpPort,
