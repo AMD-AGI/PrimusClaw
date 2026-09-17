@@ -6,9 +6,11 @@
 package envd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -26,6 +28,38 @@ func TestMain(m *testing.M) {
 
 func newTestServer() *Server {
 	return &Server{jobs: newJobRegistry(), instanceID: "inst-test"}
+}
+
+var shimProbe struct {
+	once sync.Once
+	err  error
+}
+
+// requireJobShim skips where this environment will not let the test binary
+// re-execute itself, which is how these cases reach the supervisor. A sandbox
+// runs EnvD as its own binary and has no such restriction; a build container
+// under a restrictive seccomp profile can.
+func requireJobShim(t *testing.T) {
+	t.Helper()
+	shimProbe.once.Do(func() {
+		var out synchronizedBuffer
+		s := newTestServer()
+		_, exitCh, _, err := s.startTrackedCommand(
+			[]string{"true"}, "", os.Environ(), &out, &out, false,
+		)
+		if err != nil {
+			shimProbe.err = err
+			return
+		}
+		select {
+		case <-exitCh:
+		case <-time.After(30 * time.Second):
+			shimProbe.err = errors.New("the shim did not report an exit status")
+		}
+	})
+	if shimProbe.err != nil {
+		t.Skipf("the job shim cannot start here, so the supervisor is untested: %v", shimProbe.err)
+	}
 }
 
 // run starts a tracked command and returns its exit code once the primary ends.
@@ -46,6 +80,7 @@ func run(t *testing.T, s *Server, track bool, args ...string) (int, *synchronize
 }
 
 func TestTrackedCommandDeliversOutputTheExitStatusOvertook(t *testing.T) {
+	requireJobShim(t)
 	// The exit status arrives on its own descriptor while the output crosses a
 	// pipe, so a command that writes a lot and exits at once is the case where
 	// the two race. Every line has to be present.
@@ -64,6 +99,7 @@ func TestTrackedCommandDeliversOutputTheExitStatusOvertook(t *testing.T) {
 }
 
 func TestJobShimDoesNotLeakItsControlDescriptor(t *testing.T) {
+	requireJobShim(t)
 	// fd 3 carries the primary PID and the exit status. A command that writes to
 	// it by convention must not be able to reach it, or those bytes are read
 	// back as an exit code.
@@ -76,6 +112,7 @@ func TestJobShimDoesNotLeakItsControlDescriptor(t *testing.T) {
 }
 
 func TestSetsidDescendantKeepsTheJobTracked(t *testing.T) {
+	requireJobShim(t)
 	// The shim is a subreaper, so a descendant that detaches itself is adopted
 	// by it rather than by PID 1, and the job stays on the roster until that
 	// descendant exits.
@@ -106,6 +143,7 @@ func TestSetsidDescendantKeepsTheJobTracked(t *testing.T) {
 }
 
 func TestHandsJobCountsDescendantsAndNotHandsItself(t *testing.T) {
+	requireJobShim(t)
 	// The Hands job is infrastructure: its own process never counts, and the
 	// roster reports the descendants it spawned. This is the branch that decides
 	// every reclaim in production, and it walks procfs.
@@ -133,6 +171,7 @@ func TestHandsJobCountsDescendantsAndNotHandsItself(t *testing.T) {
 }
 
 func TestUntrackedCommandStaysOffTheRoster(t *testing.T) {
+	requireJobShim(t)
 	// Probes and ledger reads travel this path. Counting them would make an idle
 	// sandbox look busy for as long as the probe runs.
 	s := newTestServer()
@@ -149,6 +188,7 @@ func TestUntrackedCommandStaysOffTheRoster(t *testing.T) {
 }
 
 func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
+	requireJobShim(t)
 	// Tracking loss is about a roster that can no longer account for its jobs.
 	// An untracked tree was never accounted for, so its supervisor dying says
 	// nothing -- and a latched flag would stop every later reclaim.
@@ -178,4 +218,29 @@ func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("an untracked shim's death latched tracking_lost")
+}
+
+func TestOnlyHandsItselfIsExcludedFromTheCount(t *testing.T) {
+	// Hands is deployed under several paths, so the leading directories are not
+	// part of the test. Everything else is user work: a command that merely
+	// mentions the path, or a wrapper named after it, occupies the sandbox, and
+	// excluding it would report that sandbox as idle.
+	for _, tc := range []struct {
+		cmd  string
+		want bool
+	}{
+		{"/app/hands-binary", true},
+		{"/tmp/.hands-binary", true},
+		{"/wekafs/Primus-Claw/primus-claw/hands-binary", true},
+		{"/app/hands-binary --serve", true},
+		{"/opt/run-hands-binary-helper", false},
+		{"sleep 60 # hands-binary", false},
+		{"cp /tmp/.hands-binary /workspace/x", false},
+		{"python train.py --out /data/hands-binary", false},
+		{"/usr/local/bin/hands-binary-wrapper", false},
+	} {
+		if got := isHandsProcess(tc.cmd); got != tc.want {
+			t.Errorf("isHandsProcess(%q) = %v, want %v", tc.cmd, got, tc.want)
+		}
+	}
 }

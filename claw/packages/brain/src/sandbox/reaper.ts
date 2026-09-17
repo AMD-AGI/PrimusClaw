@@ -497,9 +497,16 @@ export function eligibleForClusterReclaim(
   if (info.sessionDeleted === true) return true;
   const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
   const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
-  const reuseWindowStart = typeof info.quiescedAt === "number"
-    ? info.quiescedAt
-    : Math.max(idleSince, workSeenAt);
+  const quiescedAt = typeof info.quiescedAt === "number" ? info.quiescedAt : 0;
+  // The later of the three, and `workSeenAt` is in there for the sweep that
+  // cannot ask: this one reads no background-work verdict and runs on a shorter
+  // horizon than the keepalive reclaim. A handle whose roster answered empty
+  // once and has been unreachable since carries a `quiescedAt` that no longer
+  // moves, and the keepalive sweep holds it on `unknown` -- reading that stamp
+  // alone here would release the cluster out from under a handle the other
+  // sweep is deliberately keeping. `workSeenAt` advances on every sweep that
+  // could not get an answer, which is what keeps the two in step.
+  const reuseWindowStart = Math.max(quiescedAt, idleSince, workSeenAt);
   return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
 }
 

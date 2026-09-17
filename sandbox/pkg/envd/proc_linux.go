@@ -43,13 +43,31 @@ func countUserDescendants(shimPID int) (int, error) {
 			if child.state == 'Z' || child.state == 'X' {
 				continue
 			}
-			if strings.Contains(child.cmd, handsBinaryMark) {
+			if isHandsProcess(child.cmd) {
 				continue
 			}
 			count++
 		}
 	}
 	return count, nil
+}
+
+// isHandsProcess reports whether a process is the Hands daemon itself.
+//
+// Matched on the basename of argv[0], not on the command line containing the
+// name somewhere: a user command that merely mentions the path -- copying it,
+// listing it, naming a wrapper after it -- is user work, and excluding it would
+// report an occupied sandbox as idle. Hands is deployed under more than one
+// path, so the leading directories are not part of the test.
+func isHandsProcess(cmd string) bool {
+	argv0 := cmd
+	if i := strings.IndexByte(argv0, ' '); i >= 0 {
+		argv0 = argv0[:i]
+	}
+	if i := strings.LastIndexByte(argv0, '/'); i >= 0 {
+		argv0 = argv0[i+1:]
+	}
+	return argv0 == handsBinaryMark || argv0 == "."+handsBinaryMark
 }
 
 // listProcs snapshots process identity and parent links from procfs.
