@@ -53,7 +53,11 @@ func newJobRegistry() *jobRegistry {
 	return &jobRegistry{jobs: make(map[int]trackedJob), count: countUserDescendants}
 }
 
-// markLost records that a supervisor died before its tree could be accounted for.
+// markLost records that a supervisor died before its tree could be accounted
+// for. It is never unset: the descendants it is about were re-parented away
+// from every shim the walk starts at, so nothing this registry can observe will
+// ever account for them again, and no later job speaks for them. A sandbox that
+// has lost tracking is left to its own timeout rather than reported idle.
 func (r *jobRegistry) markLost() {
 	if r == nil {
 		return
@@ -192,29 +196,14 @@ func shellWords(line string) []string {
 	return out
 }
 
-// add records a newly started job shim. Tracking loss clears when the registry
-// holds no user job, the resident Hands supervisor not counting as one.
+// add records a newly started job shim.
 func (r *jobRegistry) add(shimPID int, hands bool) {
 	if r == nil || shimPID <= 0 {
 		return
 	}
 	r.mu.Lock()
-	if !r.hasUserJobLocked() {
-		r.lost = false
-	}
 	r.jobs[shimPID] = trackedJob{shimPID: shimPID, hands: hands}
 	r.mu.Unlock()
-}
-
-// hasUserJobLocked reports whether a tracked job other than the Hands
-// supervisor remains. Callers hold the mutex.
-func (r *jobRegistry) hasUserJobLocked() bool {
-	for _, j := range r.jobs {
-		if !j.hands {
-			return true
-		}
-	}
-	return false
 }
 
 // remove forgets a shim after all descendants have exited.

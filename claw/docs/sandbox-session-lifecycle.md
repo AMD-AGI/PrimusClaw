@@ -7,7 +7,7 @@ This document describes how a Claw session uses a sandbox, how the Pod is manage
 Brain decides idle reclaim from **user tasks registered in the sandbox Pod through Claw `POST /api/execute`**.
 
 - **Tracked**: EnvD `POST /api/execute` invoked by Claw via the Router (Hands start, Hands `spawn`, and `setsid` / `nohup` under that tree).
-- **Not tracked**: other EnvD HTTP APIs (`/api/session` tmux, `/api/terminal`, files, GPU query), processes that never went through execute, and processes started by the image entrypoint. Work on those paths does not block the 15-minute idle reclaim.
+- **Not tracked**: other EnvD HTTP APIs (`/api/session` tmux, `/api/terminal`, files, GPU query), processes that never went through execute, and processes started by the image entrypoint. Work on those paths does not block the idle reclaim.
 - **Multi-node**: only whether the launch script in the sandbox (and descendants registered through execute) is still running. InferaDeployment and RayJob status are not read. After the launch script exits, local jobs are empty even if the remote cluster is still running.
 - **Cluster teardown**: a multi-node GPU workload is still released on **message terminal** (complete / failed / cancelled). Remote phase does not extend the sandbox idle clock.
 
@@ -67,9 +67,9 @@ sequenceDiagram
 Brain keepalive (default interval 60s) pings sandboxes with `keepalive: true`:
 
 - agent-sandbox: `GET` session, which updates `LastActivity`.
-- safe-workload: `exec` a short command (historically wrote `/tmp/keepalive_ts`). That file is not a control-plane input; the proxy request is what refreshes `LastActivity`.
+- safe-workload: a control-plane status read. No command enters the container: the exec this replaced wrote `/tmp/keepalive_ts`, which was never a control-plane input.
 
-Sandbox idle-GC deletes a Sandbox when Redis `LastActivity` is older than 15 minutes (overridable by annotation). SaFE `timeout` still stops a Workload that is still running.
+Sandbox idle-GC deletes a Sandbox when Redis `LastActivity` is older than `--session-timeout` (overridable by annotation). It ships **disabled** (`--enable-idle-gc=false`), because a deployment running Brain reclaims through Brain instead; where it is off, an idle Sandbox is held until its own `ShutdownTime` (24h). SaFE `timeout` still stops a Workload that is still running.
 
 After a task parks, `keepalive` is set false. Keepalive then probes EnvD `GET /api/jobs`. That count includes only user tasks registered through `/api/execute`. Hands `/internal/shells/active` is not the authority for idle.
 
@@ -117,7 +117,7 @@ envd (PID 1, always running)
 - HTTP can return as soon as the shell exits. Request cancellation does not stop the shim or its descendants. A command timeout sends SIGTERM to the shim, which stops only the primary process group.
 - The shim stays alive until every user descendant of that job has exited.
 - EnvD records the **shim PID** (the Hands start job marks the Hands PID as infrastructure).
-- `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty. `tracking_lost` clears when the registry is empty and a new tracked job starts.
+- `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty. It is never unset: the descendants it is about were re-parented away from every supervisor the roster walk starts at, so nothing EnvD can observe will account for them again, and a job starting later does not speak for them. A sandbox that has lost tracking is left to its own timeout rather than reclaimed as idle.
 
 **User work remains**: a live tracked non-Hands shim exists, or the Hands job shim still has a non-zombie PID other than Hands.
 
@@ -145,11 +145,11 @@ When the SaFE **sandbox** Workload reaches a terminal phase (Failed / Stopped / 
 
 That terminal phase is the sandbox Pod / codeinterpreter, not InferaDeployment or RayJob. The create-wait path already does this. A container fault after Running takes the same path and does not enter QUIESCED.
 
-### The 15-minute idle clock scans only Running
+### The idle clock scans only Running
 
-`GET /api/jobs` and the 15-minute idle clock run **only after the sandbox Workload is Running**.
+`GET /api/jobs` and the idle clock run **only after the sandbox Workload is Running**.
 
-- **Pending** (queued, unschedulable): no 15-minute release.
+- **Pending** (queued, unschedulable): no idle release.
 - A sandbox that is not yet Running does not enter DRAINING / QUIESCED.
 - Pending ends only by becoming Running, a SaFE sandbox terminal failure, or the Pending timeout below.
 
@@ -158,7 +158,7 @@ When there is no in-flight message or tool call and `GET /api/jobs` shows no use
 Reclaim and reuse compete on one CAS: `ready` → `closing`. A handle in `closing` is not reused. Stale jobs answers are discarded when the sandbox identity or idle generation changes.
 
 ```
-Pending      queued; no jobs scan; no 15-minute idle
+Pending      queued; no jobs scan; no idle clock
   │ Running
   ▼
 ACTIVE       in-flight message, or jobs non-empty
@@ -169,18 +169,18 @@ DRAINING     poll EnvD GET /api/jobs (Running only)
   │ sandbox terminal → session failure to the frontend
   │ unknown / tracking_lost → stay DRAINING
   ▼
-QUIESCED     15 minutes from quiescedAt
+QUIESCED     the idle window, from quiescedAt
   │ new message CAS-es keepalive on → ACTIVE, clock cleared
-  │ 15 minutes elapsed → CAS to CLOSING, then destroyHands
+  │ idle window elapsed → CAS to CLOSING, then destroyHands
   ▼
 CLOSING      not reusable; retry stop until the workload is gone
 ```
 
-Those 15 minutes mean the **sandbox is Running, every user-task PID registered through `/api/execute` has exited, and there is no new message**. A still-running remote cluster does not extend this clock. `ttlSecondsAfterFinished` does not implement it. SaFE `timeout` is a hard cap on a Running Workload.
+That window means the **sandbox is Running, every user-task PID registered through `/api/execute` has exited, and there is no new message**. A still-running remote cluster does not extend this clock. `ttlSecondsAfterFinished` does not implement it. SaFE `timeout` is a hard cap on a Running Workload.
 
-### Pending timeout (existing; not the 15-minute idle)
+### Pending timeout (existing; not the idle window)
 
-Claw has a separate queue cap, unrelated to idle 15 minutes:
+Claw has a separate queue cap, unrelated to the idle window:
 
 | Config | Default | Role |
 |--------|---------|------|
@@ -196,9 +196,9 @@ EnvD exiting stops `codeinterpreter`. That is an abnormal sandbox death and fail
 
 | Observation | Session result |
 |-------------|----------------|
-| Pending | no 15-minute release; wait until Pending timeout or SaFE sandbox failure |
-| jobs empty, sandbox Workload Running | idle path, 15 minutes from `quiescedAt`, not failure |
-| new message or new execute within 15 minutes | clock reset |
+| Pending | no idle release; wait until Pending timeout or SaFE sandbox failure |
+| jobs empty, sandbox Workload Running | idle path, the idle window from `quiescedAt`, not failure |
+| new message or new execute inside the window | clock reset |
 | jobs non-empty, Running | keep the sandbox |
 | launch script exited, Infera/RayJob still running | same as jobs empty; not kept alive |
 | work only on `/api/session` or other non-execute APIs | same as jobs empty; not kept alive |
@@ -218,19 +218,19 @@ On failure: session terminal ack, a stable `failure_reason`, stop the sandbox Wo
 
 The Sandbox ResourceTemplate must list Sandbox `Succeeded` / `Failed` conditions **before** `Ready=False`, so a dead Pod becomes Workload `K8sSucceeded` / `K8sFailed` rather than staying `NotReady`. Brain `get()` treats failed/stopped/succeeded/completed/cancelled/terminated as `terminal`.
 
-OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_container_failed` from `sandbox_timed_out`. A long or zero `ttlSecondsAfterFinished` is leak cleanup only, not the 15-minute idle clock.
+OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_container_failed` from `sandbox_timed_out`. A long or zero `ttlSecondsAfterFinished` is leak cleanup only, not the idle clock.
 
 ## Acceptance
 
 | State | jobs API | sandbox Workload | Action |
 |-------|----------|------------------|--------|
-| queued / unschedulable | not scanned | Pending | no 15-minute release |
+| queued / unschedulable | not scanned | Pending | no idle release |
 | Pending longer than 3 hours (default) | — | Pending | failure to the frontend `sandbox_pending_timeout` |
-| turn parked, execute tree empty | empty | Running | record `quiescedAt`, 15-minute idle reclaim |
+| turn parked, execute tree empty | empty | Running | record `quiescedAt`, idle reclaim |
 | new message inside the window | — | Running | ACTIVE, clock cleared |
 | detached command still running via execute | non-empty | Running | keep |
-| launch-script PID exited | empty | Running | start 15 minutes; do not query Infera/RayJob |
-| work only on the tmux session API | empty | Running | 15-minute idle reclaim |
+| launch-script PID exited | empty | Running | start the idle window; do not query Infera/RayJob |
+| work only on the tmux session API | empty | Running | idle reclaim |
 | SaFE reports sandbox Failed / OOM / container exit | — | Failed | failure to the frontend |
 | platform timeout | — | Stopped (timeout) | failure to the frontend |
 | Router briefly unreachable | unknown | Running | wait, do not reclaim |

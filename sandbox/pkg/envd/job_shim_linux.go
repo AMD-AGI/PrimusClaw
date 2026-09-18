@@ -123,14 +123,14 @@ func (s *Server) startTrackedCommand(
 	env []string,
 	stdout, stderr io.Writer,
 	tracking jobTracking,
-) (primaryPID int, exitCh <-chan int, cancel func(), err error) {
+) (primaryPID int, exitCh <-chan int, drained <-chan struct{}, cancel func(), err error) {
 	self, err := os.Executable()
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
 	exitR, exitW, err := os.Pipe()
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
 
 	shim := exec.Command(self, append([]string{jobShimArg}, command...)...)
@@ -144,20 +144,20 @@ func (s *Server) startTrackedCommand(
 	if err := shim.Start(); err != nil {
 		_ = exitR.Close()
 		_ = exitW.Close()
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
 	_ = exitW.Close()
 	var pidBuf [4]byte
 	if _, err := io.ReadFull(exitR, pidBuf[:]); err != nil {
 		_ = exitR.Close()
 		_ = shim.Wait()
-		return 0, nil, nil, fmt.Errorf("job shim startup handshake: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("job shim startup handshake: %w", err)
 	}
 	primaryPID = int(int32(binary.LittleEndian.Uint32(pidBuf[:])))
 	if primaryPID <= 0 {
 		_ = exitR.Close()
 		_ = shim.Wait()
-		return 0, nil, nil, fmt.Errorf("job shim failed to start primary command")
+		return 0, nil, nil, nil, fmt.Errorf("job shim failed to start primary command")
 	}
 	if tracking.track {
 		s.jobs.add(shim.Process.Pid, tracking.hands)
@@ -173,6 +173,9 @@ func (s *Server) startTrackedCommand(
 		_ = exitR.Close()
 		ch <- code
 	}()
+	// Closed once the supervisor has been reaped, which is where os/exec has
+	// joined the goroutines copying its output: past this point the buffers a
+	// caller reads can no longer change.
 	done := make(chan struct{})
 	cancel = func() {
 		if shim.Process == nil {
@@ -195,7 +198,7 @@ func (s *Server) startTrackedCommand(
 		s.jobs.remove(shim.Process.Pid)
 		close(done)
 	}()
-	return primaryPID, ch, cancel, nil
+	return primaryPID, ch, done, cancel, nil
 }
 
 // supervisorDiedUnexpectedly is true when the shim was signaled or failed

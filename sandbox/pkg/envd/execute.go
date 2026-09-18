@@ -66,7 +66,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	var stdout, stderr synchronizedBuffer
 
 	startTime := time.Now()
-	_, exitCh, stop, err := s.startTrackedCommand(
+	_, exitCh, drained, stop, err := s.startTrackedCommand(
 		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
@@ -83,7 +83,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			// HTTP cancellation does not stop the tracked tree.
 			return
 		}
-		awaitOutputQuiet(func() time.Time {
+		awaitOutputQuiet(drained, func() time.Time {
 			out, errOut := stdout.lastWrite(), stderr.lastWrite()
 			if errOut.After(out) {
 				return errOut
@@ -165,7 +165,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := &sseCommandStream{w: w, flusher: flusher, active: true}
-	pid, exitCh, stop, err := s.startTrackedCommand(
+	pid, exitCh, drained, stop, err := s.startTrackedCommand(
 		req.Command,
 		workDir,
 		s.buildChildEnv(req.Env),
@@ -194,7 +194,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	}
 	// Let the output the exit status overtook reach the stream before it stops
 	// accepting bytes, or the tail of the command is dropped silently.
-	awaitOutputQuiet(stream.lastWrite)
+	awaitOutputQuiet(drained, stream.lastWrite)
 
 	stream.event("end", map[string]interface{}{
 		"exit_code": exitCode,
@@ -229,24 +229,38 @@ func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 const executeTimeoutExitCode = 124
 
 // How long the output path must stay silent before a response is built from it.
-//
-// The exit status travels on its own descriptor while output travels through a
-// pipe and a copy goroutine, so the status routinely overtakes the last bytes
-// the command wrote. The first wait is unconditional for that reason: a buffer
-// that has received nothing yet looks exactly like one that has received
-// everything.
 const outputQuietPeriod = 100 * time.Millisecond
 
 // Ceiling on that wait. Descendants the command detached hold the same pipe and
-// may keep writing, so silence is not guaranteed to arrive.
+// may keep writing, so neither the drain signal nor silence is guaranteed to
+// arrive, and the response has to be bounded regardless.
 const outputQuietCeiling = 2 * time.Second
 
 // awaitOutputQuiet resynchronises the exit status with the output it overtook.
-func awaitOutputQuiet(lastWrite func() time.Time) {
+//
+// The exit status travels on its own descriptor while output travels through a
+// pipe and a copy goroutine, so the status routinely overtakes the last bytes
+// the command wrote.
+//
+// `drained` closing is the real answer: it is the point at which the supervisor
+// has been reaped and os/exec has joined the copy goroutines, so nothing can
+// arrive afterwards. It cannot be waited on alone, because a detached
+// descendant inherits the same pipe and holds it open for as long as it runs --
+// which is why silence and a ceiling remain underneath it.
+//
+// Silence is only evidence once something has been written. A buffer that has
+// received nothing carries a zero timestamp, and the age of a zero timestamp is
+// quiet by any measure; treating that as completion is what answered with an
+// exit status and no output.
+func awaitOutputQuiet(drained <-chan struct{}, lastWrite func() time.Time) {
 	deadline := time.Now().Add(outputQuietCeiling)
-	time.Sleep(outputQuietPeriod)
 	for time.Now().Before(deadline) {
-		if time.Since(lastWrite()) >= outputQuietPeriod {
+		select {
+		case <-drained:
+			return
+		default:
+		}
+		if at := lastWrite(); !at.IsZero() && time.Since(at) >= outputQuietPeriod {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

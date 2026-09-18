@@ -232,6 +232,36 @@ test("a KV failure is swallowed rather than escaping the cleanup handler", async
   await parkForIdleReclaim(SID);
 });
 
+test("cluster reclaim waits out a measured quiesce, not just the park", () => {
+  // `quiescedAt` is set when a probe measured the sandbox empty, and it is the
+  // anchor the single-node reclaim counts from. The cluster sweep has to agree:
+  // counting from the park alone would let it release a sandbox whose window
+  // only started when that measurement landed, and the GPUs would go back while
+  // the keepalive that owns the handle still holds it short of its own window.
+  const now = 2_000_000;
+  const longIdle = now - MULTI_NODE_IDLE_RECLAIM_MS - 1;
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: longIdle,
+      workSeenAt: longIdle,
+      quiescedAt: now - 1,
+    }, now),
+    false,
+    "a quiesce measured a moment ago cannot already be past its window",
+  );
+  assert.equal(
+    eligibleForClusterReclaim({
+      keepalive: false,
+      idleSince: longIdle,
+      workSeenAt: longIdle,
+      quiescedAt: longIdle,
+    }, now),
+    true,
+    "a quiesce as old as the park leaves the window where it was",
+  );
+});
+
 test("cluster reclaim uses the later of idleSince and workSeenAt", () => {
   const now = 1_000_000;
   assert.equal(

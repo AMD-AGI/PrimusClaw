@@ -450,7 +450,19 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
    # between two refreshes of one handle against it and refuses to start where
    # the gap is not under it, so a ceiling too large for the interval is
    # rejected here rather than found later as a reclaimed sandbox.
-   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="900"
+   #
+   # This is a property of the platform, not a number to pick: it is how long
+   # the provider leaves an unrefreshed sandbox alone. Verify it before setting
+   # it, and verify the gap clears it -- the two settings above cannot be sized
+   # without knowing which side has room. The gap is
+   #   (1 + D) * SANDBOX_KEEPALIVE_INTERVAL_SEC + (2 + D) * SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC
+   # where D is the deferral count the ceiling implies. With the shipped
+   # defaults (interval 60s, span 540s) that is 1140s at D=0, so a 900s reclaim
+   # does not fit and Brain refuses. Either the platform's reclaim is longer
+   # than that, or the sweep span has to come down first -- and the span cannot
+   # simply be lowered, because it has to stay above a sweep's own worst case
+   # (`keepaliveSweepCeilingSec()`, 524s with the shipped retry bounds).
+   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC=""
    # Only if PRE-4 applies.
    BASH_MAX_TIMEOUT_SEC=""
    ```

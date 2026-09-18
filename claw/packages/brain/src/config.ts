@@ -1117,7 +1117,7 @@ export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_D
 // between two refreshes of one handle and the admission reclaim horizon are
 // both derived from this number, so one declared below the sweep's own worst
 // case makes both of them short in the unsafe direction.
-export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 420, { min: 1 });
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 540, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive drops the hands KV entry so the control plane can

@@ -13,7 +13,7 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { isTombstone } from "../tasks/lock.js";
-import { destroyHands } from "./reaper.js";
+import { destroyHands, handsStopCeilingMs } from "./reaper.js";
 import {
   bindHandsKv, handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
   sessionHasActiveRunLease,
@@ -1228,7 +1228,7 @@ export function keepaliveSweepCeilingSec(): number {
   return keepaliveCensusPhaseCeilingSec()
     + keepaliveIdleExpiryPhaseCeilingSec()
     + keepalivePingPhaseCeilingSec()
-    + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
+    + Math.ceil((FAILURE_PHASE_BUDGET_MS + handsStopCeiling()) / 1000);
 }
 
 /**
@@ -1244,12 +1244,22 @@ export function keepaliveSweepCeilingSec(): number {
  */
 export function keepaliveIdleExpiryPhaseCeilingSec(): number {
   return Math.ceil(
-    (IDLE_EXPIRY_BUDGET_MS + JOBS_PROBE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000,
+    (IDLE_EXPIRY_BUDGET_MS + JOBS_PROBE_BUDGET_MS + handsStopCeiling()) / 1000,
   );
 }
 
-/** Longest one started eviction may take, stop and retries together. */
-const HANDS_STOP_CEILING_MS = 30_000;
+/**
+ * Longest one started eviction may take, stop and retries together.
+ *
+ * Read from the retry bounds the stop itself uses rather than written here: as
+ * a constant it named a single attempt, so every phase that budgets around a
+ * teardown understated it by the retry count. Called rather than captured
+ * because the two modules import each other, and a value read at module scope
+ * would be read before the bounds it derives from exist.
+ */
+function handsStopCeiling(): number {
+  return handsStopCeilingMs();
+}
 
 /** Longest one ping may take before its own timeout ends it. */
 const HANDS_PING_CEILING_MS = 15_000;

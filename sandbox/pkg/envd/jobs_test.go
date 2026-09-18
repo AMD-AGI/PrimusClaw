@@ -48,21 +48,37 @@ func TestHandleJobsEmptyIsIdleWhenTrackingHolds(t *testing.T) {
 	}
 }
 
-func TestAddAfterEmptyClearsLost(t *testing.T) {
+func TestTrackingLossOutlivesTheJobsThatFollowIt(t *testing.T) {
+	// Tracking loss says a supervisor died while descendants were still
+	// unaccounted for. Those descendants were re-parented away from every shim,
+	// so no later walk can reach them and an empty count stops being evidence of
+	// idle -- permanently, because nothing in this registry can ever observe
+	// them again.
+	//
+	// A job starting afterwards says nothing about them. It especially cannot
+	// clear the flag, because the Hands restart that a dead supervisor triggers
+	// issues ordinary jobs of its own: letting those clear it made the recovery
+	// withdraw the only protection the sandbox had left, and the sandbox then
+	// read as cleanly idle with the orphans still running.
 	r := newJobRegistry()
-	r.add(1, false)
+	r.count = func(int) (int, error) { return 0, nil }
+	r.add(10, true)
 	r.markLost()
-	r.remove(1)
-	r.add(2, false)
+	r.add(20, false)
 	snap, err := r.snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.lost {
-		t.Fatal("lost must clear when tracking resumes on an empty registry")
+	if !snap.lost {
+		t.Fatal("an ordinary job cleared a tracking loss it cannot account for")
 	}
-	if snap.count != 1 {
-		t.Fatalf("count=%d", snap.count)
+	r.remove(20)
+	snap, err = r.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.lost {
+		t.Fatal("tracking loss has to outlast the jobs that ran after it")
 	}
 }
 

@@ -23,8 +23,9 @@ import {
 } from "../src/sandbox/keepalive.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
-import { bindSandboxStopRetry } from "../src/sandbox/reaper.js";
+import { bindSandboxStopRetry, handsStopCeilingMs } from "../src/sandbox/reaper.js";
 import { inspectSandboxJobs } from "../src/sandbox/job-probe.js";
+import { SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC } from "../src/config.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
 
@@ -211,14 +212,79 @@ test("the jobs probe budget covers the status read, not only the roster fetch", 
   }
 });
 
-test("the declared sweep span covers the idle-expiry phase", () => {
-  // Every phase that awaits per-target work has to appear in the span, or the
-  // span is a number the sweep routinely exceeds -- and the refresh gaps and
-  // the reclaim horizon are both derived from it.
-  const expiry = keepaliveIdleExpiryPhaseCeilingSec();
-  assert.ok(expiry > 0, "the idle-expiry phase awaits a probe and a stop per handle");
+test("the idle-expiry budget bars teardowns rather than merely being declared", async () => {
+  // The budget is what keeps one unresponsive control plane from spending the
+  // whole sweep on teardowns while the phase that renews every live record
+  // waits behind it. Asserting the declared ceiling covers the phase says
+  // nothing, since the ceiling is a sum that contains it: the observable is
+  // that an exhausted budget actually stops teardowns from starting.
+  const handles = 6;
+  const store = new Map<string, { value: Uint8Array; revision: number }>();
+  for (let i = 0; i < handles; i++) {
+    store.set(`hands.sess-budget-${i}`, {
+      value: sc.encode(JSON.stringify({ ...CLOSING_HANDLE, workloadId: `wl-${i}` })),
+      revision: 5,
+    });
+  }
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...store.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async get(k: string) {
+      const hit = store.get(k);
+      return hit ? { key: k, value: hit.value, revision: hit.revision } : null;
+    },
+    async delete(k: string) { store.delete(k); },
+    async put() { return 1; },
+    async update(k: string, value: Uint8Array, rev: number) {
+      store.set(k, { value, revision: rev + 1 });
+      return rev + 1;
+    },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  let stops = 0;
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop() { stops += 1; },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    await runKeepaliveTickForTest({
+      kv, countActiveShells: async () => 0, idleExpiryBudgetMs: 0,
+    });
+    assert.equal(
+      stops, 0,
+      `an exhausted budget still started ${stops} of ${handles} teardowns`,
+    );
+    assert.equal(store.size, handles, "a deferred teardown must leave its record alone");
+  } finally {
+    restoreRetry();
+    restore();
+    for (const key of store.keys()) unregisterSandbox(key.replace("hands.", ""));
+  }
+});
+
+test("the declared sweep span covers a sweep's real worst case", () => {
+  // Every phase that awaits per-target work has to appear in the span, and each
+  // term has to name the real cost of the work it lets start. A teardown is a
+  // stop with retries, so a term naming one attempt understates the phase by
+  // the retry count -- and the refresh gap and the reclaim horizon are both
+  // derived from this span.
   assert.ok(
-    keepaliveSweepCeilingSec() >= expiry,
-    "the span has to include the phase that tears handles down",
+    handsStopCeilingMs() > 30_000,
+    "a teardown is a stop with retries, not a single attempt",
+  );
+  assert.ok(
+    keepaliveIdleExpiryPhaseCeilingSec() * 1000 > handsStopCeilingMs(),
+    "the idle-expiry term has to cover the teardown it lets start",
+  );
+  assert.ok(
+    SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC > keepaliveSweepCeilingSec(),
+    `the shipped span ${SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC}s does not cover a worst-case `
+      + `tick of ${keepaliveSweepCeilingSec()}s`,
   );
 });

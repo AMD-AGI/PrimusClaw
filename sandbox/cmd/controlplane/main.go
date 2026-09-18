@@ -108,7 +108,12 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
-	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller, which deletes a Sandbox idle past --session-timeout")
+	// Off by default because a deployment that runs Brain already reclaims idle
+	// sandboxes through it, and two reclaimers would race over the same
+	// Sandboxes. Set it where nothing else reclaims -- a standalone sandbox API
+	// or sdk-python deployment -- or an idle Sandbox is held until its own
+	// ShutdownTime, which defaults to 24h rather than --session-timeout.
+	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller, which deletes a Sandbox idle past --session-timeout. Off by default: set it where Brain is not the reclaimer, or an idle Sandbox waits for its ShutdownTime instead")
 	flag.Parse()
 
 	// controller-runtime keeps zap here, deliberately: switching it to the

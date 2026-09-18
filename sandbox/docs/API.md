@@ -145,7 +145,10 @@ x-session-id: sess_xxx
 - `command` (`[]string`, required), `timeout` (default `60s`), `working_dir`
   (relative to workspace `/home/sandbox`; path traversal rejected with `400`),
   `env` (merged into the environment), `untracked` (omit this execute from
-  `GET /api/jobs` user-process accounting).
+  `GET /api/jobs` user-process accounting), `hands` (this execute starts the
+  resident Hands supervisor, so the roster accounts for the descendants it
+  spawns rather than counting the supervisor itself as user work). `untracked`
+  wins where both are set: an execute off the roster has nothing to account for.
 - Response (always `200`): `{ stdout, stderr, exit_code, duration, start_time, end_time }`.
   Check `exit_code` for success. Notable codes: `124` timeout, `126` not
   executable, `127` not found, `137` OOM-killed. A command that reaches its
@@ -203,6 +206,32 @@ Same `id` as the session.
 ```
 
 `available` is `false` (and `devices` is `null`) when no AMD GPU / `rocm-smi` is present.
+
+### Tracked jobs
+
+`GET {base}/api/jobs` → always `200`. Answers whether user work is still
+running, so a caller can tell an idle sandbox from a busy one.
+
+```json
+{ "user_processes": true, "user_process_count": 2, "tracking_lost": false,
+  "pod_uid": "…", "instance_id": "…" }
+```
+
+Each tracked execute runs under a supervisor that adopts its descendants, so a
+task that detaches itself with `setsid` or `nohup` is still counted. The count
+excludes the resident Hands supervisor, whose own process is infrastructure, but
+includes everything Hands spawned.
+
+`tracking_lost` reports that a supervisor died before its tree could be
+accounted for: its descendants were re-parented away and can no longer be seen,
+so `user_process_count` being `0` is not evidence that the sandbox is idle. It
+is never unset, because nothing this endpoint can observe will ever account for
+those processes again. Treat a sandbox in that state as inconclusive and leave
+it to its own timeout.
+
+`pod_uid` and `instance_id` identify the pod and the EnvD process that answered,
+so a caller can tell that a reply came from the sandbox it asked about rather
+than from a replacement that took its name.
 
 ---
 

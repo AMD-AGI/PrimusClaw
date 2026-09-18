@@ -20,7 +20,7 @@ func (s *Server) startTrackedCommand(
 	env []string,
 	stdout, stderr io.Writer,
 	tracking jobTracking,
-) (int, <-chan int, func(), error) {
+) (int, <-chan int, <-chan struct{}, func(), error) {
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = workDir
 	cmd.Env = env
@@ -28,8 +28,11 @@ func (s *Server) startTrackedCommand(
 	cmd.Stderr = stderr
 	stripEnvDProxyGroup(cmd)
 	ch := make(chan int, 1)
+	// Closed once the command has been reaped, which is where os/exec has joined
+	// the goroutines copying its output.
+	done := make(chan struct{})
 	if err := cmd.Start(); err != nil {
-		return 0, nil, func() {}, err
+		return 0, nil, nil, func() {}, err
 	}
 	if tracking.track {
 		s.jobs.add(cmd.Process.Pid, tracking.hands)
@@ -52,9 +55,10 @@ func (s *Server) startTrackedCommand(
 				code = 1
 			}
 		}
+		close(done)
 		ch <- code
 	}()
-	return cmd.Process.Pid, ch, func() {
+	return cmd.Process.Pid, ch, done, func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}

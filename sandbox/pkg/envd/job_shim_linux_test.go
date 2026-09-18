@@ -46,7 +46,7 @@ func requireJobShim(t *testing.T) {
 	shimProbe.once.Do(func() {
 		var out synchronizedBuffer
 		s := newTestServer()
-		_, exitCh, _, err := s.startTrackedCommand(
+		_, exitCh, _, _, err := s.startTrackedCommand(
 			[]string{"true"}, "", os.Environ(), &out, &out, jobTracking{},
 		)
 		if err != nil {
@@ -64,16 +64,21 @@ func requireJobShim(t *testing.T) {
 	}
 }
 
-// run starts a tracked command and returns its exit code once the primary ends.
+// run starts a tracked command and returns its exit code once the primary ends,
+// having waited out its output the way the handlers do. Cases assert on what a
+// response would have carried, so they have to wait where a response waits.
 func run(t *testing.T, s *Server, track bool, args ...string) (int, *synchronizedBuffer) {
 	t.Helper()
 	var out synchronizedBuffer
-	_, exitCh, _, err := s.startTrackedCommand(args, "", os.Environ(), &out, &out, jobTracking{track: track})
+	_, exitCh, drained, _, err := s.startTrackedCommand(
+		args, "", os.Environ(), &out, &out, jobTracking{track: track},
+	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
 	}
 	select {
 	case code := <-exitCh:
+		awaitOutputQuiet(drained, out.lastWrite)
 		return code, &out
 	case <-time.After(30 * time.Second):
 		t.Fatal("primary command did not finish")
@@ -93,10 +98,29 @@ func TestTrackedCommandDeliversOutputTheExitStatusOvertook(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
-	awaitOutputQuiet(out.lastWrite)
 	got := strings.Count(out.String(), "\n")
 	if got != lines {
 		t.Fatalf("output truncated: got %d lines, want %d", got, lines)
+	}
+}
+
+func TestOneLineOfOutputSurvivesAnImmediateExit(t *testing.T) {
+	requireJobShim(t)
+	// The shape that actually lost output: a single line, then exit. The status
+	// crosses its own descriptor and reaches the handler before the copy
+	// goroutine has been scheduled at all, so the buffer is still empty and its
+	// write timestamp still zero. Repeated because losing it is a scheduling
+	// race that a single attempt will not show.
+	s := newTestServer()
+	for attempt := 0; attempt < 60; attempt++ {
+		code, out := run(t, s, true, "sh", "-c", "echo ONLY")
+		if code != 0 {
+			t.Fatalf("attempt %d: exit=%d", attempt, code)
+		}
+		if !strings.Contains(out.String(), "ONLY") {
+			t.Fatalf("attempt %d answered with an exit status and no output: %q",
+				attempt, out.String())
+		}
 	}
 }
 
@@ -107,32 +131,94 @@ func TestJobShimDoesNotLeakItsControlDescriptor(t *testing.T) {
 	// back as an exit code.
 	s := newTestServer()
 	code, out := run(t, s, true, "sh", "-c", "echo intruder >&3 && echo reachable || echo refused")
-	awaitOutputQuiet(out.lastWrite)
 	if !strings.Contains(out.String(), "refused") {
 		t.Fatalf("fd 3 was inherited by the command: exit=%d out=%q", code, out.String())
 	}
 }
 
-func TestSetsidDescendantKeepsTheJobTracked(t *testing.T) {
+func TestSetsidDescendantIsAdoptedByItsSupervisor(t *testing.T) {
 	requireJobShim(t)
-	// The shim is a subreaper, so a descendant that detaches itself is adopted
-	// by it rather than by PID 1, and the job stays on the roster until that
-	// descendant exits.
+	// Two mechanisms hold this job together, and the assertions below name one
+	// each.
+	//
+	// `PR_SET_CHILD_SUBREAPER` is what makes a descendant that called setsid
+	// re-parent onto the shim instead of onto PID 1. Without it the descendant
+	// leaves every subtree the roster walk starts at, and no later walk can
+	// reach it -- so its parent being anything other than init is the
+	// observable.
+	//
+	// `reapOrphans` is what keeps the shim itself alive until that descendant
+	// exits. Without it the shim is reaped as soon as the primary returns, the
+	// job leaves the roster, and the sandbox reports idle with work still in it
+	// -- so the supervisor still running is the other observable.
+	//
+	// The descendant reports its own pid, because the shim's pid is not returned
+	// and init is the only parent that needs ruling out.
 	s := newTestServer()
-	code, _ := run(t, s, true, "sh", "-c", "setsid sleep 2 >/dev/null 2>&1 & exit 0")
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	var out synchronizedBuffer
+	_, exitCh, drained, stop, err := s.startTrackedCommand(
+		[]string{"sh", "-c", fmt.Sprintf(
+			"setsid sh -c 'echo $$ > %s; sleep 30' >/dev/null 2>&1 & exit 0", pidFile,
+		)},
+		"", os.Environ(), &out, &out, jobTracking{track: true},
+	)
+	if err != nil {
+		t.Fatalf("startTrackedCommand: %v", err)
+	}
+	defer stop()
+	select {
+	case code := <-exitCh:
+		if code != 0 {
+			t.Fatalf("the primary command failed: exit=%d", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the primary command did not finish")
+	}
+
+	descendant := 0
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if raw, readErr := os.ReadFile(pidFile); readErr == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr == nil {
+				descendant = pid
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if descendant == 0 {
+		t.Fatal("the detached descendant never reported its pid")
+	}
+
+	info, ok := readProc(procRoot, descendant)
+	if !ok {
+		t.Fatalf("the detached descendant %d is already gone", descendant)
+	}
+	if info.ppid == 1 {
+		t.Fatal("the detached descendant was re-parented to init, " +
+			"so no roster walk can reach it and the sandbox reads as idle")
+	}
+
+	select {
+	case <-drained:
+		t.Fatal("the supervisor was reaped while its detached descendant was still " +
+			"running, so the job left the roster with work still in it")
+	default:
+	}
+}
+
+func TestTheJobLeavesTheRosterOnceItsTreeIsEmpty(t *testing.T) {
+	requireJobShim(t)
+	// The other half of the contract: holding the job open past its tree would
+	// keep every sandbox that ever detached anything from being reclaimed.
+	s := newTestServer()
+	code, _ := run(t, s, true, "sh", "-c", "setsid sleep 1 >/dev/null 2>&1 & exit 0")
 	if code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
-	snap, err := s.jobs.snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snap.count == 0 {
-		t.Fatal("a detached descendant left the roster empty, so the sandbox reads as idle")
-	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		snap, err = s.jobs.snapshot()
+		snap, err := s.jobs.snapshot()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -196,7 +282,7 @@ func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
 	// nothing -- and a latched flag would stop every later reclaim.
 	s := newTestServer()
 	var out synchronizedBuffer
-	_, exitCh, stop, err := s.startTrackedCommand(
+	_, exitCh, _, stop, err := s.startTrackedCommand(
 		[]string{"sh", "-c", "sleep 30"}, "", os.Environ(), &out, &out, jobTracking{},
 	)
 	if err != nil {

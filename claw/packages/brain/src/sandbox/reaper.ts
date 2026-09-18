@@ -148,6 +148,26 @@ const STOP_ATTEMPTS = 3;
 const STOP_RETRY_DELAY_MS = 1_000;
 
 /**
+ * The deadline each attempt is handed, which both providers arm on their stop
+ * call. Stated here because the ceiling below is what other phases budget
+ * against, and a number living only inside the providers cannot be summed.
+ */
+const STOP_ATTEMPT_TIMEOUT_MS = 30_000;
+
+/**
+ * The longest one `destroyHands` can take, retries and the waits between them
+ * included.
+ *
+ * Derived rather than written down: a hand-written ceiling named one attempt and
+ * so understated a teardown by the retry count, and every phase that budgets
+ * around a teardown inherited that error.
+ */
+export function handsStopCeilingMs(): number {
+  return STOP_ATTEMPTS * STOP_ATTEMPT_TIMEOUT_MS
+    + (STOP_ATTEMPTS - 1) * STOP_RETRY_DELAY_MS;
+}
+
+/**
  * The bounds above, parameterised for the reason bootstrap's commands are: the
  * production numbers are sized for a real control plane, and a test of the
  * never-stops path should not have to wait all of them out.

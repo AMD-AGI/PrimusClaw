@@ -339,7 +339,12 @@ export async function bootstrapHandsInSandbox(
    */
   env?: Record<string, string>,
 ): Promise<void> {
-  const mkdir = await execFn("mkdir -p /workspace && chmod 777 /workspace", "30s");
+  // Preparing the workspace is housekeeping, so it stays out of the job roster
+  // the same way the probes do. Counted as a user job it would make a sandbox
+  // look briefly busy on every restart, for a mkdir that has already returned.
+  const mkdir = await execFn(
+    "mkdir -p /workspace && chmod 777 /workspace", "30s", { untracked: true },
+  );
   if (mkdir.exitCode !== 0) {
     throw new Error(
       `bootstrap.mkdir_workspace exit_code=${mkdir.exitCode} stderr=${mkdir.stderr.slice(0, 300)}`,
