@@ -18,7 +18,7 @@
     "@claw/protocol": "*",
     "@claw/utils": "*",
     "@modelcontextprotocol/sdk": "^1.12.0",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "axios": "^1.20.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.12.1",
