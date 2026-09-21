@@ -496,6 +496,41 @@ export async function reapPendingHands(
       );
       return;
     }
+    // No task id on the entry, which the gate above cannot judge. What decides
+    // is whether anyone still HOLDS it -- the same question, and the same read,
+    // the collector uses (`readRunLeaseState` over `lock.<runScope>`).
+    //
+    // Held: leave it. Reaping on the session alone is the mis-kill this branch
+    // exists to stop -- a lazy chat turn that never asked for a sandbox,
+    // failing, and tearing down the workload a sibling is still queueing for.
+    // Somebody is alive behind that lease and the entry is theirs.
+    //
+    // Free, or unscoped, or unreadable: reap it. This path is the only teardown
+    // such an entry will get, and the reason is a number rather than a
+    // principle: the bucket's TTL is DEFAULT_BRAIN_REGISTRY_TTL_MS (5 minutes,
+    // protocol/src/run-lease.ts) and `collectAbandonedPending` does not look
+    // until SANDBOX_PENDING_ABANDONED_AFTER_MS (2 hours). An entry nobody
+    // refreshes evaporates hours before the collector could reach it, so
+    // "leave it to the sweeper" is not deferral, it is the workload leaking
+    // with nothing left that names it.
+    //
+    // The merge that brought the two ownership gates together reasoned only
+    // about the task id -- that an entry without one could only predate both
+    // fields and so had no collector behind it. That was wrong twice over:
+    // `94b63ef` on this branch wrote `runScope` and not yet `taskId`, so the
+    // scoped-but-unnamed entry it said could not exist is what a rolling
+    // upgrade produces; and the first correction, which deferred every scoped
+    // entry to the collector, missed that the collector never gets one.
+    if (expected?.taskId && !info.taskId
+        && typeof info.runScope === "string" && info.runScope
+        && await readRunLeaseState(kv, info.runScope) === "held") {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, runScope: info.runScope,
+          taskId: expected.taskId },
+        "hands.reap_pending_skipped_unnamed_but_held",
+      );
+      return;
+    }
     // Re-asked after the read, not only before it. The caller checks that it
     // still holds the lock before calling -- but the check and the teardown are
     // separated by a KV round trip, and that is exactly long enough for the
@@ -712,10 +747,16 @@ async function collectAbandonedPending(
   revokeHandsToken(token);
   unregisterSandbox(sessionId, info as HandsProbeEntry);
   if (!await deleteHandsEntryIfRevision(kv, key, revision)) {
+    // Stopped but not cleaned up: the entry moved under the CAS, so the record
+    // is still there and a later pass will read it again. Saying "collected"
+    // after this is the same overclaim the split above was made to end, one
+    // step further along -- the workload is down, but the thing the collector
+    // was asked to remove is not gone.
     logger.warn({ sessionId, key, revision, workloadId }, "sweeper.pending_entry_left_after_stop");
+    return true;
   }
   // The claim the event above used to make, now made where it is true: the stop
-  // was confirmed and the entry is gone. Info rather than error -- by this point
+  // was confirmed AND the entry is gone. Info rather than error -- by this point
   // the thing an operator has to act on has already been reported, and what this
   // adds is that it needed no further action.
   logger.info({ sessionId, key, workloadId, ageMs }, "sweeper.pending_abandoned_collected");

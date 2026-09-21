@@ -73,7 +73,16 @@ function pending(workloadId: string, ageMs: number, extra: Record<string, unknow
 
 interface Deletion { key: string; previousSeq?: number }
 
-function bindKv(seed: Record<string, unknown>, throwOn: Set<string> = new Set()) {
+function bindKv(
+  seed: Record<string, unknown>,
+  throwOn: Set<string> = new Set(),
+  /**
+   * Keys whose revision-conditional delete declines, the way a lost CAS does.
+   * `deleteHandsEntryIfRevision` reads a throw as "not deleted", so this is the
+   * shape a refresh landing between the read and the delete presents.
+   */
+  deleteThrowsOn: Set<string> = new Set(),
+) {
   const values = new Map<string, string>(
     Object.entries(seed).map(([k, v]) => [k, JSON.stringify(v)]),
   );
@@ -94,6 +103,7 @@ function bindKv(seed: Record<string, unknown>, throwOn: Set<string> = new Set())
     async put() { return 1; },
     async update() { return REVISION + 1; },
     async delete(key: string, opts?: { previousSeq?: number }) {
+      if (deleteThrowsOn.has(key)) throw new Error("wrong last sequence");
       deleted.push({ key, previousSeq: opts?.previousSeq });
       values.delete(key);
     },
@@ -392,4 +402,35 @@ test("a stop that never happened is not reported as a collection", async () => {
     "but nothing may claim the workload was collected: it is still running",
   );
   assert.ok(values.has(KEY), "and the entry stays, as the only record that names it");
+});
+
+test("a delete that lost its CAS is not reported as a collection either", async () => {
+  // One step further along the same overclaim. The stop succeeded, so the
+  // workload is down -- but the entry moved under the revision-conditional
+  // delete and is still in the bucket, which is the thing this collector was
+  // asked to remove. A later pass reads it again; until then nothing may say it
+  // was collected.
+  const DELETE_RACED = "wl-delete-raced";
+  const { values } = bindKv(
+    { [KEY]: pending(DELETE_RACED, HORIZON + 60_000) },
+    new Set(),
+    new Set([KEY]),
+  );
+  const stopped = recordStops();
+  healthyEndpoints();
+
+  const lines = await captureLogLines(
+    () => sweepStaleHandsForTest(), "sweeper.pending_entry_left_after_stop");
+
+  const mine = lines.filter((l) => l.includes(DELETE_RACED) || l.includes(KEY));
+  assert.deepEqual(stopped, [DELETE_RACED], "the stop itself did happen");
+  assert.ok(
+    mine.some((l) => l.includes('"msg":"sweeper.pending_entry_left_after_stop"')),
+    "and the entry that outlived it is reported",
+  );
+  assert.equal(
+    mine.some((l) => l.includes('"msg":"sweeper.pending_abandoned_collected"')), false,
+    "but the collection is not claimed while the record is still there",
+  );
+  assert.ok(values.has(KEY), "the record really is still there");
 });

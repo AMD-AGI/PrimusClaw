@@ -183,3 +183,47 @@ test("and a retained container is never what a session's reap stops", async () =
   assert.deepEqual(deleted, []);
   assert.ok(values.has(key));
 });
+
+test("an entry with no task is left alone while its lease is still held", async () => {
+  // The case the merge of the two ownership gates got wrong, and then the first
+  // correction got wrong differently. The merge argued an entry without a task
+  // id could only predate both fields; but 94b63ef on this branch wrote
+  // `runScope` and not yet `taskId`, so a rolling upgrade across it produces a
+  // scoped, unnamed entry -- and the merge reaped it, which is the mis-kill
+  // this branch was opened to stop.
+  //
+  // What decides is whether anyone still holds it. A held lease means somebody
+  // is alive behind this entry and the workload is theirs.
+  const { values, deleted } = bindKv({
+    [KEY]: { ...pendingEntry(PREDECESSOR, Date.now() - 600_000), taskId: undefined },
+    [`lock.${SESSION}`]: { holder: "someone-else" },
+  });
+  const stopped = recordStops();
+
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
+
+  assert.deepEqual(stopped, [],
+    `stopped ${JSON.stringify(stopped)} -- the lease behind this entry is still held, so the `
+    + "workload belongs to whoever holds it");
+  assert.deepEqual(deleted, []);
+  assert.ok(values.has(KEY));
+});
+
+test("but reaped once the lease is gone, because nothing else will reach it", async () => {
+  // The other side, and why the fix is not "skip unnamed entries". The bucket's
+  // TTL is 5 minutes and `collectAbandonedPending` does not look until 2 hours,
+  // so an entry nobody refreshes evaporates long before the collector could
+  // take it. Leaving it is not deferral -- it is the workload leaking with
+  // nothing left that names it.
+  const { values, deleted } = bindKv({
+    [KEY]: { ...pendingEntry(PREDECESSOR, Date.now() - 600_000), taskId: undefined },
+  });
+  const stopped = recordStops();
+
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
+
+  assert.deepEqual(stopped, [PREDECESSOR],
+    "no lease, no collector in reach: this path is the only teardown it gets");
+  assert.deepEqual(deleted, [KEY]);
+  assert.equal(values.has(KEY), false);
+});
