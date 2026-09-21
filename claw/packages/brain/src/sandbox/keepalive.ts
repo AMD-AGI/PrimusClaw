@@ -1087,8 +1087,13 @@ const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
  * defer, and writing it would put a conditional update in the path of a stop
  * that is already failing.
  */
-export const TEARDOWN_RETRY_BACKOFF_MS =
-  Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 5 * 1000;
+// Capped below the bucket TTL: a closing record is not renewed by the ping
+// phase, so a backoff at or above the TTL expires the entry before the retry
+// can fire and silently abandons the stop.
+export const TEARDOWN_RETRY_BACKOFF_MS = Math.min(
+  Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 5 * 1000,
+  Math.max(1, Math.floor(BRAIN_REGISTRY_TTL_MS / 2)),
+);
 const teardownRetryAt = new Map<string, number>();
 
 /** Whether a teardown that failed is still inside its backoff. */
@@ -1100,6 +1105,27 @@ function teardownDeferred(sessionId: string, now: number): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Refresh every target the census still holds after a phase that can outlast a
+ * single bucket TTL between the walk's renew and the ping phase's.
+ */
+async function renewCensusTargets(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<void> {
+  for (const registered of targets.values()) {
+    const sid = registered.entry.sessionId || registered.sessionId;
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // The ping phase retries; a missed refresh here is not a stop.
+    }
+  }
 }
 /**
  * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
@@ -1741,7 +1767,7 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
       } else if (err instanceof SandboxRuntimeTerminalError) {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
       } else if (err instanceof SandboxTrackingLostError) {
-        logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+        logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
       } else if (err instanceof SandboxJobsUnavailableError) {
         logger.info(
           { sessionId, workloadId: info.workloadId, status: err.httpStatus },
@@ -2085,7 +2111,16 @@ async function collectTargets(
         // cannot succeed would otherwise re-pay its whole cost every sweep for
         // a set that never shrinks.
         teardownRetryAt.set(item.sessionId, clock() + TEARDOWN_RETRY_BACKOFF_MS);
-        logger.warn({ err, sessionId: item.sessionId }, `keepalive.${item.site}`);
+        logger.error(
+          {
+            err: (err as Error)?.message ?? String(err),
+            sessionId: item.sessionId,
+            workloadId: item.info.workloadId,
+            site: item.site,
+            retryInMs: TEARDOWN_RETRY_BACKOFF_MS,
+          },
+          `keepalive.${item.site}`,
+        );
       });
   });
   await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
@@ -2102,6 +2137,10 @@ async function collectTargets(
       "keepalive.idle_expiry_budget_exhausted",
     );
   }
+  // The idle-expiry phase sits between the census renew and the ping renew.
+  // With a long stop ceiling that gap alone can approach the bucket TTL, so
+  // live targets are refreshed again before the walk returns.
+  await renewCensusTargets(deps, census.targets);
   const dagComplete = await collectDagTargets(deps, census);
   stats.probes += dispatchProbes(deps, census.probeCandidates);
   // Accounted apart from the reads, and only accounted: the reads happen after
@@ -2175,6 +2214,9 @@ async function collectKvTarget(
   // unresponsive control plane spends the sweep on teardowns and the ping phase
   // behind it never renews a single live record.
   if (isClosingStatus(info.status)) {
+    // Renewed here: closing records are not ping targets, and without a refresh
+    // the bucket TTL drops them during the teardown backoff.
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
     if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
       census.teardowns.push({ sessionId, info, site: "closing_stop_retry" });
     }
@@ -2182,6 +2224,7 @@ async function collectKvTarget(
   }
   if (info.status && info.status !== "ready") return true;
   if (info.terminalReason) {
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
     if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
       logger.error(
         { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
@@ -2334,7 +2377,7 @@ async function expireIdleTarget(
         logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
       });
     } else if (err instanceof SandboxTrackingLostError) {
-      logger.warn({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
+      logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
       if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     } else if (err instanceof SandboxJobsUnavailableError) {
       logger.info(
@@ -2380,7 +2423,15 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
         if (!usable) continue;
         const key = sandboxRegistryKey(entry);
         census.seenIdentities.add(key);
-        if (!census.targets.has(key)) census.targets.set(key, { sessionId: dagRoot, entry });
+        if (!census.targets.has(key)) {
+          // The Hands entry is keyed by the user session, not the DAG root.
+          // Using the root here made reportTerminalFailure and the ping renew
+          // look up a key that never exists.
+          census.targets.set(key, {
+            sessionId: entry.sessionId || dagRoot,
+            entry,
+          });
+        }
       }
     }
     return true;
@@ -2735,7 +2786,12 @@ async function pingSandbox(
     return null;
   } catch (error: any) {
     if (error instanceof SandboxRuntimeTerminalError) {
-      await reportTerminalFailure(deps, sessionId, targetKey, error.reason);
+      await reportTerminalFailure(
+        deps,
+        entry.sessionId || sessionId,
+        targetKey,
+        error.reason,
+      );
     }
     if (error?.sandboxConfirmedRunning === true) {
       failCounts.delete(targetKey);

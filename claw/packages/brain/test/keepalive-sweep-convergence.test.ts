@@ -124,12 +124,17 @@ test("the teardown backoff outlasts the sweep interval", async () => {
   // reaches the record, so it defers nothing and the cost it exists to bound is
   // paid every sweep anyway. Pinned because the first version of this backoff
   // was exactly one interval and read as working while doing nothing.
-  const { SANDBOX_KEEPALIVE_INTERVAL_SEC } = await import("../src/config.js");
+  const { SANDBOX_KEEPALIVE_INTERVAL_SEC, BRAIN_REGISTRY_TTL_MS } = await import("../src/config.js");
   const { TEARDOWN_RETRY_BACKOFF_MS } = await import("../src/sandbox/keepalive.js");
   assert.ok(
     TEARDOWN_RETRY_BACKOFF_MS > SANDBOX_KEEPALIVE_INTERVAL_SEC * 1000,
     `a ${TEARDOWN_RETRY_BACKOFF_MS}ms backoff does not outlast a `
       + `${SANDBOX_KEEPALIVE_INTERVAL_SEC}s sweep interval`,
+  );
+  assert.ok(
+    TEARDOWN_RETRY_BACKOFF_MS < BRAIN_REGISTRY_TTL_MS,
+    `a ${TEARDOWN_RETRY_BACKOFF_MS}ms backoff at or above the `
+      + `${BRAIN_REGISTRY_TTL_MS}ms bucket TTL abandons the stop before it retries`,
   );
 });
 
@@ -274,9 +279,10 @@ test("the declared sweep span covers a sweep's real worst case", () => {
   // stop with retries, so a term naming one attempt understates the phase by
   // the retry count -- and the refresh gap and the reclaim horizon are both
   // derived from this span.
-  assert.ok(
-    handsStopCeilingMs() > 30_000,
-    "a teardown is a stop with retries, not a single attempt",
+  assert.equal(
+    handsStopCeilingMs(),
+    3 * 30_000 + 2 * 1_000,
+    "the ceiling is attempts x stop timeout plus the waits between them",
   );
   assert.ok(
     keepaliveIdleExpiryPhaseCeilingSec() * 1000 > handsStopCeilingMs(),
@@ -287,4 +293,83 @@ test("the declared sweep span covers a sweep's real worst case", () => {
     `the shipped span ${SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC}s does not cover a worst-case `
       + `tick of ${keepaliveSweepCeilingSec()}s`,
   );
+});
+
+test("the idle-expiry budget bars idle reclamations, not only closing teardowns", async () => {
+  // The closing-handle case shares the budget with idle expiries, so a guard
+  // that only wraps teardowns still keeps that case green. Idle expiries are
+  // the other starter of destroyHands in this phase, and removing only their
+  // budget check used to leave CI green.
+  const now = 1_000_000_000;
+  const idleSince = now - 3_600_000;
+  const handles = 4;
+  const store = new Map<string, { value: Uint8Array; revision: number }>();
+  for (let i = 0; i < handles; i++) {
+    store.set(`hands.sess-idle-${i}`, {
+      value: sc.encode(JSON.stringify({
+        status: "ready",
+        provider: "safe-workload",
+        workloadId: `wl-idle-${i}`,
+        platformKey: "pk",
+        namespace: "ns",
+        handsUrl: "http://sandbox:9100/mcp",
+        token: "tok",
+        keepalive: false,
+        idleSince,
+        idleEpoch: idleSince,
+        idleRev: 3,
+        quiescedAt: idleSince,
+        bgCheckedAt: now - 1_000,
+        bgRunning: 0,
+        bgEpoch: idleSince,
+        bgIdleSince: idleSince,
+        bgIdleRev: 3,
+        bgRev: 4,
+      })),
+      revision: 5,
+    });
+  }
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...store.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async get(k: string) {
+      const hit = store.get(k);
+      return hit ? { key: k, value: hit.value, revision: hit.revision } : null;
+    },
+    async delete(k: string) { store.delete(k); },
+    async put() { return 1; },
+    async update(k: string, value: Uint8Array, rev: number) {
+      store.set(k, { value, revision: rev + 1 });
+      return rev + 1;
+    },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  let stops = 0;
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop() { stops += 1; },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async () => 0,
+      idleExpiryBudgetMs: 0,
+      now: () => now,
+    });
+    assert.equal(
+      stops, 0,
+      `an exhausted budget still started ${stops} of ${handles} idle reclamations`,
+    );
+    assert.equal(store.size, handles, "a deferred idle expiry must leave its record alone");
+  } finally {
+    restoreRetry();
+    restore();
+    for (const key of store.keys()) unregisterSandbox(key.replace("hands.", ""));
+  }
 });

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -419,4 +420,76 @@ func TestOnlyHandsItselfIsExcludedFromTheCount(t *testing.T) {
 			t.Errorf("isHandsProcess(%q) = %v, want %v", tc.cmd, got, tc.want)
 		}
 	}
+}
+
+func TestKilledTrackedShimLatchesTrackingLoss(t *testing.T) {
+	requireJobShim(t)
+	// A tracked supervisor that dies on a non-SIGTERM signal leaves its
+	// setsid descendants re-parented onto PID 1, outside every roster walk.
+	// tracking_lost is the only record of that; deleting markLost would make
+	// the sandbox look idle while the orphan keeps running.
+	s := newTestServer()
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	var out synchronizedBuffer
+	_, exitCh, drained, _, err := s.startTrackedCommand(
+		[]string{"sh", "-c", fmt.Sprintf(
+			"setsid sh -c 'echo $$ > %s; sleep 60' >/dev/null 2>&1 & exit 0", pidFile,
+		)},
+		"", os.Environ(), &out, &out, jobTracking{track: true, hands: true},
+	)
+	if err != nil {
+		t.Fatalf("startTrackedCommand: %v", err)
+	}
+	select {
+	case code := <-exitCh:
+		if code != 0 {
+			t.Fatalf("the primary command failed: exit=%d", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the primary command did not finish")
+	}
+	descendant := 0
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if raw, readErr := os.ReadFile(pidFile); readErr == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr == nil {
+				descendant = pid
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if descendant == 0 {
+		t.Fatal("the detached descendant never reported its pid")
+	}
+	info, ok := readProc("/proc", descendant)
+	if !ok {
+		t.Fatalf("the detached descendant %d is already gone", descendant)
+	}
+	shim := info.ppid
+	if shim <= 1 {
+		t.Fatalf("descendant parent is %d; expected the still-running shim", shim)
+	}
+	if err := syscall.Kill(shim, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL shim %d: %v", shim, err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the killed shim was not reaped")
+	}
+	snap, err := s.jobs.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.lost {
+		t.Fatal("killing a tracked shim did not latch tracking_lost")
+	}
+	after, ok := readProc("/proc", descendant)
+	if !ok {
+		t.Fatalf("the orphaned descendant %d exited before the assertion", descendant)
+	}
+	if after.ppid != 1 {
+		t.Fatalf("orphaned descendant ppid=%d, want 1 (init)", after.ppid)
+	}
+	_ = syscall.Kill(descendant, syscall.SIGKILL)
 }

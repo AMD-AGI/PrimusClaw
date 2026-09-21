@@ -1843,21 +1843,34 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   const identity = reuseIdentity(info);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
   if (typeof info.terminalReason === "string" && info.terminalReason) {
-    // Deliberately unguarded, unlike the two branches that raise this from a
-    // probe they just took: there the sandbox is known terminal and the reason
-    // is what the turn must report, while here the reason was recorded earlier
-    // and a stop that fails says this teardown did not happen. Raising the stop
-    // error keeps the message retryable instead of reporting a session failure
-    // on the strength of a call that may succeed next time.
-    await reuseEffects.destroyHands(
+    // The previous sandbox is already finished: this turn is new work, not a
+    // retry of the one that died. Tear down whatever the control plane still
+    // holds so a replacement is not admitted beside a stuck workload, then fall
+    // through to ordinary provision. The failure is not surfaced to the user --
+    // a parked sandbox's death is not this message's outcome -- but it is logged
+    // so operators can see the replace.
+    const terminalFields = {
       sessionId,
-      identity,
-      hasToken ? info.token : undefined,
-    );
-    throw new SandboxProvisionTerminalError(
-      info.terminalReason,
-      `sandbox workload entered terminal phase (${info.terminalReason})`,
-    );
+      workloadId: info.workloadId ?? null,
+      provider: info.provider ?? null,
+      sandboxName: info.sandboxName ?? null,
+      reason: info.terminalReason,
+    };
+    logger.info(terminalFields, "ensureHands.terminal_entry_rebuilding");
+    try {
+      await reuseEffects.destroyHands(
+        sessionId,
+        identity,
+        hasToken ? info.token : undefined,
+      );
+      logger.info(terminalFields, "ensureHands.terminal_workload_stopped");
+    } catch (err) {
+      logger.warn(
+        { ...terminalFields, err: (err as Error)?.message ?? String(err) },
+        "ensureHands.terminal_cleanup_failed",
+      );
+    }
+    return null;
   }
 
   // Multi-node bakes cluster env at sandbox create; hands never reloads env.

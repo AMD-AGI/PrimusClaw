@@ -16,7 +16,7 @@ import { startSandboxKeepalive } from "./sandbox/keepalive.js";
 import {
   validateKeepaliveCapacity, type CapacitySettings,
 } from "./sandbox/keepalive-capacity.js";
-import { keepalivePingsPerSweep, keepaliveSweepCeilingSec } from "./sandbox/keepalive.js";
+import { keepalivePingsPerSweep, keepaliveSweepCeilingSec, TEARDOWN_RETRY_BACKOFF_MS } from "./sandbox/keepalive.js";
 import { toolTimeoutCeilingSec } from "./tools/hands.js";
 import { rosterDeps } from "./sandbox/roster-store.js";
 import { bindAdmission } from "./sandbox/admission.js";
@@ -435,6 +435,32 @@ function validateStartupConfig(): void {
         entryTtlMs: BRAIN_REGISTRY_TTL_MS,
       },
       "startup.idle_reclaim_unreachable (MULTI_NODE_SWEEPER_INTERVAL_MS must be below BRAIN_REGISTRY_TTL_MS)",
+    );
+  }
+
+  // A closing/terminal handle is only renewed on the walk that offers it for
+  // teardown. A backoff at or above the bucket TTL lets the entry expire before
+  // the retry fires, and the stop is abandoned with no further log.
+  if (TEARDOWN_RETRY_BACKOFF_MS >= BRAIN_REGISTRY_TTL_MS) {
+    logger.error(
+      {
+        teardownRetryBackoffMs: TEARDOWN_RETRY_BACKOFF_MS,
+        entryTtlMs: BRAIN_REGISTRY_TTL_MS,
+      },
+      "startup.teardown_retry_unreachable (TEARDOWN_RETRY_BACKOFF_MS must be below BRAIN_REGISTRY_TTL_MS)",
+    );
+  }
+
+  // The declared sweep worst case is longer than the bucket TTL. Live handles
+  // are renewed mid-sweep, so this is not by itself a silent orphan -- but a
+  // deployment whose TTL is shorter than one phase gap still loses records.
+  if (keepaliveSweepCeilingSec() * 1000 >= BRAIN_REGISTRY_TTL_MS) {
+    logger.error(
+      {
+        sweepCeilingMs: keepaliveSweepCeilingSec() * 1000,
+        entryTtlMs: BRAIN_REGISTRY_TTL_MS,
+      },
+      "startup.sweep_ceiling_exceeds_registry_ttl (raise BRAIN_REGISTRY_TTL_MS or shrink keepalive phase budgets)",
     );
   }
 

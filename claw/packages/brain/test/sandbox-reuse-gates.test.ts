@@ -813,7 +813,29 @@ test("reuse is refused while the fleet is uncounted, and registers nothing", asy
   }
 });
 
-test("a failed terminal cleanup is retryable rather than a permanent session failure", async () => {
+test("a parked terminal entry is torn down and replaced rather than failing the turn", async () => {
+  // The user sent a new message; the previous sandbox's death is not this
+  // turn's outcome. The workload is stopped first so a replacement is not
+  // admitted beside one that is still billed, then reuse falls through.
+  const destroyed: string[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    destroyHands: async (sessionId) => { destroyed.push(sessionId); },
+    registerSandbox: (() => {}) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive", reason: "exec_ok" as const }),
+    restartHandsInSandbox: async () => ({ ok: true, detail: "healthy" }),
+    countLiveWork: async () => ({ verdict: "clear", classes: {}, reason: "clear" }),
+    retainContainer: async () => "retained",
+  });
+  const { a } = attempt({
+    ...LIVE,
+    specFingerprint: specOf(),
+    terminalReason: "sandbox_timed_out",
+  });
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"]);
+});
+
+test("a failed terminal cleanup still lets the turn provision a replacement", async () => {
   restoreEffects = bindSandboxReuseEffects({
     destroyHands: async () => { throw new Error("stop failed"); },
     registerSandbox: (() => {}) as never,
@@ -827,7 +849,7 @@ test("a failed terminal cleanup is retryable rather than a permanent session fai
     specFingerprint: specOf(),
     terminalReason: "sandbox_timed_out",
   });
-  await assert.rejects(() => tryReuseSessionSandbox(a), /stop failed/);
+  assert.equal(await tryReuseSessionSandbox(a), null);
 });
 
 // A pending entry is not automatically this task's leftover.
