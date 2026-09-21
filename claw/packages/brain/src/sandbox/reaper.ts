@@ -460,14 +460,6 @@ export async function reapPendingHands(
   expected?: {
     taskId?: string | null;
     stillOwned?: () => boolean;
-    /**
-     * When this caller asked for its own sandbox, or null if it never did.
-     *
-     * The fallback for an entry that names no task, which the comparison above
-     * cannot judge. Per-entry and per-run facts only: the lease deliberately
-     * plays no part, see the block that uses it.
-     */
-    ownedSinceMs?: number | null;
   },
 ): Promise<void> {
   try {
@@ -504,52 +496,48 @@ export async function reapPendingHands(
       );
       return;
     }
-    // No task id on the entry, which the comparison above cannot judge. What
-    // decides is WHEN it was written against when this run asked for its own
-    // sandbox: an entry stamped before that ask was written by something else.
+    // No task id on the entry. For a caller that HAS one this is not an
+    // ambiguous case to be judged -- it is a certainty, and the certainty runs
+    // the other way from the field's absence.
     //
-    // Per-entry and per-run facts only, and the run lease deliberately plays no
-    // part. Three versions of this gate were wrong before this one, the last
-    // two because they reached for a signal that does not answer the question:
+    // A pending entry reaches this bucket from exactly one writer,
+    // `makeOnProvisioned` (ensure-hands.ts), which always records
+    // `taskId: deps.taskId ?? null` from the request that asked; the ready form
+    // does the same, and keepalive's refreshes rewrite the parsed entry whole
+    // (`{ ...info }`), so the field survives every later write. An entry
+    // carrying no task id therefore cannot have been written by a task-bearing
+    // run of this build. It is somebody else's -- an older process, from before
+    // the field existed -- and nothing this run did can be behind it.
     //
-    //  - the merge asked only about `taskId`, reasoning that an entry without
-    //    one predated both fields and so had no collector behind it. `94b63ef`
-    //    on this branch wrote `runScope` and not yet `taskId`, so a rolling
-    //    upgrade produces the entry that argument called impossible -- reaped,
-    //    while a live run was still provisioning it.
-    //  - the next deferred every scoped entry to `collectAbandonedPending`,
-    //    which does not look until SANDBOX_PENDING_ABANDONED_AFTER_MS (2h)
-    //    while the bucket's TTL is DEFAULT_BRAIN_REGISTRY_TTL_MS (5 min). The
-    //    entry evaporates first: not deferral, a leak.
-    //  - the next read the run lease. Under the default `RUN_GATE_KEY=workspace`
-    //    `runScope` is `ws.<workspaceId>`, one lock for every run in the
-    //    workspace, so "held" says only that SOMEBODY there is busy -- it is
-    //    not evidence about this entry, and a redelivery of the same task reads
-    //    its own lock. handles.ts and keepalive.ts both already refuse this
-    //    exact inference in as many words: a lease read keyed off something
-    //    workspace-granular "is the defect rather than the fix".
+    // Which is why no comparison is made here at all. Four versions of this
+    // gate each reached for a different signal to decide the same question, and
+    // each signal turned out to answer a different one:
     //
-    // The direction of the remaining error is the one this subsystem takes
-    // everywhere else: an entry that is not provably ours is left alone, and a
-    // workload nobody reclaims is the cost. `collectAbandonedPending` is the
-    // net under those -- a net with a hole of its own, since the horizon it
-    // uses outlasts the bucket TTL, which is a gap in that sweep rather than
-    // something this gate can close by stopping containers it cannot identify.
+    //  - `runScope` presence: said only which fields an old writer happened to
+    //    set, and `94b63ef` on this branch set that one and not `taskId`.
+    //  - "leave it to `collectAbandonedPending`": that sweep's horizon
+    //    (SANDBOX_PENDING_ABANDONED_AFTER_MS, 2h) outlasts the bucket TTL
+    //    (DEFAULT_BRAIN_REGISTRY_TTL_MS, 5 min), so the entry expires first.
+    //  - the run lease: under the default `RUN_GATE_KEY=workspace` that lock is
+    //    `ws.<workspaceId>`, one for every run in the workspace, so "held"
+    //    reported a stranger's traffic -- and a redelivery read its own lock.
+    //    handles.ts and keepalive.ts each refuse this inference in as many
+    //    words.
+    //  - `createdAt` against this run's own ask: two clocks, two processes. A
+    //    replica five seconds fast made a run that had created nothing at all
+    //    look like the entry's author.
+    //
+    // The cost is a workload this path will not reclaim when an old entry is
+    // genuinely abandoned, bounded by SANDBOX_DEFAULT_TIMEOUT_SECONDS and by
+    // whatever `collectAbandonedPending` can still reach. That is the direction
+    // this subsystem takes everywhere: a stop it cannot establish is safe is
+    // not a stop it makes.
     if (expected?.taskId && !info.taskId) {
-      const createdAt = Date.parse(typeof info.createdAt === "string" ? info.createdAt : "");
-      const since = expected.ownedSinceMs ?? null;
-      if (since === null || !Number.isFinite(createdAt) || createdAt < since) {
-        logger.info(
-          {
-            sessionId,
-            workloadId: info.workloadId,
-            createdAt: info.createdAt,
-            askedAt: since === null ? null : new Date(since).toISOString(),
-          },
-          "hands.reap_pending_not_ours",
-        );
-        return;
-      }
+      logger.info(
+        { sessionId, workloadId: info.workloadId, taskId: expected.taskId },
+        "hands.reap_pending_not_ours",
+      );
+      return;
     }
     // Re-asked after the read, not only before it. The caller checks that it
     // still holds the lock before calling -- but the check and the teardown are

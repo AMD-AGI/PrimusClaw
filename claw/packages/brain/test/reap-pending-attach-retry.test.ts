@@ -71,9 +71,19 @@ function fakeKv(seed: Record<string, string> = {}) {
   };
 }
 
-function pendingValue(workloadId: string, createdAtMs: number): string {
+function pendingValue(
+  workloadId: string,
+  createdAtMs: number,
+  /**
+   * The task that asked. `makeOnProvisioned` always records it, so an entry
+   * this run minted carries this run's id -- which is what makes it reapable
+   * by name rather than by a guess about when it was written.
+   */
+  taskId = "task-attach-retry",
+): string {
   return JSON.stringify({
     status: "pending",
+    taskId,
     provider: "safe-workload",
     workloadId,
     platformKey: "pk",
