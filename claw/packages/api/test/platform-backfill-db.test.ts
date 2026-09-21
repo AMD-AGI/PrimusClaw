@@ -37,6 +37,9 @@ before(async () => {
       -- The attempt the row belongs to now. The drain projects it so the reader
       -- can tell a handle a previous attempt recorded from this one's.
       attempt_id TEXT,
+      -- Settlement nulls attempt_id and moves the value here, and every row the
+      -- drain sees is settled -- so this is the column the guard actually reads.
+      settled_attempt_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at TIMESTAMPTZ,
       platform_message TEXT,
@@ -88,8 +91,10 @@ interface SeedOptions {
   status?: string;
   handle?: string | null;
   metadata?: Record<string, unknown>;
-  /** The attempt the row belongs to now. */
+  /** The attempt the row belongs to now; null once it has settled. */
   attemptId?: string | null;
+  /** Where settlement moves it. Every row the drain sees has this, not the above. */
+  settledAttemptId?: string | null;
   completedAgoMs?: number;
   retryDelayMs?: number;
   attempts?: number;
@@ -107,8 +112,8 @@ async function seed(id: string, reason: string, opts: SeedOptions = {}): Promise
     `INSERT INTO claw_tasks (
        task_id, session_id, status, failure_reason, sandbox_workload_id, metadata, completed_at,
        platform_facts_next_retry_at, platform_facts_attempts, platform_facts_resolved_at, origin, created_at,
-       attempt_id
-     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $11, $10, $12)`,
+       attempt_id, settled_attempt_id
+     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $11, $10, $12, $13)`,
     [id, opts.status ?? "failed", reason,
       opts.handle === undefined ? `wl-${id}` : opts.handle,
       JSON.stringify(opts.metadata ?? {}),
@@ -116,7 +121,7 @@ async function seed(id: string, reason: string, opts: SeedOptions = {}): Promise
       opts.retryDelayMs === undefined ? null : new Date(now + opts.retryDelayMs),
       opts.attempts ?? 0, opts.resolved ? new Date(now) : null, new Date(now - 300_000),
       opts.origin ?? "chat",
-      opts.attemptId ?? null],
+      opts.attemptId ?? null, opts.settledAttemptId ?? null],
   );
 }
 
@@ -355,4 +360,49 @@ test("but its own attempt's handle is read as before", async () => {
 
   assert.notEqual((await row("same-attempt")).platform_facts_attempts, 0,
     "the drain still claims and reads a handle the row's own attempt recorded");
+});
+
+test("the guard fires on a settled row, which is the only kind this drain sees", async () => {
+  // Twice now this guard shipped inert, and both times the gap was between the
+  // value the writer produced and the value this reader could see. The first
+  // time no writer wrote it. The second time the reader read `attempt_id`, and
+  // settlement nulls that column and moves the value to `settled_attempt_id`
+  // (tasks/run-claim.ts) -- while the drain selects `status = 'failed'`, so
+  // every row it processes has already settled. The comparison had nothing on
+  // one side for its entire population.
+  //
+  // So this fixture is a SETTLED row, the shape the drain really fetches.
+  await seed("settled-cross-attempt", "worker_lost", {
+    handle: null,
+    attemptId: null,
+    settledAttemptId: "attempt-B",
+    metadata: {
+      sandbox: { provider: "safe-workload", handle: "workload-of-attempt-A" },
+      sandbox_attempt: "attempt-A",
+    },
+  });
+
+  await drainPendingPlatformFacts();
+
+  const closed = await row("settled-cross-attempt");
+  assert.equal(closed.platform_node, null,
+    "a handle another attempt recorded may not close this row, settled or not");
+  assert.equal(closed.platform_facts_resolved_at, null);
+});
+
+test("and still reads a settled row's own handle", async () => {
+  await seed("settled-same-attempt", "worker_lost", {
+    handle: null,
+    attemptId: null,
+    settledAttemptId: "attempt-B",
+    metadata: {
+      sandbox: { provider: "safe-workload", handle: "workload-of-attempt-B" },
+      sandbox_attempt: "attempt-B",
+    },
+  });
+
+  await drainPendingPlatformFacts();
+
+  assert.notEqual((await row("settled-same-attempt")).platform_facts_attempts, 0,
+    "the guard must not refuse the row's own handle once it has settled");
 });

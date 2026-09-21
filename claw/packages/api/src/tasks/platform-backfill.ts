@@ -86,7 +86,13 @@ async function claimRow(row: SweptRow): Promise<SweptRow | null> {
       -- attempt_id travels with the claimed row because resolveSandbox reads
       -- THIS row, not the one the drain selected: the handle in metadata may
       -- belong to an attempt the row has since moved past.
-      RETURNING task_id, session_id, sandbox_workload_id, metadata, attempt_id,
+      -- COALESCE, because this reader only ever sees SETTLED rows: settlement
+      -- nulls attempt_id and moves the value to settled_attempt_id
+      -- (tasks/run-claim.ts), and the drain selects status = failed. Reading the
+      -- live column alone left the comparison with nothing on one side for every
+      -- row it actually processes, so the guard never fired.
+      RETURNING task_id, session_id, sandbox_workload_id, metadata,
+                COALESCE(attempt_id, settled_attempt_id) AS attempt_id,
                 origin, created_at, completed_at`,
     [row.task_id, RETRY_BASE_SEC, RETRY_MAX_SEC],
   );
@@ -413,7 +419,8 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
 export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
     `WITH eligible AS (
-       SELECT task_id, session_id, sandbox_workload_id, metadata, attempt_id,
+       SELECT task_id, session_id, sandbox_workload_id, metadata,
+              COALESCE(attempt_id, settled_attempt_id) AS attempt_id,
               platform_facts_next_retry_at IS NOT NULL AS retried,
               ROW_NUMBER() OVER (
                 PARTITION BY (platform_facts_next_retry_at IS NOT NULL)
