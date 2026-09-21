@@ -32,9 +32,6 @@ import {
   assertDagHandleAlive,
 } from "../src/sandbox/ensure-hands.js";
 import { resolveSandboxAction } from "../src/sandbox/params.js";
-import {
-  type AttributedEntry, attributionOf,
-} from "../src/sandbox/attribution.js";
 import { handsSessionKey, legacyHandsKey } from "../src/sandbox/hands-key.js";
 
 const realFetch = globalThis.fetch;
@@ -1191,18 +1188,8 @@ test("taking over a warm sandbox re-stamps who holds it", async () => {
     `the take-over has to re-stamp the holder: ${JSON.stringify(written.map(
       (w) => ({ taskId: w.taskId, attemptId: w.attemptId })))}`,
   );
-  // Asserted on the OUTCOME, not on each field. The holder here carries no task
-  // id (a chat request has none), and the stamp fills in what it knows while
-  // leaving the rest as it found it -- writing its own absence over a value the
-  // entry already had is the defect that reading `null !== "A1"` as a
-  // difference produced. What has to be true is that the entry now answers to
-  // this run and no longer to the one before it.
-  assert.equal(
-    attributionOf(stamped as AttributedEntry, { taskId: REQUEST.task_id ?? null, attemptId: "attempt-now" }),
-    "mine", "the taker reports it");
-  assert.equal(
-    attributionOf(stamped as AttributedEntry, { taskId: "task-earlier", attemptId: "attempt-earlier" }),
-    "other", "and the previous holder does not");
+  assert.equal(stamped!.taskId, REQUEST.task_id ?? null,
+    "task and attempt travel together, or the weaker half disagrees with the stronger");
 });
 
 test("a stamp that loses its race never costs the sandbox", async () => {

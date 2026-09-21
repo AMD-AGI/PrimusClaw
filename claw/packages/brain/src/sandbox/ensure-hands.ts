@@ -18,7 +18,7 @@ import type { ExecuteRequest, HandleInfo } from "@claw/protocol";
 import { isRevisionConflict, sleep } from "@claw/utils";
 import { isTombstone, pickLockKey } from "../tasks/lock.js";
 import {
-  type AttributedEntry, needsRestamp, type SandboxAttribution, stampFor,
+  type AttributedEntry, needsRestamp, type SandboxAttribution,
 } from "./attribution.js";
 import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
@@ -2001,7 +2001,8 @@ async function clearIdleMarkers(
   delete info.keepalive;
   delete info.idleSince;
   if (restamp && held) {
-    Object.assign(info, stampFor(info as AttributedEntry, held));
+    info.taskId = held.taskId;
+    info.attemptId = held.attemptId;
   }
   const { key } = binding;
   const payload = sc.encode(JSON.stringify(info));
@@ -2061,7 +2062,7 @@ async function clearIdleMarkers(
     // heartbeat landing during the health check was enough to leave the holder
     // naming whoever held it last.
     const stamped = restamp && held
-      ? stampFor(current as AttributedEntry, held)
+      ? { taskId: held.taskId, attemptId: held.attemptId }
       : {};
     const stillNeedsMarkers = current.keepalive !== undefined || current.idleSince != null;
     if (!stillNeedsMarkers && !restamp) return true;
@@ -2275,7 +2276,9 @@ async function restampSessionBinding(
     if (!needsRestamp(current, held)) return;
     await kv.update(
       binding.key,
-      sc.encode(JSON.stringify({ ...current, ...stampFor(current, held) })),
+      sc.encode(JSON.stringify({
+        ...current, taskId: held.taskId, attemptId: held.attemptId,
+      })),
       binding.revision,
     );
   } catch (err) {

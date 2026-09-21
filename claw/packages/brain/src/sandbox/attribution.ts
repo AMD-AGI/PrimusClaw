@@ -80,39 +80,8 @@ export function attributionOf(
   return "unattributed";
 }
 
-/**
- * Whether a stored entry should be re-stamped as this run takes it on.
- *
- * A holder only stamps what it KNOWS. Writing its own absence over a value the
- * entry already carries is the defect this guards against: a take-over whose
- * attribution had a task but no attempt used to null out a real `attemptId`,
- * after which `attributionOf` answered `unattributed` for ever and the entry's
- * platform facts were unreachable by anyone. Absent is not a correction.
- *
- * Normalised on both sides, because `undefined` and `null` are the same
- * statement here -- "not recorded" -- and comparing them raw made every entry
- * written before these fields existed take one pointless CAS on first reuse.
- */
+/** Whether a stored entry should be re-stamped as this run takes it on. */
 export function needsRestamp(entry: AttributedEntry, held: SandboxAttribution): boolean {
   if (!held.attemptId && !held.taskId) return false;
-  const differs = (a?: string | null, b?: string | null) => (a ?? null) !== (b ?? null);
-  // Only fields the holder can actually fill count as a difference.
-  if (held.attemptId && differs(entry.attemptId, held.attemptId)) return true;
-  if (held.taskId && differs(entry.taskId, held.taskId)) return true;
-  return false;
-}
-
-/**
- * The attribution to write when `needsRestamp` says to.
- *
- * Fills in what the holder knows and leaves the rest as it found it, so a
- * partial identity never erases a complete one.
- */
-export function stampFor(
-  entry: AttributedEntry, held: SandboxAttribution,
-): { taskId: string | null; attemptId: string | null } {
-  return {
-    taskId: held.taskId ?? entry.taskId ?? null,
-    attemptId: held.attemptId ?? entry.attemptId ?? null,
-  };
+  return entry.attemptId !== held.attemptId || entry.taskId !== held.taskId;
 }

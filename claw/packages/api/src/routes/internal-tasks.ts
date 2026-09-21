@@ -159,26 +159,15 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
               -- statements is what made the reader's guard inert -- this writer
               -- lands first with the same handle bytes, and the lease writer's
               -- change predicate then sees nothing to do.
-              metadata = CASE
-                WHEN $9::jsonb IS NULL THEN metadata
-                -- Attempt known: the handle and the attempt go in together,
-                -- which is the invariant -- they are one fact.
-                WHEN $5::text IS NOT NULL THEN jsonb_set(
-                  jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true),
-                  '{sandbox_attempt}', to_jsonb($5::text), true)
-                -- Attempt NOT known and the handle unchanged: leave the stamp
-                -- alone. Writing a JSON null here overwrote a correct stamp with
-                -- a value the reader treats as pre-rollout data and permits --
-                -- turning the guard off on the rows it was written for. Absent
-                -- is not a correction.
-                WHEN metadata->'sandbox' = $9::jsonb
-                  THEN jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
-                -- Attempt not known and the handle is NEW: the old stamp
-                -- describes a handle that is gone, so it goes with it. The row
-                -- reads as unattributed rather than mis-attributed.
-                ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
-                     - 'sandbox_attempt'
-              END,
+              metadata = CASE WHEN $9::jsonb IS NULL THEN metadata
+                         ELSE jsonb_set(
+                                jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                          '{sandbox}', $9::jsonb, true),
+                                '{sandbox_attempt}',
+                                CASE WHEN $5::text IS NULL THEN 'null'::jsonb
+                                     ELSE to_jsonb($5::text) END,
+                                true)
+                         END,
               attempt_id          = COALESCE($5, attempt_id),
               attempt_generation  = CASE
                                       WHEN $5::text IS NOT NULL
@@ -320,16 +309,11 @@ async function recordLeaseSandbox(
                 -- returns NULL -- which blanked the whole metadata column and
                 -- took the handle with it.
                 metadata = CASE
-                  WHEN $6::text IS NOT NULL THEN jsonb_set(
+                  WHEN $6::text IS NULL
+                    THEN jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+                  ELSE jsonb_set(
                     jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true),
                     '{sandbox_attempt}', to_jsonb($6::text), true)
-                  -- No fence, so nothing to record about the attempt. Same rule
-                  -- as the ownership writer: keep the stamp while the handle is
-                  -- the one it describes, drop it when the handle changes.
-                  WHEN t.metadata->'sandbox' = $4::jsonb
-                    THEN jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
-                  ELSE jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
-                       - 'sandbox_attempt'
                 END
            FROM fenced f
           WHERE t.task_id = f.task_id
@@ -337,15 +321,9 @@ async function recordLeaseSandbox(
             -- counts as a change. Comparing the handle pair alone meant a row
             -- whose handle another writer had already recorded was left with no
             -- attempt beside it, or with a previous attempt's.
-            -- The attempt counts as a change only when this writer HAS one.
-            -- Compared against an absent fence it was permanently true for any
-            -- row carrying a stamp, and the branch above cannot change that
-            -- stamp -- so every heartbeat retook the row lock and rewrote the
-            -- same bytes, which is the cost the note above says to avoid.
             AND (f.workload IS DISTINCT FROM $3
                  OR f.recorded IS DISTINCT FROM $4::jsonb
-                 OR ($6::text IS NOT NULL
-                     AND COALESCE(t.metadata->>'sandbox_attempt', '') IS DISTINCT FROM $6::text))
+                 OR COALESCE(t.metadata->>'sandbox_attempt', '') IS DISTINCT FROM COALESCE($6::text, ''))
          RETURNING 1
        )
        SELECT EXISTS (SELECT 1 FROM fenced)  AS fenced,
