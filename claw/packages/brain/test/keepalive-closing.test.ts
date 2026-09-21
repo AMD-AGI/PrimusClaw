@@ -173,6 +173,210 @@ test("a sandbox without GET /api/jobs is reclaimed after the idle window", async
   }
 });
 
+test("JobsUnavailable reclaim CAS-es closing before stop after a concurrent ready write", async () => {
+  // A transient Router 404 maps to JobsUnavailable. Without a closing CAS on
+  // that path, a probe that outlasts ensureHands would stop the reused sandbox.
+  const key = `hands.${SESSION}`;
+  const store = new Map<string, { value: Uint8Array; revision: number }>();
+  store.set(key, {
+    value: sc.encode(JSON.stringify({
+      status: "ready",
+      provider: "safe-workload",
+      workloadId: "wl-jobs",
+      platformKey: "pk",
+      namespace: "ns",
+      handsUrl: "http://sandbox:9100/mcp",
+      token: "tok",
+      keepalive: false,
+      idleSince: 0,
+      quiescedAt: 0,
+    })),
+    revision: 5,
+  });
+  const closingAt: number[] = [];
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...store.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async get(k: string) {
+      const hit = store.get(k);
+      if (!hit) return null;
+      return { key: k, value: hit.value, revision: hit.revision };
+    },
+    async delete(k: string) { store.delete(k); },
+    async put(k: string, value: Uint8Array) {
+      const next = (store.get(k)?.revision ?? 0) + 1;
+      store.set(k, { value, revision: next });
+      return next;
+    },
+    async update(k: string, value: Uint8Array, rev: number) {
+      const hit = store.get(k);
+      if (!hit || hit.revision !== rev) {
+        const err = new Error("wrong last sequence");
+        (err as { code?: string }).code = "BAD_REVISION";
+        throw err;
+      }
+      const parsed = JSON.parse(sc.decode(value)) as { status?: string };
+      if (parsed.status === "closing") closingAt.push(rev);
+      store.set(k, { value, revision: rev + 1 });
+      return rev + 1;
+    },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    let probed = false;
+    const countActiveShells = async () => {
+      if (!probed) {
+        probed = true;
+        const hit = store.get(key)!;
+        store.set(key, {
+          value: sc.encode(JSON.stringify({
+            status: "ready",
+            provider: "safe-workload",
+            workloadId: "wl-jobs",
+            platformKey: "pk",
+            namespace: "ns",
+            handsUrl: "http://sandbox:9100/mcp",
+            token: "tok",
+            keepalive: true,
+          })),
+          revision: hit.revision + 1,
+        });
+      }
+      throw new SandboxJobsUnavailableError(404);
+    };
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    await new Promise((r) => setImmediate(r));
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    assert.deepEqual(closingAt, [], "JobsUnavailable must not close over a bumped ready revision");
+    assert.equal(stopped.length, 0, "the concurrent ready sandbox must not be destroyed");
+    assert.ok(store.has(key));
+  } finally {
+    restoreRetry();
+    restore();
+  }
+});
+
+test("an in-window unknown probe advances workSeenAt for multi-node reclaim", async () => {
+  // Keepalive expiry ignores workSeenAt, but unknown sweeps must still move it
+  // so eligibleForClusterReclaim does not delete a cluster under a held handle.
+  const now = 1_000_000;
+  const { kv, store } = storeKv({
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "wl-unk",
+    platformKey: "pk",
+    namespace: "ns",
+    handsUrl: "http://sandbox:9100/mcp",
+    token: "tok",
+    keepalive: false,
+    idleSince: now - 60_000,
+    quiescedAt: now - 60_000,
+    workSeenAt: now - 60_000,
+  });
+  bindHandsKv(kv);
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  try {
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async () => { throw new Error("router briefly unreachable"); },
+      now: () => now,
+    });
+    const left = store.get(`hands.${SESSION}`);
+    assert.ok(left);
+    const info = JSON.parse(sc.decode(left.value)) as { workSeenAt?: number; quiescedAt?: number };
+    assert.equal(info.quiescedAt, now - 60_000, "unknown must not clear quiescedAt");
+    assert.ok(
+      typeof info.workSeenAt === "number" && info.workSeenAt >= now,
+      `workSeenAt must advance for MN coordination; got ${info.workSeenAt}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("a tombstoned hands key during reclaim is treated as already gone", async () => {
+  const key = `hands.${SESSION}`;
+  const store = new Map<string, { value: Uint8Array; revision: number; operation?: string }>();
+  store.set(key, {
+    value: sc.encode(JSON.stringify({
+      status: "ready",
+      provider: "safe-workload",
+      workloadId: "wl-tomb",
+      platformKey: "pk",
+      namespace: "ns",
+      handsUrl: "http://sandbox:9100/mcp",
+      token: "tok",
+      keepalive: false,
+      idleSince: 0,
+      quiescedAt: 0,
+    })),
+    revision: 5,
+  });
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...store.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async get(k: string) {
+      const hit = store.get(k);
+      if (!hit) return null;
+      return { key: k, value: hit.value, revision: hit.revision, operation: hit.operation };
+    },
+    async delete(k: string) { store.delete(k); },
+    async put() { return 1; },
+    async update(k: string, value: Uint8Array, rev: number) {
+      const hit = store.get(k);
+      if (!hit || hit.revision !== rev) {
+        const err = new Error("wrong last sequence");
+        (err as { code?: string }).code = "BAD_REVISION";
+        throw err;
+      }
+      store.set(k, { value, revision: rev + 1 });
+      return rev + 1;
+    },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    const countActiveShells = async () => {
+      store.set(key, { value: new Uint8Array(0), revision: 6, operation: "DEL" });
+      return 0;
+    };
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    await new Promise((r) => setImmediate(r));
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    assert.equal(stopped.length, 0, "a tombstone must not be parsed into a reclaim payload");
+  } finally {
+    restoreRetry();
+    restore();
+  }
+});
+
 test("idle reclaim CAS uses the enrollment revision after a concurrent ready write", async () => {
   // During the destructive probe, another writer clears idle markers and bumps
   // the revision (ensureHands). Reclaim must CAS against the enrollment

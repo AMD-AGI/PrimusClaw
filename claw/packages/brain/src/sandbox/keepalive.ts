@@ -1513,6 +1513,11 @@ type VerdictSource = "mem" | "handle" | "none";
  * A recorded `quiescedAt` is the moment EnvD first reported an empty roster, and
  * that is the clock the idle expiry measures. Without one, the window is the
  * later of the idle-period opening and the last sweep that observed work.
+ *
+ * Keepalive reclaim deliberately ignores `workSeenAt` (see
+ * `keepaliveReuseAnchor`): unknown probes still advance `workSeenAt` so the
+ * multi-node cluster sweeper stays aligned, and folding that stamp into this
+ * clock would strand JobsUnavailable sandboxes forever.
  */
 function reuseWindowStart(info: HandsKvEntry): number {
   if (typeof info.quiescedAt === "number") return info.quiescedAt;
@@ -1520,6 +1525,15 @@ function reuseWindowStart(info: HandsKvEntry): number {
     typeof info.idleSince === "number" ? info.idleSince : 0,
     typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
   );
+}
+
+/**
+ * Anchor for Brain's own idle-expiry. Prefer `quiescedAt`, else the park stamp.
+ * `workSeenAt` is reserved for multi-node cluster reclaim coordination.
+ */
+function keepaliveReuseAnchor(info: HandsKvEntry): number {
+  if (typeof info.quiescedAt === "number") return info.quiescedAt;
+  return typeof info.idleSince === "number" ? info.idleSince : 0;
 }
 
 
@@ -1811,7 +1825,7 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
   });
   try {
     const e = await deps.kv.get(key);
-    if (!e || probeIsStale(probe)) return;
+    if (!e || isTombstone(e) || probeIsStale(probe)) return;
     const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
     if (entryIdentity(current) !== identity || !sameIdlePeriod(info.idleEpoch, current)
       || info.idleSince !== current.idleSince || info.idleRev !== current.idleRev
@@ -2305,12 +2319,14 @@ async function collectIdleTarget(
   if (!canProbeJobs(info, sessionId) && bgWork !== "gone") {
     return true;
   }
+  // Keepalive expiry ignores workSeenAt so unknown probes can still advance it
+  // for multi-node cluster reclaim without stranding JobsUnavailable reclaim.
   const expired = bgWork === "gone"
-    || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
-  // Hold an in-window unknown for an in-flight probe, but never slide
-  // workSeenAt: that would reset reuseWindowStart and strand JobsUnavailable
-  // sandboxes (and the expireIdleTarget fallback) forever.
+    || (deps.now ?? Date.now)() - keepaliveReuseAnchor(info) > SANDBOX_IDLE_REUSE_MS;
+  // Hold an in-window unknown for an in-flight probe. Advance workSeenAt so
+  // eligibleForClusterReclaim stays in step; do not clear quiescedAt.
   if (bgWork === "unknown" && canProbeJobs(info, sessionId) && !expired) {
+    await refreshIdleSince(deps, key, e.revision, info, false);
     return false;
   }
   if (expired) {
@@ -2369,7 +2385,7 @@ async function expireIdleTarget(
       // Refresh fields for the stop payload; CAS still uses claimRevision.
       // A probe-side persist that advanced the key is preemption (conflict).
       const latest = await deps.kv.get(key);
-      if (!latest) return;
+      if (!latest || isTombstone(latest)) return;
       info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
     }
     await deps.kv.update(
@@ -2387,6 +2403,10 @@ async function expireIdleTarget(
   } catch (err) {
     if (err instanceof SandboxTerminalProbeError) {
       if (err.state === "absent") {
+        if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+          return;
+        }
+        claimed = true;
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
         });
@@ -2397,12 +2417,20 @@ async function expireIdleTarget(
         );
       } else {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+          return;
+        }
+        claimed = true;
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
         });
       }
     } else if (err instanceof SandboxRuntimeTerminalError) {
       await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+        return;
+      }
+      claimed = true;
       await destroyHands(sessionId, info).catch((stopErr) => {
         logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
       });
@@ -2412,10 +2440,16 @@ async function expireIdleTarget(
     } else if (err instanceof SandboxJobsUnavailableError) {
       // /api/jobs is missing on this EnvD. The idle window has already elapsed
       // to reach here; reclaim the way deployments without the jobs API did.
+      // A transient Router 404 must not skip the closing CAS: the probe can
+      // outlast an ensureHands that cleared idle markers on the same workload.
       logger.info(
         { sessionId, workloadId: info.workloadId, status: err.httpStatus },
         "keepalive.idle_reclaim_jobs_api_absent",
       );
+      if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+        return;
+      }
+      claimed = true;
       await destroyHands(sessionId, info).catch((stopErr) => {
         logger.warn({ err: stopErr, sessionId }, "keepalive.jobs_absent_stop_retry");
       });
@@ -2429,6 +2463,46 @@ async function expireIdleTarget(
       );
       if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     }
+  }
+}
+
+/**
+ * After a long destructive probe, re-check leases and CAS ready→closing before
+ * any unclaimed destroyHands. Returns false when a concurrent turn won.
+ */
+async function claimIdleStop(
+  deps: KeepaliveDeps,
+  key: string,
+  identity: string,
+  sessionId: string,
+  info: HandsKvEntry,
+  claimRevision: number,
+  e: HandsRecord,
+): Promise<boolean> {
+  if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
+    return false;
+  }
+  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
+    return false;
+  }
+  try {
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...info, status: "closing" })),
+      claimRevision,
+    );
+    return true;
+  } catch (err) {
+    if (isRevisionConflict(err)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+      return false;
+    }
+    logger.warn(
+      { err, sessionId, workloadId: info.workloadId },
+      "keepalive.idle_reclaim_deferred",
+    );
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    return false;
   }
 }
 
