@@ -2327,21 +2327,26 @@ class TaskRunner {
     // can have got as far as `onProvisioned`, which mints a workload and records
     // it as PENDING before waiting for the pod; a second attempt that fails
     // earlier than that (a KV read, an admission refusal) writes nothing of its
-    // own. Re-stamping the marker then moves the ownership floor past the entry
-    // this very run created, and the failure path's reap reads its own workload
-    // as a stranger's and leaves it running. Nothing collects it afterwards
-    // either: BRAIN_REGISTRY is a 5-minute-TTL bucket
-    // (DEFAULT_BRAIN_REGISTRY_TTL_MS) and the delivery heartbeat that was
-    // refreshing the entry stops with the run, so the entry -- the only record of
-    // workloadId + platformKey -- is gone hours before the sweeper's
-    // SANDBOX_PENDING_ABANDONED_AFTER_MS horizon could look at it.
+    // own. Re-stamping the marker then moves the floor past the entry this very
+    // run created, and `pendingHandsIdentity` stops recognising it -- so a run
+    // that minted a workload reports having minted none, and the record of
+    // workloadId + platformKey never reaches the row.
     //
-    // Keeping the earliest ask does not widen ownership onto a predecessor's
-    // entry: that entry was written before this run asked at all, which is the
-    // case `reapPendingHands` exists to refuse, and it stays refused. The
-    // rebuild path re-stamps on purpose and still does -- `runRebuild` destroys
-    // the previous sandbox and its entry first, so from there on the only entry
-    // this run can own is the one its rebuild is about to write.
+    // The teardown no longer turns on this marker: `reapPendingHands` matches
+    // the task id the entry names, which every entry this build writes carries.
+    // What is still lost by re-stamping is the REPORT, and losing it is how the
+    // workload becomes unattributable: the delivery heartbeat that refreshes
+    // the entry stops with the run, and five minutes later
+    // (DEFAULT_BRAIN_REGISTRY_TTL_MS, a per-message max age every write resets)
+    // the entry is gone. `collectAbandonedPending` only reaches entries a live
+    // session is still keeping warm, so an orphan on a session that then goes
+    // quiet is past its horizon's reach.
+    //
+    // Keeping the earliest ask widens nothing onto a predecessor's entry: that
+    // entry names a different task, which is the case `reapPendingHands` refuses
+    // outright. The rebuild path re-stamps on purpose and still does --
+    // `runRebuild` destroys the previous sandbox and its entry first, so from
+    // there on the only entry this run can own is the one its rebuild writes.
     this.sandboxAskedAt ??= Date.now();
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,

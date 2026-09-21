@@ -314,7 +314,16 @@ async function recordLeaseSandbox(
       );
     }
   } catch (err) {
-    logger.warn({ taskId, err: (err as Error)?.message }, "task.ownership_write_failed");
+    // Its own key, not `writeRunOwnership`'s. The two were byte-identical --
+    // same logger, same `{ taskId, err }` -- so a statement that threw here was
+    // indistinguishable from an ownership write that failed, and this file's
+    // convention is one key per catch (`run.lease_renew_failed`,
+    // `run.lease_acquire_failed`, and the rest). What is lost when this throws
+    // is the handle, which is what the name now says.
+    logger.warn(
+      { taskId, err: (err as Error)?.message },
+      "run_lease.sandbox_handle_write_failed",
+    );
   }
 }
 

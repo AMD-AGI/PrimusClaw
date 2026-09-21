@@ -515,9 +515,18 @@ export async function reapPendingHands(
     //
     //  - `runScope` presence: said only which fields an old writer happened to
     //    set, and `94b63ef` on this branch set that one and not `taskId`.
-    //  - "leave it to `collectAbandonedPending`": that sweep's horizon
-    //    (SANDBOX_PENDING_ABANDONED_AFTER_MS, 2h) outlasts the bucket TTL
-    //    (DEFAULT_BRAIN_REGISTRY_TTL_MS, 5 min), so the entry expires first.
+    //  - "leave it to `collectAbandonedPending`": that sweep only reaches an
+    //    entry the session is still keeping warm. `BRAIN_REGISTRY_TTL_MS` is a
+    //    per-message max age (5 min) that every write resets -- see
+    //    `tasks/lock.ts`, "the bucket expires an entry nobody refreshes" -- and
+    //    the only thing refreshing a PENDING entry is the delivery heartbeat
+    //    (runner.ts, `readHandsEntry` then `kv.update`, ownership-blind and
+    //    every LOCK_REFRESH_INTERVAL_MS; keepalive skips anything not `ready`).
+    //    So on a busy session the entry outlives the sweep's horizon and the
+    //    collector does take it; on one that goes quiet -- which is the
+    //    mid-provision brain death the collector is sold for -- it is gone five
+    //    minutes later and the horizon never sees it. Either way it is not a
+    //    thing this gate can lean on to decide an ENTRY's owner.
     //  - the run lease: under the default `RUN_GATE_KEY=workspace` that lock is
     //    `ws.<workspaceId>`, one for every run in the workspace, so "held"
     //    reported a stranger's traffic -- and a redelivery read its own lock.
