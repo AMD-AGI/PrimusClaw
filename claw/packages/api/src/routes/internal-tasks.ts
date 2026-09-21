@@ -281,7 +281,27 @@ async function recordLeaseSandbox(
          -- is a template literal.)
          UPDATE claw_tasks t
             SET sandbox_workload_id = $3,
-                metadata = jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+                -- Which attempt's sandbox this is, beside the handle itself.
+                -- The row outlives an attempt: a redelivery takes it over and
+                -- the handle its predecessor recorded stays put, so without
+                -- this the backfill asks SaFE about the previous attempt's
+                -- workload and writes that attempt's node, exit code and
+                -- preemption onto the failing row of the one that replaced it.
+                -- Brain refuses the same adoption on the KV side by comparing
+                -- the attempt the entry names; this is that comparison on the
+                -- row.
+                --
+                -- CASE and not a nested jsonb_set: a legacy lease carries no
+                -- fence, $6 is then NULL, and jsonb_set with a NULL argument
+                -- returns NULL -- which blanked the whole metadata column and
+                -- took the handle with it.
+                metadata = CASE
+                  WHEN $6::text IS NULL
+                    THEN jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true)
+                  ELSE jsonb_set(
+                    jsonb_set(COALESCE(t.metadata, '{}'::jsonb), '{sandbox}', $4::jsonb, true),
+                    '{sandbox_attempt}', to_jsonb($6::text), true)
+                END
            FROM fenced f
           WHERE t.task_id = f.task_id
             AND (f.workload IS DISTINCT FROM $3 OR f.recorded IS DISTINCT FROM $4::jsonb)

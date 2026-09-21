@@ -1131,7 +1131,16 @@ class TaskRunner {
    * this attempt is waiting on. See `pendingHandsIdentity`, which is the only
    * reader.
    */
-  private sandboxAskedAt: number | null = null;
+  /**
+   * Whether this run ever asked for a sandbox of its own.
+   *
+   * A boolean and not a timestamp, because nothing reads a time from it any
+   * more: ownership of a PENDING entry is settled by the `attemptId` the entry
+   * records, and this only answers the prior question of whether this run could
+   * own one at all. It was a threshold until the comparison it fed was measured
+   * across two processes and found to turn on their clocks.
+   */
+  private sandboxAsked = false;
   /**
    * What the platform said about this run's sandbox dying, read at the moment we
    * found out and kept until the callback carries it.
@@ -1489,10 +1498,10 @@ class TaskRunner {
    * ending. So ownership is established before anything is reported, and by the
    * same test the teardown uses: the entry names the task that asked for it, and
    * an entry naming a different one -- or naming none, which no task-bearing run
-   * of this build can write -- is somebody else's. The ask time then narrows
-   * what is left to this ATTEMPT's provision: a redelivery gets a fresh
-   * `sandboxAskedAt`, so an entry carrying the same task id from the attempt
-   * before it is stamped earlier and is not this one's to report. A run that
+   * of this build can write -- is somebody else's. The attempt then separates
+   * one delivery of that task from the next: the entry records the `attemptId`
+   * that minted it, and a redelivery's is different, so the entry its
+   * predecessor left is refused without any clock being consulted. A run that
    * never asked owns no entry at all.
    *
    * Null on anything unreadable. An absent entry, an unreachable bucket, a
@@ -1503,8 +1512,7 @@ class TaskRunner {
   private async pendingHandsIdentity(): Promise<HandsProbeEntry | null> {
     // Read once: a rebuild moves it, and the comparison below has to be made
     // against the ask this read is answering.
-    const askedAt = this.sandboxAskedAt;
-    if (askedAt === null) return null;
+    if (!this.sandboxAsked) return null;
     try {
       const entry = await readHandsEntry(this.kv, this.sessionId);
       if (!entry) return null;
@@ -1532,8 +1540,8 @@ class TaskRunner {
       // exit code and preemption onto this attempt's failing row.
       //
       // This was a timestamp comparison until it was measured: `createdAt` is
-      // stamped by whichever replica wrote the entry and `sandboxAskedAt` by
-      // this one, so a replica five seconds fast made the previous attempt's
+      // stamped by whichever replica wrote the entry and the ask time by this
+      // one, so a replica five seconds fast made the previous attempt's
       // entry look newer than this attempt's ask and it was adopted. The same
       // cross-process clock that had already been removed from the teardown
       // gate, surviving here as a narrowing.
@@ -1578,7 +1586,7 @@ class TaskRunner {
    * run, every LOCK_REFRESH_INTERVAL_MS (10s, against 15s here). A turn
    * answered from context under BRAIN_LAZY_SANDBOX has `handsIdentity` null
    * too, and costs nothing at all: `pendingHandsIdentity` answers it from
-   * `sandboxAskedAt` without opening the bucket, because a run that never asked
+   * `sandboxAsked` without opening the bucket, because a run that never asked
    * for a sandbox cannot own the entry it would find. So this adds strictly
    * less KV traffic than the run already makes, and none once the sandbox is
    * attached or while none was ever wanted.
@@ -1675,7 +1683,7 @@ class TaskRunner {
     // Marked like the first provision: a rebuild mints its own workload and
     // writes its own PENDING entry, and the destroy above has just removed the
     // one the old sandbox left.
-    this.sandboxAskedAt = Date.now();
+    this.sandboxAsked = true;
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal,
@@ -2350,39 +2358,18 @@ class TaskRunner {
 
     // Ensure Hands sandbox (GPU custom image when sandbox_image is specified).
     logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "task.sandbox_ensuring");
-    // Before the call, not after it: the PENDING entry this marker qualifies is
-    // written from inside it.
+    // Before the call, not after it: the PENDING entry this marks the run as
+    // eligible for is written from inside it.
     //
-    // And only on the FIRST ask of this run, which is why it is `??=` and not an
-    // assignment. `attachHands` deliberately does not cache a failure, so a lazy
-    // run can arrive here more than once -- the tool that hit the failure
-    // reports it and a later tool call gets a fresh attempt. The first attempt
-    // can have got as far as `onProvisioned`, which mints a workload and records
-    // it as PENDING before waiting for the pod; a second attempt that fails
-    // earlier than that (a KV read, an admission refusal) writes nothing of its
-    // own. Re-stamping the marker then moves the floor past the entry this very
-    // run created, and `pendingHandsIdentity` stops recognising it -- so a run
-    // that minted a workload reports having minted none, and the record of
-    // workloadId + platformKey never reaches the row.
-    //
-    // The teardown no longer turns on this marker: `reapPendingHands` matches
-    // the task id the entry names, which every entry this build writes carries.
-    // What is still lost by re-stamping is the REPORT, and losing it is how the
-    // workload becomes unattributable: the delivery heartbeat that refreshes
-    // the entry stops with the run, and five minutes after that last refresh
-    // (DEFAULT_BRAIN_REGISTRY_TTL_MS, a per-message max age every write resets)
-    // the entry is gone. `collectAbandonedPending` is not a second chance to
-    // rely on here: it needs the entry still present, its `createdAt` already
-    // past SANDBOX_PENDING_ABANDONED_AFTER_MS, and the lease free, all at once
-    // and with a pass landing in that window -- reachable, but not a property
-    // of the entry, and nothing this path can arrange.
-    //
-    // Keeping the earliest ask widens nothing onto a predecessor's entry: that
-    // entry names a different task, which is the case `reapPendingHands` refuses
-    // outright. The rebuild path re-stamps on purpose and still does --
-    // `runRebuild` destroys the previous sandbox and its entry first, so from
-    // there on the only entry this run can own is the one its rebuild writes.
-    this.sandboxAskedAt ??= Date.now();
+    // A latch now, not a threshold. It used to keep the EARLIEST ask, because
+    // `pendingHandsIdentity` compared the entry's `createdAt` against it and
+    // re-stamping would have moved the floor past an entry this very run had
+    // created. That comparison is gone -- it was two processes' clocks, and a
+    // replica five seconds fast was enough to adopt a previous attempt's
+    // workload -- so the only thing read here is whether this run asked at all.
+    // `runRebuild` sets it too, which is now the same statement rather than a
+    // deliberate re-stamp.
+    this.sandboxAsked = true;
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { signal: this.abortCtrl.signal, attemptId: this.attempt.attemptId },

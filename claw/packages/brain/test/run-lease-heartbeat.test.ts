@@ -315,10 +315,12 @@ test("B22 a fat-path renewal presents the row's non-null attempt token", async (
     lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
   });
 
-  assert.equal(renewals[0].attempt.claimCount, 0);
-  assert.equal(renewals[0].attempt.deliverySeq, 7);
-  assert.equal(renewals[0].attempt.deliveryCount, 1);
-  assert.ok(renewals[0].attempt.attemptId);
+  const attempt = renewals[0]?.attempt;
+  assert.ok(attempt, "the renewal carries the attempt it was sent for");
+  assert.equal(attempt.claimCount, 0);
+  assert.equal(attempt.deliverySeq, 7);
+  assert.equal(attempt.deliveryCount, 1);
+  assert.ok(attempt.attemptId);
 });
 
 test("a run without a lease says nothing", async () => {

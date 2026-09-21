@@ -41,6 +41,9 @@ before(async () => {
       origin TEXT,
       metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
       sandbox_workload_id TEXT,
+      -- The attempt the row belongs to now. The drain projects it so the reader
+      -- can tell a handle a previous attempt recorded from this one's.
+      attempt_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at TIMESTAMPTZ,
       platform_message TEXT,

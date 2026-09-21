@@ -34,6 +34,9 @@ before(async () => {
       origin TEXT,
       metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
       sandbox_workload_id TEXT,
+      -- The attempt the row belongs to now. The drain projects it so the reader
+      -- can tell a handle a previous attempt recorded from this one's.
+      attempt_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at TIMESTAMPTZ,
       platform_message TEXT,
@@ -85,6 +88,8 @@ interface SeedOptions {
   status?: string;
   handle?: string | null;
   metadata?: Record<string, unknown>;
+  /** The attempt the row belongs to now. */
+  attemptId?: string | null;
   completedAgoMs?: number;
   retryDelayMs?: number;
   attempts?: number;
@@ -101,15 +106,17 @@ async function seed(id: string, reason: string, opts: SeedOptions = {}): Promise
   await pg.query(
     `INSERT INTO claw_tasks (
        task_id, session_id, status, failure_reason, sandbox_workload_id, metadata, completed_at,
-       platform_facts_next_retry_at, platform_facts_attempts, platform_facts_resolved_at, origin, created_at
-     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $11, $10)`,
+       platform_facts_next_retry_at, platform_facts_attempts, platform_facts_resolved_at, origin, created_at,
+       attempt_id
+     ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $11, $10, $12)`,
     [id, opts.status ?? "failed", reason,
       opts.handle === undefined ? `wl-${id}` : opts.handle,
       JSON.stringify(opts.metadata ?? {}),
       new Date(now - (opts.completedAgoMs ?? 60_000)),
       opts.retryDelayMs === undefined ? null : new Date(now + opts.retryDelayMs),
       opts.attempts ?? 0, opts.resolved ? new Date(now) : null, new Date(now - 300_000),
-      opts.origin ?? "chat"],
+      opts.origin ?? "chat",
+      opts.attemptId ?? null],
   );
 }
 
@@ -304,4 +311,48 @@ test("the eligibility clause keeps every row a read could still answer for", asy
   assert.equal((await row("agent-metadata-only")).platform_facts_resolved_at, null);
   assert.ok(diagnostics.some((d) =>
     d.taskId === "agent-metadata-only" && d.reason === "termination_facts_unavailable"));
+});
+
+test("a handle another attempt recorded is not read for the attempt that replaced it", async () => {
+  // The row outlives its attempts. Attempt A records its sandbox handle; the
+  // delivery is redelivered, B takes the same row over, and A's handle stays on
+  // it. Reading it attributes A's ending -- its node, its exit code, its
+  // preemption -- to B's failure, which is the same adoption Brain refuses on
+  // the KV side by comparing the attempt the pending entry names.
+  //
+  // Both halves have to be known for the refusal: a handle written before the
+  // field existed carries no attempt, and refusing those would refuse every
+  // handle the build being replaced wrote.
+  await seed("cross-attempt", "worker_lost", {
+    handle: null,
+    attemptId: "attempt-B",
+    metadata: {
+      sandbox: { provider: "safe-workload", handle: "workload-of-attempt-A" },
+      sandbox_attempt: "attempt-A",
+    },
+  });
+
+  await drainPendingPlatformFacts();
+
+  const closed = await row("cross-attempt");
+  assert.equal(closed.platform_node, null,
+    "no facts may be written from a handle this attempt did not record");
+  assert.equal(closed.platform_facts_resolved_at, null,
+    "and the row stays unresolved rather than being closed with another attempt's ending");
+});
+
+test("but its own attempt's handle is read as before", async () => {
+  await seed("same-attempt", "worker_lost", {
+    handle: null,
+    attemptId: "attempt-B",
+    metadata: {
+      sandbox: { provider: "safe-workload", handle: "workload-of-attempt-B" },
+      sandbox_attempt: "attempt-B",
+    },
+  });
+
+  await drainPendingPlatformFacts();
+
+  assert.notEqual((await row("same-attempt")).platform_facts_attempts, 0,
+    "the drain still claims and reads a handle the row's own attempt recorded");
 });

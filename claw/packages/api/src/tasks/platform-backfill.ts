@@ -38,6 +38,8 @@ export interface SweptRow {
   session_id: string | null;
   sandbox_workload_id?: string | null;
   metadata?: Record<string, unknown> | null;
+  /** The attempt the row belongs to NOW; see `metadata.sandbox_attempt`. */
+  attempt_id?: string | null;
   origin?: string | null;
   created_at?: Date | string | null;
   completed_at?: Date | string | null;
@@ -81,7 +83,11 @@ async function claimRow(row: SweptRow): Promise<SweptRow | null> {
         AND status IN ('completed', 'failed', 'cancelled')
         AND platform_facts_resolved_at IS NULL
         AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
-      RETURNING task_id, session_id, sandbox_workload_id, metadata, origin, created_at, completed_at`,
+      -- attempt_id travels with the claimed row because resolveSandbox reads
+      -- THIS row, not the one the drain selected: the handle in metadata may
+      -- belong to an attempt the row has since moved past.
+      RETURNING task_id, session_id, sandbox_workload_id, metadata, attempt_id,
+                origin, created_at, completed_at`,
     [row.task_id, RETRY_BASE_SEC, RETRY_MAX_SEC],
   );
   return (r.rows[0] as SweptRow | undefined) ?? null;
@@ -169,6 +175,24 @@ interface ResolvedSandbox {
 }
 
 async function resolveSandbox(row: SweptRow): Promise<ResolvedSandbox | null> {
+  // Whose sandbox the recorded handle is. A row outlives its attempts -- a
+  // redelivery takes the same row over -- and the handle the previous one
+  // recorded stays on it, so asking SaFE about that workload attributes its
+  // ending to the attempt that replaced it. Measured: attempt A's Preempted,
+  // node and exit code 137 written onto B's `worker_lost` row. Brain refuses
+  // the same adoption on the KV side by comparing the attempt the entry names.
+  //
+  // Only when both are known. A handle recorded before this field existed
+  // carries no attempt and is used as before -- the rollout window, and not a
+  // licence: the alternative is refusing every handle the build being replaced
+  // wrote.
+  const handleAttempt = row.metadata?.sandbox_attempt;
+  if (typeof handleAttempt === "string" && handleAttempt
+      && typeof row.attempt_id === "string" && row.attempt_id
+      && handleAttempt !== row.attempt_id) {
+    cannotRead(row, "handle_from_another_attempt");
+    return null;
+  }
   const recorded = row.metadata?.sandbox;
   let sandbox = recorded == null
     ? parseSandboxHandle({ provider: "safe-workload", handle: row.sandbox_workload_id })
@@ -389,7 +413,7 @@ export async function backfillPlatformFacts(rows: SweptRow[]): Promise<number> {
 export async function drainPendingPlatformFacts(): Promise<number> {
   const r = await db.query(
     `WITH eligible AS (
-       SELECT task_id, session_id, sandbox_workload_id,
+       SELECT task_id, session_id, sandbox_workload_id, metadata, attempt_id,
               platform_facts_next_retry_at IS NOT NULL AS retried,
               ROW_NUMBER() OVER (
                 PARTITION BY (platform_facts_next_retry_at IS NOT NULL)
@@ -434,7 +458,12 @@ export async function drainPendingPlatformFacts(): Promise<number> {
           AND (platform_facts_next_retry_at IS NULL OR platform_facts_next_retry_at <= NOW())
           AND completed_at > NOW() - INTERVAL '1 hour'
      )
-     SELECT task_id, session_id, sandbox_workload_id
+     -- metadata and attempt_id travel with the row because the reader needs
+     -- both: the handle may live only in metadata (an agent-sandbox one leaves
+     -- the column null), and the attempt says whether that handle is still this
+     -- row's. Projecting less meant carriesSandboxIdentity read undefined for
+     -- metadata-only rows and sorted them behind handle-less ones.
+     SELECT task_id, session_id, sandbox_workload_id, metadata, attempt_id
        FROM eligible
       ORDER BY lane_position ASC, retried ASC
       LIMIT $1`,
