@@ -152,8 +152,21 @@ async function writeRunOwnership(taskId: string, body: TaskEventBody): Promise<b
       `UPDATE claw_tasks
           SET brain_id            = COALESCE($2, brain_id),
               sandbox_workload_id = COALESCE($3, sandbox_workload_id),
+              -- The handle and the attempt that minted it, written together.
+              -- They are one fact: a row outlives its attempts, so a handle
+              -- without the attempt beside it is a handle the next attempt
+              -- inherits and is then credited with. Splitting them across
+              -- statements is what made the reader's guard inert -- this writer
+              -- lands first with the same handle bytes, and the lease writer's
+              -- change predicate then sees nothing to do.
               metadata = CASE WHEN $9::jsonb IS NULL THEN metadata
-                         ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{sandbox}', $9::jsonb, true)
+                         ELSE jsonb_set(
+                                jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                          '{sandbox}', $9::jsonb, true),
+                                '{sandbox_attempt}',
+                                CASE WHEN $5::text IS NULL THEN 'null'::jsonb
+                                     ELSE to_jsonb($5::text) END,
+                                true)
                          END,
               attempt_id          = COALESCE($5, attempt_id),
               attempt_generation  = CASE
@@ -304,7 +317,13 @@ async function recordLeaseSandbox(
                 END
            FROM fenced f
           WHERE t.task_id = f.task_id
-            AND (f.workload IS DISTINCT FROM $3 OR f.recorded IS DISTINCT FROM $4::jsonb)
+            -- The attempt is part of what this writes, so it is part of what
+            -- counts as a change. Comparing the handle pair alone meant a row
+            -- whose handle another writer had already recorded was left with no
+            -- attempt beside it, or with a previous attempt's.
+            AND (f.workload IS DISTINCT FROM $3
+                 OR f.recorded IS DISTINCT FROM $4::jsonb
+                 OR COALESCE(t.metadata->>'sandbox_attempt', '') IS DISTINCT FROM COALESCE($6::text, ''))
          RETURNING 1
        )
        SELECT EXISTS (SELECT 1 FROM fenced)  AS fenced,

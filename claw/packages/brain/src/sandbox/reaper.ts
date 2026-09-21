@@ -429,9 +429,15 @@ export async function destroyHands(
  * by other means (which fields an old writer set, a collector that may not
  * reach the entry, the run lease, the entry's age against the caller's ask) and
  * each was wrong in its own way; the name is the only per-entry fact that
- * settles it. `pendingHandsIdentity` establishes ownership the same way for the
- * reporting side, so the two cannot disagree about whose workload a row
- * describes.
+ * settles it here. The reporting side asks a NARROWER question -- 
+ * `pendingHandsIdentity` compares the `attemptId` the entry records, because a
+ * redelivery carries the same task id and must not report its predecessor's
+ * workload as its own ending. This path has not been given that comparison, so
+ * the two do not ask the same thing: a teardown may still reap an entry a
+ * previous attempt of this task left behind, which is the intended reach of a
+ * reap and the wrong reach for a report. Said plainly because a docstring here
+ * claiming the two agree is how the rule got missed on the reporting side in
+ * the first place.
  *
  * A caller that names no task makes no claim, and this reaps whatever is there
  * -- the behaviour before any of these gates existed.

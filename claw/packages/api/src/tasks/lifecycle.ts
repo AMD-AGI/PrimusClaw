@@ -557,7 +557,8 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
             -- inheriting either one strands the same wrong attribution, and
             -- sandbox additionally re-arms the backfill against a workload this
             -- row never owned.
-            metadata - 'sandbox' - 'run_phase' - 'last_release' - 'retried_into' - 'sandbox_release',
+            metadata - 'sandbox' - 'sandbox_attempt' - 'run_phase' - 'last_release'
+                     - 'retried_into' - 'sandbox_release',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
             workspace_throwaway,

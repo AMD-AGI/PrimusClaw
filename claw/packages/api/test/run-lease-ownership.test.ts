@@ -605,3 +605,52 @@ for (const [label, brainId] of [
     assert.deepEqual(await storedRun(), original);
   });
 }
+
+test("the writer that records a handle records the attempt beside it", async () => {
+  // The invariant, asserted on the WRITER. A row outlives its attempts, so a
+  // handle recorded without the attempt that minted it is a handle the next
+  // attempt inherits -- and the backfill then credits it with that attempt's
+  // node, exit code and preemption.
+  //
+  // This test exists because the reader's guard shipped without it and was
+  // inert: `writeRunOwnership` lands first with the same handle bytes, so the
+  // lease writer's change predicate saw nothing to do and the attempt was never
+  // stamped. Nothing in the suite asserted that any writer produced the field,
+  // so the guard passed its own tests while never firing in production.
+  const res = await reportRunningEvent({
+    brain_id: "worker-a", attempt_id: "attempt-1",
+    sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+  assert.equal(res.statusCode, 200);
+
+  const run = await storedRun();
+  assert.equal(run.sandbox_workload_id, SAFE_SANDBOX.handle);
+  const metadata = run.metadata as Record<string, unknown>;
+  assert.deepEqual(metadata.sandbox, SAFE_SANDBOX);
+  assert.equal(
+    metadata.sandbox_attempt, "attempt-1",
+    "the handle and its attempt have to arrive together, or the reader's guard "
+    + "has nothing to compare and silently permits the inheritance",
+  );
+});
+
+test("and a later attempt reusing the same handle re-stamps it", async () => {
+  // Why comparing the handle pair alone was not enough: a redelivery that
+  // reuses the SAME sandbox writes an identical handle, so a predicate keyed on
+  // the handle sees no change and leaves the previous attempt's stamp in place
+  // -- which then refuses this row's own legitimate handle.
+  await reportRunningEvent({
+    brain_id: "worker-a", attempt_id: "attempt-1",
+    sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+  await reportRunningEvent({
+    brain_id: "worker-a", attempt_id: "attempt-2",
+    sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+
+  const metadata = (await storedRun()).metadata as Record<string, unknown>;
+  assert.equal(
+    metadata.sandbox_attempt, "attempt-2",
+    "the stamp follows the attempt that now owns the row",
+  );
+});
