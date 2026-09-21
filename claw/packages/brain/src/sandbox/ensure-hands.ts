@@ -1976,10 +1976,19 @@ async function clearIdleMarkers(
   held?: SandboxAttribution,
 ): Promise<boolean> {
   const restamp = held ? needsRestamp(info as AttributedEntry, held) : false;
-  // The early return has to account for the stamp now: an entry with no idle
-  // markers still needs a write when it changes hands, or the attribution goes
-  // stale exactly on the path that hands it over.
-  if (!restamp && info.keepalive === undefined && info.idleSince == null) return true;
+  // Why this write is happening, kept apart because the two reasons have
+  // OPPOSITE failure handling and only this knows which applies.
+  //
+  // Clearing markers is load-bearing for the reuse: the caller reads a `false`
+  // as "the slot went out from under us" and rebuilds. Re-stamping is not --
+  // the sandbox answered its own health check, and a stale holder costs a
+  // misreported ending, not a lost container. Before this stamp existed an
+  // entry with no markers took no CAS at all, so making one mandatory would
+  // have added a way for a live sandbox to be refused and replaced: a lost race
+  // whose re-read lands on a key a rolling migration has moved reads as a
+  // deleted record. That refusal stays reserved for the reason that earns it.
+  const clearingMarkers = info.keepalive !== undefined || info.idleSince != null;
+  if (!restamp && !clearingMarkers) return true;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
   // handle parked, and eligibleForClusterReclaim refuses any entry whose
   // keepalive is not false, so clearing it here would strip a session delete's
@@ -2012,7 +2021,18 @@ async function clearIdleMarkers(
   try {
     const latest = await kv.get(key);
     // Absent or tombstoned: the sweep won the race and took the slot with it.
+    //
+    // Only a write that was clearing markers may read this as a reason to
+    // refuse the reuse. A write that was only re-stamping the holder has no
+    // claim on that verdict -- the sandbox answered its health check, and a key
+    // that is missing HERE may simply have been migrated to its canonical name
+    // by `reconcileReservedKeys` mid-rollout. Refusing then would rebuild a
+    // live container to fix a record.
     if (!latest || isTombstone(latest)) {
+      if (!clearingMarkers) {
+        logger.warn({ sessionId, key }, "ensureHands.holder_restamp_skipped_key_moved");
+        return true;
+      }
       logger.warn({ sessionId, key }, "ensureHands.reuse_record_deleted_under_us");
       return false;
     }
@@ -2037,9 +2057,17 @@ async function clearIdleMarkers(
       logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
       return true;
     }
-    if (current.keepalive === undefined && current.idleSince == null) return true;
+    // The stamp travels with the retry. It was applied to the value the first
+    // CAS lost, and re-reading discards that value -- so a single ordinary
+    // heartbeat landing during the health check was enough to leave the holder
+    // naming whoever held it last.
+    const stamped = restamp && held
+      ? { taskId: held.taskId, attemptId: held.attemptId }
+      : {};
+    const stillNeedsMarkers = current.keepalive !== undefined || current.idleSince != null;
+    if (!stillNeedsMarkers && !restamp) return true;
     await kv.update(key, sc.encode(JSON.stringify({
-      ...current, keepalive: undefined, idleSince: undefined,
+      ...current, ...stamped, keepalive: undefined, idleSince: undefined,
     })), latest.revision);
     return true;
   } catch (err) {
@@ -2212,6 +2240,55 @@ export async function registerReusedDagHandle(
  * provision instead of reuse: registering a sandbox whose record the sweep just
  * removed re-adds a ping target the roster no longer holds a slot for.
  */
+/**
+ * Record the run now holding `identity` on the session binding, if that binding
+ * names the same sandbox.
+ *
+ * For the take-over paths that do not go through `clearIdleMarkers` -- today
+ * `sandbox_spec.use`, which resolves its container through the DAG handle
+ * registry and never touches the session slot. The contract says a record names
+ * WHO HOLDS IT NOW, and a path that takes a sandbox on without saying so leaves
+ * the previous holder's name on it.
+ *
+ * Conditional on the binding naming the same sandbox, and that condition is the
+ * whole safety of it: a session's slot can name a sibling DAG's container, and
+ * stamping this run onto that would claim a sandbox it is not using -- the
+ * inverse defect, and a worse one.
+ *
+ * Best effort by construction. It returns nothing and swallows everything: the
+ * caller has already probed the container and is entitled to use it, and a
+ * record that could not be updated costs a misattributed ending rather than a
+ * lost container. The reverse -- refusing a live sandbox because a write lost a
+ * race -- is the mistake this same refactor made once already.
+ */
+async function restampSessionBinding(
+  kv: ReturnType<typeof getHandsKv>,
+  sessionId: string,
+  identity: SandboxEntry,
+  held: SandboxAttribution,
+): Promise<void> {
+  if (!held.taskId && !held.attemptId) return;
+  try {
+    const binding = await readHandsEntry(kv, sessionId);
+    if (!binding) return;
+    const current = parseHandsProbeValue(binding.value) as HandsProbeEntry & AttributedEntry;
+    if (!sameHandsSandbox(identity, current)) return;
+    if (!needsRestamp(current, held)) return;
+    await kv.update(
+      binding.key,
+      sc.encode(JSON.stringify({
+        ...current, taskId: held.taskId, attemptId: held.attemptId,
+      })),
+      binding.revision,
+    );
+  } catch (err) {
+    logger.warn(
+      { err: String(err), sessionId },
+      "ensureHands.holder_restamp_failed",
+    );
+  }
+}
+
 /** The run this reuse attempt is for, as an attribution. */
 function heldBy(a: ReuseAttempt): SandboxAttribution {
   return { taskId: a.request.task_id ?? null, attemptId: a.attemptId ?? null };
@@ -2340,6 +2417,10 @@ async function provisionHands(
       "ensureHands.reusing_dag_handle",
     );
     reuseEffects.registerSandbox(sessionId, identity);
+    await restampSessionBinding(kv, sessionId, identity, {
+      taskId: request.task_id ?? null,
+      attemptId: options.attemptId ?? null,
+    });
     return { handsUrl: info.hands_url, created: false, token: info.token, identity };
   }
 
