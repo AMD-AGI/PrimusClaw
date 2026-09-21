@@ -68,11 +68,13 @@ func runJobShim() {
 	go func() { waited <- cmd.Wait() }()
 
 	var err error
+	cancelledPrimary := false
 	select {
 	case err = <-waited:
 	case <-cancelled:
 		// Stop only the primary command's process group. A descendant that
 		// deliberately created a new session remains adopted by this shim.
+		cancelledPrimary = true
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		err = <-waited
 	}
@@ -90,6 +92,13 @@ func runJobShim() {
 	_ = control.Close()
 	// Stay cancellable while adopting detached descendants: Ignore(SIGTERM)
 	// here left cancel() unable to free the roster after setsid work.
+	// When the only buffered SIGTERM was spent on the primary, reapOrphans
+	// would never see another -- kill adopted descendants immediately.
+	if cancelledPrimary {
+		killAdoptedDescendants()
+		drainOrphans()
+		return
+	}
 	reapOrphans(cancelled)
 }
 

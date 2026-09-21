@@ -297,6 +297,63 @@ func TestCancelFreesShimStuckReapingOrphans(t *testing.T) {
 	t.Fatal("cancel left the job on the roster")
 }
 
+func TestCancelWhilePrimaryRunsAlsoKillsSetsidOrphans(t *testing.T) {
+	requireJobShim(t)
+	// Timeout spends the only buffered SIGTERM on the primary process group.
+	// setsid orphans must still die or /api/jobs stays non-empty forever.
+	s := newTestServer()
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	var out synchronizedBuffer
+	_, exitCh, drained, stop, err := s.startTrackedCommand(
+		[]string{"sh", "-c", fmt.Sprintf(
+			"setsid sh -c 'echo $$ > %s; sleep 100000' >/dev/null 2>&1 & sleep 100000", pidFile,
+		)},
+		"", os.Environ(), &out, &out, jobTracking{track: true},
+	)
+	if err != nil {
+		t.Fatalf("startTrackedCommand: %v", err)
+	}
+	descendant := 0
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if raw, readErr := os.ReadFile(pidFile); readErr == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr == nil {
+				descendant = pid
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if descendant == 0 {
+		t.Fatal("the detached descendant never reported its pid")
+	}
+	stop()
+	select {
+	case <-exitCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cancelled primary did not report an exit status")
+	}
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		t.Fatal("cancel spent on the primary left the shim stuck reaping orphans")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, snapErr := s.jobs.snapshot()
+		if snapErr != nil {
+			t.Fatal(snapErr)
+		}
+		if snap.count == 0 {
+			if _, ok := readProc("/proc", descendant); ok {
+				t.Fatal("setsid orphan survived a timeout that cancelled the primary")
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("cancel while the primary ran left the job on the roster")
+}
+
 func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {
 	// The Hands job is infrastructure: the roster reports the descendants it
 	// spawned rather than the supervisor, which is the branch that decides every

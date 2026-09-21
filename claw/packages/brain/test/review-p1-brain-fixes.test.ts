@@ -126,6 +126,18 @@ test("the shipped chart does not opt every sandbox into automatic eviction", asy
   assert.match(values, /sandboxKeepaliveFailLimit:\s*"0"/);
 });
 
+test("controlplane refuses to enable sandbox idle-GC", async () => {
+  // LastActivity is no longer refreshed; enabling idle-GC would delete in-use
+  // sandboxes from create time plus session-timeout.
+  const src = await import("node:fs/promises")
+    .then((fs) => fs.readFile(
+      new URL("../../../../sandbox/cmd/controlplane/main.go", import.meta.url),
+      "utf8",
+    ));
+  assert.match(src, /if enableIdleGC \{\s*\n\s*log\.Error\("sandbox idle-GC cannot be enabled/);
+  assert.match(src, /os\.Exit\(1\)/);
+});
+
 test("a downgraded callback body caps failure_reason too", async () => {
   // The downgrade exists because the full body was already refused. Leaving
   // failure_reason uncapped -- on the script path it carries a failing step's

@@ -2361,11 +2361,11 @@ async function expireIdleTarget(
     const latest = await deps.kv.get(key);
     if (!latest || isTombstone(latest)) return;
     info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
-    await deps.kv.update(
-      key,
-      sc.encode(JSON.stringify({ ...info, status: "closing" })),
-      claimRevision,
-    );
+    // Re-check lease/local registry after the (bounded) jobs probe: a turn that
+    // started during the probe must win over this reclaim.
+    if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+      return;
+    }
     claimed = true;
     await destroyHands(sessionId, info);
     stats.expired += 1;

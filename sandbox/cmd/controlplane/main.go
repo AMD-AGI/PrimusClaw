@@ -108,12 +108,10 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
-	// Off by default because a deployment that runs Brain already reclaims idle
-	// sandboxes through it, and two reclaimers would race over the same
-	// Sandboxes. Set it where nothing else reclaims -- a standalone sandbox API
-	// or sdk-python deployment -- or an idle Sandbox is held until its own
-	// ShutdownTime, which defaults to 24h rather than --session-timeout.
-	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Run sandbox-idle-gc-controller, which deletes a Sandbox idle past --session-timeout. Off by default: set it where Brain is not the reclaimer, or an idle Sandbox waits for its ShutdownTime instead")
+	// Off by default. LastActivity is no longer refreshed for idle-GC (Brain
+	// owns reclaim via jobs), so enabling this controller would delete sandboxes
+	// from their create time plus --session-timeout while they are still in use.
+	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Refused: LastActivity is not refreshed for idle-GC; Brain reclaim owns sandbox lifetime. Leave false.")
 	flag.Parse()
 
 	// controller-runtime keeps zap here, deliberately: switching it to the
@@ -135,6 +133,10 @@ func main() {
 		enableIdleGC = true
 	} else if v == "false" {
 		enableIdleGC = false
+	}
+	if enableIdleGC {
+		log.Error("sandbox idle-GC cannot be enabled: LastActivity is not refreshed; Brain jobs reclaim owns sandbox lifetime")
+		os.Exit(1)
 	}
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v

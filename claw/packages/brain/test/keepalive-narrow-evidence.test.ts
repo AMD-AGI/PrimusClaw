@@ -86,6 +86,15 @@ test("expiry CAS is not self-bumped by jobs identity persistence", () => {
   );
 });
 
+test("idle destroy re-checks the run lease after the jobs probe", () => {
+  // A turn that starts during the (bounded) probe must not lose its sandbox.
+  const body = bodyOf("expireIdleTarget");
+  const probe = body.indexOf("probeUserProcesses(");
+  const claim = body.indexOf("claimIdleStop(");
+  assert.ok(probe >= 0 && claim > probe,
+    "claimIdleStop runs on the success path after the sync jobs probe");
+});
+
 test("an expired retry separates a failed lock read from an absent lock", () => {
   // `.catch(() => null)` made a KV hiccup indistinguishable from "nobody holds
   // this", and the unregister then ran on the strength of an error.
