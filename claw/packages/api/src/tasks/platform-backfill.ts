@@ -113,6 +113,14 @@ interface HandsEntry {
   sandbox: SandboxHandle;
   platformKey: string;
   createdAt: unknown;
+  /**
+   * The attempt the KV entry names as holding it, if any.
+   *
+   * Carried so a handle pinned from this entry is stamped with WHOSE it was --
+   * not with whoever happens to own the row now. The guard then refuses it on
+   * the rows it does not belong to, which is the whole point of pinning it.
+   */
+  attemptId: string | null;
 }
 
 async function readHandsEntry(row: SweptRow): Promise<HandsEntry | null> {
@@ -137,7 +145,11 @@ async function readHandsEntry(row: SweptRow): Promise<HandsEntry | null> {
       cannotRead(row, "invalid_kv_handle");
       return null;
     }
+    const heldBy = typeof data.attemptId === "string" && data.attemptId
+      ? data.attemptId
+      : null;
     return {
+      attemptId: heldBy,
       sandbox,
       platformKey: typeof data.platformKey === "string" ? data.platformKey : "",
       createdAt: data.createdAt,
@@ -155,21 +167,30 @@ function timestamp(value: unknown): number {
     : typeof value === "string" ? Date.parse(value) : NaN;
 }
 
-async function rememberFallback(row: SweptRow, sandbox: SandboxHandle): Promise<boolean> {
+async function rememberFallback(
+  row: SweptRow, sandbox: SandboxHandle, heldBy: string | null,
+): Promise<boolean> {
   // Pin the observed identity so a later retry cannot follow the session into
   // its next sandbox. A concurrent ownership report wins instead of being
   // overwritten with the KV snapshot.
   const r = await db.query(
     `UPDATE claw_tasks
+        -- The handle and the attempt it belonged to, together. Pinning one
+        -- without the other leaves the row's own guard nothing to compare, so
+        -- the shape this writer produced made the check it feeds permanently
+        -- permissive for exactly the rows it wrote.
         SET metadata = COALESCE(metadata, '{}'::jsonb)
-                       || jsonb_build_object('sandbox', $2::jsonb),
+                       || jsonb_build_object('sandbox', $2::jsonb)
+                       || CASE WHEN $4::text IS NULL THEN '{}'::jsonb
+                               ELSE jsonb_build_object('sandbox_attempt', $4::text) END,
             sandbox_workload_id = $3
       WHERE task_id = $1
         AND (metadata->'sandbox' IS NULL OR metadata->'sandbox' = 'null'::jsonb)
         AND NULLIF(sandbox_workload_id, '') IS NULL
         AND platform_facts_resolved_at IS NULL
       RETURNING task_id`,
-    [row.task_id, JSON.stringify(sandbox), sandbox.provider === "safe-workload" ? sandbox.handle : null],
+    [row.task_id, JSON.stringify(sandbox),
+     sandbox.provider === "safe-workload" ? sandbox.handle : null, heldBy],
   );
   if (!r.rowCount) cannotRead(row, "sandbox_ownership_changed");
   return Boolean(r.rowCount);
@@ -232,7 +253,7 @@ async function resolveSandbox(row: SweptRow): Promise<ResolvedSandbox | null> {
       return null;
     }
     sandbox = hands.sandbox;
-    if (!await rememberFallback(row, sandbox)) return null;
+    if (!await rememberFallback(row, sandbox, hands?.attemptId ?? null)) return null;
   }
   return { sandbox, hands };
 }

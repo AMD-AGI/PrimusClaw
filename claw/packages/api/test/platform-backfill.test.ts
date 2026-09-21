@@ -382,8 +382,12 @@ test("a pending legacy KV handle and its trusted key recover an unstamped chat r
   assert.deepEqual(h.kvReads, ["hands.s-kv"], "handle and key share one KV read");
   assert.deepEqual(h.fetched, ["http://safe.test/api/v1/workloads/wl-pending"]);
   assert.deepEqual(h.authorization, ["Bearer pk-from-brain"]);
+  // The fourth parameter is the attempt the KV entry named as holding it. A
+  // legacy entry names none, so the handle is pinned unstamped and the row's
+  // cross-attempt guard stays permissive for it -- which is the pre-rollout
+  // shape, not a gap.
   assert.deepEqual(h.handles, [[
-    "t-kv", JSON.stringify({ provider: "safe-workload", handle: "wl-pending" }), "wl-pending",
+    "t-kv", JSON.stringify({ provider: "safe-workload", handle: "wl-pending" }), "wl-pending", null,
   ]]);
 });
 
@@ -500,7 +504,7 @@ test("an agent-sandbox KV entry uses sessionId and records an unsupported reader
   });
   assert.equal(await backfillPlatformFacts([KV_RUN]), 0);
   assert.deepEqual(h.handles, [[
-    "t-kv", JSON.stringify({ provider: "agent-sandbox", handle: "agent-session" }), null,
+    "t-kv", JSON.stringify({ provider: "agent-sandbox", handle: "agent-session" }), null, null,
   ]]);
   assert.deepEqual(h.fetched, []);
   assert.deepEqual(h.updates, []);

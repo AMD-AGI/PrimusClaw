@@ -406,3 +406,31 @@ test("and still reads a settled row's own handle", async () => {
   assert.notEqual((await row("settled-same-attempt")).platform_facts_attempts, 0,
     "the guard must not refuse the row's own handle once it has settled");
 });
+
+test("a handle pinned from KV carries the attempt that entry named", async () => {
+  // rememberFallback writes the handle it derived from the session's KV entry.
+  // Writing it WITHOUT the attempt that entry named left the row's own
+  // cross-attempt guard nothing to compare -- so the one writer whose shape the
+  // guard depends on was the one producing rows it could never judge.
+  //
+  // The attempt stamped is the entry's, not the row's: the point of pinning is
+  // to record whose sandbox this was, and the guard then refuses it on the rows
+  // it does not belong to.
+  await seed("kv-pinned", "worker_lost", {
+    handle: null, attemptId: null, settledAttemptId: "attempt-row", metadata: {},
+  });
+  await pg.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_build_object(
+              'sandbox', jsonb_build_object('provider','safe-workload','handle','wl-from-kv'),
+              'sandbox_attempt', 'attempt-that-held-it')
+      WHERE task_id = 'kv-pinned'`,
+  );
+
+  await drainPendingPlatformFacts();
+
+  const pinned = await row("kv-pinned");
+  assert.equal(pinned.platform_node, null,
+    "a pinned handle from another attempt is refused, not read");
+  assert.equal(pinned.platform_facts_resolved_at, null);
+});
