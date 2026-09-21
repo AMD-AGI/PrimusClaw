@@ -2336,11 +2336,13 @@ class TaskRunner {
     // the task id the entry names, which every entry this build writes carries.
     // What is still lost by re-stamping is the REPORT, and losing it is how the
     // workload becomes unattributable: the delivery heartbeat that refreshes
-    // the entry stops with the run, and five minutes later
+    // the entry stops with the run, and five minutes after that last refresh
     // (DEFAULT_BRAIN_REGISTRY_TTL_MS, a per-message max age every write resets)
-    // the entry is gone. `collectAbandonedPending` only reaches entries a live
-    // session is still keeping warm, so an orphan on a session that then goes
-    // quiet is past its horizon's reach.
+    // the entry is gone. `collectAbandonedPending` is not a second chance to
+    // rely on here: it needs the entry still present, its `createdAt` already
+    // past SANDBOX_PENDING_ABANDONED_AFTER_MS, and the lease free, all at once
+    // and with a pass landing in that window -- reachable, but not a property
+    // of the entry, and nothing this path can arrange.
     //
     // Keeping the earliest ask widens nothing onto a predecessor's entry: that
     // entry names a different task, which is the case `reapPendingHands` refuses

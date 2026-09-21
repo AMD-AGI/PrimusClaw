@@ -515,18 +515,21 @@ export async function reapPendingHands(
     //
     //  - `runScope` presence: said only which fields an old writer happened to
     //    set, and `94b63ef` on this branch set that one and not `taskId`.
-    //  - "leave it to `collectAbandonedPending`": that sweep only reaches an
-    //    entry the session is still keeping warm. `BRAIN_REGISTRY_TTL_MS` is a
-    //    per-message max age (5 min) that every write resets -- see
-    //    `tasks/lock.ts`, "the bucket expires an entry nobody refreshes" -- and
-    //    the only thing refreshing a PENDING entry is the delivery heartbeat
-    //    (runner.ts, `readHandsEntry` then `kv.update`, ownership-blind and
-    //    every LOCK_REFRESH_INTERVAL_MS; keepalive skips anything not `ready`).
-    //    So on a busy session the entry outlives the sweep's horizon and the
-    //    collector does take it; on one that goes quiet -- which is the
-    //    mid-provision brain death the collector is sold for -- it is gone five
-    //    minutes later and the horizon never sees it. Either way it is not a
-    //    thing this gate can lean on to decide an ENTRY's owner.
+    //  - "leave it to `collectAbandonedPending`": that sweep takes an entry
+    //    only where three things hold at once -- the entry still exists, its
+    //    `createdAt` is at least SANDBOX_PENDING_ABANDONED_AFTER_MS old, and
+    //    `lock.<runScope>` reads free -- and a pass has to land while they do.
+    //    None of the three is implied by the others. Existence is a moving
+    //    target: BRAIN_REGISTRY_TTL_MS is a per-message max age every write
+    //    resets (`tasks/lock.ts`: "the bucket expires an entry nobody
+    //    refreshes"), and the delivery heartbeat refreshes a PENDING entry
+    //    without rewriting `createdAt`, so age keeps accruing while the session
+    //    has traffic and the record dies five minutes after the last refresh.
+    //    The lease is free only between runs. So the sweep can reach an entry
+    //    that aged under traffic and is caught in the window after the last run
+    //    releases, and can equally miss one that expired before it ever aged
+    //    in. Whichever way it falls, it is a sweep over entries rather than an
+    //    answer about who owns one, which is what this gate needs.
     //  - the run lease: under the default `RUN_GATE_KEY=workspace` that lock is
     //    `ws.<workspaceId>`, one for every run in the workspace, so "held"
     //    reported a stranger's traffic -- and a redelivery read its own lock.
