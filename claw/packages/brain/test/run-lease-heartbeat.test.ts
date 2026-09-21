@@ -230,6 +230,9 @@ test("a renewal sent while the sandbox is still provisioning names the pending w
       // has to fall back to safe-workload for it.
       await ctl.kv.put(handsSessionKey(SESSION), JSON.stringify({
         status: "pending",
+        // Recorded by `makeOnProvisioned` alongside everything else, and what
+        // the report establishes ownership by.
+        taskId: TASK,
         workloadId: "workload-pending-1",
         platformKey: "private-key",
         sandboxImage: null,

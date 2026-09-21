@@ -103,9 +103,13 @@ async function runTurn(provisions: "none" | "own") {
   const sideEffects = {
     ensureHands: (async () => {
       ensureHandsCalls++;
-      // This run's own `onProvisioned`, replacing the leftover entry.
+      // This run's own `onProvisioned`, replacing the leftover entry -- and
+      // naming this task, which is what makes it this run's to report. The
+      // leftover above deliberately names none: that is the whole shape under
+      // test, and it is now refused on the name rather than on the clock.
       await kv.put(handsSessionKey(SESSION), JSON.stringify({
         status: "pending",
+        taskId: "task-stale-pending",
         workloadId: OWN_WORKLOAD,
         platformKey: "pk",
         token: "hands-token",

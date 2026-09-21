@@ -99,6 +99,10 @@ test("preempted before ready: the platform is asked about the minted workload, b
       // bucket when the pod is reclaimed a moment later.
       await kv.put(handsSessionKey(SESSION), JSON.stringify({
         status: "pending",
+        // The task that asked. `makeOnProvisioned` always records it, and both
+        // the reap and the report now establish ownership by it -- a fixture
+        // that omitted it was modelling an entry this build cannot write.
+        taskId: "task-preempt",
         provider: "safe-workload",
         workloadId: WORKLOAD,
         platformKey: PLATFORM_KEY,

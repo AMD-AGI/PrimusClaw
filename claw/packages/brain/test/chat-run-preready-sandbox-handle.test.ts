@@ -72,7 +72,14 @@ function fakeKv(seed: Record<string, string> = {}) {
   };
 }
 
-test("a chat run killed before its first heartbeat leaves its workload on the row", async () => {
+/**
+ * Drive one chat run whose provision dies before the sandbox is ready.
+ *
+ * `entryWritten` is what the bucket holds by the time the run fails -- by
+ * default the entry this run's own `onProvisioned` would have written, and for
+ * the ownership tests below, one belonging to somebody else.
+ */
+async function runPreadyChat(entryWritten?: Record<string, unknown>) {
   const renewals: LeaseRenewal[] = [];
   const events: Array<Record<string, unknown>> = [];
   const order: string[] = [];
@@ -97,8 +104,12 @@ test("a chat run killed before its first heartbeat leaves its workload on the ro
       // provision records it before it starts waiting on the pod. Written from
       // inside the call because that is the only place it is ever written from
       // -- an entry that predates this run belongs to an earlier message.
-      await kv.put(handsSessionKey(SESSION), JSON.stringify({
+      await kv.put(handsSessionKey(SESSION), JSON.stringify(entryWritten ?? {
         status: "pending",
+        // The task that asked. `makeOnProvisioned` always records it, and both
+        // the reap and the report establish ownership by it -- a fixture that
+        // omitted it was modelling an entry this build cannot write.
+        taskId: "task-chat-preready",
         workloadId: WORKLOAD,
         platformKey: PLATFORM_KEY,
         token: "hands-token",
@@ -179,6 +190,11 @@ test("a chat run killed before its first heartbeat leaves its workload on the ro
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
   await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
+  return { renewals, events, order, delivered, entryAtRenewal, store };
+}
+
+test("a chat run killed before its first heartbeat leaves its workload on the row", async () => {
+  const { renewals, events, order, delivered, entryAtRenewal, store } = await runPreadyChat();
 
   // 1. Nothing else carried the account anywhere. The chat run has no callback,
   //    so the facts Brain read are delivered to nobody, and the completion the
@@ -210,4 +226,49 @@ test("a chat run killed before its first heartbeat leaves its workload on the ro
   assert.equal(store.get(handsSessionKey(SESSION)), undefined,
     "and the reap still runs afterwards");
   assert.deepEqual(order.filter((o) => o === "ack"), ["ack"]);
+});
+
+test("a sibling DAG's newer entry is not reported as this run's workload", async () => {
+  // The gap between the two readers of one question. `reapPendingHands` was
+  // taught to match the task the entry names; this path was left comparing
+  // timestamps, and the weaker test was the one on the reporting side.
+  //
+  // No skewed clock is needed. This run's create is refused before
+  // `onProvisioned` writes anything; a sibling DAG then writes its own PENDING
+  // entry, which is genuinely NEWER than this run's ask. On the old test this
+  // run adopted it -- reporting the sibling's workload, node and preemption
+  // reason as its own ending, on a task that never had a sandbox. The reap
+  // correctly refuses to destroy it, which does not unsay the report.
+  const { renewals } = await runPreadyChat({
+    status: "pending",
+    provider: "safe-workload",
+    workloadId: "workload-sibling-dag",
+    platformKey: PLATFORM_KEY,
+    token: "hands-token",
+    namespace: "claw",
+    taskId: "task-sibling-dag",
+    createdAt: new Date(Date.now() + 1_000).toISOString(),
+  });
+
+  assert.equal(
+    renewals.some((r) => r.sandbox), false,
+    `an entry naming another task is not this run's to report: ${
+      JSON.stringify(renewals.map((r) => r.sandbox))}`,
+  );
+});
+
+test("and neither is one that names no task at all", async () => {
+  // `makeOnProvisioned` always records the task, so an entry without one was
+  // written by a build older than the field and cannot be this run's.
+  const { renewals } = await runPreadyChat({
+    status: "pending",
+    provider: "safe-workload",
+    workloadId: "workload-unnamed",
+    platformKey: PLATFORM_KEY,
+    token: "hands-token",
+    namespace: "claw",
+    createdAt: new Date(Date.now() + 1_000).toISOString(),
+  });
+
+  assert.equal(renewals.some((r) => r.sandbox), false);
 });

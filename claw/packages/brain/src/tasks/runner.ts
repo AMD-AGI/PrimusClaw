@@ -1486,13 +1486,13 @@ class TaskRunner {
    * BRAIN_LAZY_SANDBOX can fail on an LLM error without ever calling
    * `ensureHands` -- then reads that workload as the sandbox it was on, asks
    * SaFE about it, and delivers the previous run's preemption as its own
-   * ending. So ownership is asked of this runner rather than of the entry:
-   * `sandboxAskedAt` is set immediately before `ensureHands` is called from
-   * here, `onProvisioned` stamps `createdAt` on the entry from inside that same
-   * call and in this same process, and an entry older than the ask therefore
-   * belongs to something else. Both halves matter -- a run that never asked can
-   * own no entry at all, and a run whose provision was refused before
-   * `onProvisioned` ran has only a predecessor's entry left to find.
+   * ending. So ownership is established before anything is reported, and by the
+   * same test the teardown uses: the entry names the task that asked for it, and
+   * an entry naming a different one -- or naming none, which no task-bearing run
+   * of this build can write -- is somebody else's. The ask time then narrows
+   * what is left to this run's CURRENT provision, which is what separates it
+   * from an entry a rebuild replaced under the same task id. A run that never
+   * asked owns no entry at all.
    *
    * Null on anything unreadable. An absent entry, an unreachable bucket, a
    * corrupt payload and a missing or unparseable `createdAt` all mean the same
@@ -1508,8 +1508,25 @@ class TaskRunner {
       const entry = await readHandsEntry(this.kv, this.sessionId);
       if (!entry) return null;
       const info = JSON.parse(entry.value) as HandsProbeEntry
-        & { status?: string; createdAt?: string };
+        & { status?: string; createdAt?: string; taskId?: string | null };
       if (info.status !== "pending" || !info.workloadId) return null;
+      // By name first, the way the teardown asks it. `reapPendingHands` matches
+      // the task the entry records, and this path was left comparing timestamps
+      // -- so the two readers of one question disagreed, and the weaker test was
+      // the one on the reporting side. The gap does not need a skewed clock: a
+      // sibling DAG's entry written AFTER this run asked is genuinely newer, so
+      // a run whose own provision was refused before `onProvisioned` reported
+      // the sibling's workload, node and preemption reason as its own ending.
+      //
+      // Every entry this build writes carries the task that asked
+      // (`makeOnProvisioned`), so an entry naming a different task -- or naming
+      // none, which no task-bearing run of this build can produce -- is not this
+      // run's to report.
+      if (this.request.task_id && info.taskId !== this.request.task_id) return null;
+      // Then by time, which now only narrows. It is what separates this run's
+      // own entry from one it destroyed and replaced under the same task id: a
+      // rebuild re-stamps the ask and removes the previous entry first, so an
+      // entry older than the ask is one that survived that removal.
       const createdAt = Date.parse(info.createdAt ?? "");
       return Number.isFinite(createdAt) && createdAt >= askedAt ? info : null;
     } catch (e) {
