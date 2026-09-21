@@ -99,7 +99,10 @@ async function runPreadyChat(entryWritten?: Record<string, unknown>) {
   const { kv: kvCkpt } = fakeKv();
 
   const sideEffects = {
-    ensureHands: (async () => {
+    ensureHands: (async (
+      _sid: string, _req: unknown, _pk: unknown, _ev: unknown, _mn: unknown,
+      opts?: { attemptId?: string },
+    ) => {
       // `onProvisioned`, field for field: SaFE has minted the id and the
       // provision records it before it starts waiting on the pod. Written from
       // inside the call because that is the only place it is ever written from
@@ -110,6 +113,10 @@ async function runPreadyChat(entryWritten?: Record<string, unknown>) {
         // the reap and the report establish ownership by it -- a fixture that
         // omitted it was modelling an entry this build cannot write.
         taskId: "task-chat-preready",
+        // Recorded from the options the real `ensureHands` receives, which is
+        // where `makeOnProvisioned` gets it: the report identifies the attempt
+        // that minted the entry, not merely the task.
+        attemptId: opts?.attemptId ?? null,
         workloadId: WORKLOAD,
         platformKey: PLATFORM_KEY,
         token: "hands-token",
@@ -271,4 +278,33 @@ test("and neither is one that names no task at all", async () => {
   });
 
   assert.equal(renewals.some((r) => r.sandbox), false);
+});
+
+test("nor the entry a previous attempt of this same task left behind", async () => {
+  // A redelivery carries the SAME task id, so the identity gate above cannot
+  // separate the attempts -- and the timestamp that used to stand in for it was
+  // stamped by whichever replica wrote the entry. Measured upstream: a replica
+  // five seconds fast made the previous attempt's entry look newer than this
+  // attempt's ask, and this run reported that attempt's node, exit code and
+  // preemption as its own ending.
+  //
+  // `attemptId` is minted per TaskRunner and recorded by `makeOnProvisioned`,
+  // so this is an identity test with no clock in it.
+  const { renewals } = await runPreadyChat({
+    status: "pending",
+    provider: "safe-workload",
+    workloadId: "workload-previous-attempt",
+    platformKey: PLATFORM_KEY,
+    token: "hands-token",
+    namespace: "claw",
+    taskId: "task-chat-preready",
+    attemptId: "attempt-from-the-delivery-before-this-one",
+    createdAt: new Date(Date.now() + 5_000).toISOString(),
+  });
+
+  assert.equal(
+    renewals.some((r) => r.sandbox), false,
+    `a previous attempt's workload is not this one's to report: ${
+      JSON.stringify(renewals.map((r) => r.sandbox))}`,
+  );
 });

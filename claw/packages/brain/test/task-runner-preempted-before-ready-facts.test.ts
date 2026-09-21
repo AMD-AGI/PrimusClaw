@@ -93,7 +93,10 @@ test("preempted before ready: the platform is asked about the minted workload, b
   const { kv: kvCkpt } = fakeKv();
 
   const sideEffects = {
-    ensureHands: (async () => {
+    ensureHands: (async (
+      _sid: string, _req: unknown, _pk: unknown, _ev: unknown, _mn: unknown,
+      opts?: { attemptId?: string },
+    ) => {
       // What `onProvisioned` writes: status pending, no handsUrl yet, and the
       // platform key the workload was created with. This is the state of the
       // bucket when the pod is reclaimed a moment later.
@@ -103,6 +106,10 @@ test("preempted before ready: the platform is asked about the minted workload, b
         // the reap and the report now establish ownership by it -- a fixture
         // that omitted it was modelling an entry this build cannot write.
         taskId: "task-preempt",
+        // Recorded from the options the real `ensureHands` receives, which is
+        // where `makeOnProvisioned` gets it: the report identifies the attempt
+        // that minted the entry, not merely the task.
+        attemptId: opts?.attemptId ?? null,
         provider: "safe-workload",
         workloadId: WORKLOAD,
         platformKey: PLATFORM_KEY,

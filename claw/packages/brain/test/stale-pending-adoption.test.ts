@@ -101,7 +101,10 @@ async function runTurn(provisions: "none" | "own") {
   const { kv: kvCkpt } = fakeKv();
 
   const sideEffects = {
-    ensureHands: (async () => {
+    ensureHands: (async (
+      _sid: string, _req: unknown, _pk: unknown, _ev: unknown, _mn: unknown,
+      opts?: { attemptId?: string },
+    ) => {
       ensureHandsCalls++;
       // This run's own `onProvisioned`, replacing the leftover entry -- and
       // naming this task, which is what makes it this run's to report. The
@@ -110,6 +113,10 @@ async function runTurn(provisions: "none" | "own") {
       await kv.put(handsSessionKey(SESSION), JSON.stringify({
         status: "pending",
         taskId: "task-stale-pending",
+        // Recorded from the options the real `ensureHands` receives, which is
+        // where `makeOnProvisioned` gets it: the report identifies the attempt
+        // that minted the entry, not merely the task.
+        attemptId: opts?.attemptId ?? null,
         workloadId: OWN_WORKLOAD,
         platformKey: "pk",
         token: "hands-token",

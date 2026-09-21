@@ -88,6 +88,14 @@ interface ScenarioControls {
   kv: KV;
   /** Let a held `ensureHands` return, ending the pre-ready window. */
   releaseHands: () => void;
+  /**
+   * The attempt id the runner handed to `ensureHands`.
+   *
+   * An entry the scenario writes has to carry it, because that is what
+   * `makeOnProvisioned` records and what the report identifies the entry by --
+   * a task id alone cannot tell this attempt from the delivery before it.
+   */
+  attemptId: () => string | null;
 }
 
 async function runScenario(opts: {
@@ -110,8 +118,16 @@ async function runScenario(opts: {
   let releaseHands = () => {};
   const handsHeld = new Promise<void>((resolve) => { releaseHands = () => resolve(); });
 
+  // Captured from the options the runner passes, the way the real
+  // `makeOnProvisioned` gets it: an entry written below has to name the ATTEMPT
+  // that minted it, or the report will not recognise it as this run's.
+  let attemptId: string | null = null;
   const sideEffects = {
-    ensureHands: (async () => {
+    ensureHands: (async (
+      _sid: string, _req: unknown, _pk: unknown, _ev: unknown, _mn: unknown,
+      o?: { attemptId?: string },
+    ) => {
+      attemptId = o?.attemptId ?? null;
       if (opts.holdHands) await handsHeld;
       return { handsUrl: "http://hands.test", created: true, token: "t", identity: opts.identity };
     }) as never,
@@ -142,7 +158,7 @@ async function runScenario(opts: {
   const engine: Engine = {
     async execute(_req, _onEvent, _signal, _hands, extras) {
       return opts.engineBehavior
-        ? opts.engineBehavior(extras, { kv, releaseHands })
+        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId })
         : result();
     },
   };
@@ -231,8 +247,10 @@ test("a renewal sent while the sandbox is still provisioning names the pending w
       await ctl.kv.put(handsSessionKey(SESSION), JSON.stringify({
         status: "pending",
         // Recorded by `makeOnProvisioned` alongside everything else, and what
-        // the report establishes ownership by.
+        // the report establishes ownership by -- the task, and which attempt of
+        // it.
         taskId: TASK,
+        attemptId: ctl.attemptId(),
         workloadId: "workload-pending-1",
         platformKey: "private-key",
         sandboxImage: null,

@@ -256,6 +256,15 @@ export interface SandboxReuseEffects {
 
 export interface EnsureHandsOptions {
   /**
+   * The attempt asking, not merely the task.
+   *
+   * Recorded on the PENDING entry so the reporting side can tell THIS attempt's
+   * half-created workload from one a previous delivery of the same task left
+   * behind. A task id cannot: a redelivery carries the same one, and the
+   * timestamp that stood in for this is stamped by whichever replica wrote it.
+   */
+  attemptId?: string;
+  /**
    * Provision instead of consulting `hands.<sessionId>`.
    *
    * Recovery uses this after stopping a specifically named DAG sandbox. The
@@ -2461,6 +2470,7 @@ async function provisionHands(
     // The handle this DAG is claiming, and who is claiming it. Needed inside
     // because the registration has to happen in this hook -- see the note there.
     taskId: request.task_id ?? null,
+    attemptId: options.attemptId ?? null,
     dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
     handleName: action.kind === "create" ? (action.handle ?? null) : null,
   });
@@ -2710,6 +2720,8 @@ export function makeOnProvisioned(deps: {
   stop?: (workloadId: string) => Promise<void>;
   /** Who this workload belongs to, and the handle it is claiming. */
   taskId?: string | null;
+  /** The attempt that asked; see EnsureHandsOptions.attemptId. */
+  attemptId?: string | null;
   dagRootTaskId?: string | null;
   handleName?: string | null;
 }): (workloadId: string) => Promise<void> {
@@ -2763,6 +2775,9 @@ export function makeOnProvisioned(deps: {
       // gate, so a failing task must be able to tell its own half-created
       // workload from a sibling's live one before reaping it.
       taskId: deps.taskId ?? null,
+      // Which ATTEMPT minted it. `taskId` says a redelivery is the same task;
+      // only this says it is the same run of it.
+      attemptId: deps.attemptId ?? null,
       dagRootTaskId: deps.dagRootTaskId ?? null,
       platformKey: deps.apiKey, token: deps.handsToken, namespace: deps.namespace,
       runScope: deps.runScope,

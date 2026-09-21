@@ -1509,7 +1509,8 @@ class TaskRunner {
       const entry = await readHandsEntry(this.kv, this.sessionId);
       if (!entry) return null;
       const info = JSON.parse(entry.value) as HandsProbeEntry
-        & { status?: string; createdAt?: string; taskId?: string | null };
+        & { status?: string; createdAt?: string; taskId?: string | null;
+            attemptId?: string | null };
       if (info.status !== "pending" || !info.workloadId) return null;
       // By name first, the way the teardown asks it. `reapPendingHands` matches
       // the task the entry records, and this path was left comparing timestamps
@@ -1524,19 +1525,25 @@ class TaskRunner {
       // none, which no task-bearing run of this build can produce -- is not this
       // run's to report.
       if (this.request.task_id && info.taskId !== this.request.task_id) return null;
-      // Then by time, which only narrows, and not where the rebuild is
-      // concerned: `reportableIdentity` short-circuits on a non-null
-      // `handsIdentity`, and a failed rebuild leaves the destroyed sandbox's
-      // identity in place, so that window never reaches this function at all.
-      // It is a pre-existing limit of the rebuild path, not something this test
-      // covers.
+      // Then by ATTEMPT, because the task id does not separate one delivery of
+      // a task from the next. A redelivery carries the same task id, and its
+      // predecessor can leave a PENDING entry behind -- a SIGTERM mid-provision
+      // is enough. Reporting that entry writes the previous attempt's node,
+      // exit code and preemption onto this attempt's failing row.
       //
-      // What it does cover is a REDELIVERY. `sandboxAskedAt` starts null on
-      // each TaskRunner, so a previous attempt's entry carries this same task id
-      // with a stamp older than this attempt's ask -- a workload that attempt
-      // minted, which is not this one's to report.
-      const createdAt = Date.parse(info.createdAt ?? "");
-      return Number.isFinite(createdAt) && createdAt >= askedAt ? info : null;
+      // This was a timestamp comparison until it was measured: `createdAt` is
+      // stamped by whichever replica wrote the entry and `sandboxAskedAt` by
+      // this one, so a replica five seconds fast made the previous attempt's
+      // entry look newer than this attempt's ask and it was adopted. The same
+      // cross-process clock that had already been removed from the teardown
+      // gate, surviving here as a narrowing.
+      //
+      // `attemptId` is a randomUUID minted per TaskRunner, recorded on the entry
+      // by `makeOnProvisioned`, so this is an identity test rather than an
+      // inference. An entry from a build that predates the field carries none
+      // and is refused, which is the same direction: an entry this attempt
+      // cannot prove it minted is not one it may report.
+      return info.attemptId === this.attempt.attemptId ? info : null;
     } catch (e) {
       logger.warn({ err: e, sessionId: this.sessionId }, "platform_facts.pending_identity_unreadable");
       return null;
@@ -1671,7 +1678,8 @@ class TaskRunner {
     this.sandboxAskedAt = Date.now();
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { skipSessionReuse: true, signal: this.abortCtrl.signal },
+      { skipSessionReuse: true, signal: this.abortCtrl.signal,
+        attemptId: this.attempt.attemptId },
     );
     const newHands = fx().makeHandsClient(
       newUrl, newToken, this.handsOwner, this.runId, this.request.deadline_at, this.shellRun,
@@ -2377,7 +2385,7 @@ class TaskRunner {
     this.sandboxAskedAt ??= Date.now();
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { signal: this.abortCtrl.signal },
+      { signal: this.abortCtrl.signal, attemptId: this.attempt.attemptId },
     );
     logger.info({ sessionId: this.sessionId, messageId: this.messageId, created, handsUrl }, "task.sandbox_ready");
     this.handsUrl = handsUrl;
