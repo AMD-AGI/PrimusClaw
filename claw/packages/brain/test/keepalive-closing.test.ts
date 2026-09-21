@@ -131,7 +131,11 @@ test("a closing handle is not treated as idle-empty work", async () => {
   }
 });
 
-test("a sandbox without GET /api/jobs is not idle-reclaimed", async () => {
+test("a sandbox without GET /api/jobs is reclaimed after the idle window", async () => {
+  // JobsUnavailable used to leave bgWork=unknown forever while sliding
+  // workSeenAt, so expireIdleTarget's JobsUnavailable fallback was unreachable.
+  // Past the reuse window the sweep must reclaim the same way deployments
+  // without /api/jobs did.
   const { kv, store } = storeKv({
     status: "ready",
     provider: "safe-workload",
@@ -153,6 +157,7 @@ test("a sandbox without GET /api/jobs is not idle-reclaimed", async () => {
     async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
   } as unknown as SandboxProvider;
   const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
   try {
     const absent = async () => {
       throw new SandboxJobsUnavailableError(404);
@@ -160,9 +165,110 @@ test("a sandbox without GET /api/jobs is not idle-reclaimed", async () => {
     await runKeepaliveTickForTest({ kv, countActiveShells: absent });
     await new Promise((r) => setImmediate(r));
     await runKeepaliveTickForTest({ kv, countActiveShells: absent });
-    assert.equal(stopped.length, 0, "Brain must not stop a sandbox with no jobs API");
-    assert.ok(store.has(`hands.${SESSION}`), "handle remains for the workload timeout");
+    assert.ok(stopped.includes("wl-1"), "idle window elapsed and jobs API is absent");
+    assert.equal(store.has(`hands.${SESSION}`), false);
   } finally {
+    restoreRetry();
+    restore();
+  }
+});
+
+test("idle reclaim CAS uses the enrollment revision after a concurrent ready write", async () => {
+  // During the destructive probe, another writer clears idle markers and bumps
+  // the revision (ensureHands). Reclaim must CAS against the enrollment
+  // revision so that write wins; adopting the latest revision would destroy the
+  // sandbox that just became busy.
+  const key = `hands.${SESSION}`;
+  const store = new Map<string, { value: Uint8Array; revision: number }>();
+  store.set(key, {
+    value: sc.encode(JSON.stringify({
+      status: "ready",
+      provider: "safe-workload",
+      workloadId: "wl-race",
+      platformKey: "pk",
+      namespace: "ns",
+      handsUrl: "http://sandbox:9100/mcp",
+      token: "tok",
+      keepalive: false,
+      idleSince: 0,
+      quiescedAt: 0,
+    })),
+    revision: 5,
+  });
+  const closingAt: number[] = [];
+  const kv = {
+    async keys(filter = ">") {
+      const matched = [...store.keys()].filter((k) => filterToRegExp(filter).test(k));
+      return (async function* () { yield* matched; })();
+    },
+    async get(k: string) {
+      const hit = store.get(k);
+      if (!hit) return null;
+      return { key: k, value: hit.value, revision: hit.revision };
+    },
+    async delete(k: string) { store.delete(k); },
+    async put(k: string, value: Uint8Array) {
+      const next = (store.get(k)?.revision ?? 0) + 1;
+      store.set(k, { value, revision: next });
+      return next;
+    },
+    async update(k: string, value: Uint8Array, rev: number) {
+      const hit = store.get(k);
+      if (!hit || hit.revision !== rev) {
+        const err = new Error("wrong last sequence");
+        (err as { code?: string }).code = "BAD_REVISION";
+        throw err;
+      }
+      const parsed = JSON.parse(sc.decode(value)) as { status?: string };
+      if (parsed.status === "closing") closingAt.push(rev);
+      store.set(k, { value, revision: rev + 1 });
+      return rev + 1;
+    },
+  } as unknown as KV;
+  bindHandsKv(kv);
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    let probed = false;
+    const countActiveShells = async () => {
+      if (!probed) {
+        probed = true;
+        // Simulate ensureHands: clear idle markers, bump past enrollment rev 5.
+        const hit = store.get(key)!;
+        store.set(key, {
+          value: sc.encode(JSON.stringify({
+            status: "ready",
+            provider: "safe-workload",
+            workloadId: "wl-race",
+            platformKey: "pk",
+            namespace: "ns",
+            handsUrl: "http://sandbox:9100/mcp",
+            token: "tok",
+            keepalive: true,
+          })),
+          revision: hit.revision + 1,
+        });
+      }
+      return 0;
+    };
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    await new Promise((r) => setImmediate(r));
+    await runKeepaliveTickForTest({ kv, countActiveShells });
+    assert.deepEqual(closingAt, [], "closing must not land on a bumped ready revision");
+    assert.equal(stopped.length, 0, "the concurrent ready sandbox must not be destroyed");
+    assert.ok(store.has(key), "handle remains for the live turn");
+    const left = JSON.parse(sc.decode(store.get(key)!.value)) as { status?: string; keepalive?: boolean };
+    assert.equal(left.status, "ready");
+    assert.equal(left.keepalive, true);
+  } finally {
+    restoreRetry();
     restore();
   }
 });

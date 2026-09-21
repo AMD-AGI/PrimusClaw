@@ -93,7 +93,11 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			exitCode = finalizeTimedOutCommand(exitCh, stop)
 			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
 		case <-r.Context().Done():
-			// HTTP cancellation does not stop the tracked tree.
+			// HTTP cancellation does not stop the tracked tree, but the
+			// response no longer owns these buffers. Close them so a
+			// detached descendant cannot grow heap until OOMKill.
+			_ = stdout.take()
+			_ = stderr.take()
 			return
 		}
 		awaitOutputQuiet(drained, func() time.Time {

@@ -450,6 +450,9 @@ export async function destroyHands(
   // Unreadable is different from contended: the stop is confirmed, but we
   // cannot see whose entry this is, so clearing it might remove a sibling's.
   // Refusing keeps the caller from building over a record it cannot vouch for.
+  // The slot still returns: the workload is already stopped and will not be
+  // pinged again under this identity.
+  await releaseSlot();
   throw new Error("hands KV unavailable after confirmed sandbox stop");
 }
 

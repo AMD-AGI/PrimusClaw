@@ -1127,6 +1127,24 @@ async function renewCensusTargets(
     }
   }
 }
+
+/** Refresh hands keys still held after the idle-expiry phase. */
+async function renewIdleExpiryCandidates(
+  deps: KeepaliveDeps,
+  expiries: Array<{ candidate: ProbeCandidate }>,
+): Promise<void> {
+  for (const { candidate } of expiries) {
+    const sid = candidate.sessionId;
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // Same stance as renewCensusTargets: a missed refresh is not a stop.
+    }
+  }
+}
 /**
  * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
  * The ping phase behind it needs what is left to renew every live record before
@@ -2135,6 +2153,10 @@ async function collectTargets(
       "keepalive.idle_expiry_budget_exhausted",
     );
   }
+  // Idle-expiry candidates are not in census.targets. Renew survivors (deferred,
+  // keptRunLease, superseded) so a long teardown budget cannot drop their KV TTL.
+  // Destroyed keys read as missing and are skipped.
+  await renewIdleExpiryCandidates(deps, census.idleExpiries);
   // The idle-expiry phase sits between the census renew and the ping renew.
   // With a long stop ceiling that gap alone can approach the bucket TTL, so
   // live targets are refreshed again before the walk returns.
@@ -2278,12 +2300,19 @@ async function collectIdleTarget(
     await refreshIdleSince(deps, key, e.revision, info);
     return false;
   }
-  if (bgWork === "unknown" && canProbeJobs(info, sessionId)) {
-    await refreshIdleSince(deps, key, e.revision, info, false);
-    return false;
+  // Incomplete control-plane identity cannot confirm an empty jobs roster.
+  // Do not reclaim and do not refresh clocks (would slide the idle window).
+  if (!canProbeJobs(info, sessionId) && bgWork !== "gone") {
+    return true;
   }
   const expired = bgWork === "gone"
     || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
+  // Hold an in-window unknown for an in-flight probe, but never slide
+  // workSeenAt: that would reset reuseWindowStart and strand JobsUnavailable
+  // sandboxes (and the expireIdleTarget fallback) forever.
+  if (bgWork === "unknown" && canProbeJobs(info, sessionId) && !expired) {
+    return false;
+  }
   if (expired) {
     census.idleExpiries.push({ candidate, record: { ...e, value } });
   }
@@ -2325,9 +2354,11 @@ async function expireIdleTarget(
     return;
   }
   // Reconfirm Running and an empty EnvD jobs roster at the destructive boundary.
-  // The ready-to-closing CAS lets a concurrent message win instead of being stopped.
+  // CAS uses the enrollment revision so a concurrent ensureHands /
+  // clearIdleMarkers write (new ready, higher revision) wins instead of being
+  // overwritten by a stale reclaim.
   let claimed = false;
-  let claimRevision = e.revision;
+  const claimRevision = e.revision;
   try {
     if (canProbeJobs(info, sessionId)) {
       const running = await probeUserProcesses(deps, info, sessionId);
@@ -2335,10 +2366,10 @@ async function expireIdleTarget(
         await refreshIdleSince(deps, key, claimRevision, info);
         return;
       }
-      // persistJobsIdentity may have advanced the revision during the probe.
+      // Refresh fields for the stop payload; CAS still uses claimRevision.
+      // A probe-side persist that advanced the key is preemption (conflict).
       const latest = await deps.kv.get(key);
       if (!latest) return;
-      claimRevision = latest.revision;
       info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
     }
     await deps.kv.update(

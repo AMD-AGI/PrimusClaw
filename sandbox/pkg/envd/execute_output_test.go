@@ -47,6 +47,26 @@ func TestOutputWaitEndsOnTheDrainSignal(t *testing.T) {
 	}
 }
 
+func TestTakeClosesBufferAgainstDetachedWriters(t *testing.T) {
+	// handleExecute's Context.Done path must call take() so a detached
+	// descendant cannot keep appending after the HTTP response ends.
+	var buf synchronizedBuffer
+	_, _ = buf.Write([]byte("early"))
+	if got := buf.take(); got != "early" {
+		t.Fatalf("take returned %q", got)
+	}
+	n, err := buf.Write([]byte("late-and-large"))
+	if err != nil {
+		t.Fatalf("Write after take: %v", err)
+	}
+	if n != len("late-and-large") {
+		t.Fatalf("Write should accept and discard, got n=%d", n)
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("buffer kept growing after take: %q", got)
+	}
+}
+
 func TestOutputWaitGivesUpOnADetachedWriter(t *testing.T) {
 	// A descendant the command detached holds the same pipe and can keep
 	// writing, so the drain signal may never come and silence may never arrive.
