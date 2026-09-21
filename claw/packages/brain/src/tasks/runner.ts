@@ -1490,9 +1490,10 @@ class TaskRunner {
    * same test the teardown uses: the entry names the task that asked for it, and
    * an entry naming a different one -- or naming none, which no task-bearing run
    * of this build can write -- is somebody else's. The ask time then narrows
-   * what is left to this run's CURRENT provision, which is what separates it
-   * from an entry a rebuild replaced under the same task id. A run that never
-   * asked owns no entry at all.
+   * what is left to this ATTEMPT's provision: a redelivery gets a fresh
+   * `sandboxAskedAt`, so an entry carrying the same task id from the attempt
+   * before it is stamped earlier and is not this one's to report. A run that
+   * never asked owns no entry at all.
    *
    * Null on anything unreadable. An absent entry, an unreachable bucket, a
    * corrupt payload and a missing or unparseable `createdAt` all mean the same
@@ -1523,10 +1524,17 @@ class TaskRunner {
       // none, which no task-bearing run of this build can produce -- is not this
       // run's to report.
       if (this.request.task_id && info.taskId !== this.request.task_id) return null;
-      // Then by time, which now only narrows. It is what separates this run's
-      // own entry from one it destroyed and replaced under the same task id: a
-      // rebuild re-stamps the ask and removes the previous entry first, so an
-      // entry older than the ask is one that survived that removal.
+      // Then by time, which only narrows, and not where the rebuild is
+      // concerned: `reportableIdentity` short-circuits on a non-null
+      // `handsIdentity`, and a failed rebuild leaves the destroyed sandbox's
+      // identity in place, so that window never reaches this function at all.
+      // It is a pre-existing limit of the rebuild path, not something this test
+      // covers.
+      //
+      // What it does cover is a REDELIVERY. `sandboxAskedAt` starts null on
+      // each TaskRunner, so a previous attempt's entry carries this same task id
+      // with a stamp older than this attempt's ask -- a workload that attempt
+      // minted, which is not this one's to report.
       const createdAt = Date.parse(info.createdAt ?? "");
       return Number.isFinite(createdAt) && createdAt >= askedAt ? info : null;
     } catch (e) {

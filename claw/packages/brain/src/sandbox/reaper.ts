@@ -422,37 +422,39 @@ export async function destroyHands(
  * reported its own sandbox as preempted, on a task that had never asked for
  * one.
  *
- * The test that separates them already exists and is the runner's, not ours:
- * `sandboxAskedAt` is stamped immediately before each `ensureHands` call, and
- * `onProvisioned` writes `createdAt` from inside that same call in the same
- * process, so an entry stamped before the ask belongs to something else. The
- * runner passes that threshold down rather than this function re-deriving it,
- * because it is the only thing that knows it -- see `pendingHandsIdentity`,
- * which makes exactly this comparison for the reporting side.
+ * What separates them is the task the entry names. `makeOnProvisioned` records
+ * it from inside the same call the caller made, so an entry naming a different
+ * task -- or naming none, which no task-bearing run of this build can write --
+ * was not written for this caller. Four earlier versions of this gate decided it
+ * by other means (which fields an old writer set, a collector that may not
+ * reach the entry, the run lease, the entry's age against the caller's ask) and
+ * each was wrong in its own way; the name is the only per-entry fact that
+ * settles it. `pendingHandsIdentity` establishes ownership the same way for the
+ * reporting side, so the two cannot disagree about whose workload a row
+ * describes.
  *
- * `null` means this run never asked for a sandbox at all. A run that never
- * asked owns no entry and therefore reaps nothing: there is no window in which
- * it could have minted the workload the entry names.
+ * A caller that names no task makes no claim, and this reaps whatever is there
+ * -- the behaviour before any of these gates existed.
  */
 export async function reapPendingHands(
   sessionId: string,
   /**
-   * Both gates, because they answer different questions and neither covers the
-   * other. `taskId` is the precise one: a session can hold more than one DAG
+   * `taskId` is the gate; `stillOwned` is a re-read, not a second gate. A session can hold more than one DAG
    * under a session-scoped run gate, and `hands.<sessionId>` is a single slot,
    * so the entry a failing task finds may belong to a sibling DAG that is still
    * creating -- or, if the read and the teardown straddle its promotion, still
-   * USING -- the workload it names. It is the whole gate: every entry this
-   * build writes carries a task id (ensure-hands.ts), so a predecessor's entry
-   * is identified by ITS task id rather than by when it was stamped, and a
-   * second age-based test would only disagree with this one.
+   * USING -- the workload it names. Every entry this build writes carries a task
+   * id (ensure-hands.ts), so a predecessor's entry is identified by ITS task id
+   * rather than by when it was stamped, and an age-based test alongside this one
+   * would only disagree with it.
    *
-   * An entry with NO task id is reaped anyway, and that is deliberate in both
-   * directions: it can only have come from a process running before the field
-   * existed, which also means it carries no `runScope`, and `runScope` is what
-   * `collectAbandonedPending` collects by -- so nothing else will ever reach it.
-   * Skipping it would not defer the teardown, it would leak the workload for
-   * good.
+   * An entry with NO task id is REFUSED by a caller that has one, and the
+   * refusal is a certainty rather than a judgement: every entry this build
+   * writes names the task that asked, so an unnamed one came from an older
+   * process and nothing this caller did is behind it. What that costs is a
+   * workload this path will not reclaim when such an entry is genuinely
+   * abandoned; what it buys is that a lazy chat turn which provisioned nothing
+   * cannot tear down what a sibling is still waiting on.
    *
    * `stillOwned` is re-asked after the read, because the lock can go between
    * deciding and acting.
