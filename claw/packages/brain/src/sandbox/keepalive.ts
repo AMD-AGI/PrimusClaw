@@ -1651,17 +1651,16 @@ async function persistJobsIdentity(
 ): Promise<void> {
   if (!result.podUid && !result.instanceId) return;
   try {
-    const key = `hands.${sessionId}`;
-    const entry = await deps.kv.get(key);
-    if (!entry) return;
-    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    const existing = await readHandsEntry(deps.kv, sessionId);
+    if (!existing) return;
+    const info = JSON.parse(existing.value) as HandsKvEntry;
     const next: HandsKvEntry = {
       ...info,
       podUid: info.podUid || result.podUid,
       envdInstanceId: info.envdInstanceId || result.instanceId,
     };
     if (next.podUid === info.podUid && next.envdInstanceId === info.envdInstanceId) return;
-    await deps.kv.update(key, sc.encode(JSON.stringify(next)), entry.revision);
+    await deps.kv.update(existing.key, sc.encode(JSON.stringify(next)), existing.revision);
   } catch {
     // The next successful jobs probe retries the identity binding.
   }
@@ -1675,15 +1674,14 @@ async function reportTerminalFailure(
   reason: string,
 ): Promise<void> {
   try {
-    const key = `hands.${sessionId}`;
-    const entry = await deps.kv.get(key);
-    if (!entry) return;
-    const info = JSON.parse(sc.decode(entry.value)) as HandsKvEntry;
+    const existing = await readHandsEntry(deps.kv, sessionId);
+    if (!existing) return;
+    const info = JSON.parse(existing.value) as HandsKvEntry;
     if (entryIdentity(info) !== identity || info.terminalReason) return;
     await deps.kv.update(
-      key,
+      existing.key,
       sc.encode(JSON.stringify({ ...info, terminalReason: reason })),
-      entry.revision,
+      existing.revision,
     );
   } catch {
     // A later provider check reaches the same terminal result.
@@ -2307,17 +2305,10 @@ async function collectIdleTarget(
 async function expireIdleTarget(
   deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
 ): Promise<void> {
-  const { key, identity, sessionId, info } = candidate;
+  const { key, identity, sessionId } = candidate;
+  let info = candidate.info;
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     stats.keptLocal += 1;
-    return;
-  }
-  if (!canProbeJobs(info, sessionId)) {
-    logger.info(
-      { sessionId, workloadId: info.workloadId },
-      "keepalive.idle_reclaim_jobs_identity_absent",
-    );
-    await deps.kv.update(key, e.value, e.revision).catch(() => {});
     return;
   }
   if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
@@ -2336,16 +2327,24 @@ async function expireIdleTarget(
   // Reconfirm Running and an empty EnvD jobs roster at the destructive boundary.
   // The ready-to-closing CAS lets a concurrent message win instead of being stopped.
   let claimed = false;
+  let claimRevision = e.revision;
   try {
-    const running = await probeUserProcesses(deps, info, sessionId);
-    if (running > 0) {
-      await refreshIdleSince(deps, key, e.revision, info);
-      return;
+    if (canProbeJobs(info, sessionId)) {
+      const running = await probeUserProcesses(deps, info, sessionId);
+      if (running > 0) {
+        await refreshIdleSince(deps, key, claimRevision, info);
+        return;
+      }
+      // persistJobsIdentity may have advanced the revision during the probe.
+      const latest = await deps.kv.get(key);
+      if (!latest) return;
+      claimRevision = latest.revision;
+      info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
     }
     await deps.kv.update(
       key,
       sc.encode(JSON.stringify({ ...info, status: "closing" })),
-      e.revision,
+      claimRevision,
     );
     claimed = true;
     await destroyHands(sessionId, info);
@@ -2380,11 +2379,16 @@ async function expireIdleTarget(
       logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
       if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     } else if (err instanceof SandboxJobsUnavailableError) {
+      // /api/jobs is missing on this EnvD. The idle window has already elapsed
+      // to reach here; reclaim the way deployments without the jobs API did.
       logger.info(
         { sessionId, workloadId: info.workloadId, status: err.httpStatus },
         "keepalive.idle_reclaim_jobs_api_absent",
       );
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      await destroyHands(sessionId, info).catch((stopErr) => {
+        logger.warn({ err: stopErr, sessionId }, "keepalive.jobs_absent_stop_retry");
+      });
+      stats.expired += 1;
     } else if (isRevisionConflict(err)) {
       logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
     } else {
@@ -2761,11 +2765,20 @@ async function pingSandbox(
       throw new SandboxGoneError(`sandbox workload state=${status.state}`);
     }
     if (status.state !== "running") {
+      // Counted as a failure so an opt-in fail limit can still evict. Returning
+      // null here left unknown forever when the control plane only answered
+      // with a soft state.
       logger.info(
         { sessionId, provider: entry.provider ?? "safe-workload", state: status.state ?? "unknown" },
         "keepalive.sandbox_state_unknown",
       );
-      return null;
+      return {
+        targetKey,
+        sessionId,
+        entry,
+        error: new Error(`sandbox workload state=${status.state ?? "unknown"}`),
+        gone: false,
+      };
     }
     failCounts.delete(targetKey);
     const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);

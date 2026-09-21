@@ -112,8 +112,8 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ExecuteResponse{
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
+		Stdout:    stdout.take(),
+		Stderr:    stderr.take(),
 		ExitCode:  exitCode,
 		Duration:  endTime.Sub(startTime).Seconds(),
 		StartTime: startTime.UTC(),
@@ -308,15 +308,21 @@ func exitStatusString(code int) string {
 }
 
 type synchronizedBuffer struct {
-	mu   sync.Mutex
-	b    bytes.Buffer
-	last time.Time
+	mu     sync.Mutex
+	b      bytes.Buffer
+	last   time.Time
+	closed bool
 }
 
-// Write appends command output while permitting detached descendants to drain.
+// Write appends command output while the response still owns this buffer.
+// After take(), further bytes from a long-lived detached descendant are
+// discarded so the handler's buffer cannot grow for as long as that process runs.
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return len(p), nil
+	}
 	b.last = time.Now()
 	return b.b.Write(p)
 }
@@ -332,10 +338,23 @@ func (b *synchronizedBuffer) lastWrite() time.Time {
 func (b *synchronizedBuffer) appendString(s string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
 	_, _ = b.b.WriteString(s)
 }
 
-// String returns a stable output snapshot.
+// take returns the buffered output and stops retaining later writes.
+func (b *synchronizedBuffer) take() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	out := b.b.String()
+	b.b.Reset()
+	return out
+}
+
+// String returns a stable output snapshot without closing the buffer.
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()

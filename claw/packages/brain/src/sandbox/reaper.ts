@@ -435,6 +435,9 @@ export async function destroyHands(
       { sessionId, workloadId: target.workloadId || target.sandboxName },
       "sandbox.destroy.entry_left_after_stop",
     );
+    // The workload is already stopped; the slot must still come back or the
+    // ceiling stays charged for a sandbox that will never be pinged again.
+    await releaseSlot();
     return;
   }
   if (latest.state === "valid") {
