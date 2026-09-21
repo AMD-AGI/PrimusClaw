@@ -654,6 +654,14 @@ async function collectAbandonedPending(
   // behind it means a brain died between minting a workload and recording it,
   // or a reap failed silently -- and the GPUs that entry was holding were being
   // billed the whole time. An operator should see every one of these.
+  //
+  // FOUND, not collected, and the two are separate events because the stop
+  // below can decline. This one fires for every abandoned entry, which is what
+  // makes it the alarm -- including, and especially, the entries whose stop
+  // then fails, since a workload that cannot be stopped is the one still
+  // burning GPUs. Saying "collected" here reported a teardown that had not been
+  // attempted yet, and the paths that keep the entry return without ever
+  // correcting it.
   logger.error(
     {
       sessionId,
@@ -664,7 +672,7 @@ async function collectAbandonedPending(
       ageMs,
       horizonMs: SANDBOX_PENDING_ABANDONED_AFTER_MS,
     },
-    "sweeper.pending_abandoned_collected",
+    "sweeper.pending_abandoned_found",
   );
   try {
     const outcome = await stopNamedSandbox(sessionId, info as HandsProbeEntry);
@@ -706,6 +714,11 @@ async function collectAbandonedPending(
   if (!await deleteHandsEntryIfRevision(kv, key, revision)) {
     logger.warn({ sessionId, key, revision, workloadId }, "sweeper.pending_entry_left_after_stop");
   }
+  // The claim the event above used to make, now made where it is true: the stop
+  // was confirmed and the entry is gone. Info rather than error -- by this point
+  // the thing an operator has to act on has already been reported, and what this
+  // adds is that it needed no further action.
+  logger.info({ sessionId, key, workloadId, ageMs }, "sweeper.pending_abandoned_collected");
   return true;
 }
 

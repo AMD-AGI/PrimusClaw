@@ -2283,8 +2283,7 @@ export async function reapStuckSessions(): Promise<number> {
  * wants one pass without leadership; with no lease there is no boundary to
  * check and the loop runs to the end as it always did.
  *
- *
-`dropped` counts DAGs reached, which is not a count of sandboxes released --
+ * `dropped` counts DAGs reached, which is not a count of sandboxes released --
  * `stopAllHandlesForDag` reports that separately, and this is the one teardown
  * path with no caller to report it to. So the sweeps it could not establish a
  * release for are counted and logged here, because an operator watching for a

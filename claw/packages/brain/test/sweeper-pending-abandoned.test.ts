@@ -23,6 +23,7 @@
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { StringCodec, type KV } from "nats";
 import { handsSessionKey } from "@claw/protocol";
 
@@ -307,4 +308,88 @@ test("a stop this deployment cannot issue keeps the entry it would have deleted"
     "the entry is the only record of workloadId + platformKey: deleting it after a stop "
     + "that never happened leaves a workload nothing can name");
   assert.ok(values.has(KEY), "so the next pass can ask again");
+});
+
+/**
+ * Borrow pino's sink for the duration of `run`.
+ *
+ * The logger is a module-private instance writing to fd 1, so there is no
+ * object to swap; taking `fs.write` leaves the real serializers on the path and
+ * reads the exact bytes the process was about to emit.
+ */
+async function captureLogLines(run: () => Promise<unknown>, waitFor: string): Promise<string[]> {
+  const lines: string[] = [];
+  const realWrite = fs.write as unknown as (...args: unknown[]) => unknown;
+  const realWriteSync = fs.writeSync as unknown as (...args: unknown[]) => unknown;
+  const take = (chunk: unknown) => {
+    for (const line of String(chunk).split("\n")) if (line) lines.push(line);
+  };
+  fs.write = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWrite(fd, chunk, ...rest);
+    take(chunk);
+    // The full length, because a short count reads as a partial write and the
+    // sink reissues the rest for ever.
+    const done = rest[rest.length - 1];
+    if (typeof done === "function") done(null, Buffer.byteLength(String(chunk)), chunk);
+    return undefined;
+  }) as unknown as typeof fs.write;
+  fs.writeSync = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWriteSync(fd, chunk, ...rest);
+    take(chunk);
+    return Buffer.byteLength(String(chunk));
+  }) as unknown as typeof fs.writeSync;
+  try {
+    await run();
+    // pino hands the line to the sink asynchronously, so the write can land
+    // after `run` resolves. Waited for by name rather than by a fixed sleep.
+    const wanted = `"msg":${JSON.stringify(waitFor)}`;
+    for (let i = 0; i < 500 && !lines.some((line) => line.includes(wanted)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  } finally {
+    fs.write = realWrite as unknown as typeof fs.write;
+    fs.writeSync = realWriteSync as unknown as typeof fs.writeSync;
+  }
+  return lines;
+}
+
+test("a stop that never happened is not reported as a collection", async () => {
+  // The alarm and the outcome are two different statements, and one line was
+  // making both. `sweeper.pending_abandoned_collected` was emitted at ERROR
+  // BEFORE the stop was attempted, so every path that declines the stop and
+  // keeps the entry -- which is the right thing to do -- left an operator with
+  // a record saying the workload had been collected. The one case where that
+  // matters most is this one: a stop this deployment cannot issue is exactly
+  // the workload still burning GPUs.
+  //
+  // So the alarm fires for every abandoned entry FOUND, and the collection is
+  // claimed only where it is true.
+  // Its own workload id, because the capture below borrows a process-wide sink
+  // and picks up whatever earlier tests flushed late -- including their
+  // successful `collected` lines. Scoping every assertion to THIS id is what
+  // keeps the test about this test.
+  const UNSTOPPABLE = "wl-unstoppable";
+  const { values } = bindKv({ [KEY]: pending(UNSTOPPABLE, HORIZON + 60_000) });
+  const provider = {
+    kind: "safe-workload",
+    async stop() { throw new SandboxStopUnavailable("no platform key for this deployment"); },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  healthyEndpoints();
+
+  const lines = await captureLogLines(
+    () => sweepStaleHandsForTest(), "sweeper.pending_abandoned_found");
+
+  const mine = lines.filter((l) => l.includes(UNSTOPPABLE));
+  assert.ok(
+    mine.some((l) => l.includes('"msg":"sweeper.pending_abandoned_found"')),
+    "the operator alarm still fires -- it is the entry being abandoned that has to be seen, "
+    + "and a stop that cannot be issued does not make that less true",
+  );
+  assert.equal(
+    mine.some((l) => l.includes('"msg":"sweeper.pending_abandoned_collected"')), false,
+    "but nothing may claim the workload was collected: it is still running",
+  );
+  assert.ok(values.has(KEY), "and the entry stays, as the only record that names it");
 });
