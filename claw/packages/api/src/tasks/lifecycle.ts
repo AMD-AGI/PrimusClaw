@@ -21,7 +21,7 @@ import {
 import { cancelUnheldRun } from "./chat-run.js";
 import { applyTaskStatusTransition, getTask, transitionStatus } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
-import { stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
+import { type ReleaseOutcome, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
@@ -220,12 +220,48 @@ async function maybeStopHandlesForLastUser(
   const root = r.rows[0] as { metadata: Record<string, unknown> };
   const lastUser = ((root.metadata?.derived as Record<string, unknown>)?.handle_last_user
     ?? {}) as Record<string, string>;
-  for (const [handle, nodeId] of Object.entries(lastUser)) {
-    if (nodeId === dagNodeId) {
-      await stopSandboxByHandle(dagRootTaskId, handle, sessionId).catch((e) => {
-        logger.warn({ dagRootTaskId, handle, err: (e as Error).message }, "stop_handle_failed");
-      });
-    }
+  const owned = Object.entries(lastUser).filter(([, nodeId]) => nodeId === dagNodeId);
+  if (owned.length === 0) return;
+
+  // `handle_last_user` is the last node in TOPOLOGICAL order that names the
+  // handle, which is not the last one to finish. Two siblings that both use a
+  // handle created upstream order as [root, A, B], so the map says B -- and if
+  // B finishes first, this would tear the sandbox down with A still running on
+  // it. Giving B the higher priority is enough to make that the normal case.
+  //
+  // Nothing had ever executed this teardown, because the handle map it reaches
+  // was the wrong bucket until this branch fixed it, so the derivation's
+  // looseness has never cost anything. It would now.
+  //
+  // The guard does not need to know which nodes use the handle: if any sibling
+  // is still live, the DAG is not finished with its sandboxes, and the handles
+  // are collected once it is. Not by the DAG-root transition -- that only
+  // writes the root's status -- but by the orphan sweep, on its own interval
+  // and behind its own session-liveness guard, so on a busy session a deferral
+  // can outlast the DAG by more than a tick. The failure it avoids is
+  // destroying a
+  // sandbox under a running task.
+  const live = await db.query(
+    `SELECT 1 FROM claw_tasks
+      WHERE dag_root_task_id = $1
+        AND dag_node_id <> '__dag_root__'
+        AND dag_node_id <> $2
+        AND status NOT IN ('completed','failed','cancelled')
+      LIMIT 1`,
+    [dagRootTaskId, dagNodeId],
+  );
+  if ((live.rowCount ?? 0) > 0) {
+    logger.info(
+      { dagRootTaskId, dagNodeId, handles: owned.map(([h]) => h) },
+      "sandbox.last_user_deferred_siblings_live",
+    );
+    return;
+  }
+
+  for (const [handle] of owned) {
+    await stopSandboxByHandle(dagRootTaskId, handle, sessionId).catch((e) => {
+      logger.warn({ dagRootTaskId, handle, err: (e as Error).message }, "stop_handle_failed");
+    });
   }
 }
 
@@ -238,7 +274,22 @@ type CancellationTransition = ClawTaskRow & {
 const CANCELLABLE_STATUSES = [
   "waiting_deps", "waiting_external", "queued", "preparing", "running",
 ];
-/** The ones a Stop parks rather than ends: their worker has to confirm. */
+/**
+ * The ones a Stop parks rather than ends: their worker has to confirm.
+ *
+ * `preparing` belongs here because it counts as executing, not as pending. The
+ * dispatcher sets it at the moment it publishes the execution message, so by
+ * the time anyone can cancel such a row Brain may well have picked it up, built
+ * a sandbox and started burning compute -- exactly the case the cascade comment
+ * in `cancelTask` says must not be closed straight in the database. Treating it
+ * as pending was safe only while `running` was reachable, and it never was:
+ * nothing moved rows out of `preparing`, so every executing task took the wrong
+ * arm of this CASE.
+ *
+ * The remaining ambiguity is a row published but not yet consumed, which has
+ * nothing to acknowledge the cancellation. That one sits in `cancelling` until
+ * the sweeper closes it, which is what the sweeper's `cancelling` branch is for.
+ */
 const PARKED_BY_STOP = ["preparing", "running"];
 
 /**
@@ -296,7 +347,12 @@ async function transitionCancellation(
  */
 export async function cancelTask(
   taskId: string,
-): Promise<{ ok: boolean; cancelled: number; interrupt_key?: string }> {
+): Promise<{
+  ok: boolean;
+  cancelled: number;
+  interrupt_key?: string;
+  released?: ReleaseOutcome;
+}> {
   const task = await getTask(taskId);
   if (!task) return { ok: false, cancelled: 0 };
 
@@ -307,10 +363,61 @@ export async function cancelTask(
         + "('waiting_deps','waiting_external','queued','preparing','running','cancelling')",
       params: [task.task_id],
     });
-    await stopAllHandlesForDag(task.task_id, task.session_id);
-    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id };
+    // A DAG that was already terminal is not cancelled again, and its
+    // sandboxes are not this call's to tear down.
+    //
+    // The sequence that makes this load-bearing is entirely sequential. D1
+    // finishes without its `agent_done` teardown firing -- the topological last
+    // user deferred to a live sibling, and the sibling that finished last was
+    // not the last user -- so the scheduler marks D1 completed with its handle
+    // still registered. D2 then reuses the warm sandbox and registers its own
+    // reference to the same workload. A second cancel of D1 matched no rows,
+    // yet went on to stop that workload: it killed D2 and answered
+    // `cancelled: 0, released: "confirmed"`, which is both halves wrong at
+    // once.
+    //
+    // A workload two DAGs share is the wider problem here and is not solved by
+    // this guard -- cancelling D1 *while it runs* still stops a sandbox D2 may
+    // have adopted. What this closes is the case that needs no race and no
+    // running DAG: re-cancelling something already finished. The sweeper owns
+    // whatever a terminal DAG did leave behind, under its own session guard.
+    if (rows.length === 0) {
+      logger.info(
+        { taskId: task.task_id, status: task.status },
+        "task.cancel.already_terminal_no_teardown",
+      );
+      return { ok: true, cancelled: 0, interrupt_key: task.task_id };
+    }
+    // The verdict above is already written and stays written. `released` only
+    // reports what the cleanup that follows established; a failed release must
+    // never turn a successful cancellation into a failure, because the sweeper
+    // and Dispatron both rely on the verdict landing regardless.
+    const released = await stopAllHandlesForDag(task.task_id, task.session_id);
+    if (released === "unconfirmed") {
+      logger.warn(
+        { taskId: task.task_id, sessionId: task.session_id },
+        "task.cancel.release_unconfirmed",
+      );
+    }
+    return { ok: true, cancelled: rows.length, interrupt_key: task.task_id, released };
   }
 
+  // `released` is deliberately absent from everything this branch returns, the
+  // early return below included. A non-root cancel stops no sandbox itself.
+  // Teardown happens later, by one of two routes: the `agent_done` this
+  // cancellation eventually produces, if this node is the last user of a handle
+  // and no sibling is still live, or the orphan sweep. Not the root's own
+  // transition -- that only writes status.
+  //
+  // Answering `nothing_held` here would claim this DAG holds nothing, which
+  // this branch has not checked and usually is not true, and `unconfirmed`
+  // would report a failure of an attempt that was never made. Omitting the
+  // field says what is actually the case: this call establishes nothing about
+  // the sandbox. Dispatron cancels the DAG root, which is the branch above.
+  //
+  // Which of `cancelling` and `cancelled` an executing row lands in is decided
+  // by `PARKED_BY_STOP` inside `transitionCancellation`; see the reasoning
+  // there for why `preparing` counts as executing rather than as pending.
   if ((task.status === "preparing" || task.status === "running")
       && task.origin === "chat" && await cancelUnheldRun(task.task_id)) {
     return { ok: true, cancelled: 1, interrupt_key: task.session_id ?? undefined };
@@ -437,7 +544,20 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
             -- previous one's settled time ledger or the identity that ledger
             -- was keyed under, which would credit this run with the other's
             -- states and leave it marked terminal before it starts.
-            metadata - 'sandbox' - 'run_phase' - 'last_release' - 'retried_into',
+            -- sandbox and sandbox_release for a third reason, and the
+            -- sharpest one: both are evidence about a workload the PREVIOUS
+            -- run held. Copied onto the replacement they become a leak
+            -- attributed to a task that never had a sandbox -- so the new row
+            -- reports unconfirmed forever, since releasing its own workload
+            -- clears its own entry and never the inherited one, while the
+            -- original row's evidence is cleared when that workload is finally
+            -- released. The record has to stay on the row whose run actually
+            -- held the thing. sandbox is the identity this run reported before
+            -- its reap and sandbox_release what came of releasing it;
+            -- inheriting either one strands the same wrong attribution, and
+            -- sandbox additionally re-arms the backfill against a workload this
+            -- row never owned.
+            metadata - 'sandbox' - 'run_phase' - 'last_release' - 'retried_into' - 'sandbox_release',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
             workspace_throwaway,
@@ -448,14 +568,34 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
      FROM claw_tasks WHERE task_id = $2`,
     [newId, taskId],
   );
-  // Written here as a statement rather than through `updateTask`, which is
-  // hard-wired to the pool. From inside the route's admission transaction that
-  // helper would check out a *second* connection while this request already
-  // holds one of the pool's, and it would commit the pointer on its own ahead
-  // of the clone it points at -- so a failed COMMIT above would leave the
-  // original row aimed at a task id that was never inserted. Merging with `||`
-  // against the live row rather than re-writing the blob `getTask` read at the
-  // top also keeps a concurrent metadata writer's field from being reverted.
+  // Merged in the database, not composed in this process -- and written here as
+  // a statement rather than through `updateTask`, for two independent reasons.
+  //
+  // Composing it here loses data. Two wrong versions preceded this one and both
+  // did. The original wrote `{...task.metadata, retried_into}` -- a snapshot
+  // read before the INSERT above, so anything written to the row in between was
+  // reverted, and the sweeper writes exactly such a thing: an unreleased-handle
+  // record whose loss turns a workload it could not stop into `nothing_held`.
+  // The fix for that patched only `{retried_into}`, on the belief that
+  // `updateTask` merges its patch -- it does not. `updateTask` assigns
+  // (`metadata = $1`); the function that merges is `applyTaskStatusTransition`.
+  // So the patch replaced the whole column with one key, destroying `derived`
+  // -- handle_last_user, root_node_id, schema_digest -- along with everything
+  // else, and needing no concurrency to do it.
+  //
+  // `updateTask` is also hard-wired to the pool. From inside the route's
+  // admission transaction that helper would check out a *second* connection
+  // while this request already holds one of the pool's, and it would commit the
+  // pointer on its own ahead of the clone it points at -- so a failed COMMIT
+  // above would leave the original row aimed at a task id that was never
+  // inserted. Hence `client ?? db`: the pointer rides the same connection, and
+  // the same transaction, as the INSERT it refers to.
+  //
+  // `||` against the live row is the only form that is both complete and
+  // atomic: nothing is read into this process, so nothing can go stale between
+  // the read and the write, and every key this call does not name -- including
+  // one a concurrent writer put there after `getTask` read the blob at the top
+  // -- survives.
   await (client ?? db).query(
     `UPDATE claw_tasks
         SET metadata = COALESCE(metadata, '{}'::jsonb)

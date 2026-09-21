@@ -34,6 +34,8 @@ import type { SandboxProvider } from "../src/sandbox/provider.js";
 
 const sc = StringCodec();
 
+const PREDECESSOR_TASK = "task-predecessor";
+const OWN_TASK = "task-own";
 const SESSION = "sess-reap-ownership";
 const KEY = handsSessionKey(SESSION);
 
@@ -45,9 +47,10 @@ const OWN = "wl-this-run";
 let restoreProviders: (() => void) | null = null;
 afterEach(() => { restoreProviders?.(); restoreProviders = null; });
 
-function pendingEntry(workloadId: string, createdAtMs: number) {
+function pendingEntry(workloadId: string, createdAtMs: number, taskId = PREDECESSOR_TASK) {
   return {
     status: "pending",
+    taskId,
     provider: "safe-workload",
     workloadId,
     platformKey: "pk",
@@ -97,7 +100,7 @@ test("a run that never asked for a sandbox destroys no predecessor's workload", 
   const { values, deleted } = bindKv({ [KEY]: pendingEntry(PREDECESSOR, Date.now() - 600_000) });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, null);
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
 
   assert.deepEqual(stopped, [],
     `a task that provisioned nothing stopped ${JSON.stringify(stopped)} -- the workload `
@@ -115,7 +118,7 @@ test("nor does one whose provision was refused before it wrote an entry", async 
   const { values, deleted } = bindKv({ [KEY]: pendingEntry(PREDECESSOR, askedAt - 60_000) });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, askedAt);
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
 
   assert.deepEqual(stopped, [],
     `stopped ${JSON.stringify(stopped)}: an entry stamped before this run asked was `
@@ -128,10 +131,10 @@ test("but a run that left its own pending entry behind still reaps it", async ()
   // The coverage the blind reap provided, and the common case: this must keep
   // working, or every failed provision leaks its workload for 24h.
   const askedAt = Date.now() - 5_000;
-  const { values, deleted } = bindKv({ [KEY]: pendingEntry(OWN, askedAt + 1_000) });
+  const { values, deleted } = bindKv({ [KEY]: pendingEntry(OWN, askedAt + 1_000, OWN_TASK) });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, askedAt);
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
 
   assert.deepEqual(stopped, [OWN], "this run's own orphan workload must still be stopped");
   assert.deepEqual(deleted, [KEY], "and its entry removed, so nothing re-adopts it");
@@ -140,11 +143,11 @@ test("but a run that left its own pending entry behind still reaps it", async ()
 
 test("a READY entry is still left alone for the next message to reuse", async () => {
   const askedAt = Date.now() - 5_000;
-  const ready = { ...pendingEntry(OWN, askedAt + 1_000), status: "ready", handsUrl: "http://h:9100/mcp" };
+  const ready = { ...pendingEntry(OWN, askedAt + 1_000, OWN_TASK), status: "ready", handsUrl: "http://h:9100/mcp" };
   const { values, deleted } = bindKv({ [KEY]: ready });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, askedAt);
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
 
   assert.deepEqual(stopped, [], "a healthy sandbox is kept across an agent-loop failure");
   assert.deepEqual(deleted, []);
@@ -173,7 +176,7 @@ test("and a retained container is never what a session's reap stops", async () =
   const { values, deleted } = bindKv({ [key]: retained });
   const stopped = recordStops();
 
-  await reapPendingHands(sessionId, Date.now());
+  await reapPendingHands(sessionId, { taskId: OWN_TASK });
 
   assert.deepEqual(stopped, [],
     "the retained container was stopped with its work still running inside it");

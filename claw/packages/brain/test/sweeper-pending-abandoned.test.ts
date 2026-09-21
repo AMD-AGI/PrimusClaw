@@ -29,6 +29,7 @@ import { handsSessionKey } from "@claw/protocol";
 import { sweepStaleHandsForTest } from "../src/sandbox/reaper.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
+import { SandboxStopUnavailable } from "../src/sandbox/errors.js";
 import { retentionKey } from "../src/sandbox/retain-container.js";
 import { SANDBOX_PENDING_ABANDONED_AFTER_MS } from "../src/config.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
@@ -273,4 +274,37 @@ test("nor when the bucket could not say whether the lease is held", async () => 
     `stopped ${JSON.stringify(stopped)} on the strength of a failed KV read`);
   assert.deepEqual(deleted, []);
   assert.ok(values.has(KEY));
+});
+
+test("a stop this deployment cannot issue keeps the entry it would have deleted", async () => {
+  // The collector exists to recover a pending workload nothing else can name,
+  // and the entry IS that name -- workloadId plus platformKey, nowhere else.
+  // `stopNamedSandbox` returns normally when the provider says this deployment
+  // can issue no stop at all, so "it returned" is not "it stopped"; reading the
+  // two as one deletes the last reference to a workload still running, which is
+  // the leak this collector was written to end, reached through its own
+  // cleanup. The throwing branch has always been handled; this is the silent
+  // one, and it is silent precisely because the deployment is misconfigured
+  // rather than broken.
+  //
+  // `destroyHands` has consulted this outcome since it became an outcome. The
+  // two of them are the only callers, which is what kept the difference out of
+  // sight.
+  const { values, deleted } = bindKv({ [KEY]: pending(ABANDONED, HORIZON + 60_000) });
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async stop() { throw new SandboxStopUnavailable("no platform key for this deployment"); },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+  } as unknown as SandboxProvider;
+  restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  healthyEndpoints();
+
+  await sweepStaleHandsForTest();
+
+  assert.deepEqual(stopped, [], "nothing was stopped, which is the premise");
+  assert.deepEqual(deleted, [],
+    "the entry is the only record of workloadId + platformKey: deleting it after a stop "
+    + "that never happened leaves a workload nothing can name");
+  assert.ok(values.has(KEY), "so the next pass can ask again");
 });

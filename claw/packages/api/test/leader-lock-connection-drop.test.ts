@@ -300,10 +300,15 @@ test("the orphan-handle traversal reads its lease before it acts on the next han
   // sandbox behind each terminal one, so two overlapping holders tear the same
   // sandbox down twice -- including one Brain has just rebuilt.
   //
-  // A source guard, and reluctantly: the traversal opens with
-  // `handleMap().listAll()`, which binds a NATS KV bucket through a module-level
-  // memo that no test can reach without a broker, and the loop cannot be entered
-  // without it. What the mechanism does once a lease says lost is held
+  // A source guard on PLACEMENT only. It used to be a guard of last resort --
+  // the traversal opened with `handleMap().listAll()`, bound through a
+  // module-level memo no test could reach without a broker, so the loop could
+  // not be entered at all. That is no longer true: the census now goes through
+  // `handleRegistry`, whose `listAll` a test can replace, and
+  // sweeper-orphan-handle-accounting.test.ts drives the real loop through it.
+  // What that leaves here is the one thing behaviour cannot pin cheaply --
+  // whether the check sits AHEAD of the status read rather than after it, which
+  // a passing lease makes invisible. What the mechanism does once a lease says lost is held
   // behaviourally by the tests above, against real advisory locks and a real
   // dropped backend. What is left for this to hold is the placement, which is
   // the part that is easy to lose in an edit: the check has to be the first
@@ -315,12 +320,12 @@ test("the orphan-handle traversal reads its lease before it acts on the next han
     "utf-8",
   );
   const traversal = src.slice(src.indexOf("export async function reapOrphanHandles"));
-  const loop = traversal.slice(traversal.indexOf("for (const [dagRoot] of all) {"));
+  const loop = traversal.slice(traversal.indexOf("for (const [dagRoot, handles] of all) {"));
   const body = loop.slice(0, loop.indexOf("await db.query("));
 
   assert.match(
     body,
-    /^for \(const \[dagRoot\] of all\) \{\s*const lost = lease\?\.lost\(\);\s*if \(lost\) \{/,
+    /^for \(const \[dagRoot, handles\] of all\) \{\s*const lost = lease\?\.lost\(\);\s*if \(lost\) \{/,
     "the lease has to be read at the top of the iteration, before the handle is judged",
   );
   assert.match(body, /break;/, "a boundary check that does not stop the loop is not a boundary");

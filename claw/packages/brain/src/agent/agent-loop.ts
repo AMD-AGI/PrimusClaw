@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { ToolRouter } from "../tools/router.js";
+import { isRetryable } from "../infra/retry.js";
 import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
   SUB_AGENT_MAX_TURNS, SUB_AGENT_MAX_CONCURRENT, SUB_AGENT_MAX_DEPTH,
@@ -629,6 +630,29 @@ class AgentLoopRunner {
    */
   private toolOkByName: Record<string, number>;
   private totalToolCalls: number;
+  /**
+   * Tools this process has BEGUN, counted before anything can await.
+   *
+   * Separate from `totalToolCalls`, which is a reporting figure: it is
+   * incremented after the start event is published, and it is restored from a
+   * checkpoint. Neither is a defect there -- but both make it useless as an
+   * answer to "is anything running right now", which is the question
+   * `mayRethrowOpenFailure` actually asks.
+   *
+   * The gap it closes: `runTaskTool` is dispatched with `Promise.all` over a
+   * batch, and a sibling still suspended on its own start event had not reached
+   * its increment yet. The first task's open could then fail, read the count as
+   * 1, decide nothing else was running and nak -- while `Promise.all` went on
+   * to start the sibling, which executed and wrote. The redelivery then wrote
+   * again. Reproduced against a real ledger: two rows, against one on the
+   * baseline.
+   *
+   * So this is incremented synchronously, in the first statement of each path,
+   * before any `await` can yield. An async function runs to its first await
+   * when called, so by the time `batch.map` has finished building its promises
+   * every task in the batch is already counted.
+   */
+  private toolsStarted = 0;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
   private readonly initialTurn: number;
@@ -1710,6 +1734,7 @@ class AgentLoopRunner {
       // had no matching entry to update). Total bytes still drop ~60% vs
       // the pre-optimisation baseline because the terminal event no longer
       // re-sends argumentsDetail (only `description` carrying the result).
+    this.toolsStarted++;
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "start",
         argumentsDetail: { [toolName]: toolInput },
@@ -1920,6 +1945,15 @@ class AgentLoopRunner {
           "tool.result",
         );
       } catch (err: any) {
+        // Before anything else, because this one is not a tool result at all.
+        // The lazy sandbox open happens inside this `try`, and an open that
+        // failed for a reason already judged worth a redelivery has to reach
+        // the task runner as a thrown error -- the runner is the only place
+        // that can nak. Rendered as text instead, it ends the turn normally
+        // and the delivery is acked, which is how a classified-retryable race
+        // became a permanent task failure on the default path while the eager
+        // path naked correctly. See brain/src/agent/attach-error.ts.
+        if (this.mayRethrowOpenFailure(err)) throw err.cause;
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be
@@ -1976,11 +2010,68 @@ class AgentLoopRunner {
       resultByToolId.set(toolId, resultText);
   }
 
+  /**
+   * Whether a failed sandbox open may be rethrown to end this delivery.
+   *
+   * Two conditions, and the second is the one that cost a P1.
+   *
+   * It has to be an open that failed for a reason already judged worth another
+   * delivery -- `SandboxAttachError` around a cause `isRetryable` accepts. A
+   * tool that RAN and failed is a tool result, however transient its error.
+   *
+   * And nothing in this run may have executed yet. A rethrow leaves this
+   * function before the turn's results are appended to `workingMessages`, so
+   * the redelivery re-runs the turn from its start -- including any tool that
+   * already completed. For a `read` that is waste; for an MCP call that wrote
+   * to something outside this process it is a second write, and measured as
+   * one: an external append ran once on the eager path and twice through a nak
+   * here. The eager path is safe for precisely this reason and not by luck --
+   * it opens the sandbox before any tool has run, so there is nothing to
+   * repeat.
+   *
+   * `totalToolCalls` is incremented before the call it counts, so 1 is "this
+   * one, and nothing before it". It also carries across a redelivery from the
+   * checkpoint, which keeps a resumed run on the conservative side: the work
+   * behind that count is in the recovered history and must not be re-run.
+   *
+   * The cost of being wrong either way decides where the line sits. Refusing a
+   * rethrow loses a redelivery, and the model is told the sandbox could not be
+   * opened -- the behaviour that shipped before any of this. Allowing one
+   * wrongly repeats a side effect that has already left the process, which
+   * nothing downstream can undo.
+   */
+  private mayRethrowOpenFailure(err: unknown): boolean {
+    const e = err as { name?: string; cause?: unknown } | null;
+    if (e?.name !== "SandboxAttachError") return false;
+    if (!isRetryable(e.cause)) return false;
+    // Both counters, because they answer different halves of the question and
+    // neither answers it alone. `toolsStarted` covers what this process has
+    // begun, including a sibling that has not reached its own increment;
+    // `totalToolCalls` arrives from the checkpoint and covers work done under
+    // an earlier delivery, which `toolsStarted` has no memory of.
+    if (this.toolsStarted > 1 || this.totalToolCalls > 1) {
+      logger.warn(
+        {
+          sessionId: this.sessionId,
+          toolsStarted: this.toolsStarted,
+          totalToolCalls: this.totalToolCalls,
+        },
+        "sandbox.open_retryable_but_turn_has_run_tools",
+      );
+      return false;
+    }
+    return true;
+  }
+
   private async runTaskTool(
     tc: any,
     turn: number,
     resultByToolId: Map<string, string>,
   ): Promise<void> {
+    // FIRST, before any await. A sibling in the same `Promise.all` batch must
+    // be visible to a check made while this one is still suspended -- see
+    // `toolsStarted`.
+    this.toolsStarted++;
       const toolId = tc.id as string;
       const toolInput = (tc.input || {}) as Record<string, unknown>;
       const subagentId = `sub-${randomUUID().slice(0, 8)}`;
@@ -2061,6 +2152,11 @@ class AgentLoopRunner {
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";
       } catch (err: any) {
+        // Same question as the ordinary tool path, and the same answer: a
+        // `task` whose sandbox never opened did not run a sub-agent, and the
+        // open is reached from here too (`attachHands` above) for a turn whose
+        // first tool is a `task`.
+        if (this.mayRethrowOpenFailure(err)) throw err.cause;
         resultText = `Error: ${err?.message || String(err)}`;
       this.errorCount++;
       logger.warn({ err, subagentId, depth: this.depth, sessionId: this.sessionId }, "sub-agent.failed");

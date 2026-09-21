@@ -195,6 +195,26 @@ async function loadPluginRow(pluginId: number) {
   return row;
 }
 
+/**
+ * Seam over interrupt delivery, in the shape `tasks/sandbox-stopper.ts` uses
+ * for the handle registry and `events/consumer.ts` for the tombstone bucket.
+ *
+ * `nc` is a live binding on a frozen module namespace, so until this existed
+ * the cancel handler could not be reached at all without a NATS server -- which
+ * is why the one thing it now has to get right, the response it builds, had no
+ * test that exercised it as HTTP. With the seam a test can assert the status
+ * code and the whole body, and can see whether the interrupt was published,
+ * rather than matching the handler's source text and hoping.
+ */
+export const interruptDelivery = {
+  publish(interruptKey: string): void {
+    nc.publish(interruptSubject(interruptKey));
+  },
+  flush(): Promise<void> {
+    return nc.flush();
+  },
+};
+
 /** The dag + plugin a create names, or the answer the route owes instead. */
 type CreateTarget =
   | { dag: TaskDagDef | null; plugin: Awaited<ReturnType<typeof loadPluginRow>> }
@@ -519,10 +539,10 @@ export async function registerTaskLifecycleRoutes(app: FastifyInstance): Promise
       const r = await cancelTask(req.params.taskId);
       if (!r.ok) return reply.status(404).send({ ok: false, error: "not_found_or_terminal" });
       if (r.interrupt_key) {
-        nc.publish(interruptSubject(r.interrupt_key));
+        interruptDelivery.publish(r.interrupt_key);
         try {
           await Promise.race([
-            nc.flush(),
+            interruptDelivery.flush(),
             new Promise<never>((_, reject) =>
               setTimeout(() => reject(new Error("interrupt flush timed out")), 2_000)
             ),
@@ -534,7 +554,21 @@ export async function registerTaskLifecycleRoutes(app: FastifyInstance): Promise
           );
         }
       }
-      return { ok: true, cancelled: r.cancelled };
+      // `released` says whether the sandbox teardown that cancellation triggers
+      // was actually acknowledged -- "confirmed" / "unconfirmed" / "nothing_held";
+      // see ReleaseOutcome. Without it an accepted cancel and a silently failed
+      // release are the same response, and a GPU workload that outlives its task
+      // is invisible to the caller.
+      //
+      // Added, never substituted: the status code and `ok` / `cancelled` keep
+      // exactly the values they had, and the field is omitted rather than
+      // guessed when the branch taken established nothing, so a client that
+      // does not know about it reads an unchanged response.
+      return {
+        ok: true,
+        cancelled: r.cancelled,
+        ...(r.released ? { released: r.released } : {}),
+      };
     },
   );
 

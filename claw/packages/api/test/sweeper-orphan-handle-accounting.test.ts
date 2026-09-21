@@ -22,7 +22,7 @@
  *
  * Driven rather than grepped, because the defect is arithmetic in a log field
  * and the field is the only place it is observable. The census is taken through
- * `sweeperPorts.handleMap`, and the database underneath is stubbed so every DAG
+ * `handleRegistry.listAll`, and the database underneath is stubbed so every DAG
  * reads as still running and nothing is torn down -- which is both the ordinary
  * state of the bucket and the state the defect hides in.
  */
@@ -31,13 +31,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import { db } from "../src/infra/db.js";
-import { reapOrphanHandles, sweeperPorts } from "../src/tasks/sweeper.js";
+import { reapOrphanHandles } from "../src/tasks/sweeper.js";
+import { handleRegistry } from "../src/tasks/sandbox-stopper.js";
 
 const originalQuery = db.query;
-const originalHandleMap = sweeperPorts.handleMap;
+const originalListAll = handleRegistry.listAll;
 after(() => {
   db.query = originalQuery;
-  sweeperPorts.handleMap = originalHandleMap;
+  handleRegistry.listAll = originalListAll;
 });
 
 /** A census of `count` DAGs, one handle each. */
@@ -46,9 +47,7 @@ function seedHandles(count: number): void {
     `dag-acct-${i}`,
     { main: { workload_id: `w-${i}` } },
   ]);
-  sweeperPorts.handleMap = (() => ({
-    listAll: async () => all,
-  })) as unknown as typeof sweeperPorts.handleMap;
+  handleRegistry.listAll = (async () => all) as unknown as typeof handleRegistry.listAll;
 }
 
 /**
@@ -61,9 +60,16 @@ function seedHandles(count: number): void {
 function stubDbRunning(): string[] {
   const asked: string[] = [];
   db.query = (async (text: string, params?: unknown[]) => {
-    if (/dag_node_id = '__dag_root__'/.test(text)) {
+    // Keyed by task_id alone. The predicate this used to match
+    // (`dag_node_id = '__dag_root__'`) was removed on the branch this merged
+    // with, for the reason its docstring gives: it named a DIFFERENT row for
+    // half these handles, so every one of them read as `missing` and was reaped
+    // while still running. A stub still matching the old shape would answer
+    // nothing, send this traversal down the teardown branch, and test the
+    // opposite of what it claims to.
+    if (/FROM claw_tasks WHERE task_id = \$1/.test(text)) {
       asked.push(String((params ?? [])[0]));
-      return { rows: [{ status: "running" }], rowCount: 1 };
+      return { rows: [{ status: "running", session_id: "sess-acct" }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;

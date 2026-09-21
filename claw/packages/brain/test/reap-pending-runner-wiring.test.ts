@@ -67,9 +67,20 @@ function fakeKv(seed: Record<string, string> = {}) {
   };
 }
 
-function pendingValue(workloadId: string, createdAtMs: number): string {
+function pendingValue(
+  workloadId: string,
+  createdAtMs: number,
+  /**
+   * Who wrote the entry. Defaulted to the PREDECESSOR's task because that is
+   * what the bucket really holds in the case under test: every pending entry
+   * this build writes names its task (ensure-hands.ts), so a predecessor's
+   * entry is identified by its own task id rather than by its age.
+   */
+  taskId = "task-predecessor",
+): string {
   return JSON.stringify({
     status: "pending",
+    taskId,
     provider: "safe-workload",
     workloadId,
     platformKey: "pk",
@@ -106,7 +117,7 @@ async function runTurn(provisions: "none" | "own") {
     ensureHands: (async () => {
       // This run's own `onProvisioned`, replacing the leftover entry, followed
       // by the pod dying before it ever reaches READY.
-      await kv.put(handsSessionKey(SESSION), pendingValue(OWN, Date.now()));
+      await kv.put(handsSessionKey(SESSION), pendingValue(OWN, Date.now(), "task-reap-wiring"));
       throw new Error("workload pod terminated before becoming ready");
     }) as never,
     destroyHands: noop(undefined),
