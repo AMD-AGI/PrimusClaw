@@ -56,19 +56,28 @@ function pendingEntry(workloadId: string, createdAtMs: number, taskId = PREDECES
     platformKey: "pk",
     namespace: "ns",
     token: `tok-${workloadId}`,
-    runScope: SESSION,
+    // The default gate shape: pickLockKey() under RUN_GATE_KEY=workspace is
+    // `ws.<workspaceId>`, one lock shared by every run in the workspace. A
+    // fixture using a session-granular scope would be testing a configuration
+    // this deployment does not run.
+    runScope: "ws.workspace-1",
     createdAt: new Date(createdAtMs).toISOString(),
   };
 }
 
 /** The bucket, plus what the reap actually removed from it. */
-function bindKv(seed: Record<string, unknown>) {
+function bindKv(
+  seed: Record<string, unknown>,
+  /** Keys whose read throws, the shape a dropped lease-read request presents. */
+  throwOn: Set<string> = new Set(),
+) {
   const values = new Map<string, string>(
     Object.entries(seed).map(([k, v]) => [k, JSON.stringify(v)]),
   );
   const deleted: string[] = [];
   const kv = {
     async get(key: string) {
+      if (throwOn.has(key)) throw new Error("kv unavailable");
       const raw = values.get(key);
       return raw === undefined
         ? null
@@ -184,46 +193,65 @@ test("and a retained container is never what a session's reap stops", async () =
   assert.ok(values.has(key));
 });
 
-test("an entry with no task is left alone while its lease is still held", async () => {
-  // The case the merge of the two ownership gates got wrong, and then the first
-  // correction got wrong differently. The merge argued an entry without a task
-  // id could only predate both fields; but 94b63ef on this branch wrote
-  // `runScope` and not yet `taskId`, so a rolling upgrade across it produces a
-  // scoped, unnamed entry -- and the merge reaped it, which is the mis-kill
-  // this branch was opened to stop.
+test("an entry with no task, stamped before this run asked, is left alone", async () => {
+  // The rolling-upgrade shape: 94b63ef on this branch wrote `runScope` and not
+  // yet `taskId`, so the task-id comparison cannot judge this entry at all.
+  // What decides is that it was stamped before this run asked for anything --
+  // it was written by something else, and stopping it is the mis-kill this
+  // branch exists to prevent.
   //
-  // What decides is whether anyone still holds it. A held lease means somebody
-  // is alive behind this entry and the workload is theirs.
+  // Not decided by the run lease, deliberately. Under the default
+  // RUN_GATE_KEY=workspace the scope is `ws.<workspaceId>`, held by any run in
+  // the workspace, so a lease read would answer about a stranger's traffic --
+  // handles.ts and keepalive.ts both refuse that same inference in as many
+  // words.
+  const askedAt = Date.now();
   const { values, deleted } = bindKv({
-    [KEY]: { ...pendingEntry(PREDECESSOR, Date.now() - 600_000), taskId: undefined },
-    [`lock.${SESSION}`]: { holder: "someone-else" },
+    [KEY]: { ...pendingEntry(PREDECESSOR, askedAt - 60_000), taskId: undefined },
+    // A workspace-mate is busy. It says nothing either way, and must not.
+    ["lock.ws.workspace-1"]: { holderId: "an-unrelated-session" },
   });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, { taskId: OWN_TASK });
+  await reapPendingHands(SESSION, { taskId: OWN_TASK, ownedSinceMs: askedAt });
 
   assert.deepEqual(stopped, [],
-    `stopped ${JSON.stringify(stopped)} -- the lease behind this entry is still held, so the `
-    + "workload belongs to whoever holds it");
+    `stopped ${JSON.stringify(stopped)} -- an entry older than this run's own ask was written `
+    + "by something else");
   assert.deepEqual(deleted, []);
   assert.ok(values.has(KEY));
 });
 
-test("but reaped once the lease is gone, because nothing else will reach it", async () => {
-  // The other side, and why the fix is not "skip unnamed entries". The bucket's
-  // TTL is 5 minutes and `collectAbandonedPending` does not look until 2 hours,
-  // so an entry nobody refreshes evaporates long before the collector could
-  // take it. Leaving it is not deferral -- it is the workload leaking with
-  // nothing left that names it.
+test("a run that asked for nothing at all reaps nothing", async () => {
+  // A lazy chat turn answered from context calls ensureHands zero times, so it
+  // has minted nothing and nothing in the bucket can be its own. This is the
+  // reproduced defect the branch was opened for: with a blind reap it destroyed
+  // the workload a previous message was still provisioning.
   const { values, deleted } = bindKv({
     [KEY]: { ...pendingEntry(PREDECESSOR, Date.now() - 600_000), taskId: undefined },
   });
   const stopped = recordStops();
 
-  await reapPendingHands(SESSION, { taskId: OWN_TASK });
+  await reapPendingHands(SESSION, { taskId: OWN_TASK, ownedSinceMs: null });
 
-  assert.deepEqual(stopped, [PREDECESSOR],
-    "no lease, no collector in reach: this path is the only teardown it gets");
+  assert.deepEqual(stopped, []);
+  assert.deepEqual(deleted, []);
+  assert.ok(values.has(KEY));
+});
+
+test("but an unnamed entry this run itself minted is still reaped", async () => {
+  // The coverage a blind reap provided and the common case: a provision this
+  // run started and abandoned must still be torn down, or every failed create
+  // leaks its workload.
+  const askedAt = Date.now() - 5_000;
+  const { values, deleted } = bindKv({
+    [KEY]: { ...pendingEntry(OWN, askedAt + 1_000), taskId: undefined },
+  });
+  const stopped = recordStops();
+
+  await reapPendingHands(SESSION, { taskId: OWN_TASK, ownedSinceMs: askedAt });
+
+  assert.deepEqual(stopped, [OWN], "stamped after this run's own ask");
   assert.deepEqual(deleted, [KEY]);
   assert.equal(values.has(KEY), false);
 });

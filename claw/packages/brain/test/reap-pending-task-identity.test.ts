@@ -34,7 +34,10 @@ afterEach(() => {
 });
 
 /** Drives the real reaper against one pending entry; reports what it stopped. */
-async function reap(entry: Record<string, unknown>, expected?: { taskId?: string }) {
+async function reap(
+  entry: Record<string, unknown>,
+  expected?: { taskId?: string; ownedSinceMs?: number | null },
+) {
   const stopped: string[] = [];
   const deleted: string[] = [];
   const kv = {
@@ -73,11 +76,37 @@ test("a task's own half-created workload still is", async () => {
   assert.deepEqual(r.stopped, ["W1"], "the case this function exists for still works");
 });
 
-test("an entry with no task on it is reaped as before", async () => {
-  // It can only have come from a process running before this field existed.
-  // Skipping those would leak every workload in flight across a rollout.
-  const r = await reap(pending("W0"), { taskId: "d1-task" });
-  assert.deepEqual(r.stopped, ["W0"]);
+test("an entry with no task on it is judged by when it was written", async () => {
+  // This assertion changed on the branch that merged here, and the reasoning it
+  // replaces was sound as far as it went: an entry with no task id can only
+  // come from a process older than the field, and skipping those leaks the
+  // workloads in flight across a rollout.
+  //
+  // What it did not weigh is the other side of the same rollout. That branch
+  // exists because a lazy chat turn which called ensureHands ZERO times was
+  // reaping the entry a previous message was still provisioning -- and during
+  // the window where entries carry no task id, reaping unconditionally is
+  // exactly that defect again, with the identity gate unable to see it. One
+  // choice leaks a workload the 24h timeout eventually reclaims; the other
+  // stops a job that is running. This subsystem takes the leak every time.
+  //
+  // So the fallback is the only per-entry fact available: when it was stamped,
+  // against when this run asked for a sandbox of its own. Nothing here reads
+  // the run lease -- `runScope` under the default RUN_GATE_KEY=workspace is
+  // `ws.<workspaceId>`, shared by every run in the workspace, and both
+  // handles.ts and keepalive.ts refuse that inference in as many words.
+  const askedAt = Date.now();
+  const older = await reap(
+    { ...pending("W0"), createdAt: new Date(askedAt - 60_000).toISOString() },
+    { taskId: "d1-task", ownedSinceMs: askedAt },
+  );
+  assert.deepEqual(older.stopped, [], "written before this run asked: not its own");
+
+  const newer = await reap(
+    { ...pending("W0"), createdAt: new Date(askedAt + 1_000).toISOString() },
+    { taskId: "d1-task", ownedSinceMs: askedAt },
+  );
+  assert.deepEqual(newer.stopped, ["W0"], "written after it asked: its own to clean up");
 });
 
 test("a caller that names no task reaps whatever is there", async () => {

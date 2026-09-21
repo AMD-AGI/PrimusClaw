@@ -460,6 +460,14 @@ export async function reapPendingHands(
   expected?: {
     taskId?: string | null;
     stillOwned?: () => boolean;
+    /**
+     * When this caller asked for its own sandbox, or null if it never did.
+     *
+     * The fallback for an entry that names no task, which the comparison above
+     * cannot judge. Per-entry and per-run facts only: the lease deliberately
+     * plays no part, see the block that uses it.
+     */
+    ownedSinceMs?: number | null;
   },
 ): Promise<void> {
   try {
@@ -496,40 +504,52 @@ export async function reapPendingHands(
       );
       return;
     }
-    // No task id on the entry, which the gate above cannot judge. What decides
-    // is whether anyone still HOLDS it -- the same question, and the same read,
-    // the collector uses (`readRunLeaseState` over `lock.<runScope>`).
+    // No task id on the entry, which the comparison above cannot judge. What
+    // decides is WHEN it was written against when this run asked for its own
+    // sandbox: an entry stamped before that ask was written by something else.
     //
-    // Held: leave it. Reaping on the session alone is the mis-kill this branch
-    // exists to stop -- a lazy chat turn that never asked for a sandbox,
-    // failing, and tearing down the workload a sibling is still queueing for.
-    // Somebody is alive behind that lease and the entry is theirs.
+    // Per-entry and per-run facts only, and the run lease deliberately plays no
+    // part. Three versions of this gate were wrong before this one, the last
+    // two because they reached for a signal that does not answer the question:
     //
-    // Free, or unscoped, or unreadable: reap it. This path is the only teardown
-    // such an entry will get, and the reason is a number rather than a
-    // principle: the bucket's TTL is DEFAULT_BRAIN_REGISTRY_TTL_MS (5 minutes,
-    // protocol/src/run-lease.ts) and `collectAbandonedPending` does not look
-    // until SANDBOX_PENDING_ABANDONED_AFTER_MS (2 hours). An entry nobody
-    // refreshes evaporates hours before the collector could reach it, so
-    // "leave it to the sweeper" is not deferral, it is the workload leaking
-    // with nothing left that names it.
+    //  - the merge asked only about `taskId`, reasoning that an entry without
+    //    one predated both fields and so had no collector behind it. `94b63ef`
+    //    on this branch wrote `runScope` and not yet `taskId`, so a rolling
+    //    upgrade produces the entry that argument called impossible -- reaped,
+    //    while a live run was still provisioning it.
+    //  - the next deferred every scoped entry to `collectAbandonedPending`,
+    //    which does not look until SANDBOX_PENDING_ABANDONED_AFTER_MS (2h)
+    //    while the bucket's TTL is DEFAULT_BRAIN_REGISTRY_TTL_MS (5 min). The
+    //    entry evaporates first: not deferral, a leak.
+    //  - the next read the run lease. Under the default `RUN_GATE_KEY=workspace`
+    //    `runScope` is `ws.<workspaceId>`, one lock for every run in the
+    //    workspace, so "held" says only that SOMEBODY there is busy -- it is
+    //    not evidence about this entry, and a redelivery of the same task reads
+    //    its own lock. handles.ts and keepalive.ts both already refuse this
+    //    exact inference in as many words: a lease read keyed off something
+    //    workspace-granular "is the defect rather than the fix".
     //
-    // The merge that brought the two ownership gates together reasoned only
-    // about the task id -- that an entry without one could only predate both
-    // fields and so had no collector behind it. That was wrong twice over:
-    // `94b63ef` on this branch wrote `runScope` and not yet `taskId`, so the
-    // scoped-but-unnamed entry it said could not exist is what a rolling
-    // upgrade produces; and the first correction, which deferred every scoped
-    // entry to the collector, missed that the collector never gets one.
-    if (expected?.taskId && !info.taskId
-        && typeof info.runScope === "string" && info.runScope
-        && await readRunLeaseState(kv, info.runScope) === "held") {
-      logger.info(
-        { sessionId, workloadId: info.workloadId, runScope: info.runScope,
-          taskId: expected.taskId },
-        "hands.reap_pending_skipped_unnamed_but_held",
-      );
-      return;
+    // The direction of the remaining error is the one this subsystem takes
+    // everywhere else: an entry that is not provably ours is left alone, and a
+    // workload nobody reclaims is the cost. `collectAbandonedPending` is the
+    // net under those -- a net with a hole of its own, since the horizon it
+    // uses outlasts the bucket TTL, which is a gap in that sweep rather than
+    // something this gate can close by stopping containers it cannot identify.
+    if (expected?.taskId && !info.taskId) {
+      const createdAt = Date.parse(typeof info.createdAt === "string" ? info.createdAt : "");
+      const since = expected.ownedSinceMs ?? null;
+      if (since === null || !Number.isFinite(createdAt) || createdAt < since) {
+        logger.info(
+          {
+            sessionId,
+            workloadId: info.workloadId,
+            createdAt: info.createdAt,
+            askedAt: since === null ? null : new Date(since).toISOString(),
+          },
+          "hands.reap_pending_not_ours",
+        );
+        return;
+      }
     }
     // Re-asked after the read, not only before it. The caller checks that it
     // still holds the lock before calling -- but the check and the teardown are

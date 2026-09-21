@@ -1859,6 +1859,9 @@ class TaskRunner {
       // teardown are a round trip apart, which is long enough for the heartbeat
       // to notice, and the snapshot that comes back is then the successor's.
       stillOwned: () => this.stillOwnsLock(),
+      // The fallback for an entry that names no task: this run asked for its
+      // sandbox at this instant, so anything stamped earlier is somebody else's.
+      ownedSinceMs: this.sandboxAskedAt,
     });
   }
 
