@@ -1644,8 +1644,7 @@ test("a running flag the control plane cannot qualify stays unknown", async (t) 
   await sweep(deps);
   assert.ok(statusReads > 0, "the roster is not read until Running is confirmed");
   assert.equal(k.current().bgRunning, undefined, "an unconfirmed sandbox yields no count");
-  assert.equal(k.current().workSeenAt, Date.now(), "the window is carried forward");
-  assert.ok(!k.deleted.includes(KEY));
+  assert.ok(!k.deleted.includes(KEY), "unknown must not authorise idle destroy");
 });
 
 test("evidence arriving after local reuse cannot publish idle or gone", async () => {
@@ -1769,8 +1768,7 @@ test("a failed refresh invalidates local and shared idle evidence immediately", 
   assert.equal(k.current().bgRunning, undefined, "the failed refresh invalidates the shared zero");
   assert.equal(k.current().bgCheckedAt, undefined);
   await sweep(deps);
-  assert.equal(k.current().workSeenAt, Date.now(), "the local zero cannot survive a failed refresh");
-  assert.ok(!k.deleted.includes(KEY));
+  assert.ok(!k.deleted.includes(KEY), "unknown after a failed refresh must not destroy");
   resetBackgroundWorkStateForTest();
   t.mock.timers.tick(16 * 60_000);
   await sweep(deps);

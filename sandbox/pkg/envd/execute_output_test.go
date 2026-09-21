@@ -9,6 +9,40 @@ import (
 	"time"
 )
 
+func TestAwaitTrackedExitHonoursTimeoutAfterDisconnect(t *testing.T) {
+	// Context.Done used to return immediately, dropping the request timer. A
+	// disconnect then left the tracked tree running with no deadline, so
+	// /api/jobs stayed non-empty and idle reclaim never fired.
+	exitCh := make(chan int, 1)
+	timer := time.NewTimer(40 * time.Millisecond)
+	stopped := make(chan struct{})
+	started := time.Now()
+	awaitTrackedExit(exitCh, timer, func() {
+		close(stopped)
+		exitCh <- 1
+	})
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("timeout after disconnect did not stop the tracked tree")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("awaitTrackedExit hung past the request timeout: %s", elapsed)
+	}
+}
+
+func TestAwaitTrackedExitReturnsOnNaturalExit(t *testing.T) {
+	exitCh := make(chan int, 1)
+	exitCh <- 0
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	stopped := false
+	awaitTrackedExit(exitCh, timer, func() { stopped = true })
+	if stopped {
+		t.Fatal("natural exit must not call stop")
+	}
+}
+
 func TestOutputWaitDoesNotReadSilenceAsCompletion(t *testing.T) {
 	// The exit status travels on its own descriptor while output travels through
 	// a pipe and a copy goroutine, so the status routinely overtakes the last

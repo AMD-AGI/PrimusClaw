@@ -57,6 +57,35 @@ test("missing probe credentials do not erase a witnessed running verdict", () =>
   );
 });
 
+test("incomplete probe credentials renew the KV TTL without reclaiming", () => {
+  // Returning true without a write let BRAIN_REGISTRY_TTL_MS erase the handle
+  // while idle-GC stayed off, so the Pod leaked until ShutdownTime.
+  const body = bodyOf("collectIdleTarget");
+  const gate = body.indexOf("!canProbeJobs(info, sessionId) && bgWork !== \"gone\"");
+  assert.ok(gate >= 0, "the no-probe gate is still the decision point");
+  const branch = body.slice(gate, gate + 280);
+  assert.match(branch, /kv\.update\(key, value, e\.revision\)/,
+    "the handle is renewed so Brain does not forget it");
+  assert.doesNotMatch(branch, /refreshIdleSince/,
+    "idle clocks must not slide while the roster cannot be confirmed");
+});
+
+test("expiry CAS is not self-bumped by jobs identity persistence", () => {
+  // persistJobsIdentity during the destructive probe advanced the enrollment
+  // revision the closing write conditioned on, so the first expiry always
+  // self-collided and reclaim slipped a full sweep.
+  assert.match(
+    bodyOf("expireIdleTarget"),
+    /persistIdentity:\s*false/,
+    "the destructive probe skips identity binding",
+  );
+  assert.match(
+    bodyOf("probeUserProcesses"),
+    /persistIdentity !== false/,
+    "background probes still bind identity by default",
+  );
+});
+
 test("an expired retry separates a failed lock read from an absent lock", () => {
   // `.catch(() => null)` made a KV hiccup indistinguishable from "nobody holds
   // this", and the unregister then ran on the strength of an error.

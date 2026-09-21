@@ -784,9 +784,9 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 // Returns detail info for a single sandbox session.
 // Permission: default users can only get their own sandboxes.
 //
-// This endpoint also doubles as a control-plane keepalive: every successful
-// GET bumps LastActivity so clients (e.g. the Claw executor keepalive loop)
-// can keep their sandboxes alive without having to proxy a data-plane request.
+// LastActivity is returned as stored metadata for listing/sort; this GET does
+// not refresh it. Sandbox lifetime is owned by Brain jobs reclaim when idle-GC
+// is off.
 func (s *Server) handleGetSandbox(c *gin.Context) {
 	sessionID := c.Param("sessionId")
 	if sessionID == "" {
@@ -842,15 +842,6 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 	// only then be refused.
 	if restoreRecovered {
 		s.restoreRecoveredSession(c.Request.Context(), info)
-	}
-
-	// Treat this GET as a keepalive: refresh LastActivity so idle-gc does not
-	// reap sandboxes whose clients only poll the control plane.
-	now := time.Now()
-	if err := s.store.UpdateSessionLastActivity(c.Request.Context(), sessionID, now); err != nil {
-		log.Warn("handleGetSandbox: failed to refresh last activity", "sessionId", sessionID, "error", err)
-	} else {
-		info.LastActivity = now
 	}
 
 	c.JSON(http.StatusOK, SandboxListItem{

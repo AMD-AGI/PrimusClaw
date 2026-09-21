@@ -131,11 +131,8 @@ test("a closing handle is not treated as idle-empty work", async () => {
   }
 });
 
-test("a sandbox without GET /api/jobs is reclaimed after the idle window", async () => {
-  // JobsUnavailable used to leave bgWork=unknown forever while sliding
-  // workSeenAt, so expireIdleTarget's JobsUnavailable fallback was unreachable.
-  // Past the reuse window the sweep must reclaim the same way deployments
-  // without /api/jobs did.
+test("a sandbox without GET /api/jobs is not reclaimed after the idle window", async () => {
+  // JobsUnavailable cannot prove an empty roster. Hard timeout is the backstop.
   const { kv, store } = storeKv({
     status: "ready",
     provider: "safe-workload",
@@ -165,17 +162,16 @@ test("a sandbox without GET /api/jobs is reclaimed after the idle window", async
     await runKeepaliveTickForTest({ kv, countActiveShells: absent });
     await new Promise((r) => setImmediate(r));
     await runKeepaliveTickForTest({ kv, countActiveShells: absent });
-    assert.ok(stopped.includes("wl-1"), "idle window elapsed and jobs API is absent");
-    assert.equal(store.has(`hands.${SESSION}`), false);
+    assert.equal(stopped.length, 0, "jobs unavailable must not authorise idle destroy");
+    assert.equal(store.has(`hands.${SESSION}`), true);
   } finally {
     restoreRetry();
     restore();
   }
 });
 
-test("JobsUnavailable reclaim CAS-es closing before stop after a concurrent ready write", async () => {
-  // A transient Router 404 maps to JobsUnavailable. Without a closing CAS on
-  // that path, a probe that outlasts ensureHands would stop the reused sandbox.
+test("JobsUnavailable never closes over a concurrent ready write", async () => {
+  // A transient Router 404 maps to JobsUnavailable. That path must not destroy.
   const key = `hands.${SESSION}`;
   const store = new Map<string, { value: Uint8Array; revision: number }>();
   store.set(key, {
@@ -258,7 +254,7 @@ test("JobsUnavailable reclaim CAS-es closing before stop after a concurrent read
     await runKeepaliveTickForTest({ kv, countActiveShells });
     await new Promise((r) => setImmediate(r));
     await runKeepaliveTickForTest({ kv, countActiveShells });
-    assert.deepEqual(closingAt, [], "JobsUnavailable must not close over a bumped ready revision");
+    assert.deepEqual(closingAt, [], "JobsUnavailable must not close");
     assert.equal(stopped.length, 0, "the concurrent ready sandbox must not be destroyed");
     assert.ok(store.has(key));
   } finally {
@@ -267,10 +263,9 @@ test("JobsUnavailable reclaim CAS-es closing before stop after a concurrent read
   }
 });
 
-test("an in-window unknown probe advances workSeenAt for multi-node reclaim", async () => {
-  // Keepalive expiry ignores workSeenAt, but unknown sweeps must still move it
-  // so eligibleForClusterReclaim does not delete a cluster under a held handle.
+test("an in-window unknown probe renews the handle without sliding idleSince", async () => {
   const now = 1_000_000;
+  const idleSince = now - 60_000;
   const { kv, store } = storeKv({
     status: "ready",
     provider: "safe-workload",
@@ -280,9 +275,9 @@ test("an in-window unknown probe advances workSeenAt for multi-node reclaim", as
     handsUrl: "http://sandbox:9100/mcp",
     token: "tok",
     keepalive: false,
-    idleSince: now - 60_000,
-    quiescedAt: now - 60_000,
-    workSeenAt: now - 60_000,
+    idleSince,
+    quiescedAt: idleSince,
+    workSeenAt: idleSince,
   });
   bindHandsKv(kv);
   const provider = {
@@ -300,12 +295,11 @@ test("an in-window unknown probe advances workSeenAt for multi-node reclaim", as
     });
     const left = store.get(`hands.${SESSION}`);
     assert.ok(left);
-    const info = JSON.parse(sc.decode(left.value)) as { workSeenAt?: number; quiescedAt?: number };
-    assert.equal(info.quiescedAt, now - 60_000, "unknown must not clear quiescedAt");
-    assert.ok(
-      typeof info.workSeenAt === "number" && info.workSeenAt >= now,
-      `workSeenAt must advance for MN coordination; got ${info.workSeenAt}`,
-    );
+    const info = JSON.parse(sc.decode(left.value)) as {
+      idleSince?: number; workSeenAt?: number; quiescedAt?: number;
+    };
+    assert.equal(info.idleSince, idleSince, "park stamp is the only expiry clock");
+    assert.equal(info.quiescedAt, idleSince, "unknown must not clear quiescedAt");
   } finally {
     restore();
   }

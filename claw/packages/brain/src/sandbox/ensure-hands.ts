@@ -2613,7 +2613,7 @@ async function provisionHands(
   // cluster has to exist as a file here before the optimizer runs.
   if (multiNodeContext?.sshPrivateKey && multiNodeContext.sshKeyPath) {
     await writeSandboxSshKey(
-      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t),
+      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
       multiNodeContext.sshKeyPath,
       multiNodeContext.sshPrivateKey,
     );

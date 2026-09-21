@@ -62,6 +62,7 @@ const LIVE_BINDING = {
   handsUrl: "http://live:9100/mcp",
   token: "tok-live",
   keepalive: false,
+  sessionDeleted: true,
   idleSince: IDLE_SINCE,
 };
 
@@ -142,6 +143,7 @@ test("the health sweep does not probe or evict a retained container", async () =
   const { deleted } = bindKv();
   const checked = recordHealthChecks();
   const stopped = recordStops();
+  restoreReclaim = bindClusterReclaimForTest(async () => 0);
 
   await sweepStaleHandsForTest();
 

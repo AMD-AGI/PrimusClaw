@@ -133,7 +133,7 @@ HTTP 404 / 405 / 501 on `GET /api/jobs` means this EnvD has no jobs roster (typi
 
 ## Reclaim and failure
 
-Brain owns sandbox lifetime. Sandbox idle-GC is not the idle policy (off / to be removed). `/tmp/keepalive_ts` and Redis `LastActivity` are not user-process signals.
+Brain owns sandbox lifetime. Sandbox idle-GC is not the idle policy (off / to be removed). Redis `LastActivity` is list/sort metadata only; Router and control-plane GET no longer refresh it for GC.
 
 ### SaFE failure is sandbox failure, returned to the frontend
 
@@ -153,7 +153,7 @@ That terminal phase is the sandbox Pod / codeinterpreter, not InferaDeployment o
 - A sandbox that is not yet Running does not enter DRAINING / QUIESCED.
 - Pending ends only by becoming Running, a SaFE sandbox terminal failure, or the Pending timeout below.
 
-When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain records `quiescedAt` and keeps the sandbox for `SANDBOX_IDLE_REUSE_SECONDS` (default 15 minutes). A new message or a new execute job clears that clock. Probes continue during QUIESCED. `unknown` and `tracking_lost` do not trigger reclaim.
+When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain parks with `keepalive:false` and `idleSince`. After `SANDBOX_IDLE_REUSE_SECONDS` (default 15 minutes) from that park stamp, a destroy pass **must** sync-probe `count == 0` again before CAS `ready` → `closing`. A new message clears idle markers. `unavailable` and `tracking_lost` do not trigger reclaim (workload hard timeout is the backstop). Multi-node GPU clusters are torn down after the sandbox stops (or immediately on `sessionDeleted` parks).
 
 Reclaim and reuse compete on one CAS: `ready` → `closing`. A handle in `closing` is not reused. Stale jobs answers are discarded when the sandbox identity or idle generation changes.
 

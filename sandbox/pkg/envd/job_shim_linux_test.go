@@ -231,6 +231,72 @@ func TestTheJobLeavesTheRosterOnceItsTreeIsEmpty(t *testing.T) {
 	t.Fatal("the job stayed on the roster after its descendant exited")
 }
 
+func TestCancelFreesShimStuckReapingOrphans(t *testing.T) {
+	requireJobShim(t)
+	// After the primary exits, the shim stays alive for setsid descendants.
+	// cancel() sends SIGTERM; Ignore left that signal inert and the job on the
+	// roster for the Pod lifetime, so every idle reclaim read the sandbox busy.
+	s := newTestServer()
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	var out synchronizedBuffer
+	_, exitCh, drained, stop, err := s.startTrackedCommand(
+		[]string{"sh", "-c", fmt.Sprintf(
+			"setsid sh -c 'echo $$ > %s; sleep 100000' >/dev/null 2>&1 & exit 0", pidFile,
+		)},
+		"", os.Environ(), &out, &out, jobTracking{track: true},
+	)
+	if err != nil {
+		t.Fatalf("startTrackedCommand: %v", err)
+	}
+	select {
+	case code := <-exitCh:
+		if code != 0 {
+			t.Fatalf("the primary command failed: exit=%d", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the primary command did not finish")
+	}
+	descendant := 0
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if raw, readErr := os.ReadFile(pidFile); readErr == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr == nil {
+				descendant = pid
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if descendant == 0 {
+		t.Fatal("the detached descendant never reported its pid")
+	}
+	select {
+	case <-drained:
+		t.Fatal("the supervisor left before cancel while its orphan still ran")
+	default:
+	}
+	stop()
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		t.Fatal("SIGTERM did not free a shim stuck reaping orphans")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, snapErr := s.jobs.snapshot()
+		if snapErr != nil {
+			t.Fatal(snapErr)
+		}
+		if snap.count == 0 && !snap.lost {
+			if _, ok := readProc("/proc", descendant); ok {
+				t.Fatal("the orphan survived cancel; the roster would still look busy")
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("cancel left the job on the roster")
+}
+
 func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {
 	// The Hands job is infrastructure: the roster reports the descendants it
 	// spawned rather than the supervisor, which is the branch that decides every

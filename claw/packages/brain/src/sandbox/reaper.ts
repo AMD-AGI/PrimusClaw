@@ -352,6 +352,23 @@ export async function destroyHands(
         );
       });
     }
+    // Multi-node GPU clusters follow the sandbox: same idle decision, cascade
+    // teardown. Best-effort -- workload timeout remains the hard backstop.
+    if (stopOutcome === "stopped") {
+      const platformKey = String(
+        (target as { platformKey?: string }).platformKey
+          ?? (ownsRecorded ? recorded.identity?.platformKey : "")
+          ?? "",
+      );
+      if (platformKey) {
+        await reclaimClusters(sessionId, platformKey).catch((e: unknown) => {
+          logger.warn(
+            { sessionId, err: (e as Error)?.message ?? String(e) },
+            "mn.cascade_after_sandbox_stop_failed",
+          );
+        });
+      }
+    }
   } catch (cause) {
     // Counted before the rethrow: the caller turns this into a replacement
     // decision and never reports the teardown itself, so this is the only
@@ -623,50 +640,27 @@ export function startSandboxSweeper(): void {
 }
 
 /**
- * May this session's GPU clusters be reclaimed now?
+ * May this session's GPU clusters be reclaimed by the orphan sweeper?
  *
- * `keepalive === false` comes first and is never waived: it is the only signal
- * that no task is running, and it covers DAG-rooted tasks that the session-keyed
- * task lock misses.
- *
- * Past that there are two kinds of idle and only one waits. A live session
- * between messages waits out MULTI_NODE_IDLE_RECLAIM_MS, so its cluster is still
- * warm when the next message arrives. A handle parked by a session delete skips
- * it: there is no next message to keep anything warm for, so waiting only delays
- * the GPUs going back. See parkHandsHandle for the two configurations where that
- * exemption is load-bearing rather than merely faster.
+ * `keepalive === false` is required. Idle sandbox reclaim owns lifetime;
+ * clusters for ordinary idle parks are torn down in destroyHands after the
+ * sandbox stops. This sweeper only covers session-delete parks, where there is
+ * no next message and waiting on the sandbox idle window would only delay GPUs.
  */
 export function eligibleForClusterReclaim(
   info: {
     keepalive?: unknown;
     sessionDeleted?: unknown;
-    idleSince?: unknown;
-    workSeenAt?: unknown;
-    quiescedAt?: unknown;
   },
-  now: number,
+  _now: number,
 ): boolean {
   if (info.keepalive !== false) return false;
-  if (info.sessionDeleted === true) return true;
-  const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-  const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
-  const quiescedAt = typeof info.quiescedAt === "number" ? info.quiescedAt : 0;
-  // The later of the three, and `workSeenAt` is in there for the sweep that
-  // cannot ask: this one reads no background-work verdict and runs on a shorter
-  // horizon than the keepalive reclaim. A handle whose roster answered empty
-  // once and has been unreachable since carries a `quiescedAt` that no longer
-  // moves, and the keepalive sweep holds it on `unknown` -- reading that stamp
-  // alone here would release the cluster out from under a handle the other
-  // sweep is deliberately keeping. `workSeenAt` advances on every sweep that
-  // could not get an answer, which is what keeps the two in step.
-  const reuseWindowStart = Math.max(quiescedAt, idleSince, workSeenAt);
-  return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
+  return info.sessionDeleted === true;
 }
 
 /**
- * Periodic multi-node sweeper: reclaim the GPU clusters of sessions whose sandbox
- * has gone idle, and of sessions deleted without a confirmed teardown.
- * eligibleForClusterReclaim above decides which entries qualify.
+ * Periodic multi-node sweeper: reclaim GPU clusters left after a session delete.
+ * Ordinary idle parks cascade from destroyHands instead.
  *
  * Only reaches sessions that still hold a `hands.*` entry, since the SaFE key it
  * needs to delete a workload lives there. A cluster whose entry has already

@@ -4,25 +4,16 @@
 /**
  * What an unfinished session teardown falls back to.
  *
- * A delete that cannot confirm it removed everything hands the session to nets
- * that already exist rather than driving its own retries: marking the
- * `hands.<sid>` handle idle makes sweepIdleMultiNodeClusters reclaim the
- * clusters about five minutes later, and stops anything from pinging the pod, so
- * the control-plane's own idle GC collects that too.
- *
- * Which makes the fields written here the whole contract. `keepalive` must
- * become false — the multi-node sweep requires exactly that and skips the
- * session otherwise — `idleSince` must be set, since the sweep measures the idle
- * window from it and treats a missing value as "not idle yet", and the bearer
- * token must be cleared, because leaving it in a surviving entry keeps a deleted
- * session's token accepted on every other replica.
+ * A delete that cannot confirm it removed everything parks the `hands.<sid>`
+ * handle with sessionDeleted so the multi-node sweeper can reclaim GPU clusters
+ * without waiting on the sandbox idle window. Ordinary idle parks reclaim
+ * clusters only after destroyHands stops the sandbox.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";
 
-import { MULTI_NODE_IDLE_RECLAIM_MS } from "../src/config.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { eligibleForClusterReclaim, parkForIdleReclaim } from "../src/sandbox/reaper.js";
 
@@ -77,9 +68,10 @@ test("the handle is marked idle so the multi-node sweep will claim it", async ()
 
   const info = readBack(stub);
   assert.equal(info.keepalive, false, "the sweep requires exactly this");
+  assert.equal(info.sessionDeleted, true, "session-delete parks skip the sandbox idle window");
   assert.ok(
     typeof info.idleSince === "number" && info.idleSince >= before,
-    "the sweep measures the idle window from idleSince, and treats missing as not-idle",
+    "idleSince is still recorded for the sandbox reclaim path",
   );
 });
 
@@ -106,9 +98,9 @@ test("a deleted session is eligible for reclaim at once", () => {
   );
 });
 
-test("a live session between messages still waits its idle window out", () => {
-  // The window exists for this case and must survive the exception above: the
-  // next message reuses a still-warm cluster instead of paying to build one.
+test("a live session between messages is not cluster-reclaimed by the sweeper", () => {
+  // Ordinary idle parks cascade from destroyHands after the sandbox stops.
+  // The orphan sweeper must not use its own idle window and steal the cluster.
   const now = Date.now();
 
   assert.equal(
@@ -116,31 +108,8 @@ test("a live session between messages still waits its idle window out", () => {
     false,
   );
   assert.equal(
-    eligibleForClusterReclaim({ keepalive: false, idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS }, now),
-    true,
-  );
-});
-
-test("recent background work extends the multi-node reclaim window", () => {
-  const now = Date.now();
-
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS,
-      workSeenAt: now,
-    }, now),
+    eligibleForClusterReclaim({ keepalive: false, idleSince: now - 60 * 60 * 1000 }, now),
     false,
-    "a current running verdict keeps the cluster while background work continues",
-  );
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
-      workSeenAt: now - MULTI_NODE_IDLE_RECLAIM_MS,
-    }, now),
-    true,
-    "the cluster is eligible once the whole reuse window has aged out",
   );
 });
 
@@ -230,54 +199,4 @@ test("a KV failure is swallowed rather than escaping the cleanup handler", async
 
   bindStub({ entry: { status: "ready" }, updateError: new Error("CONNECTION_CLOSED") });
   await parkForIdleReclaim(SID);
-});
-
-test("cluster reclaim waits out a measured quiesce, not just the park", () => {
-  // `quiescedAt` is set when a probe measured the sandbox empty, and it is the
-  // anchor the single-node reclaim counts from. The cluster sweep has to agree:
-  // counting from the park alone would let it release a sandbox whose window
-  // only started when that measurement landed, and the GPUs would go back while
-  // the keepalive that owns the handle still holds it short of its own window.
-  const now = 2_000_000;
-  const longIdle = now - MULTI_NODE_IDLE_RECLAIM_MS - 1;
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: longIdle,
-      workSeenAt: longIdle,
-      quiescedAt: now - 1,
-    }, now),
-    false,
-    "a quiesce measured a moment ago cannot already be past its window",
-  );
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: longIdle,
-      workSeenAt: longIdle,
-      quiescedAt: longIdle,
-    }, now),
-    true,
-    "a quiesce as old as the park leaves the window where it was",
-  );
-});
-
-test("cluster reclaim uses the later of idleSince and workSeenAt", () => {
-  const now = 1_000_000;
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS,
-      workSeenAt: now - 1,
-    }, now),
-    false,
-  );
-  assert.equal(
-    eligibleForClusterReclaim({
-      keepalive: false,
-      idleSince: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
-      workSeenAt: now - MULTI_NODE_IDLE_RECLAIM_MS - 1,
-    }, now),
-    true,
-  );
 });

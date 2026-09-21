@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 const exitStatusFD = 3
@@ -53,6 +54,7 @@ func runJobShim() {
 
 	cancelled := make(chan os.Signal, 1)
 	signal.Notify(cancelled, syscall.SIGTERM)
+	defer signal.Stop(cancelled)
 
 	if err := cmd.Start(); err != nil {
 		writeControlInt(control, 0)
@@ -74,9 +76,6 @@ func runJobShim() {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		err = <-waited
 	}
-	// The primary process is complete; later cancellation must not break
-	// adoption while detached descendants are still alive.
-	signal.Ignore(syscall.SIGTERM)
 
 	code := 0
 	if err != nil {
@@ -89,7 +88,9 @@ func runJobShim() {
 
 	writeControlInt(control, code)
 	_ = control.Close()
-	reapOrphans()
+	// Stay cancellable while adopting detached descendants: Ignore(SIGTERM)
+	// here left cancel() unable to free the roster after setsid work.
+	reapOrphans(cancelled)
 }
 
 // writeControlInt sends one process identity or exit status to EnvD.
@@ -99,8 +100,34 @@ func writeControlInt(control *os.File, value int) {
 	_, _ = control.Write(buf[:])
 }
 
-// reapOrphans waits until every descendant adopted by this shim has exited.
-func reapOrphans() {
+// reapOrphans waits until every descendant adopted by this shim has exited, or
+// until EnvD cancels the tree (request timeout after the primary already ended).
+func reapOrphans(cancelled <-chan os.Signal) {
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		switch {
+		case err == syscall.ECHILD:
+			return
+		case err == syscall.EINTR:
+			continue
+		case err != nil:
+			return
+		case pid > 0:
+			continue
+		}
+		select {
+		case <-cancelled:
+			killAdoptedDescendants()
+			drainOrphans()
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// drainOrphans blocks until Wait4 reports no children remain.
+func drainOrphans() {
 	for {
 		var ws syscall.WaitStatus
 		_, err := syscall.Wait4(-1, &ws, 0, nil)
@@ -112,6 +139,33 @@ func reapOrphans() {
 		}
 		if err != nil {
 			return
+		}
+	}
+}
+
+// killAdoptedDescendants SIGKILLs every live process under this shim.
+func killAdoptedDescendants() {
+	self := os.Getpid()
+	procs, err := listProcs(procRoot)
+	if err != nil {
+		return
+	}
+	byPPID := make(map[int][]int)
+	for _, p := range procs {
+		byPPID[p.ppid] = append(byPPID[p.ppid], p.pid)
+	}
+	seen := map[int]bool{self: true}
+	queue := []int{self}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, child := range byPPID[cur] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			queue = append(queue, child)
+			_ = syscall.Kill(child, syscall.SIGKILL)
 		}
 	}
 }

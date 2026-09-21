@@ -96,8 +96,11 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			// HTTP cancellation does not stop the tracked tree, but the
 			// response no longer owns these buffers. Close them so a
 			// detached descendant cannot grow heap until OOMKill.
+			// The request timeout still applies: abandon the response, keep
+			// waiting so a disconnect cannot leave an unbounded process tree.
 			_ = stdout.take()
 			_ = stderr.take()
+			awaitTrackedExit(exitCh, timer, stop)
 			return
 		}
 		awaitOutputQuiet(drained, func() time.Time {
@@ -209,7 +212,10 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 	case <-timer.C:
 		exitCode = finalizeTimedOutCommand(exitCh, stop)
 	case <-r.Context().Done():
+		// Same contract as handleExecute: disconnect closes the stream, the
+		// request timeout still stops the tracked tree.
 		stream.deactivate()
+		awaitTrackedExit(exitCh, timer, stop)
 		return
 	}
 	// Let the output the exit status overtook reach the stream before it stops
@@ -247,6 +253,16 @@ func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 
 // GNU timeout's documented execute timeout status.
 const executeTimeoutExitCode = 124
+
+// awaitTrackedExit keeps the request timeout armed after the HTTP client leaves.
+// Disconnect alone must not abandon a tree that would outlive every reclaim clock.
+func awaitTrackedExit(exitCh <-chan int, timer *time.Timer, stop func()) {
+	select {
+	case <-exitCh:
+	case <-timer.C:
+		_ = finalizeTimedOutCommand(exitCh, stop)
+	}
+}
 
 // How long the output path must stay silent before a response is built from it.
 const outputQuietPeriod = 100 * time.Millisecond

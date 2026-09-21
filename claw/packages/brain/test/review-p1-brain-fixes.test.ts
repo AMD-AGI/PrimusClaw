@@ -93,6 +93,18 @@ test("a transient exec 5xx does not look up the Workload API", async () => {
   assert.equal(calls, 1);
 });
 
+test("multi-node SSH key materialisation is untracked", async () => {
+  // Provision writing the cluster key without untracked counted as a user job
+  // and raced the first jobs probe into a false running verdict.
+  const src = await import("node:fs/promises")
+    .then((fs) => fs.readFile(new URL("../src/sandbox/ensure-hands.ts", import.meta.url), "utf8"));
+  const at = src.indexOf("writeSandboxSshKey(");
+  assert.ok(at >= 0, "writeSandboxSshKey is still called from ensureHands");
+  const call = src.slice(at, at + 220);
+  assert.match(call, /untracked:\s*true/,
+    "SSH key write must not occupy the jobs roster");
+});
+
 test("keepalive-style untracked exec is sent on the execute body", async () => {
   let body = "";
   globalThis.fetch = (async (_input, init) => {

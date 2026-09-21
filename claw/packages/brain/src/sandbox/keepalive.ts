@@ -9,8 +9,8 @@ import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol
 // here and by the API's orphan-handle sweep, which must not stop a sandbox this
 // file is still holding for background work; one definition is what keeps the
 // two answering the same question. See sandbox/bg-verdict.ts in @claw/protocol.
-// `reuseWindowStart` stays local: a jobs verdict's `quiescedAt` is not one of
-// the shared idle-period fields.
+// Brain idle-expiry uses park `idleSince` only; destroy requires a sync jobs
+// count of zero. Multi-node clusters are reclaimed after sandbox destroy.
 import {
   BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod,
   sameIdlePeriod, usableSharedVerdict,
@@ -175,6 +175,7 @@ async function probeUserProcesses(
   deps: KeepaliveDeps,
   info: HandsKvEntry,
   sessionId: string,
+  opts?: { persistIdentity?: boolean },
 ): Promise<number> {
   const entry = { ...info, sessionId: info.sessionId || sessionId };
   if (deps.countActiveShells) {
@@ -185,7 +186,11 @@ async function probeUserProcesses(
     return deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId);
   }
   const result = await inspectSandboxJobs(entry);
-  await persistJobsIdentity(deps, sessionId, result);
+  // Expiry CAS is conditioned on the enrollment revision. Persisting identity
+  // here bumps that revision and the subsequent closing write self-collides.
+  if (opts?.persistIdentity !== false) {
+    await persistJobsIdentity(deps, sessionId, result);
+  }
   return result.count;
 }
 
@@ -1508,31 +1513,10 @@ function newTickStats(): TickStats {
 type VerdictSource = "mem" | "handle" | "none";
 
 /**
- * The reuse window for a jobs verdict.
- *
- * A recorded `quiescedAt` is the moment EnvD first reported an empty roster, and
- * that is the clock the idle expiry measures. Without one, the window is the
- * later of the idle-period opening and the last sweep that observed work.
- *
- * Keepalive reclaim deliberately ignores `workSeenAt` (see
- * `keepaliveReuseAnchor`): unknown probes still advance `workSeenAt` so the
- * multi-node cluster sweeper stays aligned, and folding that stamp into this
- * clock would strand JobsUnavailable sandboxes forever.
+ * Park stamp for idle-expiry. The window is calendar time since the turn
+ * parked the handle; destroy still requires a sync jobs count of zero.
  */
-function reuseWindowStart(info: HandsKvEntry): number {
-  if (typeof info.quiescedAt === "number") return info.quiescedAt;
-  return Math.max(
-    typeof info.idleSince === "number" ? info.idleSince : 0,
-    typeof info.workSeenAt === "number" ? info.workSeenAt : 0,
-  );
-}
-
-/**
- * Anchor for Brain's own idle-expiry. Prefer `quiescedAt`, else the park stamp.
- * `workSeenAt` is reserved for multi-node cluster reclaim coordination.
- */
-function keepaliveReuseAnchor(info: HandsKvEntry): number {
-  if (typeof info.quiescedAt === "number") return info.quiescedAt;
+function idleExpiryAnchor(info: HandsKvEntry): number {
   return typeof info.idleSince === "number" ? info.idleSince : 0;
 }
 
@@ -1978,9 +1962,9 @@ async function persistVerdict(
         );
         return;
       }
-      // The idle window opens on the sweep clock, which is what
-      // reuseWindowStart is later compared against; verdict freshness above
-      // ages on `Date.now`. Each anchor is read off the clock that measures it.
+      // The idle window opens on the park stamp that idleExpiryAnchor later
+      // compares against; verdict freshness above ages on `Date.now`.
+      // Each anchor is read off the clock that measures it.
       const quiescedAt = (deps.now ?? Date.now)();
       const next = sc.encode(JSON.stringify({
         ...info,
@@ -2020,15 +2004,10 @@ async function persistVerdict(
 }
 
 /**
- * Move the idle clock forward on a handle whose sandbox is still working.
- * `idleSince` follows the measurement anchor; `workSeenAt` gives the reuse window
- * a current local clock. The update is conditional and best-effort.
+ * Renew a parked handle after a running jobs answer.
  *
- * `workObserved` separates a witnessed user process from a verdict that could
- * not be read. Only the former discards `quiescedAt`, so an unreadable probe
- * leaves the idle window accumulated so far in place: the jobs probe crosses
- * the control plane and the Router, and each unanswered hop would otherwise
- * restart a window that only a confirmed empty roster is allowed to close.
+ * `idleSince` stays where park opened it: destroy still keys off that stamp
+ * plus a sync count of zero. `workSeenAt` is not a reclaim clock.
  */
 async function refreshIdleSince(
   deps: KeepaliveDeps,
@@ -2038,17 +2017,8 @@ async function refreshIdleSince(
   workObserved = true,
 ): Promise<void> {
   try {
-    // `workSeenAt` carries the window, and `idleSince` is left where the idle
-    // period opened it. Moving it would be moving the period's own identity:
-    // persistVerdict matches it to decide a verdict belongs to the period it
-    // was measured under, and measuredUnderThisIdlePeriod matches it again to
-    // decide the stored verdict is still usable. A sweep that advanced it on
-    // every running answer therefore refused the idle answer that followed --
-    // and because a running verdict is what brings the sweep back here, the
-    // refusal renewed the state that caused it and the window never closed.
     const next = sc.encode(JSON.stringify({
       ...info,
-      workSeenAt: (deps.now ?? Date.now)(),
       ...(workObserved ? { quiescedAt: undefined } : {}),
     }));
     await deps.kv.update(key, next, revision);
@@ -2315,18 +2285,16 @@ async function collectIdleTarget(
     return false;
   }
   // Incomplete control-plane identity cannot confirm an empty jobs roster.
-  // Do not reclaim and do not refresh clocks (would slide the idle window).
+  // Renew the KV TTL so Brain does not forget the handle; do not reclaim.
   if (!canProbeJobs(info, sessionId) && bgWork !== "gone") {
+    await deps.kv.update(key, value, e.revision).catch(() => {});
     return true;
   }
-  // Keepalive expiry ignores workSeenAt so unknown probes can still advance it
-  // for multi-node cluster reclaim without stranding JobsUnavailable reclaim.
   const expired = bgWork === "gone"
-    || (deps.now ?? Date.now)() - keepaliveReuseAnchor(info) > SANDBOX_IDLE_REUSE_MS;
-  // Hold an in-window unknown for an in-flight probe. Advance workSeenAt so
-  // eligibleForClusterReclaim stays in step; do not clear quiescedAt.
+    || (deps.now ?? Date.now)() - idleExpiryAnchor(info) > SANDBOX_IDLE_REUSE_MS;
+  // Hold an in-window unknown for an in-flight probe; renew TTL only.
   if (bgWork === "unknown" && canProbeJobs(info, sessionId) && !expired) {
-    await refreshIdleSince(deps, key, e.revision, info, false);
+    await deps.kv.update(key, value, e.revision).catch(() => {});
     return false;
   }
   if (expired) {
@@ -2370,24 +2338,29 @@ async function expireIdleTarget(
     return;
   }
   // Reconfirm Running and an empty EnvD jobs roster at the destructive boundary.
-  // CAS uses the enrollment revision so a concurrent ensureHands /
-  // clearIdleMarkers write (new ready, higher revision) wins instead of being
-  // overwritten by a stale reclaim.
+  // Destroy requires a readable jobs count of zero; unavailable / tracking_lost
+  // never authorise reclaim. CAS uses the enrollment revision so a concurrent
+  // ensureHands / clearIdleMarkers write wins instead of being overwritten.
   let claimed = false;
   const claimRevision = e.revision;
   try {
-    if (canProbeJobs(info, sessionId)) {
-      const running = await probeUserProcesses(deps, info, sessionId);
-      if (running > 0) {
-        await refreshIdleSince(deps, key, claimRevision, info);
-        return;
-      }
-      // Refresh fields for the stop payload; CAS still uses claimRevision.
-      // A probe-side persist that advanced the key is preemption (conflict).
-      const latest = await deps.kv.get(key);
-      if (!latest || isTombstone(latest)) return;
-      info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+    if (!canProbeJobs(info, sessionId)) {
+      await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      return;
     }
+    const running = await probeUserProcesses(deps, info, sessionId, {
+      persistIdentity: false,
+    });
+    if (running > 0) {
+      await refreshIdleSince(deps, key, claimRevision, info);
+      return;
+    }
+    // Refresh fields for the stop payload; CAS still uses claimRevision.
+    // Identity binding is deferred past this CAS so the probe cannot
+    // self-bump the enrollment revision the closing write conditions on.
+    const latest = await deps.kv.get(key);
+    if (!latest || isTombstone(latest)) return;
+    info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
     await deps.kv.update(
       key,
       sc.encode(JSON.stringify({ ...info, status: "closing" })),
@@ -2435,25 +2408,16 @@ async function expireIdleTarget(
         logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
       });
     } else if (err instanceof SandboxTrackingLostError) {
+      // Tracking loss means jobs cannot prove idle; hard timeout is the backstop.
       logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
       if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     } else if (err instanceof SandboxJobsUnavailableError) {
-      // /api/jobs is missing on this EnvD. The idle window has already elapsed
-      // to reach here; reclaim the way deployments without the jobs API did.
-      // A transient Router 404 must not skip the closing CAS: the probe can
-      // outlast an ensureHands that cleared idle markers on the same workload.
+      // No readable jobs roster: never treat as idle-empty.
       logger.info(
         { sessionId, workloadId: info.workloadId, status: err.httpStatus },
-        "keepalive.idle_reclaim_jobs_api_absent",
+        "keepalive.idle_reclaim_jobs_unavailable",
       );
-      if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
-        return;
-      }
-      claimed = true;
-      await destroyHands(sessionId, info).catch((stopErr) => {
-        logger.warn({ err: stopErr, sessionId }, "keepalive.jobs_absent_stop_retry");
-      });
-      stats.expired += 1;
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     } else if (isRevisionConflict(err)) {
       logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
     } else {
@@ -2550,10 +2514,6 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
   }
 }
 
-/**
- * Periodically exec a no-op inside every active sandbox to refresh the
- * SaFE Workload Manager's lastActivity timestamp, preventing idle GC.
- */
 /** One sweep, exported so its decisions can be tested without an interval. */
 export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void> {
   // Reclaim reaches destroyHands, which reads the process-wide handle KV
@@ -2837,12 +2797,8 @@ async function pingSandbox(
 
   try {
     // A control-plane status read on both providers, and no command in the
-    // container. The exec this replaced on the safe-workload path wrote
-    // /tmp/keepalive_ts to refresh the Router's LastActivity for the sandbox
-    // idle-GC; Brain's reclaim replaced that controller, reads idleness from
-    // the EnvD roster, and nothing consumes the timestamp. What a sweep still
-    // wants of a live sandbox is whether its workload is still Running, which
-    // this asks without entering the container.
+    // container. Live targets still need a Running check; idle reclaim reads
+    // the EnvD jobs roster separately and does not refresh LastActivity.
     const status = isAgent
       ? await getAgentSandboxProvider().get({
         provider: "agent-sandbox",
