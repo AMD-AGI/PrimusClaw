@@ -14,6 +14,21 @@ export * from "./sandbox/base32.js";
 export * from "./sandbox/hands-key.js";
 export * from "./sandbox/shell-record.js";
 export * from "./sandbox/shell-classify.js";
+// The one definition of what a published background-work verdict is and when
+// it may still be believed. Exported from the package because the writer lives
+// in Brain and one of the readers lives in the API, and a second copy of these
+// rules is a defect waiting for the two to drift.
+export {
+  BG_VERDICT_TTL_MS,
+  SHARED_VERDICT_FIELDS,
+  measuredUnderThisIdlePeriod,
+  reuseWindowStart,
+  sameIdlePeriod,
+  usableSharedVerdict,
+  type BackgroundWork,
+  type IdlePeriodFields,
+  type SharedVerdictFields,
+} from "./sandbox/bg-verdict.js";
 export {
   parkHandsHandle,
   parkHandsAfterRun,
@@ -32,3 +47,4 @@ export { platformFactsFromWorkloadDetail } from "./sandbox/platform-facts.js";
 export type { PlatformFacts } from "./sandbox/platform-facts.js";
 export { DagHandleMap, HANDLE_MAP_PREFIX } from "./sandbox/handle-map.js";
 export type { HandleInfo } from "./sandbox/handle-map.js";
+export { getHandleEntry, setHandleEntry } from "./sandbox/handle-map.js";

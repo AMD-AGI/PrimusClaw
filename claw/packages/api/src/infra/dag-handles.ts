@@ -25,7 +25,13 @@ export async function listDagHandles(): Promise<Array<[string, Record<string, Ha
   const bucket = await js.views.kv(BUCKET, { bindOnly: true });
   const decoder = new TextDecoder();
   const out: Array<[string, Record<string, HandleInfo>]> = [];
-  for await (const key of await bucket.keys(`${HANDLE_MAP_PREFIX}.>`)) {
+  // Drained before the first `get`: awaiting a JetStream request inside
+  // `for await` over `keys()` stalls the ordered consumer and it ends
+  // early with no error -- 1 key out of 21 on the real bucket. See the
+  // same note in @claw/utils' kv store.
+  const keys: string[] = [];
+  for await (const key of await bucket.keys(`${HANDLE_MAP_PREFIX}.>`)) keys.push(key);
+  for (const key of keys) {
     const entry = await bucket.get(key);
     if (!entry) continue;
     const row = JSON.parse(decoder.decode(entry.value)) as Record<string, HandleInfo>;
