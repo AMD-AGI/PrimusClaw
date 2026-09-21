@@ -28,6 +28,7 @@ import {
 } from "../workspace/sync-semaphore.js";
 import { isRetryable } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
+import { attributionOf } from "../sandbox/attribution.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
@@ -1532,26 +1533,21 @@ class TaskRunner {
       // (`makeOnProvisioned`), so an entry naming a different task -- or naming
       // none, which no task-bearing run of this build can produce -- is not this
       // run's to report.
-      if (this.request.task_id && info.taskId !== this.request.task_id) return null;
-      // Then by ATTEMPT, because the task id does not separate one delivery of
-      // a task from the next. A redelivery carries the same task id, and its
-      // predecessor can leave a PENDING entry behind -- a SIGTERM mid-provision
-      // is enough. Reporting that entry writes the previous attempt's node,
-      // exit code and preemption onto this attempt's failing row.
+      // One predicate, shared with every other attribution reader, instead of
+      // each one inlining its own comparison -- which is how this path ended up
+      // on timestamps while the teardown was on task ids. `mine` is the only
+      // answer that permits a report: `other` is somebody else's ending,
+      // `unattributed` is an entry from a build that recorded nothing and no
+      // caller can show is theirs, and `unasked` cannot arise here because the
+      // branch above already refused a run that asked for nothing.
       //
-      // This was a timestamp comparison until it was measured: `createdAt` is
-      // stamped by whichever replica wrote the entry and the ask time by this
-      // one, so a replica five seconds fast made the previous attempt's
-      // entry look newer than this attempt's ask and it was adopted. The same
-      // cross-process clock that had already been removed from the teardown
-      // gate, surviving here as a narrowing.
-      //
-      // `attemptId` is a randomUUID minted per TaskRunner, recorded on the entry
-      // by `makeOnProvisioned`, so this is an identity test rather than an
-      // inference. An entry from a build that predates the field carries none
-      // and is refused, which is the same direction: an entry this attempt
-      // cannot prove it minted is not one it may report.
-      return info.attemptId === this.attempt.attemptId ? info : null;
+      // Deliberately NOT a reuse gate. A sandbox minted by one attempt and
+      // taken over by the next task is re-stamped as it changes hands
+      // (`clearIdleMarkers`), so the reuser reports its own ending.
+      return attributionOf(info, {
+        taskId: this.request.task_id ?? null,
+        attemptId: this.attempt.attemptId,
+      }) === "mine" ? info : null;
     } catch (e) {
       logger.warn({ err: e, sessionId: this.sessionId }, "platform_facts.pending_identity_unreadable");
       return null;

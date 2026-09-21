@@ -1161,3 +1161,33 @@ test("a gone container with a clear gate is still destroyed", async () => {
   assert.deepEqual(destroyed, ["s-1"], "the entry cleanup still happens");
   assert.deepEqual(retained, []);
 });
+
+test("taking over a warm sandbox re-stamps who holds it", async () => {
+  // Reuse across the tasks of a session is the feature; this asserts the record
+  // keeps up with it. The entry was left by an earlier task, and the run taking
+  // it on now writes its own task and attempt into the SAME write that takes it
+  // on -- so if the container dies under this run, this run can report it.
+  //
+  // Recording the minter instead would be the opposite defect: a legitimate
+  // reuser refused its own ending. Nothing here gates the reuse -- that is
+  // `entryOwnedByAnother`, at DAG-root grain, and it is untouched.
+  stubEffects();
+  stubHealth("ok");
+  const { a, puts } = attempt(
+    { ...LIVE, specFingerprint: specOf(), taskId: "task-earlier", attemptId: "attempt-earlier" },
+    { attemptId: "attempt-now" },
+  );
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.ok(result, "the reuse still happens -- attribution never refuses one");
+  const written = puts.map((p) => JSON.parse(p) as Record<string, unknown>);
+  const stamped = written.find((w) => w.attemptId === "attempt-now");
+  assert.ok(
+    stamped,
+    `the take-over has to re-stamp the holder: ${JSON.stringify(written.map(
+      (w) => ({ taskId: w.taskId, attemptId: w.attemptId })))}`,
+  );
+  assert.equal(stamped!.taskId, REQUEST.task_id ?? null,
+    "task and attempt travel together, or the weaker half disagrees with the stronger");
+});

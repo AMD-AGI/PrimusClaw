@@ -826,8 +826,20 @@ test("H22 the reaper's identity check is wired through every call site", async (
   const payload = ehSrc.slice(ehSrc.indexOf("const pendingPayload = sc.encode"));
   assert.match(payload.slice(0, payload.indexOf("}));")), /taskId: deps\.taskId/,
     "and the entry has to record who wrote it");
-  assert.match(ehSrc, /taskId: request\.task_id \?\? null,\n\s+dagRootTaskId:/,
+  assert.match(ehSrc, /taskId: request\.task_id \?\? null,/,
     "which means ensureHands has to pass it in");
+  // And the attempt beside it, on every entry that records an identity at all.
+  // The task id says which task; it does not separate one delivery of that task
+  // from the next, and the reporting side needs that separation -- a redelivery
+  // must not be given its predecessor's ending. Counted rather than matched
+  // once: each write site that records a taskId has to record an attemptId too,
+  // or the next reader is back to inferring it. See sandbox/attribution.ts.
+  const identityWrites = (ehSrc.match(/taskId: (?:request\.task_id|a\.request\.task_id|deps\.taskId)/g) || []).length;
+  const attemptWrites = (ehSrc.match(/attemptId: (?:options\.attemptId|attemptId|a\.attemptId|deps\.attemptId)/g) || []).length;
+  assert.equal(
+    attemptWrites, identityWrites,
+    `${identityWrites} sites record a task id and ${attemptWrites} record an attempt -- `
+    + "an entry that names a task but no attempt cannot be attributed to a delivery");
 });
 
 test("H23 the merge's own four seams", async () => {
