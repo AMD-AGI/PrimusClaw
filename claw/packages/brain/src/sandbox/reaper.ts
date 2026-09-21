@@ -39,6 +39,7 @@ export function bindClusterReclaimForTest(
 
 import { metrics } from "../infra/metrics.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { releaseHandlesForWorkload } from "./handles.js";
 import {
   getHandsKv,
   revokeHandsToken,
@@ -56,7 +57,7 @@ import {
   sameHandsSandbox,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { handsSessionKey, sessionIdFromHandsKey } from "./hands-key.js";
+import { handsSessionKey, isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
 import { readHandsEntry as readSessionBinding } from "./registry.js";
 
 const logger = pino({ name: "sandbox-reaper" });
@@ -184,21 +185,45 @@ export function bindSandboxStopRetry(over: Partial<typeof stopRetry>): () => voi
 /**
  * Stop the named sandbox, or say why the caller must not replace it.
  *
- * Returns normally in exactly two cases: the stop was confirmed, or this
- * deployment cannot issue one at all (see SandboxStopUnavailable). Everything
- * else is retried and then thrown, because the caller's next move is to build a
- * replacement over the top of it.
+ * Returns normally in exactly two cases, and says WHICH: the stop was
+ * confirmed, or this deployment cannot issue one at all (see
+ * SandboxStopUnavailable). Everything else is retried and then thrown, because
+ * the caller's next move is to build a replacement over the top of it.
+ *
+ * The distinction is not cosmetic. A caller that treats "cannot stop" as
+ * "stopped" drops the workload's last reference while it is still running --
+ * which is how a deployment with no platform key or no `SAFE_API_URL` turns
+ * every teardown into a silent leak the report then calls released.
  */
-async function stopNamedSandbox(sessionId: string, entry: HandsProbeEntry): Promise<void> {
+async function stopNamedSandbox(
+  sessionId: string,
+  entry: HandsProbeEntry,
+  /** Re-asked before every attempt -- see the note in the retry loop. */
+  stillOwned?: () => boolean,
+): Promise<"stopped" | "unavailable" | "not_owned"> {
   const inst = instanceFromEntry(sessionId, entry);
-  if (!inst) return;
+  // No instance to address: nothing was stopped, and nothing may be released
+  // on the strength of it.
+  if (!inst) return "unavailable";
   const provider = inst.provider === "agent-sandbox"
     ? getAgentSandboxProvider()
     : getSafeWorkloadProvider();
   for (let attempt = 1; ; attempt++) {
+    // Before EVERY attempt, not once before the loop. A stop that comes back
+    // 503 is retried after a wait, and that wait is long enough to stop being
+    // the owner: the first attempt can be refused while the workload is still
+    // this attempt's, and the retry land after a successor has taken the lock
+    // and promoted it. Checking on the way in only covers the first try.
+    if (stillOwned && !stillOwned()) {
+      logger.warn(
+        { sessionId, workloadId: inst.id, attempt },
+        "hands.stop_abandoned_not_owned",
+      );
+      return "not_owned";
+    }
     try {
       await provider.stop(inst);
-      return;
+      return "stopped";
     } catch (err) {
       if (err instanceof SandboxStopUnavailable) {
         // Nothing to retry and nothing an operator can do mid-request. Leave
@@ -208,7 +233,7 @@ async function stopNamedSandbox(sessionId: string, entry: HandsProbeEntry): Prom
           { err: String(err), sessionId, provider: inst.provider },
           "hands.stop_unavailable",
         );
-        return;
+        return "unavailable";
       }
       if (attempt >= stopRetry.attempts) {
         logger.warn(
@@ -260,6 +285,17 @@ export async function destroyHands(
   sessionId: string,
   known?: HandsProbeEntry,
   knownToken?: string,
+  /**
+   * Asked immediately before the stop, if given.
+   *
+   * Every caller that can lose its right to tear down between deciding to and
+   * doing it needs this asked LAST, not earliest. Checking in the caller and
+   * again after the reaper's own read still left this function's own read in
+   * between, and a lease can go during that one too -- so the check follows the
+   * reads down to the one irreversible step rather than being sprinkled above
+   * them. Callers with nothing to lose pass nothing and behave as before.
+   */
+  stillOwned?: () => boolean,
 ): Promise<void> {
   const kv = getHandsKv();
   const recorded = await readHandsEntry(sessionId);
@@ -279,8 +315,43 @@ export async function destroyHands(
   }
 
   try {
-    await stopNamedSandbox(sessionId, target);
+    // Asked inside, before every attempt, rather than once here: the retry
+    // after a refused stop is its own window.
+    const stopOutcome = await stopNamedSandbox(sessionId, target, stillOwned);
+    if (stopOutcome === "not_owned") {
+      // Nothing was stopped, so nothing downstream may act as though it was --
+      // the handle stays, the KV entry stays, local state stays. They belong to
+      // whoever holds the lock now.
+      logger.warn(
+        { sessionId, workloadId: (target as { workloadId?: string })?.workloadId ?? null },
+        "hands.destroy_skipped_not_owned",
+      );
+      return;
+    }
     metrics.onSandboxStop("ok");
+    // Whoever stops a workload frees its handle. Registration refuses to point
+    // a handle away from a workload still on record -- which is what stops a
+    // redelivery overwriting a live one -- so a handle left naming something
+    // that has been stopped blocks the replacement instead of leaking it.
+    //
+    // Contained: this is bookkeeping that makes the next step possible, and it
+    // must never be why a teardown reports failure. If it does not land, the
+    // next registration refuses and the turn fails visibly, with the handle
+    // still naming the stopped workload for a sweep to find.
+    // Only when a stop was actually issued and accepted. `unavailable` means
+    // this deployment could not ask -- the workload is still running, and its
+    // handle is the last thing pointing at it.
+    const stoppedWorkload = stopOutcome === "stopped"
+      ? (target as { workloadId?: string }).workloadId
+      : undefined;
+    if (stoppedWorkload) {
+      await releaseHandlesForWorkload(stoppedWorkload).catch((e: unknown) => {
+        logger.warn(
+          { sessionId, workloadId: stoppedWorkload, err: (e as Error)?.message ?? String(e) },
+          "dag-handles.release_after_stop_failed",
+        );
+      });
+    }
   } catch (cause) {
     // Counted before the rethrow: the caller turns this into a replacement
     // decision and never reports the teardown itself, so this is the only
@@ -387,7 +458,10 @@ export async function destroyHands(
  * etc.) — in that case the sandbox is healthy and should be kept so the
  * user's next message can reuse it; this function is a no-op for READY.
  */
-export async function reapPendingHands(sessionId: string): Promise<void> {
+export async function reapPendingHands(
+  sessionId: string,
+  expected?: { taskId?: string | null; stillOwned?: () => boolean },
+): Promise<void> {
   try {
     const kv = getHandsKv();
     // Read-through: a pending binding an old replica wrote sits under the
@@ -396,11 +470,43 @@ export async function reapPendingHands(sessionId: string): Promise<void> {
     if (!entry) return;
     const info = JSON.parse(entry.value);
     if (info.status !== "pending") return;
+    // Whose workload this is decides whether it may be stopped. A session can
+    // hold more than one DAG at once under a session-scoped run gate, and
+    // `hands.<sessionId>` is a single slot, so the entry a failing task finds
+    // may have been written by a sibling DAG that is still creating -- or, if
+    // the read and the teardown straddle its promotion, still USING -- the
+    // workload it names. Reaping on the session alone stopped it.
+    //
+    // A pending entry with no task on it predates this field and can only have
+    // come from a process that was running before this rollout; it is reaped as
+    // before, because the alternative is leaking every such workload.
+    if (expected?.taskId && info.taskId && info.taskId !== expected.taskId) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, entryTaskId: info.taskId,
+          taskId: expected.taskId },
+        "hands.reap_pending_skipped_other_task",
+      );
+      return;
+    }
+    // Re-asked after the read, not only before it. The caller checks that it
+    // still holds the lock before calling -- but the check and the teardown are
+    // separated by a KV round trip, and that is exactly long enough for the
+    // heartbeat to notice the lease is gone. The snapshot that comes back then
+    // belongs to the successor, carrying the same task id, and passes the
+    // comparison above.
+    if (expected?.stillOwned && !expected.stillOwned()) {
+      logger.warn(
+        { sessionId, workloadId: info.workloadId, taskId: expected.taskId ?? null },
+        "hands.reap_pending_skipped_lease_lost_mid_read",
+      );
+      return;
+    }
     logger.warn({ sessionId, workloadId: info.workloadId }, "hands.reap_pending");
     await destroyHands(
       sessionId,
       info as HandsProbeEntry,
       typeof info.token === "string" ? info.token : undefined,
+      expected?.stillOwned,
     );
   } catch (e) {
     logger.warn({ err: e, sessionId }, "hands.reap_pending_failed");
@@ -434,6 +540,22 @@ async function sweepStaleHands(): Promise<void> {
         if (!entry) continue;
         info = JSON.parse(sc.decode(entry.value));
       } catch { continue; }
+
+      // A retained container's projection lives in this keyspace too, and it
+      // is a copy of the binding it was made from -- same status, same
+      // handsUrl, same token -- so it passes every filter below as though it
+      // were a session's handle. It is not one. The key names a sandbox
+      // generation, so `sessionIdFromHandsKey` hands back a session id no
+      // session has, the failure counts pile up under that fabricated id, and
+      // where an operator has turned eviction on the destroy that follows stops
+      // the container the retention exists to protect and deletes the
+      // projection with it -- the live work the retention was taken for, gone,
+      // on the evidence of a health check that a container busy with that work
+      // can fail. A retention ends one way only: the keepalive sweep reading
+      // positive evidence out of the container that its work has finished.
+      // keepalive's own walk makes exactly this check before it treats an entry
+      // as a session's.
+      if (isRetentionEntry(info)) continue;
 
       // PENDING entries are owned by an in-flight ensureHands (legitimately
       // polling a slow GPU queue, or bootstrapping hands). Policy: wait
@@ -482,6 +604,11 @@ async function sweepStaleHands(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, "sweeper.pass_failed");
   }
+}
+
+/** One health-sweep pass, for tests: the interval version is fire-and-forget. */
+export async function sweepStaleHandsForTest(): Promise<void> {
+  await sweepStaleHands();
 }
 
 export function startSandboxSweeper(): void {
@@ -553,6 +680,15 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
         if (!entry) continue;
         info = JSON.parse(sc.decode(entry.value));
       } catch { continue; }
+
+      // Not a session's handle -- see the health sweep above for what this
+      // keyspace also holds. A projection carries the idle markers of the
+      // binding it was copied from and nothing refreshes them, so it reads as
+      // reclaimable from the moment it is taken and stays that way for as long
+      // as the retention lives; what it would then ask to reclaim is keyed by a
+      // session id that never existed, so every sweep spends a control-plane
+      // lookup on it for as long as the work it protects runs.
+      if (isRetentionEntry(info)) continue;
 
       if (!eligibleForClusterReclaim(info, Date.now())) continue;
       // The entry says idle; the run lease says whether anyone is using it.

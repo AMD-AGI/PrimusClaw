@@ -63,6 +63,24 @@ function constantTimeEquals(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf);
 }
 
+// CodeQL flags ``/^Bearer\s+(.+)$/i`` here as a polynomial ReDoS, and the
+// shape is right: ``\s`` and ``.`` overlap everywhere except CR, LF, U+2028
+// and U+2029, so a value holding one of those four makes ``(.+)$`` fail and
+// the engine give back ``\s+`` a character at a time from every offset.
+//
+// It is not reachable, and the reason is the HTTP framing itself. This
+// function's only input is ``req.headers.authorization``, i.e. a value Node's
+// parser produced: bare CR/LF inside a header value (and obs-folding) is a
+// 400 before any handler runs, and header values are decoded latin-1, so the
+// UTF-8 bytes of U+2028/U+2029 arrive as three separate characters below
+// U+0100 rather than as the code point. With none of the four present ``\s+``
+// stops at the first non-whitespace and ``(.+)$`` reaches the end on its first
+// try -- 800 000 leading spaces measure at 0.8ms.
+//
+// The invariant is therefore "the subject came from ``req.headers``", not
+// anything about the pattern. If this ever has to parse a bearer token from
+// somewhere else -- a websocket subprotocol, a queued message, a test fixture
+// -- narrow ``\s`` to ``[ \t]`` in the same change.
 function extractBearer(req: FastifyRequest): string | null {
   const raw = (req.headers.authorization || "").trim();
   if (!raw) return null;

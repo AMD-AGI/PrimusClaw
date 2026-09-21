@@ -13,6 +13,7 @@
 
 import { isRevisionConflict } from "@claw/utils";
 import { handsSessionKey } from "./hands-key.js";
+import { SHARED_VERDICT_FIELDS } from "./bg-verdict.js";
 
 /**
  * The revision-aware slice of a NATS KV bucket this needs. Duck-typed so utils
@@ -139,12 +140,13 @@ export function applyRunEndedIdleFields(
   info.idleSince = now;
   info.idleEpoch = now;
   info.idleRev = revision;
-  delete info.bgCheckedAt;
-  delete info.bgRunning;
-  delete info.bgEpoch;
-  delete info.bgIdleSince;
-  delete info.bgIdleRev;
-  delete info.bgRev;
+  // Cleared from the reader's own list rather than from a copy of it. A verdict
+  // is the whole set or it is nothing: leaving one field behind republishes a
+  // measurement taken in the PREVIOUS idle period as if it were about this one,
+  // and the reader that believes it (`usableSharedVerdict`, beside the list)
+  // either keeps a sandbox nobody is using or releases one with live shells in
+  // it. Two literal lists is one edit away from exactly that.
+  for (const field of SHARED_VERDICT_FIELDS) delete info[field];
   delete info.workSeenAt;
   delete info.quiescedAt;
 }

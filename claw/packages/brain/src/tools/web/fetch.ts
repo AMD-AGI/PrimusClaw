@@ -127,6 +127,27 @@ async function htmlToMarkdown(html: string): Promise<string> {
 
 // ── JS shell detection ──
 
+/**
+ * Heuristic: does this page look like an empty JS app shell (a React/Next/Vue
+ * root div and little else) rather than a document with readable prose?
+ *
+ * The `replace(/<[^>]*>/g, "")` below is NOT a sanitiser, and `stripped` is not
+ * sanitised output — static analysis (CodeQL js/incomplete-multi-character-
+ * sanitization) flags it as one, so this note is here to keep the next reader
+ * from "hardening" it. It is a cheap estimate of how much visible text the page
+ * has, and its only consumer is the `.length` comparison on the very next line.
+ * `stripped` is never returned, never concatenated into the tool result, and
+ * never handed to a browser: web_fetch returns plain text that a model reads,
+ * the real HTML→Markdown conversion is done by Turndown in htmlToMarkdown(),
+ * and nothing in this repo renders a tool result as HTML. A crafted input like
+ * `<<div>div>` does leave a residual `<div` in `stripped`, but the worst that
+ * buys an attacker is shifting this length estimate by a few characters and
+ * flipping an advisory "JS_RENDER_REQUIRED" hint — there is no injection sink
+ * on this path, so looping the strip until fixpoint would defend nothing.
+ *
+ * If you ever make `stripped` escape this function — return it, log it, put it
+ * in the tool output — that reasoning stops holding and it must be re-examined.
+ */
 function looksLikeJsShell(text: string): boolean {
   const stripped = text.replace(/<[^>]*>/g, "").trim();
   if (stripped.length > 500) return false;

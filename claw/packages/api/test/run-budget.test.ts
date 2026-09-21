@@ -19,12 +19,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { envSettingProblems } from "../src/config.js";
 import { startHarness } from "./scenario-harness.js";
+import { db } from "../src/infra/db.js";
 import {
   RUN_BUDGET_DEFAULT_SEC,
   RUN_BUDGET_OFF,
   RUN_BUDGET_BACKSTOP_GRACE_SEC,
   deadlineStampSql,
   deadlineAtInsertSql,
+  requeueSojournSql,
 } from "../src/tasks/run-budget.js";
 
 test("each scope reads its own env key, so lowering one does not move the other", async () => {
@@ -264,6 +266,55 @@ test("an a2a execution is stamped with the chat budget, not the DAG node's", asy
     assert.ok(
       Math.abs(Number(row.remaining) - CHAT_SEC) < 60,
       `an a2a execution runs on the chat budget; this one was given ${String(row.remaining)}s`,
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test("the sojourn marker is stamped at the requeue, not at the transaction's start", async () => {
+  // `NOW()` is the instant the transaction started, and both requeue writers
+  // can be inside one: `releaseClaim` settles the run's time ledger and moves
+  // the row in a single transaction, with the settlement's statements first. A
+  // marker backdated to the BEGIN reports everything that transaction did
+  // before the requeue as time the row spent waiting on the queue -- a wait
+  // that never happened, added to every requeued run, in the series the rollout
+  // gate reads its bounded-waits percentile from.
+  //
+  // Measured against the transaction's own clock rather than asserted about the
+  // SQL text, because the two spellings differ by one identifier and the whole
+  // difference is what Postgres does with it.
+  const h = await startHarness();
+  try {
+    await h.sql(
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata)
+       VALUES ('requeued','s','n','running','chat','{}'::jsonb)`,
+    );
+    const client = await db.pool.connect();
+    await client.query("BEGIN");
+    // Stands in for the work a real requeue transaction does ahead of the
+    // transition -- the settlement -- and is the whole of the error under NOW().
+    const ELAPSED_MS = 400;
+    await new Promise((resolve) => setTimeout(resolve, ELAPSED_MS));
+    await client.query(
+      `UPDATE claw_tasks
+          SET metadata = ${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")}
+        WHERE task_id = 'requeued'`,
+    );
+    await client.query("COMMIT");
+    client.release();
+
+    const [row] = await h.sql(
+      `SELECT EXTRACT(EPOCH FROM (
+                clock_timestamp() - (metadata->>'queued_since')::timestamptz
+              )) * 1000 AS age_ms
+         FROM claw_tasks WHERE task_id = 'requeued'`,
+    );
+    assert.ok(
+      Number(row.age_ms) < ELAPSED_MS / 2,
+      "the marker is the moment the row went back on the queue, so it is already "
+      + `nearly the current instant; this one was ${String(row.age_ms)}ms old, which is `
+      + "the transaction's start being reported as queue wait",
     );
   } finally {
     await h.close();

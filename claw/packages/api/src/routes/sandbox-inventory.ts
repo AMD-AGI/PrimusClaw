@@ -137,6 +137,12 @@ function dagRows(
         namespace: info.namespace,
         workloadId: info.workload_id,
         provider: info.provider,
+        // A handle registered while its workload is still provisioning carries
+        // no endpoint yet, and the session rows have always been allowed to say
+        // so. Without translating it, an ordinary queued workload is counted
+        // `unreadable` -- a census that reports a row it understands perfectly
+        // well as one it could not parse.
+        status: info.pending ? "pending" : undefined,
       })) {
         unreadable += 1;
         continue;

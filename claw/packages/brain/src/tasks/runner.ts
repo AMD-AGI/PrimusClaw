@@ -257,6 +257,65 @@ function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
 }
 
 /**
+ * Give this delivery's fat pre-gate lease back, ahead of a nak that is asking
+ * for a redelivery.
+ *
+ * A fat chat delivery takes its lease before it queues for an execution slot,
+ * and holds it across everything that follows -- the queue wait, and then every
+ * dispatch check. So a delivery that decides in `tasks/dispatch.ts` to wait and
+ * come back is holding, at the moment it naks, exactly the thing that stops the
+ * redelivery it asked for from getting anywhere: `acquireFatLease` takes a
+ * pristine row, a lapsed-and-fenced one, or one a holder gave back, and a live
+ * lease is none of the three. The redelivery is answered `superseded`, refused
+ * at the pre-gate before it ever probes the lock, and naks in turn -- so the
+ * turn stands still for the rest of the TTL, one wasted delivery at a time.
+ *
+ * The same window swallows a Stop: `stoppedAndUnheld`, the one arm that answers
+ * an acceptance with `stop: "cancelling"` so the delivery can emit the
+ * interrupted completion, requires `lease_owner IS NULL`. While this pod holds
+ * an unreleased lease the row cannot say it was stopped, and the user's Stop is
+ * answered by nothing until the lease lapses.
+ *
+ * Renewal is stopped first and the nak only after the release returns -- the
+ * order `nakAfterAttempt` and the drain branch in `delivery/dispatch.ts` both
+ * use. Both halves matter: a renewal tick landing after the release retakes the
+ * lease the release just gave back (the renewal path acquires an unheld or
+ * lapsed row as readily as an acceptance does), and a nak issued before the
+ * release lands races the redelivery against it.
+ *
+ * Lives here, beside `nakAfterAttempt`, because that is what it mirrors and
+ * because `settleRunAttempt` is the seam a test can answer. It is a no-op on
+ * every other path by construction: only a fat pre-gate delivery runs inside
+ * `fatDeliveryContext`, so a claimed doorbell, a claim-next run and a DAG or
+ * script delivery all find no context and hold no lease to give back.
+ */
+export async function releasePreGateLease(request: ExecuteRequest): Promise<void> {
+  const fat = currentFatDelivery();
+  // Nothing to fence with is nothing to release -- see the pre-gate's own
+  // `release`: `brain_id` is a pod name, the same string for every lease this
+  // pod ever takes on the row, so without the generation the settle cannot say
+  // which lease is being given back. Left to lapse instead.
+  if (!fat || fat.runClaim === undefined) return;
+  const taskId = settlementTaskIdOf(request);
+  if (!taskId) return;
+  fat.handOffRenewal();
+  await fx().settleRunAttempt(taskId, fat.runClaim, undefined, true);
+}
+
+/**
+ * The row a settlement addresses: what the wire says, or what the lease URL
+ * says when the wire says nothing.
+ *
+ * The second half is the rolling-upgrade shape `runIdentity` above documents at
+ * length -- a fat message published before `task_id` was a field -- and the two
+ * readers below are the ones that settle a row rather than describe one, where
+ * missing the id means the settle never happens at all.
+ */
+function settlementTaskIdOf(request: ExecuteRequest): string | null {
+  return request.task_id || taskIdFromLease(request).id;
+}
+
+/**
  * Resolve a task whose JetStream delivery budget is exhausted.
  *
  * DAG tasks must use the same durable callback/outbox handoff as every other
@@ -1073,6 +1132,12 @@ class TaskRunner {
   private platformFacts: PlatformFacts | null = null;
   // Workload id from this run's identity, never the DAG-shared session key.
   private handsWorkloadId = "";
+  /**
+   * Set the moment a renewal reports the lock gone, whatever else has happened
+   * to the abort signal by then. The abort reason cannot carry this on its own:
+   * only the first abort sets it, so any earlier one hides it.
+   */
+  private leaseLost = false;
   private multiNodeContext: MultiNodeContext | null = null;
   private inflightCkptHasData = false;
   private inflightCkptInProgress = false;
@@ -1301,7 +1366,7 @@ class TaskRunner {
           );
           return info;
         })
-        .catch((e) => {
+        .catch((e: unknown) => {
           logger.warn({ err: e, sessionId: this.sessionId, turn: turnSnapshot },
             "checkpoint.workspace_sync_failed");
         })
@@ -1445,6 +1510,9 @@ class TaskRunner {
     if (this.abortCtrl.signal.aborted) {
       throw new Error("sandbox recovery aborted after destroy");
     }
+    // The handle naming the sandbox just stopped is freed by `destroyHands`
+    // itself, which is where every stop goes through -- rebuild here, and the
+    // retryable-provisioning reap that would otherwise strand a redelivery.
     // Best-effort close of the dead client (its socket is likely already
     // wedged; ignore failures).
     const oldHands = this.hands;
@@ -1621,6 +1689,54 @@ class TaskRunner {
   }
 
   /** Recover the latest in-flight workspace checkpoint into the session prefix. */
+  /**
+   * Reap a PENDING entry this attempt left behind -- and only this attempt's.
+   *
+   * The entry records the task that wrote it, which keeps a failing task off a
+   * sibling DAG's workload. It cannot tell two ATTEMPTS of the same task apart:
+   * a delivery whose lease expired is redelivered under the same task_id, so
+   * the new attempt's entry carries the identity the old attempt compares
+   * against, and the old one stops a workload the new one is using.
+   *
+   * The lock is what separates them. Losing the lease means this session has
+   * moved to another holder, and a holder that no longer has the lock has no
+   * business tearing anything down -- whatever it would reap now belongs to
+   * whoever took it. The heartbeat has already aborted us by this point; this
+   * failure handler simply had not been looking.
+   */
+  /**
+   * Does this attempt still hold the session's lock?
+   *
+   * One expression, asked from two places -- before the reap and again from
+   * inside it, immediately before the stop -- because two copies of a rule are
+   * two things to keep true, and the second copy is the one that gets missed.
+   *
+   * Two ways to have lost it. The abort reason carries it when the lease loss
+   * is what aborted us; `leaseLost` carries it when something else had already
+   * aborted and taken that slot.
+   */
+  private stillOwnsLock(): boolean {
+    return !this.leaseLost
+      && this.abortCtrl.signal.reason !== LEASE_LOST_ABORT_REASON;
+  }
+
+  private async reapOwnPendingHands(): Promise<void> {
+    if (!this.stillOwnsLock()) {
+      logger.warn(
+        { sessionId: this.sessionId, taskId: this.request.task_id, lockKey: this.lockKey },
+        "hands.reap_pending_skipped_lease_lost",
+      );
+      return;
+    }
+    await fx().reapPendingHands(this.sessionId, {
+      taskId: this.request.task_id,
+      // Asked again on the far side of the reaper's KV read: this check and the
+      // teardown are a round trip apart, which is long enough for the heartbeat
+      // to notice, and the snapshot that comes back is then the successor's.
+      stillOwned: () => this.stillOwnsLock(),
+    });
+  }
+
   private async recoverInflightCheckpoint(reason: string): Promise<void> {
     // The destination is the session prefix a delete has just emptied, so this
     // is the same hazard as a late workspace flush, only with a whole snapshot
@@ -2447,6 +2563,20 @@ class TaskRunner {
   /** Release the message-scoped cluster. */
   private async teardownRayJob(): Promise<void> {
     if (!isMultiNodeRequest(this.request)) return;
+    // The same rule the sandbox teardown follows, and it has to be here too:
+    // the cluster is addressed by messageId, and a successor that took this
+    // run over ADOPTS it under that same id. So a terminal handler that has
+    // already been told its sandbox is not its to stop would go on to delete
+    // the GPU cluster the successor is now running on -- which is what
+    // happened: `hands.destroy_skipped_not_owned` followed by
+    // `DELETE /api/v1/workloads/M` against a Running, adopted cluster.
+    if (!this.stillOwnsLock()) {
+      logger.warn(
+        { sessionId: this.sessionId, messageId: this.messageId, taskId: this.request.task_id },
+        "task.cluster_release_skipped_not_owned",
+      );
+      return;
+    }
     const namespace = this.multiNodeContext?.namespace ?? this.request.workspace_id?.trim();
     if (!namespace || !this.messageId) return;
     // A deployment without SaFE has no cluster to release. Reachable: a prompt
@@ -3195,7 +3325,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands left a PENDING entry
     // (no-op when the entry is READY — a healthy sandbox is kept for the
     // retry to reuse). Done BEFORE nak so the retry starts clean.
-    await fx().reapPendingHands(this.sessionId);
+    await this.reapOwnPendingHands();
     // Flush a per-attempt transcript before NAK so the JSONL captures
     // events of THIS attempt even if the next delivery / pod loses state.
     this.transcriptLog.push({
@@ -3241,7 +3371,7 @@ class TaskRunner {
     // B: reap orphan SaFE workload if ensureHands died mid-creation and
     // left a PENDING entry. READY entries are left alone so a subsequent
     // user message can still reuse the working sandbox.
-    await fx().reapPendingHands(this.sessionId);
+    await this.reapOwnPendingHands();
     // Classify sandbox-originated failures so the frontend can render a
     // dedicated banner (and so the user sees a readable reason rather than
     // a raw stack-trace tail). Non-sandbox errors fall through with the
@@ -3531,10 +3661,19 @@ class TaskRunner {
    */
   private async nakAfterAttempt(delayMs: number): Promise<void> {
     if (this.claimed) this.declareCoverage();
-    else if (this.request.task_id) {
-      await fx().settleRunAttempt(
-        this.request.task_id, this.heldGeneration(), this.coverageReport()?.runTime, true,
-      );
+    else {
+      // Through `settlementTaskIdOf`, not `request.task_id` alone. Reading the
+      // wire only meant that a fat message from an API too old to carry the
+      // field -- the whole of a rolling-upgrade window -- skipped this settle
+      // entirely: no coverage banked, and the lease left live under an attempt
+      // that has just asked for a redelivery, which is then refused
+      // `superseded` and naks in turn until the lease lapses on its own.
+      const taskId = settlementTaskIdOf(this.request);
+      if (taskId) {
+        await fx().settleRunAttempt(
+          taskId, this.heldGeneration(), this.coverageReport()?.runTime, true,
+        );
+      }
     }
     this.msg.nak(delayMs);
   }
@@ -3615,6 +3754,13 @@ class TaskRunner {
           return;
         }
         const refused = status === "gone" || status === "superseded";
+        // Recorded before the early return, exactly as the lock renewal does.
+        // `superseded` means another worker holds this run, which is the same
+        // news as a lost lock and arrives by a different road -- fixing only
+        // the other road left this one swallowed by any earlier abort. `gone`
+        // is not: the row went terminal and nobody took over, so this worker is
+        // still the one holding the sandbox.
+        if (status === "superseded") this.leaseLost = true;
         if (!refused || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId,
@@ -3640,6 +3786,12 @@ class TaskRunner {
       try { this.msg.working(); } catch {}
       fx().refreshTaskLock(this.lockKey).then((renewal) => {
         const yielding = renewal === "lost" || renewal === "expired";
+        // Recorded before the early return. An abort that already happened for
+        // an ordinary reason -- a user interrupt, say -- used to swallow the
+        // news entirely, because the only trace of a lost lease was the abort
+        // REASON and that slot was taken. Teardown then read the successor's
+        // entry, asked whether it still held the lock, and was told yes.
+        if (yielding) this.leaseLost = true;
         if (!yielding || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey, renewal },
@@ -3710,7 +3862,13 @@ class TaskRunner {
 
   private failureOutcome(err: unknown): TaskOutcome {
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) return "retryable";
-    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) return "retryable";
+    // `stillOwnsLock()` rather than the abort reason alone: the reason belongs
+    // to whoever aborted first, so a run interrupted normally and THEN
+    // superseded carries an ordinary reason while the lock has moved. Losing
+    // it is retryable either way -- a second replica is already running this
+    // task -- and this has to agree with `handleRunFailure` below, which
+    // dispatches on the same question.
+    if (!this.stillOwnsLock()) return "retryable";
     if (this.abortCtrl.signal.reason === RUN_ROW_TERMINAL_ABORT_REASON) return "failed";
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) return "failed";
     if (this.abortCtrl.signal.aborted) return "interrupted";
@@ -3724,7 +3882,10 @@ class TaskRunner {
       await this.handleSigtermAbort();
       return;
     }
-    if (this.abortCtrl.signal.reason === LEASE_LOST_ABORT_REASON) {
+    // Same question as `failureOutcome`, and it must be asked the same way: a
+    // run that was aborted for an ordinary reason and then lost the lock has
+    // the lock gone and the reason taken.
+    if (!this.stillOwnsLock()) {
       this.handleLeaseLost();
       return;
     }

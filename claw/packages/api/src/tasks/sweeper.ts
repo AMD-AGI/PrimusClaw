@@ -19,6 +19,7 @@
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
 import { commitSessionDeletion } from "../sessions/teardown.js";
+import { withCompletionLock } from "../events/completion-lock.js";
 import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
@@ -28,6 +29,7 @@ import pino from "pino";
 import {
   appendAttemptRecord, bankQueuedMs, endAttemptRecord, interruptSubject,
   noteAttemptRenewal, openAttemptRecord,
+  BG_VERDICT_TTL_MS,
   type AttemptRecord,
 } from "@claw/protocol";
 import {
@@ -37,8 +39,13 @@ import { nc, taskDeliverySettlement } from "../infra/nats.js";
 import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
-import { stopAllHandlesForDag } from "./sandbox-stopper.js";
-import { handleMap } from "./sandbox-stopper.js";
+// `handleRegistry` is this branch's replacement for the bare `handleMap()`
+// accessor main imported here: same KV bucket, but every read goes through the
+// registry so a lookup can be re-read consistently before a destroy. The only
+// caller in this file is reapOrphanHandles, so the rename is the whole change.
+import {
+  handleRegistry, stopAllHandlesForDag, type SessionBackgroundWork,
+} from "./sandbox-stopper.js";
 import {
   DISPATCH_RECONCILE_LEASE_SEC, queuedExits, requeueSojournSql,
   RUN_BUDGET_BACKSTOP_GRACE_SEC, RUN_QUEUE_MAX_SEC,
@@ -52,7 +59,7 @@ import {
 } from "../workspace/store.js";
 import {
   ACTIONABLE_RECEIPT_SQL, deliverySettledSql, failChatRunDispatch, gateOwnershipEnforced,
-  noDeliveryInFlightSql,
+  hasHolderEvidence, noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 
@@ -70,6 +77,193 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
   BRAIN_TASK_TIMEOUT_SEC,
   { min: 1 },
 );
+/**
+ * How long the orphan sweep will wait for a background-work verdict that has
+ * not been published yet, before it stops waiting for one.
+ *
+ * The wait exists because a verdict that has not been measured is not a
+ * measurement of zero: a chat that has just ended leaves its sandbox parked
+ * with the verdict fields deliberately cleared, and Brain's keepalive sweep
+ * publishes the first answer about the new idle period one interval later
+ * (SANDBOX_KEEPALIVE_INTERVAL_SEC, 60s by default). Reaping inside that window
+ * is reaping on the absence of evidence, which is the defect this guard is for.
+ *
+ * The bound exists because "wait for a verdict" is only safe while something is
+ * producing verdicts. A fleet with the keepalive sweep switched off entirely
+ * (SANDBOX_KEEPALIVE_INTERVAL_SEC <= 0, which is permitted whenever
+ * BG_SHELL_ENABLED is false) publishes none, ever, and an unbounded wait would
+ * make this sweep permanently dead for its own primary case -- the leak it
+ * exists to stop. That failure has already shipped on this branch once and must
+ * not be reintroduced through the back door.
+ *
+ * One verdict lifetime is the value because it is the same span the reader uses
+ * to decide a published verdict is too old to believe: past it, an entry that
+ * still has nothing to say is not mid-measurement, it is unmeasured. In a fleet
+ * that is measuring, the wait is never reached -- the answer arrives in about a
+ * minute, well inside it -- so this bound bites only where the alternative is
+ * waiting forever.
+ */
+const ORPHAN_BG_VERDICT_WAIT_MS = BG_VERDICT_TTL_MS;
+
+/**
+ * How many of a session's live tasks the orphan sweep will enumerate before it
+ * stops claiming to have seen all of them.
+ *
+ * The guard below is an assertion about EVERY live task in the session, so a
+ * truncated list is not a smaller answer to the same question -- it is a
+ * different question, and the row it did not read is exactly the one that may
+ * be holding the workload about to be stopped. Past this many rows the answer
+ * is `unknown`, which defers, the same as a read that failed outright.
+ *
+ * A session with two hundred simultaneously non-terminal tasks is not a shape
+ * this system produces. If one ever appears, an operator gets a named log line
+ * saying the sweep declined rather than a sweep that quietly reaped under it.
+ */
+const LIVE_TASK_SCAN_LIMIT = 200;
+
+/** One non-terminal task of a session, and where its workload can be named. */
+interface LiveTaskRow {
+  task_id: string;
+  dag_root_task_id: string | null;
+  sandbox_workload_id: string | null;
+}
+
+/**
+ * What a session's live work is holding, as far as this sweep can establish.
+ *
+ * `unknown` is not a quieter `idle`, and the whole safety of the narrowed
+ * guard rests on keeping them apart. `idle` means the database was read and
+ * there is no non-terminal task in this session. `unknown` means there IS live
+ * work and this sweep could not find out what it holds -- a failed query, a
+ * registry read that threw, or a live task that has not yet been given a
+ * workload by anybody. Only `idle` and a `holding` set that misses the
+ * candidate may license a stop.
+ */
+type SessionHoldings =
+  | { state: "idle" }
+  | { state: "unknown"; reason: string }
+  | { state: "holding"; workloads: Set<string>; tasks: number };
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Every workload the session's live tasks hold, or why that cannot be said.
+ *
+ * Three stores can name the workload a live task is on, and none of them is
+ * sufficient alone, so all three are unioned and the union is only believed
+ * when it is non-empty:
+ *
+ *   - **The DAG handle registry.** Brain registers a handle under
+ *     `dag_root_task_id ?? task_id` the moment SaFE assigns a workload id
+ *     (`makeOnProvisioned`), i.e. while the task is still `preparing` and the
+ *     pod may still be queued for a GPU, and reuse registers the ADOPTING DAG
+ *     the same way. So this is the earliest and the most complete of the three.
+ *     It is read from the stream leader, not from the local replica: the
+ *     load-bearing answer here is the negative one -- "this live task does not
+ *     hold that workload" -- and a direct read that is merely behind an
+ *     acknowledged registration would answer it wrongly in the one direction
+ *     that costs a running pod. A read that throws is `unknown`, never "holds
+ *     nothing".
+ *   - **`claw_tasks.sandbox_workload_id`.** Written best-effort when the run
+ *     reports itself running, which is AFTER `ensureHands` returns -- so it is
+ *     NULL for the whole of `preparing` and can lag a rebuild. It can only add
+ *     a workload to the set, never remove one, so its staleness defers rather
+ *     than reaps.
+ *   - **`hands.<session>`**, read by the caller through the background-work
+ *     reader it already runs. Not part of this union because it is a property
+ *     of the session rather than of a task; the caller applies it separately.
+ *
+ * A live task that names no workload in any of them is the case the guard
+ * exists to get right: a task sitting `preparing` before anything has been
+ * created for it holds nothing YET, and it is about to either create a sandbox
+ * or adopt the session's existing one -- possibly the very one being
+ * considered. Reading it as "holds nothing, so reap everything" is how a pod
+ * gets pulled out from under the task that was one moment away from using it.
+ * It answers `unknown`, and `unknown` defers.
+ */
+async function liveWorkHoldings(
+  sessionId: string,
+  memo: Map<string, SessionHoldings>,
+): Promise<SessionHoldings> {
+  const cached = memo.get(sessionId);
+  if (cached) return cached;
+  const answer = await resolveLiveWorkHoldings(sessionId);
+  memo.set(sessionId, answer);
+  return answer;
+}
+
+async function resolveLiveWorkHoldings(sessionId: string): Promise<SessionHoldings> {
+  let rows: LiveTaskRow[];
+  try {
+    const live = await db.query(
+      `SELECT task_id, dag_root_task_id, sandbox_workload_id
+         FROM claw_tasks
+        WHERE session_id = $1
+          AND status NOT IN ('completed','failed','cancelled')
+        LIMIT $2`,
+      [sessionId, LIVE_TASK_SCAN_LIMIT + 1],
+    );
+    rows = (live.rows ?? []) as LiveTaskRow[];
+  } catch (e) {
+    return { state: "unknown", reason: `live_task_query_failed: ${errMsg(e)}` };
+  }
+  if (rows.length === 0) return { state: "idle" };
+  if (rows.length > LIVE_TASK_SCAN_LIMIT) {
+    return { state: "unknown", reason: "live_tasks_past_scan_limit" };
+  }
+  // The key Brain registers a handle under, which for a standalone task -- a
+  // chat turn -- is its own task id, because `dag_root_task_id` is NULL for
+  // one. Collected before any read so each root is leader-read ONCE: every node
+  // of a fan-out shares a root, and a session's live work is much more often
+  // many nodes of one DAG than many DAGs.
+  const byRoot = new Map<string, Set<string>>();
+  for (const row of rows) {
+    const dagRoot = row.dag_root_task_id || row.task_id;
+    if (dagRoot) byRoot.set(dagRoot, new Set());
+  }
+  for (const [dagRoot, into] of byRoot) {
+    try {
+      for (const info of Object.values(await handleRegistry.listForDagConsistent(dagRoot))) {
+        if (info.workload_id) into.add(info.workload_id);
+      }
+    } catch (e) {
+      return { state: "unknown", reason: `handle_read_failed(${dagRoot}): ${errMsg(e)}` };
+    }
+  }
+  const workloads = new Set<string>();
+  for (const row of rows) {
+    const dagRoot = row.dag_root_task_id || row.task_id;
+    const held = new Set(byRoot.get(dagRoot) ?? []);
+    if (row.sandbox_workload_id) held.add(row.sandbox_workload_id);
+    if (held.size === 0) {
+      return { state: "unknown", reason: `live_task_holds_nothing_yet(${row.task_id})` };
+    }
+    for (const workloadId of held) workloads.add(workloadId);
+  }
+  return { state: "holding", workloads, tasks: rows.length };
+}
+
+/**
+ * Does the session's `hands.<session>` slot currently name one of the
+ * workloads this sweep is about to stop?
+ *
+ * Derived from the background-work answer the sweep already reads rather than
+ * from a second point read, because that reader's workload match IS this
+ * question: every state except the three below is reached only after the
+ * binding was found to name one of the workloads asked about.
+ *
+ * `"unknown"` for an unreadable store, which is where every other unknown on
+ * this path lands too.
+ */
+function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
+  if (bg.state === "unreadable") return "unknown";
+  if (bg.state === "running" || bg.state === "awaiting") return true;
+  return bg.reason !== "no_binding" && bg.reason !== "other_sandbox"
+    && bg.reason !== "no_workload";
+}
+
 /**
  * Whether the deadline backstop is allowed to act on chat runs.
  *
@@ -1355,6 +1549,15 @@ export async function reconcileAmbiguousDispatches(limit = 100): Promise<number>
       WHERE t.task_id = due.task_id
       RETURNING t.task_id, t.session_id, t.status, t.failure_reason,
                 COALESCE(t.claim_count, 0) AS claim_count,
+                -- Read here, in the statement that takes the row, rather
+                -- than in a SELECT of their own: claim_count alone answers
+                -- "did a worker ever have this row" only for a doorbell
+                -- claim, and these two are the other two arms of
+                -- hasHolderEvidence. Adding them to a RETURNING the take
+                -- already computes costs nothing and keeps the whole decision
+                -- on one atomic snapshot of the row, taken under the same
+                -- lock that revoked the publisher's token.
+                t.lease_owner, t.lease_expires_at,
                 t.dispatch_reconcile_action AS action,
                 t.metadata->>'message_id' AS message_id`,
     [limit, DISPATCH_RECONCILE_LEASE_SEC],
@@ -1378,6 +1581,8 @@ interface AmbiguousDispatch {
   status: string;
   failure_reason: string | null;
   claim_count: number;
+  lease_owner: string | null;
+  lease_expires_at: Date | null;
   action: string | null;
   message_id: string | null;
 }
@@ -1391,9 +1596,68 @@ const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
  * A row that is held, or was ever claimed, belongs to execution: it loses the
  * marker without any session rollback, because rolling one back would idle or
  * delete a session whose turn is running.
+ *
+ * "Was ever claimed" used to be the whole of it -- `claim_count > 0` -- and
+ * that is a doorbell-only counter. `takeClaim` writes it, and on the fat path
+ * the only writer is `acquireFatLease`, which sits behind the `accept` flag. A
+ * Brain that predates that flag runs a whole fat turn without ever reaching it:
+ * its attempt token quotes `claim_count = 0`, `renewRunLease`'s `claim_count =
+ * $7` fence matches that zero and renews, and the completion is admitted
+ * because no `lease_fenced` was ever written. The row then goes terminal at
+ * zero. So on a fat row `claim_count > 0` still proves execution, while
+ * `claim_count = 0` proves nothing at all -- it is silence, and this function
+ * was reading silence as "this dispatch never ran" and deleting the
+ * conversation the user had just been answered in. That is the fleet shape of
+ * a rolling upgrade, which moves API before Brain.
+ *
+ * The decision has to live here and not in the publisher. Three publisher
+ * branches now return without a failure while the marker is armed -- the lost
+ * fence, the `held` catch arm, and a 503 `publish_unknown` whose request is
+ * gone before the turn even runs -- and the last of those has no branch left
+ * to patch: the marker outliving a request is the entire reason the marker
+ * exists. Disarming at each site is a per-branch patch of a decision made
+ * here; every future branch would be a fresh instance of the same bug. The
+ * publisher-side disarms stay because they retire a marker promptly on a path
+ * that has proof the publish landed, but they are an optimisation, not the
+ * thing that prevents the delete.
+ *
+ * The evidence used instead is the one three other readers in this codebase
+ * already use for this exact question, and it is now literally the same
+ * function: `unheldOpenRowSql` binds these three columns as the CAS that
+ * decides a row is unheld, `reapOrphanedFatRuns` scans on them under a comment
+ * that says outright that status is not holder evidence, and
+ * `finalizeDispatchCompensations` uses all three even though it only ever sees
+ * terminal rows. Every route a worker takes a fat row through writes one of
+ * them -- `renewLegacyRunLease` and `renewRunLease` for a pre-`accept` Brain,
+ * `acquireFatLease` for a current one -- while `insertTask` and the publish
+ * path write neither, and a terminal transition preserves both. Which is why
+ * the narrower alternatives were all rejected on measurement rather than
+ * taste: `started_at` is stamped at open on a row nothing has published yet,
+ * `completed_at` is stamped by every terminalization including this pass's own
+ * compensation, the dispatch receipt reads `attempted` identically on the
+ * completed legacy row and on the genuinely undecided one (that identity is
+ * why the marker exists), and a `failure_reason` whitelist is both too narrow
+ * and too wide -- a row that truly never ran is closed `dispatch_unconfirmed`
+ * by `reapOrphanedFatRuns` and `run_budget_exhausted` by
+ * `reapExpiredDoorbellRuns`, and those cleanups are owed.
+ *
+ * All of which was still a proxy, and the third one to fail. Holder evidence is
+ * written on the fat path by the lease heartbeat, and `startLeaseHeartbeat` is
+ * un-awaited with its rejection swallowed: one failed POST during the rolling
+ * restart plus a turn shorter than the heartbeat period leaves a row that
+ * executed and answered the user with all three columns empty. The pattern
+ * across all three attempts is the same -- each signal is an artefact of HOW
+ * the run was serviced, and each is absent on some legitimate path -- so the
+ * decision has stopped being taken from a signal at all. `closeChatRun` now
+ * retires the marker in the statement that terminalizes a row a worker reported
+ * on (see `RETIRE_DISPATCH_RECONCILE_SQL`): the act of completing is the
+ * record, so a turn that ran is not here to be classified. `hasHolderEvidence`
+ * stays as defence in depth for a row whose report never arrived, and the
+ * delete arm below carries the floor for when even that is silent -- but
+ * neither is load bearing any more, and neither should be made so again.
  */
 async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean> {
-  const executed = row.claim_count > 0;
+  const executed = hasHolderEvidence(row);
   if (!executed && !TERMINAL_STATUSES.has(row.status)) {
     const verdict = await failChatRunDispatch(
       row.task_id,
@@ -1403,10 +1667,16 @@ async function resolveAmbiguousDispatch(row: AmbiguousDispatch): Promise<boolean
     );
     if (verdict !== "closed") return false;
   }
-  const refused = !executed
-    && row.failure_reason === "dispatch_failed"
-    && TERMINAL_STATUSES.has(row.status);
-  if (refused || !executed) {
+  // One condition, not two. This used to read `if (refused || !executed)` over a
+  // `refused` defined as `!executed && failure_reason = 'dispatch_failed' && ...`
+  // -- a conjunction beginning with `!executed`, so the disjunction was
+  // identically `!executed` and the variable was dead. It is worth naming why it
+  // was there: the function had computed a "who closed this row" discriminator,
+  // which is the right question, and then thrown it away in favour of the row
+  // property beside it. Asking that question where it can actually be answered
+  // -- at the close, by the reporter -- is what `RETIRE_DISPATCH_RECONCILE_SQL`
+  // now does, and there is nothing left for a second term here to add.
+  if (!executed) {
     await releaseRunUse(row.task_id, false);
     if (!await runCleanupAction(row)) return false;
   }
@@ -1441,41 +1711,327 @@ async function runCleanupAction(row: AmbiguousDispatch): Promise<boolean> {
     return true;
   }
   if (row.action === "delete_created_session") {
-    const occupied = await db.query(
-      `SELECT 1 FROM claw_tasks
-        WHERE session_id = $1 AND origin = 'chat'
-          AND status IN ('queued','preparing','running','cancelling') LIMIT 1`,
-      [row.session_id],
-    );
-    if (occupied.rowCount) return true;
-    // The durable deletion, not a bare `deleted_at`. Hiding the row is only the
-    // first of the things a delete owes: `sweepSessionCleanups` selects on
-    // `cleanup_state = 'pending'`, so a session soft-deleted without it is one
-    // whose content is never tombstoned and whose workspace references and
-    // objects are never scheduled for collection. The marker is cleared a
-    // moment later, so nothing comes back to notice.
-    try {
-      await commitSessionDeletion(row.session_id);
-    } catch (err) {
-      // Left for the next tick rather than swallowed: the marker is only
-      // cleared by a `true` return, so answering false is what keeps this row
-      // eligible until the delete actually commits.
-      logger.warn(
-        { err, sessionId: row.session_id, taskId: row.task_id },
-        "sweeper.reconcile_delete_session_failed",
+    // Under the lock the completion consumer already holds for the whole of one
+    // report -- its close, its gate release and the turn it records after them
+    // -- because everything the arm below does is a read, a decision, and then
+    // an irreversible write over state that consumer is concurrently writing,
+    // and no re-read can serialise a decision against a writer it does not
+    // exclude. For any SELECT there is a commit that lands after it and before
+    // the delete; that is what the answered-probe under the R3 comment was, and
+    // it is why a session whose worker had already answered was still deleted.
+    //
+    // Held, the two orderings are the only two: the report lands first, and the
+    // floors in the take below see what it wrote, or the delete commits first
+    // and the report finds a session that is gone. `withCompletionLock` is the
+    // lock that consumer already treats as covering exactly that sequence, so
+    // this adds a second party to an existing mutual exclusion rather than
+    // inventing one.
+    //
+    // A `try` lock: losing it defers this row to the next tick with its marker
+    // intact, which is the direction every other refusal here takes, rather
+    // than waiting on a consumer that may be mid-turn. And it is not the 40P01
+    // shape the earlier attempt hit -- that was a `claw_tasks` ROW lock held
+    // across `commitSessionDeletion`, which inverts that function's documented
+    // session-before-task order. An advisory lock is taken outermost by every
+    // party that takes it, before any row lock, and degrades to a skip.
+    const outcome = await withCompletionLock(row.session_id, () => deleteCreatedSession(row));
+    if (!outcome.ran) {
+      logger.info(
+        { sessionId: row.session_id, taskId: row.task_id },
+        "sweeper.reconcile_delete_session_deferred_busy",
       );
       return false;
     }
-    return true;
+    return outcome.result;
   }
   return true;
 }
 
+/**
+ * The delete arm proper, run under the session's completion lock.
+ *
+ * Returns true when this row is settled -- the session is deleted, or the
+ * cleanup has been called off by something the arm may not overrule. False
+ * means the cleanup is still owed and the marker must stay armed for the next
+ * tick.
+ */
+async function deleteCreatedSession(row: AmbiguousDispatch): Promise<boolean> {
+  // Already gone, before anything else. Under the marker lease below this
+  // function is re-entrant: a crash between the take and `clearReconcileMarker`
+  // leaves an armed row for a deletion that committed, and re-running
+  // `commitSessionDeletion` on it would be idempotent on `deleted_at`
+  // (COALESCE) but would reset `cleanup_attempts = 0` and `cleanup_error =
+  // NULL` -- wiping the evidence `stuckCleanups` reports a failing cleanup
+  // from. It also covers a session some other party deleted while this marker
+  // was armed.
+  //
+  // The stamp is still written, and that is not bookkeeping: it is what
+  // `releaseDispatchedFatReconcile` declines on, and a publisher that found
+  // no stamp here would answer HTTP 200 `dispatched` naming a session that is
+  // already deleted. The delete this row asked for has happened; the stamp
+  // says so to the only reader that asks.
+  const already = await db.query(
+    `SELECT 1 FROM claw_sessions
+      WHERE session_id = $1 AND deleted_at IS NOT NULL LIMIT 1`,
+    [row.session_id],
+  );
+  if (already.rowCount) {
+    await db.query(
+      `UPDATE claw_tasks
+          SET metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb),
+                '{dispatch_reconcile_deleted}', 'true'::jsonb
+              )
+        WHERE task_id = $1`,
+      [row.task_id],
+    );
+    return true;
+  }
+  // Re-read, and wider than the status list it started as, because this is
+  // the last statement before an irreversible write and the snapshot the
+  // decision was taken on is by then as old as a `releaseRunUse` and
+  // whatever the rest of the batch did. Two things can have changed under
+  // it, and the caller's snapshot can see neither:
+  //
+  //   - A worker can have arrived after the take. `reconcileAmbiguousDispatches`
+  //     reads `status`, `claim_count` and the two lease columns in the UPDATE
+  //     that claims the row and never reads them again, so a heartbeat that
+  //     lands one statement later is invisible to every guard above. Holder
+  //     evidence on ANY chat row of this session is occupancy in the sense
+  //     this check already means -- "later work has adopted the session" --
+  //     and it catches the turn that completed at `claim_count = 0`, which a
+  //     status list cannot, because a completed turn is in no status a status
+  //     list of live states would name.
+  //   - The publisher can have handed the marker back after the take.
+  //     `releaseDispatchedFatReconcile` reports success to a request that then
+  //     answers HTTP 200, so a disarm committed between the take and here is
+  //     an explicit revocation of this cleanup that the snapshot cannot carry.
+  //     Settled below by taking the marker rather than reading it, which is
+  //     what makes "a successful marker update stops the delete" a statement
+  //     this code can actually keep.
+  const occupied = await db.query(
+    `SELECT 1 FROM claw_tasks
+      WHERE session_id = $1 AND origin = 'chat'
+        AND (status IN ('queued','preparing','running','cancelling')
+             OR lease_owner IS NOT NULL
+             OR lease_expires_at IS NOT NULL
+             OR COALESCE(claim_count, 0) > 0)
+      LIMIT 1`,
+    [row.session_id],
+  );
+  if (occupied.rowCount) return true;
+  // The floor, and the only guard here that measures the harm rather than
+  // guessing at the cause. Everything above asks "did this dispatch execute";
+  // this asks the question that actually decides whether the write may be
+  // made, which is "is there a conversation in here to destroy". The two
+  // outcomes are not symmetric and the code should say so -- and it should
+  // say it without the fallback this comment used to claim. There is no
+  // hourly session reaper: `reapStuckSessions` only sets `agent_status =
+  // 'idle'`, and `sweepSessionCleanups` and `stuckCleanups` both select
+  // `cleanup_state = 'pending'`, which nothing but `commitSessionDeletion`
+  // ever writes -- so a session this floor keeps is kept until an operator
+  // removes it, and no pass in this deployment collects it. It is still the
+  // side to fail towards, on the half of the asymmetry that is true: a leak
+  // is a row someone can still act on, while a session deleted is a user's
+  // conversation gone, its content tombstoned and its workspace objects
+  // scheduled, with nothing that undoes it.
+  //
+  // `is_placeholder` is what keeps the floor from swallowing the cleanups
+  // that are genuinely owed. `recordCompletionTurns` is the sole writer of
+  // this table, and it marks the assistant turn a *sweeper*-synthesized
+  // completion produces as a placeholder -- so a turn that is not one is an
+  // answer a worker actually produced and the user actually saw. A session
+  // holding only the placeholder an `announceRunFailure` wrote is still a
+  // session whose turn never ran, and is still taken back.
+  //
+  // A cheap first look and a log line, not the fence. The fence is the same
+  // predicate, folded into the take below where it is decided on one row's
+  // lock together with the marker; this SELECT exists so the ordinary case --
+  // an answer that was already there when the pass started -- is refused with
+  // a message that names it, rather than as an anonymous `revoked`. It is
+  // safe for it to be stale in only one direction, and the take covers that
+  // direction.
+  const answered = await db.query(
+    `SELECT 1 FROM claw_conversation_turns
+      WHERE session_id = $1 AND deleted_at IS NULL
+        AND role = 'assistant' AND NOT is_placeholder
+      LIMIT 1`,
+    [row.session_id],
+  );
+  if (answered.rowCount) {
+    logger.warn(
+      { sessionId: row.session_id, taskId: row.task_id },
+      "sweeper.reconcile_delete_session_answered",
+    );
+    return true;
+  }
+  // The revocation check, and it is now the marker itself rather than a look
+  // at it. It used to be a SELECT, under a comment claiming that "a
+  // successful marker update has to be able to stop the delete, or it
+  // establishes nothing" -- which a SELECT cannot deliver, because it sees
+  // only a disarm that committed before the read and the commit it guards
+  // comes after. Taking the marker makes the claim true: whoever clears
+  // `dispatch_reconcile_at` first wins, and the loser's own UPDATE matches no
+  // row and says so. That is both halves of the race in one statement -- this
+  // pass does not delete after a revocation, and `releaseDispatchedFatReconcile`
+  // cannot report a release, and so cannot answer HTTP 200 `dispatched`, once
+  // the delete has taken the marker.
+  //
+  // The stamp is what the other party reads, and it is needed because "the
+  // marker is gone" is by itself ambiguous now: `closeChatRun` retires it
+  // benignly on every turn a worker reports, and that must still leave
+  // `releaseDispatchedFatReconcile` free to answer `dispatched`. Only this
+  // statement writes it, only ever on the row it is about to delete the
+  // session for, and the publisher declines exactly on it -- so the two
+  // contend on one row's lock and neither can act on a stale reading of the
+  // other. It is durable rather than in-process on purpose: the publisher
+  // that has to read it is in a different process from the sweeper.
+  //
+  // Taking it used to mean clearing it, and that is the one part of the
+  // earlier shape that was wrong. The two facts were written by one statement
+  // and then read as indivisible, and they are not: the NULL is what fences
+  // this pass against a revocation that has already committed, while the
+  // stamp is what fences the publisher -- `releaseDispatchedFatReconcile`
+  // declines on the stamp and on nothing else. So the marker is held with a
+  // fresh lease instead of erased. The take still takes: one statement, one
+  // row lock, `dispatch_reconcile_at IS NOT NULL` still loses to a disarm
+  // that got there first, and the stamp still stops any 200 `dispatched`.
+  // What changes is only the durable state when the delete does NOT commit.
+  //
+  // Which is what the old order got wrong, and not only on a crash: clearing
+  // here made an ordinary transaction rollback -- a deadlock, a full disk,
+  // `commitSessionDeletion` is one `inTransaction` and any abort reaches its
+  // `TeardownRefused` -- permanent, because the `return false` below keeps
+  // nothing eligible once the marker it relies on is gone, and nothing else
+  // ever selects the row again. It was priced against a session reaper that
+  // does not exist (see the floor above). A lease leaves the durable default
+  // at "still owed": the row re-arms, the next tick re-takes it, and the
+  // floors below are re-evaluated against whatever arrived in between.
+  // `dispatch_reconcile_action` stays set for the same reason -- the retry
+  // reads it to know what is owed -- and `clearReconcileMarker` retires both
+  // on the way out when the delete does commit.
+  //
+  // The two floors move into this statement for the reason a SELECT cannot
+  // serve as one: the completion consumer is a writer this pass does not
+  // exclude by reading, so for any probe there is a commit that lands after
+  // it and before the delete. Here "no report and no answer existed" and
+  // "this pass won the marker" are one decision on one row's lock -- the same
+  // move the revocation check already made, applied to the floor it left
+  // behind as a read.
+  //
+  // Both traces, because they bound the report from opposite ends.
+  // `consumeEventDelivery` persists the `exec_complete` row before it closes
+  // anything, so that row is the earliest durable trace a report leaves; the
+  // turn is written last and so is the one that survives event pruning.
+  // Either alone has a window the other covers. A sweeper-synthesised
+  // completion is excluded from both by the rule `is_placeholder` already
+  // encodes: `announceRunFailure` publishes `completion_source: "sweeper"`,
+  // `consumeEventDelivery` stores the event verbatim in `data`, and that
+  // announcement is this pass talking to itself -- counting it would refuse
+  // every cleanup this arm exists to perform.
+  //
+  // What this still does not close, said plainly rather than assumed away: the
+  // consumer's event-row INSERT happens BEFORE it takes the completion lock, so
+  // a report whose very first durable trace lands between this statement and
+  // the commit below is invisible to both floors and the session is deleted
+  // under it. The lock narrows the window to those two statements; it cannot
+  // remove it, and moving the lock to cover the INSERT would not either -- it
+  // would only move the loss from "a turn written and then tombstoned" to "a
+  // turn never written", because a report the sweeper is excluding is a report
+  // the sweeper cannot see. Closing it needs positive proof instead of absence
+  // of evidence: an events-stream settlement read symmetric to
+  // `taskDeliverySettlement`, so "no exec_complete is outstanding for this
+  // session" becomes a fact this statement can require. Until then the window
+  // is two statements wide and the failure is the one this arm has always had,
+  // not a new one.
+  const took = await db.query(
+    `UPDATE claw_tasks
+        SET dispatch_reconcile_at = NOW() + ($3::int * INTERVAL '1 second'),
+            metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb),
+              '{dispatch_reconcile_deleted}', 'true'::jsonb
+            )
+      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_session_events e
+           WHERE e.session_id = $2
+             AND e.event = 'exec_complete'
+             AND e.deleted_at IS NULL
+             AND e.data->>'completion_source' IS DISTINCT FROM 'sweeper'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_conversation_turns t
+           WHERE t.session_id = $2 AND t.deleted_at IS NULL
+             AND t.role = 'assistant' AND NOT t.is_placeholder
+        )
+      RETURNING task_id`,
+    [row.task_id, row.session_id, DISPATCH_RECONCILE_LEASE_SEC],
+  );
+  if (!took.rowCount) {
+    // Three ways to lose this statement and one answer to all of them: the
+    // publisher revoked the marker, a worker's report retired it, or one of the
+    // floors matched -- including a report that landed after the probes above
+    // and before this line, which is the whole reason they are in the WHERE.
+    // Every one of them says the cleanup is called off rather than deferred, so
+    // this returns settled and `clearReconcileMarker` retires the row.
+    logger.warn(
+      { sessionId: row.session_id, taskId: row.task_id },
+      "sweeper.reconcile_delete_session_revoked",
+    );
+    return true;
+  }
+  // The durable deletion, not a bare `deleted_at`. Hiding the row is only the
+  // first of the things a delete owes: `sweepSessionCleanups` selects on
+  // `cleanup_state = 'pending'`, so a session soft-deleted without it is one
+  // whose content is never tombstoned and whose workspace references and
+  // objects are never scheduled for collection. The marker is cleared a
+  // moment later, so nothing comes back to notice.
+  try {
+    await commitSessionDeletion(row.session_id);
+  } catch (err) {
+    // Left for the next tick rather than swallowed, and that is true again
+    // now that the take above holds the marker rather than clearing it: the
+    // row is still armed, with its action, at a fresh lease, so answering
+    // false keeps it eligible until the delete actually commits. The claim
+    // this comment used to make -- "the marker is only cleared by a `true`
+    // return" -- had stopped being true twenty lines earlier.
+    //
+    // A delete that can never commit therefore re-arms every lease and logs
+    // this line every tick. That is deliberate: a loud loop bounded at one
+    // attempt per `DISPATCH_RECONCILE_LEASE_SEC` is the norm this codebase
+    // already uses for `cleanup_state = 'pending'`, and it is the failure an
+    // operator can see. Silence was the other option and it is how a session
+    // came to be abandoned with no collector.
+    logger.warn(
+      { err, sessionId: row.session_id, taskId: row.task_id },
+      "sweeper.reconcile_delete_session_failed",
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Retire the marker once the action has run, and report whether this row is
+ * settled -- which is not the same as whether this statement changed anything.
+ *
+ * Unfenced on `dispatch_reconcile_at` on purpose. The delete arm takes the
+ * marker itself, as the fence that decides the race with the publisher, and it
+ * can reach this line having left the column either way -- held at a fresh
+ * lease when it took it, or already NULL when a revocation or a worker's report
+ * beat it to it. A fenced statement would answer "not settled" for the second,
+ * leaving the pass reporting nothing resolved for a row that is. The question
+ * this return value is asked is "is this row still owed a reconciliation", and
+ * a row with no marker is not.
+ *
+ * This is also what retires the lease the delete arm's take now holds, so a
+ * committed deletion does not leave a row re-arming for ever.
+ */
 async function clearReconcileMarker(taskId: string): Promise<boolean> {
   const r = await db.query(
     `UPDATE claw_tasks
         SET dispatch_reconcile_at = NULL, dispatch_reconcile_action = NULL
-      WHERE task_id = $1 AND dispatch_reconcile_at IS NOT NULL
+      WHERE task_id = $1
       RETURNING task_id`,
     [taskId],
   );
@@ -1685,25 +2241,305 @@ export async function reapStuckSessions(): Promise<number> {
   return r.rowCount;
 }
 
-/** Reconcile DagHandleMap: drop entries for terminal DAG roots. */
+/**
+ * Reconcile DagHandleMap: drop entries for terminal DAG roots.
+ *
+ * `dropped` counts DAGs reached, which is not a count of sandboxes released --
+ * `stopAllHandlesForDag` reports that separately, and this is the one teardown
+ * path with no caller to report it to. So the sweeps it could not establish a
+ * release for are counted and logged here, because an operator watching for a
+ * leak has nowhere else to look: the per-handle warnings say which stop failed,
+ * but only this says how much of a tick's reconciliation did not land.
+ */
 export async function reapOrphanHandles(): Promise<number> {
-  const all = await handleMap().listAll();
+  const all = await handleRegistry.listAll();
   let dropped = 0;
-  for (const [dagRoot] of all) {
+  let unreleased = 0;
+  let deferred = 0;
+  // One answer per session per tick. Several DAG roots of one session reach
+  // this loop -- that is the shape the guard below is about -- and the question
+  // "what is this session's live work holding" has the same answer for all of
+  // them. Not held across ticks: the next tick asks again, which is what makes
+  // "defer" a coherent answer here at all.
+  const holdingsBySession = new Map<string, SessionHoldings>();
+  for (const [dagRoot, handles] of all) {
+    // Keyed by `task_id` alone, which is the primary key. The old predicate
+    // also demanded `dag_node_id = '__dag_root__'`, and that was not a
+    // narrowing of the same row -- it was a different row for half the
+    // handles here. Brain registers under `dag_root_task_id ?? task_id`
+    // (ensure-hands.ts), so a standalone task owns a handle under its own
+    // task id, and a standalone task's `dag_node_id` is NULL. Every one of
+    // them therefore matched nothing, read as `missing`, and was reaped as an
+    // orphan -- **while it was still running**, tearing the sandbox out from
+    // under a live task. Nothing had ever executed that path, because the
+    // handle map this walks was the wrong bucket until this branch fixed it.
     const r = await db.query(
-      `SELECT status FROM claw_tasks WHERE task_id = $1 AND dag_node_id = '__dag_root__'`,
+      `SELECT status, session_id FROM claw_tasks WHERE task_id = $1`,
       [dagRoot],
     );
-    const status = r.rows[0]?.status ?? "missing";
+    const owner = r.rows[0] as { status?: string; session_id?: string } | undefined;
+    // A row that is absent is an orphan; a row that is present and not
+    // terminal owns its sandbox, whatever shape of task it is.
+    const status = owner?.status ?? "missing";
     if (status === "completed" || status === "failed" || status === "cancelled" || status === "missing") {
-      // We pass the dag root's session id when known; falling back to ""
-      // is safe because safeStopWorkload reads the platform key from the
-      // session and skips when absent.
-      const sess = await db.query(`SELECT session_id FROM claw_tasks WHERE task_id = $1`, [dagRoot]);
-      const sessionId = sess.rows[0]?.session_id ?? "";
-      await stopAllHandlesForDag(dagRoot, sessionId);
+      // The registering task being terminal does not mean the sandbox is idle.
+      // Brain keeps a finished task's pod warm as `hands.<session>` and the
+      // next message in the same session reuses it (`tryReuseSessionSandbox`)
+      // WITHOUT moving the DAG handle's ownership. So T1 completes, T2 picks up
+      // the same workload, and this sweep -- reading only T1 -- stops the
+      // sandbox T2 is running on. No race is needed: the two are sequential,
+      // which is the normal shape of a session. Reuse now DOES register the
+      // adopting DAG, but it adds that reference without removing the creating
+      // task's, so this sweep still reaches a workload through a terminal owner
+      // while a live DAG holds it too.
+      //
+      // **The question is which workload the live work holds, not whether the
+      // session has any.** The session-wide form of it deferred a reap for a
+      // task that could not possibly be using the sandbox in hand, and that is
+      // not a harmless delay: T1 finishes on W1; T2 in the same session changes
+      // the image, cannot reuse W1, and creates W2; T2 then sits `preparing`
+      // waiting for the GPU W1 is still holding. Consecutive sweeps each saw a
+      // live task and each skipped W1, Brain's keepalive kept it alive, and W1
+      // was released only when T2 eventually timed out. A guard whose deferral
+      // is what prevents the work that would end the deferral is not a
+      // conservative guard, it is a deadlock.
+      //
+      // Asking per workload was not possible until this branch: every
+      // registry-wide scan went through `scanPrefix`, which awaited `kv.get`
+      // inside the `for await` over `kv.keys()`, stalling the ordered consumer
+      // so it ended early and silently -- 21 live keys in the DAG_HANDLES
+      // bucket, one row returned. A per-workload answer built on that would
+      // have been a confident "nobody holds it" assembled from a list that was
+      // mostly missing. With the drain fixed the same bucket returns all of it,
+      // so who holds what can be asked and believed.
+      //
+      // `liveWorkHoldings` says which workloads the session's live tasks hold,
+      // and the three ways it can fail to say -- a failed query, a registry
+      // read that threw, a live task not yet given any workload -- all answer
+      // `unknown`, which defers exactly as the old guard did. The trade this
+      // guard was written to make is unchanged: it still never permits a stop
+      // it cannot establish is safe, and a deferred reap is still preferred to
+      // a pod pulled out from under a running task. What changed is that
+      // "cannot establish" now means the answer was unavailable, rather than
+      // meaning some unrelated task in the session was running.
+      const sessionId = owner?.session_id
+        ?? Object.values(handles).find((h) => h.session_id)?.session_id
+        ?? "";
+      // What this sweep would be stopping. Handles with no workload id are the
+      // agent-sandbox (kubernetes) shape, which names a Router session instead
+      // -- there is no workload to ask about, so a candidate made only of those
+      // falls back to the session-wide question below rather than being reaped
+      // on an answer about a set that is empty.
+      const workloads = new Set(
+        Object.values(handles).map((h) => h.workload_id ?? "").filter((w) => !!w),
+      );
+      const holdings = sessionId
+        ? await liveWorkHoldings(sessionId, holdingsBySession)
+        : { state: "idle" as const };
+      if (holdings.state === "unknown") {
+        logger.info(
+          { dagRoot, sessionId, reason: holdings.reason },
+          "sweeper.orphan_handles_live_work_unknown",
+        );
+        deferred++;
+        continue;
+      }
+      if (holdings.state === "holding") {
+        const held = [...workloads].filter((w) => holdings.workloads.has(w));
+        if (workloads.size === 0 || held.length > 0) {
+          logger.info(
+            {
+              dagRoot, sessionId, liveTasks: holdings.tasks,
+              held: workloads.size === 0 ? "unnamed_workload" : held,
+            },
+            "sweeper.orphan_handles_session_live",
+          );
+          deferred++;
+          continue;
+        }
+      }
+      // A session with no live task can still be carrying live work.
+      //
+      // Background shells outlive the run that started them -- that is the
+      // whole point of them. Ending a chat parks the sandbox and keeps them
+      // running, and from that moment this sweep sees exactly the shape it was
+      // written to reap: a terminal (or absent) DAG row, no live task in the
+      // session, and a handle pointing at a workload. Stopping it kills the
+      // user's background work, and the reproduction is not subtle -- at the
+      // moment `/stop` was issued the running process count inside the sandbox
+      // was still 1.
+      //
+      // Brain has a mechanism that means "do not stop this": it writes a
+      // retention record, and `handleRegistry.retained` inside the teardown
+      // refuses on one. But it writes that record when it RELEASES a container
+      // whose DAG is finished with it -- not when a chat simply ends. This path
+      // produces no retention record at all, so the gate that was supposed to
+      // protect it never sees anything, and the liveness check above passes
+      // because no *task* is running. Nothing else in the chain is looking at
+      // the sandbox itself.
+      //
+      // So the session's entry is read. Brain's keepalive sweep probes idle
+      // handles and publishes what it found onto `hands.<session>`, and that
+      // verdict -- read under the freshness rules it was written with, which
+      // live in `@claw/protocol` beside the writer rather than being restated
+      // here -- is the evidence this sweep was missing.
+      //
+      // The session's entry, NOT the sandbox's, and the two stop being the same
+      // thing the moment the session moves off the sandbox. `hands.<session>`
+      // is one slot: a turn that changes the image cannot reuse W1, creates W2,
+      // and W2's binding is written over W1's at that one key -- taking the
+      // verdict that said "there are shells running in W1" with it. The reader
+      // then answers `other_sandbox` about W1, which is true about the binding
+      // it found and is not an answer about W1 at all, and this guard reads a
+      // non-answer as nothing to defer for. Reproduced: T1 completes on W1 with
+      // a shell still running, T2 binds W2, and this sweep stops W1 with the
+      // shell alive inside it.
+      //
+      // That is not fixable from here, and the reason is worth writing down so
+      // the next reader does not go looking for a read that would fix it. Once
+      // the slot has moved there is no record left in this process's reach that
+      // is ABOUT W1 -- and a sweep cannot manufacture one, because the
+      // overwrite can happen in any gap between two ticks, so a verdict it
+      // cached would be evidence only for the sessions it happened to be
+      // watching at the right moment. Per-workload evidence has exactly one
+      // durable home: a retention record, keyed by the container's own
+      // generation rather than by session, which `handleRegistry.retained`
+      // matches by workload id and which `stopSandboxByHandle` already refuses
+      // on -- that whole chain is exercised over this very shape in
+      // `orphan-sweep-displaced-sandbox.test.ts`. The missing half is the
+      // write, and it belongs to the party that destroys the evidence at the
+      // moment it destroys it: Brain retains a container it RELEASES
+      // (`retainInsteadOfDestroying` in brain/src/sandbox/ensure-hands.ts) and
+      // writes nothing on the path that merely abandons one for a replacement.
+      //
+      // The cost is one point read per DAG this sweep was about to act on, and
+      // only for DAGs that got past every cheaper check above -- next to the
+      // `retained` scan the stop itself already runs over the whole bucket per
+      // handle, it is not a term worth trading a user's background work for.
+      //
+      // "Defer" is a coherent answer only because this is a periodic sweep: it
+      // runs again in TASK_SWEEPER_TICK_MS and will reap the moment the sandbox
+      // reports idle. It would not be coherent on the cancel path, where there
+      // is no next time and deferring means never stopping, which is why the
+      // guard is here and not inside `stopAllHandlesForDag`.
+      const bg = sessionId
+        ? await handleRegistry.backgroundWork(sessionId, [...workloads])
+        : { state: "clear" as const, reason: "no_workload" as const };
+      // The second half of "does live work hold THIS workload", and the half
+      // the handle registry cannot answer on its own.
+      //
+      // `hands.<session>` is the one slot a session reuses from: a live task
+      // that has never touched this workload can still be a moment away from
+      // adopting whatever that slot names, and adoption registers its handle
+      // only afterwards. So while the session has live work, a binding pointing
+      // at one of these workloads keeps them, and that is also the backstop for
+      // a registration this sweep read late or not at all. It costs nothing
+      // extra: the workload match is already the first thing the background-work
+      // reader does, so this is the read above classified rather than a second
+      // one, and it is skipped entirely for a session with no live work -- which
+      // is where the genuine orphan lives, and where the background-work guard
+      // below, not this one, is what decides.
+      if (holdings.state === "holding") {
+        const names = bindingNamesOneOf(bg);
+        if (names !== false) {
+          logger.info(
+            { dagRoot, sessionId, liveTasks: holdings.tasks, certain: names !== "unknown" },
+            "sweeper.orphan_handles_session_binding_holds",
+          );
+          deferred++;
+          continue;
+        }
+      }
+      if (bg.state === "running") {
+        logger.info(
+          { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
+          "sweeper.orphan_handles_background_work",
+        );
+        deferred++;
+        continue;
+      }
+      if (bg.state === "unreadable") {
+        // An unreadable store is not a sandbox with nothing in it. Same
+        // direction as every other unknown on this path: decline to act, and
+        // say so where an operator can see it.
+        logger.warn(
+          { dagRoot, sessionId, reason: bg.reason },
+          "sweeper.orphan_handles_background_unreadable",
+        );
+        deferred++;
+        continue;
+      }
+      if (bg.state === "awaiting") {
+        if (bg.sinceMs < ORPHAN_BG_VERDICT_WAIT_MS) {
+          // Distinct from the `running` line on purpose. This one repeats every
+          // tick for the same handle while nothing resolves it, and an operator
+          // watching a workload that is never reclaimed needs to be able to
+          // tell "held because work was measured" from "held because nothing
+          // has measured it yet".
+          logger.info(
+            { dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs },
+            "sweeper.orphan_handles_background_unknown",
+          );
+          deferred++;
+          continue;
+        }
+        logger.warn(
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs,
+            waitMs: ORPHAN_BG_VERDICT_WAIT_MS,
+          },
+          "sweeper.orphan_handles_background_unresolved",
+        );
+      }
+      // The population this sweep cannot answer for, named so it can be counted.
+      //
+      // `other_sandbox` is the reader saying the binding it found names a
+      // DIFFERENT workload, so about the one in hand it says nothing -- and
+      // "nothing on record" is what the stop below then acts on. Every other
+      // unknown on this path defers; this one must not, because a displaced
+      // sandbox whose work really is finished is the orphan this sweep exists
+      // to reap and deferring on it is both the leak and the deadlock that put
+      // the narrowed guard above here in the first place. So the risk is
+      // carried, and until a retention record is written wherever a session's
+      // slot moves off a container that may still be running work, this line is
+      // the only place in the fleet where it is visible.
+      if (bg.state === "clear" && bg.reason === "other_sandbox") {
+        logger.warn(
+          { dagRoot, sessionId, stopping: [...workloads], bindingNames: bg.workloadId },
+          "sweeper.orphan_handles_displaced_sandbox",
+        );
+      }
+      // The owner's session id when known, the handles' own when the DAG row
+      // is gone, and "" when neither names one.
+      //
+      // That fallback is not a stop that is skipped. `safeStopWorkload` does
+      // NOT decline on a missing platform key -- it POSTs the stop with no
+      // `Authorization` header, and SaFE answers 401 -- so "" means a request
+      // that reaches the provider and cannot succeed. This comment used to
+      // claim the opposite, and on the orphan path the difference was the
+      // whole bug: the stop failed, the DAG row was gone so the failure had
+      // nowhere to be recorded, and the mapping was destroyed anyway, leaving
+      // a running workload that nothing in the system named.
+      //
+      // What makes passing "" acceptable is one level down, in
+      // `stopSandboxByHandle`: a teardown that can neither issue the stop nor
+      // record that it did not now KEEPS the handle mapping. So this sweep
+      // finds the same workload again next tick instead of losing it, and
+      // counts it in `unreleased` every one of those ticks -- which is where
+      // an operator sees a session whose key never came back.
+      if (await stopAllHandlesForDag(dagRoot, sessionId) === "unconfirmed") unreleased++;
       dropped++;
     }
+  }
+  if (unreleased > 0) {
+    logger.warn({ dropped, unreleased }, "sweeper.orphan_handles_unreleased");
+  }
+  // Reported separately from `dropped`, which counts DAGs this sweep acted on.
+  // A tick that acted on nothing because everything was deferred and a tick
+  // that found nothing to do both return 0, and those are very different
+  // states of the fleet.
+  if (deferred > 0) {
+    logger.info({ dropped, deferred }, "sweeper.orphan_handles_deferred");
   }
   return dropped;
 }

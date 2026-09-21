@@ -133,6 +133,10 @@ async function downloadSkill(
   const isZip = (buf[0] === 0x50 && buf[1] === 0x4b) || contentType.includes("zip") || contentType.includes("octet-stream");
   if (isZip) {
     try {
+      // Both sides of the containment check below go through resolve(), so a
+      // relative TMPDIR cannot make the prefix comparison fail open (or, worse,
+      // fail closed on every entry and ship an empty skill).
+      const stagingRoot = path.resolve(localDir);
       const zip = new AdmZip(buf);
       for (const entry of zip.getEntries()) {
         if (entry.isDirectory) continue;
@@ -141,7 +145,22 @@ async function downloadSkill(
           logger.warn({ toolId, skillName, entryName }, "skill.zip_unsafe_entry_skipped");
           continue;
         }
-        const outPath = path.join(localDir, entryName);
+        const outPath = path.resolve(stagingRoot, entryName);
+        // Zip slip, checked twice on purpose. `isSafeRelativePath` above rejects
+        // the entry *names* that escape (absolute, or carrying a ".." segment);
+        // this re-asks the question about the joined path, after normalization,
+        // and is the check that actually pins the invariant: nothing this loop
+        // writes lands outside the staging directory we just created. Both are
+        // kept because the name check lives in sandbox/write.ts, where its
+        // docstring is about sandbox uploads -- it can be relaxed for that
+        // caller by someone who never reads this loop. The archive arrives from
+        // the marketplace over the network and is unpacked by Brain itself, so
+        // an escape here is an arbitrary file write on the orchestrator, as the
+        // orchestrator's user, not inside anyone's sandbox.
+        if (!outPath.startsWith(stagingRoot + path.sep)) {
+          logger.warn({ toolId, skillName, entryName }, "skill.zip_escaping_entry_skipped");
+          continue;
+        }
         fs.mkdirSync(path.dirname(outPath), { recursive: true });
         fs.writeFileSync(outPath, entry.getData());
       }

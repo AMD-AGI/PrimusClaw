@@ -93,10 +93,21 @@ export function natsKvStore(kv: NatsLikeKv): KVStore {
     },
     async scanPrefix(prefix) {
       const filter = prefix.endsWith(".") ? `${prefix}>` : `${prefix}.>`;
-      const iter = await kv.keys(filter);
+      // The key iterator is DRAINED BEFORE the first `get`, and that is not a
+      // style choice. `kv.keys()` is an ordered-consumer subscription; awaiting
+      // another JetStream request inside `for await` stalls its message pump,
+      // and the consumer ends early rather than erroring. Measured against the
+      // live DAG_HANDLES bucket (21 keys, all live): getting inside the loop
+      // returned 1 key, draining first returned all 21. Silently, with no
+      // rejection anywhere -- which is the worst shape this could take, because
+      // every registry-wide scan is built on this one call and a short list
+      // reads exactly like a small registry.
+      const keys: string[] = [];
+      for await (const key of await kv.keys(filter)) {
+        if (key.startsWith(prefix)) keys.push(key);
+      }
       const out: Array<[string, Record<string, unknown>]> = [];
-      for await (const key of iter) {
-        if (!key.startsWith(prefix)) continue;
+      for (const key of keys) {
         const entry = await kv.get(key);
         if (!entry) continue;
         try {

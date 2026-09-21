@@ -152,6 +152,9 @@ test("a handle record another replica wrote is admitted and pinged in the same t
   kv.seed("hands.sess-remote", entry("wl-remote"));
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv,
     countActiveShells: async () => 1,
     roster: { store: rosterStore(kv), config: CONFIG },
@@ -182,6 +185,9 @@ test("remote registrations past the ceiling are admitted, reported, and served",
 
   const probed: string[] = [];
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv,
     countActiveShells: async (_url, _token, owner) => { probed.push(owner); return 1; },
     roster: { store: rosterStore(kv), config: CONFIG },
@@ -228,6 +234,9 @@ test("a registration arriving mid-sweep is admitted and served by the next one",
   };
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv,
     countActiveShells: async () => 1,
     roster: { store: rosterStore(kv), config: CONFIG },
@@ -238,6 +247,9 @@ test("a registration arriving mid-sweep is admitted and served by the next one",
 
   pinged.length = 0;
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv,
     countActiveShells: async () => 1,
     roster: { store: rosterStore(kv), config: CONFIG },
@@ -331,9 +343,15 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
   };
   // Twice, because the probe answers behind the sweep: the first tick reads
   // `unknown` and the second acts on the answer.
-  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+  await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {}, kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
   await new Promise((r) => setImmediate(r));
-  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+  await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {}, kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
 
   assert.ok(arrived, "the registration really did land during a sweep");
   assert.ok(probedOwners.includes("sess-working"), "the retained handle was actually asked about");
@@ -353,7 +371,10 @@ test("mid-sweep arrival, over-cap result, and a retained shell that must not be 
 
   // A third tick picks up what arrived during the first two.
   pinged.length = 0;
-  await runKeepaliveTickForTest({ kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
+  await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {}, kv, countActiveShells: probe, roster: { store: rosterStore(kv), config: CONFIG } });
   assert.ok(roster()!.entries.some((e) => e.identity === "safe:wl-latecomer"),
     "the mid-sweep arrival is admitted rather than lost");
   assert.ok(pinged.includes("wl-latecomer"));
@@ -396,6 +417,9 @@ test("last activity never ages past the idle deadline, over four of them", async
     sweepAt.push(sweepStart);
     pinged.length = 0;
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv,
       countActiveShells: async (_u, _t, owner) => (owner === "sess-3" ? 1 : 0),
       pingBudgetMs: C * PING_MS,
@@ -452,6 +476,9 @@ test("a target that arrives or leaves cannot push a deferred one further back", 
     if (sweep > 0) values.delete(`hands.sess-churn-${sweep - 1}`);
 
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, pingBudgetMs: C * PING_MS, now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
@@ -478,6 +505,9 @@ test("a contended reconciliation blocks the next ordinary claim until it recover
   // contention, which is what exhaustion looks like from inside the sweep.
   const contended = { ...rosterStore(kv)!, async write() { return false; } };
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: contended, config: CONFIG },
   });
 
@@ -498,6 +528,9 @@ test("a contended reconciliation blocks the next ordinary claim until it recover
 
   // A later sweep that lands clears it.
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
   assert.equal(await isRosterStale(), false);
@@ -519,6 +552,9 @@ test("a census that could not be read does not clear staleness", async () => {
   kv.seed("hands.sess-broken", "{ not json");
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
 
@@ -528,6 +564,9 @@ test("a census that could not be read does not clear staleness", async () => {
   // Repaired, and the next sweep clears it.
   values.delete("hands.sess-broken");
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
   assert.equal(await isRosterStale(), false);
@@ -550,6 +589,9 @@ test("a KV read that rejects makes the census incomplete, not the key absent", a
   };
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
 
@@ -558,6 +600,9 @@ test("a KV read that rejects makes the census incomplete, not the key absent", a
 
   (kv as unknown as { get: unknown }).get = realGet;
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
   assert.equal(await isRosterStale(), false);
@@ -574,6 +619,9 @@ test("a DAG sandbox surviving a restart is admitted and pinged", async () => {
   });
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv,
     countActiveShells: async () => 1,
     listDagHandles: async () => [["dag-root-1", {
@@ -609,6 +657,9 @@ test("many simultaneous eviction failures do not stretch the sweep past its span
 
   const started = now;
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, now: () => now,
     roster: { store: rosterStore(kv), config: CONFIG },
   });
@@ -670,6 +721,9 @@ test("many unresponsive retained containers do not stretch the sweep past its sp
 
   const started = now;
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, now: () => now,
     roster: { store: rosterStore(kv), config: CONFIG },
   });
@@ -804,6 +858,9 @@ test("a retention whose work has finished is read even when stuck ones lead the 
 
   for (let sweep = 0; sweep < 5; sweep++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
@@ -876,6 +933,9 @@ test("the tail of the walk gets its turn however many stuck containers lead it",
   let released = 0;
   for (let sweep = 1; sweep <= 20; sweep++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
@@ -956,6 +1016,9 @@ test("a slow preliminary walk cannot spend the retention-read budget", async () 
     }
     for (let sweep = 0; sweep < 3; sweep++) {
       await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
         kv, countActiveShells: async () => 0, now: () => now,
         roster: { store: rosterStore(kv), config: { ...CONFIG, ceiling: 64 } },
       });
@@ -978,6 +1041,9 @@ test("the clock seam is inert when it is not supplied", async () => {
   kv.seed("hands.sess-b", entry("wl-b"));
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
   });
   const withoutSeam = [...pinged].sort();
@@ -985,6 +1051,9 @@ test("the clock seam is inert when it is not supplied", async () => {
   pinged.length = 0;
   // The same sweep with the seam supplied as the real clock: identical work.
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, now: () => Date.now(),
     roster: { store: rosterStore(kv), config: CONFIG },
   });
@@ -1034,6 +1103,9 @@ test("a parked handle that expires gives its slot back", async () => {
   let clock = Date.now();
   for (let i = 0; i < 3; i++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv,
       countActiveShells: async () => 0,
       roster: { store: rosterStore(kv), config: CONFIG },
@@ -1070,6 +1142,9 @@ test("an expiry whose delete lost its race keeps the slot", async () => {
 
   for (let i = 0; i < 3; i++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv: contended, countActiveShells: async () => 0,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
@@ -1148,6 +1223,9 @@ test("a finished retention is read within its bound when refreshes permute the w
   let released = 0;
   for (let sweep = 1; sweep <= 20; sweep++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, now: () => now,
       // Small enough that the batch cannot ping every target, which is what
       // makes it rotate -- and rotating it is what rewrites a different subset
@@ -1228,6 +1306,9 @@ test("a census read that outlasts the container timeout still fits the census ce
   });
 
   await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
     kv, countActiveShells: async () => 0, now: () => now,
     roster: { store: rosterStore(kv), config: CONFIG },
   });
@@ -1245,6 +1326,72 @@ test("a census read that outlasts the container timeout still fits the census ce
     assert.equal((signal as AbortSignal).aborted, false,
       "the read was handed a signal that had already fired");
   }
+});
+
+test("a slow handle release cannot push the phase past its declared ceiling", async () => {
+  // Round 47. The handle cleanup added to this phase is a full-table scan plus a
+  // CAS per handle, and only the enumeration carries a limit of its own -- so
+  // before it was bounded here, a `clear` verdict arriving near the read budget
+  // could be followed by an unbounded cleanup, and the phase could exceed the
+  // very number every span and refresh interval is derived from.
+  //
+  // The existing ceiling test above resolves `releaseDagHandles` immediately, so
+  // it cannot see this: what it measures is the reads.
+  const { keepaliveCensusPhaseCeilingSec } = await import("../src/sandbox/keepalive.js");
+  const ceilingMs = keepaliveCensusPhaseCeilingSec() * 1000;
+
+  const generation = "gen-slow-release";
+  const key = retentionKey(generation);
+  const value = entry(`wl-${generation}`, {
+    sandboxName: generation, protected: true, reason: "protected",
+    detail: "live_work_present", keepalive: false, idleSince: 0,
+  });
+  kv.seed(key, value);
+  kv.seed(ledgerKeyForRetention(key), value);
+
+  // The container has to answer `clear`, or the sweep never reaches the release
+  // at all -- which is what the guard below caught the first time this test ran.
+  let now = 0;
+  const CLEAR = 'MARKER {"epoch":"e1","bearer":{"pid":7,"startToken":"t7"}}\nSUBTREE ok\nPROCS 7';
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async exec(_inst: { id: string }, command: string) {
+        if (!command.includes("MARKER")) {
+          now += 100;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: CLEAR, stderr: "" };
+      },
+      async stop() {},
+    } as unknown as SandboxProvider,
+  });
+
+  let reachedRelease = false;
+  const startedAt = Date.now();
+  await runKeepaliveTickForTest({
+    // Never settles. The bound has to come from this side of the call, which is
+    // the whole point: a release that hangs is exactly the case a limit on the
+    // enumeration alone does not cover.
+    releaseDagHandles: () => { reachedRelease = true; return new Promise<void>(() => {}); },
+    kv, countActiveShells: async () => 0, now: () => now,
+    roster: { store: rosterStore(kv), config: CONFIG },
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  // First: that the release was reached at all. Without this the timing
+  // assertion passes whenever the sweep never gets that far, which is how a
+  // bound that does not exist would also look.
+  assert.ok(reachedRelease,
+    "the sweep never reached the handle release, so this proves nothing about its bound");
+  assert.ok(elapsedMs <= ceilingMs,
+    `the tick waited ${elapsedMs}ms on a hanging release against a declared phase `
+      + `ceiling of ${ceilingMs}ms`);
+  // And the retention survives, because the release never happened -- the next
+  // sweep is what retries it. Read from the backing map, not `kv.get`: that
+  // returns a promise, so comparing it to undefined asserts nothing at all.
+  assert.ok(values.has(key) || values.has(ledgerKeyForRetention(key)),
+    "a release that timed out must leave the retention standing");
 });
 
 test("a restart mid-cycle costs the tail one more cycle and no more", async () => {
@@ -1295,6 +1442,9 @@ test("a restart mid-cycle costs the tail one more cycle and no more", async () =
   let released = 0;
   for (let sweep = 1; sweep <= 4 * cycle; sweep++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });
@@ -1383,6 +1533,9 @@ test("a retention the walk could not read keeps its place in the queue", async (
   let released = 0;
   for (sweep = 1; sweep <= 20; sweep++) {
     await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
       kv, countActiveShells: async () => 0, now: () => now,
       roster: { store: rosterStore(kv), config: CONFIG },
     });

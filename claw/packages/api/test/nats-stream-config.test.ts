@@ -32,8 +32,12 @@
  * tombstone that covered it could both exist. Every other bucket's TTL is a
  * setting this code is the authority on, and refusing to shorten one of those is
  * how a bucket comes to outlive the deadlines derived from the same number.
- * Whatever the code cannot read for itself, it reads off the stream instead --
- * which is the last part here.
+ *
+ * DAG_HANDLES is not reconciled from here in either direction, which is the
+ * other way a TTL can stop being this process's business: the bucket is Brain's,
+ * so this side binds to it and never states an opinion about its configuration
+ * at all. Whatever the code cannot read for itself, it reads off the stream
+ * instead -- which is the last part here.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -299,7 +303,7 @@ test("the two ensureStream call sites in the source each name their own replica 
   // that the reconciliation is correct and nothing at all about the number it
   // is given. `initNats` is where that number is chosen, and it needs a live
   // NATS connection -- it connects, opens a JetStream manager and provisions
-  // the consumer and four buckets before it returns -- so there is no seam to
+  // the consumer and five buckets before it returns -- so there is no seam to
   // assert the two calls through. That leaves the source, as with the
   // tombstone bucket's `retentionMeasured` below.
   //
@@ -483,20 +487,39 @@ test("the tombstone bucket is the one bucket whose TTL is never narrowed", async
   assert.equal(calls[0].opts.ttlPolicy, "widenOnly");
 });
 
-test("and it is the only bucket of the five that asks for that policy", async () => {
+test("only the one bucket whose TTL this process does not own asks for widenOnly", async () => {
   // The conclusion of this whole change, and the thing nothing else holds: every
-  // other bucket's TTL is a setting this code is the authority on, so one of them
-  // given `widenOnly` as well is a bucket a shortened setting can no longer
-  // reach -- silently, since refusing to narrow is by design invisible from
-  // outside. Reading the wiring is what used to have to catch that.
+  // other bucket's TTL is a setting this code is the authority on, so a bucket
+  // whose TTL is a setting must be given `exact` -- one handed `widenOnly` as
+  // well is a bucket a shortened setting can no longer reach, silently, since
+  // refusing to narrow is by design invisible from outside. Reading the wiring is
+  // what used to have to catch that.
+  //
+  // One bucket is legitimately not a setting: BRAIN_TOMBSTONES' TTL is derived
+  // from the event stream's retention. DOORBELL_FLOOR's zero is a setting like
+  // the rest of them, which is why it is asserted below by its value rather than
+  // given a policy of its own.
+  //
+  // DAG_HANDLES is not in this list at all any more. It is not this process's
+  // bucket -- Brain creates and writes it, this side only binds to destroy rows
+  // -- and an `ensure` from here would correct drift as well as create, so it
+  // would rewrite Brain's replica count on every boot. Binding is how a bucket
+  // with one owner keeps one answer about its own configuration.
   const { ensure, calls } = recordingEnsure();
 
-  const buckets = await ensureKvBuckets({ retentionMs: EVENT_STREAM_RETENTION_MS, measured: true }, ensure);
+  let bound = 0;
+  const buckets = await ensureKvBuckets(
+    { retentionMs: EVENT_STREAM_RETENTION_MS, measured: true },
+    ensure,
+    async () => { bound += 1; return {} as never; },
+  );
 
+  assert.equal(bound, 1, "DAG_HANDLES is attached, not ensured");
   assert.deepEqual(
     calls.map((c) => c.name),
     ["BRAIN_REGISTRY", "BRAIN_CHECKPOINTS", "BRAIN_TOMBSTONES", "SYSTEM_ENV", "DOORBELL_FLOOR"],
-    "every bucket this process owns goes through here, or the guard below sees less than it claims",
+    "every bucket this process configures goes through here, or the guards below see less than "
+    + "they claim",
   );
   assert.deepEqual(
     calls.filter((c) => c.opts.ttlPolicy === "widenOnly").map((c) => c.name),
@@ -507,9 +530,14 @@ test("and it is the only bucket of the five that asks for that policy", async ()
     assert.equal(call.opts.ttlPolicy ?? "exact", "exact",
       `${call.name}'s TTL is a setting, so a start-up has to be able to shorten it`);
   }
+  assert.equal(
+    calls.find((c) => c.name === "DAG_HANDLES"), undefined,
+    "Brain owns this bucket; this side binds to it and never configures it",
+  );
   assert.deepEqual(Object.keys(buckets).sort(),
-    ["checkpoints", "doorbellFloor", "registry", "systemEnv", "tombstones"],
-    "and every one of them is handed back, since initNats binds all five");
+    ["checkpoints", "dagHandles", "doorbellFloor", "registry", "systemEnv", "tombstones"],
+    "and every one of them is handed back, since initNats holds all six -- the five it "
+    + "configures and the one it binds");
   // The floor is an operator assertion about the fleet, not coordination state,
   // and the two failures a TTL on it produces are not symmetrical: a running
   // replica never learns the key aged out and goes on publishing doorbells,

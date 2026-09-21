@@ -24,6 +24,9 @@
  *   F9  a Stop taken while queued settles visibly and leaks no slot
  *   F10 the accepted generation reaches the run's own heartbeat and completion
  *   F14 a drain gives the accepted lease back with the message
+ *   F15 a dispatch check that naks gives the accepted lease back first
+ *   F16 a retry's settle names the row the lease URL names
+ *   F17 an emit that fails on the stop path asks for the delivery again
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -43,6 +46,8 @@ import type { Engine } from "../src/agent/index.js";
 import {
   bindTaskRunnerDeps, runHandleTask, type TaskRunnerSideEffects,
 } from "../src/tasks/runner.js";
+import { bindTaskDispatchKv, handleTask } from "../src/tasks/dispatch.js";
+import { bindTaskLockKv } from "../src/tasks/lock.js";
 
 const SESSION = "sess-fat";
 const HEARTBEAT_MS = 5;
@@ -106,6 +111,8 @@ function harness(opts: {
   draining?: () => boolean;
   /** The settle-and-release POST, for the case that asserts the lease goes back. */
   settle?: FatPreGateDeps["settle"];
+  /** Run after the event is recorded, for the case that fails the publish. */
+  onEmit?: (evt: Record<string, unknown>) => Promise<void>;
 }): Harness {
   const gate = new ExecutionGate(opts.max ?? 1, opts.max ?? 1);
   const leases: LeaseRenewal[] = [];
@@ -126,7 +133,7 @@ function harness(opts: {
       surplusNakMs: () => 1_000,
       isDraining: () => opts.draining?.() ?? false,
       fatPreGate: createFatPreGate({
-        emit: async (_sessionId, evt) => { events.push(evt); },
+        emit: async (_sessionId, evt) => { events.push(evt); await opts.onEmit?.(evt); },
         ask: async (request, renewal) => {
           leases.push(renewal);
           return opts.answers(leases.length, renewal, request);
@@ -436,6 +443,67 @@ describe("a Stop taken while the delivery is queued", () => {
     assert.equal(completion.run_claim, undefined, "an API that issued none is quoted none");
     h.finish();
   });
+
+  it("F17 hands the lease and the message back when the completion cannot be emitted", async () => {
+    // The emit is a JetStream publish and can fail. What happened then was
+    // chosen by nobody: the throw skipped the ack, nothing naked in its place,
+    // and the delivery sat until the server took it back a full ack_wait later
+    // -- two minutes, and one delivery of the budget, spent on a Stop the user
+    // is watching for. Worse at the end of that budget than in the middle of
+    // it, because the poison guard that turns an exhausted message into a
+    // visible failure lives inside `handleTask`, past `deps.handle`, and a
+    // stopped delivery returns before it: the last attempt is followed by no
+    // event at all. Only `reapLostLeases` is left, once this pod's lease
+    // lapses, which is why the fault reads as slowness rather than a hang.
+    //
+    // So the retry is asked for, in F14 and F15's order and for their reason:
+    // the lease goes back before the message does, or the redelivery finds it
+    // live, classifies itself `superseded`, and naks in turn for a whole TTL.
+    const order: string[] = [];
+    const settles: Array<Record<string, unknown>> = [];
+    const h = harness({
+      answers: (_n, renewal, request) => {
+        if (request.task_id !== "t-2") return granted("preparing", 3);
+        return renewal.accept ? granted("preparing", 7) : granted("cancelling", 7);
+      },
+      max: 1,
+      onEmit: async () => { throw new Error("no responders for the event stream"); },
+      settle: (async (taskId, claimCount, _runTime, releaseLease, as) => {
+        order.push("release");
+        // Several heartbeat periods, so a renewal that was not stopped first
+        // lands inside the release and is seen retaking the lease it hands back.
+        await tick(3);
+        settles.push({ taskId, claimCount, releaseLease, as });
+      }) as NonNullable<FatPreGateDeps["settle"]>,
+    });
+
+    void runDelivery(msgFor(fatRequest()), h.deps);
+    await settle();
+    const stopped = msgFor(fatRequest({ task_id: "t-2" }));
+    const nak = stopped.nak.bind(stopped);
+    stopped.nak = (ms?: number) => { order.push("nak"); nak(ms); };
+
+    await runDelivery(stopped, h.deps);
+
+    assert.equal(h.events.length, 1, "the completion was attempted");
+    assert.deepEqual(
+      verdictsOf(stopped), ["nak:1000"],
+      "asked for again rather than acked away, and rather than left to ack_wait",
+    );
+    assert.deepEqual(
+      order, ["release", "nak"],
+      "renewal stopped, then the lease back, then the message",
+    );
+    assert.equal(settles.length, 1);
+    assert.equal(settles[0].taskId, "t-2");
+    assert.equal(settles[0].claimCount, 7, "the generation the acceptance minted");
+    assert.equal(settles[0].releaseLease, true);
+    assert.deepEqual(settles[0].as, { brainId: "brain-7", attempts: 1 });
+    assert.equal(h.handled.length, 1, "the stopped delivery still never entered the handler");
+    assert.equal(h.errors.length, 1, "and the failure is reported rather than swallowed");
+    assert.match(String((h.errors[0] as Error).message), /no responders/);
+    h.finish();
+  });
 });
 
 describe("a drain that starts while the delivery is queued", () => {
@@ -567,6 +635,129 @@ describe("the accepted generation", () => {
       "the generation the acceptance minted, not the 0 the attempt was born with",
     );
     assert.equal(runner.settles[0].releaseLease, true);
+  });
+
+  it("F16 names the row from the lease URL when the retry has no task_id", async () => {
+    // The rolling-upgrade shape F13 covers for the completion, on the other
+    // path out of a run: a fat message published by an API from before
+    // `task_id` was on the wire names its row only in the lease URL. This
+    // reader looked at `request.task_id` and nothing else, so for that payload
+    // the settle behind the nak was skipped entirely -- no coverage banked and,
+    // worse, the lease left live under an attempt that has just asked for a
+    // redelivery. `acquireFatLease` takes a pristine row, a lapsed fenced one
+    // or one a holder gave back, and a live lease is none of the three: the
+    // redelivery is refused `superseded` and naks in turn until the lease runs
+    // out on its own, which for the whole of a rolling upgrade is every retry
+    // of every legacy message.
+    const legacy = fatRequest({
+      task_id: undefined,
+      run_lease: { url: "http://api.test/v1/internal/tasks/t-legacy/lease", token: "tok" },
+    } as Partial<ExecuteRequest>);
+    const runner = runnerFixture({ failEngine: true });
+    const h = harness({
+      answers: () => granted("preparing", 6),
+      handle: (msg) => runner.run(msg, legacy),
+    });
+
+    await runDelivery(msgFor(legacy), h.deps);
+
+    assert.equal(
+      runner.settles.length, 1,
+      "the attempt was never settled, so its lease stays live against its own redelivery",
+    );
+    assert.equal(runner.settles[0].taskId, "t-legacy", "recovered from the only place it is said");
+    assert.equal(runner.settles[0].claimCount, 6);
+    assert.equal(runner.settles[0].releaseLease, true);
+  });
+});
+
+/**
+ * A kv whose lock is always held by somebody else.
+ *
+ * `create` is how `acquireTaskLock` takes the lock, and a throw is what NATS
+ * answers when the key exists -- which is the whole of what this case needs
+ * from the bucket. Everything else reads as absent: no tombstone for the
+ * session, no retry-pending lease.
+ */
+function lockedOutKv(): KV {
+  return {
+    async get() { return null; },
+    async create() { throw new Error("wrong last sequence: key exists"); },
+    async put() { return 1; },
+    async delete() {},
+  } as unknown as KV;
+}
+
+describe("a dispatch check that hands the delivery back", () => {
+  it("F15 gives the accepted lease back before it naks", async () => {
+    // The lease is taken before the gate and held across every check that
+    // follows it, and `tasks/dispatch.ts` has several that end in a nak asking
+    // for a redelivery that will probe the lock again. Every one of them used
+    // to nak while still holding the lease -- which is precisely what stops the
+    // redelivery getting as far as the lock: `acquireFatLease` has no arm for a
+    // live lease, so the acceptance is refused, the pre-gate naks it before
+    // `handleTask` is reached, and the turn stands still for the rest of the
+    // TTL, one spent delivery at a time. The same window swallows a Stop, since
+    // the arm that answers one -- `stoppedAndUnheld` -- wants `lease_owner IS
+    // NULL`.
+    //
+    // Driven through the real `runDelivery` and the real pre-gate, because the
+    // context the release reads is `runDelivery`'s and a stub would be
+    // asserting the test's own wiring. The lock is held by nobody reachable,
+    // which is the commonest of those checks: a sibling turn in the session.
+    const order: string[] = [];
+    const settles: Array<{ taskId: string; claimCount?: number; releaseLease?: boolean }> = [];
+    const kv = lockedOutKv();
+    bindTaskDispatchKv(kv);
+    bindTaskLockKv(kv);
+    bindTaskRunnerDeps({
+      kv,
+      kvCkpt: fakeKv(),
+      emitter: { async emit() {} } as unknown as NatsEmitter,
+      engine: {} as Engine,
+      sideEffects: {
+        settleRunAttempt: (async (
+          taskId: string, claimCount?: number, _runTime?: unknown, releaseLease?: boolean,
+        ) => {
+          order.push("release");
+          // Several heartbeat periods, so a renewal that was not stopped first
+          // lands inside the release and is recorded -- it would retake the
+          // lease the release is in the middle of handing back.
+          await tick(3);
+          settles.push({ taskId, claimCount, releaseLease });
+        }) as never,
+      } as unknown as TaskRunnerSideEffects,
+    });
+
+    const h = harness({
+      answers: (_n, renewal) => {
+        order.push(renewal.accept ? "accept" : "renew");
+        return granted("preparing", 5);
+      },
+      handle: (msg) => handleTask(msg),
+    });
+    const msg = msgFor(fatRequest());
+    const nak = msg.nak.bind(msg);
+    msg.nak = (ms?: number) => { order.push("nak"); nak(ms); };
+
+    await runDelivery(msg, h.deps);
+
+    assert.ok(order.includes("release"),
+      "the delivery naked while still holding the lease, so its own redelivery is refused "
+      + "`superseded` before it ever probes the lock");
+    assert.deepEqual(
+      order.slice(order.indexOf("release")), ["release", "nak"],
+      "renewal stopped, then the lease back, then the message: a renewal landing after the "
+      + "release retakes the lease, and a nak before it races the redelivery against it",
+    );
+    assert.equal(settles.length, 1);
+    assert.equal(settles[0].taskId, "t-1");
+    assert.equal(settles[0].claimCount, 5, "the generation the acceptance minted");
+    assert.equal(settles[0].releaseLease, true);
+    assert.equal(h.handled.length, 1, "the delivery did reach the handler");
+    assert.match(verdictsOf(msg).at(-1) ?? "", /^nak:/);
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.gate.inflight, 0);
   });
 });
 

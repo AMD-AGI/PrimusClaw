@@ -786,30 +786,29 @@ func (c *K8sSandboxCreator) waitForPodHealthy(ctx context.Context, sandboxName, 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// Track the last known failure reason. The Pod may be deleted between
-	// failure detection and diagnostics collection, so we cache the reason.
-	var lastFailReason string
-
 	for {
 		select {
 		case <-ticker.C:
 			// Check for terminal failure first — collect diagnostics IMMEDIATELY
 			// because the Pod may be deleted shortly after entering Failed state.
+			// The reason travels into the error rather than being re-derived there:
+			// isPodFailed saw the Pod while it still existed, and by the time
+			// getPodFailureDetails looks again the controller may have removed it,
+			// leaving the reason as the only surviving evidence of what went wrong.
 			if failed, reason := c.isPodFailed(checkCtx, sandboxName, namespace); failed {
-				lastFailReason = reason
-				// Collect diagnostics right now while Pod still exists
-				return c.timeoutErrorWithDiagnostics(sandboxName, namespace)
+				return c.podFailureError(sandboxName, namespace, reason)
 			}
-			// Check if Pod disappeared (was deleted by controller)
-			if lastFailReason == "" {
-				podList := &corev1.PodList{}
-				if err := c.client.List(checkCtx, podList,
-					ctrlclient.InNamespace(namespace),
-					ctrlclient.MatchingLabels{sandboxNameLabelKey: sandboxName},
-				); err == nil && len(podList.Items) == 0 {
-					// Pod was found before but now gone — it was likely deleted after failure
-					return fmt.Errorf("sandbox %s/%s pod disappeared (likely crashed and was cleaned up)", namespace, sandboxName)
-				}
+			// Check if Pod disappeared (was deleted by controller). Reaching here means
+			// isPodFailed found nothing, so a Pod-gone observation is all we have —
+			// and the Pod did exist earlier, because the caller only gets this far
+			// after waitForSandboxPodRunning read an IP off it.
+			podList := &corev1.PodList{}
+			if err := c.client.List(checkCtx, podList,
+				ctrlclient.InNamespace(namespace),
+				ctrlclient.MatchingLabels{sandboxNameLabelKey: sandboxName},
+			); err == nil && len(podList.Items) == 0 {
+				// Pod was found before but now gone — it was likely deleted after failure
+				return fmt.Errorf("sandbox %s/%s pod disappeared (likely crashed and was cleaned up)", namespace, sandboxName)
 			}
 			// Check if Pod is truly Running with containers ready
 			if c.isPodReady(checkCtx, sandboxName, namespace) {
@@ -818,22 +817,36 @@ func (c *K8sSandboxCreator) waitForPodHealthy(ctx context.Context, sandboxName, 
 		case <-checkCtx.Done():
 			// maxWait exceeded — check one more time for failure
 			if failed, reason := c.isPodFailed(context.Background(), sandboxName, namespace); failed {
-				lastFailReason = reason
-				return c.timeoutErrorWithDiagnostics(sandboxName, namespace)
+				return c.podFailureError(sandboxName, namespace, reason)
 			}
 			// If Pod is Ready at timeout, it's healthy — let it proceed.
 			if c.isPodReady(context.Background(), sandboxName, namespace) {
 				return nil
 			}
-			// Pod is neither Failed nor Ready after maxWait.
-			// Use cached failure reason if available.
-			if lastFailReason != "" {
-				return fmt.Errorf("sandbox %s/%s failed: %s", namespace, sandboxName, lastFailReason)
-			}
-			// No cached reason — collect whatever diagnostics we can
+			// Pod is neither Failed nor Ready after maxWait, and never was Failed on
+			// any earlier tick either (every such tick returns above), so there is no
+			// reason to report — collect whatever diagnostics we can.
 			return c.timeoutErrorWithDiagnostics(sandboxName, namespace)
 		}
 	}
+}
+
+// podFailureError builds the error for a Pod that isPodFailed has already diagnosed.
+// The reason is a parameter instead of being looked up again because the two reads
+// see different worlds: isPodFailed inspected the Pod while it was still there,
+// whereas getPodFailureDetails below re-lists it and comes back empty once the
+// controller has deleted it. Without the reason in the message, a sandbox whose
+// container exited 1 and was then cleaned up reports only a bare timeout, which is
+// both wrong (nothing timed out) and useless to whoever has to debug the template.
+func (c *K8sSandboxCreator) podFailureError(sandboxName, namespace, reason string) error {
+	diagCtx, diagCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer diagCancel()
+	details := c.getPodFailureDetails(diagCtx, sandboxName, namespace)
+	if details != "" {
+		return fmt.Errorf("sandbox %s/%s failed: %s\n\nPod diagnostics:\n%s",
+			namespace, sandboxName, reason, details)
+	}
+	return fmt.Errorf("sandbox %s/%s failed: %s", namespace, sandboxName, reason)
 }
 
 // isPodReady checks if the sandbox Pod is Running with all containers in Ready state.

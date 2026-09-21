@@ -139,13 +139,30 @@ test("two holders close nothing, build nothing, and refuse startup", { skip }, a
 
   await assert.rejects(
     h.app.initDb(),
-    /more than one active row holds the same chat turn.*s4\/m4/s,
-    "the group is named, because choosing which execution to kill is not a migration's call",
+    /refusing to serve: idx_tasks_chat_turn_unique is absent/,
+    "a turn two executions hold is not a turn a migration may pick a survivor for",
   );
 
   assert.equal((await h.taskRow("task-h1")).status, "running");
   assert.equal((await h.taskRow("task-h2")).status, "running");
   assert.equal(await h.indexIsValid(), null, "and no index claims an invariant that does not hold");
+  // The refusal is deferred to `assertSchema` rather than raised where the
+  // ambiguity is found, so the pod that will not serve is at least holding a
+  // fully migrated database. Raising it at the reconcile aborted `initDb` in
+  // the middle of its DDL -- the half-run migration every other ending in that
+  // function is written to avoid -- and left the operator fixing the turn
+  // before they could find out what else was missing. This table is created
+  // after the reconcile, so it is only here if the migration ran on past it.
+  const later = await h.b.query(
+    "SELECT to_regclass('claw_system_env_vars') IS NOT NULL AS present",
+  );
+  assert.equal(later.rows[0].present, true,
+    "the DDL below the reconcile still ran before the deployment refused");
+  // The groups themselves are still named, where they always were.
+  assert.equal(
+    (await h.taskRow("task-h1")).failure_reason, null,
+    "and neither holder was closed on the way to that answer",
+  );
 });
 
 test("a claim in flight delays the build, which then arrives valid", { skip }, async () => {

@@ -28,6 +28,7 @@ export let kv: KV;
 export let kvCkpt: KV;
 export let kvSystemEnv: KV;
 export let kvTombstones: KV;
+export let kvDagHandles: KV;
 export let kvDoorbellFloor: KV;
 
 // Stream + subject names are stable across environments. Multi-account
@@ -65,6 +66,43 @@ export const BRAIN_TOMBSTONES_BUCKET = "BRAIN_TOMBSTONES";
 // entry that merely ages out delivers no operation at all.
 export const DOORBELL_FLOOR_BUCKET = "DOORBELL_FLOOR";
 const DOORBELL_FLOOR_TTL_MS = 0;
+/**
+ * Sandbox handle registry, per DAG. Brain is the only writer of handle entries
+ * -- see `brain/src/sandbox/handles.ts` -- and this side is the only destroyer.
+ *
+ * Brain also OWNS the bucket's configuration, and nothing on this side corrects
+ * it. `bindDagHandles` and `listDagHandles` attach with `bindOnly: true`, and
+ * DAG_HANDLES is deliberately kept out of `ensureKvBuckets` (see the "Bound,
+ * never ensured" note there, and nats-stream-config.test.ts, which pins that it
+ * never arrives). So the replica count and TTL brain creates it with are the
+ * ones it keeps for the life of the cluster; if they are wrong on brain's first
+ * boot against a fresh cluster they stay wrong until somebody deletes the
+ * bucket by hand.
+ *
+ * That cost is deliberate, because `ensureKvBucket` corrects drift as well as
+ * creating: a configuration declared on this side would be written onto brain's
+ * bucket on every boot of this process, and on a cluster that came up api-first
+ * it would bring the bucket into existence with numbers brain never chose. A
+ * bucket with one owner has one answer about its own configuration.
+ *
+ * This comment used to say the opposite -- that only this side reconciles the
+ * bucket, and that a brain-created one keeps its settings "until api corrects
+ * the drift". No call in this package performs that reconcile. The same false
+ * claim stood in api/src/config.ts and was cited on a sibling review to justify
+ * accepting a defect, which is what a fallback nobody implements is good for.
+ *
+ * For a long time this side did not read the bucket at all: the API's
+ * sandbox-stopper read `BRAIN_REGISTRY` instead, a bucket Brain never writes a
+ * handle to, so every teardown it ran found nothing to tear down and every
+ * DAG's sandboxes outlived their DAG.
+ *
+ * TTL 0 is not a default, it is the requirement: a handle has to live as long
+ * as its DAG, which for a long evaluation is hours, and `BRAIN_REGISTRY`'s
+ * five-minute TTL -- sized for `lock.<key>` -- is what made the wrong bucket
+ * look plausible while quietly discarding the mapping. That TTL is brain's to
+ * declare, for the reason above; this side only binds.
+ */
+export const DAG_HANDLES_BUCKET = "DAG_HANDLES";
 
 // KV bucket config (Plan Y v2). Local consts; brain/src/config.ts mirrors
 // these so a future @claw/shared-config package has one grep target. The
@@ -310,7 +348,11 @@ export async function initNats(): Promise<void> {
   kvCkpt = buckets.checkpoints;
   kvTombstones = buckets.tombstones;
   kvSystemEnv = buckets.systemEnv;
+  kvDagHandles = buckets.dagHandles;
   kvDoorbellFloor = buckets.doorbellFloor;
+  // Last, once every handle above is published, because this one does not end
+  // with the call: the watch runs for the life of the process, keeping the
+  // in-memory doorbell latch tracking the fleet's asserted floor.
   startDoorbellSemanticsWatch(kvDoorbellFloor);
 
   logger.info(
@@ -344,6 +386,8 @@ export interface KvBuckets {
   tombstones: KV;
   systemEnv: KV;
   doorbellFloor: KV;
+  /** Bound rather than provisioned; brain owns it. See `bindDagHandles`. */
+  dagHandles: KV;
 }
 
 /**
@@ -352,13 +396,19 @@ export interface KvBuckets {
  * Apart from `initNats` so that the settings each bucket is created with can be
  * asserted against a fake. The TTL policy is the reason: `exact` is the default
  * and is what a TTL that is a setting needs, `widenOnly` belongs to the
- * tombstone bucket alone (see KvTtlPolicy), and a second bucket quietly given
- * `widenOnly` is a bucket whose TTL a shortened setting can no longer reach --
- * with nothing failing, and nothing in a start-up log to say so.
+ * buckets whose TTL is not a setting this process owns (see KvTtlPolicy) --
+ * BRAIN_TOMBSTONES, derived from the event stream's retention, and
+ * DAG_HANDLES, which brain also creates. A bucket whose TTL *is* a setting and
+ * is quietly given `widenOnly` is one a shortened setting can no longer reach
+ * -- with nothing failing, and nothing in a start-up log to say so.
  */
 export async function ensureKvBuckets(
   retention: EventStreamRetention,
   ensure: EnsureKvBucket = ensureKvBucket,
+  // Separate from `ensure` on purpose: this one attaches and never configures,
+  // and a test that watches `ensure` has to be able to see that DAG_HANDLES is
+  // not among the buckets this process opens with an opinion.
+  bind: () => Promise<KV> = bindDagHandles,
 ): Promise<KvBuckets> {
   return {
     // Brain Registry KV: short-lived coordination state.
@@ -386,6 +436,22 @@ export async function ensureKvBuckets(
       ttl: DOORBELL_FLOOR_TTL_MS,
       replicas: BRAIN_REGISTRY_REPLICAS,
     }),
+    // DAG sandbox handles. Brain owns this bucket: it creates it at boot and
+    // writes every row. This side attaches to destroy rows -- whoever stops a
+    // workload frees its handle, and since #46 this side is one of the things
+    // that stops them.
+    //
+    // Bound, never ensured. `ensureKvBucket` does not only create: it corrects
+    // drift, so an attach from here with its own replica setting would rewrite
+    // Brain's bucket config on every boot, and on an api-first cluster would
+    // create it with a count Brain never chose. A bucket with one owner has one
+    // answer to how many replicas it has.
+    //
+    // An absent bucket is not fatal here. It means Brain has not booted yet, so
+    // there are no handles to destroy; the attach is retried on next use and
+    // teardown reports `unconfirmed` in the meantime, which is the same answer
+    // it gives for every other unreadable-KV case.
+    dagHandles: await bind(),
   };
 }
 
@@ -616,7 +682,8 @@ export function kvTtlTooNarrow(currentMaxAgeNs: number, desiredMaxAgeNs: number)
  * What a start-up may do to a bucket's existing TTL.
  *
  * `exact` reconciles in both directions, which is what a TTL that is a setting
- * needs. `BRAIN_REGISTRY_TTL_MS` is the one that matters: `lock.<key>` lives in
+ * needs. `widenOnly` belongs to the buckets whose TTL is not one -- the
+ * tombstone bucket, and DAG_HANDLES, which brain may have created. `BRAIN_REGISTRY_TTL_MS` is the one that matters: `lock.<key>` lives in
  * that bucket, so the TTL is how long a dead worker's claim survives it, and the
  * lease reap grace and the lock-blocked takeover deadlines are re-derived from
  * the same number. An operator who shortens it and leaves the bucket at the old,
@@ -706,6 +773,44 @@ export interface EnsureKvBucketOpts {
  * we drive updates via jsm.streams.update so we can correct drift that
  * js.views.kv() (which is attach-only on existing buckets) cannot fix.
  */
+/**
+ * Attach to Brain's DAG handle bucket without ever creating or altering it.
+ *
+ * Returns a lazy proxy when the bucket is not there yet: every method retries
+ * the bind, so a cluster that starts api-first recovers as soon as Brain
+ * creates it, without this process holding an opinion about its configuration.
+ */
+export async function bindDagHandles(): Promise<KV> {
+  const bind = async (): Promise<KV> => js.views.kv(DAG_HANDLES_BUCKET, { bindOnly: true });
+  try {
+    return await bind();
+  } catch (err) {
+    logger.warn(
+      { bucket: DAG_HANDLES_BUCKET, err: (err as Error)?.message },
+      "nats.dag_handles_not_bound_yet",
+    );
+    let real: KV | null = null;
+    const ensureBound = async (): Promise<KV> => (real ??= await bind());
+    return new Proxy({} as KV, {
+      get(_t, prop) {
+        // `then` must stay absent. Returning a function for it makes this
+        // object a thenable, so the `await` that receives it calls
+        // `proxy.then(resolve, reject)` -- which binds the bucket and then
+        // invokes a `then` the real KV does not have. The awaited promise never
+        // settles, and the process either dies on the unhandled rejection or
+        // hangs in start-up. Same reasoning for the symbol keys a runtime
+        // probes when it inspects a value.
+        if (typeof prop !== "string") return undefined;
+        if (prop === "then" || prop === "catch" || prop === "finally") return undefined;
+        return async (...args: unknown[]) => {
+          const kv = await ensureBound();
+          return (kv as unknown as Record<string, (...a: unknown[]) => unknown>)[prop](...args);
+        };
+      },
+    });
+  }
+}
+
 export async function ensureKvBucket(
   name: string,
   opts: EnsureKvBucketOpts,

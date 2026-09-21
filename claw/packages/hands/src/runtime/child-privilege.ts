@@ -191,6 +191,13 @@ function persistAllocations(table: Map<string, number>): void {
  */
 const WORKSPACE_FACING = [
   "PATH", "HOME", "SHELL", "TERM", "TZ", "LANG", "LC_ALL", "PWD", "USER", "LOGNAME",
+  // The session a command is running for. Named here because a command needs to
+  // be able to say which session it belongs to -- Hyperloom stamps it into its
+  // run manifest and its LLM attribution -- and because the alternative is what
+  // was there before: the same value reaching the child anyway under a
+  // second, application-specific name. An identifier, not a credential; the
+  // credential is AUTH_CLAW_TOKEN, which this list deliberately omits.
+  "CLAW_SESSION_ID",
 ];
 
 /**

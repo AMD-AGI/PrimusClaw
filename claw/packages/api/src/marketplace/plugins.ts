@@ -68,12 +68,49 @@ function requireNonBlankVersion(raw: unknown): string {
   return s;
 }
 
+// The trimmable set: JavaScript's ``\s`` (ECMA-262 WhiteSpace plus the line
+// terminators, which already covers NBSP and the BOM) widened by the three
+// zero-width joiners/space that ``\s`` leaves out. None of these are surrogate
+// halves, so scanning by code unit never splits an astral character.
+function isOuterTrimmable(code: number): boolean {
+  return (
+    code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c
+    || code === 0x0d || code === 0x20 || code === 0xa0 || code === 0x1680
+    || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x200b || code === 0x200c || code === 0x200d
+    || code === 0x2028 || code === 0x2029 || code === 0x202f
+    || code === 0x205f || code === 0x3000 || code === 0xfeff
+  );
+}
+
 // Forward declaration helper: ``trimOuterWhitespace`` is defined further down
 // alongside the SKILL.md parsers. We expose ``trimAll`` here so the request
 // validation helpers above (which run before that block in source order at
 // call time) share the same whitespace policy without forcing a re-order.
+//
+// SECURITY: scanned from both ends rather than written
+// ``s.replace(/^[\s\u00a0\u200b\u200c\u200d\ufeff]+|[...]+$/g, "")``, which is
+// what this used to be. That spelling is quadratic on its *trailing*
+// alternative: nothing anchors where a run of whitespace may begin, so the
+// engine retries at every offset in the string and, at each one, consumes the
+// whole run before ``$`` fails and it gives the characters back one at a time.
+//
+// Both entry points hand it attacker-sized input. The request-validation
+// helpers above pass ``name`` / ``display_name`` / ``version`` straight off a
+// JSON body bounded only by the 4 MiB ``bodyLimit``, and the
+// ``trimOuterWhitespace`` alias below runs this over whole ``SKILL.md`` bodies
+// lifted out of an uploaded archive. Measured: one non-space character
+// followed by 80 KB of tabs blocks the event loop for 2.5s, and the cost is
+// quadratic from there -- a single request carrying a few such fields is an
+// API outage, not a slow request. The regex spelling is shorter; it is also a
+// denial of service. Do not put it back. Covered by
+// ``test/redos-untrusted-input.test.ts``.
 function trimAll(s: string): string {
-  return s.replace(/^[\s\u00a0\u200b\u200c\u200d\ufeff]+|[\s\u00a0\u200b\u200c\u200d\ufeff]+$/g, "");
+  let i = 0;
+  let j = s.length;
+  while (i < j && isOuterTrimmable(s.charCodeAt(i))) i++;
+  while (j > i && isOuterTrimmable(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
 }
 
 function coalesceIsPublic(raw: unknown): boolean {
@@ -1205,12 +1242,51 @@ export async function uploadIconBytes(
   const key = `icons/${userId}/${Date.now()}_${safe}`;
   await s3PutBytes(key, buf, contentType);
   if (S3_API_ENDPOINT) {
-    return `${S3_API_ENDPOINT.replace(/\/+$/, "")}/${S3_PLUGINS_BUCKET}/${key}`;
+    return `${stripTrailingSlashes(S3_API_ENDPOINT)}/${S3_PLUGINS_BUCKET}/${key}`;
   }
   return `s3://${S3_PLUGINS_BUCKET}/${key}`;
 }
 
 // --- import (simplified zip discover/commit) --------------------------------------
+
+// SECURITY: every archive path below is normalized through these three
+// helpers rather than through the regexes they replaced
+// (``.replace(/\\/g, "/")``, ``.replace(/^\/+|\/+$/g, "")`` and
+// ``.replace(/\/+$/, "")``).
+//
+// The two slash-trimming regexes are quadratic in the length of a trailing
+// ``/`` run for exactly the reason ``trimAll`` above was: ``\/+$`` is not
+// anchored at the front, so the engine starts a fresh attempt at every offset
+// and each attempt walks the whole run and then backtracks it character by
+// character looking for ``$`` that is not there.
+//
+// The subject is a zip entry name. A zip entry name is chosen by whoever
+// uploaded the archive and the format allows it to be 64 KB long, so
+// ``"a" + "/".repeat(60000) + "b"`` is a legal entry, costs ~1.5s of blocked
+// event loop per normalization, and an archive may carry thousands of them --
+// and several of these loops normalize *every* entry in the zip. Keep these
+// three regex-free.
+// Exported, with the three below, for the ReDoS regression test.
+export function toPosixPath(s: string): string {
+  return s.indexOf("\\") < 0 ? s : s.split("\\").join("/");
+}
+
+// Equivalent of ``.replace(/\/+$/, "")``: drop the trailing run of ``/``.
+export function stripTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 0x2f) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
+// Equivalent of ``.replace(/^\/+|\/+$/g, "")``: drop the leading *and*
+// trailing runs of ``/``. An all-slash string collapses to "", as it did.
+export function stripOuterSlashes(s: string): string {
+  let i = 0;
+  let j = s.length;
+  while (i < j && s.charCodeAt(i) === 0x2f) i++;
+  while (j > i && s.charCodeAt(j - 1) === 0x2f) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
 
 // Hard cap on any discovered archive (GitHub zipball or direct upload).
 // Mirrors Python ``MAX_ZIP_BYTES`` in tool_import.py.
@@ -1294,7 +1370,29 @@ async function stageDelete(archiveKey: string): Promise<void> {
 
 // Strict skill/rule name charset; also used to validate ``name_override`` from the UI.
 // Parity with Python ``SKILL_NAME_SAFE`` in tool_import.py.
+//
+// Anchored at both ends, so unlike the trimming patterns this one is linear:
+// ``^`` pins the only start offset the engine may try.
 const SKILL_NAME_SAFE = /^[A-Za-z0-9._-]+$/;
+
+// Equivalent of ``.replace(/^['"]+|['"]+$/g, "")``: drop the leading and
+// trailing runs of ASCII quotes.
+//
+// SECURITY: a scan for the same reason as the helpers above -- CodeQL did not
+// flag this one, but it is the same defect. ``['"]+$`` has no anchor, so on a
+// long quote run that is not at the end of the string the engine restarts at
+// every offset (80 KB of ``"`` between two letters: ~2.3s of blocked event
+// loop). The subject is the value half of a ``title:`` / ``name:`` line in a
+// ``SKILL.md`` pulled out of an uploaded archive, and nothing bounds the
+// length of a line in that file.
+export function stripOuterQuotes(s: string): string {
+  const quote = (c: number) => c === 0x22 || c === 0x27; // " '
+  let i = 0;
+  let j = s.length;
+  while (i < j && quote(s.charCodeAt(i))) i++;
+  while (j > i && quote(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
 
 // Fold a raw ``name:`` value to the portable charset.
 // Keeps alnum, CJK, ``-_.``; spaces collapse to ``-``; other chars drop.
@@ -1303,7 +1401,7 @@ function normalizeSkillNameValue(raw: string): string {
   // Python ``str.strip("\"'")`` peels any run of ``"`` or ``'`` from both ends,
   // not just a single matched pair. Mirror that, otherwise values like
   // ``""foo""`` would leak a stray quote into the DB ``name``.
-  s = s.replace(/^['"]+|['"]+$/g, "");
+  s = stripOuterQuotes(s);
   if (!s) return "";
   const buf: string[] = [];
   for (const c of s) {
@@ -1315,6 +1413,9 @@ function normalizeSkillNameValue(raw: string): string {
       buf.push("-");
     }
   }
+  // ``/-+/g`` collapses every run first, so by the time ``/^-+|-+$/g`` runs no
+  // run is longer than one character and the unanchored ``-+$`` has nothing to
+  // backtrack over -- measured linear. Keep the collapse ahead of the trim.
   return buf.join("").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
 }
 
@@ -1333,7 +1434,8 @@ function normalizeNewlines(s: string): string {
 // otherwise leak into the DB. Aliased to the same regex as ``trimAll`` (the
 // inbound request-validation helper) so file-derived and form-derived values
 // share one whitespace policy.
-const trimOuterWhitespace = trimAll;
+// Exported for the ReDoS regression test; production callers are in-module.
+export const trimOuterWhitespace = trimAll;
 
 // First top-level ``title:`` line wins, falling back to the first ``name:``
 // line. Both keys are matched case-insensitively (``Title:``, ``NAME:`` etc).
@@ -1454,11 +1556,11 @@ function minimalSkillRoots(roots: string[]): string[] {
 // Extract all files whose archive path sits under the skill root ``rel``.
 // The top-level root (``rel===""``) collects only ``SKILL.md`` (parity with Python).
 function collectSkillFiles(zip: AdmZip, rel: string): Array<[string, Buffer]> {
-  const clean = rel.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const clean = stripOuterSlashes(toPosixPath(rel));
   const out: Array<[string, Buffer]> = [];
   for (const entry of zip.getEntries()) {
     if (entry.isDirectory) continue;
-    const name = entry.entryName.replace(/\\/g, "/");
+    const name = toPosixPath(entry.entryName);
     if (name.split("/").includes("..")) continue;
     let inner: string;
     if (clean) {
@@ -1482,7 +1584,7 @@ function collectSkillFiles(zip: AdmZip, rel: string): Array<[string, Buffer]> {
 // The zip-side ``rel`` is intentionally not leaked into the S3 layout so outer
 // archive prefixes like ``my_repo/.cursor/skills/foo/`` collapse to ``skills/foo/``.
 function skillS3ObjectSuffix(inner: string, skillName: string): string {
-  const innerN = inner.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const innerN = stripOuterSlashes(toPosixPath(inner));
   if (!innerN || innerN.split("/").includes("..")) {
     throw new BadRequestError("invalid skill inner path");
   }
@@ -1597,7 +1699,7 @@ function ruleDescriptionFromFileBody(text: string): string {
 
 // True when any directory segment equals ``rules`` and a file name follows it.
 function pathUnderRulesFolder(norm: string): boolean {
-  const parts = norm.replace(/\\/g, "/").split("/").filter(Boolean);
+  const parts = toPosixPath(norm).split("/").filter(Boolean);
   if (!parts.length) return false;
   for (let i = 0; i < parts.length; i++) {
     if (parts[i].toLowerCase() === "rules" && parts.length > i + 1) return true;
@@ -1623,9 +1725,9 @@ function guessRuleContentType(inner: string): string {
 
 // Tolerant lookup by normalized entry name (used by rule/hooks commit paths).
 function zipResolveEntry(zip: AdmZip, target: string): AdmZip.IZipEntry | null {
-  const want = target.replace(/\\/g, "/").replace(/\/+$/, "");
+  const want = stripTrailingSlashes(toPosixPath(target));
   for (const e of zip.getEntries()) {
-    const n = e.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const n = stripTrailingSlashes(toPosixPath(e.entryName));
     if (n === want) return e;
   }
   return null;
@@ -1635,12 +1737,33 @@ function zipResolveEntry(zip: AdmZip, target: string): AdmZip.IZipEntry | null {
 
 const TOOL_NAME_SEGMENT_UNSAFE = /[^A-Za-z0-9._-]+/g;
 
+// Equivalent of ``.replace(/^[._-]+|[._-]+$/g, "")``: drop the leading and
+// trailing runs of the three joiner characters.
+//
+// SECURITY: written as a scan for the same reason as the slash helpers above.
+// ``[._-]+$`` has nothing anchoring its start, so on a long run of ``-`` that
+// is not at the end of the string the engine restarts at every offset and
+// backtracks the whole run at each one -- 80 KB of ``-`` between two letters
+// costs ~2.7s of blocked event loop. ``raw`` here is a hooks ``tag`` or an
+// archive entry basename, both attacker-chosen and both long enough to matter.
+function stripOuterNameJoiners(s: string): string {
+  const joiner = (c: number) => c === 0x2e || c === 0x5f || c === 0x2d; // . _ -
+  let i = 0;
+  let j = s.length;
+  while (i < j && joiner(s.charCodeAt(i))) i++;
+  while (j > i && joiner(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
+
 // Fold an arbitrary string to the ``[A-Za-z0-9._-]`` charset for tool-name
 // suffix segments; strip leading/trailing ``._-`` and cap to ``maxLen``.
-function sanitizeToolNameSegment(raw: string, maxLen = 200): string {
+//
+// ``TOOL_NAME_SEGMENT_UNSAFE`` itself is safe to leave as a regex: a global
+// ``[^...]+`` replace with nothing following it never backtracks.
+export function sanitizeToolNameSegment(raw: string, maxLen = 200): string {
   const s = (raw || "").trim();
   if (!s) return "";
-  const out = s.replace(TOOL_NAME_SEGMENT_UNSAFE, "_").replace(/^[._-]+|[._-]+$/g, "");
+  const out = stripOuterNameJoiners(s.replace(TOOL_NAME_SEGMENT_UNSAFE, "_"));
   return out ? out.slice(0, maxLen) : "";
 }
 
@@ -1663,7 +1786,7 @@ function flattenHooksCommitSelections(selections: JsonObject[]): JsonObject[] {
       for (const item of scripts) {
         if (typeof item !== "object" || item === null) continue;
         const rec = item as JsonObject;
-        const rel = String(rec.relative_path ?? "").trim().replace(/\\/g, "/");
+        const rel = toPosixPath(String(rec.relative_path ?? "").trim());
         if (!rel) continue;
         const row: JsonObject = { ...sel };
         delete row.scripts;
@@ -1672,7 +1795,7 @@ function flattenHooksCommitSelections(selections: JsonObject[]): JsonObject[] {
       }
       continue;
     }
-    const rel = String(sel.relative_path ?? "").trim().replace(/\\/g, "/");
+    const rel = toPosixPath(String(sel.relative_path ?? "").trim());
     if (rel) flat.push(sel);
   }
   return flat;
@@ -1684,7 +1807,7 @@ function hookScriptsToDeriveRows(
 ): Array<[string, string, Buffer, string]> {
   const rows: Array<[string, string, Buffer, string]> = [];
   for (const s of hookScripts) {
-    const rel = String(s.relative_path ?? "").trim().replace(/\\/g, "/");
+    const rel = toPosixPath(String(s.relative_path ?? "").trim());
     if (rel) rows.push([rel, "", Buffer.alloc(0), ""]);
   }
   return rows;
@@ -1701,7 +1824,7 @@ function deriveHooksToolName(
     if (seg) return prefix + seg;
   }
   if (rows.length) {
-    const bn = path.posix.basename(String(rows[0][0]).replace(/\\/g, "/"));
+    const bn = path.posix.basename(toPosixPath(String(rows[0][0])));
     const seg = sanitizeToolNameSegment(bn);
     if (seg) return prefix + seg;
   }
@@ -1711,7 +1834,7 @@ function deriveHooksToolName(
 // True when ``norm`` lives under a directory segment named ``hooks`` (case-insensitive).
 // Matches both ``hooks/x.sh`` and ``repo/hooks/sub/x.sh``; excludes files literally named ``hooks``.
 function pathUnderHooksFolder(norm: string): boolean {
-  const n = norm.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const n = stripOuterSlashes(toPosixPath(norm));
   if (!n || n.split("/").includes("..")) return false;
   const nl = n.toLowerCase();
   if (nl.startsWith("hooks/")) return true;
@@ -1721,7 +1844,7 @@ function pathUnderHooksFolder(norm: string): boolean {
 // Tolerant textual containment: full path / basename / any trailing subpath.
 function pathStringInHooksJson(norm: string, hooksText: string): boolean {
   if (!hooksText) return false;
-  const n = norm.replace(/\\/g, "/").trim();
+  const n = toPosixPath(norm).trim();
   if (n && hooksText.includes(n)) return true;
   const bn = path.posix.basename(n);
   if (bn && hooksText.includes(bn)) return true;
@@ -1748,7 +1871,7 @@ function firstHooksJsonPathInZip(zip: AdmZip): string | null {
   const paths: string[] = [];
   for (const e of zip.getEntries()) {
     if (e.isDirectory) continue;
-    const n = e.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const n = stripTrailingSlashes(toPosixPath(e.entryName));
     if (path.posix.basename(n).toLowerCase() === "hooks.json") paths.push(n);
   }
   paths.sort();
@@ -1764,9 +1887,9 @@ function zipHasHooksJsonFile(data: Buffer): boolean {
 // Return the inclusive path starting at the first ``folder/`` segment.
 // Example: ``repo/.cursor/hooks/a.py`` -> ``hooks/a.py``.
 function s3SuffixAfterFolder(archivePath: string, folder: string): string {
-  const n = archivePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const n = stripOuterSlashes(toPosixPath(archivePath));
   if (!n || n.split("/").includes("..")) throw new Error("invalid archive path");
-  const fl = folder.replace(/^\/+|\/+$/g, "").toLowerCase();
+  const fl = stripOuterSlashes(folder).toLowerCase();
   const low = n.toLowerCase();
   const needle = `/${fl}/`;
   const idx = low.indexOf(needle);
@@ -1777,7 +1900,7 @@ function s3SuffixAfterFolder(archivePath: string, folder: string): string {
 
 // Archive path -> key suffix under ``plugins/{id}/{ver}/hooks/`` (no leading ``hooks/``).
 function hooksInnerPathFromArchive(archiveRel: string): string {
-  const r = archiveRel.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const r = stripOuterSlashes(toPosixPath(archiveRel));
   if (!r || r.split("/").includes("..")) throw new Error("invalid archive path for hooks s3 key");
   let seg: string;
   try {
@@ -1816,12 +1939,12 @@ function importAllowsHooks(meta: JsonObject, fromStagedArchive: boolean): boolea
 // Collect skill roots, merge nested SKILL.md into their outer root, and build
 // one candidate per root with title/description parsed from SKILL.md.
 function scanZipSkills(data: Buffer, subdir = ""): JsonObject[] {
-  const sub = subdir.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const sub = stripOuterSlashes(toPosixPath(subdir));
   const zip = new AdmZip(data);
   const rootsRaw: string[] = [];
   const seen = new Set<string>();
   for (const ent of zip.getEntries()) {
-    const n = ent.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const n = stripTrailingSlashes(toPosixPath(ent.entryName));
     if (sub && !(n === sub || n.startsWith(`${sub}/`))) continue;
     if (path.posix.basename(n).toLowerCase() !== "skill.md") continue;
     const parent = path.posix.dirname(n);
@@ -1866,7 +1989,7 @@ function scanZipForRules(data: Buffer): JsonObject[] {
   const paths: string[] = [];
   for (const info of zip.getEntries()) {
     if (info.isDirectory) continue;
-    const norm = info.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const norm = stripTrailingSlashes(toPosixPath(info.entryName));
     if (norm.split("/").includes("..")) continue;
     if (!pathUnderRulesFolder(norm)) continue;
     paths.push(norm);
@@ -1896,7 +2019,7 @@ function scanZipForHooks(data: Buffer): JsonObject[] {
   const hooksPaths: string[] = [];
   for (const e of zip.getEntries()) {
     if (e.isDirectory) continue;
-    const n = e.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const n = stripTrailingSlashes(toPosixPath(e.entryName));
     if (path.posix.basename(n).toLowerCase() === "hooks.json") hooksPaths.push(n);
   }
   hooksPaths.sort();
@@ -1910,7 +2033,7 @@ function scanZipForHooks(data: Buffer): JsonObject[] {
   const out: JsonObject[] = [];
   for (const info of zip.getEntries()) {
     if (info.isDirectory) continue;
-    const norm = info.entryName.replace(/\\/g, "/").replace(/\/+$/, "");
+    const norm = stripTrailingSlashes(toPosixPath(info.entryName));
     if (norm.split("/").includes("..")) continue;
     if (norm === hooksPath) continue;
     // Any other ``hooks.json`` members are non-authoritative; never emitted as script candidates.
@@ -1943,7 +2066,7 @@ function importCandidateSortKey(a: JsonObject, b: JsonObject): number {
     const k = t === "hooks"
       ? String(item.hooks_json_relative_path ?? "")
       : String(item.relative_path ?? "");
-    return k.replace(/\\/g, "/");
+    return toPosixPath(k);
   };
   return keyOf(a).localeCompare(keyOf(b));
 }
@@ -1956,10 +2079,10 @@ function scanZipForImport(data: Buffer): JsonObject[] {
     const hookScripts = scanZipForHooks(data);
     let hooksPath = "";
     if (hookScripts.length > 0) {
-      hooksPath = String(hookScripts[0].hooks_json_relative_path ?? "").replace(/\\/g, "/");
+      hooksPath = toPosixPath(String(hookScripts[0].hooks_json_relative_path ?? ""));
     } else {
       const zip = new AdmZip(data);
-      hooksPath = (firstHooksJsonPathInZip(zip) ?? "").replace(/\\/g, "/");
+      hooksPath = toPosixPath(firstHooksJsonPathInZip(zip) ?? "");
     }
     const nestedScripts: JsonObject[] = [];
     for (const c of hookScripts) {
@@ -2048,7 +2171,7 @@ async function commitOneSkill(
   opts: CommitWorkerOpts,
 ): Promise<JsonObject> {
   // ``.trim()`` mirrors Python ``(sel.get("relative_path") or "").strip()``.
-  const rel = String(sel.relative_path ?? "").trim().replace(/\\/g, "/");
+  const rel = toPosixPath(String(sel.relative_path ?? "").trim());
   const nameOverride = String(sel.name_override ?? "").trim();
   const base = index.get(rel);
   if (!base) {
@@ -2168,7 +2291,7 @@ async function commitOneRule(
   opts: CommitWorkerOpts,
 ): Promise<JsonObject> {
   // ``.trim()`` mirrors Python ``(sel.get("relative_path") or "").strip()``.
-  const rel = String(sel.relative_path ?? "").trim().replace(/\\/g, "/");
+  const rel = toPosixPath(String(sel.relative_path ?? "").trim());
   const nameOverride = String(sel.name_override ?? "").trim();
   const base = index.get(rel);
   if (!base) {
@@ -2284,7 +2407,7 @@ async function commitHooksBatch(
   const rows: Row[] = [];
 
   for (const sel of flat) {
-    const rel = String(sel.relative_path ?? "").trim().replace(/\\/g, "/");
+    const rel = toPosixPath(String(sel.relative_path ?? "").trim());
     if (!rel) continue;
     if (seen.has(rel)) continue;
     seen.add(rel);
@@ -2292,7 +2415,7 @@ async function commitHooksBatch(
     if (!base) {
       return { type: "hooks", status: "failed", error: `hook file not in archive: ${rel}` };
     }
-    const hp = String(base.hooks_json_relative_path ?? "").replace(/\\/g, "/");
+    const hp = toPosixPath(String(base.hooks_json_relative_path ?? ""));
     hooksPaths.add(hp);
     // Script display labels originate from discover; bundle name override is separate.
     const scriptName = String(base.name ?? "");
@@ -2403,7 +2526,7 @@ async function commitHooksBatch(
 
   const tid = Number(row.id);
   const hooksDir = `${s3PluginsCommitPrefix(tid, opts.ver)}hooks/`;
-  const hooksPrefix = hooksDir.replace(/\/+$/, "");
+  const hooksPrefix = stripTrailingSlashes(hooksDir);
 
   try {
     await s3PutBytes(`${hooksDir}hooks.json`, rawH, "application/json");
@@ -2491,7 +2614,7 @@ export async function commitImportSelections(
     } else if (typ === "rule") {
       results.push(await commitOneRule(sel, zip, meta, idxRule, workerOpts));
     } else {
-      const rel = String(sel.relative_path ?? "").trim().replace(/\\/g, "/");
+      const rel = toPosixPath(String(sel.relative_path ?? "").trim());
       results.push({
         type: typ, relative_path: rel,
         status: "failed", error: "type must be skill, rule, or hooks",
