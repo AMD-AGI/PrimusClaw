@@ -65,6 +65,18 @@ RUN apt-get update \
       echo "no extra CA anchors requested (EXTRA_CA_CERT_URLS empty)."; \
     fi
 
+# Node does not read the system trust store. `update-ca-certificates` above puts
+# the anchors where curl, wget and openssl find them, and npm -- which is Node --
+# goes on verifying against its own bundled roots, so behind the TLS-intercepting
+# proxy this block exists to support, `npm ci` below failed with
+# UNABLE_TO_VERIFY_LEAF_SIGNATURE while curl in the same stage succeeded. Running
+# after the anchors are installed is not what saves it; this is. `runtime` sets
+# the same variable for the same reason.
+#
+# Harmless with no anchors requested: the path is the distro's own bundle, which
+# is what Node would otherwise approximate from its built-in list.
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
 # Bun is downloaded HERE, in the stage that just installed the EXTRA_CA_CERT_URLS
 # anchors, and the compile stage below takes the binary from this stage instead
 # of fetching its own. Those anchors exist in exactly two places -- this stage,
@@ -73,8 +85,8 @@ RUN apt-get update \
 # the block above exists to support, that fetch cannot validate the certificate
 # the proxy substitutes and the image build dies on
 # "curl: (60) SSL certificate problem". `npm ci` below reaches the registry over
-# the same intercepted HTTPS and survives only because it, too, runs after this
-# block. Keep new downloads in this stage; packages/api/test/dockerfile-ca-anchors.test.ts
+# the same intercepted HTTPS, and for it the anchors are not enough on their own
+# -- see the NODE_EXTRA_CA_CERTS line above. Keep new downloads in this stage; packages/api/test/dockerfile-ca-anchors.test.ts
 # reads the stage graph and fails when one appears anywhere else.
 #
 # The archive is pinned and its checksum verified rather than piping

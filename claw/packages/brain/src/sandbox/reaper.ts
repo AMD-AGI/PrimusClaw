@@ -488,8 +488,10 @@ export async function reapPendingHands(
     // workload it names. Reaping on the session alone stopped it.
     //
     // A pending entry with no task on it predates this field and can only have
-    // come from a process that was running before this rollout; it is reaped as
-    // before, because the alternative is leaking every such workload.
+    // come from a process running before this rollout -- so it is not this
+    // caller's, and the block below refuses it. That costs a workload this path
+    // will not reclaim; reaping it instead cost a live sibling's sandbox, which
+    // is the defect this gate exists for.
     if (expected?.taskId && info.taskId && info.taskId !== expected.taskId) {
       logger.info(
         { sessionId, workloadId: info.workloadId, entryTaskId: info.taskId,
@@ -589,11 +591,15 @@ const SWEEPER_HEALTH_TIMEOUT_MS = 3_000;
  * whether we could find out.
  *
  * `sessionHasActiveRunLease` is the same read and the same tombstone rule; what
- * it does not have is the third answer. It returns `false` when the bucket
- * cannot be read, because its callers turn a `false` into a skipped reclaim
- * that the next pass retries. The pending collector turns a `false` into a stop
- * against a user's sandbox, and there is nothing after that to retry, so "the
- * store did not answer" has to stay distinguishable from "nobody is running".
+ * it does not have is the third answer. It collapses an unreadable bucket into
+ * `false`, and `false` is not inert at its callers: the multi-node sweep
+ * (`mn_sweeper`, below) reads it as licence and goes on to `reclaimClusters`,
+ * which deletes the user's cluster and cannot be undone by a later pass. That
+ * is a hazard in the existing helper rather than something introduced here, and
+ * it is the reason this function was added instead of reusing it: the pending
+ * collector would inherit the same collapse, and a stop issued against a live
+ * sandbox because a KV read timed out has nothing after it to retry. "The store
+ * did not answer" has to stay distinguishable from "nobody is running".
  */
 async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free" | "unknown"> {
   let lock;

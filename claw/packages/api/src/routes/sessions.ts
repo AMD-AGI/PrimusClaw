@@ -764,7 +764,13 @@ async function backfillCachedRunId(
  * kind a run id on purpose, `rejected` and `publish_failed` have already rolled
  * their session row back, and `publish_unknown`'s body names nothing a caller
  * could come back for. A cached 2xx is therefore the only handle anyone has on
- * work that exists; a cached failure is a record that nothing exists.
+ * work that exists; a cached failure is a record that names nothing.
+ *
+ * Which is not the same as a record that nothing exists, and the difference is
+ * `publish_unknown`: its session row stands and its run may be executing. The
+ * rule below turns on what the client can come back FOR, not on what the system
+ * is left holding -- an unnameable run is a leak for the sweeps to find, and
+ * overwriting the key that names a real one would add a second.
  *
  * Hence the rule, in one line: a success may take the key from a failure, and
  * nothing else may take the key from anything.
@@ -781,8 +787,11 @@ async function backfillCachedRunId(
  *     the client (neither names anything), and of two successes only one can be
  *     the key's answer; overwriting the first would orphan the run it names to
  *     no one's benefit, so the churn buys nothing. `lock_lost_before_create`
- *     already refuses any request whose lock dropped BEFORE it created, so two
- *     live successes on one key need two drops landing after two creates.
+ *     refuses any request whose lock dropped BEFORE it created, which bounds
+ *     when a second success can appear but does not make one rare: a single
+ *     lost lock is enough to produce two 200s and two queued runs, reproduced
+ *     against a real Postgres. The rule is what keeps the key pointing at one
+ *     of them rather than at whichever finished last.
  *   - an expired row: claimed by anyone. `readIdempotency` refuses to replay
  *     it, so no client is holding it as a handle and the key is free again.
  *

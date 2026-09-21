@@ -186,3 +186,35 @@ test("R3 the Bun archive is one of the fetches R2 looked at", () => {
       "this scan cannot find means R2 stopped guarding the thing it was written for.",
   );
 });
+
+test("R4 the stage that runs npm also tells Node about those anchors", () => {
+  // The anchors go into the system trust store, and Node does not read it: npm
+  // verifies against its own bundled roots. So behind the TLS-intercepting
+  // proxy this whole block exists for, `curl` in the builder succeeded while
+  // `npm ci` two lines later failed with UNABLE_TO_VERIFY_LEAF_SIGNATURE --
+  // measured on node 26.9.0 with a private root installed into a scratch
+  // system store. Ordering after `update-ca-certificates` is not what makes
+  // npm work; NODE_EXTRA_CA_CERTS is.
+  //
+  // Asserted on the stage graph rather than on a line number, because the point
+  // is the relationship: whichever stage reaches a registry over https with npm
+  // has to have set it first.
+  const npmRuns = INSTRUCTIONS.filter(
+    (ins) => ins.keyword === "RUN" && /\bnpm\b/.test(ins.text),
+  );
+  assert.ok(npmRuns.length > 0, "the build still runs npm somewhere");
+
+  for (const run of npmRuns) {
+    const envBefore = INSTRUCTIONS.some(
+      (ins) => ins.keyword === "ENV"
+        && /NODE_EXTRA_CA_CERTS\s*=/.test(ins.text)
+        && ins.stage === run.stage
+        && ins.index < run.index,
+    );
+    assert.ok(
+      envBefore,
+      `stage ${run.stage} runs npm without NODE_EXTRA_CA_CERTS set before it: ${
+        run.text.slice(0, 80)} -- behind a TLS-intercepting proxy npm cannot verify the registry`,
+    );
+  }
+});
