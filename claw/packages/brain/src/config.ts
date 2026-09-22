@@ -776,13 +776,14 @@ export const SYSTEM_ENV_BUCKET = env("SYSTEM_ENV_BUCKET", "SYSTEM_ENV");
 // non-clustered mode (err 10074) for every one that gets missed.
 export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
 export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS);
-// At least the keepalive sweep-span default (SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=540):
-// parked handles renew on the sweep, and a TTL shorter than that span can drop
-// the KV key between mid-sweep renewals.
-const DEFAULT_REGISTRY_TTL_MS = Math.max(DEFAULT_BRAIN_REGISTRY_TTL_MS, 540_000);
+// Keep the shared protocol default. Raising this alone (without the API that
+// creates the bucket) leaves Brain writing under a TTL the store does not
+// honour; raising it also inflates PING/IDLE phase budgets (TTL fractions) and
+// can push keepaliveSweepCeilingSec above SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC.
+// Span may exceed TTL: mid-sweep renewals refresh parked hands keys in place.
 export const BRAIN_REGISTRY_TTL_MS = envInt(
   "BRAIN_REGISTRY_TTL_MS",
-  DEFAULT_REGISTRY_TTL_MS,
+  DEFAULT_BRAIN_REGISTRY_TTL_MS,
 );
 
 /**
