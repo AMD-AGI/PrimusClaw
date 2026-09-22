@@ -6,8 +6,11 @@
  * completion is not.
  *
  * `withCompletionLock` is the one caller of `withLeaderLock` whose body has no
- * loop boundary and no way to stop: it reads `processed_at`, runs
- * `handleComplete`, and writes `processed_at`. The whole argument for letting a
+ * loop boundary: it reads `processed_at`, runs `handleComplete`, and writes
+ * `processed_at`. It asks whether the lock is still held twice -- once in front
+ * of those writes and once in front of the marker -- so a loss recorded before
+ * the body reaches them skips them, while one recorded after still leaves the
+ * work done and only the marker withheld. The whole argument for letting a
  * lost hold throw there -- see the header of events/completion-lock.ts -- is
  * that the throw becomes a nak, the nak becomes a redelivery, and the
  * redelivery finds `processed_at` still NULL and redoes the completion under a
@@ -216,7 +219,11 @@ test("a completion that lost its lock leaves processed_at NULL, so the redeliver
     "a pass that was not exclusive has to be naked, not acked");
   assert.equal(handouts.length, 1);
   assert.equal(handouts[0].destroyed, true, "a dropped session is not handed to the next caller");
-  assert.ok(completionWork().length > 0, "the body did run its completion work before the drop");
+  assert.deepEqual(completionWork(), [],
+    "a loss that is already recorded when the body reaches its writes stops them outright, "
+    + "so the duplicate handleComplete this repair exists to redo is never run in the first "
+    + "place. A drop that lands after that check still leaves the work done and only the "
+    + "done-marker withheld, which is the case the nak and redelivery below repair.");
 
   assert.equal(
     await processedAt(1), null,
