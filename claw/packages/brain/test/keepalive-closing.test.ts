@@ -263,9 +263,10 @@ test("JobsUnavailable never closes over a concurrent ready write", async () => {
   }
 });
 
-test("an in-window unknown probe renews the handle without sliding idleSince", async () => {
+test("an in-window unknown probe renews the handle without clearing quiescedAt", async () => {
   const now = 1_000_000;
   const idleSince = now - 60_000;
+  const quiescedAt = idleSince;
   const { kv, store } = storeKv({
     status: "ready",
     provider: "safe-workload",
@@ -276,7 +277,7 @@ test("an in-window unknown probe renews the handle without sliding idleSince", a
     token: "tok",
     keepalive: false,
     idleSince,
-    quiescedAt: idleSince,
+    quiescedAt,
     workSeenAt: idleSince,
   });
   bindHandsKv(kv);
@@ -296,10 +297,10 @@ test("an in-window unknown probe renews the handle without sliding idleSince", a
     const left = store.get(`hands.${SESSION}`);
     assert.ok(left);
     const info = JSON.parse(sc.decode(left.value)) as {
-      idleSince?: number; workSeenAt?: number; quiescedAt?: number;
+      idleSince?: number; quiescedAt?: number;
     };
-    assert.equal(info.idleSince, idleSince, "park stamp is the only expiry clock");
-    assert.equal(info.quiescedAt, idleSince, "unknown must not clear quiescedAt");
+    assert.equal(info.idleSince, idleSince, "park stamp stays the idle-period identity");
+    assert.equal(info.quiescedAt, quiescedAt, "unknown must not clear the reuse-window anchor");
   } finally {
     restore();
   }
@@ -571,6 +572,61 @@ test("an absent workload is reaped without a frontend sandbox failure", async ()
     await runKeepaliveTickForTest(deps);
     assert.ok(stopped.includes("wl-1"));
     assert.equal(events.length, 0, "absent is not a frontend sandbox failure");
+  } finally {
+    restoreRetry();
+    restore();
+  }
+});
+
+test("a terminal jobs answer closes and records the reason in one reclaim CAS", async () => {
+  const { kv, store } = storeKv({
+    status: "ready",
+    provider: "safe-workload",
+    workloadId: "wl-term-cas",
+    platformKey: "pk",
+    namespace: "ns",
+    handsUrl: "http://sandbox:9100/mcp",
+    token: "tok",
+    keepalive: false,
+    idleSince: 0,
+    quiescedAt: 0,
+  });
+  bindHandsKv(kv);
+  const key = `hands.${SESSION}`;
+  const closingWrites: Array<{ status?: string; terminalReason?: string }> = [];
+  const origUpdate = kv.update.bind(kv);
+  kv.update = async (k: string, value: Uint8Array, rev: number) => {
+    const parsed = JSON.parse(sc.decode(value)) as { status?: string; terminalReason?: string };
+    if (parsed.status === "closing") closingWrites.push(parsed);
+    return origUpdate(k, value, rev);
+  };
+  const events: Array<{ status?: string; reason?: string }> = [];
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, state: "running" }; },
+    async stop(inst: { id?: string }) { stopped.push(String(inst.id ?? "")); },
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  try {
+    const { SandboxTerminalProbeError } = await import("../src/sandbox/job-probe.js");
+    await runKeepaliveTickForTest({
+      kv,
+      countActiveShells: async () => {
+        throw new SandboxTerminalProbeError("terminal", "sandbox_workload_terminal");
+      },
+      emitSandboxFailure: async (_sid, evt) => { events.push(evt); },
+      now: () => 1_000_000,
+    });
+    assert.equal(closingWrites.length, 1, "one closing write, not terminalReason then closing");
+    assert.equal(closingWrites[0]?.status, "closing");
+    assert.equal(closingWrites[0]?.terminalReason, "sandbox_workload_terminal");
+    assert.ok(stopped.includes("wl-term-cas"), "destroy must run after the combined CAS");
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.reason, "sandbox_workload_terminal");
+    assert.equal(store.has(key), false);
   } finally {
     restoreRetry();
     restore();

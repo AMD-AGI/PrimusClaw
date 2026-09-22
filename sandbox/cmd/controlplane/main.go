@@ -31,7 +31,6 @@ import (
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	extensionscontrollers "sigs.k8s.io/agent-sandbox/extensions/controllers"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
-	"sigs.k8s.io/agent-sandbox/pkg/agentd"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
@@ -84,16 +83,13 @@ func main() {
 
 	var routerPort int
 	var wmPort int
-	var sessionTimeout time.Duration
 	var metricsAddr string
 	var probeAddr string
 	var enableLeaderElection bool
 	var enableExtensions bool
-	var enableIdleGC bool
 
 	routerPort = 8080
 	wmPort = 8081
-	sessionTimeout = agentd.DefaultSessionTimeout
 
 	flag.IntVar(&routerPort, "router-port", routerPort, "HTTP listen port for the Router API")
 	flag.IntVar(&wmPort, "wm-port", wmPort, "HTTP listen port for the internal Workload Manager API")
@@ -103,15 +99,10 @@ func main() {
 	flag.StringVar(&wmCfg.Namespace, "namespace", wmCfg.Namespace, "K8s namespace for system components")
 	flag.DurationVar(&wmCfg.GCInterval, "gc-interval", wmCfg.GCInterval, "GC scan interval")
 	flag.DurationVar(&wmCfg.DefaultTTL, "default-ttl", wmCfg.DefaultTTL, "Default sandbox TTL")
-	flag.DurationVar(&sessionTimeout, "session-timeout", sessionTimeout, "Idle timeout after which a Sandbox is deleted")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8082", "Metrics bind address for the controller manager")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
-	// Off by default. LastActivity is no longer refreshed for idle-GC (Brain
-	// owns reclaim via jobs), so enabling this controller would delete sandboxes
-	// from their create time plus --session-timeout while they are still in use.
-	flag.BoolVar(&enableIdleGC, "enable-idle-gc", false, "Refused: LastActivity is not refreshed for idle-GC; Brain reclaim owns sandbox lifetime. Leave false.")
 	flag.Parse()
 
 	// controller-runtime keeps zap here, deliberately: switching it to the
@@ -129,15 +120,6 @@ func main() {
 	if v := os.Getenv("ENABLE_AUTH"); v == "true" {
 		routerCfg.EnableAuth = true
 	}
-	if v := os.Getenv("ENABLE_SANDBOX_IDLE_GC"); v == "true" {
-		enableIdleGC = true
-	} else if v == "false" {
-		enableIdleGC = false
-	}
-	if enableIdleGC {
-		log.Error("sandbox idle-GC cannot be enabled: LastActivity is not refreshed; Brain jobs reclaim owns sandbox lifetime")
-		os.Exit(1)
-	}
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v
 	}
@@ -149,11 +131,6 @@ func main() {
 	if v := os.Getenv("DEFAULT_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			wmCfg.DefaultTTL = d
-		}
-	}
-	if v := os.Getenv("SESSION_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			sessionTimeout = d
 		}
 	}
 
@@ -296,21 +273,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if enableIdleGC {
-		if err := (&agentd.SandboxReconciler{
-			Client:         mgr.GetClient(),
-			Scheme:         mgr.GetScheme(),
-			SessionTimeout: sessionTimeout,
-			Store:          st,
-			Audit:          auditStore,
-			Recorder:       mgr.GetEventRecorderFor("sandbox-idle-gc"),
-		}).SetupWithManager(mgr); err != nil {
-			log.Error("unable to setup idle GC controller", "error", err)
-			os.Exit(1)
-		}
-	} else {
-		log.Info("sandbox idle-GC controller disabled")
-	}
+	// Sandbox idle-GC is not wired: Brain reclaim (GET /api/jobs + idle window)
+	// owns sandbox lifetime. LastActivity is not refreshed for GC.
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error("unable to set up health check", "error", err)

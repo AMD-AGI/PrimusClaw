@@ -785,8 +785,7 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 // Permission: default users can only get their own sandboxes.
 //
 // LastActivity is returned as stored metadata for listing/sort; this GET does
-// not refresh it. Sandbox lifetime is owned by Brain jobs reclaim when idle-GC
-// is off.
+// not refresh it. Sandbox lifetime is owned by Brain jobs reclaim.
 func (s *Server) handleGetSandbox(c *gin.Context) {
 	sessionID := c.Param("sessionId")
 	if sessionID == "" {

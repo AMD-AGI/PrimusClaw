@@ -24,8 +24,6 @@ controlplane:
   config:
     leaderElect: true
     extensions: true
-    enableIdleGC: false
-    sessionTimeout: 15m
     envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
     auditEnabled: true
     auditRetentionDays: 30

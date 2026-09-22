@@ -126,16 +126,17 @@ test("the shipped chart does not opt every sandbox into automatic eviction", asy
   assert.match(values, /sandboxKeepaliveFailLimit:\s*"0"/);
 });
 
-test("controlplane refuses to enable sandbox idle-GC", async () => {
-  // LastActivity is no longer refreshed; enabling idle-GC would delete in-use
-  // sandboxes from create time plus session-timeout.
+test("controlplane does not expose a sandbox idle-GC enable switch", async () => {
+  // Brain reclaim owns lifetime; wiring idle-GC would delete from create time
+  // once LastActivity stopped being refreshed.
   const src = await import("node:fs/promises")
     .then((fs) => fs.readFile(
       new URL("../../../../sandbox/cmd/controlplane/main.go", import.meta.url),
       "utf8",
     ));
-  assert.match(src, /if enableIdleGC \{\s*\n\s*log\.Error\("sandbox idle-GC cannot be enabled/);
-  assert.match(src, /os\.Exit\(1\)/);
+  assert.doesNotMatch(src, /enable-idle-gc|ENABLE_SANDBOX_IDLE_GC|enableIdleGC/);
+  assert.doesNotMatch(src, /agentd\.SandboxReconciler|sandbox-idle-gc/);
+  assert.match(src, /Sandbox idle-GC is not wired/);
 });
 
 test("a downgraded callback body caps failure_reason too", async () => {

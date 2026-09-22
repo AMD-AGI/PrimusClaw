@@ -95,6 +95,27 @@ test("idle destroy re-checks the run lease after the jobs probe", () => {
     "claimIdleStop runs on the success path after the sync jobs probe");
 });
 
+test("terminal idle reclaim writes terminalReason and closing in one CAS", () => {
+  // Splitting reportTerminalFailure from claimIdleStop bumped the enrollment
+  // revision so the closing write always lost to itself and destroy never ran.
+  const expire = bodyOf("expireIdleTarget");
+  assert.doesNotMatch(
+    expire,
+    /reportTerminalFailure/,
+    "expiry must not write terminalReason in a separate update",
+  );
+  assert.match(
+    bodyOf("claimIdleStop"),
+    /terminalReason/,
+    "claimIdleStop records terminalReason on the same closing CAS",
+  );
+  assert.match(
+    bodyOf("reportTerminalFailure"),
+    /status:\s*"closing"/,
+    "background/ping terminal writes also close in the same update",
+  );
+});
+
 test("an expired retry separates a failed lock read from an absent lock", () => {
   // `.catch(() => null)` made a KV hiccup indistinguishable from "nobody holds
   // this", and the unregister then ran on the strength of an error.

@@ -60,18 +60,15 @@ sequenceDiagram
 
 - Tool calls and shells go Router → EnvD `/api/execute` (after Hands is up, also `spawn` inside the container).
 - EnvD `execute` uses `Setpgid` so HTTP `CommandContext` cancellation does not kill the whole `setsid` process group.
-- While an HTTP execute is in flight, the Router refreshes Redis `LastActivity`.
+- While an HTTP execute is in flight, the Router proxies to EnvD; it does **not** refresh Redis `LastActivity` for lifetime policy.
 
-### Keepalive and idle-GC (current)
+### Keepalive and reclaim (current)
 
-Brain keepalive (default interval 60s) pings sandboxes with `keepalive: true`:
+Brain owns sandbox lifetime. There is **no** sandbox controlplane idle-GC switch: the controller is not wired, and `--enable-idle-gc` / `ENABLE_SANDBOX_IDLE_GC` are not accepted. An idle Sandbox is held until Brain reclaim or its own `ShutdownTime` / SaFE `timeout`.
 
-- agent-sandbox: `GET` session, which updates `LastActivity`.
-- safe-workload: a control-plane status read. No command enters the container: the exec this replaced wrote `/tmp/keepalive_ts`, which was never a control-plane input.
+Brain keepalive (default interval 60s) pings sandboxes with `keepalive: true` via a control-plane status read (no container exec). Soft / unknown control-plane states are not treated as keepalive failures.
 
-Sandbox idle-GC deletes a Sandbox when Redis `LastActivity` is older than `--session-timeout` (overridable by annotation). It ships **disabled** (`--enable-idle-gc=false`), because a deployment running Brain reclaims through Brain instead; where it is off, an idle Sandbox is held until its own `ShutdownTime` (24h). SaFE `timeout` still stops a Workload that is still running.
-
-After a task parks, `keepalive` is set false. Keepalive then probes EnvD `GET /api/jobs`. That count includes only user tasks registered through `/api/execute`. Hands `/internal/shells/active` is not the authority for idle.
+After a task parks, `keepalive` is set false. Keepalive then probes EnvD `GET /api/jobs`. That count includes only user tasks registered through `/api/execute`. Hands `/internal/shells/active` is not the authority for idle. The reuse window starts at `quiescedAt` (first confirmed empty roster); destroy still requires a sync `count == 0`.
 
 ### Stop
 
@@ -133,7 +130,7 @@ HTTP 404 / 405 / 501 on `GET /api/jobs` means this EnvD has no jobs roster (typi
 
 ## Reclaim and failure
 
-Brain owns sandbox lifetime. Sandbox idle-GC is not the idle policy (off / to be removed). Redis `LastActivity` is list/sort metadata only; Router and control-plane GET no longer refresh it for GC.
+Brain owns sandbox lifetime. Sandbox controlplane idle-GC is not available (not wired; no enable flag). Redis `LastActivity` is list/sort metadata only and is not refreshed for lifetime policy.
 
 ### SaFE failure is sandbox failure, returned to the frontend
 
@@ -153,7 +150,7 @@ That terminal phase is the sandbox Pod / codeinterpreter, not InferaDeployment o
 - A sandbox that is not yet Running does not enter DRAINING / QUIESCED.
 - Pending ends only by becoming Running, a SaFE sandbox terminal failure, or the Pending timeout below.
 
-When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain parks with `keepalive:false` and `idleSince`. After `SANDBOX_IDLE_REUSE_SECONDS` (default 15 minutes) from that park stamp, a destroy pass **must** sync-probe `count == 0` again before CAS `ready` → `closing`. A new message clears idle markers. `unavailable` and `tracking_lost` do not trigger reclaim (workload hard timeout is the backstop). Multi-node GPU clusters are torn down after the sandbox stops (or immediately on `sessionDeleted` parks).
+When there is no in-flight message or tool call and `GET /api/jobs` shows no user tasks, Brain parks with `keepalive:false` and `idleSince`, and records `quiescedAt` on the first confirmed empty roster. After `SANDBOX_IDLE_REUSE_SECONDS` (default 15 minutes) from that quiesce stamp, a destroy pass **must** sync-probe `count == 0` again before CAS `ready` → `closing`. A new message clears idle markers. `unavailable` and `tracking_lost` do not trigger reclaim (workload hard timeout is the backstop). Multi-node GPU clusters are torn down after the sandbox stops (or immediately on `sessionDeleted` parks).
 
 Reclaim and reuse compete on one CAS: `ready` → `closing`. A handle in `closing` is not reused. Stale jobs answers are discarded when the sandbox identity or idle generation changes.
 

@@ -9,8 +9,8 @@ import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol
 // here and by the API's orphan-handle sweep, which must not stop a sandbox this
 // file is still holding for background work; one definition is what keeps the
 // two answering the same question. See sandbox/bg-verdict.ts in @claw/protocol.
-// Brain idle-expiry uses park `idleSince` only; destroy requires a sync jobs
-// count of zero. Multi-node clusters are reclaimed after sandbox destroy.
+// Brain idle-expiry uses first confirmed empty (`quiescedAt`); destroy requires
+// a sync jobs count of zero. Multi-node clusters are reclaimed after sandbox destroy.
 import {
   BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod,
   sameIdlePeriod, usableSharedVerdict,
@@ -1513,11 +1513,13 @@ function newTickStats(): TickStats {
 type VerdictSource = "mem" | "handle" | "none";
 
 /**
- * Park stamp for idle-expiry. The window is calendar time since the turn
- * parked the handle; destroy still requires a sync jobs count of zero.
+ * Anchor for idle-expiry (scheme B): first confirmed empty jobs roster.
+ * Park's `idleSince` opens the idle period but does not start the reuse window;
+ * a long bg-shell that outlasts the park must still get a full window after it
+ * stops. Without `quiescedAt`, the handle is not clock-expired.
  */
-function idleExpiryAnchor(info: HandsKvEntry): number {
-  return typeof info.idleSince === "number" ? info.idleSince : 0;
+function idleExpiryAnchor(info: HandsKvEntry): number | null {
+  return typeof info.quiescedAt === "number" ? info.quiescedAt : null;
 }
 
 
@@ -1682,7 +1684,28 @@ async function persistJobsIdentity(
   }
 }
 
-/** Persist and publish one terminal verdict for a sandbox identity. */
+/** Publish a sandbox-failed event after a successful terminal CAS. */
+async function emitTerminalFailureEvent(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  if (!deps.emitSandboxFailure) return;
+  await deps.emitSandboxFailure(sessionId, {
+    type: "sandboxStatus",
+    status: "failed",
+    reason,
+    message: `Sandbox workload entered terminal phase (${reason})`,
+  }).catch((err) => {
+    logger.warn({ err, sessionId, reason }, "keepalive.terminal_event_failed");
+  });
+}
+
+/**
+ * Persist one terminal verdict for a sandbox identity.
+ * Writes `terminalReason` and `status: closing` in a single CAS so a later
+ * reclaim cannot self-collide on the enrollment revision, then emits.
+ */
 async function reportTerminalFailure(
   deps: KeepaliveDeps,
   sessionId: string,
@@ -1696,22 +1719,14 @@ async function reportTerminalFailure(
     if (entryIdentity(info) !== identity || info.terminalReason) return;
     await deps.kv.update(
       existing.key,
-      sc.encode(JSON.stringify({ ...info, terminalReason: reason })),
+      sc.encode(JSON.stringify({ ...info, terminalReason: reason, status: "closing" })),
       existing.revision,
     );
   } catch {
     // A later provider check reaches the same terminal result.
     return;
   }
-  if (!deps.emitSandboxFailure) return;
-  await deps.emitSandboxFailure(sessionId, {
-    type: "sandboxStatus",
-    status: "failed",
-    reason,
-    message: `Sandbox workload entered terminal phase (${reason})`,
-  }).catch((err) => {
-    logger.warn({ err, sessionId, reason }, "keepalive.terminal_event_failed");
-  });
+  await emitTerminalFailureEvent(deps, sessionId, reason);
 }
 
 interface ProbeCandidate {
@@ -1962,9 +1977,8 @@ async function persistVerdict(
         );
         return;
       }
-      // The idle window opens on the park stamp that idleExpiryAnchor later
-      // compares against; verdict freshness above ages on `Date.now`.
-      // Each anchor is read off the clock that measures it.
+      // The reuse window opens on first confirmed empty (`quiescedAt`); verdict
+      // freshness above ages on `Date.now`. Each anchor is read off its clock.
       const quiescedAt = (deps.now ?? Date.now)();
       const next = sc.encode(JSON.stringify({
         ...info,
@@ -2006,8 +2020,8 @@ async function persistVerdict(
 /**
  * Renew a parked handle after a running jobs answer.
  *
- * `idleSince` stays where park opened it: destroy still keys off that stamp
- * plus a sync count of zero. `workSeenAt` is not a reclaim clock.
+ * Clears `quiescedAt` so the reuse window restarts only after the next confirmed
+ * empty roster. `idleSince` stays where park opened the idle period.
  */
 async function refreshIdleSince(
   deps: KeepaliveDeps,
@@ -2290,8 +2304,10 @@ async function collectIdleTarget(
     await deps.kv.update(key, value, e.revision).catch(() => {});
     return true;
   }
+  const anchor = idleExpiryAnchor(info);
   const expired = bgWork === "gone"
-    || (deps.now ?? Date.now)() - idleExpiryAnchor(info) > SANDBOX_IDLE_REUSE_MS;
+    || (anchor !== null
+      && (deps.now ?? Date.now)() - anchor > SANDBOX_IDLE_REUSE_MS);
   // Hold an in-window unknown for an in-flight probe; renew TTL only.
   if (bgWork === "unknown" && canProbeJobs(info, sessionId) && !expired) {
     await deps.kv.update(key, value, e.revision).catch(() => {});
@@ -2389,8 +2405,11 @@ async function expireIdleTarget(
           "keepalive.idle_handle_absent",
         );
       } else {
-        await reportTerminalFailure(deps, sessionId, identity, err.reason);
-        if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+        // One CAS: terminalReason + closing. Splitting those writes bumped the
+        // enrollment revision so claimIdleStop always lost to itself.
+        if (!(await claimIdleStop(
+          deps, key, identity, sessionId, info, claimRevision, e, err.reason,
+        ))) {
           return;
         }
         claimed = true;
@@ -2399,8 +2418,9 @@ async function expireIdleTarget(
         });
       }
     } else if (err instanceof SandboxRuntimeTerminalError) {
-      await reportTerminalFailure(deps, sessionId, identity, err.reason);
-      if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+      if (!(await claimIdleStop(
+        deps, key, identity, sessionId, info, claimRevision, e, err.reason,
+      ))) {
         return;
       }
       claimed = true;
@@ -2433,6 +2453,8 @@ async function expireIdleTarget(
 /**
  * After a long destructive probe, re-check leases and CAS ready→closing before
  * any unclaimed destroyHands. Returns false when a concurrent turn won.
+ * When `terminalReason` is set, the same CAS also records it so emit and
+ * destroy do not race a second update against the enrollment revision.
  */
 async function claimIdleStop(
   deps: KeepaliveDeps,
@@ -2442,6 +2464,7 @@ async function claimIdleStop(
   info: HandsKvEntry,
   claimRevision: number,
   e: HandsRecord,
+  terminalReason?: string,
 ): Promise<boolean> {
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     return false;
@@ -2450,12 +2473,10 @@ async function claimIdleStop(
     return false;
   }
   try {
-    await deps.kv.update(
-      key,
-      sc.encode(JSON.stringify({ ...info, status: "closing" })),
-      claimRevision,
-    );
-    return true;
+    const next = terminalReason
+      ? { ...info, terminalReason, status: "closing" as const }
+      : { ...info, status: "closing" as const };
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), claimRevision);
   } catch (err) {
     if (isRevisionConflict(err)) {
       logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
@@ -2468,6 +2489,8 @@ async function claimIdleStop(
     await deps.kv.update(key, e.value, e.revision).catch(() => {});
     return false;
   }
+  if (terminalReason) await emitTerminalFailureEvent(deps, sessionId, terminalReason);
+  return true;
 }
 
 async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -2826,20 +2849,14 @@ async function pingSandbox(
       throw new SandboxGoneError(`sandbox workload state=${status.state}`);
     }
     if (status.state !== "running") {
-      // Counted as a failure so an opt-in fail limit can still evict. Returning
-      // null here left unknown forever when the control plane only answered
-      // with a soft state.
+      // Soft / unknown control-plane states are not keepalive failures: counting
+      // them would let a brief SaFE blip burn FAIL_LIMIT and destroyHands every
+      // target, including sandboxes with live background shells.
       logger.info(
         { sessionId, provider: entry.provider ?? "safe-workload", state: status.state ?? "unknown" },
         "keepalive.sandbox_state_unknown",
       );
-      return {
-        targetKey,
-        sessionId,
-        entry,
-        error: new Error(`sandbox workload state=${status.state ?? "unknown"}`),
-        gone: false,
-      };
+      return null;
     }
     failCounts.delete(targetKey);
     const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
