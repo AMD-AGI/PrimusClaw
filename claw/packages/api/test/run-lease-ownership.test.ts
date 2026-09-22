@@ -654,3 +654,52 @@ test("and a later attempt reusing the same handle re-stamps it", async () => {
     "the stamp follows the attempt that now owns the row",
   );
 });
+
+test("an ownership report with no attempt does not clear a valid stamp", async () => {
+  // Reverted once, reintroduced, and reproduced end to end against Postgres:
+  // attempt A records handle W and its stamp; an ownership report arrives for
+  // the same handle carrying no attempt_id; the stamp is nulled; B settles; the
+  // backfill then reads W -- A's workload -- and writes A's node and exit code
+  // onto B's row. The reader treats a JSON null as pre-rollout data and permits
+  // it, so nulling a stamp is not neutral: it switches the guard off.
+  //
+  // The handle is unchanged here, so the stamp still describes the handle the
+  // row carries. Absent is not a correction.
+  await reportRunningEvent({
+    brain_id: "worker-a", attempt_id: "attempt-1",
+    sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+  await reportRunningEvent({
+    brain_id: "worker-a", sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+
+  const metadata = (await storedRun()).metadata as Record<string, unknown>;
+  assert.equal(
+    metadata.sandbox_attempt, "attempt-1",
+    "a report that cannot name an attempt may not erase the one on record",
+  );
+});
+
+test("but a NEW handle with no attempt drops the stamp that described the old one", async () => {
+  // The other direction, and why "leave it alone" is not the whole rule. A
+  // stamp naming attempt A beside a handle A never held is worse than no stamp:
+  // the guard refuses the row's own legitimate handle and the ending is never
+  // recorded at all. Reproduced as handle C / stamp A / settled C.
+  await reportRunningEvent({
+    brain_id: "worker-a", attempt_id: "attempt-1",
+    sandbox_workload_id: SAFE_SANDBOX.handle,
+  });
+  await reportRunningEvent({
+    brain_id: "worker-a", sandbox_workload_id: "workload-replacement",
+  });
+
+  const metadata = (await storedRun()).metadata as Record<string, unknown>;
+  assert.deepEqual(
+    metadata.sandbox, { provider: "safe-workload", handle: "workload-replacement" },
+    "the new handle is recorded",
+  );
+  assert.equal(
+    metadata.sandbox_attempt, undefined,
+    "and the stamp that described the handle it replaced goes with it",
+  );
+});

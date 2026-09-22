@@ -474,3 +474,19 @@ test("a KV handle from another attempt is refused, not merely pinned", async () 
     `refused for the right reason: ${JSON.stringify(diagnostics)}`,
   );
 });
+
+test("REPRO fat redelivery: row can only name the PREVIOUS attempt", async () => {
+  await seed("repro-fat", "worker_lost", {
+    handle: null, attemptId: null, settledAttemptId: "attempt-A",
+    metadata: {}, origin: "chat", completedAgoMs: 60_000,
+  });
+  hands.set(handsSessionKey("repro-fat"), {
+    status: "pending", workloadId: "wl-b-minted", platformKey: "pk",
+    attemptId: "attempt-B",
+    createdAt: new Date(Date.now() - 120_000).toISOString(),
+  });
+  await drainPendingPlatformFacts();
+  const r = await row("repro-fat");
+  console.log("REPRO node:", r.platform_node, "exit:", r.platform_exit_code,
+    "resolved:", r.platform_facts_resolved_at, "diag:", JSON.stringify(diagnostics));
+});
