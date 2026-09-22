@@ -278,7 +278,11 @@ test("R7 the drain fairly interleaves new rows and eligible retries", async () =
   await drainPendingPlatformFacts();
   const sel = h.queries.find((t) => /SELECT/i.test(t) && /FROM claw_tasks/.test(t))!;
   assert.match(sel, /PARTITION BY \(platform_facts_next_retry_at IS NOT NULL\)/);
-  assert.match(sel, /ORDER BY lane_position ASC, retried ASC/);
+  // Identity leads the ordering, but the lanes still interleave underneath it,
+  // which is the fairness this pins: neither a permanently failing lane nor a
+  // stream of new rows can starve the other, within identity-carrying rows and
+  // within handle-less ones alike.
+  assert.match(sel, /ORDER BY carries_identity DESC, lane_position ASC, retried ASC/);
 });
 
 test("R8 a drained row is actually asked about and recorded", async () => {

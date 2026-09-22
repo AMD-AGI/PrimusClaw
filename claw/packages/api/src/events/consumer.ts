@@ -236,6 +236,17 @@ async function processCompletionEvent(
     const namesChatRow = provenance !== null && provenance !== "foreign";
     const messageAlreadyProcessed = await completionAlreadyProcessed(sessionId, messageId ?? "");
     const alreadyProcessed = !namesChatRow && messageAlreadyProcessed;
+    // The same check the done-marker below makes, made before the writes
+    // instead of only after them. Everything past this point writes: turn
+    // indices, a closed row, a released gate. A hold that lost its lock during
+    // the reads above would otherwise allocate turn indices while another
+    // holder allocates its own, and a redelivery cannot repair it -- conflict
+    // handling does not renumber turn_index, so the history keeps both
+    // holders' copies side by side forever. Returning here leaves
+    // `processed_at` NULL, which is the column's existing contract for a body
+    // that did not finish: the nak retry re-runs it under whoever holds the
+    // lock then.
+    if (lease.lost()) return;
     if (alreadyProcessed) {
       if (messageId && event.completion_source !== "sweeper") {
         await recordCompletionTurns(sessionId, event, messageId);

@@ -466,6 +466,13 @@ export async function drainPendingPlatformFacts(): Promise<number> {
        SELECT task_id, session_id, sandbox_workload_id, metadata,
               COALESCE(attempt_id, settled_attempt_id) AS attempt_id,
               platform_facts_next_retry_at IS NOT NULL AS retried,
+              -- carriesSandboxIdentity, asked in SQL so that it orders the
+              -- rows the LIMIT keeps rather than the ones it already dropped.
+              -- The JavaScript copy runs after the truncation and so could only
+              -- ever reorder a batch that was already chosen without it.
+              (NULLIF(sandbox_workload_id, '') IS NOT NULL
+               OR (metadata->'sandbox' IS NOT NULL
+                   AND metadata->'sandbox' <> 'null'::jsonb)) AS carries_identity,
               ROW_NUMBER() OVER (
                 PARTITION BY (platform_facts_next_retry_at IS NOT NULL)
                 ORDER BY platform_facts_next_retry_at ASC NULLS LAST,
@@ -516,7 +523,17 @@ export async function drainPendingPlatformFacts(): Promise<number> {
      -- metadata-only rows and sorted them behind handle-less ones.
      SELECT task_id, session_id, sandbox_workload_id, metadata, attempt_id
        FROM eligible
-      ORDER BY lane_position ASC, retried ASC
+      -- Identity first, and before the lanes rather than inside them: the
+      -- starvation this answers is not two rows competing for one position, it
+      -- is a mass of handle-less rows holding every low position in both lanes.
+      -- Chat rows that name no handle stay eligible -- the KV fallback is the
+      -- one thing that can still attribute them -- but a row whose handle is
+      -- already on the row is a read that can answer, while theirs depends on a
+      -- registry entry that may have been swept; certainty takes the cap first.
+      -- Measured with the production retry SQL over an hour of ticks: 2000
+      -- handle-less chat rows spent 3000 claims and the 60 rows carrying a
+      -- handle got zero reads before they aged out of the window above.
+      ORDER BY carries_identity DESC, lane_position ASC, retried ASC
       LIMIT $1`,
     [MAX_PER_SWEEP],
   );

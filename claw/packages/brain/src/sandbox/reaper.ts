@@ -429,7 +429,7 @@ export async function destroyHands(
  * by other means (which fields an old writer set, a collector that may not
  * reach the entry, the run lease, the entry's age against the caller's ask) and
  * each was wrong in its own way; the name is the only per-entry fact that
- * settles it here. The reporting side asks a NARROWER question -- 
+ * settles it here. The reporting side asks a NARROWER question --
  * `pendingHandsIdentity` compares the `attemptId` the entry records, because a
  * redelivery carries the same task id and must not report its predecessor's
  * workload as its own ending. This path has not been given that comparison, so

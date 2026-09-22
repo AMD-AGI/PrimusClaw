@@ -490,3 +490,23 @@ test("REPRO fat redelivery: row can only name the PREVIOUS attempt", async () =>
   console.log("REPRO node:", r.platform_node, "exit:", r.platform_exit_code,
     "resolved:", r.platform_facts_resolved_at, "diag:", JSON.stringify(diagnostics));
 });
+
+test("a mass of handle-less chat rows does not take the cap from rows that name a handle", async () => {
+  // The starvation the eligibility clause answers for non-chat rows has a chat
+  // shape too: those rows stay eligible because the KV fallback is the only
+  // thing that can attribute them, so they cannot be excluded -- but a row
+  // whose handle is already on it is a read that can answer, while theirs
+  // depends on a registry entry that may already have been swept. Ordering by
+  // that in JavaScript reordered a batch the LIMIT had already chosen.
+  for (let i = 0; i < 60; i++) await seed(`handleless-${i}`, "worker_lost", { handle: null });
+  for (let i = 0; i < 10; i++) await seed(`named-${i}`, "worker_lost");
+  platformBackfillPorts.readHandsKey = (async () => null) as typeof platformBackfillPorts.readHandsKey;
+
+  await drainPendingPlatformFacts();
+
+  const named = await pg.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM claw_tasks
+      WHERE task_id LIKE 'named-%' AND platform_facts_resolved_at IS NOT NULL`,
+  );
+  assert.equal(named.rows[0].n, 10, "every row carrying a handle was read in the first sweep");
+});

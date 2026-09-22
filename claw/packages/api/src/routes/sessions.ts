@@ -1164,25 +1164,35 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // of what this lock is for. What a late drop actually costs is the
         // idempotency record, and that is recovered rather than refused; see
         // saveIdempotencyBestEffort.
-        if (idemLock) {
+        // Asked again immediately before the insert, not only here: every
+        // await between the two is another chance for the lock connection to
+        // drop, and the answer is only useful while it is still true that
+        // nothing has been created. Checking once at the top made the refusal
+        // describe a state the request had already left -- a competitor could
+        // take the same key and cache its own result during the env snapshot,
+        // and this request would still create its session and return 200,
+        // which is the duplicate the lock exists to prevent.
+        const refuseIfLockLost = (): { statusCode: number; response: unknown } | null => {
+          if (!idemLock) return null;
           const lost = connectionLost(idemLock.client);
-          if (lost) {
-            logger.error(
-              { userId, route, err: lost.message },
-              "idempotency.lock_lost_before_create (the server released this key's lock when "
-              + "the connection dropped, so this create is no longer de-duplicated against a "
-              + "concurrent retry; refusing while nothing has been created)",
-            );
-            return {
-              statusCode: 503,
-              response: {
-                ok: false,
-                error: "lock_connection_lost",
-                message: "creation lost its de-duplication lock; please retry",
-              },
-            };
-          }
-        }
+          if (!lost) return null;
+          logger.error(
+            { userId, route, err: lost.message },
+            "idempotency.lock_lost_before_create (the server released this key's lock when "
+            + "the connection dropped, so this create is no longer de-duplicated against a "
+            + "concurrent retry; refusing while nothing has been created)",
+          );
+          return {
+            statusCode: 503,
+            response: {
+              ok: false,
+              error: "lock_connection_lost",
+              message: "creation lost its de-duplication lock; please retry",
+            },
+          };
+        };
+        const lostEarly = refuseIfLockLost();
+        if (lostEarly) return lostEarly as { statusCode: number; response: Record<string, unknown> };
 
         // Snapshot user env BEFORE inserting the session so a snapshot failure
         // can short-circuit without leaving a row behind.
@@ -1216,6 +1226,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
         // before the row is written.
+        const lostLate = refuseIfLockLost();
+        if (lostLate) return lostLate as { statusCode: number; response: Record<string, unknown> };
         const refused = await createSessionRow(newRow, parentSid, user);
         if (refused) {
           return { statusCode: refused.statusCode, response: refused.response };
