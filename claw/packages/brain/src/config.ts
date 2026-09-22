@@ -1155,13 +1155,13 @@ export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_D
 // then stops each handle, the ping phase, and the failure handling. The gap
 // between two refreshes of one handle and the admission reclaim horizon are
 // both derived from this number, so one declared below the sweep's own worst
-// case makes both of them short in the unsafe direction. BRAIN_REGISTRY_TTL_MS
-// defaults to at least this span so a parked handle cannot expire mid-sweep.
+// case makes both of them short in the unsafe direction. Mid-sweep renewals
+// refresh parked hands keys when this span exceeds BRAIN_REGISTRY_TTL_MS.
 export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 540, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
-// expires, sandbox-keepalive drops the hands KV entry so the control plane can
-// reclaim the orphaned workload via idle/TTL GC instead of pinging forever.
+// expires, sandbox-keepalive stops the orphaned workload instead of pinging
+// forever.
 export const RETRY_PENDING_KEEPALIVE_GRACE_SEC = envInt("RETRY_PENDING_KEEPALIVE_GRACE_SEC", 420);
 // Periodic stale-Hands sweeper: after this many consecutive failed /health
 // checks (sweeper runs ~every 5 min) a sandbox is stopped + its KV entry
@@ -1169,28 +1169,12 @@ export const RETRY_PENDING_KEEPALIVE_GRACE_SEC = envInt("RETRY_PENDING_KEEPALIVE
 // run and log, but a sandbox is never auto-stopped on transient health
 // failures (parity with SANDBOX_KEEPALIVE_FAIL_LIMIT). Default 0 (disabled).
 export const SANDBOX_SWEEPER_EVICT_AFTER_FAILURES = envInt("SANDBOX_SWEEPER_EVICT_AFTER_FAILURES", 0);
-// Periodic multi-node sweeper: reclaim a session's GPU clusters once its
-// sandbox has been idle (no task running) for this long. Unlike the sandbox
-// itself there is no reuse value in keeping a cluster warm -- it holds whole
-// GPUs -- so this is deliberately shorter than SANDBOX_IDLE_REUSE_MS.
-//
-// What it reaches is narrower than "any Brain that stopped": the sweep requires
-// `keepalive === false` on `hands.<sid>`, and only a task reaching a terminal
-// state or a session teardown that could not confirm itself ever writes that. A
-// Brain killed mid-task writes neither, and nothing is left to refresh the
-// entry, so the bucket TTL removes it before the idle threshold is even met.
-// This is therefore the net for a per-message release that failed or never ran,
-// not for a lost process; the workload's own `timeout` covers that one. Set <=0
-// to disable the sweeper.
-//
-// Invariant worth keeping in mind when changing this: an entry has to outlive
-// the wait to become eligible for it, and this threshold equals
-// BRAIN_REGISTRY_TTL_MS. An entry nobody refreshes therefore expires at the
-// exact moment it qualifies. The keepalive tick does refresh idle entries, which
-// covers the ordinary case, but only READY ones and only while keepalive is on
-// (SANDBOX_KEEPALIVE_INTERVAL_SEC > 0). Anything that comes to rely on the wait
-// outside those two conditions needs this threshold moved far enough below the
-// bucket TTL for a refresh or a sweep to fall in between.
+// Enables the periodic multi-node sweeper that reclaims GPU clusters left after
+// a session delete (`keepalive === false` and `sessionDeleted === true` on
+// `hands.<sid>`). Ordinary idle parks cascade from destroyHands instead; this
+// path covers session-delete parks where no next message will reclaim. Set <=0
+// to disable the sweeper. The numeric magnitude is not an idle wait: eligibility
+// no longer compares wall-clock idle age.
 export const MULTI_NODE_IDLE_RECLAIM_MS = envInt("MULTI_NODE_IDLE_RECLAIM_MS", 5 * 60 * 1000);
 // How often that sweep runs. Configurable because it carries a hard constraint:
 // it MUST stay below BRAIN_REGISTRY_TTL_MS.

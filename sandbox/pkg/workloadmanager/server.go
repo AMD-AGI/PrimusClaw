@@ -550,7 +550,8 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 		sandboxName = result.SandboxName
 		sandboxKind = result.Kind
 		// Per-resource maxSessionDuration overrides global TTL (no hard cap).
-		// sessionTimeout is stored as K8s Sandbox Annotation — enforced by Agentd.
+		// sessionTimeout is stored as a K8s Sandbox annotation for metadata;
+		// Brain owns idle reclaim, not a control-plane idle-GC controller.
 		if result.MaxSessionDuration > 0 {
 			ttl = result.MaxSessionDuration
 		}
@@ -561,8 +562,8 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 	}
 
 	// Update placeholder with real sandbox info.
-	// idle timeout (sessionTimeout) is NOT stored in Redis — it lives in Sandbox annotation,
-	// read by Agentd for per-sandbox K8s-level GC.
+	// sessionTimeout is not stored in Redis; it lives on the Sandbox annotation
+	// as metadata. Idle reclaim is Brain's jobs probe, not Agentd idle-GC.
 	info := &store.SandboxInfo{
 		Kind:         sandboxKind,
 		SessionID:    sessionID,
@@ -1028,7 +1029,7 @@ func (s *Server) gcOnce(ctx context.Context) {
 	now := time.Now()
 
 	// Delete sessions past their hard ExpiresAt (maxSessionDuration).
-	// Idle timeout (sessionTimeout) is enforced per-sandbox by Agentd via K8s annotation.
+	// Idle reclaim is Brain's jobs probe; this path is the hard TTL backstop.
 	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 100); err == nil {
 		for _, info := range expired {
 			log.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)

@@ -1195,8 +1195,8 @@ export function startMultiNodeSweeper(): void {
  * let the nets that already exist catch it: sweepIdleMultiNodeClusters above
  * walks `hands.*` and reclaims a deleted session's clusters on its next pass,
  * without the idle window a live session would have to sit through. The pod goes
- * with it, from the other direction -- `keepalive: false` stops the ticker
- * pinging it, so the control-plane's own sandbox idle-GC stops being suppressed.
+ * with it from the other direction: `keepalive: false` stops the ticker pinging
+ * it, and Brain idle reclaim (or the workload hard TTL) tears the sandbox down.
  *
  * Deliberately does not retry on conflict or error. Losing this hand-off costs
  * the sweeper's path, not the reclamation itself: the workload's own timeout

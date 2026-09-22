@@ -114,8 +114,8 @@ interface HandsKvEntry extends SharedVerdictFields {
   taskId?: string | null;
   attemptId?: string | null;
   dagRootTaskId?: string | null;
-  /** False on a post-task idle reuse handle: kept for reuse but NOT pinged so
-   *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
+  /** False on a post-task idle reuse handle: kept for reuse but not pinged.
+   *  Brain idle reclaim (or the workload hard TTL) tears it down. */
   keepalive?: boolean;
   /** Epoch ms when EnvD first reported no tracked user jobs. */
   quiescedAt?: number;
@@ -1643,10 +1643,16 @@ function peekBackgroundWork(
   return { state: "unknown", source: "none" };
 }
 
-/** Whether the handle contains enough control-plane identity to query EnvD jobs. */
+/**
+ * Whether the handle contains enough control-plane identity to query EnvD jobs.
+ *
+ * agent-sandbox needs both the Router session id (header) and the CodeInterpreter
+ * name (URL path). sessionId alone still builds `.../code-interpreters//...`,
+ * which 404s as jobs-unavailable and never reclaim.
+ */
 function canProbeJobs(info: HandsKvEntry, sessionId: string): boolean {
   return info.provider === "agent-sandbox"
-    ? !!(info.sessionId || sessionId)
+    ? !!(info.sessionId || sessionId) && !!info.sandboxName
     : !!(info.workloadId && info.platformKey);
 }
 
