@@ -776,9 +776,13 @@ export const SYSTEM_ENV_BUCKET = env("SYSTEM_ENV_BUCKET", "SYSTEM_ENV");
 // non-clustered mode (err 10074) for every one that gets missed.
 export const NATS_REPLICAS = envInt("NATS_REPLICAS", 3, { min: 1 });
 export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_REPLICAS);
+// At least the keepalive sweep-span default (SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=540):
+// parked handles renew on the sweep, and a TTL shorter than that span can drop
+// the KV key between mid-sweep renewals.
+const DEFAULT_REGISTRY_TTL_MS = Math.max(DEFAULT_BRAIN_REGISTRY_TTL_MS, 540_000);
 export const BRAIN_REGISTRY_TTL_MS = envInt(
   "BRAIN_REGISTRY_TTL_MS",
-  DEFAULT_BRAIN_REGISTRY_TTL_MS,
+  DEFAULT_REGISTRY_TTL_MS,
 );
 
 /**
@@ -1150,7 +1154,8 @@ export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_D
 // then stops each handle, the ping phase, and the failure handling. The gap
 // between two refreshes of one handle and the admission reclaim horizon are
 // both derived from this number, so one declared below the sweep's own worst
-// case makes both of them short in the unsafe direction.
+// case makes both of them short in the unsafe direction. BRAIN_REGISTRY_TTL_MS
+// defaults to at least this span so a parked handle cannot expire mid-sweep.
 export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 540, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace

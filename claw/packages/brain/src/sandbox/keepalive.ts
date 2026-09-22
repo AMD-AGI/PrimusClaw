@@ -874,7 +874,7 @@ async function shouldSkipExpiredRetry(
   try {
     const existing = await readHandsEntry(deps.kv, sessionId);
     if (existing) {
-      const info = JSON.parse(sc.decode(existing.value)) as HandsKvEntry;
+      const info = JSON.parse(existing.value) as HandsKvEntry;
       known = {
         provider: info.provider,
         workloadId: info.workloadId || entry?.workloadId || pending.workloadId,
@@ -2048,15 +2048,15 @@ async function persistVerdict(
         );
         return;
       }
-      // The reuse window opens on first confirmed empty (`quiescedAt`); verdict
-      // freshness above ages on `Date.now`. Each anchor is read off its clock.
+      // The reuse window opens on first confirmed empty (`quiescedAt`). Keep an
+      // existing anchor; if work cleared it while the shared verdict stayed
+      // idle, stamp a new one so the clock cannot stick open forever.
       const quiescedAt = (deps.now ?? Date.now)();
       const next = sc.encode(JSON.stringify({
         ...info,
-        ...(running === 0 && usableSharedVerdict(info)?.state !== "idle"
+        ...(running === 0
           ? { quiescedAt: info.quiescedAt ?? quiescedAt }
-          : {}),
-        ...(running > 0 ? { quiescedAt: undefined } : {}),
+          : { quiescedAt: undefined }),
         bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,

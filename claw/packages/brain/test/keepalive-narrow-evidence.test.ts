@@ -142,4 +142,31 @@ test("an expired retry stops the sandbox before dropping the hands pointer", () 
     /retry_pending_stop_failed/,
     "a failed stop keeps the pointer for the next sweep",
   );
+  assert.match(
+    body,
+    /JSON\.parse\(existing\.value\)/,
+    "readHandsEntry already returns a decoded string",
+  );
+  assert.doesNotMatch(
+    body.slice(body.indexOf("readHandsEntry"), drop),
+    /sc\.decode\(existing\.value\)/,
+    "must not decode an already-decoded hands value",
+  );
+});
+
+test("idle verdict re-stamps quiescedAt when the anchor was cleared", () => {
+  // refreshIdleSince / clearIdleMarkers can drop quiescedAt while a fresh
+  // shared idle verdict remains; refusing to re-stamp then left the reuse
+  // window permanently open.
+  const body = bodyOf("persistVerdict");
+  assert.match(
+    body,
+    /quiescedAt:\s*info\.quiescedAt\s*\?\?\s*quiescedAt/,
+    "an idle write must fill a missing quiescedAt",
+  );
+  assert.doesNotMatch(
+    body,
+    /usableSharedVerdict\(info\)\?\.state\s*!==\s*"idle"/,
+    "already-idle must not block re-anchoring",
+  );
 });

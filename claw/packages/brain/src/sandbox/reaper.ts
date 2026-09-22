@@ -370,10 +370,24 @@ export async function destroyHands(
           ?? (ownsRecorded ? recorded.identity?.messageId : "")
           ?? "",
       ).trim();
+      const mnServiceUrl = String(
+        (target as { mnServiceUrl?: string }).mnServiceUrl
+          ?? (ownsRecorded ? recorded.identity?.mnServiceUrl : "")
+          ?? "",
+      ).trim();
       if (platformKey && messageId) {
         await reclaimClusters(sessionId, platformKey, messageId).catch((e: unknown) => {
           logger.warn(
             { sessionId, messageId, err: (e as Error)?.message ?? String(e) },
+            "mn.cascade_after_sandbox_stop_failed",
+          );
+        });
+      } else if (platformKey && mnServiceUrl) {
+        // Pre-messageId MN handles: fall back to session-scoped reclaim so the
+        // cluster is not left solely to SaFE workload timeout.
+        await reclaimClusters(sessionId, platformKey).catch((e: unknown) => {
+          logger.warn(
+            { sessionId, err: (e as Error)?.message ?? String(e) },
             "mn.cascade_after_sandbox_stop_failed",
           );
         });
