@@ -39,7 +39,7 @@ import {
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
-import { instanceFromEntry } from "./container-probe.js";
+import { instanceFromEntry, type HandsProbeEntry } from "./container-probe.js";
 import { LIVE_WORK_READ_CEILING_MS, countLiveWork } from "./live-work-gate.js";
 import type { SandboxInstance } from "./provider.js";
 import {
@@ -70,6 +70,8 @@ export interface SandboxEntry {
   sandboxName?: string;  // agent-sandbox
   namespace?: string;
   userId?: string;       // agent-sandbox: BYOK identity forwarded to the Router
+  /** Multi-node cluster workload id (= message id) for cascade reclaim. */
+  messageId?: string;
 }
 
 /**
@@ -846,6 +848,60 @@ async function shouldSkipExpiredRetry(
         deadlineIso: new Date(pending.deadlineMs).toISOString(),
       },
       "keepalive.retry_pending_expired_but_lock_active",
+    );
+    return false;
+  }
+
+  // Stop the workload (and messageId-scoped MN cluster) before dropping the
+  // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
+  // delete, so releasing the pointer alone would orphan the sandbox until its
+  // workload timeout.
+  let known: HandsProbeEntry | undefined;
+  let token: string | undefined;
+  try {
+    const existing = await readHandsEntry(deps.kv, sessionId);
+    if (existing) {
+      const info = JSON.parse(sc.decode(existing.value)) as HandsKvEntry;
+      known = {
+        provider: info.provider,
+        workloadId: info.workloadId || entry?.workloadId || pending.workloadId,
+        platformKey: info.platformKey || entry?.platformKey,
+        token: info.token,
+        sessionId: info.sessionId || entry?.sessionId,
+        sandboxName: info.sandboxName || entry?.sandboxName,
+        namespace: info.namespace || entry?.namespace,
+        userId: info.userId || entry?.userId,
+        messageId: info.messageId || pending.messageId || entry?.messageId,
+      };
+      token = info.token;
+    } else if (entry || pending.workloadId || pending.messageId) {
+      known = {
+        provider: entry?.provider,
+        workloadId: entry?.workloadId || pending.workloadId,
+        platformKey: entry?.platformKey,
+        sessionId: entry?.sessionId,
+        sandboxName: entry?.sandboxName,
+        namespace: entry?.namespace,
+        userId: entry?.userId,
+        messageId: pending.messageId || entry?.messageId,
+      };
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId }, "keepalive.retry_pending_entry_read_failed");
+    return false;
+  }
+
+  try {
+    await destroyHands(sessionId, known, token);
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error)?.message ?? String(err),
+        sessionId,
+        workloadId: known?.workloadId || entry?.workloadId || pending.workloadId,
+        messageId: known?.messageId || pending.messageId,
+      },
+      "keepalive.retry_pending_stop_failed",
     );
     return false;
   }

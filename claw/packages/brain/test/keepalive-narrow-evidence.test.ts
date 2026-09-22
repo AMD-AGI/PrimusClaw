@@ -128,3 +128,18 @@ test("an expired retry separates a failed lock read from an absent lock", () => 
     "a failed read returns before anything is released",
   );
 });
+
+test("an expired retry stops the sandbox before dropping the hands pointer", () => {
+  // After sandbox idle-GC was removed, deleting only the KV entry left the
+  // workload (and any MN cluster) with no Brain pointer until workload TTL.
+  const body = bodyOf("shouldSkipExpiredRetry");
+  const stop = body.indexOf("destroyHands(");
+  const drop = body.indexOf("deleteExpiredRetryRecord(");
+  assert.ok(stop >= 0 && drop > stop,
+    "destroyHands must run before the hands record is deleted");
+  assert.match(
+    body,
+    /retry_pending_stop_failed/,
+    "a failed stop keeps the pointer for the next sweep",
+  );
+});

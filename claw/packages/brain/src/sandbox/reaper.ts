@@ -352,11 +352,13 @@ export async function destroyHands(
         );
       });
     }
-    // Multi-node GPU clusters follow the sandbox: same idle decision, cascade
-    // teardown scoped to this handle's messageId so a successor ensure() under
-    // the same session is not deleted with the prior sandbox. Best-effort --
-    // workload timeout remains the hard backstop.
-    if (stopOutcome === "stopped") {
+    // Multi-node GPU clusters follow the sandbox once this generation's stop
+    // is finished or abandoned. Scope DELETE to messageId so a successor
+    // ensure() under the same session is not swept. Include `unavailable`:
+    // teardown still drops the hands pointer, and without cascade the cluster
+    // would wait on workload timeout alone. Best-effort -- timeout remains the
+    // hard backstop when SaFE itself cannot be reached.
+    if (stopOutcome === "stopped" || stopOutcome === "unavailable") {
       const platformKey = String(
         (target as { platformKey?: string }).platformKey
           ?? (ownsRecorded ? recorded.identity?.platformKey : "")
