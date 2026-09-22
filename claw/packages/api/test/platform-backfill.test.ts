@@ -277,7 +277,11 @@ test("R7 the drain fairly interleaves new rows and eligible retries", async () =
   const h = drainHarness([]);
   await drainPendingPlatformFacts();
   const sel = h.queries.find((t) => /SELECT/i.test(t) && /FROM claw_tasks/.test(t))!;
-  assert.match(sel, /PARTITION BY \(platform_facts_next_retry_at IS NOT NULL\)/);
+  // Partitioned by the identity group too, so a lane position is a position in
+  // the lane it is actually compared against rather than one counted across
+  // both groups.
+  assert.match(sel, /PARTITION BY\s+\(NULLIF\(sandbox_workload_id/);
+  assert.match(sel, /\(platform_facts_next_retry_at IS NOT NULL\)\s+ORDER BY/);
   // Identity leads the ordering, but the lanes still interleave underneath it,
   // which is the fairness this pins: neither a permanently failing lane nor a
   // stream of new rows can starve the other, within identity-carrying rows and

@@ -510,3 +510,23 @@ test("a mass of handle-less chat rows does not take the cap from rows that name 
   );
   assert.equal(named.rows[0].n, 10, "every row carrying a handle was read in the first sweep");
 });
+
+test("within the identity group the fresh lane still gets its half of the cap", async () => {
+  // The lane position is what keeps a backlog of retries from starving rows
+  // that have never been tried. It only does that if it is counted inside the
+  // group it is compared against: counted across both groups, the second
+  // group's fresh lane starts wherever the first group's rows left off and
+  // never reaches the cap.
+  for (let i = 0; i < 60; i++) {
+    await seed(`retrying-${i}`, "worker_lost", { retryDelayMs: -60_000, attempts: 1 });
+  }
+  for (let i = 0; i < 10; i++) await seed(`fresh-${i}`, "worker_lost");
+
+  await drainPendingPlatformFacts();
+
+  const fresh = await pg.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM claw_tasks
+      WHERE task_id LIKE 'fresh-%' AND platform_facts_resolved_at IS NOT NULL`,
+  );
+  assert.equal(fresh.rows[0].n, 10, "never-tried rows are not held back by a retry backlog");
+});

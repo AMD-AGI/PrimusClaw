@@ -473,8 +473,20 @@ export async function drainPendingPlatformFacts(): Promise<number> {
               (NULLIF(sandbox_workload_id, '') IS NOT NULL
                OR (metadata->'sandbox' IS NOT NULL
                    AND metadata->'sandbox' <> 'null'::jsonb)) AS carries_identity,
+              -- Partitioned by the identity group as well as the lane, because
+              -- the outer ORDER BY uses this to order rows WITHIN a group: a
+              -- position counted across both groups makes the fresh lane of the
+              -- group that sorts second start wherever the other group's rows
+              -- left off, which is not a position in the lane it is compared
+              -- against. Both fresh/retry lanes therefore interleave inside
+              -- each group, rather than one group's lanes interleaving with the
+              -- other's.
               ROW_NUMBER() OVER (
-                PARTITION BY (platform_facts_next_retry_at IS NOT NULL)
+                PARTITION BY
+                  (NULLIF(sandbox_workload_id, '') IS NOT NULL
+                   OR (metadata->'sandbox' IS NOT NULL
+                       AND metadata->'sandbox' <> 'null'::jsonb)),
+                  (platform_facts_next_retry_at IS NOT NULL)
                 ORDER BY platform_facts_next_retry_at ASC NULLS LAST,
                          completed_at ASC, task_id ASC
               ) AS lane_position
