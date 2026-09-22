@@ -32,13 +32,26 @@ async function readTurnTools(sessionId: string, messageId: string | null) {
 }
 
 /** Persist a completion, allowing a real answer to replace only a sweeper placeholder. */
+/**
+ * Turn indices are allocated by reading MAX and inserting one past it, so two
+ * holders that both read the same MAX both write the same indices -- and that
+ * cannot be repaired afterwards, because nothing renumbers `turn_index`. The
+ * caller holds an advisory lock on a SEPARATE connection, so `stillHeld` is
+ * asked here, immediately in front of the read, rather than only before the
+ * call: everything between the two -- another statement's round trip, a pool
+ * wait -- is time the lock can be released in. It narrows the window to the
+ * read itself; closing it entirely means allocating on the lock's own
+ * connection, so that a released lock fails the statement instead of running it.
+ */
 export async function recordCompletionTurns(
   sessionId: string,
   event: Record<string, unknown>,
   messageId: string | null,
+  stillHeld?: () => boolean,
 ): Promise<void> {
   const { final_text, failed, prompt, interrupted, failure_reason } = event as any;
   if (!final_text && !interrupted && !failed) return;
+  if (stillHeld && !stillHeld()) return;
 
   const lastIdx = (await db.query(
     "SELECT COALESCE(MAX(turn_index), 0) as max FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL",

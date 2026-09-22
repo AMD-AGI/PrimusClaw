@@ -146,17 +146,37 @@ function isRefusal(
 // never saw is exactly the child idled into the tree that `sessionTreeShape`
 // is written to bound, and it would be paid for later by every session in the
 // tree, whose next turn is the one the ceiling finally refuses.
+/**
+ * `stillHeld` is the de-duplication lock, asked beside the INSERT rather than
+ * only before this call. Everything in between -- a pool wait, the transaction,
+ * the admission lock, the parent authorisation read -- is a round trip the lock
+ * can be released during, and a create that goes ahead after that is the
+ * duplicate session the lock exists to prevent: a competitor takes the same key,
+ * caches its own result, and the retry gets a different session from the one
+ * this request returned 200 for. It cannot be closed by asking more often --
+ * the lock lives on another connection -- but asking it here rather than several
+ * awaits earlier is the difference between a window the size of one statement
+ * and one the size of the whole create.
+ */
 async function createSessionRow(
   row: NewSessionRow,
   parentSid: string | null,
   user: ReturnType<typeof getUser>,
+  stillHeld?: () => boolean,
 ): Promise<SessionCreateRefusal | null> {
-  if (parentSid) return admitParentedSessionCreate(parentSid, user, row);
+  if (parentSid) return admitParentedSessionCreate(parentSid, user, row, stillHeld);
   const parentAuth = await resolveParentAuthorisation(db, parentSid, user);
   if (isRefusal(parentAuth)) return parentAuth;
+  if (stillHeld && !stillHeld()) return LOCK_LOST_REFUSAL;
   await insertSessionRow(db, row, parentAuth);
   return null;
 }
+
+/** The 503 a create takes when its de-duplication lock went away before the INSERT. */
+const LOCK_LOST_REFUSAL: SessionCreateRefusal = {
+  statusCode: 503,
+  response: { ok: false, error: "lock_connection_lost" },
+};
 
 /**
  * The parent read, the tree decision and the INSERT are one transaction whose
@@ -168,6 +188,7 @@ export async function admitParentedSessionCreate(
   parentSid: string,
   user: ReturnType<typeof getUser>,
   row: NewSessionRow,
+  stillHeld?: () => boolean,
 ): Promise<SessionCreateRefusal | null> {
   const client = await db.pool.connect();
   try {
@@ -207,6 +228,7 @@ export async function admitParentedSessionCreate(
           response: { ok: false, error: "admission_rejected", reason: refusal },
         };
       }
+      if (stillHeld && !stillHeld()) return LOCK_LOST_REFUSAL;
       await insertSessionRow(client, row, parentAuth);
       await client.query("COMMIT");
       return null;
@@ -1226,9 +1248,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
         // before the row is written.
-        const lostLate = refuseIfLockLost();
-        if (lostLate) return lostLate as { statusCode: number; response: Record<string, unknown> };
-        const refused = await createSessionRow(newRow, parentSid, user);
+        const refused = await createSessionRow(
+          newRow, parentSid, user,
+          () => !(idemLock && connectionLost(idemLock.client)),
+        );
         if (refused) {
           return { statusCode: refused.statusCode, response: refused.response };
         }

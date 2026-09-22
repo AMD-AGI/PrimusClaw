@@ -249,16 +249,16 @@ async function processCompletionEvent(
     if (lease.lost()) return;
     if (alreadyProcessed) {
       if (messageId && event.completion_source !== "sweeper") {
-        await recordCompletionTurns(sessionId, event, messageId);
+        await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
       }
       logger.info({ sessionId, rowId, messageId }, "exec_complete.skipped_already_processed");
     } else if (namesChatRow && messageAlreadyProcessed) {
       const verdict = await completionAdmissibility(provenance, runClaimOf(event));
       if (verdict === "active") {
-        await handleComplete(sessionId, event, rowId, provenance);
+        await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
       } else {
         if (verdict === "settled" && messageId && event.completion_source !== "sweeper") {
-          await recordCompletionTurns(sessionId, event, messageId);
+          await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
         }
         logger.info(
           { sessionId, rowId, messageId, verdict },
@@ -266,7 +266,7 @@ async function processCompletionEvent(
         );
       }
     } else {
-      await handleComplete(sessionId, event, rowId, provenance);
+      await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
     }
     // The durable done-marker, and the one statement in this body that a hold
     // which has already lost its lock must not write.
@@ -734,6 +734,10 @@ async function handleComplete(
   event: Record<string, unknown>,
   eventRowId?: number | null,
   provenance: string | "foreign" | null = null,
+  // Asked again beside the turn write inside, not only before this call: the
+  // steps above it each take a round trip, and the lock this body depends on
+  // is held on another connection that can be released during any of them.
+  stillHeld?: () => boolean,
 ): Promise<void> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
@@ -837,7 +841,7 @@ async function handleComplete(
   );
 
   // 3. Save conversation turns.
-  await recordCompletionTurns(sessionId, event, messageId);
+  await recordCompletionTurns(sessionId, event, messageId, stillHeld);
 
   // 4. Process explicit save_memory events (from Brain's save_memory tool).
   // Gated by CLAW_MEMORY_ENABLED. When OFF: drop the payload, warn for audit.
