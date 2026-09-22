@@ -30,6 +30,7 @@ import { SandboxStopUnavailable } from "../src/sandbox/errors.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
 
 const sc = StringCodec();
+const OWN_TASK = "task-destroy-hands";
 const SESSION = "sess-stop";
 const ENTRY = {
   provider: "safe-workload",
@@ -215,12 +216,23 @@ test("a TTL refresh between the caller's read and the teardown does not stop it"
   // passed, not whatever the key names now, and the KV delete below is a CAS
   // gated on sameHandsSandbox, so a sibling that really did take the key over
   // keeps both its workload and its entry (see the sibling test above).
-  const { kv, deleted } = bumpedKv({ ...ENTRY, status: "pending" });
+  // Provisioned by the run that is reaping it: `createdAt` at or after the
+  // moment it asked, which is what makes this entry its own to destroy.
+  const askedAt = Date.now() - 1_000;
+  const { kv, deleted } = bumpedKv({
+    // Named, because the reap establishes ownership by the task the entry
+    // records. This call used to pass a bare `askedAt` against a signature that
+    // no longer takes one: at runtime a number carries no `taskId`, so the
+    // identity gate never fired and the green result was verifying an anonymous
+    // caller rather than this one.
+    ...ENTRY, status: "pending", taskId: OWN_TASK,
+    createdAt: new Date(askedAt + 100).toISOString(),
+  });
   bindHandsKv(kv);
   restoreRetry = bindSandboxStopRetry({ delayMs: 1 });
   const stub = stubStop(async () => {});
 
-  await reapPendingHands(SESSION);
+  await reapPendingHands(SESSION, { taskId: OWN_TASK });
 
   assert.equal(stub.calls(), 1,
     "a bumped revision is a TTL refresh, not a change of owner: the dead "

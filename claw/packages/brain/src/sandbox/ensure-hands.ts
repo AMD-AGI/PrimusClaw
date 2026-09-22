@@ -18,6 +18,9 @@ import type { ExecuteRequest, HandleInfo } from "@claw/protocol";
 import { isRevisionConflict, sleep } from "@claw/utils";
 import { isTombstone, pickLockKey } from "../tasks/lock.js";
 import {
+  type AttributedEntry, needsRestamp, type SandboxAttribution,
+} from "./attribution.js";
+import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
   ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
@@ -257,6 +260,15 @@ export interface SandboxReuseEffects {
 
 export interface EnsureHandsOptions {
   /**
+   * The attempt asking, not merely the task.
+   *
+   * Recorded on the PENDING entry so the reporting side can tell THIS attempt's
+   * half-created workload from one a previous delivery of the same task left
+   * behind. A task id cannot: a redelivery carries the same one, and the
+   * timestamp that stood in for this is stamped by whichever replica wrote it.
+   */
+  attemptId?: string;
+  /**
    * Provision instead of consulting `hands.<sessionId>`.
    *
    * Recovery uses this after stopping a specifically named DAG sandbox. The
@@ -441,6 +453,13 @@ export interface ReuseAttempt {
   request: ExecuteRequest;
   multiNodeContext?: MultiNodeContext;
   requestedSpec: string;
+  /**
+   * The attempt asking. Recorded on whatever entry this reuse writes, so the
+   * record names the run that HOLDS the sandbox rather than the one that minted
+   * it. Never consulted to decide whether the reuse is allowed -- that is
+   * `entryOwnedByAnother`, at DAG-root grain. See sandbox/attribution.ts.
+   */
+  attemptId?: string | null;
   onEvent: (evt: Record<string, unknown>) => Promise<void>;
   signal?: AbortSignal;
   /**
@@ -500,6 +519,7 @@ async function recoverOrRetainUnusableSandbox(
       identity,
       binding,
       signal,
+      heldBy(attempt),
     );
     if (recovery.outcome === "reused" && recovery.result) return recovery.result;
     containerGone = recovery.outcome === "gone";
@@ -618,6 +638,8 @@ async function recoverUnhealthyReuse(
   identity: SandboxEntry,
   binding: HandsBinding,
   signal?: AbortSignal,
+  /** Passed through to the accept below; see `acceptExistingSandbox`. */
+  held?: SandboxAttribution,
 ): Promise<UnhealthyRecovery> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
   if (probe.reason === "exec_sandbox_terminal") {
@@ -677,7 +699,7 @@ async function recoverUnhealthyReuse(
   );
   return {
     outcome: "reused",
-    result: await acceptExistingSandbox(kv, sessionId, info, identity, binding),
+    result: await acceptExistingSandbox(kv, sessionId, info, identity, binding, held),
   };
 }
 
@@ -1526,6 +1548,9 @@ async function restoreSessionBinding(
     // Who holds it -- see the note on `entryOwnedByAnother`. This DAG does: it
     // is the DAG the handle row is keyed by.
     taskId: a.request.task_id ?? null,
+    // This DAG is re-binding a container it did not create, and the record
+    // names the run that now HOLDS it -- which is what attribution is for.
+    attemptId: a.attemptId ?? null,
     dagRootTaskId: dagRoot,
     runScope: pickLockKey(a.request),
     provider: own.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
@@ -1966,7 +1991,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       { sessionId, handsUrl: info.handsUrl, specMatch: verdict.reason },
       "ensureHands.reusing_existing",
     );
-    return acceptExistingSandbox(kv, sessionId, info, identity, binding);
+    return acceptExistingSandbox(kv, sessionId, info, identity, binding, heldBy(a));
   }
   return recoverOrRetainUnusableSandbox(a, info, identity, binding, health, hasToken);
 }
@@ -1999,12 +2024,34 @@ async function clearIdleMarkers(
   info: any,
   identity: SandboxEntry,
   binding: HandsBinding,
+  /**
+   * The run taking the sandbox on.
+   *
+   * Re-stamped in the SAME write that takes it on, because the attribution
+   * means "who holds it now". A container minted by one attempt and then reused
+   * by the next task is that task's to report while it is using it: if it dies
+   * under them, that death is their ending. Recording the minter instead would
+   * refuse a legitimate reuser its own ending, which is why this is a re-stamp
+   * and not a check -- nothing here can refuse the reuse.
+   */
+  held?: SandboxAttribution,
 ): Promise<boolean> {
-  if (
-    info.keepalive === undefined
-    && info.idleSince == null
-    && info.quiescedAt == null
-  ) return true;
+  const restamp = held ? needsRestamp(info as AttributedEntry, held) : false;
+  // Why this write is happening, kept apart because the two reasons have
+  // OPPOSITE failure handling and only this knows which applies.
+  //
+  // Clearing markers is load-bearing for the reuse: the caller reads a `false`
+  // as "the slot went out from under us" and rebuilds. Re-stamping is not --
+  // the sandbox answered its own health check, and a stale holder costs a
+  // misreported ending, not a lost container. Before this stamp existed an
+  // entry with no markers took no CAS at all, so making one mandatory would
+  // have added a way for a live sandbox to be refused and replaced: a lost race
+  // whose re-read lands on a key a rolling migration has moved reads as a
+  // deleted record. That refusal stays reserved for the reason that earns it.
+  const clearingMarkers = info.keepalive !== undefined
+    || info.idleSince != null
+    || info.quiescedAt != null;
+  if (!restamp && !clearingMarkers) return true;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
   // handle parked, and eligibleForClusterReclaim refuses any entry whose
   // keepalive is not false, so clearing it here would strip a session delete's
@@ -2021,6 +2068,10 @@ async function clearIdleMarkers(
   delete info.keepalive;
   delete info.idleSince;
   delete info.quiescedAt;
+  if (restamp && held) {
+    info.taskId = held.taskId;
+    info.attemptId = held.attemptId;
+  }
   const { key } = binding;
   const payload = sc.encode(JSON.stringify(info));
   try {
@@ -2038,7 +2089,18 @@ async function clearIdleMarkers(
   try {
     const latest = await kv.get(key);
     // Absent or tombstoned: the sweep won the race and took the slot with it.
+    //
+    // Only a write that was clearing markers may read this as a reason to
+    // refuse the reuse. A write that was only re-stamping the holder has no
+    // claim on that verdict -- the sandbox answered its health check, and a key
+    // that is missing HERE may simply have been migrated to its canonical name
+    // by `reconcileReservedKeys` mid-rollout. Refusing then would rebuild a
+    // live container to fix a record.
     if (!latest || isTombstone(latest)) {
+      if (!clearingMarkers) {
+        logger.warn({ sessionId, key }, "ensureHands.holder_restamp_skipped_key_moved");
+        return true;
+      }
       logger.warn({ sessionId, key }, "ensureHands.reuse_record_deleted_under_us");
       return false;
     }
@@ -2073,13 +2135,20 @@ async function clearIdleMarkers(
       logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
       return true;
     }
-    if (
-      current.keepalive === undefined
-      && current.idleSince == null
-      && current.quiescedAt == null
-    ) return true;
+    // The stamp travels with the retry. It was applied to the value the first
+    // CAS lost, and re-reading discards that value -- so a single ordinary
+    // heartbeat landing during the health check was enough to leave the holder
+    // naming whoever held it last.
+    const stamped = restamp && held
+      ? { taskId: held.taskId, attemptId: held.attemptId }
+      : {};
+    const stillNeedsMarkers = current.keepalive !== undefined
+      || current.idleSince != null
+      || current.quiescedAt != null;
+    if (!stillNeedsMarkers && !restamp) return true;
     await kv.update(key, sc.encode(JSON.stringify({
       ...current,
+      ...stamped,
       keepalive: undefined,
       idleSince: undefined,
       quiescedAt: undefined,
@@ -2255,19 +2324,75 @@ export async function registerReusedDagHandle(
  * provision instead of reuse: registering a sandbox whose record the sweep just
  * removed re-adds a ping target the roster no longer holds a slot for.
  */
+/**
+ * Record the run now holding `identity` on the session binding, if that binding
+ * names the same sandbox.
+ *
+ * For the take-over paths that do not go through `clearIdleMarkers` -- today
+ * `sandbox_spec.use`, which resolves its container through the DAG handle
+ * registry and never touches the session slot. The contract says a record names
+ * WHO HOLDS IT NOW, and a path that takes a sandbox on without saying so leaves
+ * the previous holder's name on it.
+ *
+ * Conditional on the binding naming the same sandbox, and that condition is the
+ * whole safety of it: a session's slot can name a sibling DAG's container, and
+ * stamping this run onto that would claim a sandbox it is not using -- the
+ * inverse defect, and a worse one.
+ *
+ * Best effort by construction. It returns nothing and swallows everything: the
+ * caller has already probed the container and is entitled to use it, and a
+ * record that could not be updated costs a misattributed ending rather than a
+ * lost container. The reverse -- refusing a live sandbox because a write lost a
+ * race -- is the mistake this same refactor made once already.
+ */
+async function restampSessionBinding(
+  kv: ReturnType<typeof getHandsKv>,
+  sessionId: string,
+  identity: SandboxEntry,
+  held: SandboxAttribution,
+): Promise<void> {
+  if (!held.taskId && !held.attemptId) return;
+  try {
+    const binding = await readHandsEntry(kv, sessionId);
+    if (!binding) return;
+    const current = parseHandsProbeValue(binding.value) as HandsProbeEntry & AttributedEntry;
+    if (!sameHandsSandbox(identity, current)) return;
+    if (!needsRestamp(current, held)) return;
+    await kv.update(
+      binding.key,
+      sc.encode(JSON.stringify({
+        ...current, taskId: held.taskId, attemptId: held.attemptId,
+      })),
+      binding.revision,
+    );
+  } catch (err) {
+    logger.warn(
+      { err: String(err), sessionId },
+      "ensureHands.holder_restamp_failed",
+    );
+  }
+}
+
+/** The run this reuse attempt is for, as an attribution. */
+function heldBy(a: ReuseAttempt): SandboxAttribution {
+  return { taskId: a.request.task_id ?? null, attemptId: a.attemptId ?? null };
+}
+
 async function acceptExistingSandbox(
   kv: ReuseAttempt["kv"],
   sessionId: string,
   info: any,
   identity: SandboxEntry,
   binding: HandsBinding,
+  /** The run taking it on; re-stamped by `clearIdleMarkers`. */
+  held?: SandboxAttribution,
 ): Promise<EnsureHandsResult | null> {
   // Reactivate a post-task idle reuse handle: clear the keepalive:false marker
   // so the ticker resumes owning it as an active session and
   // stopKeepaliveAfterTask re-marks it idle when this task ends. A handle with
   // no markers needs no write at all -- the entry that passed the gate is
   // already the entry we want.
-  if (!await clearIdleMarkers(kv, sessionId, info, identity, binding)) return null;
+  if (!await clearIdleMarkers(kv, sessionId, info, identity, binding, held)) return null;
   // Before the local registration, which is what makes this replica ping it:
   // provisioning is not the only way a ping target is taken on, and a reuse
   // admitted against an uncounted fleet is the same unadmitted target by a
@@ -2376,6 +2501,10 @@ async function provisionHands(
       "ensureHands.reusing_dag_handle",
     );
     reuseEffects.registerSandbox(sessionId, identity);
+    await restampSessionBinding(kv, sessionId, identity, {
+      taskId: request.task_id ?? null,
+      attemptId: options.attemptId ?? null,
+    });
     return { handsUrl: info.hands_url, created: false, token: info.token, identity };
   }
 
@@ -2386,6 +2515,7 @@ async function provisionHands(
   if (!options.skipSessionReuse) {
     const reused = await tryReuseSessionSandbox({
       kv, sessionId, request, multiNodeContext, requestedSpec, onEvent,
+      attemptId: options.attemptId ?? null,
       // The resolved action, so the reuse decision can start from the record
       // that is actually keyed by "which sandbox is this DAG's <handle>"
       // rather than from the session slot every node of every DAG shares.
@@ -2499,7 +2629,7 @@ async function provisionHands(
     }
     return await ensureHandsAgentSandbox(
       sessionId, request, action, workloadImage, env, handsToken, mcpPort, onEvent,
-      requestedSpec,
+      options.attemptId ?? null, requestedSpec,
     );
   }
 
@@ -2537,9 +2667,18 @@ async function provisionHands(
   const hold = await admitSandbox(sessionId);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
+    // Same field the READY payload below carries, and for the same reason, but
+    // it is the PENDING form that cannot do without it: the sweeper's collector
+    // has to ask whether anyone still holds this session's run lease before it
+    // stops a queued workload, and `lock.<sessionId>` is not where that lease
+    // is. Without this the collector cannot tell "nobody is waiting for this"
+    // from "I looked under the wrong key", and it is written to skip rather
+    // than guess -- so an entry with no runScope is an entry nothing collects.
+    runScope: pickLockKey(request),
     // The handle this DAG is claiming, and who is claiming it. Needed inside
     // because the registration has to happen in this hook -- see the note there.
     taskId: request.task_id ?? null,
+    attemptId: options.attemptId ?? null,
     dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
     handleName: action.kind === "create" ? (action.handle ?? null) : null,
   });
@@ -2635,6 +2774,12 @@ async function provisionHands(
     status: "ready",
     // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
     taskId: request.task_id ?? null,
+    // Carried across the promotion rather than dropped at it. The attempt
+    // minted with the PENDING entry used to end here, which left everything
+    // downstream of "usable" attempt-blind and forced the same rule to be
+    // taught again on the database row. Re-stamped when another run takes the
+    // sandbox on, not frozen at mint -- see sandbox/attribution.ts.
+    attemptId: options.attemptId ?? null,
     dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
     // The key the run lease is actually under. Not the session: the gate is
     // workspace-scoped by default, so a run holding files takes
@@ -2781,9 +2926,18 @@ export function makeOnProvisioned(deps: {
   sandboxImage: string | null;
   kv: KV;
   hold: AdmissionHold;
+  /**
+   * The key this run's lease is under (`pickLockKey`), recorded on the PENDING
+   * entry so a sweeper can ask whether the run that minted this workload is
+   * still alive. Omitted only where there is no request to take it from; the
+   * collector treats an entry without it as one it may not judge.
+   */
+  runScope?: string;
   stop?: (workloadId: string) => Promise<void>;
   /** Who this workload belongs to, and the handle it is claiming. */
   taskId?: string | null;
+  /** The attempt that asked; see EnsureHandsOptions.attemptId. */
+  attemptId?: string | null;
   dagRootTaskId?: string | null;
   handleName?: string | null;
 }): (workloadId: string) => Promise<void> {
@@ -2837,8 +2991,17 @@ export function makeOnProvisioned(deps: {
       // gate, so a failing task must be able to tell its own half-created
       // workload from a sibling's live one before reaping it.
       taskId: deps.taskId ?? null,
+      // Which ATTEMPT minted it. `taskId` says a redelivery is the same task;
+      // only this says it is the same run of it.
+      attemptId: deps.attemptId ?? null,
       dagRootTaskId: deps.dagRootTaskId ?? null,
       platformKey: deps.apiKey, token: deps.handsToken, namespace: deps.namespace,
+      runScope: deps.runScope,
+      // Stamped once, here, and never rewritten. The delivery heartbeat re-puts
+      // this entry's bytes back unchanged every 10s to refresh its TTL, so this
+      // is an age from creation and not from the last touch -- which is what
+      // lets both the runner's ownership test and the sweeper's abandonment
+      // horizon read it.
       createdAt: new Date().toISOString(),
     }));
 
@@ -3295,6 +3458,8 @@ async function ensureHandsAgentSandbox(
   handsToken: string,
   mcpPort: string,
   onEvent: (evt: Record<string, unknown>) => Promise<void>,
+  /** The attempt asking; recorded on the entry. See sandbox/attribution.ts. */
+  attemptId: string | null,
   /**
    * Passed in rather than recomputed, because the value stored here is what a
    * later request compares itself against: two call sites deriving it
@@ -3395,6 +3560,9 @@ async function ensureHandsAgentSandbox(
       status: "ready",
       // Who this sandbox belongs to -- see the note on `entryOwnedByAnother`.
       taskId: request.task_id ?? null,
+      // Same field, same meaning as the safe-workload path. This provider has
+      // no PENDING phase, so this write is the only place it is recorded.
+      attemptId: attemptId ?? null,
       dagRootTaskId: request.dag_root_task_id ?? request.task_id ?? null,
       // The key the run lease is actually under -- see the note on the other
       // create path: workspace-gated by default, session only as a fallback.

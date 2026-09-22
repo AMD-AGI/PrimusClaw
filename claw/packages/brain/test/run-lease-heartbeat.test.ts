@@ -26,6 +26,10 @@ import {
   activeAbort, LEASE_LOST_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "../src/tasks/abort-registry.js";
 import { beginRun, endRun, phaseOf, whileWaiting } from "../src/tasks/run-phase.js";
+import type { LeaseRenewal } from "../src/tasks/callback.js";
+import type { SandboxEntry } from "../src/sandbox/keepalive.js";
+import { handsSessionKey } from "../src/sandbox/hands-key.js";
+import { RUN_LEASE_HEARTBEAT_MS } from "../src/config.js";
 import { testRunKey } from "./support/run-identity.js";
 
 const SESSION = "sess-lease";
@@ -79,33 +83,54 @@ function result(): ExecuteResult {
   } as ExecuteResult;
 }
 
-interface Renewal {
-  brainId: string;
-  phase: string;
-  waitedMs: number;
-  leaseSeconds: number;
-  attempt: {
-    attemptId: string;
-    claimCount: number;
-    deliverySeq: number;
-    deliveryCount: number;
-  };
+interface ScenarioControls {
+  /** The same bucket the runner reads, so a test can play `onProvisioned`. */
+  kv: KV;
+  /** Let a held `ensureHands` return, ending the pre-ready window. */
+  releaseHands: () => void;
+  /**
+   * The attempt id the runner handed to `ensureHands`.
+   *
+   * An entry the scenario writes has to carry it, because that is what
+   * `makeOnProvisioned` records and what the report identifies the entry by --
+   * a task id alone cannot tell this attempt from the delivery before it.
+   */
+  attemptId: () => string | null;
 }
 
 async function runScenario(opts: {
   lease?: { url: string; token: string };
-  engineBehavior?: (extras: ExecuteExtras | undefined) => Promise<ExecuteResult>;
+  identity?: SandboxEntry;
+  /** Park `ensureHands` until the scenario says so, to hold the run pre-ready. */
+  holdHands?: boolean;
+  engineBehavior?: (
+    extras: ExecuteExtras | undefined, ctl: ScenarioControls,
+  ) => Promise<ExecuteResult>;
   leaseVerdict?: (n: number) => string;
 }) {
-  const renewals: Renewal[] = [];
+  const renewals: LeaseRenewal[] = [];
   const { msg } = fakeMsg();
   const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
   const emitter = { async emit() {} } as unknown as NatsEmitter;
   const noop = <T>(value: T) => (..._a: unknown[]) => Promise.resolve(value) as never;
 
+  let releaseHands = () => {};
+  const handsHeld = new Promise<void>((resolve) => { releaseHands = () => resolve(); });
+
+  // Captured from the options the runner passes, the way the real
+  // `makeOnProvisioned` gets it: an entry written below has to name the ATTEMPT
+  // that minted it, or the report will not recognise it as this run's.
+  let attemptId: string | null = null;
   const sideEffects = {
-    ensureHands: noop({ handsUrl: "http://hands.test", created: true, token: "t" }),
+    ensureHands: (async (
+      _sid: string, _req: unknown, _pk: unknown, _ev: unknown, _mn: unknown,
+      o?: { attemptId?: string },
+    ) => {
+      attemptId = o?.attemptId ?? null;
+      if (opts.holdHands) await handsHeld;
+      return { handsUrl: "http://hands.test", created: true, token: "t", identity: opts.identity };
+    }) as never,
     destroyHands: noop(undefined),
     reapPendingHands: noop(undefined),
     unregisterSandbox: (() => {}) as never,
@@ -119,7 +144,7 @@ async function runScenario(opts: {
     restoreWorkspace: noop({ ok: true }),
     postAgentDone: noop(undefined),
     postTaskRunning: noop(undefined),
-    postRunLease: ((_req: unknown, renewal: Renewal) => {
+    postRunLease: ((_req: unknown, renewal: LeaseRenewal) => {
       renewals.push(renewal);
       return Promise.resolve(opts.leaseVerdict?.(renewals.length) ?? "running");
     }) as never,
@@ -132,7 +157,9 @@ async function runScenario(opts: {
 
   const engine: Engine = {
     async execute(_req, _onEvent, _signal, _hands, extras) {
-      return opts.engineBehavior ? opts.engineBehavior(extras) : result();
+      return opts.engineBehavior
+        ? opts.engineBehavior(extras, { kv, releaseHands, attemptId: () => attemptId })
+        : result();
     },
   };
 
@@ -166,6 +193,121 @@ test("a run with a lease claims it before it starts working", async () => {
   assert.ok(renewals.length >= 1, "the lease is taken up front");
   assert.equal(renewals[0].phase, "executing");
   assert.ok(renewals[0].leaseSeconds > 0);
+  assert.equal(renewals[0].sandbox, undefined);
+});
+
+for (const identity of [
+  { workloadId: "workload-1", platformKey: "private-key" },
+  { provider: "agent-sandbox" as const, sessionId: "router-session-1", sandboxName: "pod-1" },
+]) {
+  test(`a later heartbeat reports the lazily attached ${identity.provider ?? "safe-workload"} handle`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const { renewals } = await runScenario({
+      lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+      identity,
+      async engineBehavior(extras) {
+        await extras!.attachHands!();
+        t.mock.timers.tick(RUN_LEASE_HEARTBEAT_MS);
+        return result();
+      },
+    });
+    assert.equal(renewals[0].sandbox, undefined);
+    assert.deepEqual(renewals.at(-1)?.sandbox, {
+      provider: identity.provider ?? "safe-workload",
+      handle: identity.provider === "agent-sandbox" ? identity.sessionId : identity.workloadId,
+    });
+    assert.ok(renewals.length > 1);
+  });
+}
+/** Drain the KV read and the POST the heartbeat now chains behind it. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+}
+
+test("a renewal sent while the sandbox is still provisioning names the pending workload", async (t) => {
+  // The three endings this branch exists to explain -- sandbox_pending_timeout,
+  // sandbox_exited_before_ready, sandbox_gone -- all happen before ensureHands
+  // returns, so `handsIdentity` is null for every renewal any of them will ever
+  // send. The renewal is where the API gets the handle it later asks SaFE about
+  // (recordLeaseSandbox -> platform-backfill), and backfill's KV fallback
+  // refuses a reused sandbox, so a row with no handle on it is a kill nobody
+  // can attribute. The id does exist by then: onProvisioned writes a PENDING
+  // entry naming it before it starts waiting for the pod.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { renewals } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    identity: { workloadId: "workload-ready", platformKey: "private-key" },
+    holdHands: true,
+    async engineBehavior(extras, ctl) {
+      const attaching = extras!.attachHands!();
+      await settle();
+      // What onProvisioned writes, field for field, while the provision is
+      // still waiting on the pod -- no `provider`, which is why sandboxForLease
+      // has to fall back to safe-workload for it.
+      await ctl.kv.put(handsSessionKey(SESSION), JSON.stringify({
+        status: "pending",
+        // Recorded by `makeOnProvisioned` alongside everything else, and what
+        // the report establishes ownership by -- the task, and which attempt of
+        // it.
+        taskId: TASK,
+        attemptId: ctl.attemptId(),
+        workloadId: "workload-pending-1",
+        platformKey: "private-key",
+        sandboxImage: null,
+        createdAt: new Date().toISOString(),
+      }));
+      t.mock.timers.tick(RUN_LEASE_HEARTBEAT_MS);
+      await settle();
+      ctl.releaseHands();
+      await attaching;
+      // The PENDING entry is still sitting in KV, unchanged, so the last
+      // renewal naming the attached sandbox is the guard short-circuiting on
+      // `handsIdentity` rather than the entry happening to have moved on.
+      t.mock.timers.tick(RUN_LEASE_HEARTBEAT_MS);
+      await settle();
+      return result();
+    },
+  });
+
+  assert.equal(renewals[0].sandbox, undefined,
+    "nothing was provisioned when the lease was taken, so there is nothing to name");
+  assert.deepEqual(renewals[1]?.sandbox, { provider: "safe-workload", handle: "workload-pending-1" },
+    "a run the cluster kills here must still leave the workload id on its row");
+  assert.deepEqual(renewals.at(-1)?.sandbox, { provider: "safe-workload", handle: "workload-ready" },
+    "and the attached sandbox still wins once ensureHands has returned");
+});
+
+test("a renewal does not claim a sandbox this run never attached to", async (t) => {
+  // The other half of the same read. A session whose previous message left a
+  // READY entry behind is exactly the case backfill's KV fallback refuses, and
+  // reporting that live workload as this run's handle would file a placement
+  // -- and later an ending -- against a run that never touched it. Only a
+  // PENDING entry belongs to the provision this run is waiting on.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { renewals } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    identity: { workloadId: "workload-ready", platformKey: "private-key" },
+    holdHands: true,
+    async engineBehavior(extras, ctl) {
+      const attaching = extras!.attachHands!();
+      await settle();
+      await ctl.kv.put(handsSessionKey(SESSION), JSON.stringify({
+        status: "ready",
+        workloadId: "workload-someone-elses",
+        platformKey: "private-key",
+      }));
+      t.mock.timers.tick(RUN_LEASE_HEARTBEAT_MS);
+      await settle();
+      ctl.releaseHands();
+      await attaching;
+      return result();
+    },
+  });
+
+  assert.ok(
+    renewals.every((r) => r.sandbox?.handle !== "workload-someone-elses"),
+    "a READY entry is some earlier message's sandbox, not this run's",
+  );
 });
 
 test("B22 a fat-path renewal presents the row's non-null attempt token", async () => {
@@ -173,10 +315,12 @@ test("B22 a fat-path renewal presents the row's non-null attempt token", async (
     lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
   });
 
-  assert.equal(renewals[0].attempt.claimCount, 0);
-  assert.equal(renewals[0].attempt.deliverySeq, 7);
-  assert.equal(renewals[0].attempt.deliveryCount, 1);
-  assert.ok(renewals[0].attempt.attemptId);
+  const attempt = renewals[0]?.attempt;
+  assert.ok(attempt, "the renewal carries the attempt it was sent for");
+  assert.equal(attempt.claimCount, 0);
+  assert.equal(attempt.deliverySeq, 7);
+  assert.equal(attempt.deliveryCount, 1);
+  assert.ok(attempt.attemptId);
 });
 
 test("a run without a lease says nothing", async () => {

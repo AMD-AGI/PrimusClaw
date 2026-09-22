@@ -1000,6 +1000,40 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
 
+// How long a PENDING `hands.<sid>` entry may sit there with nobody running for
+// it before the sweeper treats it as abandoned, stops its workload and deletes
+// the entry. Configured in seconds like the ceiling above, stored in ms. Set
+// <=0 to disable the collection entirely (the pre-collector behaviour: a
+// pending entry is then never reclaimed by the sweeper).
+//
+// This is NOT the in-task ceiling above and does not duplicate it. That one is
+// spent by a run that is present: it watches its own workload queue and fails
+// the message at `sandbox_pending_timeout`. This one is the net under the run
+// that is NOT present -- a pod killed between minting a workload and reaping
+// it, leaving an entry that no longer has an owner to time it out. Which is why
+// it is guarded by the run lease rather than by being longer than the ceiling:
+// a run still queueing at 2h50m holds its lease, so the guard skips it and its
+// own 3h ceiling is what ends it.
+//
+// The trade in the number. GPU queueing here is unbounded -- SANDBOX_POLL_TIMEOUT_MS
+// is an hour, SANDBOX_PENDING_TIMEOUT_SECONDS three, and a busy cluster can sit
+// a workload behind others for longer than either -- so too SHORT a horizon
+// stops a sandbox that is legitimately still queued for a run that will use it,
+// and the user sees provisioning fail for no reason they can act on. Too LONG
+// and the leak stays open: the entry is the only record of workloadId +
+// platformKey, so until something collects it the workload runs to its own
+// absolute timeout, SANDBOX_DEFAULT_TIMEOUT_SECONDS, 24 hours of GPUs on a
+// workload nobody is waiting for. Two hours sits past any queue wait we have
+// actually measured and an order of magnitude under the 24h fallback.
+//
+// A reclaim here logs at ERROR, not warn. Nothing reaches this line in normal
+// operation: a run that ends, retries or crashes with its pod alive reaps its
+// own pending entry, so an entry that got here means a brain died between
+// minting a workload and recording it, or a reap failed silently. That is an
+// operator's problem to see, not a number to collect quietly.
+export const SANDBOX_PENDING_ABANDONED_AFTER_MS =
+  envInt("SANDBOX_PENDING_ABANDONED_AFTER_SECONDS", 2 * 60 * 60) * 1000;
+
 // Hands /health readiness poll AFTER the sandbox reaches Running and the
 // hands-binary bootstrap has been kicked off. Total budget ≈ TRIES * INTERVAL.
 // Default raised to 40 * 3s = 120s (was a hardcoded 20 * 3s = 60s): non-Claw

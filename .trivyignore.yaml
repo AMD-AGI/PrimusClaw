@@ -21,30 +21,19 @@
 # pushed out deliberately, in a commit, with the reason updated. An exemption
 # that cannot expire is how a scan quietly stops being a scan.
 
-vulnerabilities:
-  # libpcre2 in Debian 12 (bookworm). Fixed in 10.42-1+deb12u1; both
-  # `node:26-bookworm-slim` and `python:3.14-slim-bookworm` still ship 10.42-1.
-  #
-  # Checked on 2026-09-15 rather than assumed: the newest `node:26-bookworm-slim`
-  # on Docker Hub at that point (sha256:cd9f682f...) was scanned with the same
-  # trivy 0.72.0 the gate uses and still reported both CVEs, and the newest
-  # `python:3.14-slim-bookworm` digest was byte-identical to the one pinned here
-  # -- upstream had not rebuilt either image. Bumping the pins was tried first
-  # and does not close these.
-  #
-  # Reachability, for the record: PCRE2 is linked by the base image's own
-  # userland (grep and friends). Neither the API/Brain process nor the memory
-  # services call into it -- Node uses V8's regex engine and CPython uses its
-  # own `re` -- so no request path in our code reaches this parser.
-  - id: CVE-2026-86145
-    statement: >-
-      pcre2 out-of-bounds write. Fixed in Debian as 10.42-1+deb12u1; the node
-      and python bookworm-slim images have not been rebuilt with it. No action
-      available here until they are -- the gate scans the upstream image.
-    expired_at: 2026-10-15
-
-  - id: CVE-2026-89161
-    statement: >-
-      pcre2 memory corruption in pcre2_jit_match. Same package, same fixed
-      version, same upstream-rebuild dependency as CVE-2026-86145.
-    expired_at: 2026-10-15
+# Empty, and that is the state to keep it in. The two libpcre2 entries that
+# stood here were exactly what the rule above describes -- Debian had shipped
+# 10.42-1+deb12u1 and the image publishers had not rebuilt. On 2026-09-21 both
+# had, so the pins moved to the rebuilt digests (node:26-bookworm-slim
+# sha256:582460f6..., python:3.14-slim-bookworm sha256:82bc3c53...) and the
+# exemptions were deleted rather than renewed.
+#
+# Verified by reading `var/lib/dpkg/status` out of the published layer, not by
+# trusting the rebuild date -- the note being replaced here records that bumping
+# the pins had already been tried once and did NOT close these, so a new digest
+# is not by itself evidence of a new package. Both images now carry
+# libpcre2-8-0 10.42-1+deb12u1.
+#
+# The rebuild also closes CVE-2026-89157, the third of the same batch, which was
+# failing the gate with no entry here at all.
+vulnerabilities: []

@@ -73,11 +73,27 @@ test("a task's own half-created workload still is", async () => {
   assert.deepEqual(r.stopped, ["W1"], "the case this function exists for still works");
 });
 
-test("an entry with no task on it is reaped as before", async () => {
-  // It can only have come from a process running before this field existed.
-  // Skipping those would leak every workload in flight across a rollout.
+test("an entry with no task on it is never the caller's, so it is left alone", async () => {
+  // This assertion changed on the branch that merged here, and the reasoning it
+  // replaces was sound as far as it went: an entry with no task id can only
+  // come from a process older than the field, and skipping those leaks the
+  // workloads in flight across a rollout.
+  //
+  // What it did not weigh is the other side of the same rollout. That branch
+  // exists because a lazy chat turn which called ensureHands ZERO times was
+  // reaping the entry a previous message was still provisioning -- and during
+  // the window where entries carry no task id, reaping unconditionally is that
+  // defect again with the identity gate unable to see it. One choice leaks a
+  // workload SANDBOX_DEFAULT_TIMEOUT_SECONDS eventually reclaims; the other
+  // stops a job that is running.
+  //
+  // And it is not a judgement call in the end. `makeOnProvisioned` is the only
+  // writer of a pending entry and always records the task that asked, the ready
+  // form does the same, and keepalive rewrites the parsed entry whole -- so an
+  // entry with no task id cannot have been written by a task-bearing run of
+  // this build. Nothing this caller did is behind it.
   const r = await reap(pending("W0"), { taskId: "d1-task" });
-  assert.deepEqual(r.stopped, ["W0"]);
+  assert.deepEqual(r.stopped, []);
 });
 
 test("a caller that names no task reaps whatever is there", async () => {
@@ -161,8 +177,8 @@ test("a lease lost between a refused stop and its retry abandons the retry", asy
   // Round 36. A stop that comes back 503 is retried after a wait, and that wait
   // is long enough to stop being the owner: the first attempt is refused while
   // the workload is still this attempt's, and the retry lands after a successor
-  // has taken the lock and promoted it -- `第一次 stop：stillOwned=true`,
-  // `第二次 stop：stillOwned=false, successorReady=true`, 503 then 202.
+  // has taken the lock and promoted it -- first stop: stillOwned=true; second
+  // stop: stillOwned=false, successorReady=true; 503 then 202.
   //
   // So the question is asked before EVERY attempt, not once on the way in.
   const { bindSandboxStopRetry } = await import("../src/sandbox/reaper.js");

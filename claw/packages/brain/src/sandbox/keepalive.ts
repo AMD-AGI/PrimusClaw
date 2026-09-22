@@ -101,6 +101,19 @@ interface HandsKvEntry extends SharedVerdictFields {
    * the readers fall back to the session for those.
    */
   runScope?: string;
+  /**
+   * Who holds this sandbox for REPORTING purposes -- see sandbox/attribution.ts.
+   *
+   * Declared here, on the shared entry type, rather than re-declared inline by
+   * each reader. Every defect in this family began the same way: the fields
+   * were in the bytes and in no type, so a reader that forgot them cost nothing
+   * at compile time and was found in production instead. Neither field is ever
+   * a precondition for reuse -- a session's next task takes the sandbox the
+   * last one left warm, and that is decided at DAG-root grain elsewhere.
+   */
+  taskId?: string | null;
+  attemptId?: string | null;
+  dagRootTaskId?: string | null;
   /** False on a post-task idle reuse handle: kept for reuse but NOT pinged so
    *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
   keepalive?: boolean;

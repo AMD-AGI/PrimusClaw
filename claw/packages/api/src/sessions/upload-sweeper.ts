@@ -513,7 +513,10 @@ export async function runSweepPass(): Promise<void> {
     const outcome = await withLeaderLock(
       LEADER_LOCK_IDS.uploadSweep,
       "upload_sweep",
-      sweepOnce,
+      // Wrapped rather than passed by reference: `withLeaderLock` now hands its
+      // callback a `LeaderLease`, and `sweepOnce`'s first parameter is its
+      // options object, which would silently receive it.
+      () => sweepOnce(),
     );
     if (!outcome.ran) return;
     const { ttlDays, scanned, deleted, skipped } = outcome.result;
