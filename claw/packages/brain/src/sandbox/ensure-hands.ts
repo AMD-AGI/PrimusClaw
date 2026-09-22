@@ -2658,6 +2658,8 @@ async function provisionHands(
     namespace: nsForSandbox,
     // Multi-node cluster URL baked into env at create (observability only).
     mnServiceUrl: multiNodeContext?.serviceUrl ?? null,
+    // Cluster DELETE target for destroyHands cascade (workload id = message id).
+    messageId: multiNodeContext ? (request.message_id?.trim() || null) : null,
     createdAt: new Date().toISOString(),
   }));
 

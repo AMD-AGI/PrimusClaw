@@ -339,6 +339,25 @@ test("idle reclaim treats an unrecognised list as nothing found, not a failure",
   assert.equal(await reclaimIdleSessionClusters(SESSION, KEY), 0);
 });
 
+test("message-scoped idle reclaim deletes only that workload id", async (t) => {
+  // destroyHands cascades with the prior handle's messageId so a successor
+  // ensure() under the same session is not swept with the sandbox being stopped.
+  const calls = stubSafeApi(t, {
+    list: [workload("msg-old", "running", "RayJob"), workload("msg-new", "running", "RayJob")],
+    deleteStatus: 204,
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY, "msg-old"), 1);
+  const deletes = calls.filter((c) => c.method === "DELETE");
+  assert.equal(deletes.length, 1);
+  assert.match(deletes[0]!.url, /\/workloads\/msg-old$/);
+  assert.equal(
+    calls.filter((c) => c.method === "GET").length,
+    0,
+    "a scoped reclaim must not list the whole session",
+  );
+});
+
 test("no platform key is incomplete, not nothing to do", async (t) => {
   const calls = stubSafeApi(t, { list: [] });
 

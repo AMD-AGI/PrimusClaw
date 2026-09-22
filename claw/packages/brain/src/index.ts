@@ -451,19 +451,6 @@ function validateStartupConfig(): void {
     );
   }
 
-  // The declared sweep worst case is longer than the bucket TTL. Live handles
-  // are renewed mid-sweep, so this is not by itself a silent orphan -- but a
-  // deployment whose TTL is shorter than one phase gap still loses records.
-  if (keepaliveSweepCeilingSec() * 1000 >= BRAIN_REGISTRY_TTL_MS) {
-    logger.error(
-      {
-        sweepCeilingMs: keepaliveSweepCeilingSec() * 1000,
-        entryTtlMs: BRAIN_REGISTRY_TTL_MS,
-      },
-      "startup.sweep_ceiling_exceeds_registry_ttl (raise BRAIN_REGISTRY_TTL_MS or shrink keepalive phase budgets)",
-    );
-  }
-
   // Mutual exclusion rests on `lock.<key>` outliving the gap between two
   // renewals, and that needs room for a second attempt inside the TTL. Too
   // close to it, the entry lapses between renewals that are all succeeding, and

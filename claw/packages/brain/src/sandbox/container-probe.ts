@@ -93,6 +93,8 @@ export interface HandsProbeEntry {
   namespace?: string;
   userId?: string;
   terminalReason?: string;
+  /** Multi-node cluster workload id (= message id) for scoped cascade reclaim. */
+  messageId?: string;
 }
 
 export interface ContainerProbeEffects {

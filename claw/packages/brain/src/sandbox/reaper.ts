@@ -30,7 +30,7 @@ import { reclaimIdleSessionClusters as realReclaimIdleSessionClusters }
 let reclaimClusters = realReclaimIdleSessionClusters;
 
 export function bindClusterReclaimForTest(
-  fn: (sessionId: string, apiKey: string) => Promise<number>,
+  fn: (sessionId: string, apiKey: string, messageId?: string) => Promise<number>,
 ): () => void {
   const prev = reclaimClusters;
   reclaimClusters = fn;
@@ -353,17 +353,24 @@ export async function destroyHands(
       });
     }
     // Multi-node GPU clusters follow the sandbox: same idle decision, cascade
-    // teardown. Best-effort -- workload timeout remains the hard backstop.
+    // teardown scoped to this handle's messageId so a successor ensure() under
+    // the same session is not deleted with the prior sandbox. Best-effort --
+    // workload timeout remains the hard backstop.
     if (stopOutcome === "stopped") {
       const platformKey = String(
         (target as { platformKey?: string }).platformKey
           ?? (ownsRecorded ? recorded.identity?.platformKey : "")
           ?? "",
       );
-      if (platformKey) {
-        await reclaimClusters(sessionId, platformKey).catch((e: unknown) => {
+      const messageId = String(
+        (target as { messageId?: string }).messageId
+          ?? (ownsRecorded ? recorded.identity?.messageId : "")
+          ?? "",
+      ).trim();
+      if (platformKey && messageId) {
+        await reclaimClusters(sessionId, platformKey, messageId).catch((e: unknown) => {
           logger.warn(
-            { sessionId, err: (e as Error)?.message ?? String(e) },
+            { sessionId, messageId, err: (e as Error)?.message ?? String(e) },
             "mn.cascade_after_sandbox_stop_failed",
           );
         });

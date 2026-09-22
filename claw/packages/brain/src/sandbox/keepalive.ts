@@ -123,6 +123,8 @@ interface HandsKvEntry extends SharedVerdictFields {
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
   sessionDeleted?: boolean;
+  /** Multi-node cluster workload id (= message id) for destroyHands cascade. */
+  messageId?: string;
 }
 
 interface KeepaliveDeps {
