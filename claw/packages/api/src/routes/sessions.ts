@@ -228,7 +228,14 @@ export async function admitParentedSessionCreate(
           response: { ok: false, error: "admission_rejected", reason: refusal },
         };
       }
-      if (stillHeld && !stillHeld()) return LOCK_LOST_REFUSAL;
+      // Rolled back like every other refusal in this block: returning from
+      // inside the transaction would hand the connection back to the pool with
+      // the transaction still open and the admission lock still held, which is
+      // a lock every other create waits on.
+      if (stillHeld && !stillHeld()) {
+        await client.query("ROLLBACK");
+        return LOCK_LOST_REFUSAL;
+      }
       await insertSessionRow(client, row, parentAuth);
       await client.query("COMMIT");
       return null;

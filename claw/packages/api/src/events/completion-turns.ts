@@ -43,6 +43,14 @@ async function readTurnTools(sessionId: string, messageId: string | null) {
  * read itself; closing it entirely means allocating on the lock's own
  * connection, so that a released lock fails the statement instead of running it.
  */
+/** The hold was gone before the turns were allocated; the caller must not go on. */
+export class CompletionLockLost extends Error {
+  constructor() {
+    super("completion lock was released before the turns were allocated");
+    this.name = "CompletionLockLost";
+  }
+}
+
 export async function recordCompletionTurns(
   sessionId: string,
   event: Record<string, unknown>,
@@ -51,7 +59,14 @@ export async function recordCompletionTurns(
 ): Promise<void> {
   const { final_text, failed, prompt, interrupted, failure_reason } = event as any;
   if (!final_text && !interrupted && !failed) return;
-  if (stillHeld && !stillHeld()) return;
+  // Thrown, not returned. A plain return is indistinguishable from "saved",
+  // and the caller goes on to dispatch the next queued message with a history
+  // this turn is missing from -- a payload no later write can correct, because
+  // the task has already been published. The throw is what the lock-loss
+  // contract already expects: the body does not finish, `processed_at` stays
+  // NULL, and the redelivery redoes the whole completion under a lock that is
+  // really held.
+  if (stillHeld && !stillHeld()) throw new CompletionLockLost();
 
   const lastIdx = (await db.query(
     "SELECT COALESCE(MAX(turn_index), 0) as max FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL",

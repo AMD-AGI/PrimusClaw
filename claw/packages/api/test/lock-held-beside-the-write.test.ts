@@ -20,8 +20,10 @@ test("the turn allocation asks whether the lock is still held, in front of the M
   const src = await read("../src/events/completion-turns.ts");
   const head = src.slice(0, src.indexOf("COALESCE(MAX(turn_index)"));
   assert.match(head, /stillHeld\?: \(\) => boolean/, "the probe is a parameter");
-  assert.match(head, /if \(stillHeld && !stillHeld\(\)\) return;/,
-    "and it is asked before the read that decides the indices, not after it");
+  assert.match(head, /if \(stillHeld && !stillHeld\(\)\) throw new CompletionLockLost\(\);/,
+    "asked before the read that decides the indices, and THROWN rather than returned: a "
+    + "plain return reads as \"saved\" to the caller, which then dispatches the next queued "
+    + "message with a history this turn is missing from");
 });
 
 test("every completion path hands that probe down rather than dropping it", async () => {
@@ -46,8 +48,18 @@ test("the session insert asks it beside the INSERT, not before the awaits that p
                         "await insertSessionRow(client, row, parentAuth);"]) {
     const at = src.indexOf(insert);
     assert.ok(at > 0, `${insert} is still the insert site`);
-    const before = src.slice(Math.max(0, at - 200), at);
-    assert.match(before, /if \(stillHeld && !stillHeld\(\)\) return LOCK_LOST_REFUSAL;/,
+    const before = src.slice(Math.max(0, at - 400), at);
+    assert.match(before, /if \(stillHeld && !stillHeld\(\)\)/,
       "the lock is re-checked immediately in front of this insert");
+    assert.match(before, /return LOCK_LOST_REFUSAL;/, "and the create is refused");
+  }
+  // The refusal inside the transaction has to give the connection back clean:
+  // returning with the transaction open leaves the admission lock held, and
+  // that is a lock every other create waits on.
+  const txAt = src.indexOf("await insertSessionRow(client, row, parentAuth);");
+  const txBefore = src.slice(Math.max(0, txAt - 400), txAt);
+  {
+    assert.match(txBefore, /await client\.query\("ROLLBACK"\);\s*\n\s*return LOCK_LOST_REFUSAL;/,
+      "the transactional refusal rolls back before it returns");
   }
 });
