@@ -252,6 +252,29 @@ async function resolveSandbox(row: SweptRow): Promise<ResolvedSandbox | null> {
       cannotRead(row, "kv_handle_outside_run", hands.sandbox);
       return null;
     }
+    // Whose workload this is, asked of the KV entry -- the only side that knows
+    // on this branch, because the row has no handle recorded to carry a stamp.
+    //
+    // The guard at the top of this function cannot answer here: it compares
+    // `metadata.sandbox_attempt`, which exists only once a handle has been
+    // recorded ON the row. A chat row with no handle takes this branch, and its
+    // only other test is the createdAt window -- which another attempt's
+    // workload satisfies by construction, since it was created during this
+    // row's own lifetime. So the adoption that writes the facts was the one
+    // adoption with nothing checking it.
+    //
+    // Pinning it is not the check. `readAndStore` runs `readSafeWorkload` and
+    // `storePlatformRead` in the same pass, and that stamps
+    // `platform_facts_resolved_at`, after which the drain never selects the row
+    // again -- so a pin written here is read back only on the retry of a FAILED
+    // read. The pass that actually records an ending has to refuse the handle
+    // itself.
+    if (typeof hands.attemptId === "string" && hands.attemptId
+        && typeof row.attempt_id === "string" && row.attempt_id
+        && hands.attemptId !== row.attempt_id) {
+      cannotRead(row, "kv_handle_from_another_attempt", hands.sandbox);
+      return null;
+    }
     sandbox = hands.sandbox;
     if (!await rememberFallback(row, sandbox, hands?.attemptId ?? null)) return null;
   }

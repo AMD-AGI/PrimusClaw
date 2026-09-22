@@ -434,3 +434,43 @@ test("a handle pinned from KV carries the attempt that entry named", async () =>
     "a pinned handle from another attempt is refused, not read");
   assert.equal(pinned.platform_facts_resolved_at, null);
 });
+
+test("a KV handle from another attempt is refused, not merely pinned", async () => {
+  // The hole the pin alone did not close. The guard at the top of
+  // resolveSandbox compares metadata.sandbox_attempt, which exists only once a
+  // handle has been recorded ON the row -- and a chat row with no handle takes
+  // the KV fallback instead, whose only other test is the createdAt window.
+  // Another attempt's workload satisfies that window by construction: it was
+  // created during this row's own lifetime.
+  //
+  // Pinning it was not the check. readAndStore runs readSafeWorkload and
+  // storePlatformRead in the same pass, and that stamps
+  // platform_facts_resolved_at, after which the drain never selects the row
+  // again -- so the pin is read back only when a read FAILED. The pass that
+  // records an ending has to refuse the handle itself.
+  // Run created 5 minutes ago, completed 1 minute ago: the workload below is
+  // stamped between the two, so the window test passes and the only thing left
+  // that can refuse it is the attempt comparison.
+  await seed("kv-other-attempt", "worker_lost", {
+    handle: null, attemptId: null, settledAttemptId: "attempt-B",
+    metadata: {}, origin: "chat", completedAgoMs: 60_000,
+  });
+  hands.set(handsSessionKey("kv-other-attempt"), {
+    status: "ready", workloadId: "wl-of-attempt-A", platformKey: "pk",
+    attemptId: "attempt-A",
+    // Inside the window by construction -- created during this row's own life.
+    createdAt: new Date(Date.now() - 120_000).toISOString(),
+  });
+
+  await drainPendingPlatformFacts();
+
+  const closed = await row("kv-other-attempt");
+  assert.equal(closed.platform_node, null,
+    "another attempt's workload may not close this row, however well it fits the window");
+  assert.equal(closed.platform_facts_resolved_at, null,
+    "and the row stays open rather than being settled with a foreign ending");
+  assert.ok(
+    diagnostics.some((d) => d.reason === "kv_handle_from_another_attempt"),
+    `refused for the right reason: ${JSON.stringify(diagnostics)}`,
+  );
+});

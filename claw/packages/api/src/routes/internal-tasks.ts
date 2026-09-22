@@ -321,9 +321,18 @@ async function recordLeaseSandbox(
             -- counts as a change. Comparing the handle pair alone meant a row
             -- whose handle another writer had already recorded was left with no
             -- attempt beside it, or with a previous attempt's.
+            -- The attempt counts as a change only when this writer HAS one.
+            -- null is reachable here, not theoretical: the fat-lease
+            -- acquisition path passes a token-less fence on purpose, because
+            -- acquireFatLease has just nulled attempt_id. Compared against an
+            -- absent fence the clause was permanently true for any row still
+            -- carrying a stamp, while the branch it selected cannot change that
+            -- stamp -- so every heartbeat retook the row lock and rewrote the
+            -- same bytes, which is the cost the note above exists to avoid.
             AND (f.workload IS DISTINCT FROM $3
                  OR f.recorded IS DISTINCT FROM $4::jsonb
-                 OR COALESCE(t.metadata->>'sandbox_attempt', '') IS DISTINCT FROM COALESCE($6::text, ''))
+                 OR ($6::text IS NOT NULL
+                     AND COALESCE(t.metadata->>'sandbox_attempt', '') IS DISTINCT FROM $6::text))
          RETURNING 1
        )
        SELECT EXISTS (SELECT 1 FROM fenced)  AS fenced,
