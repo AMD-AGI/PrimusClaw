@@ -1161,3 +1161,94 @@ test("a gone container with a clear gate is still destroyed", async () => {
   assert.deepEqual(destroyed, ["s-1"], "the entry cleanup still happens");
   assert.deepEqual(retained, []);
 });
+
+test("taking over a warm sandbox re-stamps who holds it", async () => {
+  // Reuse across the tasks of a session is the feature; this asserts the record
+  // keeps up with it. The entry was left by an earlier task, and the run taking
+  // it on now writes its own task and attempt into the SAME write that takes it
+  // on -- so if the container dies under this run, this run can report it.
+  //
+  // Recording the minter instead would be the opposite defect: a legitimate
+  // reuser refused its own ending. Nothing here gates the reuse -- that is
+  // `entryOwnedByAnother`, at DAG-root grain, and it is untouched.
+  stubEffects();
+  stubHealth("ok");
+  const { a, puts } = attempt(
+    { ...LIVE, specFingerprint: specOf(), taskId: "task-earlier", attemptId: "attempt-earlier" },
+    { attemptId: "attempt-now" },
+  );
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.ok(result, "the reuse still happens -- attribution never refuses one");
+  const written = puts.map((p) => JSON.parse(p) as Record<string, unknown>);
+  const stamped = written.find((w) => w.attemptId === "attempt-now");
+  assert.ok(
+    stamped,
+    `the take-over has to re-stamp the holder: ${JSON.stringify(written.map(
+      (w) => ({ taskId: w.taskId, attemptId: w.attemptId })))}`,
+  );
+  assert.equal(stamped!.taskId, REQUEST.task_id ?? null,
+    "task and attempt travel together, or the weaker half disagrees with the stronger");
+});
+
+test("a stamp that loses its race never costs the sandbox", async () => {
+  // The regression this refactor introduced and then had to take back. An entry
+  // with no idle markers used to take no CAS at all; making one mandatory for
+  // the stamp added a way for a LIVE sandbox to be refused: the retry re-reads
+  // by key, and a key a rolling migration has moved reads as a deleted record,
+  // so the caller rebuilds a container to fix a record.
+  //
+  // The refusal belongs to the reason that earns it -- clearing markers is
+  // load-bearing for the reuse, stamping is not.
+  stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(
+    // No idle markers, so the only reason to write is the holder change.
+    { ...LIVE, specFingerprint: specOf(), taskId: "task-earlier", attemptId: "attempt-earlier" },
+    { attemptId: "attempt-now" },
+  );
+  // The write loses, and the re-read that follows finds nothing under that key
+  // -- the shape a key migrated by `reconcileReservedKeys` presents. The FIRST
+  // read still answers, or the reuse would never begin.
+  const realGet = (a.kv as unknown as { get: (k: string) => Promise<unknown> }).get;
+  let reads = 0;
+  (a.kv as unknown as { update: unknown }).update = async () => {
+    throw new Error("wrong last sequence: 7");
+  };
+  (a.kv as unknown as { get: unknown }).get = async (k: string) => {
+    reads += 1;
+    return reads === 1 ? realGet.call(a.kv, k) : null;
+  };
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.ok(result,
+    "a sandbox that answered its health check is still reused; a stale holder "
+    + "costs a misreported ending, not a GPU container");
+});
+
+test("but a marker clear that loses its race still refuses", async () => {
+  // The other half, unchanged. Clearing `keepalive:false` is what the caller
+  // reads as "this slot is mine to take"; if the record went out from under it,
+  // reusing anyway is how a swept slot gets handed back.
+  stubEffects();
+  stubHealth("ok");
+  const { a } = attempt(
+    { ...LIVE, specFingerprint: specOf(), keepalive: false, taskId: "task-earlier" },
+    { attemptId: "attempt-now" },
+  );
+  const realGet2 = (a.kv as unknown as { get: (k: string) => Promise<unknown> }).get;
+  let reads2 = 0;
+  (a.kv as unknown as { update: unknown }).update = async () => {
+    throw new Error("wrong last sequence: 7");
+  };
+  (a.kv as unknown as { get: unknown }).get = async (k: string) => {
+    reads2 += 1;
+    return reads2 === 1 ? realGet2.call(a.kv, k) : null;
+  };
+
+  const result = await tryReuseSessionSandbox(a);
+
+  assert.equal(result, null, "the slot was taken; this run does not get it");
+});

@@ -36,7 +36,7 @@ import {
   envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
 import { nc, taskDeliverySettlement } from "../infra/nats.js";
-import { LEADER_LOCK_IDS, withLeaderLock } from "../infra/leader-lock.js";
+import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
 // `handleRegistry` is this branch's replacement for the bare `handleMap()`
@@ -283,7 +283,21 @@ function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
  */
 const RUN_ROWS_SWEEPABLE = envBool("RUN_ROWS_SWEEPABLE", false);
 
-/** Injection seam for the terminal events a reap has to announce. */
+/**
+ * Injection seam for the terminal events a reap has to announce.
+ *
+ * The census `reapOrphanHandles` traverses is NOT here, and that is the merge
+ * of two branches rather than an oversight. It used to be reached through a
+ * bare `handleMap()` bound by a module-level memo over a NATS KV bucket that no
+ * caller could reach without a broker, which left the one sweep with an
+ * irreversible action -- it destroys sandboxes -- as the one sweep whose loop no
+ * test could enter. Naming it as a port here was one answer; going through
+ * `handleRegistry` (sandbox-stopper.ts) is the other, and it is the one that
+ * landed, because the registry is an exported object whose `listAll` a test can
+ * replace directly and whose reads can be re-read consistently before a
+ * destroy. Listing it in both places would be worse than either: a test would
+ * stub the port and drive a traversal that no longer reads it.
+ */
 export const sweeperPorts = {
   publishSessionEvent: publishEvent,
   drainPendingMessage: drainOldestPendingMessage,
@@ -2244,6 +2258,31 @@ export async function reapStuckSessions(): Promise<number> {
 /**
  * Reconcile DagHandleMap: drop entries for terminal DAG roots.
  *
+ * `lease` is the leadership this scan is running under, and the loop below
+ * checks it because this is the one sweep whose action is irreversible: it
+ * decides the DAG behind a handle is over and destroys the sandbox. The lock
+ * that makes that decision safe is a session-scoped advisory lock on a
+ * connection this function never touches -- every statement here goes through
+ * `db.query` on the main pool -- so when that connection drops, Postgres
+ * releases the lock immediately and nothing in this traversal notices. Measured:
+ * a second replica took the same lock 200ms later while this loop ran on for
+ * twenty-one more queries, which is two replicas both concluding "the DAG behind
+ * this handle is over" about the same handle, and the second one deciding it
+ * against a world the first has already changed.
+ *
+ * At the top of the iteration and not anywhere finer, because that is the only
+ * boundary where stopping is coherent: mid-`stopAllHandlesForDag` there is a
+ * teardown in flight that this function cannot take back.
+ *
+ * Stopping bounds the exposure and does not repair it. The handles torn down
+ * before the drop stay torn down, and the count returned is of those. The
+ * caller is told the pass was not exclusive by `withLeaderLock`, which throws
+ * `LeadershipLostError` rather than letting this return read as a clean sweep.
+ *
+ * Optional because this is also called directly, by tests and by anything that
+ * wants one pass without leadership; with no lease there is no boundary to
+ * check and the loop runs to the end as it always did.
+ *
  * `dropped` counts DAGs reached, which is not a count of sandboxes released --
  * `stopAllHandlesForDag` reports that separately, and this is the one teardown
  * path with no caller to report it to. So the sweeps it could not establish a
@@ -2251,11 +2290,19 @@ export async function reapStuckSessions(): Promise<number> {
  * leak has nowhere else to look: the per-handle warnings say which stop failed,
  * but only this says how much of a tick's reconciliation did not land.
  */
-export async function reapOrphanHandles(): Promise<number> {
+export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
   const all = await handleRegistry.listAll();
   let dropped = 0;
   let unreleased = 0;
   let deferred = 0;
+  // How much of the traversal happened, which is not how much of it did
+  // anything. `dropped` counts teardowns and most handles are torn down by
+  // nobody, so `all.length - dropped` answers "how many handles are alive"
+  // rather than "how much of this pass was abandoned" -- a hundred handles
+  // walked down to the last ten reported a hundred still to go. The number the
+  // line exists to carry is how much work was handed to the next leader, so it
+  // has to come off a counter the loop advances every iteration.
+  let examined = 0;
   // One answer per session per tick. Several DAG roots of one session reach
   // this loop -- that is the shape the guard below is about -- and the question
   // "what is this session's live work holding" has the same answer for all of
@@ -2263,6 +2310,20 @@ export async function reapOrphanHandles(): Promise<number> {
   // "defer" a coherent answer here at all.
   const holdingsBySession = new Map<string, SessionHoldings>();
   for (const [dagRoot, handles] of all) {
+    const lost = lease?.lost();
+    if (lost) {
+      // The handle this iteration had not yet judged is one of the remaining
+      // ones: the gate is read before anything looks at it, so it is left whole
+      // for the next leader along with everything behind it.
+      logger.error(
+        { dagRoot, examined, dropped, unreleased, deferred,
+          remaining: all.length - examined, err: lost.message },
+        "sweeper.orphan_handles_stopped (the lock connection dropped, so this traversal "
+        + "was no longer exclusive and the rest of it is left to the next leader)",
+      );
+      break;
+    }
+    examined++;
     // Keyed by `task_id` alone, which is the primary key. The old predicate
     // also demanded `dag_node_id = '__dag_root__'`, and that was not a
     // narrowing of the same row -- it was a different row for half the

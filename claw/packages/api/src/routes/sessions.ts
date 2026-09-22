@@ -3,7 +3,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
-import { db, type StatementRunner } from "../infra/db.js";
+import { connectionLost, db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
@@ -146,17 +146,37 @@ function isRefusal(
 // never saw is exactly the child idled into the tree that `sessionTreeShape`
 // is written to bound, and it would be paid for later by every session in the
 // tree, whose next turn is the one the ceiling finally refuses.
+/**
+ * `stillHeld` is the de-duplication lock, asked beside the INSERT rather than
+ * only before this call. Everything in between -- a pool wait, the transaction,
+ * the admission lock, the parent authorisation read -- is a round trip the lock
+ * can be released during, and a create that goes ahead after that is the
+ * duplicate session the lock exists to prevent: a competitor takes the same key,
+ * caches its own result, and the retry gets a different session from the one
+ * this request returned 200 for. It cannot be closed by asking more often --
+ * the lock lives on another connection -- but asking it here rather than several
+ * awaits earlier is the difference between a window the size of one statement
+ * and one the size of the whole create.
+ */
 async function createSessionRow(
   row: NewSessionRow,
   parentSid: string | null,
   user: ReturnType<typeof getUser>,
+  stillHeld?: () => boolean,
 ): Promise<SessionCreateRefusal | null> {
-  if (parentSid) return admitParentedSessionCreate(parentSid, user, row);
+  if (parentSid) return admitParentedSessionCreate(parentSid, user, row, stillHeld);
   const parentAuth = await resolveParentAuthorisation(db, parentSid, user);
   if (isRefusal(parentAuth)) return parentAuth;
+  if (stillHeld && !stillHeld()) return LOCK_LOST_REFUSAL;
   await insertSessionRow(db, row, parentAuth);
   return null;
 }
+
+/** The 503 a create takes when its de-duplication lock went away before the INSERT. */
+const LOCK_LOST_REFUSAL: SessionCreateRefusal = {
+  statusCode: 503,
+  response: { ok: false, error: "lock_connection_lost" },
+};
 
 /**
  * The parent read, the tree decision and the INSERT are one transaction whose
@@ -168,6 +188,7 @@ export async function admitParentedSessionCreate(
   parentSid: string,
   user: ReturnType<typeof getUser>,
   row: NewSessionRow,
+  stillHeld?: () => boolean,
 ): Promise<SessionCreateRefusal | null> {
   const client = await db.pool.connect();
   try {
@@ -206,6 +227,14 @@ export async function admitParentedSessionCreate(
           statusCode: 429,
           response: { ok: false, error: "admission_rejected", reason: refusal },
         };
+      }
+      // Rolled back like every other refusal in this block: returning from
+      // inside the transaction would hand the connection back to the pool with
+      // the transaction still open and the admission lock still held, which is
+      // a lock every other create waits on.
+      if (stillHeld && !stillHeld()) {
+        await client.query("ROLLBACK");
+        return LOCK_LOST_REFUSAL;
       }
       await insertSessionRow(client, row, parentAuth);
       await client.query("COMMIT");
@@ -601,6 +630,12 @@ function isClientGone(req: FastifyRequest): boolean {
  * (another in-flight request held it past the budget) so the caller can replay
  * the cache or fail transiently WITHOUT pinning a connection. Held until
  * releaseIdempotencyLock returns the pooled client.
+ *
+ * Taking it is not the same as keeping it: it is session-scoped, so the server
+ * releases it the moment this connection's backend goes, and nothing the caller
+ * does afterwards would notice. The caller checks `connectionLost` on this
+ * client before it creates anything -- see execute() -- and again before it
+ * writes the key's cache entry.
  */
 async function acquireIdempotencyLock(
   userId: string,
@@ -734,6 +769,102 @@ async function backfillCachedRunId(
   };
 }
 
+/**
+ * Record this request's result under the key, unless the key already holds a
+ * result worth more to the client than this one.
+ *
+ * WHAT DECIDES, AND WHY IT IS NOT "WHO GOT THERE FIRST"
+ *
+ * Two requests can be live on one key at once, and the drop that makes that
+ * possible is the same drop the fallback exists for: the advisory lock is
+ * session-scoped, so the server hands it away the instant a lock connection
+ * goes, and from then on the request that lost it is still running -- it will
+ * still create, still dispatch, still come here to write -- while another pod
+ * takes the freed lock and does the same. Both read this key when it was empty.
+ * Both arrive here. Neither can see the other, and the order the two statements
+ * land in is decided by the network.
+ *
+ * So the conflict clause cannot be asked "did I get here first", because the
+ * answer is noise. What it is asked instead is which of the two results is
+ * still worth handing back, and for this endpoint that has a single durable
+ * answer sitting in the row itself: a 2xx create response carries `session_id`
+ * and `message.run_id`, and every failure this route caches carries neither.
+ * That is a contract, not an observation -- `DispatchResult` gives no failing
+ * kind a run id on purpose, `rejected` and `publish_failed` have already rolled
+ * their session row back, and `publish_unknown`'s body names nothing a caller
+ * could come back for. A cached 2xx is therefore the only handle anyone has on
+ * work that exists; a cached failure is a record that names nothing.
+ *
+ * Which is not the same as a record that nothing exists, and the difference is
+ * `publish_unknown`: its session row stands and its run may be executing. The
+ * rule below turns on what the client can come back FOR, not on what the system
+ * is left holding -- an unnameable run is a leak for the sweeps to find, and
+ * overwriting the key that names a real one would add a second.
+ *
+ * Hence the rule, in one line: a success may take the key from a failure, and
+ * nothing else may take the key from anything.
+ *
+ *   - failure landing on a success: refused. This is the round-N clobber -- a
+ *     503 written over the 200 that names a live run would answer every later
+ *     retry on the key with a failure while that run went on executing in its
+ *     sandbox with nobody able to name it.
+ *   - success landing on a failure: claimed. This is the same defect in the
+ *     other order, and it is the same victim -- the request that actually
+ *     created something. Refusing it leaves the key answering retries with a
+ *     failure for a create that did not happen, in front of a run that did.
+ *   - like on like: the incumbent keeps it. Two failures are worth the same to
+ *     the client (neither names anything), and of two successes only one can be
+ *     the key's answer; overwriting the first would orphan the run it names to
+ *     no one's benefit, so the churn buys nothing. `lock_lost_before_create`
+ *     refuses any request whose lock dropped BEFORE it created, which bounds
+ *     when a second success can appear but does not make one rare: a single
+ *     lost lock is enough to produce two 200s and two queued runs, reproduced
+ *     against a real Postgres. The rule is what keeps the key pointing at one
+ *     of them rather than at whichever finished last.
+ *   - an expired row: claimed by anyone. `readIdempotency` refuses to replay
+ *     it, so no client is holding it as a handle and the key is free again.
+ *
+ * WHY NOT LOCK OWNERSHIP
+ *
+ * The obvious rival rule -- the holder's write wins, a lockless write only
+ * fills an empty slot -- is rejected twice over.
+ *
+ * It is wrong on the merits: the holder is not reliably the request that
+ * created anything. Let the holder's dispatch fail and a lockless request's
+ * succeed, and ownership hands the key to the 503 and orphans the live run. It
+ * arbitrates the wrong thing, because what the client loses is never "the wrong
+ * writer won", it is "the key stopped naming work that exists".
+ *
+ * And it cannot be evaluated here even where it would agree. There is no column
+ * recording it and there could not be an honest one: a writer's belief that it
+ * holds the lock is a `connectionLost` read taken before the statement, and the
+ * server can release the lock in the gap between that read and this INSERT.
+ * Storing it would put the read-then-act shape that produced every defect on
+ * this path INTO the row, where it would outlive the request that was wrong.
+ * Worse, it has no answer at all in the case the fallback was added for -- both
+ * requests lockless, nobody to appeal to -- where it collapses to "whoever
+ * wrote first", which is the rule being replaced.
+ *
+ * WHAT THIS STATEMENT READS, AND WHEN
+ *
+ * The decision reads nothing outside itself. `existing` and `EXCLUDED` are both
+ * evaluated inside this one INSERT, under the row lock ON CONFLICT takes, and
+ * against the latest committed version of the row -- so a same-key writer that
+ * commits while we are in flight is seen by our comparison rather than missed
+ * by it. There is no window between the read and the act, because they are the
+ * same statement. `connectionLost` still runs in the caller, but only to pick
+ * WHICH connection carries this write; a stale answer there costs a failed
+ * statement on a dead backend, which the caller already catches, never a wrong
+ * winner.
+ *
+ * That makes the outcome independent of arrival order, which is the property
+ * the old rule lacked: "success beats failure" is a one-way upgrade and every
+ * other pair is refused, so whichever order the two statements land in, the key
+ * converges on the same row -- the first success if either request produced
+ * one, otherwise the first failure.
+ *
+ * Returns whether this request's result is the one now stored.
+ */
 async function saveIdempotency(
   client: QueryRunner,
   userId: string,
@@ -741,30 +872,101 @@ async function saveIdempotency(
   key: string,
   statusCode: number,
   response: unknown,
-): Promise<void> {
-  await client.query(
+): Promise<boolean> {
+  const claimed = await client.query(
     `INSERT INTO claw_idempotency_keys (idem_key, user_id, route, status_code, response, expires_at)
      VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + ($6 || ' milliseconds')::interval)
      ON CONFLICT (user_id, route, idem_key) DO UPDATE SET
        status_code = EXCLUDED.status_code,
        response = EXCLUDED.response,
        created_at = NOW(),
-       expires_at = EXCLUDED.expires_at`,
+       expires_at = EXCLUDED.expires_at
+     WHERE claw_idempotency_keys.expires_at <= NOW()
+        OR (claw_idempotency_keys.status_code >= 400 AND EXCLUDED.status_code < 400)`,
     [key, userId, route, statusCode, JSON.stringify(response), String(IDEMPOTENCY_TTL_MS)],
   );
+  return (claimed.rowCount ?? 0) > 0;
 }
 
-/** Cache idempotency response without changing the primary request outcome. */
+/**
+ * Cache the idempotency response without changing the primary request outcome.
+ *
+ * Written on the connection holding the key's lock, which is where every save
+ * has gone -- unless that connection has dropped, in which case it goes out on
+ * the main pool instead. Two different pools of different connections: the drop
+ * is one backend's, and `db.query` is untouched by it.
+ *
+ * The fallback is not a nicety. This row IS what makes the client's retry a
+ * replay, and a request that reaches here has already created the session and
+ * dispatched its first turn. Losing the row loses the only handle anyone has on
+ * that work: the retry misses the cache, takes the lock and creates a SECOND
+ * session, while the first one's run goes on executing in its sandbox with no
+ * caller left holding its id. The lock is already gone by the time this runs
+ * (the server released it with the backend), so what the fallback recovers is
+ * the record of a create that the lock no longer covers.
+ *
+ * Which does not make it a licence to assign. The same drop that sent this
+ * write to the main pool freed the lock for another pod, whose create can have
+ * finished and cached its own result in the meantime -- and, in the other
+ * order, can still be mid-flight and about to. So what lands here is a claim:
+ * `saveIdempotency` decides between this result and whatever the key holds at
+ * the instant of the statement, and it decides on which of the two names work
+ * that exists, not on which of them arrived first. A failure from this path
+ * therefore takes the key only while nothing better is on it; a success takes
+ * it even from a failure another request has already left there, which is the
+ * case this fallback runs into most, because a create whose lock dropped is by
+ * construction the one writing alongside somebody else.
+ *
+ * Refused either way, this request's own answer is the only handle on what it
+ * created, so both refusals are logged -- but only one of them is a loss. A
+ * failure refused by a live success is the rule working: the key names a run
+ * that is executing and the client's retries will reach it. A success refused
+ * by another success is a real orphan: two creates landed on one key, and the
+ * session this one made is now reachable only through the 200 it is about to
+ * return to its own caller.
+ *
+ * Best-effort either way: a create the client already completed is not failed
+ * because the note about it did not land.
+ */
 async function saveIdempotencyBestEffort(
-  client: QueryRunner,
+  lock: IdempotencyLock,
   userId: string,
   route: string,
   key: string,
   statusCode: number,
   response: unknown,
 ): Promise<void> {
+  let writer: QueryRunner = lock.client;
+  const lost = connectionLost(lock.client);
+  if (lost) {
+    writer = db;
+    logger.error(
+      { userId, route, err: lost.message },
+      "idempotency.lock_connection_lost_before_save (the server released this key's lock when "
+      + "the connection dropped; saving the create's result on the main pool so the client's "
+      + "retry replays it instead of creating a second session)",
+    );
+  }
   try {
-    await saveIdempotency(client, userId, route, key, statusCode, response);
+    if (!await saveIdempotency(writer, userId, route, key, statusCode, response)) {
+      const fields = { userId, route, statusCode, lockLost: !!lost };
+      if (statusCode < 400) {
+        logger.error(
+          fields,
+          "idempotency.success_not_stored (a concurrent request on this key had already "
+          + "cached a create of its own, so this one's result was NOT stored; retries replay "
+          + "that record and the session this request created is reachable only through the "
+          + "answer it is returning now)",
+        );
+      } else {
+        logger.warn(
+          fields,
+          "idempotency.failure_not_stored (this key already names a create that succeeded, "
+          + "so this request's failure was NOT stored over it; retries replay that create "
+          + "and this request's own answer stays with its own caller)",
+        );
+      }
+    }
   } catch (err) {
     logger.error({ err, userId, route }, "idempotency.save_failed");
   }
@@ -968,6 +1170,59 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           }
         }
 
+        // The last boundary at which this request can still change its mind.
+        //
+        // The lock above is a session-scoped advisory lock on `idemLock.client`,
+        // and the server releases it the instant that backend goes -- so from a
+        // drop onwards this request holds nothing, and a concurrent same-key
+        // retry is free to take the lock and create a second session alongside
+        // it. The request cannot notice on its own: everything below runs on the
+        // main pool, which the drop does not touch. db.ts publishes the loss for
+        // exactly this reason; honouring it is the caller's job, and honouring
+        // it HERE is the whole of the choice. Nothing durable has been written
+        // yet, so the request can end with no session, no run and no sandbox
+        // behind it, and the client's retry does the create once, under a lock
+        // that is really held.
+        //
+        // Deliberately not repeated after the dispatch, which is where the
+        // shape stops matching `withLeaderLock`. A lease holder can be told it
+        // is no longer the leader; a create cannot be un-created. Past this
+        // point the session row exists and its first turn is a run in a live
+        // sandbox, so a late 503 would report failure for work that is still
+        // executing AND send the client to start a second one -- the opposite
+        // of what this lock is for. What a late drop actually costs is the
+        // idempotency record, and that is recovered rather than refused; see
+        // saveIdempotencyBestEffort.
+        // Asked again immediately before the insert, not only here: every
+        // await between the two is another chance for the lock connection to
+        // drop, and the answer is only useful while it is still true that
+        // nothing has been created. Checking once at the top made the refusal
+        // describe a state the request had already left -- a competitor could
+        // take the same key and cache its own result during the env snapshot,
+        // and this request would still create its session and return 200,
+        // which is the duplicate the lock exists to prevent.
+        const refuseIfLockLost = (): { statusCode: number; response: unknown } | null => {
+          if (!idemLock) return null;
+          const lost = connectionLost(idemLock.client);
+          if (!lost) return null;
+          logger.error(
+            { userId, route, err: lost.message },
+            "idempotency.lock_lost_before_create (the server released this key's lock when "
+            + "the connection dropped, so this create is no longer de-duplicated against a "
+            + "concurrent retry; refusing while nothing has been created)",
+          );
+          return {
+            statusCode: 503,
+            response: {
+              ok: false,
+              error: "lock_connection_lost",
+              message: "creation lost its de-duplication lock; please retry",
+            },
+          };
+        };
+        const lostEarly = refuseIfLockLost();
+        if (lostEarly) return lostEarly as { statusCode: number; response: Record<string, unknown> };
+
         // Snapshot user env BEFORE inserting the session so a snapshot failure
         // can short-circuit without leaving a row behind.
         let userEnvSnapshot: Record<string, string> = {};
@@ -1000,7 +1255,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
         // before the row is written.
-        const refused = await createSessionRow(newRow, parentSid, user);
+        const refused = await createSessionRow(
+          newRow, parentSid, user,
+          () => !(idemLock && connectionLost(idemLock.client)),
+        );
         if (refused) {
           return { statusCode: refused.statusCode, response: refused.response };
         }
@@ -1016,7 +1274,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
             },
           };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, response);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
           metrics.onSessionCreated("ok");
           return { statusCode: 200, response };
         }
@@ -1086,12 +1344,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           // A settled failure deleted its row; counting it would name no session.
           if (dispatch.kind === "publish_unknown") metrics.onSessionCreated("ok");
           const errResp = { ok: false, error: "task dispatch failed", detail: dispatch.error?.message };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 503, errResp);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 503, errResp);
           return { statusCode: 503, response: errResp };
         }
         if (dispatch.kind === "rejected") {
           const errResp = { ok: false, error: "admission_rejected", reason: dispatch.reason };
-          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 429, errResp);
+          if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 429, errResp);
           return { statusCode: 429, response: errResp };
         }
 
@@ -1115,7 +1373,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             },
           },
         };
-        if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock.client, userId, route, idemKey, 200, okResp);
+        if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, okResp);
         metrics.onSessionCreated("ok");
         return { statusCode: 200, response: okResp };
       } catch (err) {

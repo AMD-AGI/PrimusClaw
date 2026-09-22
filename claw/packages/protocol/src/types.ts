@@ -183,6 +183,13 @@ export interface RunLease {
 /** What one lease POST asks of the row. */
 export interface RunLeaseRequest {
   brain_id: string;
+  /**
+   * Which sandbox this run is holding, so the row can name it in a platform
+   * kill reason instead of reporting a bare failure. Optional because a run
+   * with no sandbox attached, and a Brain predating the field, both send none
+   * -- the endpoint refuses a malformed value rather than inferring one.
+   */
+  sandbox?: { provider: "safe-workload" | "agent-sandbox"; handle: string };
   lease_seconds?: number;
   phase?: RunPhase;
   wait_reason?: RunWaitReason;

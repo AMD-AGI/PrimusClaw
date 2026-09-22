@@ -544,15 +544,21 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
             -- previous one's settled time ledger or the identity that ledger
             -- was keyed under, which would credit this run with the other's
             -- states and leave it marked terminal before it starts.
-            -- sandbox_release for a third reason, and the sharpest one: it
-            -- is evidence about a workload the PREVIOUS run held. Copied onto
-            -- the replacement it becomes a leak attributed to a task that
-            -- never had a sandbox -- so the new row reports unconfirmed
-            -- forever, since releasing its own workload clears its own entry
-            -- and never the inherited one, while the original row's evidence
-            -- is cleared when that workload is finally released. The record
-            -- has to stay on the row whose run actually held the thing.
-            metadata - 'run_phase' - 'last_release' - 'retried_into' - 'sandbox_release',
+            -- sandbox and sandbox_release for a third reason, and the
+            -- sharpest one: both are evidence about a workload the PREVIOUS
+            -- run held. Copied onto the replacement they become a leak
+            -- attributed to a task that never had a sandbox -- so the new row
+            -- reports unconfirmed forever, since releasing its own workload
+            -- clears its own entry and never the inherited one, while the
+            -- original row's evidence is cleared when that workload is finally
+            -- released. The record has to stay on the row whose run actually
+            -- held the thing. sandbox is the identity this run reported before
+            -- its reap and sandbox_release what came of releasing it;
+            -- inheriting either one strands the same wrong attribution, and
+            -- sandbox additionally re-arms the backfill against a workload this
+            -- row never owned.
+            metadata - 'sandbox' - 'sandbox_attempt' - 'run_phase' - 'last_release'
+                     - 'retried_into' - 'sandbox_release',
             -- carried, not defaulted: a retry of a task that declared its
             -- workspace throwaway must not start uploading it.
             workspace_throwaway,

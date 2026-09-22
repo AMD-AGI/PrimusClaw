@@ -22,6 +22,7 @@
 import pino from "pino";
 
 import { db } from "../infra/db.js";
+import type { LeaderLease } from "../infra/leader-lock.js";
 import { envInt, reportSettingProblem, TASK_SWEEPER_TICK_MS } from "../config.js";
 import {
   CLEANUP_RETRY_MAX_SEC, recordCleanupOutcome, runSessionCleanup,
@@ -114,7 +115,7 @@ interface PendingCleanup {
  *
  * @returns how many deletions this pass finished.
  */
-export async function sweepSessionCleanups(): Promise<number> {
+export async function sweepSessionCleanups(lease?: LeaderLease): Promise<number> {
   const due = (await db.query(
     `SELECT session_id, user_id
        FROM claw_sessions
@@ -130,6 +131,27 @@ export async function sweepSessionCleanups(): Promise<number> {
   let finished = 0;
   let attempted = 0;
   for (const row of due) {
+    // Checked here, beside the budget, because the two bound the same traversal
+    // for the same reason: past either one this pass may not keep acting. The
+    // difference is what they protect. The budget stops a pass that is merely
+    // slow; this stops a pass that is no longer exclusive -- a dropped lock
+    // connection releases the advisory lock server-side, so another replica is
+    // already free to take the same rows while this loop is between statements,
+    // and two holders deleting one session's S3 objects and writing its KV keys
+    // decide against each other's half-finished state.
+    //
+    // A boundary, not a rollback: what this pass already deleted stays deleted.
+    // The row it stops before is left `pending`, which is the state the next
+    // leader selects on, so nothing is lost by stopping -- only by continuing.
+    const lost = lease?.lost();
+    if (lost) {
+      logger.error(
+        { finished, attempted, remaining: due.length - attempted, err: lost.message },
+        "session_cleanup.stopped (the lock connection dropped, so this pass was no "
+        + "longer exclusive and the rest of it is left to the next leader)",
+      );
+      break;
+    }
     const left = deadline - Date.now();
     if (left <= 0) break;
     attempted += 1;
@@ -224,8 +246,8 @@ export async function stuckCleanups(): Promise<StuckCleanups | null> {
  * found anything to do -- a row whose backoff has not elapsed is not due and is
  * exactly the row worth reporting.
  */
-export async function runCleanupSweep(): Promise<void> {
-  await sweepSessionCleanups();
+export async function runCleanupSweep(lease?: LeaderLease): Promise<void> {
+  await sweepSessionCleanups(lease);
   const stuck = await stuckCleanups();
   if (!stuck) return;
   logger.error(
