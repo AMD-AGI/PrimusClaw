@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	recoverySession = "keepalive-session"
+	recoverySession = "default/sandbox-under-test"
 	recoveryOwner   = "owner-1"
 )
 
@@ -71,12 +71,15 @@ func getSandboxAs(t *testing.T, s *Server, userID, role string) *httptest.Respon
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest("GET", "/v1/code-interpreter/sessions/"+recoverySession, nil)
+	c.Request = httptest.NewRequest("GET", "/v1/code-interpreter/sessions/default/sandbox-under-test", nil)
 	if userID != "" {
 		c.Request.Header.Set(UserIDHeader, userID)
 		c.Request.Header.Set(UserRoleHeader, role)
 	}
-	c.Params = gin.Params{{Key: "sessionId", Value: recoverySession}}
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "sandbox-under-test"},
+	}
 	s.handleGetSandbox(c)
 	return rec
 }

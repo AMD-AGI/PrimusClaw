@@ -35,9 +35,9 @@ func (s *Server) handleGetLogs(c *gin.Context) {
 		return
 	}
 
-	sessionID := c.Param("sessionId")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+	_, _, sessionID, ok := pathSandboxRef(c)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
 		return
 	}
 
@@ -103,7 +103,10 @@ func (s *Server) handleInternalAudit(c *gin.Context) {
 
 	sessionID := c.Param("sessionId")
 	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+		_, _, sessionID, _ = pathSandboxRef(c)
+	}
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
 		return
 	}
 

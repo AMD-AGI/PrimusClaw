@@ -31,6 +31,7 @@ import (
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/api"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
@@ -57,7 +58,9 @@ type SandboxResult struct {
 	// MaxSessionDuration is read from CodeInterpreter.spec.maxSessionDuration.
 	// WM uses this to set SandboxInfo.ExpiresAt (hard upper bound on session lifetime).
 	MaxSessionDuration time.Duration
-	// Policy fields propagated from CodeInterpreter spec to Redis SandboxInfo.
+	// SessionID is namespace/name, the cluster-facing sandbox id.
+	SessionID string
+	// Policy fields copied from the template onto the Sandbox CR.
 	RuntimePolicy        string
 	AllowedEgressHosts   []string
 	AllowedInternalHosts []string
@@ -82,10 +85,8 @@ const (
 	// Following SaFE convention: userName → Annotation (may contain special chars).
 	userNameAnnotationKey = "runtime.agent-sandbox.io/user.name"
 
-	// sessionIDAnnotationKey stores the session ID on the Sandbox object.
-	// This enables session recovery from K8s when Redis data is lost (e.g. Redis restart).
-	// The Router can ask WM to look up a Sandbox by this annotation to rebuild the
-	// session→pod mapping without requiring Redis persistence.
+	// sessionIDAnnotationKey stores the sandbox id (namespace/name) on the Sandbox
+	// and Pod. EnvD JWT binding reads this via the downward API.
 	sessionIDAnnotationKey = "runtime.agent-sandbox.io/session-id"
 )
 
@@ -252,7 +253,6 @@ func validatePodIP(pod *corev1.Pod) (string, error) {
 // Safe parameters can be overridden via the overrides argument.
 func (c *K8sSandboxCreator) CreateSandbox(
 	ctx context.Context,
-	sessionID string,
 	ciName string,
 	namespace string,
 	user *UserIdentity,
@@ -272,6 +272,7 @@ func (c *K8sSandboxCreator) CreateSandbox(
 	// Note: CodeInterpreter names must NOT contain dots (e.g. use "python-311-runc"
 	// instead of "python-3.11-runc") to satisfy DNS-1035 Service naming rules.
 	sandboxName := ciName + "-" + randString(8)
+	sessionID := api.FormatSandboxID(namespace, sandboxName)
 
 	var result *SandboxResult
 	var err error
@@ -298,7 +299,8 @@ func (c *K8sSandboxCreator) CreateSandbox(
 		result.MaxSessionDuration = DefaultMaxSessionDuration
 	}
 
-	// Propagate egress policy from CodeInterpreter spec → SandboxResult → Redis SandboxInfo.
+	result.SessionID = sessionID
+	// Propagate egress policy from CodeInterpreter spec onto the result (also stamped on the CR).
 	result.RuntimePolicy = ci.Spec.RuntimePolicy
 	if result.RuntimePolicy == "" {
 		result.RuntimePolicy = "agent-default"
@@ -336,6 +338,7 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 	annotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
+	writePolicyAnnotations(annotations, sandboxPolicyFromTemplate(ci))
 	if podTemplate.ObjectMeta.Annotations == nil {
 		podTemplate.ObjectMeta.Annotations = make(map[string]string)
 	}
@@ -525,6 +528,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 	claimAnnotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
+	writePolicyAnnotations(claimAnnotations, sandboxPolicyFromTemplate(ci))
 	if user != nil {
 		if user.UserID != "" {
 			claimLabels[userIDLabelKey] = user.UserID
@@ -572,6 +576,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 				patchAnnotations := map[string]string{
 					sessionIDAnnotationKey: sessionID,
 				}
+				writePolicyAnnotations(patchAnnotations, sandboxPolicyFromTemplate(ci))
 				// User override takes precedence over template default.
 				if overrides != nil && overrides.SessionTimeout != "" {
 					if userDur, err := time.ParseDuration(overrides.SessionTimeout); err == nil && userDur > 0 {
@@ -1326,6 +1331,29 @@ func applyOverrides(
 	}
 }
 
+// GetSandbox loads a Sandbox CR by namespace and name.
+func (c *K8sSandboxCreator) GetSandbox(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
+	sb := &sandboxv1alpha1.Sandbox{}
+	if err := c.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sb); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+// PatchSandboxPolicy writes egress policy annotations onto a Sandbox CR.
+func (c *K8sSandboxCreator) PatchSandboxPolicy(ctx context.Context, namespace, name string, p sandboxPolicy) error {
+	sb, err := c.GetSandbox(ctx, namespace, name)
+	if err != nil {
+		return err
+	}
+	patch := ctrlclient.MergeFrom(sb.DeepCopy())
+	if sb.Annotations == nil {
+		sb.Annotations = make(map[string]string)
+	}
+	writePolicyAnnotations(sb.Annotations, p)
+	return c.client.Patch(ctx, sb, patch)
+}
+
 // RecoverSessionFromK8s rebuilds a SandboxInfo by searching K8s for a Sandbox
 // with a matching session-id annotation. This is the fallback path when Redis
 // data is lost (e.g. Redis restart without persistence).
@@ -1391,6 +1419,13 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 		info.UserName = uname
 	}
 
+	pol := readPolicyAnnotations(sb)
+	info.RuntimePolicy = pol.RuntimePolicy
+	info.PolicyMode = pol.PolicyMode
+	info.AllowedEgressHosts = pol.AllowedEgressHosts
+	info.AllowedInternalHosts = pol.AllowedInternalHosts
+	info.PolicyVersion = pol.PolicyVersion
+
 	// Use Lifecycle.ShutdownTime for accurate ExpiresAt.
 	if !sb.Spec.Lifecycle.ShutdownTime.IsZero() {
 		info.ExpiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
@@ -1413,6 +1448,19 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 func (c *K8sSandboxCreator) findSandboxBySessionID(
 	ctx context.Context, sessionID string,
 ) (*sandboxv1alpha1.Sandbox, error) {
+	if ns, name, ok := api.ParseSandboxID(sessionID); ok {
+		sb, err := c.GetSandbox(ctx, ns, name)
+		if err == nil {
+			if err := rejectIfTerminating(sessionID, sb); err != nil {
+				return nil, err
+			}
+			return sb, nil
+		}
+		if !k8serrors.IsNotFound(err) {
+			return nil, err
+		}
+	}
+
 	if c.cachedReader != nil {
 		indexed := &sandboxv1alpha1.SandboxList{}
 		err := c.cachedReader.List(ctx, indexed, ctrlclient.MatchingFields{SessionIDIndexField: sessionID})

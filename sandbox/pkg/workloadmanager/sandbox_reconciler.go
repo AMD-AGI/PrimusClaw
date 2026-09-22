@@ -12,8 +12,6 @@ package workloadmanager
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -27,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/api"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -41,8 +40,8 @@ type SandboxStatusUpdate struct {
 //
 // When Store is non-nil, it also auto-registers sessions into Redis for
 // Sandboxes that carry the runtime.agent-sandbox.io/session-id annotation.
-// If a Sandbox reaches Running without a session-id, one is generated and
-// patched onto the Sandbox CR so that it can always be resolved via Router.
+// If a Sandbox reaches Running without a sandbox id, namespace/name is written
+// onto the CR so that it can always be resolved via Router.
 type SandboxReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -215,12 +214,13 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 	if sandbox.Annotations != nil {
 		sessionID = sandbox.Annotations[sessionIDAnnotationKey]
 	}
+	canonicalID := api.FormatSandboxID(sandbox.Namespace, sandbox.Name)
 
 	needsPatch := false
 	if sessionID == "" {
-		sessionID = generateSessionID()
+		sessionID = canonicalID
 		needsPatch = true
-		log.V(2).Infof("SandboxReconciler: generated session-id %s for %s/%s",
+		log.V(2).Infof("SandboxReconciler: binding sandbox id %s for %s/%s",
 			sessionID, sandbox.Namespace, sandbox.Name)
 	}
 
@@ -258,6 +258,9 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		sandbox.Annotations[sessionIDAnnotationKey] = sessionID
 		if defaultShutdown != nil {
 			sandbox.Spec.Lifecycle.ShutdownTime = defaultShutdown
+		}
+		if _, ok := sandbox.Annotations[runtimePolicyAnnotationKey]; !ok {
+			writePolicyAnnotations(sandbox.Annotations, defaultSandboxPolicy())
 		}
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
 			return fmt.Errorf("patch sandbox defaults: %w", err)
@@ -319,13 +322,6 @@ func (r *SandboxReconciler) resolveSandboxAddress(sandbox *sandboxv1alpha1.Sandb
 		return fmt.Sprintf("%s.%s.svc.cluster.local", sandbox.Status.Service, sandbox.Namespace), nil
 	}
 	return "", fmt.Errorf("sandbox %s/%s has no ServiceFQDN or Service in status", sandbox.Namespace, sandbox.Name)
-}
-
-// generateSessionID creates a new session ID with the standard "sess_" prefix.
-func generateSessionID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return "sess_" + hex.EncodeToString(b)
 }
 
 // WatchSandboxOnce registers a one-time watcher for the given sandbox.

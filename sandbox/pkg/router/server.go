@@ -199,8 +199,8 @@ func (s *Server) setupRoutes() {
 	v1.POST("/code-interpreter", s.proxyToWM)
 	v1.POST("/code-interpreter/stream", s.proxyToWM) // SSE streaming sandbox creation
 	v1.GET("/code-interpreter/sessions", s.proxyToWM)
-	v1.GET("/code-interpreter/sessions/:sessionId", s.proxyToWM)
-	v1.DELETE("/code-interpreter/sessions/:sessionId", s.proxyToWM)
+	v1.GET("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
+	v1.DELETE("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
 
 	// Template management (CRUD)
 	v1.POST("/templates", s.proxyToWM)
@@ -211,9 +211,9 @@ func (s *Server) setupRoutes() {
 	v1.DELETE("/templates/:namespace/:name", s.proxyToWM)
 
 	// Sandbox policy management (proxied to WM)
-	v1.GET("/sandbox/sessions/:sessionId/policy", s.proxyToWM)
-	v1.PATCH("/sandbox/sessions/:sessionId/policy", s.proxyToWM)
-	v1.GET("/sandbox/sessions/:sessionId/logs", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
+	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.proxyToWM)
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
