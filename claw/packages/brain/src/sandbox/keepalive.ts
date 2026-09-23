@@ -916,7 +916,11 @@ async function shouldSkipExpiredRetry(
     sandboxName: info.sandboxName || entry?.sandboxName,
     namespace: info.namespace || entry?.namespace,
     userId: info.userId || entry?.userId,
-    messageId: info.messageId || pending.messageId || entry?.messageId,
+    // Only from the handle. `pending.messageId` is the message the retry was
+    // for, which every session has; the cascade field is a multi-node cluster
+    // id, which only a multi-node handle records. Backfilled from the retry it
+    // sent every single-node teardown looking for clusters that never existed.
+    messageId: info.messageId || entry?.messageId,
   };
 
   // Queued, not awaited: this runs inside the serial walk of the bucket, and a
@@ -1192,6 +1196,19 @@ export const TEARDOWN_RETRY_BACKOFF_MS = Math.min(
   Math.max(1, Math.floor(BRAIN_REGISTRY_TTL_MS / 2)),
 );
 const teardownRetryAt = new Map<string, number>();
+
+/**
+ * Drop the backoffs whose wait has passed.
+ *
+ * `teardownDeferred` clears an entry when it is asked about one, and a handle
+ * that leaves the bucket is never asked about again -- so without this the map
+ * keeps a row per session that was ever deferred, for the life of the process.
+ */
+function pruneTeardownBackoff(now: number): void {
+  for (const [sessionId, until] of teardownRetryAt) {
+    if (now >= until) teardownRetryAt.delete(sessionId);
+  }
+}
 
 /** Whether a teardown that failed is still inside its backoff. */
 function teardownDeferred(sessionId: string, now: number): boolean {
@@ -2208,6 +2225,7 @@ async function collectTargets(
 ): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
   const clock = deps.now ?? Date.now;
   const censusStartedAt = clock();
+  pruneTeardownBackoff(censusStartedAt);
   const census: TargetCensus = {
     targets: new Map(), seenIdentities, probeCandidates: [], stats,
     retentionReads: new Map(),

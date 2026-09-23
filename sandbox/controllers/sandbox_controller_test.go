@@ -245,6 +245,35 @@ func TestRuntimeReasonCannotRejectTheStatusUpdate(t *testing.T) {
 	require.Equal(t, "OOMKilled", conditionReason("OOMKilled"))
 }
 
+func TestPodFailureNamesTheContainerThatFailed(t *testing.T) {
+	// A sidecar that exited 0 can stand ahead of the container that crashed,
+	// and taking whichever terminated first reported the crash as a clean exit.
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name: "sidecar",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "Completed",
+					ExitCode: 0,
+				}},
+			},
+			{
+				Name: "envd",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "OOMKilled",
+					ExitCode: 137,
+				}},
+			},
+		},
+	}})
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, "OOMKilled", failed.Reason)
+	require.Contains(t, failed.Message, "Container envd")
+}
+
 func TestReconcile(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"

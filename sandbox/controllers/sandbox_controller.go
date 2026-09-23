@@ -248,27 +248,50 @@ func conditionReason(reason string) string {
 
 // podFailureDetail preserves the container termination reason for SaFE and
 // Brain instead of reducing every sandbox crash to a generic PodFailed.
+//
+// The container that failed is the one that explains the Pod, and it is not
+// necessarily the first in the list: a sidecar that exited 0 stands ahead of
+// the OOMKilled sandbox in many Pods, and taking whichever came first reported
+// the crash as a clean exit. A zero-exit container is therefore only the
+// answer when nothing else terminated.
 func podFailureDetail(pod *corev1.Pod) (string, string) {
-	for _, status := range pod.Status.ContainerStatuses {
+	var clean *corev1.ContainerStatus
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
 		terminated := status.State.Terminated
 		if terminated == nil {
 			continue
 		}
-		reason := terminated.Reason
-		if reason == "" {
-			reason = sandboxv1alpha1.SandboxReasonPodFailed
+		if terminated.ExitCode == 0 {
+			if clean == nil {
+				clean = status
+			}
+			continue
 		}
-		return conditionReason(reason), fmt.Sprintf(
-			"Container %s terminated: reason=%s exitCode=%d",
-			status.Name,
-			reason,
-			terminated.ExitCode,
-		)
+		return terminatedDetail(status)
+	}
+	if clean != nil {
+		return terminatedDetail(clean)
 	}
 	if pod.Status.Message != "" {
 		return sandboxv1alpha1.SandboxReasonPodFailed, pod.Status.Message
 	}
 	return sandboxv1alpha1.SandboxReasonPodFailed, "Pod phase is Failed"
+}
+
+// terminatedDetail renders one terminated container as a condition.
+func terminatedDetail(status *corev1.ContainerStatus) (string, string) {
+	terminated := status.State.Terminated
+	reason := terminated.Reason
+	if reason == "" {
+		reason = sandboxv1alpha1.SandboxReasonPodFailed
+	}
+	return conditionReason(reason), fmt.Sprintf(
+		"Container %s terminated: reason=%s exitCode=%d",
+		status.Name,
+		reason,
+		terminated.ExitCode,
+	)
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1alpha1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {
