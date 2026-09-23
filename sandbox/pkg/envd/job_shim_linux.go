@@ -42,9 +42,6 @@ func runJobShim() {
 	// is killed, so a request would wait out its timeout instead.
 	syscall.CloseOnExec(exitStatusFD)
 	control := os.NewFile(uintptr(exitStatusFD), "job-control")
-	if control == nil {
-		os.Exit(1)
-	}
 
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
 	cmd.Stdout = os.Stdout
@@ -67,12 +64,19 @@ func runJobShim() {
 	defer signal.Stop(purge)
 
 	if err := cmd.Start(); err != nil {
-		writeControlInt(control, 0)
-		writeControlInt(control, 1)
+		_ = writeControlInt(control, 0)
+		_ = writeControlInt(control, 1)
 		_ = control.Close()
 		os.Exit(1)
 	}
-	writeControlInt(control, cmd.Process.Pid)
+	// Fatal when it cannot be sent. The caller is blocked reading these four
+	// bytes, and a descriptor that cannot carry them never will -- leaving
+	// instead of going on gives that read an EOF to fail on rather than a wait
+	// with no end, and the exit takes the command's process group with it.
+	if err := writeControlInt(control, cmd.Process.Pid); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		os.Exit(1)
+	}
 
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
@@ -101,7 +105,10 @@ func runJobShim() {
 		}
 	}
 
-	writeControlInt(control, code)
+	// Not fatal, unlike the identity above: the caller's read of this one is
+	// bounded by its own request timeout, and the shim still owes the tree it
+	// adopted a reaper.
+	_ = writeControlInt(control, code)
 	_ = control.Close()
 	if purgeRequested {
 		killAdoptedDescendants()
@@ -134,24 +141,26 @@ func purgeJobTree(shimPID int) error {
 }
 
 // isJobShim reports whether the PID is one of this EnvD's job shims.
+//
+// Matched where the shim itself reads it -- argv[1], which is how runJobShim
+// decides it is a shim at all. Anywhere in the command line is not the same
+// test: a user command that merely mentions the flag would pass it, and what
+// this guards is a signal whose default disposition is to kill.
 func isJobShim(pid int) bool {
 	raw, err := os.ReadFile(fmt.Sprintf("%s/%d/cmdline", procRoot, pid))
 	if err != nil {
 		return false
 	}
-	for _, arg := range strings.Split(string(raw), "\x00") {
-		if arg == jobShimArg {
-			return true
-		}
-	}
-	return false
+	argv := strings.Split(string(raw), "\x00")
+	return len(argv) > 1 && argv[1] == jobShimArg
 }
 
 // writeControlInt sends one process identity or exit status to EnvD.
-func writeControlInt(control *os.File, value int) {
+func writeControlInt(control *os.File, value int) error {
 	var buf [4]byte
 	binary.LittleEndian.PutUint32(buf[:], uint32(int32(value)))
-	_, _ = control.Write(buf[:])
+	_, err := control.Write(buf[:])
+	return err
 }
 
 // reapOrphans waits until every descendant adopted by this shim has exited, or
@@ -255,17 +264,24 @@ func (s *Server) startTrackedCommand(
 		return 0, nil, nil, nil, err
 	}
 	_ = exitW.Close()
+	// Registered before the handshake, not after it. The shim has already been
+	// exec'd and is starting the command, so a roster that waits for the reply
+	// reports an empty sandbox over the window in which the user's command is
+	// coming up -- and an idle sweep landing there reclaims it.
+	jobToken := uint64(0)
+	if tracking.track {
+		jobToken = s.jobs.add(shim.Process.Pid, tracking.hands)
+	}
 	var pidBuf [4]byte
 	if _, err := io.ReadFull(exitR, pidBuf[:]); err != nil {
 		_ = exitR.Close()
 		_ = shim.Wait()
 		// The supervisor died before it could name its primary, and the command
-		// it was started for may already be running. Nothing will ever account
-		// for that tree -- the roster never learned of it -- which is a
-		// tracking loss and not an empty sandbox. Without this the endpoint
-		// reports no user processes while the user's command runs, and the
-		// sandbox is reclaimed out from under it.
+		// it was started for may already be running. The roster entry goes --
+		// the shim behind it is gone -- but nothing will ever account for that
+		// tree, which is a tracking loss and not an empty sandbox.
 		if tracking.track {
+			s.jobs.remove(shim.Process.Pid, jobToken)
 			s.jobs.markLost()
 		}
 		return 0, nil, nil, nil, fmt.Errorf("job shim startup handshake: %w", err)
@@ -274,11 +290,11 @@ func (s *Server) startTrackedCommand(
 	if primaryPID <= 0 {
 		_ = exitR.Close()
 		_ = shim.Wait()
+		// The command never started, so there is no tree to account for.
+		if tracking.track {
+			s.jobs.remove(shim.Process.Pid, jobToken)
+		}
 		return 0, nil, nil, nil, fmt.Errorf("job shim failed to start primary command")
-	}
-	jobToken := uint64(0)
-	if tracking.track {
-		jobToken = s.jobs.add(shim.Process.Pid, tracking.hands)
 	}
 
 	ch := make(chan int, 1)

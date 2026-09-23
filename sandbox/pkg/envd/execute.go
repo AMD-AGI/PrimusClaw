@@ -175,12 +175,6 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		workDir = abs
 	}
 
-	// Setup SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		httpError(w, "streaming not supported", http.StatusInternalServerError)
@@ -197,9 +191,17 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	if err != nil {
+		// Before the stream's headers, so a start that failed answers as an
+		// ordinary error rather than as an event stream that carries one.
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Setup SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Send start event
 	stream.event("start", map[string]interface{}{"pid": pid})

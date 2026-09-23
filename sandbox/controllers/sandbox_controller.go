@@ -277,11 +277,16 @@ func podFailureDetail(pod *corev1.Pod) (string, string) {
 		}
 		return terminatedDetail(status)
 	}
+	// Nothing in the Pod failed, yet the Pod did. Eviction and node pressure
+	// are decided about the Pod rather than about a container, and the Pod's
+	// own message is the only place that reason appears -- so it is preferred
+	// over a container that exited 0, which as a failure detail reports
+	// exitCode=0 and explains nothing.
+	if pod.Status.Message != "" {
+		return conditionReason(pod.Status.Reason), pod.Status.Message
+	}
 	if clean != nil {
 		return terminatedDetail(clean)
-	}
-	if pod.Status.Message != "" {
-		return sandboxv1alpha1.SandboxReasonPodFailed, pod.Status.Message
 	}
 	return sandboxv1alpha1.SandboxReasonPodFailed, "Pod phase is Failed"
 }

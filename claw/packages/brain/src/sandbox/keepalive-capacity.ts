@@ -150,7 +150,9 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       `SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=${input.sweepSpanSec} does not cover a sweep's `
       + `own worst case of ${input.pingPhaseCeilingSec}s -- the retention reads, the ping `
       + "phase and the failure handling that follows it, each bounded by its own budget -- "
-      + "so the span every refresh gap is derived from is one the sweep routinely exceeds.",
+      + "so the span every refresh gap is derived from is one the sweep routinely exceeds. "
+      + "Two of those budgets are fractions of BRAIN_REGISTRY_TTL_MS, so raising the "
+      + "bucket TTL raises this worst case with it and the span has to follow.",
     );
   }
   const deadline = requirePositiveInteger(
