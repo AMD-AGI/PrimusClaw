@@ -172,8 +172,8 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	allErrors = errors.Join(allErrors, err)
 
 	// Reconcile Pod
-	pod, err := r.reconcilePod(ctx, sandbox, nameHash)
-	allErrors = errors.Join(allErrors, err)
+	pod, podErr := r.reconcilePod(ctx, sandbox, nameHash)
+	allErrors = errors.Join(allErrors, podErr)
 	if pod == nil {
 		sandbox.Status.Replicas = 0
 		sandbox.Status.LabelSelector = ""
@@ -189,7 +189,14 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// compute and set overall Ready condition
 	readyCondition := r.computeReadyCondition(sandbox, allErrors, svc, pod)
 	meta.SetStatusCondition(&sandbox.Status.Conditions, readyCondition)
-	applyPodTerminalConditions(sandbox, pod)
+	// Only where the Pod's state was actually read. A Get that failed is not a
+	// Pod that is absent, and acting on it as one removes a terminal condition
+	// already published -- which is how a sandbox that failed stops saying so
+	// on one apiserver blip, and, where the Pod is gone for good, never says it
+	// again.
+	if podErr == nil {
+		applyPodTerminalConditions(sandbox, pod)
+	}
 
 	return allErrors
 }

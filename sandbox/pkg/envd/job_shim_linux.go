@@ -259,6 +259,15 @@ func (s *Server) startTrackedCommand(
 	if _, err := io.ReadFull(exitR, pidBuf[:]); err != nil {
 		_ = exitR.Close()
 		_ = shim.Wait()
+		// The supervisor died before it could name its primary, and the command
+		// it was started for may already be running. Nothing will ever account
+		// for that tree -- the roster never learned of it -- which is a
+		// tracking loss and not an empty sandbox. Without this the endpoint
+		// reports no user processes while the user's command runs, and the
+		// sandbox is reclaimed out from under it.
+		if tracking.track {
+			s.jobs.markLost()
+		}
 		return 0, nil, nil, nil, fmt.Errorf("job shim startup handshake: %w", err)
 	}
 	primaryPID = int(int32(binary.LittleEndian.Uint32(pidBuf[:])))

@@ -900,6 +900,17 @@ export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
 // ready→closing and destroyHands. Operators set SANDBOX_IDLE_REUSE_SECONDS
 // (default 900). Values below 1s are refused and this default is used.
 export const SANDBOX_IDLE_REUSE_MS = envInt("SANDBOX_IDLE_REUSE_SECONDS", 15 * 60, { min: 1 }) * 1000;
+// The setting used to be named for milliseconds. A deployment still carrying
+// the old name is not reading the default it thinks it is -- the new name is
+// in seconds, so even a copied value would mean something else -- and a
+// sandbox lifetime that silently reverts to 15 minutes is the kind of change
+// that is found from a reclaimed sandbox rather than from a config review.
+if (env("SANDBOX_IDLE_REUSE_MS")) {
+  settingProblems.push(
+    "SANDBOX_IDLE_REUSE_MS is no longer read: the setting is now "
+      + "SANDBOX_IDLE_REUSE_SECONDS and it is in seconds, not milliseconds",
+  );
+}
 // Mirror of CHECKPOINT_TTL_MS; kept as a distinct symbol so call-sites that
 // attach to the BRAIN_CHECKPOINTS bucket read the bucket-scoped constant
 // (matches BRAIN_REGISTRY_TTL_MS naming).
