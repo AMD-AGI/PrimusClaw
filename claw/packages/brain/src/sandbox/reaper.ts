@@ -347,6 +347,18 @@ export async function destroyHands(
    * them. Callers with nothing to lose pass nothing and behave as before.
    */
   stillOwned?: () => boolean,
+  /**
+   * The message this teardown is being run on behalf of, where there is one.
+   *
+   * A multi-node cluster is named by the message that created it, and a
+   * redelivery of that same message adopts the cluster rather than building a
+   * new one -- so when a replacement is being built FOR that message, the
+   * cluster the handle names is the one the replacement is about to be wired
+   * to. Cascading there deletes it out from under the run. Callers replacing a
+   * sandbox pass the message in flight; callers whose message is over (idle
+   * reclaim, session delete) pass nothing and cascade as before.
+   */
+  opts?: { activeMessageId?: string },
 ): Promise<void> {
   const kv = getHandsKv();
   const recorded = await readHandsEntry(sessionId);
@@ -431,7 +443,16 @@ export async function destroyHands(
           ?? (ownsRecorded ? recorded.identity?.messageId : "")
           ?? "",
       ).trim();
-      if (platformKey && messageId) {
+      const activeMessageId = (opts?.activeMessageId ?? "").trim();
+      if (messageId && messageId === activeMessageId) {
+        // The message that owns this cluster is the one running now: this is a
+        // replacement being built for it, not the end of it. Its cluster has
+        // already been adopted by the run that is about to use it.
+        logger.info(
+          { sessionId, messageId },
+          "mn.cascade_skipped_for_message_in_flight",
+        );
+      } else if (platformKey && messageId) {
         await withCeiling(
           reclaimClusters(sessionId, platformKey, messageId),
           CLUSTER_CASCADE_CEILING_MS,

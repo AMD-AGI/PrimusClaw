@@ -275,14 +275,18 @@ func (s *Server) startTrackedCommand(
 	var pidBuf [4]byte
 	if _, err := io.ReadFull(exitR, pidBuf[:]); err != nil {
 		_ = exitR.Close()
-		_ = shim.Wait()
-		// The supervisor died before it could name its primary, and the command
-		// it was started for may already be running. The roster entry goes --
-		// the shim behind it is gone -- but nothing will ever account for that
-		// tree, which is a tracking loss and not an empty sandbox.
+		waitErr := shim.Wait()
+		// The roster entry goes -- the shim behind it is gone. Whether anything
+		// is left running is what the exit status says: a shim that exited on
+		// its own never reached the command (a bad environment refused by the
+		// Go runtime is the ordinary case, and a sandbox must not be pinned by
+		// one), while one that was signalled may have started the command
+		// already and left a tree nothing can account for.
 		if tracking.track {
 			s.jobs.remove(shim.Process.Pid, jobToken)
-			s.jobs.markLost()
+			if supervisorDiedUnexpectedly(waitErr) {
+				s.jobs.markLost()
+			}
 		}
 		return 0, nil, nil, nil, fmt.Errorf("job shim startup handshake: %w", err)
 	}

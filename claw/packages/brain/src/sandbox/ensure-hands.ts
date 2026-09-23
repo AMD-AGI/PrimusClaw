@@ -235,6 +235,8 @@ export interface SandboxReuseEffects {
     sessionId: string,
     known?: HandsProbeEntry,
     knownToken?: string,
+    /** The message a replacement is being built for; never cascaded away. */
+    activeMessageId?: string,
   ) => Promise<void>;
   registerSandbox: typeof registerSandbox;
   probeSandboxContainer: (
@@ -291,7 +293,9 @@ const realReuseEffects: SandboxReuseEffects = {
   dagHoldsWorkload,
   workloadHeldByOtherDag,
   releaseHandlesForWorkload,
-  destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
+  destroyHands: (sessionId, known, knownToken, activeMessageId) =>
+    destroyHands(sessionId, known, knownToken, undefined, { activeMessageId }),
+  registerSandbox, probeSandboxContainer, restartHandsInSandbox,
   unregisterSandbox, markHandsIdle,
   countLiveWork, retainContainer,
 };
@@ -1890,6 +1894,7 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
         sessionId,
         identity,
         hasToken ? info.token : undefined,
+        request.message_id,
       );
       logger.info(terminalFields, "ensureHands.terminal_workload_stopped");
     } catch (err) {
@@ -1920,7 +1925,12 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       );
       return null;
     }
-    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    // The cluster this handle names belongs to the message being replaced, and
+    // for a redelivery that is the message running now -- whose cluster the
+    // provider has already adopted for the sandbox about to be built.
+    await reuseEffects.destroyHands(
+      sessionId, identity, hasToken ? info.token : undefined, request.message_id,
+    );
     return null;
   }
 

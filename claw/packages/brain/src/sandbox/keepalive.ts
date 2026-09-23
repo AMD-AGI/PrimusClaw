@@ -879,6 +879,7 @@ async function shouldSkipExpiredRetry(
     return false;
   }
 
+
   // Resolved by identity, not by whichever key answers first: during a rolling
   // upgrade the canonical key can hold a different, live generation, and both
   // the stop and the delete have to land on the one this retry owned.
@@ -902,11 +903,27 @@ async function shouldSkipExpiredRetry(
     return true;
   }
 
+  const info = record.info;
+
+  // An undelivered retry says nothing about what is running inside the
+  // sandbox, and this path stops the workload rather than only dropping its
+  // pointer -- so the reclaim evidence has to be asked for here too. A
+  // background shell started by an earlier task of this session outlives the
+  // message that started it; the lock this retry released is a statement about
+  // that message, not about the container. Answering "not yet" costs a sweep,
+  // which the record outlives; answering "stop" over live work does not undo.
+  //
+  // Not the local registry, unlike the idle path: this walk reaches handles
+  // through it, and the registration left by the attempt that never came back
+  // is the orphan being collected rather than evidence against collecting it.
+  const identity = entryIdentity(info);
+  if (peekBackgroundWork(identity, info).state === "running") return false;
+  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) return false;
+
   // Stop the workload (and messageId-scoped MN cluster) before dropping the
   // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
   // delete, so releasing the pointer alone would orphan the sandbox until its
   // workload timeout.
-  const info = record.info;
   const known: HandsProbeEntry = {
     provider: info.provider,
     workloadId: info.workloadId || entry?.workloadId || pending.workloadId,

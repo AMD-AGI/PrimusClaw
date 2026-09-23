@@ -181,6 +181,15 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set before the command starts, because its output writers are live from
+	// the moment it does: a first write that beat this would commit the
+	// response with a sniffed content type. Nothing is sent yet, so a start
+	// that fails can still answer with a status -- it withdraws these first.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
 	stream := &sseCommandStream{w: w, flusher: flusher, active: true}
 	pid, exitCh, drained, stop, err := s.startTrackedCommand(
 		req.Command,
@@ -191,17 +200,14 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	if err != nil {
-		// Before the stream's headers, so a start that failed answers as an
-		// ordinary error rather than as an event stream that carries one.
+		h := w.Header()
+		h.Del("Content-Type")
+		h.Del("Cache-Control")
+		h.Del("Connection")
+		h.Del("X-Accel-Buffering")
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	// Setup SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Send start event
 	stream.event("start", map[string]interface{}{"pid": pid})
