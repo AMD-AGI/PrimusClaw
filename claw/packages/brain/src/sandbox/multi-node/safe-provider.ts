@@ -230,10 +230,29 @@ export async function reclaimIdleSessionClusters(
 ): Promise<number> {
   const scoped = (messageId ?? "").trim();
   if (scoped) {
+    // Established as one of THIS session's clusters before it is deleted, the
+    // way the unscoped branch below establishes every id it acts on. The id
+    // reaches here from the client's `message_id`, and a DELETE on a workload
+    // id is unconditional at the control plane: unchecked, a caller naming one
+    // of its own unrelated workloads has it reclaimed on a sandbox's idle
+    // timer, and the 404 that a wrong guess returns reads as success.
+    //
+    // Unverified means not deleted. A cluster left behind costs GPUs until the
+    // workload's own timeout; deleting something this session does not own
+    // costs work nobody asked to end.
+    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey);
+    const named = items.find((ref) => ref.id === scoped);
+    if (!named || !CLUSTER_KINDS.has(named.kind)) {
+      logger.warn(
+        { sessionId, workloadId: scoped, kind: named?.kind ?? null, incomplete },
+        "mn.safe_idle_reclaim_unverified",
+      );
+      return 0;
+    }
     const resp = await safeFetch(`/api/v1/workloads/${scoped}`, { method: "DELETE", apiKey })
       .catch((e) => ({ status: 0, body: String(e) }));
     if ([200, 202, 204, 404].includes(resp.status)) {
-      logger.info({ sessionId, workloadId: scoped }, "mn.safe_idle_reclaimed");
+      logger.info({ sessionId, workloadId: scoped, kind: named.kind }, "mn.safe_idle_reclaimed");
       return 1;
     }
     logger.warn(

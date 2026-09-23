@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"reflect"
+	"regexp"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -228,6 +229,23 @@ func applyPodTerminalConditions(sandbox *sandboxv1alpha1.Sandbox, pod *corev1.Po
 	}
 }
 
+// conditionReasonPattern is what the API server accepts in a condition reason.
+var conditionReasonPattern = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`)
+
+// conditionReason holds a reason to what a status update can actually carry.
+//
+// The container runtime supplies the termination reason, and nothing about it
+// is bound to the API server's grammar: one space or hyphen in it and the
+// whole Status().Update() is rejected -- Ready and every other condition with
+// it -- leaving the controller to fail the same reconcile for ever. The
+// unusable text is not lost, only moved: the message below quotes it.
+func conditionReason(reason string) string {
+	if conditionReasonPattern.MatchString(reason) {
+		return reason
+	}
+	return sandboxv1alpha1.SandboxReasonPodFailed
+}
+
 // podFailureDetail preserves the container termination reason for SaFE and
 // Brain instead of reducing every sandbox crash to a generic PodFailed.
 func podFailureDetail(pod *corev1.Pod) (string, string) {
@@ -240,7 +258,7 @@ func podFailureDetail(pod *corev1.Pod) (string, string) {
 		if reason == "" {
 			reason = sandboxv1alpha1.SandboxReasonPodFailed
 		}
-		return reason, fmt.Sprintf(
+		return conditionReason(reason), fmt.Sprintf(
 			"Container %s terminated: reason=%s exitCode=%d",
 			status.Name,
 			reason,

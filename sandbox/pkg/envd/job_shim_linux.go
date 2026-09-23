@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -120,8 +121,30 @@ func runJobShim() {
 // The signal is the whole protocol: a shim that has outlived its request is
 // waiting on it, and one still running its primary command takes the primary
 // down with the tree.
+//
+// The target is confirmed first. A roster PID is only as good as the moment it
+// was read, the kernel is free to hand a reaped shim's number to anything, and
+// the default disposition of SIGUSR1 is to terminate -- so an unchecked signal
+// can end a process that has nothing to do with this sandbox's jobs.
 func purgeJobTree(shimPID int) error {
+	if !isJobShim(shimPID) {
+		return fmt.Errorf("pid %d is not a job shim", shimPID)
+	}
 	return syscall.Kill(shimPID, syscall.SIGUSR1)
+}
+
+// isJobShim reports whether the PID is one of this EnvD's job shims.
+func isJobShim(pid int) bool {
+	raw, err := os.ReadFile(fmt.Sprintf("%s/%d/cmdline", procRoot, pid))
+	if err != nil {
+		return false
+	}
+	for _, arg := range strings.Split(string(raw), "\x00") {
+		if arg == jobShimArg {
+			return true
+		}
+	}
+	return false
 }
 
 // writeControlInt sends one process identity or exit status to EnvD.
@@ -244,8 +267,9 @@ func (s *Server) startTrackedCommand(
 		_ = shim.Wait()
 		return 0, nil, nil, nil, fmt.Errorf("job shim failed to start primary command")
 	}
+	jobToken := uint64(0)
 	if tracking.track {
-		s.jobs.add(shim.Process.Pid, tracking.hands)
+		jobToken = s.jobs.add(shim.Process.Pid, tracking.hands)
 	}
 
 	ch := make(chan int, 1)
@@ -280,7 +304,7 @@ func (s *Server) startTrackedCommand(
 		if tracking.track && supervisorDiedUnexpectedly(waitErr) {
 			s.jobs.markLost()
 		}
-		s.jobs.remove(shim.Process.Pid)
+		s.jobs.remove(shim.Process.Pid, jobToken)
 		close(done)
 	}()
 	return primaryPID, ch, done, cancel, nil

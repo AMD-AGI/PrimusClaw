@@ -351,11 +351,34 @@ test("message-scoped idle reclaim deletes only that workload id", async (t) => {
   const deletes = calls.filter((c) => c.method === "DELETE");
   assert.equal(deletes.length, 1);
   assert.match(deletes[0]!.url, /\/workloads\/msg-old$/);
-  assert.equal(
-    calls.filter((c) => c.method === "GET").length,
-    0,
-    "a scoped reclaim must not list the whole session",
-  );
+});
+
+test("message-scoped idle reclaim deletes nothing it cannot place in this session", async (t) => {
+  // The id arrives from the client as `message_id`, and a DELETE on a workload
+  // id is unconditional at the control plane: unchecked, a caller naming one of
+  // its own unrelated workloads has it reclaimed on this sandbox's idle timer,
+  // and the 404 a wrong guess returns reads as a successful reclaim. The
+  // session's own listing is what the scoped branch is allowed to act on, the
+  // same enumeration the unscoped branch deletes from.
+  const calls = stubSafeApi(t, {
+    list: [workload("msg-old", "running", "RayJob")],
+    deleteStatus: 204,
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY, "another-users-workload"), 0);
+  assert.equal(calls.filter((c) => c.method === "DELETE").length, 0);
+});
+
+test("message-scoped idle reclaim spares a workload of this session that is not a cluster", async (t) => {
+  // Same sparing the unscoped branch does: the sandbox's own workload is in
+  // the session's listing, and reclaiming GPUs must not stop the sandbox.
+  const calls = stubSafeApi(t, {
+    list: [workload("msg-old", "running", "CodeInterpreter")],
+    deleteStatus: 204,
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY, "msg-old"), 0);
+  assert.equal(calls.filter((c) => c.method === "DELETE").length, 0);
 });
 
 test("no platform key is incomplete, not nothing to do", async (t) => {

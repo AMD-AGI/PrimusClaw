@@ -27,6 +27,11 @@ const handsBinaryMark = "hands-binary"
 type trackedJob struct {
 	shimPID int
 	hands   bool
+	// token tells two jobs apart that were given the same PID. The kernel is
+	// free to reuse a PID the moment its process is reaped, and a job's removal
+	// runs after that -- so a removal matched on the PID alone can drop the
+	// live job that took the number, and a running command reads as idle.
+	token uint64
 }
 
 // jobTracking says how an execute is accounted for in the job roster.
@@ -43,6 +48,7 @@ type jobTracking struct {
 type jobRegistry struct {
 	mu   sync.Mutex
 	jobs map[int]trackedJob
+	seq  uint64
 	lost bool
 	// count resolves a Hands shim to its live user descendants. It is a field
 	// so accounting can be exercised against a known tree; the walk it defaults
@@ -198,14 +204,17 @@ func shellWords(line string) []string {
 	return out
 }
 
-// add records a newly started job shim.
-func (r *jobRegistry) add(shimPID int, hands bool) {
+// add records a newly started job shim and returns the token that names it.
+func (r *jobRegistry) add(shimPID int, hands bool) uint64 {
 	if r == nil || shimPID <= 0 {
-		return
+		return 0
 	}
 	r.mu.Lock()
-	r.jobs[shimPID] = trackedJob{shimPID: shimPID, hands: hands}
+	r.seq++
+	token := r.seq
+	r.jobs[shimPID] = trackedJob{shimPID: shimPID, hands: hands, token: token}
 	r.mu.Unlock()
+	return token
 }
 
 // userShimPIDs lists the shims of tracked user jobs.
@@ -229,12 +238,17 @@ func (r *jobRegistry) userShimPIDs() []int {
 }
 
 // remove forgets a shim after all descendants have exited.
-func (r *jobRegistry) remove(shimPID int) {
+//
+// Matched on the token as well as the PID, so a removal that arrives after the
+// number has been handed to another job leaves that one on the roster.
+func (r *jobRegistry) remove(shimPID int, token uint64) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	delete(r.jobs, shimPID)
+	if job, ok := r.jobs[shimPID]; ok && job.token == token {
+		delete(r.jobs, shimPID)
+	}
 	r.mu.Unlock()
 }
 
@@ -249,22 +263,37 @@ func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 	if r == nil {
 		return jobSnapshot{}, nil
 	}
+	// The roster is copied under the lock and walked outside it. The walk reads
+	// two files per process in the whole table, and every execute that starts
+	// or ends takes this same lock -- so holding it across the walk stalls the
+	// endpoint the walk exists to describe.
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	count := 0
+	jobs := make([]trackedJob, 0, len(r.jobs))
 	for _, j := range r.jobs {
+		jobs = append(jobs, j)
+	}
+	count := r.count
+	r.mu.Unlock()
+
+	total := 0
+	for _, j := range jobs {
 		if j.hands {
-			n, err := r.count(j.shimPID)
+			n, err := count(j.shimPID)
 			if err != nil {
 				return jobSnapshot{}, err
 			}
-			count += n
+			total += n
 			continue
 		}
 		// A non-Hands shim exits once its tree is empty, so a live shim is user work.
-		count++
+		total++
 	}
-	return jobSnapshot{count: count, lost: r.lost}, nil
+
+	// Read after the walk, so a supervisor lost while it ran is in the answer.
+	r.mu.Lock()
+	lost := r.lost
+	r.mu.Unlock()
+	return jobSnapshot{count: total, lost: lost}, nil
 }
 
 // handleJobs reports whether any tracked user task process remains, and on
@@ -284,7 +313,11 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, JobsResponse{
-		UserProcesses:    snap.count > 0 && !snap.lost,
+		// Lost tracking is not an empty sandbox. The descendants the loss is
+		// about cannot be counted, so the only honest answer to "is anything
+		// still running" is yes -- a consumer reading this field alone must
+		// not be told a sandbox whose roster nobody can account for is free.
+		UserProcesses:    snap.count > 0 || snap.lost,
 		UserProcessCount: snap.count,
 		TrackingLost:     snap.lost,
 		PodUID:           s.podUID,

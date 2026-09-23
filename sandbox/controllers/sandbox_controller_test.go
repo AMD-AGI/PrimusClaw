@@ -220,6 +220,31 @@ func TestApplyPodTerminalConditions(t *testing.T) {
 	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
 }
 
+func TestRuntimeReasonCannotRejectTheStatusUpdate(t *testing.T) {
+	// The reason comes from the container runtime and is bound by nothing the
+	// API server accepts. One that fails validation rejects the whole status
+	// update, Ready with it, and the controller then fails the same reconcile
+	// for ever -- so the reason is held to the grammar and the runtime's text
+	// survives in the message instead.
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "sandbox",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Reason:   "OOM killed - cgroup limit",
+				ExitCode: 137,
+			}},
+		}},
+	}})
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodFailed, failed.Reason)
+	require.Contains(t, failed.Message, "OOM killed - cgroup limit")
+
+	require.Equal(t, "OOMKilled", conditionReason("OOMKilled"))
+}
+
 func TestReconcile(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"

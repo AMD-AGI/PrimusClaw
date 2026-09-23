@@ -41,8 +41,9 @@ func (s *Server) startTrackedCommand(
 	if err := cmd.Start(); err != nil {
 		return 0, nil, nil, func() {}, err
 	}
+	jobToken := uint64(0)
 	if tracking.track {
-		s.jobs.add(cmd.Process.Pid, tracking.hands)
+		jobToken = s.jobs.add(cmd.Process.Pid, tracking.hands)
 	}
 	go func() {
 		err := cmd.Wait()
@@ -53,7 +54,7 @@ func (s *Server) startTrackedCommand(
 				s.jobs.markLost()
 			}
 		}
-		s.jobs.remove(cmd.Process.Pid)
+		s.jobs.remove(cmd.Process.Pid, jobToken)
 		code := 0
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {

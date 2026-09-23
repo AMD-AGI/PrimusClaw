@@ -26,8 +26,14 @@ func TestHandleJobsReportsTrackingLost(t *testing.T) {
 	if !resp.TrackingLost {
 		t.Fatal("expected tracking_lost")
 	}
-	if resp.UserProcesses {
-		t.Fatal("lost tracking must not look idle-empty as live work")
+	// The count is what it is -- nothing is being tracked -- but the boolean a
+	// consumer may read on its own must not answer "idle" for a roster nobody
+	// can account for.
+	if resp.UserProcessCount != 0 {
+		t.Fatalf("count=%d", resp.UserProcessCount)
+	}
+	if !resp.UserProcesses {
+		t.Fatal("lost tracking reported as an idle sandbox")
 	}
 	if resp.InstanceID != "inst-1" || resp.PodUID != "pod-1" {
 		t.Fatalf("identity=%+v", resp)
@@ -64,7 +70,7 @@ func TestTrackingLossOutlivesTheJobsThatFollowIt(t *testing.T) {
 	r.count = func(int) (int, error) { return 0, nil }
 	r.add(10, true)
 	r.markLost()
-	r.add(20, false)
+	ordinary := r.add(20, false)
 	snap, err := r.snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -72,13 +78,56 @@ func TestTrackingLossOutlivesTheJobsThatFollowIt(t *testing.T) {
 	if !snap.lost {
 		t.Fatal("an ordinary job cleared a tracking loss it cannot account for")
 	}
-	r.remove(20)
+	r.remove(20, ordinary)
 	snap, err = r.snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !snap.lost {
 		t.Fatal("tracking loss has to outlast the jobs that ran after it")
+	}
+}
+
+func TestRemovalMatchesTheJobItWasIssuedFor(t *testing.T) {
+	// The kernel may hand a reaped shim's PID to the next one, and a job's
+	// removal runs after its process was reaped. Matched on the PID alone, the
+	// late removal drops the live job that took the number and the sandbox
+	// reads idle with a command still running.
+	r := newJobRegistry()
+	stale := r.add(7, false)
+	r.remove(7, stale)
+	current := r.add(7, false)
+	r.remove(7, stale)
+	snap, err := r.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.count != 1 {
+		t.Fatalf("a stale removal dropped the job that reused the pid: %+v", snap)
+	}
+	r.remove(7, current)
+	if snap, err = r.snapshot(); err != nil {
+		t.Fatal(err)
+	} else if snap.count != 0 {
+		t.Fatalf("the job did not leave on its own removal: %+v", snap)
+	}
+}
+
+func TestLostTrackingIsNotReportedAsAnEmptySandbox(t *testing.T) {
+	// user_processes is the field a consumer that reads nothing else acts on.
+	// Tracking loss is about descendants nobody can count, so answering "none"
+	// hands out a sandbox whose roster cannot be accounted for.
+	r := newJobRegistry()
+	r.markLost()
+	snap, err := r.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.count != 0 || !snap.lost {
+		t.Fatalf("expected an empty but lost roster: %+v", snap)
+	}
+	if !(snap.count > 0 || snap.lost) {
+		t.Fatal("user_processes would report a lost roster as an idle sandbox")
 	}
 }
 

@@ -111,7 +111,8 @@ type GPUDevice struct {
 
 // JobsResponse is the response from GET /api/jobs.
 type JobsResponse struct {
-	// UserProcesses is true when any tracked execute still has a live user PID.
+	// UserProcesses is true when any tracked execute still has a live user PID,
+	// and when tracking was lost: an unaccountable roster is not an empty one.
 	UserProcesses    bool   `json:"user_processes"`
 	UserProcessCount int    `json:"user_process_count"`
 	TrackingLost     bool   `json:"tracking_lost"`

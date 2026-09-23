@@ -412,10 +412,19 @@ func (s *sseCommandStream) event(name string, data interface{}) {
 	}
 }
 
-// deactivate stops writes after the HTTP response has ended.
+// deactivate stops writes after the HTTP response has ended, and lets go of
+// the response it was writing to.
+//
+// Releasing the writer matters because of how long this struct can live: the
+// field writers below are the shim's stdout and stderr, and os/exec joins its
+// copy goroutines only once every holder of that pipe has closed it -- which
+// includes work the command detached. Held, the ResponseWriter of a connection
+// that ended minutes ago stays reachable for as long as that work runs.
 func (s *sseCommandStream) deactivate() {
 	s.mu.Lock()
 	s.active = false
+	s.w = nil
+	s.flusher = nil
 	s.mu.Unlock()
 }
 
