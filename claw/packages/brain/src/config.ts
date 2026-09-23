@@ -365,90 +365,50 @@ export function goDurationSeconds(ns: bigint): number {
 }
 
 /**
- * Idle timeout for sandboxes this Brain creates, as a Go duration ("2h", "90m").
+ * Idle timeout recorded on sandboxes this Brain creates, as a Go duration.
  *
- * The platform deletes a Sandbox once `lastActivity + timeout` passes, and
- * `lastActivity` only moves for traffic through the Router -- a request in
- * flight, or the Brain keepalive exec. Work running *inside* the pod does not
- * move it, so a sandbox busy with a long computation looks exactly like an
- * abandoned one. Brain also stops the keepalive the moment a task reaches a
- * terminal state (see stopKeepaliveAfterTask), which is right when the sandbox
- * is only a warm cache for the next message -- and wrong when something the
- * task started is still running in there. That combination reclaims a working
- * sandbox 15 minutes after the agent turn ends.
+ * Recorded, and nothing more. It reaches the create so the Sandbox carries the
+ * value an operator asked for, and lands on
+ * `runtime.agent-sandbox.io/idle-timeout` -- an annotation whose only reader
+ * was the control plane's sandbox idle GC, which no longer exists. The idle
+ * deadline it used to set is now Brain's own: SANDBOX_IDLE_REUSE_SECONDS,
+ * measured from the first confirmed-empty EnvD jobs roster rather than from an
+ * activity stamp that traffic through the Router pushed back.
  *
- * The platform has always taken a per-sandbox override
- * (`runtime.agent-sandbox.io/idle-timeout`, no upper bound, with
- * maxSessionDuration as the real backstop) and the Workload Manager writes it
- * from the CodeInterpreter spec -- Brain simply never set the field, so every
- * sandbox took the controller default of 15m no matter what it was for.
+ * Kept rather than deleted because the value is still worth carrying on the
+ * object -- an operator asking "what lifetime was this built with" has
+ * somewhere to read it -- and because removing a setting silently is the
+ * failure this file reports elsewhere. Startup says it does nothing.
  *
- * Empty means "leave whatever the base template says", which is what every
- * deployment gets until it opts in: a mounted ConfigMap that sets its own
- * sessionTimeout keeps it, and the inline skeleton keeps its 15m. Raising this
- * costs held nodes -- every sandbox survives that much longer after everyone has
- * stopped asking it for anything -- so raise it for a deployment whose work
- * needs it, not as a default. Per-workload is not offered: the value would have
- * to reach the create path through the protocol and request normalisation and
- * join the sandbox reuse fingerprint, or a session would reuse a pod built with
- * a different lifetime and the caller's value would silently not apply.
+ * AGENT_SANDBOX_MAX_SESSION_DURATION is the lifetime that is still enforced.
  */
-/**
- * Floor for AGENT_SANDBOX_SESSION_TIMEOUT, in nanoseconds.
- *
- * The idle timeout is a deadline something else has to keep pushing back, and
- * what pushes it back arrives on a fixed cadence -- the Router refreshes
- * LastActivity every 5 minutes for as long as a proxy connection is open, and
- * that constant carries the invariant in its own comment: it has to sit "well
- * below the default idle timeout (15min) to guarantee the sandbox is never
- * mistakenly considered idle". This setting is the first thing that can move
- * the other side of that comparison, and so the first thing that can invert it.
- * Set below the cadence, the sandbox is reclaimed while it is being used,
- * because the signal saying so was not due yet -- and nothing reports that as a
- * misconfiguration, it looks like a sandbox that died.
- *
- * The floor is two refresh intervals plus slack: one missed tick must not be
- * fatal, and at exactly two intervals it still is. Miss the tick at 5m and the
- * next write is due at 10m -- but the write is not instant, the Router gives it
- * its own 2s timeout, so at a 10m timeout the deadline can fall while the write
- * that would have moved it is still in flight. Nothing on the other side is
- * obliged to wait that out. agentd asks to be re-queued a second past expiry
- * (`time.Until(expiresAt) + time.Second`), and that is a request for when to
- * look again, not a grace period: it is one reconcile's own schedule, and any
- * unrelated event on the Sandbox can bring a pass forward. So a second is the
- * most that can be assumed, and not even that reliably.
- *
- * So 2 x 5m + 1m. A minute rather than the ~3s the write and the requeue
- * account for, because 3s of headroom is a knife-edge held up by nothing --
- * ticker drift, a scheduler that is late, a store write slower than usual, an
- * early reconcile, all of which land inside a margin that thin. It stays looser
- * than the 3x implied by the shipped 15m default, because this rejects a
- * setting outright rather than quietly clamping it, and what it has to
- * establish is only the floor of what can work at all.
- */
-const AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS = 660_000_000_000n; // 2 x 5m + 1m
-
 function resolveAgentSandboxSessionTimeout(): string {
   const configured = env("AGENT_SANDBOX_SESSION_TIMEOUT");
   if (!configured) return "";
-  const ns = goDurationNs(configured);
-  if (ns === null) {
+  if (goDurationNs(configured) === null) {
     settingProblems.push(
       `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is not a positive Go duration `
         + `(e.g. "90m", "2h30m"); leaving the template's own value`,
     );
     return "";
   }
-  if (ns < AGENT_SANDBOX_SESSION_TIMEOUT_FLOOR_NS) {
-    settingProblems.push(
-      `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is below the 11m floor: the `
-        + `liveness signal that holds a sandbox open only arrives every 5m, and `
-        + `the floor is two of those plus a minute for the write to land, so a `
-        + `sandbox still in use would be reclaimed before the signal saying so is `
-        + `due; leaving the template's own value`,
-    );
-    return "";
-  }
+  // Forwarded and inert. It still travels to the create so the value an
+  // operator asked for is recorded on the Sandbox, but nothing acts on it in
+  // either deploy mode: safe-workload never had an idle timeout to map it
+  // onto, and the controller that read the annotation in kubernetes mode --
+  // the sandbox idle GC -- is gone. Idle reclaim is Brain's now, on
+  // SANDBOX_IDLE_REUSE_SECONDS, driven by EnvD's jobs roster rather than by an
+  // activity stamp anything can refresh.
+  //
+  // Reported wherever it is set, rather than only where it never applied: a
+  // lifetime that silently does nothing is found from a sandbox that outlived
+  // what the operator thought they had configured.
+  settingProblems.push(
+    `AGENT_SANDBOX_SESSION_TIMEOUT=${configured} is recorded on the sandbox and `
+      + "enforced by nothing: idle reclaim is Brain's, on "
+      + "SANDBOX_IDLE_REUSE_SECONDS, read from EnvD's jobs roster. "
+      + "AGENT_SANDBOX_MAX_SESSION_DURATION is the lifetime that still applies",
+  );
   return configured;
 }
 export const AGENT_SANDBOX_SESSION_TIMEOUT = resolveAgentSandboxSessionTimeout();
@@ -519,13 +479,6 @@ export const AGENT_SANDBOX_MAX_SESSION_SECONDS: number | null = (() => {
 // the sandbox, and `ttlSecondsAfterFinished` is cleanup after it ends. Said at
 // startup so it is read once by the person who set it, rather than discovered
 // from a sandbox that was reclaimed on a schedule they thought they had changed.
-if (AGENT_SANDBOX_SESSION_TIMEOUT && CLAW_DEPLOY_MODE !== "kubernetes") {
-  settingProblems.push(
-    `AGENT_SANDBOX_SESSION_TIMEOUT=${AGENT_SANDBOX_SESSION_TIMEOUT} has no effect `
-      + `with CLAW_DEPLOY_MODE=${CLAW_DEPLOY_MODE}: safe-workload has no idle `
-      + `timeout. AGENT_SANDBOX_MAX_SESSION_DURATION does apply there`,
-  );
-}
 export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,

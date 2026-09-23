@@ -38,6 +38,17 @@ import type {
 
 const logger = pino({ name: "agent-sandbox-provider" });
 
+/** Map a terminal session phase, and any reason with it, to a stable reason. */
+function terminalReasonFor(phase: string, reported?: string): string {
+  const named = (reported ?? "").trim();
+  // The controller writes this one from the container that failed, and holds
+  // it to the API server's grammar, so it is already a stable token.
+  if (named) return named;
+  if (phase === "failed") return "sandbox_container_failed";
+  if (phase === "succeeded" || phase === "completed") return "sandbox_envd_exited";
+  return "sandbox_workload_terminal";
+}
+
 const HANDS_MCP_PORT = 9100;
 const TEMPLATE_READY_TIMEOUT_MS = 90_000;
 const TEMPLATE_POLL_INTERVAL_MS = 2_000;
@@ -296,6 +307,16 @@ export class AgentSandboxProvider implements SandboxProvider {
     };
   }
 
+  /**
+   * A stable reason for a terminal agent-sandbox, from what the Router says.
+   *
+   * The session endpoint answers with the phase and, where it has one, the
+   * Sandbox's own failure reason; that one is preferred because it comes from
+   * the container that failed. Without it the phase is all there is, and the
+   * phase does separate the two outcomes that matter to a caller: a workload
+   * that failed is not one whose EnvD exited cleanly, and reporting both as a
+   * generic terminal left the reasons this deployment can act on unreachable.
+   */
   async get(inst: SandboxInstance): Promise<SandboxStatus> {
     try {
       const resp = await this.routerFetch(`/v1/code-interpreter/sessions/${inst.id}`, {
@@ -305,13 +326,21 @@ export class AgentSandboxProvider implements SandboxProvider {
         return { running: false, healthy: false, state: "absent" };
       }
       if (!resp.ok) return { running: false, healthy: false, state: "unknown" };
-      const d = (await resp.json()) as { status?: string; healthy?: boolean; podIp?: string };
+      const d = (await resp.json()) as {
+        status?: string; healthy?: boolean; podIp?: string; reason?: string;
+      };
       const status = String(d.status ?? "").toLowerCase();
       if (status === "running") {
         return { running: true, healthy: !!d.healthy, podIp: d.podIp, state: "running" };
       }
       if (["failed", "stopped", "succeeded", "completed", "cancelled", "terminated"].includes(status)) {
-        return { running: false, healthy: false, podIp: d.podIp, state: "terminal" };
+        return {
+          running: false,
+          healthy: false,
+          podIp: d.podIp,
+          state: "terminal",
+          reason: terminalReasonFor(status, d.reason),
+        };
       }
       return { running: false, healthy: false, state: "unknown" };
     } catch {

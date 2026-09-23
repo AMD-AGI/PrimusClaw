@@ -16,7 +16,12 @@ const inst: SandboxInstance = {
 test("get separates absence, terminal and unknown provider outcomes", async (t) => {
   const unknown = { running: false, healthy: false, state: "unknown" };
   // A finished session is conclusive, and reports the address it last held.
-  const terminal = { running: false, healthy: false, podIp: undefined, state: "terminal" };
+  // The reason travels with it: a phase that says the workload failed is not
+  // the same outcome as one whose EnvD exited cleanly, and collapsing both
+  // into a generic terminal left the specific reasons unreachable.
+  const terminalWith = (reason: string) => ({
+    running: false, healthy: false, podIp: undefined, state: "terminal", reason,
+  });
   const cases: Array<{ name: string; status: number; body: string; expected: unknown }> = [
     ...[404, 410].map((status) => ({
       name: `HTTP ${status}`, status, body: "",
@@ -29,10 +34,21 @@ test("get separates absence, terminal and unknown provider outcomes", async (t) 
       name: `session status ${JSON.stringify(status)}`, status: 200,
       body: JSON.stringify({ status }), expected: unknown,
     })),
-    ...["stopped", "failed", "completed"].map((status) => ({
+    ...([
+      ["stopped", "sandbox_workload_terminal"],
+      ["failed", "sandbox_container_failed"],
+      ["completed", "sandbox_envd_exited"],
+    ] as const).map(([status, reason]) => ({
       name: `session status ${JSON.stringify(status)}`, status: 200,
-      body: JSON.stringify({ status }), expected: terminal,
+      body: JSON.stringify({ status }), expected: terminalWith(reason),
     })),
+    {
+      // What the Router reports wins: it comes from the container that failed,
+      // while the phase only says that something did.
+      name: "a reason the Router named", status: 200,
+      body: JSON.stringify({ status: "failed", reason: "OOMKilled" }),
+      expected: terminalWith("OOMKilled"),
+    },
     ...["null", "{}", "[]", "invalid json"].map((body) => ({
       name: `body ${body}`, status: 200, body, expected: unknown,
     })),
