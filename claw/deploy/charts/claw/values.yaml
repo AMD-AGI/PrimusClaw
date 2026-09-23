@@ -614,6 +614,10 @@ features:
   # before it is served. Size the ceiling to the deployment's real fleet: too
   # low refuses new sandboxes, too high means the refresh gap was proven at a
   # number the fleet exceeds.
+  #
+  # Keep it at or below one sweep's ping capacity (160 in this build): at or
+  # under it a handle waits no deferrals, past it the refresh gap grows by a
+  # whole sweep and a deadline that was accepted stops being accepted.
   keepaliveTargetCeiling: ""
   keepaliveReconcileReserve: ""
   # The shortest idle reclaim in force on this deployment, in seconds. Brain
