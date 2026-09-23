@@ -42,9 +42,8 @@ sequenceDiagram
     EnvD->>Hands: /tmp/.hands-binary
     Brain->>Brain: hands.<sid> ready, keepalive true
     loop keepalive is true
-        Brain->>Router: exec or GET session
-        Router->>EnvD: request
-        Note over Router: proxy refreshes LastActivity
+        Brain->>Router: control-plane status read
+        Note over Brain: no command in the container, no LastActivity refresh
     end
     Brain->>Brain: park Hands, keepalive false
 ```
