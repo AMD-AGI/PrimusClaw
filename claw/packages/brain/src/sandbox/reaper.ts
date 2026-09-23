@@ -413,6 +413,13 @@ export async function destroyHands(
     // teardown still drops the hands pointer, and without cascade the cluster
     // would wait on workload timeout alone. Best-effort -- timeout remains the
     // hard backstop when SaFE itself cannot be reached.
+    //
+    // A handle with no messageId cascades nothing. Session-scoped reclaim is
+    // the only other thing this could do, and it deletes every non-terminal
+    // cluster the session has -- including one a successor message created
+    // while this teardown was in flight, which is the case the scoping exists
+    // to prevent. Handles written before the field carry no cluster this can
+    // safely name, and their clusters are left to the workload timeout.
     if (stopOutcome === "stopped" || stopOutcome === "unavailable") {
       const platformKey = String(
         (target as { platformKey?: string }).platformKey
@@ -424,11 +431,6 @@ export async function destroyHands(
           ?? (ownsRecorded ? recorded.identity?.messageId : "")
           ?? "",
       ).trim();
-      const mnServiceUrl = String(
-        (target as { mnServiceUrl?: string }).mnServiceUrl
-          ?? (ownsRecorded ? recorded.identity?.mnServiceUrl : "")
-          ?? "",
-      ).trim();
       if (platformKey && messageId) {
         await withCeiling(
           reclaimClusters(sessionId, platformKey, messageId),
@@ -437,19 +439,6 @@ export async function destroyHands(
         ).catch((e: unknown) => {
           logger.warn(
             { sessionId, messageId, err: (e as Error)?.message ?? String(e) },
-            "mn.cascade_after_sandbox_stop_failed",
-          );
-        });
-      } else if (platformKey && mnServiceUrl) {
-        // Pre-messageId MN handles: fall back to session-scoped reclaim so the
-        // cluster is not left solely to SaFE workload timeout.
-        await withCeiling(
-          reclaimClusters(sessionId, platformKey),
-          CLUSTER_CASCADE_CEILING_MS,
-          "mn cluster cascade",
-        ).catch((e: unknown) => {
-          logger.warn(
-            { sessionId, err: (e as Error)?.message ?? String(e) },
             "mn.cascade_after_sandbox_stop_failed",
           );
         });
