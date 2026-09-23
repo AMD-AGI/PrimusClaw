@@ -764,19 +764,24 @@ function sandboxRegistryKey(entry: SandboxEntry): string {
  * identity is the only way to tell them apart, so an unreadable or
  * non-matching record is passed over rather than guessed at.
  */
-async function recordKeyNamingSandbox(
+async function recordNamingSandbox(
   kv: KV, sessionId: string, entry: SandboxEntry,
-): Promise<string | null> {
+): Promise<{ key: string; info: HandsKvEntry } | null> {
   for (const key of handsEntryKeys(sessionId)) {
     const found = await kv.get(key).catch(() => null);
     if (!found) continue;
     try {
-      if (sameRegisteredSandbox(entry, JSON.parse(sc.decode(found.value)) as HandsKvEntry)) {
-        return key;
-      }
+      const info = JSON.parse(sc.decode(found.value)) as HandsKvEntry;
+      if (sameRegisteredSandbox(entry, info)) return { key, info };
     } catch { /* unreadable is not evidence that this is the record we want */ }
   }
   return null;
+}
+
+async function recordKeyNamingSandbox(
+  kv: KV, sessionId: string, entry: SandboxEntry,
+): Promise<string | null> {
+  return (await recordNamingSandbox(kv, sessionId, entry))?.key ?? null;
 }
 
 /**
@@ -823,6 +828,7 @@ function entryIdentity(info: HandsKvEntry): string {
 /** Drop orphaned READY sandboxes when a retryable attempt was never redelivered. */
 async function shouldSkipExpiredRetry(
   deps: KeepaliveDeps,
+  census: TargetCensus,
   sessionId: string,
   source: "local" | "kv",
   entry?: SandboxEntry,
@@ -865,83 +871,98 @@ async function shouldSkipExpiredRetry(
     return false;
   }
 
-  // Stop the workload (and messageId-scoped MN cluster) before dropping the
-  // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
-  // delete, so releasing the pointer alone would orphan the sandbox until its
-  // workload timeout.
-  let known: HandsProbeEntry | undefined;
-  let token: string | undefined;
+  // The retry owned one generation of this session. A pending record is
+  // session-scoped, so the sibling generation's handle sees it too -- and that
+  // sibling can be live. A record naming something else is not this retry's to
+  // stop, and stays an ordinary target of the walk.
+  if (pending.workloadId && entry?.workloadId && pending.workloadId !== entry.workloadId) {
+    return false;
+  }
+
+  // Resolved by identity, not by whichever key answers first: during a rolling
+  // upgrade the canonical key can hold a different, live generation, and both
+  // the stop and the delete have to land on the one this retry owned.
+  let record: { key: string; info: HandsKvEntry } | null = null;
   try {
-    const existing = await readHandsEntry(deps.kv, sessionId);
-    if (existing) {
-      const info = JSON.parse(existing.value) as HandsKvEntry;
-      known = {
-        provider: info.provider,
-        workloadId: info.workloadId || entry?.workloadId || pending.workloadId,
-        platformKey: info.platformKey || entry?.platformKey,
-        token: info.token,
-        sessionId: info.sessionId || entry?.sessionId,
-        sandboxName: info.sandboxName || entry?.sandboxName,
-        namespace: info.namespace || entry?.namespace,
-        userId: info.userId || entry?.userId,
-        messageId: info.messageId || pending.messageId || entry?.messageId,
-      };
-      token = info.token;
-    } else if (entry || pending.workloadId || pending.messageId) {
-      known = {
-        provider: entry?.provider,
-        workloadId: entry?.workloadId || pending.workloadId,
-        platformKey: entry?.platformKey,
-        sessionId: entry?.sessionId,
-        sandboxName: entry?.sandboxName,
-        namespace: entry?.namespace,
-        userId: entry?.userId,
-        messageId: pending.messageId || entry?.messageId,
-      };
-    }
+    record = entry ? await recordNamingSandbox(deps.kv, sessionId, entry) : null;
   } catch (err) {
     logger.warn({ err, sessionId }, "keepalive.retry_pending_entry_read_failed");
     return false;
   }
-
-  try {
-    await destroyHands(sessionId, known, token);
-  } catch (err) {
+  if (!record) {
+    // Nothing on record names it, so there is nothing to stop and nothing this
+    // may delete -- deleting the record that does answer would strand the
+    // workload it names. The orphan, if there is one, is left to the bucket TTL.
+    unregisterSandbox(sessionId, entry);
+    await clearRetryPending(deps.kv, sessionId, pending.lockKey);
     logger.warn(
-      {
-        err: (err as Error)?.message ?? String(err),
-        sessionId,
-        workloadId: known?.workloadId || entry?.workloadId || pending.workloadId,
-        messageId: known?.messageId || pending.messageId,
-      },
-      "keepalive.retry_pending_stop_failed",
+      { sessionId, source, workloadId: entry?.workloadId || pending.workloadId },
+      "keepalive.retry_pending_record_unresolved",
     );
-    return false;
+    return true;
   }
 
-  unregisterSandbox(sessionId, entry);
-  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
-  await clearRetryPending(deps.kv, sessionId, pending.lockKey);
-  logger.warn(
-    {
-      sessionId,
-      source,
-      attempt: pending.attempt,
-      messageId: pending.messageId,
-      lockKey,
-      reasonClass: pending.reasonClass,
-      reason: pending.reason,
-      workloadId: entry?.workloadId || pending.workloadId,
-      graceSec: pending.graceSec,
-      ageMs: nowMs - pending.createdAtMs,
-      createdAtMs: pending.createdAtMs,
-      createdAtIso: new Date(pending.createdAtMs).toISOString(),
-      deadlineMs: pending.deadlineMs,
-      deadlineIso: new Date(pending.deadlineMs).toISOString(),
-      expiredByMs: nowMs - pending.deadlineMs,
+  // Stop the workload (and messageId-scoped MN cluster) before dropping the
+  // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
+  // delete, so releasing the pointer alone would orphan the sandbox until its
+  // workload timeout.
+  const info = record.info;
+  const known: HandsProbeEntry = {
+    provider: info.provider,
+    workloadId: info.workloadId || entry?.workloadId || pending.workloadId,
+    platformKey: info.platformKey || entry?.platformKey,
+    token: info.token,
+    sessionId: info.sessionId || entry?.sessionId,
+    sandboxName: info.sandboxName || entry?.sandboxName,
+    namespace: info.namespace || entry?.namespace,
+    userId: info.userId || entry?.userId,
+    messageId: info.messageId || pending.messageId || entry?.messageId,
+  };
+
+  // Queued, not awaited: this runs inside the serial walk of the bucket, and a
+  // stop carries its own retries and sleeps. Run here, one unresponsive control
+  // plane spends the sweep on teardowns and the ping phase behind it never
+  // renews a live record. The queue is bounded by the idle-expiry budget, and
+  // the bookkeeping below is only correct once the stop has succeeded, so it
+  // travels with the item rather than running now.
+  if (teardownDeferred(sessionId, nowMs)) return true;
+  if (census.expiredRetriesQueued.has(sessionId)) return true;
+  census.expiredRetriesQueued.add(sessionId);
+  census.teardowns.push({
+    sessionId,
+    info: known,
+    token: info.token,
+    site: "retry_pending_stop_retry",
+    after: async () => {
+      unregisterSandbox(sessionId, entry);
+      // A teardown that owned the record has already removed it under its own
+      // CAS; only one it could not claim is left for this to drop.
+      if (entry && await recordKeyNamingSandbox(deps.kv, sessionId, entry)) {
+        await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
+      }
+      await clearRetryPending(deps.kv, sessionId, pending.lockKey);
+      logger.warn(
+        {
+          sessionId,
+          source,
+          attempt: pending.attempt,
+          messageId: pending.messageId,
+          lockKey,
+          reasonClass: pending.reasonClass,
+          reason: pending.reason,
+          workloadId: entry?.workloadId || pending.workloadId,
+          graceSec: pending.graceSec,
+          ageMs: nowMs - pending.createdAtMs,
+          createdAtMs: pending.createdAtMs,
+          createdAtIso: new Date(pending.createdAtMs).toISOString(),
+          deadlineMs: pending.deadlineMs,
+          deadlineIso: new Date(pending.deadlineMs).toISOString(),
+          expiredByMs: nowMs - pending.deadlineMs,
+        },
+        "keepalive.retry_pending_expired",
+      );
     },
-    "keepalive.retry_pending_expired",
-  );
+  });
   return true;
 }
 
@@ -2159,7 +2180,25 @@ interface TargetCensus {
   retentionReads: Map<string, RetentionRead>;
   idleExpiries: Array<{ candidate: ProbeCandidate; record: HandsRecord }>;
   /** Stops owed by handles the walk found already closing or already terminal. */
-  teardowns: Array<{ sessionId: string; info: HandsKvEntry; site: string }>;
+  teardowns: Array<{
+    sessionId: string;
+    info: HandsKvEntry | HandsProbeEntry;
+    site: string;
+    token?: string;
+    /** Bookkeeping that is only correct once the stop has succeeded. */
+    after?: () => Promise<void>;
+  }>;
+  /**
+   * Sessions whose expired retry-pending record is already owed a stop.
+   *
+   * One session is reachable from the local registry and from its KV record,
+   * and a queue built from both would act on that record twice -- which the
+   * inline stop this queue replaced could not do, because the first one
+   * cleared the record the second would have read. Closing and terminal
+   * handles are not deduplicated: those are per record, and one session can
+   * legitimately owe a stop for more than one generation.
+   */
+  expiredRetriesQueued: Set<string>;
 }
 
 async function collectTargets(
@@ -2174,9 +2213,12 @@ async function collectTargets(
     retentionReads: new Map(),
     idleExpiries: [],
     teardowns: [],
+    expiredRetriesQueued: new Set(),
   };
   for (const [key, registered] of localRegistry) {
-    if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
+    if (await shouldSkipExpiredRetry(
+      deps, census, registered.sessionId, "local", registered.entry,
+    )) continue;
     census.targets.set(key, registered);
   }
   const kvComplete = await collectKvTargets(deps, census);
@@ -2194,8 +2236,11 @@ async function collectTargets(
       deferredExpiries += 1;
       return;
     }
-    await destroyHands(item.sessionId, item.info)
-      .then(() => teardownRetryAt.delete(item.sessionId))
+    await destroyHands(item.sessionId, item.info, item.token)
+      .then(async () => {
+        teardownRetryAt.delete(item.sessionId);
+        await item.after?.();
+      })
       .catch((err) => {
         // Held off rather than retried on the next sweep. The record stays
         // `closing`, so the walk keeps offering this handle, and a stop that
@@ -2336,9 +2381,12 @@ async function collectKvTarget(
   census.seenIdentities.add(identity);
   if (info.keepalive === false && await collectIdleTarget(deps, census, key, e, info)) return true;
   const entry = sandboxEntryFrom(info);
-  if (!entry || await shouldSkipExpiredRetry(deps, sessionId, "kv", entry, key)) return true;
-  // Renew before queueing so bounded ping concurrency cannot exhaust the TTL.
+  if (!entry) return true;
+  // Renew before queueing so bounded ping concurrency cannot exhaust the TTL,
+  // and before the expired-retry check so a teardown deferred by that queue's
+  // budget still finds its record on the next sweep.
   await deps.kv.update(key, e.value, e.revision).catch(() => {});
+  if (await shouldSkipExpiredRetry(deps, census, sessionId, "kv", entry, key)) return true;
   if (!census.targets.has(identity)) census.targets.set(identity, { sessionId, entry });
   return true;
 }

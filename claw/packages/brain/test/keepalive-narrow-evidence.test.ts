@@ -132,25 +132,44 @@ test("an expired retry separates a failed lock read from an absent lock", () => 
 test("an expired retry stops the sandbox before dropping the hands pointer", () => {
   // After sandbox idle-GC was removed, deleting only the KV entry left the
   // workload (and any MN cluster) with no Brain pointer until workload TTL.
+  // The stop is owed by the walk but not run inside it: the walk is serial and
+  // a stop carries retries and sleeps, so it is queued for the budgeted phase
+  // and its bookkeeping travels with it, to run only once the stop succeeded.
   const body = bodyOf("shouldSkipExpiredRetry");
-  const stop = body.indexOf("destroyHands(");
-  const drop = body.indexOf("deleteExpiredRetryRecord(");
-  assert.ok(stop >= 0 && drop > stop,
-    "destroyHands must run before the hands record is deleted");
-  assert.match(
-    body,
-    /retry_pending_stop_failed/,
-    "a failed stop keeps the pointer for the next sweep",
+  assert.doesNotMatch(
+    body, /await destroyHands\(/,
+    "the serial walk must not await a teardown",
   );
+  const queued = body.indexOf("census.teardowns.push(");
+  const drop = body.indexOf("deleteExpiredRetryRecord(");
+  assert.ok(queued >= 0 && drop > queued,
+    "the record is dropped by the queued item, not by the walk");
   assert.match(
-    body,
-    /JSON\.parse\(existing\.value\)/,
-    "readHandsEntry already returns a decoded string",
+    body.slice(queued),
+    /after:\s*async \(\) => \{[\s\S]*deleteExpiredRetryRecord\(/,
+    "dropping the pointer belongs to the after-stop callback",
+  );
+  const runner = bodyOf("collectTargets");
+  assert.match(
+    runner,
+    /destroyHands\(item\.sessionId, item\.info, item\.token\)\s*\.then\([\s\S]*item\.after\?\.\(\)/,
+    "the queued bookkeeping runs only after the stop resolved",
+  );
+  // Which record is acted on is decided by identity, not by whichever key
+  // answers first: during a rolling upgrade the canonical key can hold a
+  // different, live generation of the same session, and stopping that one
+  // strands a running workload.
+  assert.match(
+    body, /recordNamingSandbox\(deps\.kv, sessionId, entry\)/,
+    "the record to stop is the one naming this generation",
   );
   assert.doesNotMatch(
-    body.slice(body.indexOf("readHandsEntry"), drop),
-    /sc\.decode\(existing\.value\)/,
-    "must not decode an already-decoded hands value",
+    body, /readHandsEntry\(/,
+    "a canonical-first read cannot tell two generations apart",
+  );
+  assert.match(
+    body, /pending\.workloadId !== entry\.workloadId\)\s*\{\s*return false;/,
+    "a record naming another workload is not this retry's to stop",
   );
 });
 

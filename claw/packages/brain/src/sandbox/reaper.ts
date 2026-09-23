@@ -476,9 +476,10 @@ export async function destroyHands(
       { sessionId, workloadId: target.workloadId || target.sandboxName },
       "sandbox.destroy.entry_left_after_stop",
     );
-    // The workload is already stopped; the slot must still come back or the
-    // ceiling stays charged for a sandbox that will never be pinged again.
-    await releaseSlot();
+    // The slot stays out: a binding still in the bucket under this identity is
+    // a target the next sweep reconciles back in, and a ceiling handed on
+    // before the record goes admits over itself. Reconciliation is what gives
+    // the slot back, once the record it is derived from is gone.
     return;
   }
   if (latest.state === "valid") {
@@ -491,8 +492,10 @@ export async function destroyHands(
   // Unreadable is different from contended: the stop is confirmed, but we
   // cannot see whose entry this is, so clearing it might remove a sibling's.
   // Refusing keeps the caller from building over a record it cannot vouch for.
-  // The slot still returns: the workload is already stopped and will not be
-  // pinged again under this identity.
+  // The slot does return here, unlike the branch above: there the record was
+  // read and still named this identity, so a sweep brings it back and the
+  // ceiling is not lost. Nothing here can be read, so nothing will reconcile,
+  // and a slot kept would stay charged to a stopped workload until the horizon.
   await releaseSlot();
   throw new Error("hands KV unavailable after confirmed sandbox stop");
 }

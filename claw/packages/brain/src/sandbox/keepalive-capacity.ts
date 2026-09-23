@@ -163,7 +163,10 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       `these settings cannot keep a sandbox alive: at SANDBOX_KEEPALIVE_TARGET_CEILING`
       + `=${ceiling} a handle waits up to ${deferrals} deferral(s), so two refreshes of `
       + `one handle can be ${gap}s apart, which is not under the ${deadline}s reclaim in `
-      + `force (SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC). Lower the ceiling or the interval, `
+      + `force (SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC). The gap is `
+      + `(1 + ${deferrals}) * ${input.keepaliveIntervalSec}s interval + `
+      + `(2 + ${deferrals}) * ${input.sweepSpanSec}s span, so this configuration needs `
+      + `SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC > ${gap}. Lower the ceiling or the interval, `
       + `or declare a longer deadline.`,
     );
   }

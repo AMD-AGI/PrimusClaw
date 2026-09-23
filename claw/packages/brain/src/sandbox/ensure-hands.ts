@@ -66,7 +66,6 @@ import {
   admitSandbox, assertFleetCensused, type AdmissionHold,
 } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
-import { SandboxProvisionTerminalError } from "./errors.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -394,13 +393,17 @@ async function probeHandleSandbox(
   if (!identity || !token) return { state: "gone", detail: health.detail };
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
   if (probe.reason === "exec_sandbox_terminal") {
+    // Same stance as the recorded-terminalReason branch in reuseRecordedSandbox:
+    // a parked sandbox's death is not this message's outcome. Stop whatever the
+    // control plane still holds, then answer `gone` so the caller rebuilds --
+    // a `use` node, which cannot rebuild, still fails on `gone`.
     await reuseEffects.destroyHands(sessionId, identity, token).catch((err) => {
       logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
     });
-    throw new SandboxProvisionTerminalError(
-      probe.failureReason ?? "sandbox_workload_terminal",
-      `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
-    );
+    return {
+      state: "gone",
+      detail: probe.failureReason ?? "sandbox_workload_terminal",
+    };
   }
   if (probe.verdict === "unknown") return { state: "unknown", detail: probe.reason };
   if (probe.verdict === "dead") return { state: "gone", detail: health.detail };
@@ -643,6 +646,9 @@ async function recoverUnhealthyReuse(
 ): Promise<UnhealthyRecovery> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
   if (probe.reason === "exec_sandbox_terminal") {
+    // A terminal workload is the same fact the recorded-terminalReason branch
+    // acts on, and it gets the same answer: stop what is left, report the
+    // container gone, and let this message provision its own sandbox.
     await reuseEffects.destroyHands(
       sessionId,
       identity,
@@ -650,10 +656,7 @@ async function recoverUnhealthyReuse(
     ).catch((err) => {
       logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
     });
-    throw new SandboxProvisionTerminalError(
-      probe.failureReason ?? "sandbox_workload_terminal",
-      `sandbox workload entered terminal phase (${probe.failureReason ?? "sandbox_workload_terminal"})`,
-    );
+    return { outcome: "gone" };
   }
   if (probe.verdict === "dead") return { outcome: "gone" };
   if (probe.verdict === "unknown") {
