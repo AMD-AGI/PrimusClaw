@@ -111,8 +111,8 @@ envd (PID 1, always running)
         └── setsid children (adopted by the shim, not PID 1)
 ```
 
-- HTTP can return as soon as the shell exits. Request cancellation does not stop the shim or its descendants. A command timeout sends SIGTERM to the shim, which stops only the primary process group.
-- The shim stays alive until every user descendant of that job has exited.
+- HTTP can return as soon as the shell exits. Request cancellation does not stop the shim or its descendants. A command timeout sends SIGTERM to the shim, which stops only the primary process group; work that detached itself with `setsid` is not part of that group and keeps running.
+- The shim stays alive until every user descendant of that job has exited, or until the job is purged.
 - EnvD records the **shim PID** (the Hands start job marks the Hands PID as infrastructure).
 - `GET /api/jobs` includes `pod_uid` and `instance_id`. A changed identity is a replaced sandbox, not idle. A signaled shim sets `tracking_lost`; that is unknown, not empty. It is never unset: the descendants it is about were re-parented away from every supervisor the roster walk starts at, so nothing EnvD can observe will account for them again, and a job starting later does not speak for them. A sandbox that has lost tracking is left to its own timeout rather than reclaimed as idle.
 
@@ -120,7 +120,7 @@ envd (PID 1, always running)
 
 **No user work remains**: only Hands (and idle shims) remain. Brain keepalive pings, container probes, and live-work reads send `untracked` execute and are not user jobs.
 
-EnvD exposes a read-only `GET /api/jobs`. Brain uses only that API. It does not scan the container `/proc` and does not query InferaDeployment / RayJob.
+EnvD exposes `GET /api/jobs` for the roster and `DELETE /api/jobs` to end every tracked user job, the work its commands detached included (SIGUSR1 to each shim; the Hands supervisor is spared). Brain's idle reclaim reads only the `GET`. The `DELETE` is the deliberate call for a caller that means to empty the roster rather than to end one command; a request timeout never does that. Neither path scans the container `/proc` or queries InferaDeployment / RayJob.
 
 A probe failure (timeout, 502) is **unknown**: no reclaim, and the session is not marked failed.
 

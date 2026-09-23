@@ -119,6 +119,14 @@ type JobsResponse struct {
 	InstanceID       string `json:"instance_id"`
 }
 
+// JobsPurgeResponse is the response from DELETE /api/jobs.
+type JobsPurgeResponse struct {
+	// Requested is how many tracked user jobs were on the roster.
+	Requested int `json:"requested"`
+	// Purged is how many of them were asked to end.
+	Purged int `json:"purged"`
+}
+
 // GPUStatusResponse is the response from GET /api/gpu/status.
 type GPUStatusResponse struct {
 	Available   bool        `json:"available"`

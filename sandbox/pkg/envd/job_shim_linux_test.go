@@ -231,11 +231,12 @@ func TestTheJobLeavesTheRosterOnceItsTreeIsEmpty(t *testing.T) {
 	t.Fatal("the job stayed on the roster after its descendant exited")
 }
 
-func TestCancelFreesShimStuckReapingOrphans(t *testing.T) {
+func TestPurgeFreesShimStuckReapingOrphans(t *testing.T) {
 	requireJobShim(t)
-	// After the primary exits, the shim stays alive for setsid descendants.
-	// cancel() sends SIGTERM; Ignore left that signal inert and the job on the
-	// roster for the Pod lifetime, so every idle reclaim read the sandbox busy.
+	// After the primary exits, the shim stays alive for setsid descendants, and
+	// the roster goes on reporting them -- they are running, so a sandbox
+	// hosting them is not idle. Purging is the deliberate call that ends them,
+	// and without it a shim adopting a detached tree could not be freed at all.
 	s := newTestServer()
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 	var out synchronizedBuffer
@@ -271,14 +272,34 @@ func TestCancelFreesShimStuckReapingOrphans(t *testing.T) {
 	}
 	select {
 	case <-drained:
-		t.Fatal("the supervisor left before cancel while its orphan still ran")
+		t.Fatal("the supervisor left while its orphan still ran")
 	default:
 	}
+	// The request's own cancellation does not reach the detached tree.
 	stop()
+	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-drained:
+		t.Fatal("SIGTERM ended a tree the request does not own")
+	default:
+	}
+	if _, ok := readProc("/proc", descendant); !ok {
+		t.Fatal("SIGTERM killed a descendant that had detached itself")
+	}
+	purged := 0
+	for _, pid := range s.jobs.userShimPIDs() {
+		if err := purgeJobTree(pid); err != nil {
+			t.Fatalf("purgeJobTree: %v", err)
+		}
+		purged++
+	}
+	if purged != 1 {
+		t.Fatalf("the tracked job was not on the roster to purge: %d", purged)
+	}
 	select {
 	case <-drained:
 	case <-time.After(30 * time.Second):
-		t.Fatal("SIGTERM did not free a shim stuck reaping orphans")
+		t.Fatal("the purge did not free a shim stuck reaping orphans")
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -288,19 +309,21 @@ func TestCancelFreesShimStuckReapingOrphans(t *testing.T) {
 		}
 		if snap.count == 0 && !snap.lost {
 			if _, ok := readProc("/proc", descendant); ok {
-				t.Fatal("the orphan survived cancel; the roster would still look busy")
+				t.Fatal("the orphan survived the purge; the roster would still look busy")
 			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("cancel left the job on the roster")
+	t.Fatal("the purge left the job on the roster")
 }
 
-func TestCancelWhilePrimaryRunsAlsoKillsSetsidOrphans(t *testing.T) {
+func TestCancelWhilePrimaryRunsSparesSetsidWork(t *testing.T) {
 	requireJobShim(t)
-	// Timeout spends the only buffered SIGTERM on the primary process group.
-	// setsid orphans must still die or /api/jobs stays non-empty forever.
+	// A request timeout cancels the command the request started. Work that
+	// detached itself is not that command: killing it with the timeout is what
+	// stopped a sandbox being able to host background work at all, which is the
+	// thing the jobs roster exists to keep alive.
 	s := newTestServer()
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 	var out synchronizedBuffer
@@ -332,26 +355,41 @@ func TestCancelWhilePrimaryRunsAlsoKillsSetsidOrphans(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the cancelled primary did not report an exit status")
 	}
+	time.Sleep(500 * time.Millisecond)
+	if _, ok := readProc("/proc", descendant); !ok {
+		t.Fatal("the timeout killed work the command had detached from it")
+	}
+	select {
+	case <-drained:
+		t.Fatal("the shim left while the work it adopted was still running")
+	default:
+	}
+	snap, snapErr := s.jobs.snapshot()
+	if snapErr != nil {
+		t.Fatal(snapErr)
+	}
+	if snap.count == 0 {
+		t.Fatal("the surviving background work is not on the roster, so the sandbox reads idle")
+	}
+	// And the roster is still emptiable, by the call that means to.
+	for _, pid := range s.jobs.userShimPIDs() {
+		if err := purgeJobTree(pid); err != nil {
+			t.Fatalf("purgeJobTree: %v", err)
+		}
+	}
 	select {
 	case <-drained:
 	case <-time.After(30 * time.Second):
-		t.Fatal("cancel spent on the primary left the shim stuck reaping orphans")
+		t.Fatal("the purge did not free the shim")
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		snap, snapErr := s.jobs.snapshot()
-		if snapErr != nil {
-			t.Fatal(snapErr)
-		}
-		if snap.count == 0 {
-			if _, ok := readProc("/proc", descendant); ok {
-				t.Fatal("setsid orphan survived a timeout that cancelled the primary")
-			}
+		if _, ok := readProc("/proc", descendant); !ok {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("cancel while the primary ran left the job on the roster")
+	t.Fatal("the purge left the detached work running")
 }
 
 func TestHandsStartIsAccountedAsInfrastructure(t *testing.T) {

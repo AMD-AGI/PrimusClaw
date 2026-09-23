@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // newEnvDInstanceID identifies this EnvD process for jobs-probe binding.
@@ -206,6 +208,26 @@ func (r *jobRegistry) add(shimPID int, hands bool) {
 	r.mu.Unlock()
 }
 
+// userShimPIDs lists the shims of tracked user jobs.
+//
+// The resident Hands supervisor is left out. It is infrastructure, and ending
+// it takes the sandbox's agent down with the background work.
+func (r *jobRegistry) userShimPIDs() []int {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pids := make([]int, 0, len(r.jobs))
+	for _, j := range r.jobs {
+		if j.hands {
+			continue
+		}
+		pids = append(pids, j.shimPID)
+	}
+	return pids
+}
+
 // remove forgets a shim after all descendants have exited.
 func (r *jobRegistry) remove(shimPID int) {
 	if r == nil {
@@ -245,8 +267,13 @@ func (r *jobRegistry) snapshot() (jobSnapshot, error) {
 	return jobSnapshot{count: count, lost: r.lost}, nil
 }
 
-// handleJobs reports whether any tracked user task process remains.
+// handleJobs reports whether any tracked user task process remains, and on
+// DELETE ends the tracked jobs instead.
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		s.purgeJobs(w)
+		return
+	}
 	if r.Method != http.MethodGet {
 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -263,4 +290,24 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		PodUID:           s.podUID,
 		InstanceID:       s.instanceID,
 	})
+}
+
+// purgeJobs ends every tracked user job, the descendants it detached included.
+//
+// A request timeout ends the command it started and leaves detached work
+// alone, so background work outlives the call that launched it. This is the
+// deliberate call that takes that work too, for a caller that means to empty
+// the roster rather than to end one command.
+func (s *Server) purgeJobs(w http.ResponseWriter) {
+	pids := s.jobs.userShimPIDs()
+	purged := 0
+	for _, pid := range pids {
+		if err := purgeJobTree(pid); err != nil {
+			log.Warn("jobs purge failed", "shim", pid, "err", err)
+			continue
+		}
+		purged++
+	}
+	log.Info("jobs purged", "requested", len(pids), "purged", purged)
+	writeJSON(w, http.StatusOK, JobsPurgeResponse{Requested: len(pids), Purged: purged})
 }

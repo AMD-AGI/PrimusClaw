@@ -6,12 +6,19 @@
 package envd
 
 import (
+	"errors"
 	"io"
 	"os/exec"
 )
 
 // runJobShim is unavailable outside Linux.
 func runJobShim() {}
+
+// purgeJobTree has no shim to ask outside Linux: an execute runs as a plain
+// child here, so there is no adopted tree to end and nothing to signal.
+func purgeJobTree(int) error {
+	return errors.New("job tree purge requires the Linux job shim")
+}
 
 // startTrackedCommand preserves basic execute behavior outside Linux.
 func (s *Server) startTrackedCommand(

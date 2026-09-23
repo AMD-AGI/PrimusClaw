@@ -52,9 +52,18 @@ func runJobShim() {
 	cmd.Env = os.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	// Two signals, two meanings. SIGTERM ends the command this execute started
+	// and nothing else: a descendant that detached itself is background work
+	// the request does not own, and killing it with the request is what made a
+	// sandbox unable to host any. SIGUSR1 is the deliberate call that does end
+	// the whole adopted tree. Notified before the command starts, because the
+	// default disposition of SIGUSR1 is to terminate this process.
 	cancelled := make(chan os.Signal, 1)
 	signal.Notify(cancelled, syscall.SIGTERM)
 	defer signal.Stop(cancelled)
+	purge := make(chan os.Signal, 1)
+	signal.Notify(purge, syscall.SIGUSR1)
+	defer signal.Stop(purge)
 
 	if err := cmd.Start(); err != nil {
 		writeControlInt(control, 0)
@@ -68,13 +77,16 @@ func runJobShim() {
 	go func() { waited <- cmd.Wait() }()
 
 	var err error
-	cancelledPrimary := false
+	purgeRequested := false
 	select {
 	case err = <-waited:
 	case <-cancelled:
 		// Stop only the primary command's process group. A descendant that
 		// deliberately created a new session remains adopted by this shim.
-		cancelledPrimary = true
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		err = <-waited
+	case <-purge:
+		purgeRequested = true
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		err = <-waited
 	}
@@ -90,16 +102,26 @@ func runJobShim() {
 
 	writeControlInt(control, code)
 	_ = control.Close()
-	// Stay cancellable while adopting detached descendants: Ignore(SIGTERM)
-	// here left cancel() unable to free the roster after setsid work.
-	// When the only buffered SIGTERM was spent on the primary, reapOrphans
-	// would never see another -- kill adopted descendants immediately.
-	if cancelledPrimary {
+	if purgeRequested {
 		killAdoptedDescendants()
 		drainOrphans()
 		return
 	}
-	reapOrphans(cancelled)
+	// Whether or not the primary was cancelled, what it detached is still
+	// running, and the roster has to go on accounting for it -- a sandbox is
+	// only idle once this shim reports no descendants. Waiting on the purge
+	// signal, not on SIGTERM: the request's cancellation has already been
+	// spent, and the tree ends either when it finishes or when it is purged.
+	reapOrphans(purge)
+}
+
+// purgeJobTree asks a shim to end everything it has adopted.
+//
+// The signal is the whole protocol: a shim that has outlived its request is
+// waiting on it, and one still running its primary command takes the primary
+// down with the tree.
+func purgeJobTree(shimPID int) error {
+	return syscall.Kill(shimPID, syscall.SIGUSR1)
 }
 
 // writeControlInt sends one process identity or exit status to EnvD.
@@ -110,8 +132,8 @@ func writeControlInt(control *os.File, value int) {
 }
 
 // reapOrphans waits until every descendant adopted by this shim has exited, or
-// until EnvD cancels the tree (request timeout after the primary already ended).
-func reapOrphans(cancelled <-chan os.Signal) {
+// until EnvD purges the tree.
+func reapOrphans(purge <-chan os.Signal) {
 	for {
 		var ws syscall.WaitStatus
 		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
@@ -126,7 +148,7 @@ func reapOrphans(cancelled <-chan os.Signal) {
 			continue
 		}
 		select {
-		case <-cancelled:
+		case <-purge:
 			killAdoptedDescendants()
 			drainOrphans()
 			return
