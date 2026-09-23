@@ -5,12 +5,17 @@
 # E2E smoke test for Brain idle reclaim via GET /api/jobs.
 # Requires: SAFE_API_KEY, AUTH_INTERNAL_TOKEN (optional), kubectl access.
 #
-# Usage (from a host with cluster network + SaFE API):
-#   SAFE_API_KEY=ak-xxx AUTH_INTERNAL_TOKEN=... ./deploy/test/test-idle-reclaim-e2e.sh
+# Usage (from a host with cluster network + SaFE API). The deployment-specific
+# values are required rather than defaulted: a default pointing at one cluster
+# is wrong everywhere else, and silently so.
+#   SAFE_API_KEY=ak-xxx \
+#   SAFE_API_URL=https://safe.example.com \
+#   SANDBOX_NAMESPACE=your-namespace \
+#   SANDBOX_IMAGE=registry.example.com/org/claw:tag \
+#   ./deploy/test/test-idle-reclaim-e2e.sh
 #
 # Optional:
-#   SANDBOX_NAMESPACE=project1-dev
-#   SANDBOX_IMAGE=harbor.../claw:tag
+#   AUTH_INTERNAL_TOKEN=...
 #   JOB_SLEEP_SEC=25
 #   QUIESCE_WAIT_SEC=120
 
@@ -18,9 +23,9 @@ set -euo pipefail
 
 SAFE_API_KEY="${SAFE_API_KEY:?set SAFE_API_KEY}"
 AUTH_INTERNAL_TOKEN="${AUTH_INTERNAL_TOKEN:-}"
-SAFE_API_URL="${SAFE_API_URL:-https://project1.tw325.primus-safe.amd.com}"
-SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-project1-dev}"
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-harbor.project1.tw325.primus-safe.amd.com/primussafe/claw:main-9076625-09041019}"
+SAFE_API_URL="${SAFE_API_URL:?set SAFE_API_URL, e.g. https://safe.example.com}"
+SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:?set SANDBOX_NAMESPACE}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:?set SANDBOX_IMAGE, e.g. registry.example.com/org/claw:tag}"
 JOB_SLEEP_SEC="${JOB_SLEEP_SEC:-25}"
 QUIESCE_WAIT_SEC="${QUIESCE_WAIT_SEC:-120}"
 ROUTER_URL="${ROUTER_URL:-http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080}"

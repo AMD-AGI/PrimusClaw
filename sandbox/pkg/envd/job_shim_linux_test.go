@@ -569,7 +569,7 @@ func TestOnlyHandsItselfIsExcludedFromTheCount(t *testing.T) {
 	}{
 		{"/app/hands-binary", true},
 		{"/tmp/.hands-binary", true},
-		{"/wekafs/Primus-Claw/primus-claw/hands-binary", true},
+		{"/mnt/shared/primus-claw/hands-binary", true},
 		{"/app/hands-binary --serve", true},
 		{"/opt/run-hands-binary-helper", false},
 		{"sleep 60 # hands-binary", false},

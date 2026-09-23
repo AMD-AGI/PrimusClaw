@@ -1288,7 +1288,7 @@ test("a census read that outlasts the container timeout still fits the census ce
         now += 100;
         return { running: true, healthy: true, state: "running" };
       },
-      async exec(_inst: { id: string }, command: string, _timeout: string, signal?: AbortSignal) {
+      async exec(inst: { id: string }, command: string, _timeout: string, signal?: AbortSignal) {
         if (!command.includes("MARKER")) {
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
