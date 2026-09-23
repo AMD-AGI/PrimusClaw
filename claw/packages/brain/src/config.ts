@@ -1157,7 +1157,7 @@ export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_D
 // both derived from this number, so one declared below the sweep's own worst
 // case makes both of them short in the unsafe direction. Mid-sweep renewals
 // refresh parked hands keys when this span exceeds BRAIN_REGISTRY_TTL_MS.
-export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 540, { min: 1 });
+export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 660, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace
 // expires, sandbox-keepalive stops the orphaned workload instead of pinging

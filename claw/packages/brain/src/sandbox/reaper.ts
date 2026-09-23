@@ -157,16 +157,66 @@ const STOP_RETRY_DELAY_MS = 1_000;
 const STOP_ATTEMPT_TIMEOUT_MS = 30_000;
 
 /**
+ * The longest the dag-handle release may hold a teardown.
+ *
+ * The scan inside it carries its own deadline; the conditional writes that
+ * follow, one per handle naming the workload, do not. Armed here so the term
+ * below bounds a wait this side actually enforces.
+ */
+const HANDLE_RELEASE_CEILING_MS = 15_000;
+
+/**
+ * The longest the multi-node cascade may hold a teardown.
+ *
+ * A messageId-scoped cascade is one DELETE, but the pre-messageId fallback
+ * pages the session's workloads and deletes them in turn, and page count times
+ * control-plane latency is not a number this file can state. Bounding the wait
+ * is what makes the term below true; the cascade is best-effort either way and
+ * the workload timeout stays behind it.
+ */
+const CLUSTER_CASCADE_CEILING_MS = 30_000;
+
+/**
+ * Fail the wait once the ceiling is spent, whatever the call is still doing.
+ *
+ * The call is not cancelled -- neither the handle store nor the control plane
+ * takes a signal here -- so what this bounds is the waiting, which is the cost
+ * the teardown's callers budget for.
+ */
+async function withCeiling<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  // Claimed so the losing side cannot surface as an unhandled rejection after
+  // the race has already settled.
+  work.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms}ms`)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * The longest one `destroyHands` can take, retries and the waits between them
  * included.
  *
  * Derived rather than written down: a hand-written ceiling named one attempt and
  * so understated a teardown by the retry count, and every phase that budgets
- * around a teardown inherited that error.
+ * around a teardown inherited that error. The two awaits that follow the stop
+ * are terms for the same reason -- a teardown is not over when the workload
+ * stops, and a phase that budgets for the stop alone overruns by whatever the
+ * handle release and the cluster cascade take.
  */
 export function handsStopCeilingMs(): number {
   return STOP_ATTEMPTS * STOP_ATTEMPT_TIMEOUT_MS
-    + (STOP_ATTEMPTS - 1) * STOP_RETRY_DELAY_MS;
+    + (STOP_ATTEMPTS - 1) * STOP_RETRY_DELAY_MS
+    + HANDLE_RELEASE_CEILING_MS
+    + CLUSTER_CASCADE_CEILING_MS;
 }
 
 /**
@@ -346,7 +396,11 @@ export async function destroyHands(
       ? (target as { workloadId?: string }).workloadId
       : undefined;
     if (stoppedWorkload) {
-      await releaseHandlesForWorkload(stoppedWorkload).catch((e: unknown) => {
+      await withCeiling(
+        releaseHandlesForWorkload(stoppedWorkload),
+        HANDLE_RELEASE_CEILING_MS,
+        "dag-handle release",
+      ).catch((e: unknown) => {
         logger.warn(
           { sessionId, workloadId: stoppedWorkload, err: (e as Error)?.message ?? String(e) },
           "dag-handles.release_after_stop_failed",
@@ -376,7 +430,11 @@ export async function destroyHands(
           ?? "",
       ).trim();
       if (platformKey && messageId) {
-        await reclaimClusters(sessionId, platformKey, messageId).catch((e: unknown) => {
+        await withCeiling(
+          reclaimClusters(sessionId, platformKey, messageId),
+          CLUSTER_CASCADE_CEILING_MS,
+          "mn cluster cascade",
+        ).catch((e: unknown) => {
           logger.warn(
             { sessionId, messageId, err: (e as Error)?.message ?? String(e) },
             "mn.cascade_after_sandbox_stop_failed",
@@ -385,7 +443,11 @@ export async function destroyHands(
       } else if (platformKey && mnServiceUrl) {
         // Pre-messageId MN handles: fall back to session-scoped reclaim so the
         // cluster is not left solely to SaFE workload timeout.
-        await reclaimClusters(sessionId, platformKey).catch((e: unknown) => {
+        await withCeiling(
+          reclaimClusters(sessionId, platformKey),
+          CLUSTER_CASCADE_CEILING_MS,
+          "mn cluster cascade",
+        ).catch((e: unknown) => {
           logger.warn(
             { sessionId, err: (e as Error)?.message ?? String(e) },
             "mn.cascade_after_sandbox_stop_failed",

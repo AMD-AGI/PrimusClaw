@@ -279,10 +279,14 @@ test("the declared sweep span covers a sweep's real worst case", () => {
   // stop with retries, so a term naming one attempt understates the phase by
   // the retry count -- and the refresh gap and the reclaim horizon are both
   // derived from this span.
+  //
+  // The stop is also not where a teardown ends: the dag-handle release and the
+  // multi-node cascade are awaited after it, and a ceiling that stops at the
+  // stop understates a teardown by however long those two take.
   assert.equal(
     handsStopCeilingMs(),
-    3 * 30_000 + 2 * 1_000,
-    "the ceiling is attempts x stop timeout plus the waits between them",
+    3 * 30_000 + 2 * 1_000 + 15_000 + 30_000,
+    "the ceiling is the stop's attempts and waits, plus the release and the cascade",
   );
   assert.ok(
     keepaliveIdleExpiryPhaseCeilingSec() * 1000 > handsStopCeilingMs(),

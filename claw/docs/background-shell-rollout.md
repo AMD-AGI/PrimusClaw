@@ -457,11 +457,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
    # without knowing which side has room. The gap is
    #   (1 + D) * SANDBOX_KEEPALIVE_INTERVAL_SEC + (2 + D) * SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC
    # where D is the deferral count the ceiling implies. With the shipped
-   # defaults (interval 60s, span 540s) that is 1140s at D=0, so a 900s reclaim
-   # does not fit and Brain refuses. Either the platform's reclaim is longer
-   # than that, or the sweep span has to come down first -- and the span cannot
-   # simply be lowered, because it has to stay above a sweep's own worst case
-   # (`keepaliveSweepCeilingSec()`, 524s with the shipped retry bounds).
+   # defaults (interval 60s, span 660s) that is 1380s at D=0, so a 900s reclaim
+   # does not fit and Brain refuses, naming both numbers. Either the platform's
+   # reclaim is longer than that, or the sweep span has to come down first --
+   # and the span cannot simply be lowered, because it has to stay above a
+   # sweep's own worst case (`keepaliveSweepCeilingSec()`, 624s with the shipped
+   # retry bounds, of which 137s is one teardown: the stop's retries plus the
+   # dag-handle release and the multi-node cascade that follow it).
    SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC=""
    # Only if PRE-4 applies.
    BASH_MAX_TIMEOUT_SEC=""
