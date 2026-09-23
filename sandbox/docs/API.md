@@ -69,9 +69,12 @@ Key `spec` fields: `template.fromImage` (required), `template.runtimeClassName`
 (`""`=runc, `kata-qemu`=VM isolation), `template.resources`, `template.steps`
 (`run`/`env`/`workdir`), `template.sidecars`, `gpu` (`count`, `product`,
 `resourceName`, `sharedMemory`), `warmPoolSize` (default `0`),
-`sessionTimeout` (default `15m`), `maxSessionDuration` (default `24h`),
-`authMode` (`envd`|`none`). Template name must be DNS-1035 (`[a-z0-9-]`, no dots).
-GPU sandboxes are `runc`-only.
+`maxSessionDuration` (default `24h`), `authMode` (`envd`|`none`). Template name
+must be DNS-1035 (`[a-z0-9-]`, no dots). GPU sandboxes are `runc`-only.
+
+`sessionTimeout` is still accepted and recorded on the Sandbox, and nothing
+acts on it: a sandbox is not reclaimed for being idle. `maxSessionDuration` is
+what ends one.
 
 ### Create a sandbox
 

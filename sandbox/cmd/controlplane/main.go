@@ -87,6 +87,13 @@ func main() {
 	var probeAddr string
 	var enableLeaderElection bool
 	var enableExtensions bool
+	// Accepted and ignored for one release. Sandbox idle reclaim is Brain's,
+	// driven by EnvD's jobs roster, and nothing here reads this any more --
+	// but an unknown argument ends flag.Parse in os.Exit(2), before a single
+	// listener or controller starts. A Deployment that still carries this one
+	// would take the whole control plane down on an image bump alone, so it is
+	// parsed and reported rather than refused. Remove in the next release.
+	var deprecatedSessionTimeout time.Duration
 
 	routerPort = 8080
 	wmPort = 8081
@@ -103,7 +110,17 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "Health probe bind address for the controller manager")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for the unified controlplane")
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
+	flag.DurationVar(&deprecatedSessionTimeout, "session-timeout", 0,
+		"Deprecated and ignored: sandbox idle reclaim is owned by Brain")
 	flag.Parse()
+
+	// Said out loud, because the environment variable never failed at all: a
+	// deployment that set it has been reading a lifetime nothing enforces.
+	if deprecatedSessionTimeout != 0 || os.Getenv("SESSION_TIMEOUT") != "" {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: session-timeout is ignored. Sandbox idle reclaim is owned by Brain "+
+				"(EnvD GET /api/jobs); only the hard --default-ttl applies here.")
+	}
 
 	// controller-runtime keeps zap here, deliberately: switching it to the
 	// shared handler changes the format of every line this binary emits, and

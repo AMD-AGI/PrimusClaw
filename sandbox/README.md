@@ -97,7 +97,7 @@ A high-frequency, short-task code-execution environment that also supports long-
 - AMD GPU status queries.
 - OpenAI-compatible: `OPENAI_BASE_URL` injected for in-sandbox model calls via the platform LLM proxy.
 - Optional egress control (transparent proxy + SSRF protection) with policy synced from the Workload Manager.
-- Session lifecycle management with idle-timeout and max-duration auto-reclamation.
+- Session lifecycle management with max-duration auto-reclamation.
 - Auth: SaFE Cookie (browser) or API Key (`ak-` prefix, for SDK / CLI).
 
 ## Runtime Security
