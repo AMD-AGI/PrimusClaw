@@ -516,6 +516,9 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
     backendFramework: p.framework,
     kvTransferBackend: p.kvTransferBackend,
     serviceRoles,
+    // Every GPU role deploys idle and never opens the readiness port before
+    // the SSH launch, so SaFE must skip the readiness probe for it.
+    idleRoles: serviceRoles.filter((r) => r !== "frontend"),
   };
   if (multinodeRoles.length > 0) inferaOptions.multinodeRoles = multinodeRoles;
 
