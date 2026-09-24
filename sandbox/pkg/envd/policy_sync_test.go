@@ -45,8 +45,8 @@ func TestPolicySyncerSyncsAllowedInternalHostsToSSRFChecker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	wm := &inferenceKeyCache{wmURL: server.URL, sessionID: "default/sbx", jwtToken: "router-token"}
-	syncer := NewPolicySyncer(engine, ssrf, wm)
+	session := &sessionContext{wmURL: server.URL, sessionID: "default/sbx", jwtToken: "router-token", ready: make(chan struct{})}
+	syncer := NewPolicySyncer(engine, ssrf, session)
 	syncer.syncOnce(context.Background())
 
 	cfg := engine.GetConfig()

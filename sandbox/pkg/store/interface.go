@@ -37,10 +37,6 @@ type SandboxInfo struct {
 	// Empty when auth is disabled.
 	UserID   string `json:"user_id,omitempty"`
 	UserName string `json:"user_name,omitempty"`
-	// InferenceApiKey is the user's API Key for the unified inference gateway (§4.2).
-	// Stored by WM at sandbox creation/claim, pulled by EnvD via policy endpoint,
-	// injected into child processes as OPENAI_API_KEY. Empty when inference is disabled.
-	InferenceApiKey string `json:"inference_api_key,omitempty"`
 
 	// RuntimePolicy is the name of the ClusterSandboxPolicy applied to this sandbox (§4.1).
 	// "agent-default" = external open + internal blocked; "agent-restricted" = whitelist mode.

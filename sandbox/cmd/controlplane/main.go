@@ -217,10 +217,6 @@ func main() {
 		}
 	}
 
-	if os.Getenv("INFERENCE_ENABLED") == "true" {
-		wmCfg.Inference.Enabled = true
-		wmCfg.Inference.LiteLLMEndpoint = os.Getenv("INFERENCE_LITELLM_ENDPOINT")
-	}
 	wmCfg.Audit.Enabled = os.Getenv("AUDIT_ENABLED") != "false"
 	wmCfg.Audit.RetentionDays = 30
 	if v := os.Getenv("AUDIT_RETENTION_DAYS"); v != "" {

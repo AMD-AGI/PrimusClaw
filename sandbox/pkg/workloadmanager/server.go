@@ -35,14 +35,6 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
-// InferenceConfig holds unified inference gateway configuration.
-// OPENAI_BASE_URL is injected as Pod env (global); OPENAI_API_KEY is per-user,
-// stored in Redis by WM and injected by EnvD at process level.
-type InferenceConfig struct {
-	Enabled         bool
-	LiteLLMEndpoint string // e.g. http://litellm.agent-sandbox-system:4000/v1
-}
-
 // AuditConfig holds audit logging configuration.
 type AuditConfig struct {
 	Enabled              bool
@@ -58,7 +50,6 @@ type Config struct {
 	Namespace  string
 	GCInterval time.Duration
 	DefaultTTL time.Duration
-	Inference  InferenceConfig
 	Audit      AuditConfig
 	// Namespaces decides which namespaces this Workload Manager serves: see
 	// package nsadmission for the routes it covers. nil admits every namespace.
@@ -142,11 +133,6 @@ func New(cfg Config, st store.Store) *Server {
 			s.safeClient = safe.NewClient(cfg.SafeAPIURL)
 			log.Info("WM: SaFE API Key authentication enabled", "safeAPIURL", cfg.SafeAPIURL)
 		}
-	}
-
-	if cfg.Inference.Enabled {
-		log.Info("WM: unified inference gateway enabled",
-			"litellmEndpoint", cfg.Inference.LiteLLMEndpoint)
 	}
 
 	s.setupRoutes()
@@ -427,11 +413,6 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 			info.UserID = user.UserID
 			info.UserName = user.UserName
 		}
-		if s.cfg.Inference.Enabled {
-			if apiKey := c.GetHeader(api.SandboxApiKeyHeader); apiKey != "" {
-				info.InferenceApiKey = apiKey
-			}
-		}
 		if err := s.store.StoreSandbox(c.Request.Context(), info); err != nil {
 			writeSSE("error", gin.H{"error": "failed to store session: " + err.Error()})
 			return
@@ -459,6 +440,21 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 		createStatus = "success"
 	} else {
 		sessionID := api.FormatSandboxID(ns, req.Name)
+		info := &store.SandboxInfo{
+			SessionID: sessionID, SandboxName: req.Name, Namespace: ns,
+			PodIP: "127.0.0.1", PodPort: 8080,
+			CreatedAt: time.Now(), LastActivity: time.Now(),
+			ExpiresAt: time.Now().Add(s.cfg.DefaultTTL), Status: "running",
+			EntryPoints: map[string]string{"/": "127.0.0.1:8080"},
+		}
+		if user != nil {
+			info.UserID = user.UserID
+			info.UserName = user.UserName
+		}
+		if err := s.store.StoreSandbox(c.Request.Context(), info); err != nil {
+			writeSSE("error", gin.H{"error": "failed to store session: " + err.Error()})
+			return
+		}
 		writeSSE("phase", BuildPhase{Phase: "ready", Status: "completed", Message: "Dev mode"})
 		writeSSE("end", gin.H{
 			"build_status": "ready",
@@ -578,13 +574,6 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 	if user != nil {
 		info.UserID = user.UserID
 		info.UserName = user.UserName
-	}
-	// Store user's API Key for unified inference gateway (§4.2).
-	// EnvD pulls this from Redis via the policy endpoint and injects as OPENAI_API_KEY.
-	if s.cfg.Inference.Enabled {
-		if apiKey := c.GetHeader(api.SandboxApiKeyHeader); apiKey != "" {
-			info.InferenceApiKey = apiKey
-		}
 	}
 	if err := s.store.StoreSandbox(c.Request.Context(), info); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store session: " + err.Error()})
@@ -804,8 +793,8 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 	restoreRecovered := false
 	if err != nil {
 		// Only a confirmed missing record justifies a rebuild. An unreadable
-		// store is a different fact: the real record, with the policy and
-		// inference state the CR cannot reproduce, is still there. Rebuilding on
+		// store is a different fact: the real record, with the policy state
+		// the CR cannot reproduce, is still there. Rebuilding on
 		// a timeout or a reset would overwrite it with the thirteen fields
 		// RecoverSessionFromK8s can reconstruct, dropping the egress whitelist
 		// and downgrading an agent-restricted sandbox to the permissive default.
@@ -1600,9 +1589,8 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 	}
 }
 
-// handleInternalPolicy serves GET /v1/internal/policy/{sessionId}.
-// EnvD calls this once on first request to cache the inference key.
-// Returns inference.apiKey from Redis session data for process-level OPENAI_API_KEY injection.
+// handleInternalPolicy serves GET /v1/internal/policy/{namespace}/{name}.
+// EnvD polls this to pick up egress policy changes made on the Sandbox CR.
 func (s *Server) handleInternalPolicy(c *gin.Context) {
 	namespace, name, sessionID, ok := pathSandboxRef(c)
 	if !ok {
@@ -1618,29 +1606,35 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 			return
 		}
 		pol = readPolicyAnnotations(sb)
+	} else if s.store != nil {
+		// Dev/test without a K8s client: serve the policy mirrored in the store.
+		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.Warn("handleInternalPolicy: store error", "sessionId", sessionID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
+			return
+		}
+		if info != nil {
+			if info.RuntimePolicy != "" {
+				pol.RuntimePolicy = info.RuntimePolicy
+			}
+			if info.PolicyMode != "" {
+				pol.PolicyMode = info.PolicyMode
+			}
+			pol.AllowedEgressHosts = info.AllowedEgressHosts
+			pol.AllowedInternalHosts = info.AllowedInternalHosts
+			if info.PolicyVersion > 0 {
+				pol.PolicyVersion = info.PolicyVersion
+			}
+		}
 	}
 
-	var inferenceKey string
-	info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		log.Warn("handleInternalPolicy: store error", "sessionId", sessionID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
-		return
-	}
-	if info != nil && s.cfg.Inference.Enabled {
-		inferenceKey = info.InferenceApiKey
-	}
-
-	type inferencePolicy struct {
-		ApiKey string `json:"apiKey,omitempty"`
-	}
 	type policyResponse struct {
-		PolicyVersion        int64            `json:"policyVersion"`
-		Inference            *inferencePolicy `json:"inference,omitempty"`
-		RuntimePolicy        string           `json:"runtimePolicy,omitempty"`
-		PolicyMode           string           `json:"policyMode,omitempty"`
-		AllowedEgressHosts   []string         `json:"allowedEgressHosts,omitempty"`
-		AllowedInternalHosts []string         `json:"allowedInternalHosts,omitempty"`
+		PolicyVersion        int64    `json:"policyVersion"`
+		RuntimePolicy        string   `json:"runtimePolicy,omitempty"`
+		PolicyMode           string   `json:"policyMode,omitempty"`
+		AllowedEgressHosts   []string `json:"allowedEgressHosts,omitempty"`
+		AllowedInternalHosts []string `json:"allowedInternalHosts,omitempty"`
 	}
 
 	resp := policyResponse{
@@ -1652,9 +1646,6 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 	}
 	if resp.PolicyVersion == 0 {
 		resp.PolicyVersion = 1
-	}
-	if inferenceKey != "" {
-		resp.Inference = &inferencePolicy{ApiKey: inferenceKey}
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -1669,19 +1660,48 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
 		return
 	}
-	if s.k8s == nil {
+
+	var pol sandboxPolicy
+	if s.k8s != nil {
+		sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
+			return
+		}
+		if !s.admitNamespace(c, namespace) {
+			return
+		}
+		pol = readPolicyAnnotations(sb)
+	} else if s.store != nil {
+		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
+			return
+		}
+		if !s.admitNamespace(c, namespace) {
+			return
+		}
+		pol = defaultSandboxPolicy()
+		if info.RuntimePolicy != "" {
+			pol.RuntimePolicy = info.RuntimePolicy
+		}
+		if info.PolicyMode != "" {
+			pol.PolicyMode = info.PolicyMode
+		}
+		pol.AllowedEgressHosts = info.AllowedEgressHosts
+		pol.AllowedInternalHosts = info.AllowedInternalHosts
+		if info.PolicyVersion > 0 {
+			pol.PolicyVersion = info.PolicyVersion
+		}
+	} else {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
 		return
 	}
-	sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
-		return
-	}
-	if !s.admitNamespace(c, namespace) {
-		return
-	}
-	pol := readPolicyAnnotations(sb)
+
 	c.JSON(http.StatusOK, gin.H{
 		"sessionId":            sessionID,
 		"runtimePolicy":        pol.RuntimePolicy,
@@ -1706,10 +1726,6 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
 		return
 	}
-	if s.k8s == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
-		return
-	}
 
 	var req UpdatePolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1717,15 +1733,46 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		return
 	}
 
-	sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
+	var pol sandboxPolicy
+	if s.k8s != nil {
+		sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
+			return
+		}
+		if !s.admitNamespace(c, namespace) {
+			return
+		}
+		pol = readPolicyAnnotations(sb)
+	} else if s.store != nil {
+		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
+			return
+		}
+		if !s.admitNamespace(c, namespace) {
+			return
+		}
+		pol = defaultSandboxPolicy()
+		if info.RuntimePolicy != "" {
+			pol.RuntimePolicy = info.RuntimePolicy
+		}
+		if info.PolicyMode != "" {
+			pol.PolicyMode = info.PolicyMode
+		}
+		pol.AllowedEgressHosts = info.AllowedEgressHosts
+		pol.AllowedInternalHosts = info.AllowedInternalHosts
+		if info.PolicyVersion > 0 {
+			pol.PolicyVersion = info.PolicyVersion
+		}
+	} else {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
 		return
 	}
-	if !s.admitNamespace(c, namespace) {
-		return
-	}
-	pol := readPolicyAnnotations(sb)
 
 	if req.AllowedInternalHosts != nil {
 		for _, cidr := range *req.AllowedInternalHosts {
@@ -1748,9 +1795,26 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	}
 
 	pol.PolicyVersion++
-	if err := s.k8s.PatchSandboxPolicy(c.Request.Context(), namespace, name, pol); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
-		return
+	if s.k8s != nil {
+		if err := s.k8s.PatchSandboxPolicy(c.Request.Context(), namespace, name, pol); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
+			return
+		}
+	} else {
+		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
+			return
+		}
+		info.RuntimePolicy = pol.RuntimePolicy
+		info.PolicyMode = pol.PolicyMode
+		info.AllowedEgressHosts = pol.AllowedEgressHosts
+		info.AllowedInternalHosts = pol.AllowedInternalHosts
+		info.PolicyVersion = pol.PolicyVersion
+		if err := s.store.StoreSandbox(c.Request.Context(), info); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
+			return
+		}
 	}
 
 	policyUpdateTotal.WithLabelValues(sessionID).Inc()

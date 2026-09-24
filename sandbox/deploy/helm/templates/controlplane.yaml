@@ -237,10 +237,6 @@ spec:
             - name: SANDBOX_NODE_SELECTOR
               value: {{ .Values.controlplane.config.sandboxNodeSelector | quote }}
             {{- end }}
-            - name: INFERENCE_ENABLED
-              value: {{ ternary "true" "false" .Values.inference.enabled | quote }}
-            - name: INFERENCE_LITELLM_ENDPOINT
-              value: {{ .Values.inference.litellmEndpoint | quote }}
             - name: ENVD_INJECTOR_IMAGE
               value: {{ .Values.controlplane.config.envdInjectorImage | quote }}
             - name: WORKLOAD_MANAGER_SERVICE_NAME

@@ -98,7 +98,7 @@ redis:
   # as authentication disabled, redis-cli with an empty REDISCLI_AUTH sends no
   # AUTH and so both probes still pass, and go-redis skips AUTH entirely. With
   # redis.deploy=true the result is a passwordless Redis that reports healthy
-  # while holding the session records EnvD reads per-user OPENAI_API_KEYs from.
+  # while holding session records used for routing and lifecycle.
   #
   # install.sh never reaches that state: it generates or reuses a 32-char
   # password and passes it in a values file. The exposed path was a hand-run
@@ -207,12 +207,4 @@ workloadmanager:
 egress:
   enabled: false                    # true = enable transparent proxy + SSRF protection
   extraBlockedCIDRs: ""             # Extra blocked CIDRs (comma-separated) for ranges the built-in list does not cover, e.g. "203.0.113.0/24,198.51.100.0/24"
-
-# ── Inference (unified inference gateway) ─────────────────────────────────────
-# OPENAI_BASE_URL injected via Pod env (global);
-# OPENAI_API_KEY injected by EnvD at process level (per-user, fetched from Redis session).
-# Backend LLM API keys only exist in LiteLLM memory, never enter sandbox Pods.
-inference:
-  enabled: false                    # true = enable unified inference gateway
-  litellmEndpoint: ""               # LiteLLM inference gateway URL, e.g. http://litellm.agent-sandbox-system:4000/v1
 

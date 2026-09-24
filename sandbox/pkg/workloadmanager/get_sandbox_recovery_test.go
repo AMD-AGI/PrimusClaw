@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The keepalive GET rebuilds a session from its Sandbox CR when the store has
-// lost the record. The rebuild is lossy -- the CR cannot reproduce the egress
-// policy or the inference key -- and it writes, so two things decide whether it
-// helps or harms: it must fire only for a record that is confirmed absent, and
-// it must not write before the caller is authorised. These tests pin both.
+// lost the record. The rebuild writes, so two things decide whether it helps or
+// harms: it must fire only for a record that is confirmed absent, and it must
+// not write before the caller is authorised. These tests pin both.
 //
 // Each builds its own store and client and shares no state, so they run in parallel.
 package workloadmanager
@@ -100,7 +99,6 @@ func TestGetSandboxDoesNotRebuildOnAnUnreadableStore(t *testing.T) {
 		RuntimePolicy:      "agent-restricted",
 		PolicyMode:         "enforce",
 		AllowedEgressHosts: []string{"api.internal.example"},
-		InferenceApiKey:    "sk-do-not-lose-me",
 	}
 	if err := base.StoreSandbox(context.Background(), complete); err != nil {
 		t.Fatalf("seed store: %v", err)
@@ -124,9 +122,8 @@ func TestGetSandboxDoesNotRebuildOnAnUnreadableStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record must survive: %v", err)
 	}
-	if kept.RuntimePolicy != "agent-restricted" || kept.InferenceApiKey != "sk-do-not-lose-me" {
-		t.Errorf("record was overwritten by a rebuild: policy=%q key=%q",
-			kept.RuntimePolicy, kept.InferenceApiKey)
+	if kept.RuntimePolicy != "agent-restricted" {
+		t.Errorf("record was overwritten by a rebuild: policy=%q", kept.RuntimePolicy)
 	}
 	if len(kept.AllowedEgressHosts) != 1 {
 		t.Errorf("egress whitelist lost: %v", kept.AllowedEgressHosts)
