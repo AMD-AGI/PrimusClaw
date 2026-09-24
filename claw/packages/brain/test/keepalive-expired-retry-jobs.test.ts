@@ -149,3 +149,36 @@ test("an expired retry stops only after an explicit empty jobs roster", async ()
   assert.ok(probes >= 1, "the destructive boundary must probe jobs");
   assert.deepEqual(writes.stopped, [WL], "an empty roster authorises the stop");
 });
+
+test("an expired retry yields when a concurrent write wins the closing CAS", async () => {
+  // Probe can take seconds. A redelivery that writes the handle in that window
+  // must win: destroyHands must not run on a superseded enrollment revision.
+  const { kv, writes } = fakeKv();
+  bindHandsKv(kv);
+  bindRunningProvider(writes);
+  await markRetryPending(kv, {
+    sessionId: SESSION,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: WL,
+  });
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => {
+      // Bump the enrollment revision while the probe is in flight.
+      const cur = await kv.get(HANDS_KEY);
+      assert.ok(cur);
+      await kv.update(
+        HANDS_KEY,
+        sc.encode(JSON.stringify({ ...BINDING, keepalive: true, bumped: true })),
+        cur.revision,
+      );
+      return 0;
+    },
+  });
+
+  assert.deepEqual(writes.stopped, [], "a superseded closing CAS must not stop");
+  assert.ok(!writes.deleted.includes(HANDS_KEY), "the hands pointer must stay");
+});

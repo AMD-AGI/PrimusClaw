@@ -724,6 +724,7 @@ function sandboxEntryFrom(info: HandsKvEntry): SandboxEntry | null {
     sandboxName: info.sandboxName,
     namespace: info.namespace,
     userId: info.userId,
+    messageId: info.messageId || undefined,
   };
 }
 
@@ -766,13 +767,15 @@ function sandboxRegistryKey(entry: SandboxEntry): string {
  */
 async function recordNamingSandbox(
   kv: KV, sessionId: string, entry: SandboxEntry,
-): Promise<{ key: string; info: HandsKvEntry } | null> {
+): Promise<{ key: string; info: HandsKvEntry; record: HandsRecord } | null> {
   for (const key of handsEntryKeys(sessionId)) {
     const found = await kv.get(key).catch(() => null);
     if (!found) continue;
     try {
       const info = JSON.parse(sc.decode(found.value)) as HandsKvEntry;
-      if (sameRegisteredSandbox(entry, info)) return { key, info };
+      if (sameRegisteredSandbox(entry, info)) {
+        return { key, info, record: { value: found.value, revision: found.revision } };
+      }
     } catch { /* unreadable is not evidence that this is the record we want */ }
   }
   return null;
@@ -953,7 +956,9 @@ async function shouldSkipExpiredRetry(
     info: known,
     token: info.token,
     site: "retry_pending_stop_retry",
-    confirm: () => confirmExpiredRetryStop(deps, sessionId, info, lockKey),
+    confirm: () => confirmExpiredRetryStop(
+      deps, sessionId, info, lockKey, record.key, record.record,
+    ),
     after: async () => {
       unregisterSandbox(sessionId, entry);
       // A teardown that owned the record has already removed it under its own
@@ -991,14 +996,18 @@ async function shouldSkipExpiredRetry(
  * Destructive-boundary evidence for an expired retry-pending stop.
  *
  * Same shape as idle reclaim: only an explicit empty jobs roster authorises
- * destroyHands. Lock and run-lease are rechecked here because the teardown was
- * queued during the census walk and may wait tens of seconds before running.
+ * destroyHands, and after that probe the enrollment must still be claimable
+ * (lock / lease / ready→closing CAS). Lock and run-lease are checked before
+ * the probe as a cheap filter, then again after it -- a redelivery that lands
+ * during the probe window must win.
  */
 async function confirmExpiredRetryStop(
   deps: KeepaliveDeps,
   sessionId: string,
   info: HandsKvEntry,
   lockKey: string,
+  recordKey: string,
+  enrollment: HandsRecord,
 ): Promise<boolean> {
   try {
     if (await deps.kv.get(`lock.${lockKey}`)) {
@@ -1026,18 +1035,32 @@ async function confirmExpiredRetryStop(
     );
     return false;
   }
+  const identity = entryIdentity(info);
+  // Enrollment revision is taken here, not at walk queue time: the KV walk may
+  // renew the same key after the teardown was queued, and a stale revision
+  // would self-collide on the closing CAS.
+  let enrollmentNow = enrollment;
+  let infoNow = info;
   try {
-    const running = await probeUserProcesses(deps, info, sessionId, {
+    const fresh = await deps.kv.get(recordKey);
+    if (!fresh || isTombstone(fresh)) return false;
+    infoNow = { ...info, ...JSON.parse(sc.decode(fresh.value)) as HandsKvEntry };
+    enrollmentNow = { value: fresh.value, revision: fresh.revision };
+  } catch {
+    return false;
+  }
+  const claimRevision = enrollmentNow.revision;
+  try {
+    const running = await probeUserProcesses(deps, infoNow, sessionId, {
       persistIdentity: false,
     });
     if (running > 0) {
       logger.info(
-        { sessionId, workloadId: info.workloadId, running },
+        { sessionId, workloadId: infoNow.workloadId, running },
         "keepalive.retry_pending_stop_deferred_jobs_busy",
       );
       return false;
     }
-    return true;
   } catch (err) {
     // Unavailable / tracking_lost / soft control-plane faults never authorise
     // a stop. Terminal/absent are conclusions about the workload, not a zero
@@ -1046,12 +1069,41 @@ async function confirmExpiredRetryStop(
       {
         err: (err as Error)?.message ?? String(err),
         sessionId,
-        workloadId: info.workloadId,
+        workloadId: infoNow.workloadId,
       },
       "keepalive.retry_pending_stop_evidence_unavailable",
     );
     return false;
   }
+
+  // Probe window: a redelivery may have taken the lock or run lease, or written
+  // the handle. Recheck and CAS before destroyHands -- same race idle reclaim
+  // already closes with claimIdleStop.
+  try {
+    if (await deps.kv.get(`lock.${lockKey}`)) {
+      logger.warn(
+        { sessionId, lockKey, workloadId: infoNow.workloadId },
+        "keepalive.retry_pending_stop_deferred_lock_active",
+      );
+      return false;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
+    return false;
+  }
+  const latest = await deps.kv.get(recordKey);
+  if (!latest || isTombstone(latest)) return false;
+  let claimedInfo = infoNow;
+  try {
+    claimedInfo = { ...infoNow, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+  } catch {
+    return false;
+  }
+  return claimIdleStop(
+    deps, recordKey, identity, sessionId, claimedInfo, claimRevision, enrollmentNow,
+    undefined,
+    { collectingIdentity: identity },
+  );
 }
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
@@ -2338,7 +2390,11 @@ async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
   stats: TickStats,
-): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
+): Promise<{
+  targets: Map<string, RegisteredSandbox>;
+  complete: boolean;
+  idleHolds: Array<{ sessionId: string }>;
+}> {
   const clock = deps.now ?? Date.now;
   const censusStartedAt = clock();
   pruneTeardownBackoff(censusStartedAt);
@@ -2452,7 +2508,8 @@ async function collectTargets(
   const readsComplete = census.retentionReads.size
     ? await runRetentionReadPhase(deps, census, kvComplete)
     : true;
-  return { targets: census.targets, complete: kvComplete && dagComplete && readsComplete };
+  return { targets: census.targets, complete: kvComplete && dagComplete && readsComplete,
+    idleHolds: census.idleHolds };
 }
 
 async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -2721,6 +2778,10 @@ async function expireIdleTarget(
  * any unclaimed destroyHands. Returns false when a concurrent turn won.
  * When `terminalReason` is set, the same CAS also records it so emit and
  * destroy do not race a second update against the enrollment revision.
+ *
+ * `collectingIdentity`: the sandbox this stop is collecting. Its own local
+ * registration is the orphan under collection, not evidence against stopping
+ * it -- a sibling identity for the same session still vetoes.
  */
 async function claimIdleStop(
   deps: KeepaliveDeps,
@@ -2731,8 +2792,14 @@ async function claimIdleStop(
   claimRevision: number,
   e: HandsRecord,
   terminalReason?: string,
+  opts?: { collectingIdentity?: string },
 ): Promise<boolean> {
-  if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
+  const collecting = opts?.collectingIdentity;
+  if (collecting) {
+    for (const [regKey, registered] of localRegistry) {
+      if (registered.sessionId === sessionId && regKey !== collecting) return false;
+    }
+  } else if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     return false;
   }
   if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
@@ -2835,6 +2902,7 @@ interface KeepaliveFailure {
 const FAILURE_PHASE_BUDGET_MS = 30_000;
 
 async function handleKeepaliveFailures(
+  deps: KeepaliveDeps,
   failures: KeepaliveFailure[],
   targetCount: number,
   now: () => number = Date.now,
@@ -2888,7 +2956,38 @@ async function handleKeepaliveFailures(
       // otherwise a genuine node-wide loss would be suppressed forever.
       && (!goneCircuitOpen || fails > SANDBOX_KEEPALIVE_FAIL_LIMIT)
     ) {
-      await destroyHands(sessionId, entry).catch((err2) =>
+      // Failure eviction is not a rebuild. Skip MN cascade only while a run
+      // lease proves a message still owns the cluster (it may rebuild). A
+      // stale handle messageId with no lease must cascade now: destroyHands
+      // deletes the hands entry, and mn_sweeper cannot see it afterwards.
+      let activeMessageId = "";
+      let messageId = (entry.messageId || "").trim();
+      let runScope: string | undefined;
+      const found = await readHandsEntry(deps.kv, sessionId).catch(() => null);
+      if (found) {
+        try {
+          const parsed = JSON.parse(found.value) as {
+            messageId?: string; runScope?: string;
+          };
+          if (!messageId) messageId = (parsed.messageId || "").trim();
+          if (typeof parsed.runScope === "string" && parsed.runScope) {
+            runScope = parsed.runScope;
+          }
+        } catch { /* unreadable: cascade as usual */ }
+      }
+      if (
+        messageId
+        && await sessionHasActiveRunLease(deps.kv, sessionId, runScope)
+      ) {
+        activeMessageId = messageId;
+      }
+      await destroyHands(
+        sessionId,
+        entry,
+        undefined,
+        undefined,
+        activeMessageId ? { activeMessageId } : undefined,
+      ).catch((err2) =>
         logger.warn({ err: err2, sessionId }, "keepalive.destroy_failed"),
       );
       failCounts.delete(targetKey);
@@ -3201,6 +3300,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   const stats = newTickStats();
   const census = await collectTargets(deps, seenIdentities, stats);
   const targets = census.targets;
+  const idleHolds = census.idleHolds;
   const servable = await admitTargets(deps, targets, census.complete);
   if (servable) dropUnadmitted(targets, servable);
   pruneSweepState(targets, seenIdentities);
@@ -3217,21 +3317,25 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     );
   }
 
-  if (!targets.size) return;
+  if (targets.size) {
+    const clock = deps.now ?? Date.now;
+    const phase = await runPingPhase(deps, targets);
 
-  const clock = deps.now ?? Date.now;
-  const phase = await runPingPhase(deps, targets);
+    await handleKeepaliveFailures(deps, phase.failures, targets.size, clock);
 
-  await handleKeepaliveFailures(phase.failures, targets.size, clock);
-
-  pingDeferred = phase.deferredNow;
-  if (phase.deferred > 0) {
-    logger.warn(
-      { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
-        budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
-      "keepalive.ping_budget_exhausted",
-    );
+    pingDeferred = phase.deferredNow;
+    if (phase.deferred > 0) {
+      logger.warn(
+        { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
+          budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
+        "keepalive.ping_budget_exhausted",
+      );
+    }
   }
+
+  // After ping/failure (or when there were no ping targets): within-window
+  // parks sat out of both phases and need a refresh that outlasts them.
+  await renewIdleHolds(deps, idleHolds);
 }
 
 /**

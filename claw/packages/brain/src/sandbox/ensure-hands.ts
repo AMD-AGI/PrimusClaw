@@ -289,12 +289,26 @@ export interface EnsureHandsOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Maps the reuse-effects arity onto destroyHands opts.
+ *
+ * Call sites pass the in-flight messageId as the fourth argument; destroyHands
+ * takes it on opts so MN cascade can skip the cluster that message still owns.
+ */
+export function destroyHandsForReuse(
+  sessionId: string,
+  known?: HandsProbeEntry,
+  knownToken?: string,
+  activeMessageId?: string,
+): Promise<void> {
+  return destroyHands(sessionId, known, knownToken, undefined, { activeMessageId });
+}
+
 const realReuseEffects: SandboxReuseEffects = {
   dagHoldsWorkload,
   workloadHeldByOtherDag,
   releaseHandlesForWorkload,
-  destroyHands: (sessionId, known, knownToken, activeMessageId) =>
-    destroyHands(sessionId, known, knownToken, undefined, { activeMessageId }),
+  destroyHands: destroyHandsForReuse,
   registerSandbox, probeSandboxContainer, restartHandsInSandbox,
   unregisterSandbox, markHandsIdle,
   countLiveWork, retainContainer,

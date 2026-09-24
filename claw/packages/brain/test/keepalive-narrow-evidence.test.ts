@@ -164,6 +164,11 @@ test("an expired retry stops the sandbox before dropping the hands pointer", () 
     /probeUserProcesses\(/,
     "expired-retry must read the jobs roster, not a walk-time peek cache",
   );
+  assert.match(
+    bodyOf("confirmExpiredRetryStop"),
+    /claimIdleStop\(/,
+    "expired-retry must CAS ready→closing after the jobs probe",
+  );
   assert.doesNotMatch(
     body, /peekBackgroundWork\(/,
     "peek never sees a usable verdict on READY keepalive:true retry handles",
@@ -235,4 +240,12 @@ test("handle-register rollback passes the in-flight messageId so MN cascade skip
     /destroyHands\([\s\S]*request\.message_id/,
     "rollback must name the message whose cluster must not be cascaded",
   );
+});
+
+test("tick renews idle holds again after ping and failure phases", () => {
+  const body = bodyOf("tick");
+  const ping = body.indexOf("runPingPhase(");
+  const holds = body.indexOf("renewIdleHolds(");
+  assert.ok(ping >= 0 && holds > ping,
+    "end-of-tick renewIdleHolds must follow the ping phase");
 });
