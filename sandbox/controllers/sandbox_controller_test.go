@@ -220,6 +220,29 @@ func TestApplyPodTerminalConditions(t *testing.T) {
 	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
 }
 
+func TestScaleToZeroKeepsPublishedTerminalCondition(t *testing.T) {
+	// Replicas 0 deletes the Pod on purpose; that absence is not evidence the
+	// terminal outcome already published for it no longer holds.
+	sandbox := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-zero", Namespace: "sb-ns", Generation: 1},
+		Spec:       sandboxv1alpha1.SandboxSpec{Replicas: ptr.To(int32(0))},
+	}
+	meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+		Type:   string(sandboxv1alpha1.SandboxConditionFailed),
+		Status: metav1.ConditionTrue,
+		Reason: sandboxv1alpha1.SandboxReasonPodFailed,
+	})
+	r := SandboxReconciler{
+		Client: newFakeClient(sandbox),
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	require.NoError(t, r.reconcileChildResources(t.Context(), sandbox))
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed, "scale-to-zero must not erase a published Failed condition")
+	require.Equal(t, metav1.ConditionTrue, failed.Status)
+}
+
 func TestRuntimeReasonCannotRejectTheStatusUpdate(t *testing.T) {
 	// The reason comes from the container runtime and is bound by nothing the
 	// API server accepts. One that fails validation rejects the whole status

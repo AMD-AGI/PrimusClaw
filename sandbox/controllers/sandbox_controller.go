@@ -193,8 +193,10 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// Pod that is absent, and acting on it as one removes a terminal condition
 	// already published -- which is how a sandbox that failed stops saying so
 	// on one apiserver blip, and, where the Pod is gone for good, never says it
-	// again.
-	if podErr == nil {
+	// again. Replicas 0 deletes the Pod on purpose, so its absence there says
+	// nothing about the outcome already published either.
+	scaledToZero := sandbox.Spec.Replicas != nil && *sandbox.Spec.Replicas == 0
+	if podErr == nil && !scaledToZero {
 		applyPodTerminalConditions(sandbox, pod)
 	}
 

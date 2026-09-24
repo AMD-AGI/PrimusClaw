@@ -65,6 +65,19 @@ func TestOutputWaitDoesNotReadSilenceAsCompletion(t *testing.T) {
 	}
 }
 
+func TestOutputWaitDoesNotPayTheCeilingForASilentDetachedTree(t *testing.T) {
+	// A command that writes nothing and detaches a child never drains and never
+	// records a write. Waiting out the full ceiling there taxed every silent
+	// background-job launch by two seconds.
+	var buf synchronizedBuffer
+	running := make(chan struct{})
+	started := time.Now()
+	awaitOutputQuiet(running, buf.lastWrite)
+	if elapsed := time.Since(started); elapsed >= outputQuietCeiling/2 {
+		t.Fatalf("a silent tree paid %s of a %s ceiling", elapsed, outputQuietCeiling)
+	}
+}
+
 func TestOutputWaitEndsOnTheDrainSignal(t *testing.T) {
 	// `shim.Wait()` returning is the point at which os/exec has joined the copy
 	// goroutines feeding this buffer, so nothing can arrive after it. Waiting

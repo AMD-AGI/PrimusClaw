@@ -126,6 +126,20 @@ test("the execute that starts Hands says so, and the surrounding steps do not", 
   }
 });
 
+test("the env handover stays off the job roster like the mkdir", async () => {
+  // Counted as user jobs, a probe landing on the write or the cleanup clears
+  // quiescedAt and restarts the sandbox's idle window.
+  const r = recorder([ok, ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, TOKEN, { HF_TOKEN: "x" });
+  const housekeeping = r.cmds
+    .map((cmd, i) => ({ cmd, untracked: r.opts[i]?.untracked === true }))
+    .filter(({ cmd }) => isEnvWrite(cmd) || isEnvCleanup(cmd));
+  assert.ok(housekeeping.length >= 2, "precondition: the file is written and removed");
+  for (const { cmd, untracked } of housekeeping) {
+    assert.ok(untracked, `env housekeeping must be untracked:\n${cmd}`);
+  }
+});
+
 test("an image without the binary falls through to the next source", async (t) => {
   if (!CLAW_DEPLOY_ROOT && !BRAIN_HTTP_URL) {
     t.skip("no fallback source configured in this environment");

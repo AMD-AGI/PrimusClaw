@@ -365,8 +365,10 @@ export async function bootstrapHandsInSandbox(
       // consumed it. A source whose Hands read the file and then died would
       // otherwise leave that proof lying around for the next one, which would
       // start with nothing to read and be told it had passed.
+      // Housekeeping like the mkdir above: kept off the job roster so a probe
+      // landing on it does not reset the sandbox's idle window.
       if (envToPlace) {
-        const wrote = await execFn(writeEnvFileCmd(envToPlace), "30s");
+        const wrote = await execFn(writeEnvFileCmd(envToPlace), "30s", { untracked: true });
         if (wrote.exitCode !== 0) {
           // Fatal rather than degraded: a sandbox without the user's environment
           // fails later, further away, and looks like the user's own mistake.
@@ -397,7 +399,7 @@ export async function bootstrapHandsInSandbox(
     // write that failed after an earlier source had already placed it, an
     // exec-channel throw, no source working -- would otherwise leave the
     // caller's keys in /tmp until the pod's TTL.
-    if (envFile) await execFn(`rm -f ${envFile}`, "30s").catch(() => {});
+    if (envFile) await execFn(`rm -f ${envFile}`, "30s", { untracked: true }).catch(() => {});
   }
 
   // Naming every source that was tried, because the failure that matters is

@@ -318,6 +318,40 @@ func TestPurgeFreesShimStuckReapingOrphans(t *testing.T) {
 	t.Fatal("the purge left the job on the roster")
 }
 
+func TestPurgeFreesShimWhileTheTreeKeepsForking(t *testing.T) {
+	requireJobShim(t)
+	// A purge kills from one /proc snapshot. A process forked after it is
+	// adopted by the shim once its parent dies, and a blocking reap then waits
+	// on it for ever: the shim never exits and the sandbox reads busy for good.
+	s := newTestServer()
+	var out synchronizedBuffer
+	_, exitCh, drained, _, err := s.startTrackedCommand(
+		[]string{"sh", "-c",
+			"setsid sh -c 'i=0; while [ $i -lt 3000 ]; do sleep 100000 & i=$((i+1)); done; wait'" +
+				" >/dev/null 2>&1 & exit 0"},
+		"", os.Environ(), &out, &out, jobTracking{track: true},
+	)
+	if err != nil {
+		t.Fatalf("startTrackedCommand: %v", err)
+	}
+	select {
+	case <-exitCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the primary command did not finish")
+	}
+	time.Sleep(100 * time.Millisecond)
+	for _, pid := range s.jobs.userShimPIDs() {
+		if err := purgeJobTree(pid); err != nil {
+			t.Fatalf("purgeJobTree: %v", err)
+		}
+	}
+	select {
+	case <-drained:
+	case <-time.After(purgeDrainLimit + 10*time.Second):
+		t.Fatal("a purge raced by new forks left the shim waiting for ever")
+	}
+}
+
 func TestCancelWhilePrimaryRunsSparesSetsidWork(t *testing.T) {
 	requireJobShim(t)
 	// A request timeout cancels the command the request started. Work that

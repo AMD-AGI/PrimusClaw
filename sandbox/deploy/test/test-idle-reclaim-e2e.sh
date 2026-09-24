@@ -131,7 +131,8 @@ ok "post-execute jobs roster: user_process_count=0"
 
 log "Brain quiesce check (workload-only sandbox; expect no idle_reclaim without Claw session)..."
 log "For full 15min reclaim, attach a Claw session and watch: kubectl logs -n primus-claw deploy/primus-claw-brain -c brain | grep idle_reclaim"
-log "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC=900 on brain (15min quiesce window)"
+log "Quiesce window is SANDBOX_IDLE_REUSE_SECONDS on brain (default 900s = 15min)"
+log "SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC is the platform idle deadline, not this window; brain refuses startup below the sweep gap (see background-shell-rollout.md, 1800)"
 
 echo ""
 ok "E2E jobs API + execute path verified for workload ${WORKLOAD_ID}"

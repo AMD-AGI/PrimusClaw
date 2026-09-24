@@ -111,7 +111,6 @@ func runJobShim() {
 	_ = writeControlInt(control, code)
 	_ = control.Close()
 	if purgeRequested {
-		killAdoptedDescendants()
 		drainOrphans()
 		return
 	}
@@ -181,7 +180,6 @@ func reapOrphans(purge <-chan os.Signal) {
 		}
 		select {
 		case <-purge:
-			killAdoptedDescendants()
 			drainOrphans()
 			return
 		case <-time.After(50 * time.Millisecond):
@@ -189,20 +187,40 @@ func reapOrphans(purge <-chan os.Signal) {
 	}
 }
 
-// drainOrphans blocks until Wait4 reports no children remain.
+// Upper bound on a purge. A tree that keeps forking faster than it is killed
+// must not hold the shim, and with it the roster entry, open for ever.
+const purgeDrainLimit = 10 * time.Second
+
+// drainOrphans kills and reaps adopted descendants until none remain.
+//
+// One /proc snapshot is not enough: a process forked after it is adopted by
+// this subreaper once its parent dies, and a blocking Wait4 would then wait on
+// it indefinitely. So each round re-kills whatever is live, reaps without
+// blocking, and repeats until Wait4 reports no children or the limit passes.
 func drainOrphans() {
+	deadline := time.Now().Add(purgeDrainLimit)
 	for {
-		var ws syscall.WaitStatus
-		_, err := syscall.Wait4(-1, &ws, 0, nil)
-		if err == syscall.ECHILD {
+		killAdoptedDescendants()
+		for {
+			var ws syscall.WaitStatus
+			pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+			if err == syscall.ECHILD {
+				return
+			}
+			if err == syscall.EINTR {
+				continue
+			}
+			if err != nil {
+				return
+			}
+			if pid == 0 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
 			return
 		}
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return
-		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

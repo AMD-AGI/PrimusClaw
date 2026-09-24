@@ -280,6 +280,11 @@ const outputQuietPeriod = 100 * time.Millisecond
 // arrive, and the response has to be bounded regardless.
 const outputQuietCeiling = 2 * time.Second
 
+// How long to wait for a first byte when nothing has been written yet. Long
+// enough for output the exit status overtook to land, short of the ceiling so a
+// silent command that detached a child does not pay all of it.
+const outputFirstByteGrace = 500 * time.Millisecond
+
 // awaitOutputQuiet resynchronises the exit status with the output it overtook.
 //
 // The exit status travels on its own descriptor while output travels through a
@@ -295,16 +300,23 @@ const outputQuietCeiling = 2 * time.Second
 // Silence is only evidence once something has been written. A buffer that has
 // received nothing carries a zero timestamp, and the age of a zero timestamp is
 // quiet by any measure; treating that as completion is what answered with an
-// exit status and no output.
+// exit status and no output. Nothing written is bounded by
+// outputFirstByteGrace instead.
 func awaitOutputQuiet(drained <-chan struct{}, lastWrite func() time.Time) {
-	deadline := time.Now().Add(outputQuietCeiling)
+	started := time.Now()
+	deadline := started.Add(outputQuietCeiling)
 	for time.Now().Before(deadline) {
 		select {
 		case <-drained:
 			return
 		default:
 		}
-		if at := lastWrite(); !at.IsZero() && time.Since(at) >= outputQuietPeriod {
+		at := lastWrite()
+		if at.IsZero() {
+			if time.Since(started) >= outputFirstByteGrace {
+				return
+			}
+		} else if time.Since(at) >= outputQuietPeriod {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

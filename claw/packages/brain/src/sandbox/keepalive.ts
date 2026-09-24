@@ -886,7 +886,7 @@ async function shouldSkipExpiredRetry(
   // Resolved by identity, not by whichever key answers first: during a rolling
   // upgrade the canonical key can hold a different, live generation, and both
   // the stop and the delete have to land on the one this retry owned.
-  let record: { key: string; info: HandsKvEntry } | null = null;
+  let record: Awaited<ReturnType<typeof recordNamingSandbox>> = null;
   try {
     record = entry ? await recordNamingSandbox(deps.kv, sessionId, entry) : null;
   } catch (err) {
@@ -906,7 +906,8 @@ async function shouldSkipExpiredRetry(
     return true;
   }
 
-  const info = record.info;
+  const named = record;
+  const info = named.info;
 
   // An undelivered retry says nothing about what is running inside the
   // sandbox, and this path stops the workload rather than only dropping its
@@ -961,7 +962,7 @@ async function shouldSkipExpiredRetry(
     token: info.token,
     site: "retry_pending_stop_retry",
     confirm: () => confirmExpiredRetryStop(
-      deps, sessionId, info, lockKey, record.key, record.record, known,
+      deps, sessionId, info, lockKey, named.key, named.record, known,
     ),
     after: async () => {
       unregisterSandbox(sessionId, entry);
