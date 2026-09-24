@@ -27,7 +27,7 @@ import { isTombstone } from "../tasks/lock.js";
 import { destroyHands, handsStopCeilingMs } from "./reaper.js";
 import {
   bindHandsKv, handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
-  sessionHasActiveRunLease,
+  readRunLeaseState, sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { dagsNamingWorkload, listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
@@ -919,8 +919,12 @@ async function shouldSkipExpiredRetry(
   // it), so peeking would always pass and stop live work.
   //
   // Walk-time lease filter only: the queue confirm rechecks lease and lock
-  // after the (bounded) delay before destroyHands.
-  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) return false;
+  // after the (bounded) delay before destroyHands. Unknown is not free.
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") return false;
+  }
 
   // Stop the workload (and messageId-scoped MN cluster) before dropping the
   // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
@@ -957,7 +961,7 @@ async function shouldSkipExpiredRetry(
     token: info.token,
     site: "retry_pending_stop_retry",
     confirm: () => confirmExpiredRetryStop(
-      deps, sessionId, info, lockKey, record.key, record.record,
+      deps, sessionId, info, lockKey, record.key, record.record, known,
     ),
     after: async () => {
       unregisterSandbox(sessionId, entry);
@@ -997,9 +1001,9 @@ async function shouldSkipExpiredRetry(
  *
  * Same shape as idle reclaim: only an explicit empty jobs roster authorises
  * destroyHands, and after that probe the enrollment must still be claimable
- * (lock / lease / ready→closing CAS). Lock and run-lease are checked before
- * the probe as a cheap filter, then again after it -- a redelivery that lands
- * during the probe window must win.
+ * through claimIdleStop (lock / lease / identity / ready→closing CAS). Lock
+ * and run-lease are checked before the probe as a cheap filter, then again
+ * after it -- a redelivery that lands during the probe window must win.
  */
 async function confirmExpiredRetryStop(
   deps: KeepaliveDeps,
@@ -1008,6 +1012,7 @@ async function confirmExpiredRetryStop(
   lockKey: string,
   recordKey: string,
   enrollment: HandsRecord,
+  expected: SandboxEntry,
 ): Promise<boolean> {
   try {
     if (await deps.kv.get(`lock.${lockKey}`)) {
@@ -1021,12 +1026,16 @@ async function confirmExpiredRetryStop(
     logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
     return false;
   }
-  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
-    logger.info(
-      { sessionId, workloadId: info.workloadId },
-      "keepalive.retry_pending_stop_deferred_run_lease",
-    );
-    return false;
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_run_lease",
+      );
+      return false;
+    }
   }
   if (!canProbeJobs(info, sessionId)) {
     logger.warn(
@@ -1044,7 +1053,22 @@ async function confirmExpiredRetryStop(
   try {
     const fresh = await deps.kv.get(recordKey);
     if (!fresh || isTombstone(fresh)) return false;
-    infoNow = { ...info, ...JSON.parse(sc.decode(fresh.value)) as HandsKvEntry };
+    const parsed = JSON.parse(sc.decode(fresh.value)) as HandsKvEntry;
+    if (!sameRegisteredSandbox(expected, {
+      provider: parsed.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+      workloadId: parsed.workloadId,
+      platformKey: parsed.platformKey,
+      sessionId: parsed.sessionId,
+      sandboxName: parsed.sandboxName,
+      namespace: parsed.namespace,
+    })) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_identity",
+      );
+      return false;
+    }
+    infoNow = { ...info, ...parsed };
     enrollmentNow = { value: fresh.value, revision: fresh.revision };
   } catch {
     return false;
@@ -1077,8 +1101,7 @@ async function confirmExpiredRetryStop(
   }
 
   // Probe window: a redelivery may have taken the lock or run lease, or written
-  // the handle. Recheck and CAS before destroyHands -- same race idle reclaim
-  // already closes with claimIdleStop.
+  // a new generation onto the same key. Recheck and CAS via claimIdleStop.
   try {
     if (await deps.kv.get(`lock.${lockKey}`)) {
       logger.warn(
@@ -1091,18 +1114,33 @@ async function confirmExpiredRetryStop(
     logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
     return false;
   }
-  const latest = await deps.kv.get(recordKey);
-  if (!latest || isTombstone(latest)) return false;
   let claimedInfo = infoNow;
   try {
-    claimedInfo = { ...infoNow, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+    const latest = await deps.kv.get(recordKey);
+    if (!latest || isTombstone(latest)) return false;
+    const parsed = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
+    if (!sameRegisteredSandbox(expected, {
+      provider: parsed.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+      workloadId: parsed.workloadId,
+      platformKey: parsed.platformKey,
+      sessionId: parsed.sessionId,
+      sandboxName: parsed.sandboxName,
+      namespace: parsed.namespace,
+    })) {
+      logger.info(
+        { sessionId, workloadId: infoNow.workloadId },
+        "keepalive.retry_pending_stop_deferred_identity",
+      );
+      return false;
+    }
+    claimedInfo = { ...infoNow, ...parsed };
   } catch {
     return false;
   }
   return claimIdleStop(
     deps, recordKey, identity, sessionId, claimedInfo, claimRevision, enrollmentNow,
     undefined,
-    { collectingIdentity: identity },
+    { collectingIdentity: identity, expected },
   );
 }
 
@@ -2663,9 +2701,13 @@ async function expireIdleTarget(
     stats.keptLocal += 1;
     return;
   }
-  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
-    stats.keptRunLease += 1;
-    return;
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") {
+      stats.keptRunLease += 1;
+      return;
+    }
   }
   if (probeIsStale(candidate) || localRegistry.has(identity) || registeredSandboxCount(sessionId) > 0) {
     stats.keptLocal += 1;
@@ -2682,6 +2724,8 @@ async function expireIdleTarget(
   // ensureHands / clearIdleMarkers write wins instead of being overwritten.
   let claimed = false;
   const claimRevision = e.revision;
+  const expected = sandboxEntryFrom(candidate.info);
+  const claimOpts = expected ? { expected } : undefined;
   try {
     if (!canProbeJobs(info, sessionId)) {
       await deps.kv.update(key, e.value, e.revision).catch(() => {});
@@ -2697,12 +2741,18 @@ async function expireIdleTarget(
     // Refresh fields for the stop payload; CAS still uses claimRevision.
     // Identity binding is deferred past this CAS so the probe cannot
     // self-bump the enrollment revision the closing write conditions on.
-    const latest = await deps.kv.get(key);
-    if (!latest || isTombstone(latest)) return;
-    info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+    try {
+      const latest = await deps.kv.get(key);
+      if (!latest || isTombstone(latest)) return;
+      info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+    } catch {
+      return;
+    }
     // Re-check lease/local registry after the (bounded) jobs probe: a turn that
     // started during the probe must win over this reclaim.
-    if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+    if (!(await claimIdleStop(
+      deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
+    ))) {
       return;
     }
     claimed = true;
@@ -2715,7 +2765,9 @@ async function expireIdleTarget(
   } catch (err) {
     if (err instanceof SandboxTerminalProbeError) {
       if (err.state === "absent") {
-        if (!(await claimIdleStop(deps, key, identity, sessionId, info, claimRevision, e))) {
+        if (!(await claimIdleStop(
+          deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
+        ))) {
           return;
         }
         claimed = true;
@@ -2731,7 +2783,7 @@ async function expireIdleTarget(
         // One CAS: terminalReason + closing. Splitting those writes bumped the
         // enrollment revision so claimIdleStop always lost to itself.
         if (!(await claimIdleStop(
-          deps, key, identity, sessionId, info, claimRevision, e, err.reason,
+          deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
         ))) {
           return;
         }
@@ -2742,7 +2794,7 @@ async function expireIdleTarget(
       }
     } else if (err instanceof SandboxRuntimeTerminalError) {
       if (!(await claimIdleStop(
-        deps, key, identity, sessionId, info, claimRevision, e, err.reason,
+        deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
       ))) {
         return;
       }
@@ -2779,9 +2831,10 @@ async function expireIdleTarget(
  * When `terminalReason` is set, the same CAS also records it so emit and
  * destroy do not race a second update against the enrollment revision.
  *
- * `collectingIdentity`: the sandbox this stop is collecting. Its own local
- * registration is the orphan under collection, not evidence against stopping
- * it -- a sibling identity for the same session still vetoes.
+ * Shared gate for idle reclaim, expired-retry, and failure eviction:
+ * registry / sibling check, fail-closed run lease, optional identity match,
+ * then revision CAS. Paths that must stop a dead sandbox under a live turn
+ * pass `claimDespiteLease` and decide MN cascade from the lease themselves.
  */
 async function claimIdleStop(
   deps: KeepaliveDeps,
@@ -2792,8 +2845,19 @@ async function claimIdleStop(
   claimRevision: number,
   e: HandsRecord,
   terminalReason?: string,
-  opts?: { collectingIdentity?: string },
+  opts?: {
+    collectingIdentity?: string;
+    expected?: SandboxEntry;
+    claimDespiteLease?: boolean;
+  },
 ): Promise<boolean> {
+  if (opts?.expected) {
+    const named = sandboxEntryFrom(info);
+    if (!named || !sameRegisteredSandbox(opts.expected, named)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_identity_mismatch");
+      return false;
+    }
+  }
   const collecting = opts?.collectingIdentity;
   if (collecting) {
     for (const [regKey, registered] of localRegistry) {
@@ -2802,7 +2866,16 @@ async function claimIdleStop(
   } else if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     return false;
   }
-  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
+  const leaseScope = typeof info.runScope === "string" && info.runScope
+    ? info.runScope : sessionId;
+  const lease = await readRunLeaseState(deps.kv, leaseScope);
+  if (lease !== "free" && !opts?.claimDespiteLease) {
+    if (lease === "unknown") {
+      logger.warn(
+        { sessionId, identity, leaseScope },
+        "keepalive.idle_reclaim_lease_unreadable",
+      );
+    }
     return false;
   }
   try {
@@ -2956,30 +3029,43 @@ async function handleKeepaliveFailures(
       // otherwise a genuine node-wide loss would be suppressed forever.
       && (!goneCircuitOpen || fails > SANDBOX_KEEPALIVE_FAIL_LIMIT)
     ) {
-      // Failure eviction is not a rebuild. Skip MN cascade only while a run
-      // lease proves a message still owns the cluster (it may rebuild). A
-      // stale handle messageId with no lease must cascade now: destroyHands
-      // deletes the hands entry, and mn_sweeper cannot see it afterwards.
+      // Failure eviction shares claimIdleStop with idle/expired-retry: identity
+      // + ready→closing CAS before destroyHands. Lease is fail-closed and only
+      // gates MN cascade (held/unknown → skip); claimDespiteLease still stops a
+      // dead sandbox under a live turn so the message can rebuild.
+      const named = await recordNamingSandbox(deps.kv, sessionId, entry);
       let activeMessageId = "";
-      let messageId = (entry.messageId || "").trim();
-      let runScope: string | undefined;
-      const found = await readHandsEntry(deps.kv, sessionId).catch(() => null);
-      if (found) {
-        try {
-          const parsed = JSON.parse(found.value) as {
-            messageId?: string; runScope?: string;
-          };
-          if (!messageId) messageId = (parsed.messageId || "").trim();
-          if (typeof parsed.runScope === "string" && parsed.runScope) {
-            runScope = parsed.runScope;
-          }
-        } catch { /* unreadable: cascade as usual */ }
-      }
-      if (
-        messageId
-        && await sessionHasActiveRunLease(deps.kv, sessionId, runScope)
-      ) {
-        activeMessageId = messageId;
+      if (named) {
+        const leaseScope = typeof named.info.runScope === "string" && named.info.runScope
+          ? named.info.runScope : sessionId;
+        const lease = await readRunLeaseState(deps.kv, leaseScope);
+        const messageId = (
+          entry.messageId || named.info.messageId || ""
+        ).trim();
+        if (messageId && lease !== "free") activeMessageId = messageId;
+        const identity = entryIdentity(named.info);
+        const claimed = await claimIdleStop(
+          deps,
+          named.key,
+          identity,
+          sessionId,
+          named.info,
+          named.record.revision,
+          named.record,
+          undefined,
+          {
+            collectingIdentity: identity,
+            expected: entry,
+            claimDespiteLease: true,
+          },
+        );
+        if (!claimed) continue;
+      } else {
+        // No enrollment naming this generation: still stop the known target,
+        // but never cascade on an unreadable lease.
+        const lease = await readRunLeaseState(deps.kv, sessionId);
+        const messageId = (entry.messageId || "").trim();
+        if (messageId && lease !== "free") activeMessageId = messageId;
       }
       await destroyHands(
         sessionId,

@@ -169,6 +169,16 @@ test("an expired retry stops the sandbox before dropping the hands pointer", () 
     /claimIdleStop\(/,
     "expired-retry must CAS ready→closing after the jobs probe",
   );
+  assert.match(
+    bodyOf("confirmExpiredRetryStop"),
+    /sameRegisteredSandbox\(/,
+    "expired-retry must refuse when the enrollment identity changed",
+  );
+  assert.match(
+    bodyOf("confirmExpiredRetryStop"),
+    /readRunLeaseState\(/,
+    "expired-retry must fail-closed on an unreadable run lease",
+  );
   assert.doesNotMatch(
     body, /peekBackgroundWork\(/,
     "peek never sees a usable verdict on READY keepalive:true retry handles",
@@ -248,4 +258,13 @@ test("tick renews idle holds again after ping and failure phases", () => {
   const holds = body.indexOf("renewIdleHolds(");
   assert.ok(ping >= 0 && holds > ping,
     "end-of-tick renewIdleHolds must follow the ping phase");
+});
+
+test("failure eviction claims through claimIdleStop before destroyHands", () => {
+  const at = SRC.indexOf("async function handleKeepaliveFailures");
+  assert.ok(at >= 0);
+  const body = SRC.slice(at, SRC.indexOf("\nasync function admitTargets", at));
+  assert.match(body, /claimIdleStop\(/, "failure eviction must CAS before destroy");
+  assert.match(body, /readRunLeaseState\(/, "cascade skip must be fail-closed on lease reads");
+  assert.match(body, /claimDespiteLease:\s*true/, "a live turn must still stop a dead sandbox");
 });

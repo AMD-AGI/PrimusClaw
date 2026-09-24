@@ -182,3 +182,44 @@ test("an expired retry yields when a concurrent write wins the closing CAS", asy
   assert.deepEqual(writes.stopped, [], "a superseded closing CAS must not stop");
   assert.ok(!writes.deleted.includes(HANDS_KEY), "the hands pointer must stay");
 });
+
+test("an expired retry yields when the enrollment identity changes during the probe", async () => {
+  // Queue window can span tens of seconds. A redelivery that wrote a new
+  // generation onto the same key must not be marked closing.
+  const { kv, writes } = fakeKv();
+  bindHandsKv(kv);
+  bindRunningProvider(writes);
+  await markRetryPending(kv, {
+    sessionId: SESSION,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: WL,
+  });
+
+  await runKeepaliveTickForTest({
+    kv,
+    countActiveShells: async () => {
+      const cur = await kv.get(HANDS_KEY);
+      assert.ok(cur);
+      await kv.update(
+        HANDS_KEY,
+        sc.encode(JSON.stringify({
+          ...BINDING,
+          workloadId: "wl-successor",
+          keepalive: true,
+        })),
+        cur.revision,
+      );
+      return 0;
+    },
+  });
+
+  assert.deepEqual(writes.stopped, [], "a successor generation must not be stopped");
+  assert.ok(!writes.deleted.includes(HANDS_KEY), "the hands pointer must stay");
+  const left = await kv.get(HANDS_KEY);
+  assert.ok(left);
+  const info = JSON.parse(sc.decode(left.value)) as { status?: string; workloadId?: string };
+  assert.equal(info.status, "ready");
+  assert.equal(info.workloadId, "wl-successor");
+});

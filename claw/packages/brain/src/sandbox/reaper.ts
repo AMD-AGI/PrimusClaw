@@ -45,7 +45,7 @@ import {
   getHandsKv,
   revokeHandsToken,
   revokeSessionHandsToken,
-  sessionHasActiveRunLease,
+  readRunLeaseState,
 } from "./registry.js";
 import { isTombstone } from "../tasks/lock.js";
 import { SandboxStopUnavailable } from "./errors.js";
@@ -763,34 +763,6 @@ const SWEEPER_HEALTH_TIMEOUT_MS = 3_000;
 // <=0 disables sweeper-driven eviction entirely.
 
 /**
- * Whether anyone still holds the run lease at `scope` -- and, separately,
- * whether we could find out.
- *
- * `sessionHasActiveRunLease` is the same read and the same tombstone rule; what
- * it does not have is the third answer. It collapses an unreadable bucket into
- * `false`, and `false` is not inert at its callers: the multi-node sweep
- * (`mn_sweeper`, below) reads it as licence and goes on to `reclaimClusters`,
- * which deletes the user's cluster and cannot be undone by a later pass. That
- * is a hazard in the existing helper rather than something introduced here, and
- * it is the reason this function was added instead of reusing it: the pending
- * collector would inherit the same collapse, and a stop issued against a live
- * sandbox because a KV read timed out has nothing after it to retry. "The store
- * did not answer" has to stay distinguishable from "nobody is running".
- */
-async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free" | "unknown"> {
-  let lock;
-  try {
-    lock = await kv.get(`lock.${scope}`);
-  } catch (err) {
-    logger.warn({ err, scope }, "sweeper.lease_read_failed");
-    return "unknown";
-  }
-  // A released lease is deleted, and a delete leaves a readable entry with an
-  // empty value -- so presence alone reads every finished run as a running one.
-  return lock && !isTombstone(lock) ? "held" : "free";
-}
-
-/**
  * Is the walked entry still, byte for byte, the one the decision was taken on?
  *
  * The revision answers it on its own -- in a NATS KV bucket a revision is the
@@ -1089,12 +1061,8 @@ async function sweepStaleHands(): Promise<void> {
           );
           continue;
         }
-        //
-        // And an unreadable bucket is not an absent lease either, which is the
-        // one place this cannot simply call `sessionHasActiveRunLease`: that
-        // one folds a failed read into `false`, which is harmless where it is
-        // used today (a skipped cluster reclaim, retried next pass) and is a
-        // licence to stop a live sandbox here.
+        // And an unreadable bucket is not an absent lease either: readRunLeaseState
+        // keeps "unknown" distinct so a KV blip cannot licence a stop.
         const lease = await readRunLeaseState(kv, info.runScope);
         if (lease !== "free") {
           if (lease === "unknown") {
@@ -1217,7 +1185,9 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
       // `idleSince` on a sandbox a turn is actively running in, and that is
       // exactly the shape this function reads as its licence. What it does
       // next is delete the user's cluster, which no later pass can undo.
-      if (await sessionHasActiveRunLease(kv, sessionId, info.runScope)) {
+      const leaseScope = typeof info.runScope === "string" && info.runScope
+        ? info.runScope : sessionId;
+      if ((await readRunLeaseState(kv, leaseScope)) !== "free") {
         logger.info({ sessionId }, "mn_sweeper.skipped_run_in_flight");
         continue;
       }
