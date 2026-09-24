@@ -4,10 +4,38 @@
 package envd
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStreamOutputFollowsTheStartEvent(t *testing.T) {
+	// The output writers are live from the moment the shim starts, before the
+	// pid handshake the start event carries. A fast command's first data event
+	// then reached the client ahead of start.
+	rec := httptest.NewRecorder()
+	stream := &sseCommandStream{w: rec, flusher: rec, active: true}
+	_, _ = stream.writer("stdout").Write([]byte("EARLY"))
+	stream.begin(42)
+	body := rec.Body.String()
+	start, data := strings.Index(body, "event: start"), strings.Index(body, "EARLY")
+	if start < 0 || data < 0 || data < start {
+		t.Fatalf("data must follow start, got:\n%s", body)
+	}
+}
+
+func TestStreamStartFailureLeavesTheResponseUncommitted(t *testing.T) {
+	// A handshake that fails answers with a status. Output the shim already
+	// wrote must not have committed the response as a 200 event stream first.
+	rec := httptest.NewRecorder()
+	stream := &sseCommandStream{w: rec, flusher: rec, active: true}
+	_, _ = stream.writer("stderr").Write([]byte("runtime: bad env"))
+	stream.deactivate()
+	if rec.Body.Len() != 0 || rec.Flushed {
+		t.Fatalf("a failed start already wrote the response: %q", rec.Body.String())
+	}
+}
 
 func TestAwaitTrackedExitHonoursTimeoutAfterDisconnect(t *testing.T) {
 	// Context.Done used to return immediately, dropping the request timer. A

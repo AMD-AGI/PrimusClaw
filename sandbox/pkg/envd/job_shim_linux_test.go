@@ -6,8 +6,11 @@
 package envd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -84,6 +87,34 @@ func run(t *testing.T, s *Server, track bool, args ...string) (int, *synchronize
 	case <-time.After(30 * time.Second):
 		t.Fatal("primary command did not finish")
 		return 0, nil
+	}
+}
+
+func TestTimeoutNoticeFollowsTheCommandsLastStderr(t *testing.T) {
+	requireJobShim(t)
+	// Callers read the tail of stderr for the timeout marker. Appended before
+	// the output the exit status overtook has drained, the command's last lines
+	// land after it and the marker is no longer the tail.
+	s := newTestServer()
+	s.inference = &inferenceKeyCache{}
+	s.workspace = t.TempDir()
+	// Writing until killed leaves stderr in the pipe that the copy goroutine
+	// only delivers after the exit status.
+	body := `{"command":["sh","-c","while :; do echo LAST_LINE >&2; done"],"timeout":"300ms"}`
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		s.handleExecute(rec, httptest.NewRequest(http.MethodPost, "/api/execute", strings.NewReader(body)))
+		var resp ExecuteResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v: %s", err, rec.Body.String())
+		}
+		if !strings.Contains(resp.Stderr, "LAST_LINE") {
+			t.Fatalf("precondition: the command wrote no stderr: %q", resp.Stderr)
+		}
+		stderr := strings.TrimSpace(resp.Stderr)
+		if !strings.HasSuffix(stderr, "command timed out after 300ms") {
+			t.Fatalf("the timeout notice is not the tail of stderr: ...%q", stderr[max(0, len(stderr)-120):])
+		}
 	}
 }
 

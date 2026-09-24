@@ -856,7 +856,8 @@ async function shouldSkipExpiredRetry(
     // Nothing is known, so nothing is released: the next sweep asks again.
     return false;
   }
-  if (activeLock) {
+  // A released lease reads back as a tombstone, not a miss.
+  if (activeLock && !isTombstone(activeLock)) {
     logger.warn(
       {
         sessionId,
@@ -1016,7 +1017,8 @@ async function confirmExpiredRetryStop(
   expected: SandboxEntry,
 ): Promise<boolean> {
   try {
-    if (await deps.kv.get(`lock.${lockKey}`)) {
+    const lock = await deps.kv.get(`lock.${lockKey}`);
+    if (lock && !isTombstone(lock)) {
       logger.warn(
         { sessionId, lockKey, workloadId: info.workloadId },
         "keepalive.retry_pending_stop_deferred_lock_active",
@@ -1104,7 +1106,8 @@ async function confirmExpiredRetryStop(
   // Probe window: a redelivery may have taken the lock or run lease, or written
   // a new generation onto the same key. Recheck and CAS via claimIdleStop.
   try {
-    if (await deps.kv.get(`lock.${lockKey}`)) {
+    const lock = await deps.kv.get(`lock.${lockKey}`);
+    if (lock && !isTombstone(lock)) {
       logger.warn(
         { sessionId, lockKey, workloadId: infoNow.workloadId },
         "keepalive.retry_pending_stop_deferred_lock_active",

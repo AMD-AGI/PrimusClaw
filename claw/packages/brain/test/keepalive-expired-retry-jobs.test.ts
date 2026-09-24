@@ -150,6 +150,26 @@ test("an expired retry stops only after an explicit empty jobs roster", async ()
   assert.deepEqual(writes.stopped, [WL], "an empty roster authorises the stop");
 });
 
+test("an expired retry is not held off by a released lock's tombstone", async () => {
+  // A DEL/PURGE leaves a readable entry with an empty value. Read as a held
+  // lock, it skips the teardown for as long as the tombstone lives.
+  const { kv, writes } = fakeKv();
+  bindHandsKv(kv);
+  bindRunningProvider(writes);
+  await markRetryPending(kv, {
+    sessionId: SESSION,
+    createdAtMs: 0,
+    deadlineMs: 1,
+    graceSec: 0,
+    workloadId: WL,
+  });
+  await kv.put(`lock.${SESSION}`, new Uint8Array());
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.deepEqual(writes.stopped, [WL], "a tombstone is a released lock, not a held one");
+});
+
 test("an expired retry yields when a concurrent write wins the closing CAS", async () => {
   // Probe can take seconds. A redelivery that writes the handle in that window
   // must win: destroyHands must not run on a superseded enrollment revision.

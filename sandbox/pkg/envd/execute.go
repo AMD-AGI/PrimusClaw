@@ -84,6 +84,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	exitCode := 0
+	timedOut := false
 	if err == nil {
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
@@ -91,7 +92,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		case exitCode = <-exitCh:
 		case <-timer.C:
 			exitCode = finalizeTimedOutCommand(exitCh, stop)
-			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
+			timedOut = true
 		case <-r.Context().Done():
 			// HTTP cancellation does not stop the tracked tree, but the
 			// response no longer owns these buffers. Close them so a
@@ -110,6 +111,10 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			}
 			return out
 		})
+		// After the drain, so callers reading the tail of stderr find it last.
+		if timedOut {
+			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
+		}
 	}
 	endTime := time.Now()
 
@@ -200,6 +205,9 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	if err != nil {
+		// Output held before start is dropped with the stream, so the response
+		// is still uncommitted and can carry a status.
+		stream.deactivate()
 		h := w.Header()
 		h.Del("Content-Type")
 		h.Del("Cache-Control")
@@ -209,8 +217,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send start event
-	stream.event("start", map[string]interface{}{"pid": pid})
+	stream.begin(pid)
 
 	exitCode := 0
 	timer := time.NewTimer(timeout)
@@ -407,6 +414,32 @@ type sseCommandStream struct {
 	flusher http.Flusher
 	active  bool
 	last    time.Time
+	// Output held until begin sends the start event. The writers go live when
+	// the shim starts, ahead of the pid handshake, so nothing may reach the
+	// response before start -- and a failed handshake must still find it
+	// uncommitted so it can answer with a status.
+	started bool
+	pending []sseChunk
+}
+
+// sseChunk is one output write held back until the start event is sent.
+type sseChunk struct {
+	key  string
+	text string
+}
+
+// begin sends the start event, then any output that arrived before it.
+func (s *sseCommandStream) begin(pid int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		sseWrite(s.w, s.flusher, "start", map[string]interface{}{"pid": pid})
+		for _, c := range s.pending {
+			sseWrite(s.w, s.flusher, "data", map[string]string{c.key: c.text})
+		}
+	}
+	s.started = true
+	s.pending = nil
 }
 
 // lastWrite reports when output last arrived, zero where none has.
@@ -445,6 +478,7 @@ func (s *sseCommandStream) deactivate() {
 	s.active = false
 	s.w = nil
 	s.flusher = nil
+	s.pending = nil
 	s.mu.Unlock()
 }
 
@@ -458,9 +492,14 @@ func (w *sseFieldWriter) Write(p []byte) (int, error) {
 	w.stream.mu.Lock()
 	defer w.stream.mu.Unlock()
 	w.stream.last = time.Now()
-	if w.stream.active {
-		sseWrite(w.stream.w, w.stream.flusher, "data", map[string]string{w.key: string(p)})
+	if !w.stream.active {
+		return len(p), nil
 	}
+	if !w.stream.started {
+		w.stream.pending = append(w.stream.pending, sseChunk{key: w.key, text: string(p)})
+		return len(p), nil
+	}
+	sseWrite(w.stream.w, w.stream.flusher, "data", map[string]string{w.key: string(p)})
 	return len(p), nil
 }
 
