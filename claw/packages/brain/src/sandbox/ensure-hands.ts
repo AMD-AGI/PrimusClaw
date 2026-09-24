@@ -2901,7 +2901,12 @@ async function provisionHands(
         { sessionId, dagRoot, handle: action.handle, workloadId, err: (e as Error).message },
         "ensureHands.handle_register_failed_rollback",
       );
-      await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+      await reuseEffects.destroyHands(
+        sessionId,
+        identity,
+        handsToken,
+        request.message_id?.trim() || undefined,
+      ).catch((cleanupErr) => {
         // Logged with the id: if the early registration is also gone, this
         // line is what is left to find the workload by.
         logger.error(

@@ -733,7 +733,8 @@ export const BRAIN_REGISTRY_REPLICAS = envInt("BRAIN_REGISTRY_REPLICAS", NATS_RE
 // creates the bucket) leaves Brain writing under a TTL the store does not
 // honour; raising it also inflates PING/IDLE phase budgets (TTL fractions) and
 // can push keepaliveSweepCeilingSec above SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC.
-// Span may exceed TTL: mid-sweep renewals refresh parked hands keys in place.
+// Span may exceed TTL when mid-sweep renewals cover every hands key the walk
+// still holds: ping targets, idle-expiry survivors, and within-window parks.
 export const BRAIN_REGISTRY_TTL_MS = envInt(
   "BRAIN_REGISTRY_TTL_MS",
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
@@ -1120,7 +1121,8 @@ export const SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC = env("SANDBOX_KEEPALIVE_IDLE_D
 // between two refreshes of one handle and the admission reclaim horizon are
 // both derived from this number, so one declared below the sweep's own worst
 // case makes both of them short in the unsafe direction. Mid-sweep renewals
-// refresh parked hands keys when this span exceeds BRAIN_REGISTRY_TTL_MS.
+// refresh ping targets, idle-expiry survivors, and within-window parks when
+// this span exceeds BRAIN_REGISTRY_TTL_MS.
 export const SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC = envInt("SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC", 660, { min: 1 });
 // After a retryable task exit, keep the READY sandbox alive only briefly while
 // NATS redelivers the message. If no new attempt starts before this grace

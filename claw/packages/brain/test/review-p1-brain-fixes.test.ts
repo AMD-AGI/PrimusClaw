@@ -126,16 +126,17 @@ test("the shipped chart does not opt every sandbox into automatic eviction", asy
   assert.match(values, /sandboxKeepaliveFailLimit:\s*"0"/);
 });
 
-test("controlplane does not expose a sandbox idle-GC enable switch", async () => {
-  // Brain reclaim owns lifetime; wiring idle-GC would delete from create time
-  // once LastActivity stopped being refreshed.
+test("controlplane accepts enable-idle-gc as a no-op, like session-timeout", async () => {
+  // Manifests from this PR's earlier revisions still pass --enable-idle-gc=false.
+  // An unknown flag ends flag.Parse in os.Exit(2) before any listener starts.
   const src = await import("node:fs/promises")
     .then((fs) => fs.readFile(
       new URL("../../../../sandbox/cmd/controlplane/main.go", import.meta.url),
       "utf8",
     ));
-  assert.doesNotMatch(src, /enable-idle-gc|ENABLE_SANDBOX_IDLE_GC|enableIdleGC/);
-  assert.doesNotMatch(src, /agentd\.SandboxReconciler|sandbox-idle-gc/);
+  assert.match(src, /flag\.BoolVar\(&deprecatedEnableIdleGC, "enable-idle-gc"/);
+  assert.match(src, /WARNING: enable-idle-gc is ignored/);
+  assert.doesNotMatch(src, /agentd\.SandboxReconciler|sandbox-idle-gc-controller/);
   assert.match(src, /Sandbox idle-GC is not wired/);
 });
 

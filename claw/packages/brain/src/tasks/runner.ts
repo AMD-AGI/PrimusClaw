@@ -1663,6 +1663,8 @@ class TaskRunner {
       this.sessionId,
       this.handsIdentity ?? undefined,
       this.handsToken,
+      undefined,
+      { activeMessageId: this.messageId },
     );
     if (this.abortCtrl.signal.aborted) {
       throw new Error("sandbox recovery aborted after destroy");

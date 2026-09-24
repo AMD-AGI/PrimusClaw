@@ -94,6 +94,7 @@ func main() {
 	// would take the whole control plane down on an image bump alone, so it is
 	// parsed and reported rather than refused. Remove in the next release.
 	var deprecatedSessionTimeout time.Duration
+	var deprecatedEnableIdleGC bool
 
 	routerPort = 8080
 	wmPort = 8081
@@ -112,6 +113,11 @@ func main() {
 	flag.BoolVar(&enableExtensions, "extensions", true, "Enable SandboxClaim and SandboxWarmPool controllers")
 	flag.DurationVar(&deprecatedSessionTimeout, "session-timeout", 0,
 		"Deprecated and ignored: sandbox idle reclaim is owned by Brain")
+	// Accepted so manifests that still pass --enable-idle-gc=false (this PR's
+	// earlier deployables) do not CrashLoop on flag.Parse. The controller is
+	// not wired: LastActivity is not refreshed, and Brain owns idle reclaim.
+	flag.BoolVar(&deprecatedEnableIdleGC, "enable-idle-gc", false,
+		"Deprecated and ignored: sandbox idle reclaim is owned by Brain")
 	flag.Parse()
 
 	// Said out loud, because the environment variable never failed at all: a
@@ -120,6 +126,17 @@ func main() {
 		fmt.Fprintln(os.Stderr,
 			"WARNING: session-timeout is ignored. Sandbox idle reclaim is owned by Brain "+
 				"(EnvD GET /api/jobs); only the hard --default-ttl applies here.")
+	}
+	idleGCFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "enable-idle-gc" {
+			idleGCFlagSet = true
+		}
+	})
+	if idleGCFlagSet || os.Getenv("ENABLE_SANDBOX_IDLE_GC") != "" {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: enable-idle-gc is ignored. Sandbox idle reclaim is owned by Brain "+
+				"(EnvD GET /api/jobs); the control-plane idle-GC controller is not wired.")
 	}
 
 	// controller-runtime keeps zap here, deliberately: switching it to the

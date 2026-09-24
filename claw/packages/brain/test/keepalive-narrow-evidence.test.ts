@@ -152,8 +152,21 @@ test("an expired retry stops the sandbox before dropping the hands pointer", () 
   const runner = bodyOf("collectTargets");
   assert.match(
     runner,
-    /destroyHands\(item\.sessionId, item\.info, item\.token\)\s*\.then\([\s\S]*item\.after\?\.\(\)/,
-    "the queued bookkeeping runs only after the stop resolved",
+    /item\.confirm[\s\S]*destroyHands\(item\.sessionId, item\.info, item\.token\)\s*\.then\([\s\S]*item\.after\?\.\(\)/,
+    "the queued bookkeeping runs only after confirm and the stop resolved",
+  );
+  assert.match(
+    body, /confirm:\s*\(\) => confirmExpiredRetryStop\(/,
+    "expired-retry stops recheck evidence at the destructive boundary",
+  );
+  assert.match(
+    bodyOf("confirmExpiredRetryStop"),
+    /probeUserProcesses\(/,
+    "expired-retry must read the jobs roster, not a walk-time peek cache",
+  );
+  assert.doesNotMatch(
+    body, /peekBackgroundWork\(/,
+    "peek never sees a usable verdict on READY keepalive:true retry handles",
   );
   // Which record is acted on is decided by identity, not by whichever key
   // answers first: during a rolling upgrade the canonical key can hold a
@@ -187,5 +200,39 @@ test("idle verdict re-stamps quiescedAt when the anchor was cleared", () => {
     body,
     /usableSharedVerdict\(info\)\?\.state\s*!==\s*"idle"/,
     "already-idle must not block re-anchoring",
+  );
+});
+
+test("runRebuild passes the in-flight messageId so MN cascade skips it", () => {
+  // destroyHands cascades by handle.messageId; runRebuild reuses multiNodeContext
+  // for that same message. Without activeMessageId the cascade deletes the GPU
+  // cluster the rebuild is about to wire back up.
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/tasks/runner.ts", import.meta.url)),
+    "utf8",
+  );
+  const at = src.indexOf("private async runRebuild(");
+  assert.ok(at >= 0, "runRebuild is gone; this test is about it");
+  const body = src.slice(at, src.indexOf("\n  private ", at + 1));
+  assert.match(
+    body,
+    /destroyHands\([\s\S]*activeMessageId:\s*this\.messageId/,
+    "runRebuild must name the message whose cluster must not be cascaded",
+  );
+});
+
+test("handle-register rollback passes the in-flight messageId so MN cascade skips it", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../src/sandbox/ensure-hands.ts", import.meta.url)),
+    "utf8",
+  );
+  const at = src.indexOf("ensureHands.handle_register_failed_rollback");
+  assert.ok(at >= 0, "the SaFE handle-register rollback log is gone");
+  // Window covering destroyHands after that log, before the next ensureHands log.
+  const window = src.slice(at, at + 800);
+  assert.match(
+    window,
+    /destroyHands\([\s\S]*request\.message_id/,
+    "rollback must name the message whose cluster must not be cascaded",
   );
 });

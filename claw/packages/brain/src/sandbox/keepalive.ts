@@ -907,17 +907,16 @@ async function shouldSkipExpiredRetry(
 
   // An undelivered retry says nothing about what is running inside the
   // sandbox, and this path stops the workload rather than only dropping its
-  // pointer -- so the reclaim evidence has to be asked for here too. A
-  // background shell started by an earlier task of this session outlives the
-  // message that started it; the lock this retry released is a statement about
-  // that message, not about the container. Answering "not yet" costs a sweep,
-  // which the record outlives; answering "stop" over live work does not undo.
+  // pointer -- so the reclaim evidence has to be asked for at the destructive
+  // boundary (confirm below), not from the walk-time peek cache. A background
+  // shell started by an earlier task of this session outlives the message that
+  // started it; the lock this retry released is a statement about that
+  // message, not about the container. READY / keepalive:true handles never
+  // carry a usable peek verdict here (clearIdleMarkers / registerSandbox wipe
+  // it), so peeking would always pass and stop live work.
   //
-  // Not the local registry, unlike the idle path: this walk reaches handles
-  // through it, and the registration left by the attempt that never came back
-  // is the orphan being collected rather than evidence against collecting it.
-  const identity = entryIdentity(info);
-  if (peekBackgroundWork(identity, info).state === "running") return false;
+  // Walk-time lease filter only: the queue confirm rechecks lease and lock
+  // after the (bounded) delay before destroyHands.
   if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) return false;
 
   // Stop the workload (and messageId-scoped MN cluster) before dropping the
@@ -954,6 +953,7 @@ async function shouldSkipExpiredRetry(
     info: known,
     token: info.token,
     site: "retry_pending_stop_retry",
+    confirm: () => confirmExpiredRetryStop(deps, sessionId, info, lockKey),
     after: async () => {
       unregisterSandbox(sessionId, entry);
       // A teardown that owned the record has already removed it under its own
@@ -985,6 +985,73 @@ async function shouldSkipExpiredRetry(
     },
   });
   return true;
+}
+
+/**
+ * Destructive-boundary evidence for an expired retry-pending stop.
+ *
+ * Same shape as idle reclaim: only an explicit empty jobs roster authorises
+ * destroyHands. Lock and run-lease are rechecked here because the teardown was
+ * queued during the census walk and may wait tens of seconds before running.
+ */
+async function confirmExpiredRetryStop(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  info: HandsKvEntry,
+  lockKey: string,
+): Promise<boolean> {
+  try {
+    if (await deps.kv.get(`lock.${lockKey}`)) {
+      logger.warn(
+        { sessionId, lockKey, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_lock_active",
+      );
+      return false;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
+    return false;
+  }
+  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
+    logger.info(
+      { sessionId, workloadId: info.workloadId },
+      "keepalive.retry_pending_stop_deferred_run_lease",
+    );
+    return false;
+  }
+  if (!canProbeJobs(info, sessionId)) {
+    logger.warn(
+      { sessionId, workloadId: info.workloadId },
+      "keepalive.retry_pending_stop_deferred_unprobeable",
+    );
+    return false;
+  }
+  try {
+    const running = await probeUserProcesses(deps, info, sessionId, {
+      persistIdentity: false,
+    });
+    if (running > 0) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId, running },
+        "keepalive.retry_pending_stop_deferred_jobs_busy",
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    // Unavailable / tracking_lost / soft control-plane faults never authorise
+    // a stop. Terminal/absent are conclusions about the workload, not a zero
+    // roster, and this path is only for reclaiming an orphaned READY handle.
+    logger.warn(
+      {
+        err: (err as Error)?.message ?? String(err),
+        sessionId,
+        workloadId: info.workloadId,
+      },
+      "keepalive.retry_pending_stop_evidence_unavailable",
+    );
+    return false;
+  }
 }
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
@@ -1276,6 +1343,24 @@ async function renewIdleExpiryCandidates(
     }
   }
 }
+
+/** Refresh parked idle handles that are still inside the reuse window. */
+async function renewIdleHolds(
+  deps: KeepaliveDeps,
+  holds: Array<{ sessionId: string }>,
+): Promise<void> {
+  for (const { sessionId: sid } of holds) {
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // A missed refresh is not a stop; the next sweep asks again.
+    }
+  }
+}
+
 /**
  * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
  * The ping phase behind it needs what is left to renew every live record before
@@ -2221,7 +2306,21 @@ interface TargetCensus {
     token?: string;
     /** Bookkeeping that is only correct once the stop has succeeded. */
     after?: () => Promise<void>;
+    /**
+     * Destructive-boundary gate. Asked immediately before destroyHands; false
+     * skips the stop and its after callback (evidence must be re-checked after
+     * the walk→queue delay).
+     */
+    confirm?: () => Promise<boolean>;
   }>;
+  /**
+   * Parked idle handles still inside the reuse window.
+   *
+   * They renew once during the walk, then sit out of census.targets and
+   * census.idleExpiries -- so without a mid-sweep refresh a long teardown
+   * phase can outlast BRAIN_REGISTRY_TTL_MS and drop them.
+   */
+  idleHolds: Array<{ sessionId: string }>;
   /**
    * Sessions whose expired retry-pending record is already owed a stop.
    *
@@ -2248,6 +2347,7 @@ async function collectTargets(
     retentionReads: new Map(),
     idleExpiries: [],
     teardowns: [],
+    idleHolds: [],
     expiredRetriesQueued: new Set(),
   };
   for (const [key, registered] of localRegistry) {
@@ -2271,6 +2371,7 @@ async function collectTargets(
       deferredExpiries += 1;
       return;
     }
+    if (item.confirm && !(await item.confirm())) return;
     await destroyHands(item.sessionId, item.info, item.token)
       .then(async () => {
         teardownRetryAt.delete(item.sessionId);
@@ -2312,6 +2413,9 @@ async function collectTargets(
   // keptRunLease, superseded) so a long teardown budget cannot drop their KV TTL.
   // Destroyed keys read as missing and are skipped.
   await renewIdleExpiryCandidates(deps, census.idleExpiries);
+  // Within-window parks are likewise outside targets; refresh them here so a
+  // sweep whose teardown phase outlasts the bucket TTL does not forget them.
+  await renewIdleHolds(deps, census.idleHolds);
   // The idle-expiry phase sits between the census renew and the ping renew.
   // With a long stop ceiling that gap alone can approach the bucket TTL, so
   // live targets are refreshed again before the walk returns.
@@ -2461,6 +2565,7 @@ async function collectIdleTarget(
   // Incomplete control-plane identity cannot confirm an empty jobs roster.
   // Renew the KV TTL so Brain does not forget the handle; do not reclaim.
   if (!canProbeJobs(info, sessionId) && bgWork !== "gone") {
+    census.idleHolds.push({ sessionId });
     await deps.kv.update(key, value, e.revision).catch(() => {});
     return true;
   }
@@ -2478,6 +2583,7 @@ async function collectIdleTarget(
   }
   else {
     stats.withinWindow += 1;
+    census.idleHolds.push({ sessionId });
     await deps.kv.update(key, value, e.revision).catch(() => {});
   }
   return true;
