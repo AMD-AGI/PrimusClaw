@@ -213,6 +213,9 @@ test("buildInferaWorkloadBody deploys aggregated workers idle with a role-scoped
   assert.deepStrictEqual(body.inferaOptions.serviceRoles, ["frontend", "worker"]);
   // worker.replica IS the node count: one LWS group spanning both nodes.
   assert.deepStrictEqual(body.inferaOptions.multinodeRoles, ["worker"]);
+  // Idle workers never open the readiness port before the SSH launch, so
+  // SaFE must skip the probe for them or the workload never reaches Running.
+  assert.deepStrictEqual(body.inferaOptions.idleRoles, ["worker"]);
   assert.equal(body.resources[1].replica, 2);
   assert.equal(body.resources[1].rdmaResource, "1");
   assert.equal(body.resources[0].gpu, undefined, "frontend is CPU-only");
@@ -252,6 +255,8 @@ test("buildInferaWorkloadBody splits prefill/decode roles when PD-disaggregated"
   assert.deepStrictEqual(body.inferaOptions.serviceRoles, ["frontend", "prefill", "decode"]);
   // TP 8 fits one 8-GPU pod, so neither role spans nodes.
   assert.equal(body.inferaOptions.multinodeRoles, undefined);
+  // Single-node roles get the readiness probe unless marked idle.
+  assert.deepStrictEqual(body.inferaOptions.idleRoles, ["prefill", "decode"]);
   assert.equal(body.resources[1].replica, 1);
   assert.equal(body.resources[2].replica, 1);
   // Both roles still need RDMA: the KV transfer plane no-ops without a device.
